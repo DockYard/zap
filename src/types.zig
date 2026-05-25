@@ -8033,13 +8033,30 @@ pub const TypeChecker = struct {
                     // downstream `Error.kind(inner)` call fails
                     // `resolveProtocolDispatch` with "first argument does
                     // not satisfy protocol Error" (Phase 1.2.5 Gap 2).
-                    for (call.args) |arg| _ = try self.inferExpr(arg);
+                    const receiver_type_id = if (call.args.len > 0)
+                        try self.inferExpr(call.args[0])
+                    else
+                        TypeStore.UNKNOWN;
+                    for (call.args[@min(1, call.args.len)..]) |arg| _ = try self.inferExpr(arg);
                     const field_name_text = self.interner.get(fa.field);
                     for (proto_entry.decl.functions) |fn_sig| {
                         const fn_name_text = self.interner.get(fn_sig.name);
                         if (!std.mem.eql(u8, fn_name_text, field_name_text)) continue;
                         if (fn_sig.params.len != arity) continue;
                         const ret_expr = fn_sig.return_type orelse return TypeStore.VOID;
+                        // Parametric protocol existential (`Callable(args,
+                        // result)`, `Enumerable(element)`): the method's
+                        // declared return type expression references the
+                        // protocol's FORMAL type-parameter names. Bind each
+                        // formal to the receiver's concrete
+                        // `protocol_constraint` type argument before
+                        // resolving, so `Callable.call(f, ...)` on a
+                        // `Callable({i64}, i64)`-typed `f` resolves `result`
+                        // to `i64` rather than collapsing to a fresh
+                        // type-var. A BARE protocol (`Error`, no type-params)
+                        // takes the empty-binding fast path — identical to
+                        // the prior behavior.
+                        try self.bindProtocolFormalsFromReceiver(proto_entry.decl.type_params, receiver_type_id);
                         return self.resolveTypeExpr(ret_expr) catch TypeStore.UNKNOWN;
                     }
                     return TypeStore.UNKNOWN;
@@ -8071,6 +8088,30 @@ pub const TypeChecker = struct {
 
         for (call.args) |arg| _ = try self.inferExpr(arg);
         return TypeStore.UNKNOWN;
+    }
+
+    /// Bind a parametric protocol's formal type-parameter names to the
+    /// concrete type arguments carried by a `protocol_constraint`
+    /// receiver, so the protocol method's declared return/param type
+    /// expressions (which reference the formal names) resolve to the
+    /// instantiation's concrete types. Used by protocol-existential
+    /// dispatch (`Callable.call(f, ...)` on a `Callable({i64}, i64)`-typed
+    /// `f`). A bare protocol (no formals) or a non-constraint receiver is
+    /// a no-op, preserving the prior behavior for `Error`/`Stringable`.
+    fn bindProtocolFormalsFromReceiver(
+        self: *TypeChecker,
+        formal_names: []const ast.StringId,
+        receiver_type_id: TypeId,
+    ) !void {
+        if (formal_names.len == 0) return;
+        if (receiver_type_id >= self.store.types.items.len) return;
+        const receiver = self.store.getType(receiver_type_id);
+        if (receiver != .protocol_constraint) return;
+        const type_args = receiver.protocol_constraint.type_params;
+        const pair_count = @min(formal_names.len, type_args.len);
+        for (formal_names[0..pair_count], type_args[0..pair_count]) |formal_id, arg_type_id| {
+            try self.type_var_scope.put(self.interner.get(formal_id), arg_type_id);
+        }
     }
 
     // ============================================================

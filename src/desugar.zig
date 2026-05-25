@@ -35,6 +35,35 @@ pub const Desugarer = struct {
     /// `list_at`, etc.), tripping spurious "function not found"
     /// diagnostics during type-checking.
     in_macro_body: bool = false,
+    /// Monotonic counter for synthesized closure structs (`__closure_N`).
+    /// Program-wide so every generated `Callable` impl target name is
+    /// globally unique regardless of which struct/function the closure
+    /// literal appeared in.
+    closure_counter: u32 = 0,
+    /// Synthesized `struct __closure_N { <captures> }` declarations,
+    /// produced when a capturing closure literal appears in an escaping
+    /// position (struct-field value, collection element, or `fn`-typed
+    /// return tail). Flushed into `program.structs` at the end of
+    /// `desugarProgram` so `buildStructPrograms` discovers them — the same
+    /// mechanism `desugarErrorDecls` uses for its generated structs.
+    pending_closure_structs: std.ArrayList(ast.StructDecl) = .empty,
+    /// Synthesized `pub impl Callable({...}, R) for __closure_N` top items,
+    /// emitted alongside each `__closure_N` struct and flushed into
+    /// `program.top_items` at the end of `desugarProgram`.
+    pending_closure_impls: std.ArrayList(ast.TopItem) = .empty,
+    /// Set while desugaring an expression that occupies an ESCAPING
+    /// position — a struct-literal field value, a list/map element, or
+    /// the `fn`-typed tail/return expression of a function. A capturing
+    /// closure literal seen with this flag set is rewritten into a boxed
+    /// `Callable` existential (`%__closure_N{captures}` + `impl Callable`);
+    /// a capturing closure seen WITHOUT this flag (e.g. a direct call
+    /// argument consumed by the callee) is left untouched for the existing
+    /// #201 `make_closure`/`call_closure` direct path. Non-capturing
+    /// closures are never boxed here regardless of position (a code
+    /// pointer has no environment to manage — Gap E's direct path owns
+    /// them). This is the conservative Phase-1 box decision; full
+    /// escape-driven box-vs-direct unification is Phase 3.
+    closure_escapes: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, interner: *ast.StringInterner, graph: ?*const scope_mod.ScopeGraph) Desugarer {
         return .{
@@ -125,6 +154,22 @@ pub const Desugarer = struct {
                 else => try new_top_items.append(self.allocator, try self.desugarTopItem(item)),
             }
         }
+
+        // Flush every synthesized closure struct + `impl Callable`
+        // accumulated while walking the program. The structs join
+        // `program.structs` so `buildStructPrograms` routes their
+        // generated `call` method onto the right struct; the impls join
+        // `top_items` so the collector registers them. Append-after so a
+        // closure synthesized inside the last user struct/function is
+        // still flushed.
+        for (self.pending_closure_structs.items) |closure_struct| {
+            try new_structs.append(self.allocator, closure_struct);
+        }
+        for (self.pending_closure_impls.items) |closure_impl| {
+            try new_top_items.append(self.allocator, closure_impl);
+        }
+        self.pending_closure_structs.clearRetainingCapacity();
+        self.pending_closure_impls.clearRetainingCapacity();
 
         return .{
             .structs = try new_structs.toOwnedSlice(self.allocator),
@@ -896,12 +941,30 @@ pub const Desugarer = struct {
     fn desugarFunctionDecl(self: *Desugarer, func: *const ast.FunctionDecl) !*const ast.FunctionDecl {
         var new_clauses: std.ArrayList(ast.FunctionClause) = .empty;
         for (func.clauses) |clause| {
+            // The tail (result) expression of a clause whose declared
+            // return type is a `fn`-type is an escaping position: a
+            // capturing closure returned there outlives the frame and must
+            // box as `Callable`. When the tail is in fact a capturing
+            // closure, also rewrite the `fn(A) -> B` return type to
+            // `Callable({A}, B)` so the boxed value type-checks against the
+            // return slot and `maybeBoxAsProtocol` auto-boxes it. A
+            // non-capturing tail closure keeps the bare `fn`-type (Gap E's
+            // direct return path) — its return type is left unchanged.
+            const return_is_fn = clause.return_type != null and clause.return_type.?.* == .function;
+            const body = if (clause.body) |b|
+                try self.desugarFunctionClauseBody(b, return_is_fn)
+            else
+                null;
+            const return_type = if (return_is_fn and body != null and self.tailIsBoxedClosure(body.?))
+                try self.callableTypeFromFunctionType(clause.return_type.?)
+            else
+                clause.return_type;
             try new_clauses.append(self.allocator, .{
                 .meta = clause.meta,
                 .params = clause.params,
-                .return_type = clause.return_type,
+                .return_type = return_type,
                 .refinement = if (clause.refinement) |r| try self.desugarExpr(r) else null,
-                .body = if (clause.body) |body| try self.desugarBlock(body) else null,
+                .body = body,
                 // Carry the declared `raises` row through desugar unchanged:
                 // type expressions in the row are not rewritten by desugar
                 // (mirrors `return_type`), so pass the slice by reference.
@@ -914,6 +977,38 @@ pub const Desugarer = struct {
             .clauses = try new_clauses.toOwnedSlice(self.allocator),
             .visibility = func.visibility,
         });
+    }
+
+    /// Desugar a function clause body, marking the tail (result)
+    /// expression as escaping when `return_is_fn` so a capturing closure
+    /// returned directly is boxed as `Callable`. Only the final statement
+    /// — and only when it is a bare expression statement — is the result
+    /// position; every earlier statement desugars in the ambient
+    /// (non-escaping) context.
+    fn desugarFunctionClauseBody(self: *Desugarer, stmts: []const ast.Stmt, return_is_fn: bool) anyerror![]const ast.Stmt {
+        if (!return_is_fn or stmts.len == 0) return try self.desugarBlock(stmts);
+        var new_stmts: std.ArrayList(ast.Stmt) = .empty;
+        for (stmts, 0..) |stmt, index| {
+            const is_tail = index == stmts.len - 1;
+            if (is_tail and stmt == .expr) {
+                try new_stmts.append(self.allocator, .{ .expr = try self.desugarExprEscaping(stmt.expr) });
+            } else {
+                try new_stmts.append(self.allocator, try self.desugarStmt(stmt));
+            }
+        }
+        return new_stmts.toOwnedSlice(self.allocator);
+    }
+
+    /// True iff the body's tail (result) statement is a
+    /// `%__closure_N{...}` construction synthesized by the escaping-closure
+    /// desugar — i.e. the closure was boxed as a `Callable`. Used to decide
+    /// whether the clause's `fn`-typed return annotation should be rewritten
+    /// to `Callable`.
+    fn tailIsBoxedClosure(self: *const Desugarer, stmts: []const ast.Stmt) bool {
+        if (stmts.len == 0) return false;
+        const tail = stmts[stmts.len - 1];
+        if (tail != .expr) return false;
+        return self.exprIsSynthesizedClosureStruct(tail.expr);
     }
 
     // ============================================================
@@ -1077,6 +1172,26 @@ pub const Desugarer = struct {
                 });
             },
             .anonymous_function => |anon| {
+                // A capturing closure literal in an ESCAPING position
+                // (struct-field value, collection element, `fn`-typed
+                // return tail) is rewritten into a boxed `Callable`
+                // existential: a synthesized `struct __closure_N` holding
+                // the captures + `impl Callable({params}, ret)` whose
+                // `call` method is the body, and the literal becomes a
+                // `%__closure_N{captures}` construction. This is the
+                // currently-failing case (a capture-environment struct
+                // cannot fit a bare `fn`-ptr slot). Non-capturing closures
+                // and capturing closures consumed as direct call arguments
+                // stay on the existing #201/Gap E direct path.
+                if (self.closure_escapes and try self.closureLiteralCaptures(anon.decl)) {
+                    return try self.desugarEscapingClosure(anon);
+                }
+                // The closure's OWN body is not an escaping context for the
+                // expressions inside it; reset the flag while recursing so
+                // a non-escaping inner closure is not spuriously boxed.
+                const saved_escapes = self.closure_escapes;
+                self.closure_escapes = false;
+                defer self.closure_escapes = saved_escapes;
                 return try self.create(ast.Expr, .{
                     .anonymous_function = .{
                         .meta = anon.meta,
@@ -1230,23 +1345,28 @@ pub const Desugarer = struct {
 
             // List cons expression → recurse into head and tail
             .list_cons_expr => |lce| {
+                // A list cons stores both head and tail into the list — an
+                // escaping position for a capturing closure head.
                 return try self.create(ast.Expr, .{
                     .list_cons_expr = .{
                         .meta = lce.meta,
-                        .head = try self.desugarExpr(lce.head),
-                        .tail = try self.desugarExpr(lce.tail),
+                        .head = try self.desugarExprEscaping(lce.head),
+                        .tail = try self.desugarExprEscaping(lce.tail),
                     },
                 });
             },
 
             // Struct expression: desugar update syntax %Name{old | field: val}
             .struct_expr => |se| {
-                // Recurse into field values
+                // Struct-field values are an escaping position: a capturing
+                // closure stored in a `fn`-typed field must box as
+                // `Callable` so the field can carry the captured
+                // environment (a bare `fn`-ptr cannot).
                 var new_fields: std.ArrayList(ast.StructField) = .empty;
                 for (se.fields) |field| {
                     try new_fields.append(self.allocator, .{
                         .name = field.name,
-                        .value = try self.desugarExpr(field.value),
+                        .value = try self.desugarExprEscaping(field.value),
                     });
                 }
 
@@ -1336,9 +1456,14 @@ pub const Desugarer = struct {
                 });
             },
             .list => |le| {
+                // List elements are an escaping position: a value stored
+                // in a list outlives the expression that produced it, so a
+                // capturing closure element must box as `Callable`. This is
+                // the canonical heterogeneous-collection case
+                // (`[fn(i64) -> i64]`).
                 var new_elements: std.ArrayList(*const ast.Expr) = .empty;
                 for (le.elements) |elem| {
-                    try new_elements.append(self.allocator, try self.desugarExpr(elem));
+                    try new_elements.append(self.allocator, try self.desugarExprEscaping(elem));
                 }
                 return try self.create(ast.Expr, .{
                     .list = .{
@@ -1536,6 +1661,772 @@ pub const Desugarer = struct {
     /// Expand struct update syntax: %Name{old | x: new_x}
     /// Looks up the struct definition to get all field names, then generates
     /// a complete struct init where unchanged fields use old.field_name.
+    // ============================================================
+    // Escaping closure → `struct __closure_N` + `impl Callable` desugar
+    //
+    // A capturing closure literal in an escaping position (struct-field
+    // value, collection element, `fn`-typed return tail) is rewritten into
+    // a boxed `Callable` existential. This mirrors the `pub error` desugar
+    // (`desugarErrorDecl`): a synthesized struct + impl pair joins the
+    // program, and the surface expression becomes a struct construction
+    // that downstream HIR/IR auto-boxes (`maybeBoxAsProtocol`) wherever it
+    // flows into a `protocol_box(Callable)` slot.
+    //
+    //   fn(x :: i64) -> i64 { x + n }      # captures `n`
+    //
+    // becomes
+    //
+    //   struct __closure_N { n :: i64 }
+    //   pub impl Callable({i64}, i64) for __closure_N {
+    //     fn call(self :: __closure_N, args :: {i64}) -> i64 {
+    //       x = args.0          # one prelude binding per closure param
+    //       x + self.n          # captures rewritten to self.<field>
+    //     }
+    //   }
+    //
+    // and the literal becomes `%__closure_N{ n: n }`. Capture-field
+    // ordering is the deterministic first-reference order of the free
+    // variables in the body (see `collectClosureCaptures`).
+    // ============================================================
+
+    /// Desugar an expression that occupies an escaping position. Sets the
+    /// `closure_escapes` flag for the duration of the recursion so a
+    /// capturing closure literal directly in this position is boxed as
+    /// `Callable`, then restores the previous flag.
+    fn desugarExprEscaping(self: *Desugarer, expr: *const ast.Expr) anyerror!*const ast.Expr {
+        const saved = self.closure_escapes;
+        self.closure_escapes = true;
+        defer self.closure_escapes = saved;
+        return self.desugarExpr(expr);
+    }
+
+    /// True iff `expr` is a `%__closure_N{...}` construction synthesized by
+    /// `desugarEscapingClosure`. Recognized by the `__closure_` name
+    /// prefix on a single-part struct reference.
+    fn exprIsSynthesizedClosureStruct(self: *const Desugarer, expr: *const ast.Expr) bool {
+        if (expr.* != .struct_expr) return false;
+        const name = expr.struct_expr.struct_name;
+        if (name.parts.len != 1) return false;
+        return std.mem.startsWith(u8, self.interner.get(name.parts[name.parts.len - 1]), "__closure_");
+    }
+
+    /// Build the `Callable({P0, P1, ...}, R)` type expression that a boxed
+    /// closure's slot must carry, from the closure's `fn(P0, P1) -> R` type
+    /// expression. The argument tuple is the closure's parameter types
+    /// (the empty tuple `{}` for a zero-arg closure — a genuine
+    /// zero-element tuple distinct from `void`).
+    fn callableTypeFromFunctionType(self: *Desugarer, fn_type: *const ast.TypeExpr) !*const ast.TypeExpr {
+        const ft = fn_type.function;
+        return self.buildCallableTypeExpr(ft.params, ft.return_type, fn_type.getMeta().span);
+    }
+
+    /// Construct a `Callable({args...}, result)` type expression. `args` is
+    /// the closure parameter type list packed into a brace-tuple; `result`
+    /// is the closure return type.
+    fn buildCallableTypeExpr(
+        self: *Desugarer,
+        args: []const *const ast.TypeExpr,
+        result: *const ast.TypeExpr,
+        span: ast.SourceSpan,
+    ) !*const ast.TypeExpr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        const callable_id = try interner_mut.intern("Callable");
+        const args_tuple = try self.create(ast.TypeExpr, .{
+            .tuple = .{ .meta = .{ .span = span }, .elements = try self.allocSlice(*const ast.TypeExpr, args) },
+        });
+        const type_args = try self.allocSlice(*const ast.TypeExpr, &.{ args_tuple, result });
+        return try self.create(ast.TypeExpr, .{
+            .name = .{ .meta = .{ .span = span }, .name = callable_id, .args = type_args },
+        });
+    }
+
+    /// Syntactic free-variable test: does the closure literal reference any
+    /// value binding from an enclosing scope (a capture)? A closure with no
+    /// captures is a bare code pointer with no environment to manage, so it
+    /// stays on the direct path (Gap E / #201) and is never boxed.
+    ///
+    /// Conservative and sound: collects the closure's bound names (its
+    /// parameters and its own `=` assignment bindings) and walks the body
+    /// for `var_ref`s outside that set. Module/struct references are dotted
+    /// (`Foo.bar`) or bare calls the desugar rewrites to `Kernel.bar`, so a
+    /// surviving bare lowercase `var_ref` is a genuine captured value
+    /// (Zap requires module qualification for cross-module functions).
+    fn closureLiteralCaptures(self: *Desugarer, decl: *const ast.FunctionDecl) !bool {
+        var captures: std.ArrayList(ast.StringId) = .empty;
+        defer captures.deinit(self.allocator);
+        try self.collectClosureCaptures(decl, &captures);
+        return captures.items.len > 0;
+    }
+
+    /// Collect the free variables (captures) of a closure literal in
+    /// deterministic first-reference order. A name is a capture iff it is
+    /// referenced by a `var_ref` in the body and is neither one of the
+    /// closure's parameters nor a name the body itself binds via `=`.
+    /// Names already collected are skipped so each capture appears once.
+    fn collectClosureCaptures(
+        self: *Desugarer,
+        decl: *const ast.FunctionDecl,
+        captures: *std.ArrayList(ast.StringId),
+    ) !void {
+        if (decl.clauses.len == 0) return;
+        const clause = decl.clauses[0];
+        // Names bound inside the closure (not captures): its parameters
+        // plus any locals it binds via `=`. Built per-closure.
+        var bound = std.AutoHashMap(ast.StringId, void).init(self.allocator);
+        defer bound.deinit();
+        for (clause.params) |param| {
+            try self.collectPatternBindings(param.pattern, &bound);
+        }
+        const body = clause.body orelse return;
+        for (body) |stmt| {
+            try self.collectStmtBoundNames(stmt, &bound);
+        }
+        for (body) |stmt| {
+            try self.collectStmtCaptures(stmt, &bound, captures);
+        }
+    }
+
+    /// Record every binding name introduced by a pattern (a `bind`, or the
+    /// sub-patterns of tuple/list/cons/struct/binary/paren/pin patterns).
+    fn collectPatternBindings(
+        self: *Desugarer,
+        pattern: *const ast.Pattern,
+        bound: *std.AutoHashMap(ast.StringId, void),
+    ) anyerror!void {
+        switch (pattern.*) {
+            .bind => |b| try bound.put(b.name, {}),
+            .wildcard, .literal => {},
+            .tuple => |t| for (t.elements) |sub| try self.collectPatternBindings(sub, bound),
+            .list => |l| for (l.elements) |sub| try self.collectPatternBindings(sub, bound),
+            .list_cons => |lc| {
+                for (lc.heads) |sub| try self.collectPatternBindings(sub, bound);
+                try self.collectPatternBindings(lc.tail, bound);
+            },
+            .map => |m| for (m.fields) |field| try self.collectPatternBindings(field.value, bound),
+            .struct_pattern => |sp| for (sp.fields) |field| try self.collectPatternBindings(field.pattern, bound),
+            .pin => {},
+            .paren => |p| try self.collectPatternBindings(p.inner, bound),
+            .binary => |bp| for (bp.segments) |seg| {
+                if (seg.value == .pattern) try self.collectPatternBindings(seg.value.pattern, bound);
+            },
+            .tagged_union_variant => |tv| if (tv.payload) |payload| try self.collectPatternBindings(payload, bound),
+        }
+    }
+
+    /// Record names a statement binds: assignment LHS patterns and nested
+    /// closure-free `=` bindings. (A nested closure introduces its own
+    /// scope; its parameters are not visible to the outer body, so they
+    /// are not added here — only the outer assignment LHS names are.)
+    fn collectStmtBoundNames(
+        self: *Desugarer,
+        stmt: ast.Stmt,
+        bound: *std.AutoHashMap(ast.StringId, void),
+    ) anyerror!void {
+        switch (stmt) {
+            .assignment => |assign| try self.collectPatternBindings(assign.pattern, bound),
+            else => {},
+        }
+    }
+
+    /// Walk a statement collecting captured `var_ref`s (those outside
+    /// `bound`).
+    fn collectStmtCaptures(
+        self: *Desugarer,
+        stmt: ast.Stmt,
+        bound: *std.AutoHashMap(ast.StringId, void),
+        captures: *std.ArrayList(ast.StringId),
+    ) anyerror!void {
+        switch (stmt) {
+            .expr => |e| try self.collectExprCaptures(e, bound, captures),
+            .assignment => |assign| try self.collectExprCaptures(assign.value, bound, captures),
+            else => {},
+        }
+    }
+
+    /// Walk an expression collecting captured `var_ref`s. A bare
+    /// `var_ref` whose name is not in `bound` is appended to `captures`
+    /// (once). Nested closures are walked with their own parameters added
+    /// to a forked `bound` set so the inner closure's params do not count
+    /// as outer captures, while a free variable the inner closure pulls
+    /// from the OUTER scope is still recorded as an outer capture.
+    fn collectExprCaptures(
+        self: *Desugarer,
+        expr: *const ast.Expr,
+        bound: *std.AutoHashMap(ast.StringId, void),
+        captures: *std.ArrayList(ast.StringId),
+    ) anyerror!void {
+        switch (expr.*) {
+            .var_ref => |vr| {
+                if (bound.contains(vr.name)) return;
+                for (captures.items) |existing| {
+                    if (existing == vr.name) return;
+                }
+                try captures.append(self.allocator, vr.name);
+            },
+            .binary_op => |bo| {
+                try self.collectExprCaptures(bo.lhs, bound, captures);
+                try self.collectExprCaptures(bo.rhs, bound, captures);
+            },
+            .unary_op => |uo| try self.collectExprCaptures(uo.operand, bound, captures),
+            .call => |call| {
+                try self.collectExprCaptures(call.callee, bound, captures);
+                for (call.args) |arg| try self.collectExprCaptures(arg, bound, captures);
+            },
+            .field_access => |fa| try self.collectExprCaptures(fa.object, bound, captures),
+            .pipe => |pe| {
+                try self.collectExprCaptures(pe.lhs, bound, captures);
+                try self.collectExprCaptures(pe.rhs, bound, captures);
+            },
+            .unwrap => |uw| try self.collectExprCaptures(uw.expr, bound, captures),
+            .tuple => |te| for (te.elements) |elem| try self.collectExprCaptures(elem, bound, captures),
+            .list => |le| for (le.elements) |elem| try self.collectExprCaptures(elem, bound, captures),
+            .list_cons_expr => |lce| {
+                try self.collectExprCaptures(lce.head, bound, captures);
+                try self.collectExprCaptures(lce.tail, bound, captures);
+            },
+            .map => |me| {
+                if (me.update_source) |src| try self.collectExprCaptures(src, bound, captures);
+                for (me.fields) |field| {
+                    try self.collectExprCaptures(field.key, bound, captures);
+                    try self.collectExprCaptures(field.value, bound, captures);
+                }
+            },
+            .struct_expr => |se| {
+                if (se.update_source) |src| try self.collectExprCaptures(src, bound, captures);
+                for (se.fields) |field| try self.collectExprCaptures(field.value, bound, captures);
+            },
+            .range => |re| {
+                try self.collectExprCaptures(re.start, bound, captures);
+                try self.collectExprCaptures(re.end, bound, captures);
+                if (re.step) |s| try self.collectExprCaptures(s, bound, captures);
+            },
+            .if_expr => |ie| {
+                try self.collectExprCaptures(ie.condition, bound, captures);
+                for (ie.then_block) |stmt| try self.collectStmtCaptures(stmt, bound, captures);
+                if (ie.else_block) |eb| for (eb) |stmt| try self.collectStmtCaptures(stmt, bound, captures);
+            },
+            .case_expr => |ce| {
+                try self.collectExprCaptures(ce.scrutinee, bound, captures);
+                for (ce.clauses) |clause| {
+                    if (clause.guard) |g| try self.collectExprCaptures(g, bound, captures);
+                    for (clause.body) |stmt| try self.collectStmtCaptures(stmt, bound, captures);
+                }
+            },
+            .block => |blk| for (blk.stmts) |stmt| try self.collectStmtCaptures(stmt, bound, captures),
+            .anonymous_function => |anon| {
+                // Walk the nested closure with its parameters added to a
+                // forked bound set so its own params are not outer
+                // captures, but free variables it pulls from the outer
+                // scope still register as outer captures.
+                if (anon.decl.clauses.len == 0) return;
+                const inner = anon.decl.clauses[0];
+                var inner_bound = try bound.clone();
+                defer inner_bound.deinit();
+                for (inner.params) |param| try self.collectPatternBindings(param.pattern, &inner_bound);
+                if (inner.body) |inner_body| {
+                    for (inner_body) |stmt| try self.collectStmtBoundNames(stmt, &inner_bound);
+                    for (inner_body) |stmt| try self.collectStmtCaptures(stmt, &inner_bound, captures);
+                }
+            },
+            .type_annotated => |ta| try self.collectExprCaptures(ta.expr, bound, captures),
+            .error_pipe => |ep| try self.collectExprCaptures(ep.chain, bound, captures),
+            .try_rescue => |tr| {
+                for (tr.body) |stmt| try self.collectStmtCaptures(stmt, bound, captures);
+                for (tr.rescue_clauses) |clause| {
+                    for (clause.body) |stmt| try self.collectStmtCaptures(stmt, bound, captures);
+                }
+                if (tr.after_block) |after| for (after) |stmt| try self.collectStmtCaptures(stmt, bound, captures);
+            },
+            .raise_expr => |re| try self.collectExprCaptures(re.value, bound, captures),
+            // Literals, struct/function/attr references, intrinsics, quote
+            // forms, and poison carry no captured value variables.
+            else => {},
+        }
+    }
+
+    /// Rewrite a capturing closure literal into a boxed `Callable`
+    /// existential: synthesize `struct __closure_N { <captures> }` +
+    /// `pub impl Callable({params}, ret) for __closure_N { fn call(...) }`,
+    /// register both with the program, and return the
+    /// `%__closure_N{ field: capturedVar, ... }` construction expression.
+    fn desugarEscapingClosure(self: *Desugarer, anon: ast.AnonymousFunctionExpr) anyerror!*const ast.Expr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        const decl = anon.decl;
+        const span = anon.meta.span;
+        if (decl.clauses.len == 0) {
+            @panic("desugarEscapingClosure: closure literal has no clause");
+        }
+        const clause = decl.clauses[0];
+
+        // ----- 1. Determine captures (deterministic first-reference order).
+        var captures: std.ArrayList(ast.StringId) = .empty;
+        defer captures.deinit(self.allocator);
+        try self.collectClosureCaptures(decl, &captures);
+
+        // ----- 2. Resolve param types and the return type. A closure
+        // literal carries `:: T` annotations on every parameter and a
+        // `-> R` return type (the surface form `fn(x :: A) -> R { ... }`).
+        // When an annotation is absent we fall back to `any` so the impl is
+        // still well-formed; the type checker then refines via inference.
+        const param_types = try self.allocator.alloc(*const ast.TypeExpr, clause.params.len);
+        for (clause.params, 0..) |param, idx| {
+            param_types[idx] = param.type_annotation orelse try self.anyTypeExpr(span);
+        }
+        const return_type = clause.return_type orelse try self.anyTypeExpr(span);
+
+        // ----- 3. Synthesize the closure struct name `__closure_N`.
+        const closure_index = self.closure_counter;
+        self.closure_counter += 1;
+        const struct_name_text = try std.fmt.allocPrint(self.allocator, "__closure_{d}", .{closure_index});
+        const struct_name_id = try interner_mut.intern(struct_name_text);
+        const struct_name: ast.StructName = .{
+            .parts = try self.allocSlice(ast.StringId, &.{struct_name_id}),
+            .span = span,
+        };
+
+        // ----- 4. Build the struct's capture fields (one per captured
+        // variable, in capture order). Each field's type is the captured
+        // binding's type; the desugar cannot resolve types, so each field
+        // is annotated `any` and the type checker infers the concrete
+        // capture type from the construction site's argument. Deterministic
+        // ordering is the capture-collection order.
+        const fields = try self.allocator.alloc(ast.StructFieldDecl, captures.items.len);
+        for (captures.items, 0..) |capture_name, idx| {
+            fields[idx] = .{
+                .meta = .{ .span = span },
+                .name = capture_name,
+                .type_expr = try self.anyTypeExpr(span),
+                .default = null,
+            };
+        }
+
+        // ----- 5. Build the `call` method body:
+        //   - one prelude binding `p_i = args.<i>` per closure parameter,
+        //     so the original body's parameter references resolve unchanged;
+        //   - the original body with captured `var_ref`s rewritten to
+        //     `self.<field>` (params are already in scope via the prelude).
+        const args_name_id = try interner_mut.intern("args");
+        const self_name_id = try interner_mut.intern("self");
+        var capture_set = std.AutoHashMap(ast.StringId, void).init(self.allocator);
+        defer capture_set.deinit();
+        for (captures.items) |capture_name| try capture_set.put(capture_name, {});
+
+        var call_body: std.ArrayList(ast.Stmt) = .empty;
+        // Prelude: bind each parameter name to its tuple slot. Only
+        // `bind`-pattern params get a prelude binding; a non-bind param
+        // pattern (destructuring) is bound directly against the tuple slot
+        // value via an assignment whose LHS is the original pattern.
+        for (clause.params, 0..) |param, idx| {
+            const slot = try self.tupleIndexAccess(args_name_id, idx, span);
+            try call_body.append(self.allocator, .{
+                .assignment = try self.create(ast.Assignment, .{
+                    .meta = .{ .span = span },
+                    .pattern = param.pattern,
+                    .value = slot,
+                }),
+            });
+        }
+        const original_body = clause.body orelse &[_]ast.Stmt{};
+        for (original_body) |stmt| {
+            try call_body.append(self.allocator, try self.rewriteCaptureStmt(stmt, self_name_id, &capture_set));
+        }
+
+        // ----- 6. The `call` method signature:
+        //   pub fn call(self :: __closure_N, args :: {P0, P1, ...}) -> R
+        const self_type = try self.create(ast.TypeExpr, .{
+            .name = .{ .meta = .{ .span = span }, .name = struct_name_id, .args = &.{} },
+        });
+        const args_tuple_type = try self.create(ast.TypeExpr, .{
+            .tuple = .{ .meta = .{ .span = span }, .elements = try self.allocSlice(*const ast.TypeExpr, param_types) },
+        });
+        const self_param: ast.Param = .{
+            .meta = .{ .span = span },
+            .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = .{ .span = span }, .name = self_name_id } }),
+            .type_annotation = self_type,
+            .ownership = .shared,
+            .ownership_explicit = false,
+            .default = null,
+        };
+        const args_param: ast.Param = .{
+            .meta = .{ .span = span },
+            .pattern = try self.create(ast.Pattern, .{ .bind = .{ .meta = .{ .span = span }, .name = args_name_id } }),
+            .type_annotation = args_tuple_type,
+            .ownership = .shared,
+            .ownership_explicit = false,
+            .default = null,
+        };
+        const call_name_id = try interner_mut.intern("call");
+        const call_clauses = try self.allocator.alloc(ast.FunctionClause, 1);
+        call_clauses[0] = .{
+            .meta = .{ .span = span },
+            .params = try self.allocSlice(ast.Param, &.{ self_param, args_param }),
+            .return_type = return_type,
+            .refinement = null,
+            // The closure body may itself contain pipes, interpolations, or
+            // nested escaping closures: desugar it.
+            .body = try self.desugarBlock(try call_body.toOwnedSlice(self.allocator)),
+            .raises = clause.raises,
+        };
+        const call_decl = try self.create(ast.FunctionDecl, .{
+            .meta = .{ .span = span },
+            .name = call_name_id,
+            .name_expr = null,
+            .clauses = call_clauses,
+            .visibility = .public,
+        });
+
+        // ----- 7. Emit the synthesized struct declaration into the
+        // pending list (flushed into `program.structs`).
+        const struct_value: ast.StructDecl = .{
+            .meta = .{ .span = span },
+            .name = struct_name,
+            .parent = null,
+            .type_params = &.{},
+            .items = &.{},
+            .fields = fields,
+            .is_private = false,
+        };
+        try self.pending_closure_structs.append(self.allocator, struct_value);
+
+        // ----- 8. Emit the `pub impl Callable({...}, R) for __closure_N`.
+        const callable_proto_id = try interner_mut.intern("Callable");
+        const callable_proto_parts = try self.allocSlice(ast.StringId, &.{callable_proto_id});
+        const proto_args_tuple = try self.create(ast.TypeExpr, .{
+            .tuple = .{ .meta = .{ .span = span }, .elements = try self.allocSlice(*const ast.TypeExpr, param_types) },
+        });
+        const proto_type_args = try self.allocSlice(*const ast.TypeExpr, &.{ proto_args_tuple, return_type });
+        const impl_fns = try self.allocator.alloc(*const ast.FunctionDecl, 1);
+        impl_fns[0] = call_decl;
+        const impl_decl = try self.create(ast.ImplDecl, .{
+            .meta = .{ .span = span },
+            .protocol_name = .{ .parts = callable_proto_parts, .span = span },
+            .protocol_type_args = proto_type_args,
+            .target_type = struct_name,
+            .type_params = &.{},
+            .functions = impl_fns,
+            .is_private = false,
+        });
+        try self.pending_closure_impls.append(self.allocator, .{ .impl_decl = impl_decl });
+
+        // ----- 9. Build the `%__closure_N{ field: capturedVar, ... }`
+        // construction expression. Each field value is a `var_ref` to the
+        // captured variable in the ENCLOSING scope (where the closure
+        // literal appeared), so the capture is read at construction time.
+        const struct_fields = try self.allocator.alloc(ast.StructField, captures.items.len);
+        for (captures.items, 0..) |capture_name, idx| {
+            struct_fields[idx] = .{
+                .name = capture_name,
+                .value = try self.create(ast.Expr, .{
+                    .var_ref = .{ .meta = .{ .span = span }, .name = capture_name },
+                }),
+            };
+        }
+        return try self.create(ast.Expr, .{
+            .struct_expr = .{
+                .meta = .{ .span = span },
+                .struct_name = struct_name,
+                .type_args = &.{},
+                .type_args_parens_present = false,
+                .update_source = null,
+                .fields = struct_fields,
+            },
+        });
+    }
+
+    /// Build an `any` type expression at `span`.
+    fn anyTypeExpr(self: *Desugarer, span: ast.SourceSpan) !*const ast.TypeExpr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        const any_id = try interner_mut.intern("any");
+        return try self.create(ast.TypeExpr, .{
+            .name = .{ .meta = .{ .span = span }, .name = any_id, .args = &.{} },
+        });
+    }
+
+    /// Build the tuple-slot access expression `args.<index>` — a
+    /// `field_access` whose field name is the decimal index, matching how
+    /// tuple element access is written and lowered (`tuple.0`, `tuple.1`).
+    fn tupleIndexAccess(self: *Desugarer, tuple_name: ast.StringId, index: usize, span: ast.SourceSpan) !*const ast.Expr {
+        const interner_mut: *ast.StringInterner = self.interner;
+        const index_text = try std.fmt.allocPrint(self.allocator, "{d}", .{index});
+        defer self.allocator.free(index_text);
+        const index_field_id = try interner_mut.intern(index_text);
+        const tuple_ref = try self.create(ast.Expr, .{
+            .var_ref = .{ .meta = .{ .span = span }, .name = tuple_name },
+        });
+        return try self.create(ast.Expr, .{
+            .field_access = .{ .meta = .{ .span = span }, .object = tuple_ref, .field = index_field_id },
+        });
+    }
+
+    /// Rewrite every captured `var_ref` in a statement to `self.<name>`,
+    /// leaving all other structure intact. Used to lower a closure body
+    /// into its `Callable.call` method, where captures live on the
+    /// `self` receiver as fields.
+    fn rewriteCaptureStmt(
+        self: *Desugarer,
+        stmt: ast.Stmt,
+        self_name: ast.StringId,
+        capture_set: *const std.AutoHashMap(ast.StringId, void),
+    ) anyerror!ast.Stmt {
+        return switch (stmt) {
+            .expr => |e| .{ .expr = try self.rewriteCaptureExpr(e, self_name, capture_set) },
+            .assignment => |assign| .{
+                .assignment = try self.create(ast.Assignment, .{
+                    .meta = assign.meta,
+                    .pattern = assign.pattern,
+                    .value = try self.rewriteCaptureExpr(assign.value, self_name, capture_set),
+                }),
+            },
+            else => stmt,
+        };
+    }
+
+    /// Rewrite captured `var_ref`s in an expression to `self.<name>` field
+    /// accesses. Recurses through the full expression surface. Nested
+    /// closures are walked so a capture shared with an inner closure is
+    /// also rewritten (the inner closure, if it escapes, is independently
+    /// desugared on a later pass over the rewritten body).
+    fn rewriteCaptureExpr(
+        self: *Desugarer,
+        expr: *const ast.Expr,
+        self_name: ast.StringId,
+        capture_set: *const std.AutoHashMap(ast.StringId, void),
+    ) anyerror!*const ast.Expr {
+        switch (expr.*) {
+            .var_ref => |vr| {
+                if (!capture_set.contains(vr.name)) return expr;
+                const self_ref = try self.create(ast.Expr, .{
+                    .var_ref = .{ .meta = vr.meta, .name = self_name },
+                });
+                return try self.create(ast.Expr, .{
+                    .field_access = .{ .meta = vr.meta, .object = self_ref, .field = vr.name },
+                });
+            },
+            .binary_op => |bo| return try self.create(ast.Expr, .{
+                .binary_op = .{
+                    .meta = bo.meta,
+                    .op = bo.op,
+                    .lhs = try self.rewriteCaptureExpr(bo.lhs, self_name, capture_set),
+                    .rhs = try self.rewriteCaptureExpr(bo.rhs, self_name, capture_set),
+                },
+            }),
+            .unary_op => |uo| return try self.create(ast.Expr, .{
+                .unary_op = .{
+                    .meta = uo.meta,
+                    .op = uo.op,
+                    .operand = try self.rewriteCaptureExpr(uo.operand, self_name, capture_set),
+                },
+            }),
+            .call => |call| {
+                const new_args = try self.allocator.alloc(*const ast.Expr, call.args.len);
+                for (call.args, 0..) |arg, idx| {
+                    new_args[idx] = try self.rewriteCaptureExpr(arg, self_name, capture_set);
+                }
+                return try self.create(ast.Expr, .{
+                    .call = .{
+                        .meta = call.meta,
+                        .callee = try self.rewriteCaptureExpr(call.callee, self_name, capture_set),
+                        .args = new_args,
+                    },
+                });
+            },
+            .field_access => |fa| return try self.create(ast.Expr, .{
+                .field_access = .{
+                    .meta = fa.meta,
+                    .object = try self.rewriteCaptureExpr(fa.object, self_name, capture_set),
+                    .field = fa.field,
+                },
+            }),
+            .pipe => |pe| return try self.create(ast.Expr, .{
+                .pipe = .{
+                    .meta = pe.meta,
+                    .lhs = try self.rewriteCaptureExpr(pe.lhs, self_name, capture_set),
+                    .rhs = try self.rewriteCaptureExpr(pe.rhs, self_name, capture_set),
+                },
+            }),
+            .unwrap => |uw| return try self.create(ast.Expr, .{
+                .unwrap = .{ .meta = uw.meta, .expr = try self.rewriteCaptureExpr(uw.expr, self_name, capture_set) },
+            }),
+            .tuple => |te| {
+                const new_elements = try self.allocator.alloc(*const ast.Expr, te.elements.len);
+                for (te.elements, 0..) |elem, idx| new_elements[idx] = try self.rewriteCaptureExpr(elem, self_name, capture_set);
+                return try self.create(ast.Expr, .{ .tuple = .{ .meta = te.meta, .elements = new_elements } });
+            },
+            .list => |le| {
+                const new_elements = try self.allocator.alloc(*const ast.Expr, le.elements.len);
+                for (le.elements, 0..) |elem, idx| new_elements[idx] = try self.rewriteCaptureExpr(elem, self_name, capture_set);
+                return try self.create(ast.Expr, .{ .list = .{ .meta = le.meta, .elements = new_elements } });
+            },
+            .list_cons_expr => |lce| return try self.create(ast.Expr, .{
+                .list_cons_expr = .{
+                    .meta = lce.meta,
+                    .head = try self.rewriteCaptureExpr(lce.head, self_name, capture_set),
+                    .tail = try self.rewriteCaptureExpr(lce.tail, self_name, capture_set),
+                },
+            }),
+            .map => |me| {
+                const new_fields = try self.allocator.alloc(ast.MapField, me.fields.len);
+                for (me.fields, 0..) |field, idx| new_fields[idx] = .{
+                    .key = try self.rewriteCaptureExpr(field.key, self_name, capture_set),
+                    .value = try self.rewriteCaptureExpr(field.value, self_name, capture_set),
+                };
+                return try self.create(ast.Expr, .{
+                    .map = .{
+                        .meta = me.meta,
+                        .update_source = if (me.update_source) |src| try self.rewriteCaptureExpr(src, self_name, capture_set) else null,
+                        .fields = new_fields,
+                    },
+                });
+            },
+            .struct_expr => |se| {
+                const new_fields = try self.allocator.alloc(ast.StructField, se.fields.len);
+                for (se.fields, 0..) |field, idx| new_fields[idx] = .{
+                    .name = field.name,
+                    .value = try self.rewriteCaptureExpr(field.value, self_name, capture_set),
+                };
+                return try self.create(ast.Expr, .{
+                    .struct_expr = .{
+                        .meta = se.meta,
+                        .struct_name = se.struct_name,
+                        .type_args = se.type_args,
+                        .type_args_parens_present = se.type_args_parens_present,
+                        .update_source = if (se.update_source) |src| try self.rewriteCaptureExpr(src, self_name, capture_set) else null,
+                        .fields = new_fields,
+                    },
+                });
+            },
+            .range => |re| return try self.create(ast.Expr, .{
+                .range = .{
+                    .meta = re.meta,
+                    .start = try self.rewriteCaptureExpr(re.start, self_name, capture_set),
+                    .end = try self.rewriteCaptureExpr(re.end, self_name, capture_set),
+                    .step = if (re.step) |s| try self.rewriteCaptureExpr(s, self_name, capture_set) else null,
+                },
+            }),
+            .if_expr => |ie| return try self.create(ast.Expr, .{
+                .if_expr = .{
+                    .meta = ie.meta,
+                    .condition = try self.rewriteCaptureExpr(ie.condition, self_name, capture_set),
+                    .then_block = try self.rewriteCaptureBlock(ie.then_block, self_name, capture_set),
+                    .else_block = if (ie.else_block) |eb| try self.rewriteCaptureBlock(eb, self_name, capture_set) else null,
+                },
+            }),
+            .case_expr => |ce| {
+                const new_clauses = try self.allocator.alloc(ast.CaseClause, ce.clauses.len);
+                for (ce.clauses, 0..) |clause, idx| new_clauses[idx] = .{
+                    .meta = clause.meta,
+                    .pattern = clause.pattern,
+                    .type_annotation = clause.type_annotation,
+                    .guard = if (clause.guard) |g| try self.rewriteCaptureExpr(g, self_name, capture_set) else null,
+                    .body = try self.rewriteCaptureBlock(clause.body, self_name, capture_set),
+                };
+                return try self.create(ast.Expr, .{
+                    .case_expr = .{
+                        .meta = ce.meta,
+                        .scrutinee = try self.rewriteCaptureExpr(ce.scrutinee, self_name, capture_set),
+                        .clauses = new_clauses,
+                    },
+                });
+            },
+            .block => |blk| return try self.create(ast.Expr, .{
+                .block = .{ .meta = blk.meta, .stmts = try self.rewriteCaptureBlock(blk.stmts, self_name, capture_set) },
+            }),
+            .anonymous_function => |anon| {
+                // Rewrite captures the inner closure shares from the outer
+                // scope. The inner closure's own params shadow; a captured
+                // name that the inner closure rebinds as a param must NOT
+                // be rewritten there. Fork the capture set minus the inner
+                // params.
+                if (anon.decl.clauses.len == 0) return expr;
+                const inner = anon.decl.clauses[0];
+                var inner_captures = try capture_set.clone();
+                defer inner_captures.deinit();
+                for (inner.params) |param| try self.removePatternBindingsFromSet(param.pattern, &inner_captures);
+                const new_body: ?[]const ast.Stmt = if (inner.body) |b|
+                    try self.rewriteCaptureBlock(b, self_name, &inner_captures)
+                else
+                    null;
+                const new_clauses = try self.allocator.alloc(ast.FunctionClause, anon.decl.clauses.len);
+                new_clauses[0] = .{
+                    .meta = inner.meta,
+                    .params = inner.params,
+                    .return_type = inner.return_type,
+                    .refinement = inner.refinement,
+                    .body = new_body,
+                    .raises = inner.raises,
+                };
+                for (anon.decl.clauses[1..], 1..) |c, idx| new_clauses[idx] = c;
+                const new_decl = try self.create(ast.FunctionDecl, .{
+                    .meta = anon.decl.meta,
+                    .name = anon.decl.name,
+                    .name_expr = anon.decl.name_expr,
+                    .clauses = new_clauses,
+                    .visibility = anon.decl.visibility,
+                });
+                return try self.create(ast.Expr, .{
+                    .anonymous_function = .{ .meta = anon.meta, .decl = new_decl },
+                });
+            },
+            .type_annotated => |ta| return try self.create(ast.Expr, .{
+                .type_annotated = .{
+                    .meta = ta.meta,
+                    .expr = try self.rewriteCaptureExpr(ta.expr, self_name, capture_set),
+                    .type_expr = ta.type_expr,
+                },
+            }),
+            .raise_expr => |re| return try self.create(ast.Expr, .{
+                .raise_expr = .{ .meta = re.meta, .value = try self.rewriteCaptureExpr(re.value, self_name, capture_set) },
+            }),
+            // Literals, references that cannot name a captured value
+            // (struct_ref, function_ref, attr_ref), intrinsics, quote
+            // forms, error-pipe/try-rescue (not produced inside a closure
+            // body before this pass), and poison are returned unchanged.
+            else => return expr,
+        }
+    }
+
+    /// Rewrite captures in a statement block.
+    fn rewriteCaptureBlock(
+        self: *Desugarer,
+        stmts: []const ast.Stmt,
+        self_name: ast.StringId,
+        capture_set: *const std.AutoHashMap(ast.StringId, void),
+    ) anyerror![]const ast.Stmt {
+        const new_stmts = try self.allocator.alloc(ast.Stmt, stmts.len);
+        for (stmts, 0..) |stmt, idx| {
+            new_stmts[idx] = try self.rewriteCaptureStmt(stmt, self_name, capture_set);
+        }
+        return new_stmts;
+    }
+
+    /// Remove every binding a pattern introduces from a capture set — used
+    /// so a nested closure's own parameters shadow outer captures of the
+    /// same name during capture rewriting.
+    fn removePatternBindingsFromSet(
+        self: *Desugarer,
+        pattern: *const ast.Pattern,
+        set: *std.AutoHashMap(ast.StringId, void),
+    ) anyerror!void {
+        switch (pattern.*) {
+            .bind => |b| _ = set.remove(b.name),
+            .wildcard, .literal => {},
+            .tuple => |t| for (t.elements) |sub| try self.removePatternBindingsFromSet(sub, set),
+            .list => |l| for (l.elements) |sub| try self.removePatternBindingsFromSet(sub, set),
+            .list_cons => |lc| {
+                for (lc.heads) |sub| try self.removePatternBindingsFromSet(sub, set);
+                try self.removePatternBindingsFromSet(lc.tail, set);
+            },
+            .map => |m| for (m.fields) |field| try self.removePatternBindingsFromSet(field.value, set),
+            .struct_pattern => |sp| for (sp.fields) |field| try self.removePatternBindingsFromSet(field.pattern, set),
+            .pin => {},
+            .paren => |p| try self.removePatternBindingsFromSet(p.inner, set),
+            .binary => |bp| for (bp.segments) |seg| {
+                if (seg.value == .pattern) try self.removePatternBindingsFromSet(seg.value.pattern, set);
+            },
+            .tagged_union_variant => |tv| if (tv.payload) |payload| try self.removePatternBindingsFromSet(payload, set),
+        }
+    }
+
     fn desugarStructUpdate(
         self: *Desugarer,
         original: ast.StructExpr,
