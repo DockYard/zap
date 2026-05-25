@@ -3263,59 +3263,35 @@ pub const IrBuilder = struct {
     /// `emitLocalGet`. Cleared per function group like `known_local_types`.
     materialized_closure_locals: std.AutoHashMapUnmanaged(LocalId, void),
     /// FCC Phase 2 — IR locals that hold a GENUINELY-BOXED protocol
-    /// existential: the dest of a `box_as_protocol` instruction (or an
-    /// alias of one) whose protocol family has a real emitted vtable
-    /// instance carrying a `__box_header__.drop`. These OWN a
-    /// heap-allocated typed inner (the closure environment / boxed
-    /// concrete value) and so need a scope-exit drop dispatched through
-    /// `<Protocol>VTable.drop(box)`.
+    /// existential whose CURRENT ZigType is `.protocol_box`: the dest of a
+    /// `box_as_protocol` (or an alias of one), OR a call-result local whose
+    /// callee returns an owned box. These OWN a heap-allocated typed inner
+    /// (the closure environment) and need a scope-exit `.protocol_box_drop`.
     ///
-    /// This is the construction-site ownership discriminator that
-    /// distinguishes a boxed parametric existential (`Callable` closure
-    /// env — NEEDS a drop) from a DEVIRTUALIZED parametric protocol local
-    /// (`Enumerable(element)` in `Enum.sum`/`map`/`reduce` — monomorphized,
-    /// NO box, must NOT be dropped). Both carry a parametric
-    /// `protocol_constraint` HIR type and therefore both lower to a
-    /// `.protocol_box(<mangled>)` ZigType via `typeIdToZigTypeWithStore`,
-    /// so keying ownership on the ZigType (or on the parametric
-    /// `protocol_constraint` type) would wrongly classify the
-    /// devirtualized `Enumerable` param `.owned` and trip ARC verifier
-    /// V11 on its `share_value`. A devirtualized `Enumerable` value is a
-    /// `param_get`/folded concrete-impl-call result and is NEVER a
-    /// `box_as_protocol` dest, so it never enters this set.
+    /// This is the PRECISE, builder-local, V11-safe ownership discriminator
+    /// for boxed parametric existentials (`Callable` closures):
+    ///   * It only ever contains locals produced by an actual
+    ///     `box_as_protocol` (construction site) or a call to a
+    ///     box-returning callee — never a DEVIRTUALIZED parametric-protocol
+    ///     local (`Enumerable(element)` iteration state in
+    ///     `Enum.count_total_next`), which is produced by `make_closure` /
+    ///     `index_get` / `param_get`, carries a non-box ZigType where it is
+    ///     not boxed, and is NEVER a `box_as_protocol` dest. Keying ownership
+    ///     here (not on the parametric `protocol_constraint` HIR type, which
+    ///     a devirtualized `Enumerable` shares, nor on a whole-program
+    ///     "boxed families" set, which is inconsistent across the
+    ///     stdlib/user per-struct build split) is what keeps ARC verifier
+    ///     V11 from firing on `Enum.*`.
+    ///   * Membership is gated by `localZigTypeIsBox` at every consult so a
+    ///     closure that was boxed then DEVIRTUALIZED by #201/Gap-E to a bare
+    ///     `.function` pointer is excluded (`retainAny` rejects a `fn()`).
     ///
-    /// Populated by `maybeBoxAsProtocol` (box dest) and propagated
-    /// source→dest through `emitLocalGet` and the alias-forming
-    /// `local_set` path, mirroring `materialized_closure_locals` /
-    /// `param_derived_closure_locals`. Read by `isArcManagedLocal` /
-    /// `computeLocalOwnership` to force `.owned`. Cleared per function
-    /// group like `materialized_closure_locals`.
+    /// Populated by `maybeBoxAsProtocol` (box dest) and the call lowering
+    /// (call-result of a box-returning callee), propagated source→dest
+    /// through `emitLocalGet` / the `local_set` alias path (like
+    /// `materialized_closure_locals`). Read by `isArcManagedLocal`. Cleared
+    /// per function group.
     boxed_existential_locals: std.AutoHashMapUnmanaged(LocalId, void),
-    /// FCC Phase 2 — the set of protocol vtable-FAMILY names (the mangled
-    /// per-instantiation name a `.protocol_box` ZigType carries, e.g.
-    /// `Callable_Tuple_i64_i64`, plus its bare base `Callable`) that are
-    /// GENUINELY BOXED somewhere in the program — i.e. a concrete struct
-    /// implementing that protocol instantiation is coerced into a
-    /// `protocol_constraint`/`.protocol_box` slot (`box_as_protocol`).
-    ///
-    /// This whole-program set is the type-level half of the
-    /// boxed-vs-devirtualized discriminator. A local typed
-    /// `protocol_constraint(P)` (which lowers to `.protocol_box(family)`)
-    /// in a CALLER frame — e.g. `add5 = Maker.make_adder(5)` whose box was
-    /// constructed in the callee, so the caller's binding is NOT itself a
-    /// `box_as_protocol` dest (`boxed_existential_locals` misses it) — is
-    /// ARC-managed (owning, needs a scope-exit drop) iff its family is in
-    /// this set. A devirtualized `Enumerable(element)` local carries the
-    /// SAME parametric `protocol_constraint`/`.protocol_box` shape but its
-    /// family is NEVER in this set (a `List`/`Range`/concrete receiver
-    /// flowing into an `Enumerable` slot is NOT boxed by
-    /// `maybeBoxAsProtocol` — only a concrete struct with a registered
-    /// `impl` is), so it stays `.trivial` and ARC verifier V11 does not
-    /// fire. Populated order-independently by `recordBoxedProtocolFamilies`
-    /// (a pre-scan over HIR, before any body is lowered) and consulted by
-    /// `isArcManagedType` / `defaultResultConvention` /
-    /// `defaultParamConventionForParam`.
-    boxed_protocol_families: std.StringHashMapUnmanaged(void),
     /// Locals whose value originated from a `param_get` instruction.
     /// Used by the call-builtin encoder to detect bridge calls inside
     /// generic Zap functions — those have `param: anytype` in the
@@ -3467,7 +3443,6 @@ pub const IrBuilder = struct {
             .local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(allocator),
             .materialized_closure_locals = .empty,
             .boxed_existential_locals = .empty,
-            .boxed_protocol_families = .empty,
             .param_backed_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .rescue_unboxed_borrow_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(allocator),
@@ -3490,7 +3465,6 @@ pub const IrBuilder = struct {
         self.local_hir_types.deinit();
         self.materialized_closure_locals.deinit(self.allocator);
         self.boxed_existential_locals.deinit(self.allocator);
-        self.boxed_protocol_families.deinit(self.allocator);
         self.param_backed_locals.deinit();
         self.rescue_unboxed_borrow_locals.deinit();
         self.term_tuple_locals.deinit();
@@ -3716,6 +3690,24 @@ pub const IrBuilder = struct {
         const zig_type = typeIdToZigTypeWithStore(type_id, self.type_store);
         if (zig_type != .any and zig_type != .void) {
             try self.known_local_types.put(dest, zig_type);
+        }
+        // FCC Phase 2 — a call whose result ZigType is `.protocol_box`
+        // returns an OWNED boxed existential (the callee transfers the box;
+        // a function returning `fn(i64) -> i64` lowers it to
+        // `.protocol_box(Callable_…)` and its result convention is owned).
+        // Mark the result local as a boxed owner so the caller's binding
+        // (`add5 = Maker.make_adder(5)`) gets a scope-exit
+        // `.protocol_box_drop`. This is the cross-function counterpart of the
+        // `box_as_protocol` construction-site mark — precise (only
+        // `.protocol_box`-typed call results, never a devirtualized
+        // `.function` closure result nor a devirtualized `Enumerable`, which
+        // `Enum.*` never RETURNS as a box) and builder-local (no
+        // whole-program "boxed families" set, which is inconsistent across
+        // the stdlib/user per-struct build split and tripped V11). Bare
+        // protocol existentials (`-> Error`) are already owned via the
+        // type-level predicate; marking them here is redundant but harmless.
+        if (zig_type == .protocol_box) {
+            try self.boxed_existential_locals.put(self.allocator, dest, {});
         }
     }
 
@@ -4425,16 +4417,6 @@ pub const IrBuilder = struct {
                 try self.scanForTryVariantNames(clause.body, null);
             }
         }
-
-        // Third-and-a-half pass: FCC Phase 2 — pre-scan every function body
-        // for genuinely-boxed protocol families, BEFORE any body is lowered.
-        // `computeLocalOwnership` / `defaultResultConvention` /
-        // `defaultParamConventionForParam` consult `boxed_protocol_families`
-        // to decide whether a parametric-protocol-typed local (`Callable`
-        // closure box vs devirtualized `Enumerable`) is owning. Running it
-        // as a pre-scan makes that decision independent of the order
-        // functions are lowered in (a caller may precede its boxing callee).
-        try self.recordBoxedProtocolFamilies(hir_program);
 
         // Fourth pass: build function bodies
         for (hir_program.structs) |mod| {
@@ -9709,6 +9691,14 @@ pub const IrBuilder = struct {
                     if (self.materialized_closure_locals.contains(val)) {
                         try self.materialized_closure_locals.put(self.allocator, ls.index, {});
                     }
+                    // FCC Phase 2 — propagate the boxed-existential owner
+                    // marker from the RHS into the binding local, so
+                    // `add5 = make_adder(5)` (RHS is the box-returning call's
+                    // result) marks `add5` as a box owner needing a
+                    // scope-exit `.protocol_box_drop`.
+                    if (self.boxed_existential_locals.contains(val)) {
+                        try self.boxed_existential_locals.put(self.allocator, ls.index, {});
+                    }
                     // Phase 0 — DWARF foundation: record the Zap source
                     // identifier for this local so the ZIR backend can
                     // emit a `dbg_var_val`, preserving the name into
@@ -9866,34 +9856,7 @@ pub const IrBuilder = struct {
         // `runtime.zig`. Keep
         // `isArcManagedTypeId` and this method in lockstep — both
         // must agree on every type.
-        // NOTE: `isArcManagedType` is intentionally NOT widened for
-        // parametric `protocol_constraint`. A `fn(A) -> B` value's HIR type
-        // is `protocol_constraint(Callable)` regardless of representation,
-        // but the #201 / Gap-E DEVIRTUALIZED path lowers it to a bare
-        // `.function` pointer (no box, no ARC), while the escaping path
-        // lowers it to a `.protocol_box`. Keying ARC-management on the HIR
-        // type alone would wrongly retain a bare-fn-ptr closure parameter
-        // (`f :: fn() -> i64`) — `retainAny` rejects a `fn()` value. The
-        // boxed-family classification is therefore applied only where the
-        // ZigType is known to be `.protocol_box` (see
-        // `parametricProtocolBoxFamilyIsBoxed`, consulted by
-        // `isArcManagedLocal` / `defaultParamConventionForParam` /
-        // `computeResultConvention`), never via this type-only predicate.
         return isArcManagedTypeId(store, type_id);
-    }
-
-    /// FCC Phase 2 — true iff `zig_type` is a `.protocol_box(family)` whose
-    /// family is recorded in `boxed_protocol_families` (genuinely boxed
-    /// somewhere in the program). This is the type-level half of the
-    /// boxed-vs-devirtualized discriminator, gated on the BOX ZigType so it
-    /// applies only to genuinely-boxed existential locals/params/returns —
-    /// NOT a devirtualized `.function` closure (#201/Gap-E) nor a
-    /// devirtualized `Enumerable(element)` (which is never in the set, so it
-    /// stays `.trivial` and does not trip ARC verifier V11).
-    fn parametricProtocolBoxFamilyIsBoxed(self: *const IrBuilder, zig_type: ZigType) bool {
-        if (self.boxed_protocol_families.count() == 0) return false;
-        if (zig_type != .protocol_box) return false;
-        return self.boxed_protocol_families.contains(zig_type.protocol_box);
     }
 
     /// Returns whether the value held in `local` is ARC-managed at the
@@ -9902,50 +9865,32 @@ pub const IrBuilder = struct {
     /// default that avoids spurious retains on locals whose types we
     /// genuinely don't know.
     fn isArcManagedLocal(self: *const IrBuilder, local: LocalId) bool {
-        // FCC Phase 2 — a genuinely-boxed protocol existential (dest of a
-        // `box_as_protocol`, or an alias of one) OWNS a heap-allocated
-        // typed inner and is ARC-managed. Two construction-site signals, in
-        // order:
-        //   1. `boxed_existential_locals` — this local IS a `box_as_protocol`
-        //      dest (or an alias propagated through `emitLocalGet`): the
-        //      in-frame owner.
-        //   2. The local's tracked ZigType is `.protocol_box(family)` for a
-        //      family genuinely boxed somewhere in the program. This catches
-        //      a CALLER-side binding (`add5 = make_adder(5)`) whose box was
-        //      constructed in the callee — the binding is not itself a
-        //      `box_as_protocol` dest, but its `.protocol_box` ZigType +
-        //      boxed-family membership prove it owns a box.
-        // Gating signal 2 on the `.protocol_box` ZigType (not the parametric
-        // `protocol_constraint` HIR type) is essential: a #201/Gap-E
-        // DEVIRTUALIZED `fn(...)`-typed local has the same parametric
-        // `protocol_constraint` HIR type but a `.function` ZigType (bare fn
-        // ptr, no box) — it must stay `.trivial` or `retainAny` rejects the
-        // fn value. A devirtualized `Enumerable(element)` likewise never has
-        // its family in the set, so it stays `.trivial` (no V11).
-        // Both boxed signals additionally require the local's CURRENT
-        // ZigType to be `.protocol_box`: a closure whose value was boxed by
-        // `maybeBoxAsProtocol` (entering `boxed_existential_locals`) but
-        // then DEVIRTUALIZED by the #201 / Gap-E path to a bare
-        // `.function` pointer (`make_closure`) must NOT be retained/released
-        // as a box — `retainAny`/`releaseAny` reject a `fn()` value. The
-        // box-dest's `known_local_types` is `.protocol_box` only while it
-        // genuinely carries a box; the devirtualization rewrites it to
-        // `.function`. Requiring `.protocol_box` here is the precise gate.
-        if (self.localZigTypeIsBox(local)) {
-            if (self.boxed_existential_locals.contains(local)) return true;
-            if (self.known_local_types.get(local)) |zig_type| {
-                if (self.parametricProtocolBoxFamilyIsBoxed(zig_type)) return true;
-            }
+        // FCC Phase 2 — a GENUINELY-BOXED protocol existential (dest of a
+        // `box_as_protocol`, an alias of one, or a call-result of a
+        // box-returning callee) OWNS a heap-allocated typed inner and needs
+        // a scope-exit drop. Recognised via the precise construction-site
+        // set `boxed_existential_locals`, GATED on the local's current
+        // ZigType still being `.protocol_box` (so a closure that was boxed
+        // then DEVIRTUALIZED by #201/Gap-E to a bare `.function` pointer is
+        // excluded — `retainAny`/`releaseAny` reject a `fn()` value). The
+        // type-level `isArcManagedType` deliberately returns false for the
+        // parametric `protocol_constraint` HIR type these carry (a
+        // devirtualized `Enumerable(element)` shares that type), so the
+        // boxed case must be recognised through this construction-site
+        // signal — never the type alone (which would trip ARC verifier V11
+        // on `Enum.count_total_next`'s devirtualized iteration state).
+        if (self.boxed_existential_locals.contains(local) and self.localZigTypeIsBox(local)) {
+            return true;
         }
         const hir_type = self.local_hir_types.get(local) orelse return false;
         return self.isArcManagedType(hir_type);
     }
 
-    /// FCC Phase 2 — true iff `local`'s tracked ZigType is a `.protocol_box`
-    /// (a genuinely-boxed protocol existential). False for a devirtualized
-    /// `.function` closure (#201/Gap-E) or any non-box local. Used to gate
-    /// the boxed-existential ARC ownership signals so a closure that was
-    /// boxed then devirtualized to a bare fn pointer is not mis-managed.
+    /// FCC Phase 2 — true iff `local`'s tracked ZigType is `.protocol_box`
+    /// (a genuinely-boxed protocol existential right now). False for a
+    /// DEVIRTUALIZED `.function` closure (#201/Gap-E) or any non-box local.
+    /// Gates the boxed-existential ARC ownership signal so a closure that
+    /// was boxed then devirtualized to a bare fn pointer is not mis-managed.
     fn localZigTypeIsBox(self: *const IrBuilder, local: LocalId) bool {
         const zig_type = self.known_local_types.get(local) orelse return false;
         return zig_type == .protocol_box;
@@ -10032,18 +9977,7 @@ pub const IrBuilder = struct {
     fn defaultParamConventionForParam(self: *const IrBuilder, param: Param) ParamConvention {
         const hir_convention = defaultParamConvention(self.type_store, param.type_id);
         if (hir_convention != .trivial) return hir_convention;
-        if (self.isArcManagedZigType(param.type_expr)) return .borrowed;
-        // FCC Phase 2 — a parameter whose ZigType is a genuinely-boxed
-        // PARAMETRIC protocol box (`f :: fn(i64) -> i64` lowered to
-        // `.protocol_box(Callable_…)`) is `.borrowed`: the caller owns the
-        // box and the callee reads through it. Gated on the `.protocol_box`
-        // ZigType so a #201/Gap-E DEVIRTUALIZED `fn`-param (`.function`
-        // ZigType, bare fn ptr) stays `.trivial` — it carries no box.
-        // `isArcManagedZigType` gates parametric protocols off via
-        // `protocolHasVTable` (bare-only), so the boxed parametric case is
-        // recognised here.
-        if (self.parametricProtocolBoxFamilyIsBoxed(param.type_expr)) return .borrowed;
-        return .trivial;
+        return if (self.isArcManagedZigType(param.type_expr)) .borrowed else .trivial;
     }
 
     /// Phase 1.2.5.d helper: true iff the scope graph carries a
@@ -11203,26 +11137,27 @@ pub const IrBuilder = struct {
         while (iter.next()) |entry| {
             if (entry.value_ptr.* != .protocol_box) continue;
             const protocol_name = entry.value_ptr.protocol_box;
+            const local = entry.key_ptr.*;
             // A box local's release must route through the synthetic
-            // `<Protocol>VTable.drop(box)` helper, which only exists when
-            // a vtable was emitted for the family. Two families qualify:
+            // `<Protocol>VTable.drop(box)` helper, which only exists when a
+            // vtable was emitted for the family. Two families qualify:
             //   * a BARE protocol with an emitted per-protocol vtable
             //     (`protocolHasVTable`), and
-            //   * FCC Phase 2: a PARAMETRIC family that is genuinely boxed
-            //     somewhere in the program (`boxed_protocol_families`).
-            //     Boxing implies a registered concrete `impl P for T`, for
-            //     which `populateProtocolVTables` (3.7.c) emits a
+            //   * FCC Phase 2: a PARAMETRIC family local that is GENUINELY
+            //     BOXED (`boxed_existential_locals`) — boxing implies a
+            //     registered concrete `impl P for T`, for which
+            //     `populateProtocolVTables` (3.7.c) emits a
             //     `<mangled>VTable_for_<T>` instance with a `__box_header__`
-            //     drop — so the helper is guaranteed to exist.
-            // A DEVIRTUALIZED parametric family (`Enumerable`) is in neither
-            // set, so its `.protocol_box`-typed locals (which never carry a
-            // real box at runtime) are correctly skipped — no spurious
-            // `.protocol_box_drop` against a non-box value.
+            //     drop, so the helper is guaranteed to exist.
+            // A DEVIRTUALIZED parametric `.protocol_box` local (e.g. the
+            // `Enumerable` iteration state in `Enum.count_total_next`) is
+            // NOT in `boxed_existential_locals`, so it is correctly skipped —
+            // no spurious `.protocol_box_drop` against a non-box value.
             const has_vtable = self.protocolHasVTable(protocol_name) or
-                self.boxed_protocol_families.contains(protocol_name);
+                self.boxed_existential_locals.contains(local);
             if (!has_vtable) continue;
             const protocol_name_copy = try cloneBytes(self.allocator, protocol_name);
-            try out.put(self.allocator, entry.key_ptr.*, protocol_name_copy);
+            try out.put(self.allocator, local, protocol_name_copy);
         }
         return out;
     }
@@ -11234,19 +11169,19 @@ pub const IrBuilder = struct {
     fn computeResultConvention(self: *const IrBuilder, return_type_id: ?hir_mod.TypeId) ResultConvention {
         const base = defaultResultConvention(self.type_store, return_type_id);
         if (base != .trivial) return base;
-        // FCC Phase 2 — a function returning a genuinely-boxed PARAMETRIC
-        // protocol existential (`-> fn(i64) -> i64` lowered to
-        // `.protocol_box(Callable_…)`) returns an OWNER: it transfers the
-        // box to the caller, who destroys it. `defaultResultConvention`
-        // keys on the free `isArcManagedTypeId`, which returns false for
-        // parametric `protocol_constraint`, so recognise the boxed
-        // parametric case here — gated on the `.protocol_box` ZigType so a
-        // #201/Gap-E DEVIRTUALIZED `fn`-return (`.function` ZigType) stays
-        // `.trivial` (no box to transfer), and a devirtualized `Enumerable`
-        // return (family not in the set) likewise stays `.trivial`.
+        // FCC Phase 2 — a function whose return ZigType is `.protocol_box`
+        // returns an OWNED boxed existential: it transfers the box to the
+        // caller (who destroys it), so the returned box must NOT get a
+        // scope-exit drop in the callee. `defaultResultConvention` keys on
+        // the free `isArcManagedTypeId`, which returns false for a
+        // parametric `protocol_constraint` return (`-> fn(i64) -> i64` =
+        // `Callable({i64}, i64)`), so recognise the boxed case here. Gated
+        // on the `.protocol_box` ZigType so a #201/Gap-E DEVIRTUALIZED
+        // `fn`-return (`.function` ZigType) stays `.trivial` (no box to
+        // transfer); `Enum.*` never RETURNS a devirtualized `Enumerable`.
         if (return_type_id) |tid| {
             const zig_type = typeIdToZigTypeWithStore(tid, self.type_store);
-            if (self.parametricProtocolBoxFamilyIsBoxed(zig_type)) return .owned;
+            if (zig_type == .protocol_box) return .owned;
         }
         return base;
     }
@@ -11313,13 +11248,11 @@ pub const IrBuilder = struct {
         }
         // FCC Phase 2 — propagate the boxed-existential owner marker across
         // the alias. `also = add5` makes `also` an INDEPENDENT owner of the
-        // box: `isArcManagedLocal(source)` is now true, so the `.retain`
-        // above already fired (the box's vtable `retain` bumps the inner's
-        // refcount), and the alias dest needs its own scope-exit
-        // `.protocol_box_drop` — which only happens if `dest` is also
-        // classified `.owned`. Mirrors the `materialized_closure_locals`
-        // propagation so a shared boxed closure stays refcount-balanced
-        // (one retain per extra owner, one drop per owner).
+        // box; `isArcManagedLocal(source)` is now true (the box source), so
+        // the `.retain` above already fired, and the alias dest needs its
+        // own scope-exit `.protocol_box_drop` — which only happens if `dest`
+        // is also classified owned. Mirrors the `materialized_closure_locals`
+        // propagation.
         if (self.boxed_existential_locals.contains(source)) {
             try self.boxed_existential_locals.put(self.allocator, dest, {});
         }
@@ -11624,301 +11557,6 @@ pub const IrBuilder = struct {
         return null;
     }
 
-    /// FCC Phase 2 — boxing oracle on a (value, expected-slot) HIR TypeId
-    /// pair. Returns the mangled protocol vtable-family name
-    /// (`Callable_Tuple_i64_i64`) iff coercing a value of HIR type
-    /// `value_type_id` into a slot of HIR type `expected_type_id` would
-    /// emit a `box_as_protocol` — i.e. the slot is a `protocol_constraint(P)`
-    /// and the value is a CONCRETE struct (nominal `struct_type` or applied
-    /// struct) with a registered `impl <base P> for <value struct>`. Mirrors
-    /// `maybeBoxAsProtocol`'s Path 3 exactly: a `List`/`Map`/primitive/
-    /// already-`protocol_constraint` value is NOT boxed (so a `List` flowing
-    /// into an `Enumerable` slot — the devirtualized `Enum.sum([1,2,3])`
-    /// case — yields null and never marks the `Enumerable` family). The
-    /// returned name is the SAME string `typeIdToZigTypeWithStore` produces
-    /// for the slot's `.protocol_box`, so it matches what
-    /// `boxed_protocol_families` is later queried with.
-    fn boxedFamilyForCoercion(
-        self: *const IrBuilder,
-        value_type_id: hir_mod.TypeId,
-        expected_type_id: hir_mod.TypeId,
-    ) ?[]const u8 {
-        if (self.type_store == null) return null;
-        const graph = self.scope_graph orelse return null;
-        if (expected_type_id == types_mod.TypeStore.UNKNOWN) return null;
-        if (value_type_id == types_mod.TypeStore.UNKNOWN) return null;
-        if (value_type_id == expected_type_id) return null;
-
-        // The slot must be a protocol existential. Its mangled
-        // `.protocol_box` name is the family key the consumer later queries.
-        const expected_zig = typeIdToZigTypeWithStore(expected_type_id, self.type_store);
-        if (expected_zig != .protocol_box) return null;
-        const family = expected_zig.protocol_box;
-
-        // The value must be a CONCRETE struct (its ZigType is `.struct_ref`)
-        // — exactly the case `maybeBoxAsProtocol` boxes. A value that is
-        // itself a `.protocol_box` (already boxed / a devirtualized protocol
-        // param), or a `.list`/`.map`/primitive (the devirtualized
-        // `Enum.sum([1,2,3])` receiver), is NOT boxed here and must not mark
-        // the family.
-        const value_zig = typeIdToZigTypeWithStore(value_type_id, self.type_store);
-        if (value_zig != .struct_ref) return null;
-        const target_name = value_zig.struct_ref;
-
-        // Confirm a registered concrete `impl <base P> for <value struct>` —
-        // the same `findImpl` gate `maybeBoxAsProtocol` applies before
-        // emitting `box_as_protocol`.
-        const base_protocol = self.baseProtocolName(family);
-        const protocol_id = self.interner.lookupExisting(base_protocol) orelse return null;
-        const target_id = self.interner.lookupExisting(target_name) orelse return null;
-        const proto_struct_name: ast.StructName = .{
-            .parts = &[_]ast.StringId{protocol_id},
-            .span = .{ .start = 0, .end = 0 },
-        };
-        const target_struct_name: ast.StructName = .{
-            .parts = &[_]ast.StringId{target_id},
-            .span = .{ .start = 0, .end = 0 },
-        };
-        if (graph.findImpl(proto_struct_name, target_struct_name) == null) return null;
-        return family;
-    }
-
-    /// FCC Phase 2 — record a boxing coercion's family into
-    /// `boxed_protocol_families` (cloning the mangled name so it outlives
-    /// the HIR). Also records the bare base-protocol name so a caller-side
-    /// binding whose `.protocol_box` ZigType resolves to the base name
-    /// (rather than the mangled instantiation) is still recognised.
-    fn recordCoercionFamily(
-        self: *IrBuilder,
-        value_type_id: hir_mod.TypeId,
-        expected_type_id: hir_mod.TypeId,
-    ) !void {
-        const family = self.boxedFamilyForCoercion(value_type_id, expected_type_id) orelse return;
-        if (!self.boxed_protocol_families.contains(family)) {
-            const owned = try cloneBytes(self.allocator, family);
-            try self.boxed_protocol_families.put(self.allocator, owned, {});
-        }
-        const base = self.baseProtocolName(family);
-        if (!std.mem.eql(u8, base, family) and !self.boxed_protocol_families.contains(base)) {
-            const owned_base = try cloneBytes(self.allocator, base);
-            try self.boxed_protocol_families.put(self.allocator, owned_base, {});
-        }
-    }
-
-    /// FCC Phase 2 — pre-scan the whole HIR program for boxing sites and
-    /// populate `boxed_protocol_families` BEFORE any function body is
-    /// lowered, so the per-function ownership/convention computation
-    /// (`computeLocalOwnership` / `defaultResultConvention` /
-    /// `defaultParamConventionForParam`) can classify a parametric-protocol
-    /// local `.owned`/`.borrowed` iff its family is genuinely boxed —
-    /// independent of the order functions are lowered in (a caller may be
-    /// lowered before the callee that constructs the box).
-    fn recordBoxedProtocolFamilies(self: *IrBuilder, hir_program: *const hir_mod.Program) !void {
-        if (self.type_store == null or self.scope_graph == null) return;
-        // Scan the WHOLE program, not just this lowering unit. The
-        // per-struct lowering path (`compileStructByStruct` /
-        // `runIrLoweringWithTryIdSeed`) lowers each struct in isolation, so
-        // a caller (`main`) and the boxing callee (`Maker.make_adder`) land
-        // in DIFFERENT `IrBuilder` instances each with a partial
-        // `hir_program`. The families set must be whole-program complete in
-        // EVERY instance, or a caller's lowering unit would never see that
-        // its callee boxes. `known_name_program` is the full merged program
-        // (same source the name-registration pass walks); fall back to the
-        // per-unit `hir_program` for the whole-program lowering path.
-        const scan_program = self.known_name_program orelse hir_program;
-        for (scan_program.structs) |mod| {
-            for (mod.functions) |func_group| {
-                for (func_group.clauses) |clause| {
-                    try self.recordBoxedFamiliesInClause(&clause);
-                }
-            }
-        }
-        for (scan_program.top_functions) |func_group| {
-            for (func_group.clauses) |clause| {
-                try self.recordBoxedFamiliesInClause(&clause);
-            }
-        }
-    }
-
-    fn recordBoxedFamiliesInClause(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
-        // The clause body's tail flows into the declared return type — the
-        // coercion site for a closure-returning factory's `Callable` return.
-        try self.recordBoxedFamiliesInBlock(clause.body, clause.return_type);
-    }
-
-    /// Element TypeId of a `List(elem)` HIR type, or UNKNOWN for non-list
-    /// types. Used by the boxing pre-scan to find a list literal's element
-    /// slot expectation (a `[fn(i64) -> i64]` literal's elements flow into a
-    /// `protocol_constraint(Callable)` slot).
-    fn listElementTypeId(store: *const types_mod.TypeStore, list_type_id: hir_mod.TypeId) hir_mod.TypeId {
-        return switch (store.getType(list_type_id)) {
-            .list => |lt| lt.element,
-            else => types_mod.TypeStore.UNKNOWN,
-        };
-    }
-
-    /// Recursively walk an HIR expression, recording any boxing coercion.
-    /// `expected_type_id` is the slot type THIS expression flows into
-    /// (`UNKNOWN` when there is no protocol-typed expectation). Children
-    /// are recursed with their own per-position expected types.
-    fn recordBoxedFamiliesInExpr(
-        self: *IrBuilder,
-        expr: *const hir_mod.Expr,
-        expected_type_id: hir_mod.TypeId,
-    ) anyerror!void {
-        // This expression coerced into its slot.
-        try self.recordCoercionFamily(expr.type_id, expected_type_id);
-
-        const store = self.type_store orelse return;
-        switch (expr.kind) {
-            .call => |call| {
-                for (call.args) |arg| {
-                    try self.recordBoxedFamiliesInExpr(arg.expr, arg.expected_type);
-                }
-            },
-            .list_init => |elems| {
-                // Each element flows into the list's element slot.
-                const elem_expected = listElementTypeId(store, expr.type_id);
-                for (elems) |elem| {
-                    try self.recordBoxedFamiliesInExpr(elem, elem_expected);
-                }
-            },
-            .tuple_init => |elems| {
-                for (elems) |elem| {
-                    try self.recordBoxedFamiliesInExpr(elem, types_mod.TypeStore.UNKNOWN);
-                }
-            },
-            .list_cons => |cons| {
-                const elem_expected = listElementTypeId(store, expr.type_id);
-                try self.recordBoxedFamiliesInExpr(cons.head, elem_expected);
-                try self.recordBoxedFamiliesInExpr(cons.tail, expr.type_id);
-            },
-            .map_init => |entries| {
-                for (entries) |entry| {
-                    try self.recordBoxedFamiliesInExpr(entry.key, types_mod.TypeStore.UNKNOWN);
-                    try self.recordBoxedFamiliesInExpr(entry.value, types_mod.TypeStore.UNKNOWN);
-                }
-            },
-            .struct_init => |si| {
-                for (si.fields) |field| {
-                    const field_expected = self.structFieldTypeId(expr.type_id, field.name);
-                    try self.recordBoxedFamiliesInExpr(field.value, field_expected);
-                }
-            },
-            .union_init => |ui| {
-                try self.recordBoxedFamiliesInExpr(ui.value, types_mod.TypeStore.UNKNOWN);
-            },
-            .binary => |bin| {
-                try self.recordBoxedFamiliesInExpr(bin.lhs, types_mod.TypeStore.UNKNOWN);
-                try self.recordBoxedFamiliesInExpr(bin.rhs, types_mod.TypeStore.UNKNOWN);
-            },
-            .unary => |un| {
-                try self.recordBoxedFamiliesInExpr(un.operand, types_mod.TypeStore.UNKNOWN);
-            },
-            .field_get => |fg| {
-                try self.recordBoxedFamiliesInExpr(fg.object, types_mod.TypeStore.UNKNOWN);
-            },
-            .tuple_index_get => |g| try self.recordBoxedFamiliesInExpr(g.object, types_mod.TypeStore.UNKNOWN),
-            .list_index_get => |g| try self.recordBoxedFamiliesInExpr(g.list, types_mod.TypeStore.UNKNOWN),
-            .list_head_get => |g| try self.recordBoxedFamiliesInExpr(g.list, types_mod.TypeStore.UNKNOWN),
-            .list_tail_get => |g| try self.recordBoxedFamiliesInExpr(g.list, types_mod.TypeStore.UNKNOWN),
-            .map_value_get => |g| {
-                try self.recordBoxedFamiliesInExpr(g.map, types_mod.TypeStore.UNKNOWN);
-                try self.recordBoxedFamiliesInExpr(g.key, types_mod.TypeStore.UNKNOWN);
-            },
-            .block => |blk| {
-                try self.recordBoxedFamiliesInBlock(&blk, expected_type_id);
-            },
-            .branch => |br| {
-                try self.recordBoxedFamiliesInExpr(br.condition, types_mod.TypeStore.UNKNOWN);
-                try self.recordBoxedFamiliesInBlock(br.then_block, expected_type_id);
-                if (br.else_block) |eb| try self.recordBoxedFamiliesInBlock(eb, expected_type_id);
-            },
-            .match => |m| {
-                try self.recordBoxedFamiliesInExpr(m.scrutinee, types_mod.TypeStore.UNKNOWN);
-            },
-            .case => |c| {
-                try self.recordBoxedFamiliesInExpr(c.scrutinee, types_mod.TypeStore.UNKNOWN);
-                for (c.arms) |arm| {
-                    if (arm.guard) |g| try self.recordBoxedFamiliesInExpr(g, types_mod.TypeStore.UNKNOWN);
-                    try self.recordBoxedFamiliesInBlock(arm.body, expected_type_id);
-                }
-            },
-            .panic => |e| try self.recordBoxedFamiliesInExpr(e, types_mod.TypeStore.UNKNOWN),
-            .unwrap => |e| try self.recordBoxedFamiliesInExpr(e, types_mod.TypeStore.UNKNOWN),
-            .closure_create => |cc| {
-                // A capturing closure that captures ANOTHER boxed closure
-                // (nested case): each capture value flows into the
-                // synthesized env struct's field. The field's declared type
-                // is the closure's `fn(...)`-typed capture, i.e. a
-                // `protocol_constraint(Callable)` slot, so the capture is a
-                // boxing coercion when the captured value is a concrete
-                // closure struct. Use the capture expr's own static type as
-                // the slot expectation conservatively (the type-checker has
-                // already unified the capture to the env field type).
-                for (cc.captures) |cap| {
-                    try self.recordBoxedFamiliesInExpr(cap.expr, cap.expr.type_id);
-                }
-            },
-            else => {},
-        }
-    }
-
-    fn recordBoxedFamiliesInBlock(
-        self: *IrBuilder,
-        block: *const hir_mod.Block,
-        tail_expected: hir_mod.TypeId,
-    ) anyerror!void {
-        const n = block.stmts.len;
-        for (block.stmts, 0..) |stmt, i| {
-            // Only the tail statement flows into the block's result slot.
-            const expected = if (i + 1 == n) tail_expected else types_mod.TypeStore.UNKNOWN;
-            try self.recordBoxedFamiliesInStmt(stmt, expected);
-        }
-    }
-
-    fn recordBoxedFamiliesInStmt(
-        self: *IrBuilder,
-        stmt: hir_mod.Stmt,
-        tail_expected: hir_mod.TypeId,
-    ) anyerror!void {
-        switch (stmt) {
-            .expr => |e| try self.recordBoxedFamiliesInExpr(e, tail_expected),
-            .local_set => |ls| {
-                // The RHS flows into the binding's declared value type.
-                const expected = ls.value.type_id;
-                try self.recordBoxedFamiliesInExpr(ls.value, expected);
-            },
-            else => {},
-        }
-    }
-
-    /// HIR-level struct-field type lookup by field name id, returning the
-    /// field's declared TypeId (substituted for an applied instantiation).
-    /// Used by the boxing pre-scan to find the expected slot type of a
-    /// struct-literal field value. Returns UNKNOWN when unresolved.
-    fn structFieldTypeId(
-        self: *const IrBuilder,
-        struct_type_id: hir_mod.TypeId,
-        field_name: ast.StringId,
-    ) hir_mod.TypeId {
-        const store = self.type_store orelse return types_mod.TypeStore.UNKNOWN;
-        const typ = store.getType(struct_type_id);
-        const fields = switch (typ) {
-            .struct_type => |st| st.fields,
-            .applied => |ap| blk: {
-                const base = store.getType(ap.base);
-                if (base != .struct_type) break :blk null;
-                break :blk base.struct_type.fields;
-            },
-            else => null,
-        } orelse return types_mod.TypeStore.UNKNOWN;
-        for (fields) |f| {
-            if (f.name == field_name) return f.type_id;
-        }
-        return types_mod.TypeStore.UNKNOWN;
-    }
-
     /// Phase 1.2.5.c construction-site auto-boxing detector. Given a
     /// freshly-lowered value local and the ZigType the consuming
     /// slot expects, emit a `box_as_protocol` coercion if the slot
@@ -12079,44 +11717,33 @@ pub const IrBuilder = struct {
         // field promotion) see the right shape.
         try self.known_local_types.put(box_dest, expected_zig_type);
 
-        // FCC Phase 2 — record the box dest as a genuinely-boxed
-        // existential (construction-site ownership signal). Reaching this
+        // FCC Phase 2 — record the box dest as a genuinely-boxed existential
+        // (the precise construction-site ownership signal). Reaching this
         // point proves the value was actually boxed (Path 3: a concrete
         // struct with a registered `impl <base_protocol> for <target>`
-        // flowing into a `.protocol_box` slot), so `populateProtocolVTables`
+        // coerced into a `.protocol_box` slot), so `populateProtocolVTables`
         // emits a `<Protocol>VTable_for_<Target>` instance with a
-        // `__box_header__.drop` for it (bare protocols via 3.7.b, parametric
-        // protocols like `Callable` via 3.7.c). `computeLocalOwnership` reads
-        // this set to classify the box `.owned` and schedule a scope-exit
-        // drop, which `rewriteProtocolBoxReleases` flips to
-        // `.protocol_box_drop`.
-        //
-        // This construction-site signal — NOT the box-dest's
-        // `.protocol_box` ZigType nor its parametric `protocol_constraint`
-        // HIR type — is what discriminates a boxed `Callable` (NEEDS a
-        // drop) from a DEVIRTUALIZED `Enumerable(element)` param (NO box,
-        // must NOT be dropped, else ARC verifier V11 fires on its
-        // `share_value`). A devirtualized `Enumerable` value is a
-        // `param_get`/folded concrete-impl-call result and never reaches
-        // this boxing site, so it never enters the set.
+        // `__box_header__.drop` (bare protocols via 3.7.b, parametric
+        // `Callable` via 3.7.c). `isArcManagedLocal` reads this set
+        // (ZigType-gated) to classify the box `.owned` and schedule a
+        // scope-exit `.protocol_box_drop`. A devirtualized
+        // `Enumerable(element)` value never reaches this boxing site, so it
+        // never enters the set (no ARC verifier V11 regression).
         try self.boxed_existential_locals.put(self.allocator, box_dest, {});
 
         // Record the box dest's HIR type as the protocol's
-        // `protocol_constraint`. For a BARE protocol (`Error`) this alone
-        // also drives the legacy type-level ownership path
-        // (`isArcManagedTypeId` returns true for `type_params.len == 0`);
-        // for a PARAMETRIC protocol (`Callable`) the type-level path
-        // deliberately returns false (it would catch devirtualized
-        // `Enumerable`), so the construction-site `boxed_existential_locals`
-        // membership above is the authoritative owner signal. Stamping the
-        // HIR type is still required so the box's protocol identity is
-        // recoverable downstream (`rewriteProtocolBoxReleases` keys the
-        // `.protocol_box_drop` rewrite on `protocol_box_locals`, populated
-        // from `known_local_types`). The `protocol_constraint` TypeId
-        // already exists in the store (the program type-checked with
-        // `<Protocol>`-typed values); look it up by protocol name rather
-        // than synthesising one (the IR builder holds `type_store` as
-        // `*const`).
+        // `protocol_constraint` so the ARC ownership pass classifies the
+        // box as an OWNED local that needs a scope-exit drop. Without
+        // this, `computeLocalOwnership` -> `isArcManagedLocal(box_dest)`
+        // reads `local_hir_types` (NOT `known_local_types`), finds no
+        // entry, classifies the box `.trivial`, and `arc_drop_insertion`
+        // never schedules its release — leaking the heap-allocated inner
+        // the box owns (the construction-site `allocAny`). The
+        // `protocol_constraint` TypeId already exists in the store (the
+        // program type-checked with `<Protocol>`-typed values); look it
+        // up by protocol name rather than synthesising one (the IR
+        // builder holds `type_store` as `*const`). `rewriteProtocolBoxReleases`
+        // then flips the scheduled `.release` to `.protocol_box_drop`.
         if (self.findProtocolConstraintHirType(protocol_id)) |constraint_type_id| {
             try self.local_hir_types.put(box_dest, constraint_type_id);
         }
@@ -12748,32 +12375,6 @@ pub const IrBuilder = struct {
                             // `trackCallResultType`).
                             if (slot.return_type != .any and slot.return_type != .void) {
                                 try self.known_local_types.put(dest, slot.return_type);
-                            }
-                            // FCC Phase 2 — emit the post-dispatch releases
-                            // for every ARC arg shared into this dispatch
-                            // (receiver + non-receiver args), exactly as the
-                            // `call_direct`/`call_named` tail does at the
-                            // bottom of `.call` lowering (the
-                            // `shared_release_locals` loop). The dispatch
-                            // BORROWS its receiver and args (`arc_ownership`
-                            // records `consumes=false`), so each
-                            // `share_value{retain}` the classifier emits for
-                            // an ARC operand is a TRANSIENT borrow whose
-                            // matching release belongs right after the
-                            // dispatch — not at scope exit. This `return
-                            // dest` previously bypassed the shared-release
-                            // loop at the bottom of `.call`, so a boxed
-                            // closure invoked through `protocol_dispatch`
-                            // never got its receiver-share released at the
-                            // call site, deferring an unbalanced release to
-                            // the scope-exit drop set. The
-                            // `elideBorrowedPassThroughShares` pass collapses
-                            // this share/retain/dispatch/release quad to a
-                            // pure borrow when the box source is
-                            // lifetime-extended (a higher-scope owner),
-                            // matching the call-path borrow elision.
-                            for (shared_release_locals.items) |shared_local| {
-                                try self.current_instrs.append(self.allocator, .{ .release = .{ .value = shared_local } });
                             }
                             return dest;
                         }
