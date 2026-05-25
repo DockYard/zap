@@ -3284,23 +3284,30 @@ pub const HirBuilder = struct {
             final_param_ownerships = param_ownerships[0..arity];
         }
         var return_type = if (clause.return_type) |rt| self.resolveTypeExpr(rt) else types_mod.TypeStore.UNKNOWN;
-        // A generic clause whose return type still carries type variables
-        // (e.g. `List.get(list :: List(t), index) -> t`) must be specialized
-        // from the concrete argument types at the call site, not left as a
-        // bare `t`. Without this, `g = List.get(callable_list, i)` records
-        // `g`'s binding type as an unbound `type_var`, so the implicit-call
-        // rewrite (`rewriteCallableValueCall`) cannot see that `g` is a boxed
-        // `Callable` and the call wrongly falls to the legacy
-        // `{call_fn, env}` closure path. `substituteReturnTypeFromArgs`
-        // unifies the clause params against the arg types and applies the
-        // resulting substitution to the return type (so `t -> Callable({i64},
-        // i64)` for a `[fn(i64) -> i64]` element). This mirrors the
-        // `resolveGenericReturnType*` paths the non-`selected_call_info`
-        // branches already use; doing it here covers the
-        // `resolveCallInStruct`/`resolveCallInScope`-selected path that takes
-        // `info.return_type` verbatim.
-        if (self.type_store.containsTypeVars(return_type)) {
-            return_type = self.substituteReturnTypeFromArgs(&clause, call_args, return_type);
+        // A generic container clause whose return type is (or contains) a
+        // type variable that binds to a boxed `Callable` existential from a
+        // concrete argument — e.g. `List.get(list :: List(t), index) -> t`
+        // applied to a `[fn(i64) -> i64]` (`List(Callable)`) — must be
+        // specialized HERE so the call's static type is `Callable`, not a
+        // bare `t`. Without it, `g = List.get(callable_list, i)` records
+        // `g`'s binding type as an unbound `type_var`, the implicit-call
+        // rewrite (`rewriteCallableValueCall`) cannot see `g` is a boxed
+        // `Callable`, and the call wrongly falls to the legacy
+        // `{call_fn, env}` closure path.
+        //
+        // This is deliberately scoped to the `Callable` case: the result is
+        // adopted ONLY when substitution yields a type that mentions
+        // `Callable` (and the raw return did not). The verbatim
+        // `info.return_type` is correct for every other generic — including
+        // higher-order `Enum.*` whose `Enumerable(element)` + `fn(...)`
+        // callback params would have their result type var resolved
+        // DOWNSTREAM (monomorphize / `local_types`), and where applying the
+        // partial unification here mis-binds the callback-derived type var.
+        if (self.type_store.containsTypeVars(return_type) and !self.typeMentionsCallable(return_type)) {
+            const substituted = self.substituteReturnTypeFromArgs(&clause, call_args, return_type);
+            if (self.typeMentionsCallable(substituted)) {
+                return_type = substituted;
+            }
         }
         _ = name;
         return .{
@@ -7518,6 +7525,34 @@ pub const HirBuilder = struct {
         if (expected_typ != .applied) return null;
         if (expected_typ.applied.base != declaration_type_id) return null;
         return expected;
+    }
+
+    /// True iff `type_id` is, or structurally contains, a `Callable`
+    /// `protocol_constraint` existential. Walks list/map/tuple/function/
+    /// applied compounds. Used to scope the container-return `Callable`
+    /// substitution (`resolveClauseCallInfo`) to exactly the boxed-closure
+    /// case so it cannot perturb other generic return-type resolution.
+    fn typeMentionsCallable(self: *const HirBuilder, type_id: types_mod.TypeId) bool {
+        if (type_id >= self.type_store.types.items.len) return false;
+        const typ = self.type_store.getType(type_id);
+        return switch (typ) {
+            .protocol_constraint => |pc| std.mem.eql(u8, self.interner.get(pc.protocol_name), "Callable"),
+            .list => |lt| self.typeMentionsCallable(lt.element),
+            .map => |mt| self.typeMentionsCallable(mt.key) or self.typeMentionsCallable(mt.value),
+            .tuple => |tt| {
+                for (tt.elements) |elem| if (self.typeMentionsCallable(elem)) return true;
+                return false;
+            },
+            .function => |ft| {
+                for (ft.params) |p| if (self.typeMentionsCallable(p)) return true;
+                return self.typeMentionsCallable(ft.return_type);
+            },
+            .applied => |at| {
+                for (at.args) |arg| if (self.typeMentionsCallable(arg)) return true;
+                return false;
+            },
+            else => false,
+        };
     }
 
     /// If the current expected type is a `List(Callable(...))` — i.e. a
