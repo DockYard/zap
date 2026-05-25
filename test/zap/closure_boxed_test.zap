@@ -60,5 +60,28 @@ pub struct Zap.ClosureBoxedTest {
         assert(first(10) == 11)
       }
     }
+
+    test("SHARED boxed closure is balanced (no leak, no double-free)") {
+      # FCC Phase 2 gap — a boxed `Callable` closure shared across multiple
+      # owners. `add5` is aliased into `also` and `again` (two more
+      # independent owners) and ALSO stored into a heterogeneous list that is
+      # itself extracted from. Before the fix this double-freed under
+      # `Memory.Tracking` (two owners eagerly freeing one shared env). Each
+      # owning path must now drop exactly once: under a no-refcount manager
+      # each alias is an independent CLONE of the env; under a refcount
+      # manager each alias bumps the env's refcount. The net live-allocation
+      # delta is zero.
+      assert_no_leaks {
+        add5 = Zap.ClosureFactory.make_adder(5)
+        also = add5
+        again = also
+        assert(add5(10) == 15)
+        assert(also(10) == 15)
+        assert(again(10) == 15)
+        held = [add5, Zap.ClosureFactory.make_adder(0)]
+        picked = List.get(held, 0)
+        assert(picked(10) == 15)
+      }
+    }
   }
 }

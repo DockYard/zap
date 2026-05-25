@@ -45,6 +45,19 @@ run_clean capture_i64_dropped.zap "15"
 run_clean capture_string_deep_drop.zap "hello world"
 run_clean heterogeneous_list_dropped.zap "11" "15"
 
+echo "== FCC Phase 2: SHARED boxed closures balanced under both managers =="
+# A shared boxed closure (aliased to a second/third binding, or kept while
+# also held in a container) must be balanced under BOTH managers: under a
+# no-refcount manager each owner gets an independent CLONE of the env (no
+# double-free, no leak); under a refcount manager the share bumps the env's
+# refcount.
+run_clean shared_two_bindings.zap "15"
+run_clean shared_three_bindings.zap "15"
+run_clean shared_string_closure.zap "hi there"
+run_clean shared_closure_retained.zap "15"
+run_clean shared_list_and_binding.zap "15"
+run_clean returned_and_kept.zap "7"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "FCC PHASE 2 ACCEPTANCE: ALL PASS"
