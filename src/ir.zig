@@ -12610,6 +12610,17 @@ pub const IrBuilder = struct {
                 };
                 const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type orelse .any);
                 if (elem_type == .any and fallback_elem_type == null) return error.ListElementTypeUnavailable;
+                // When the list's element type is a protocol-box
+                // existential (`[fn(i64) -> i64]` -> `[Callable(...)]`),
+                // box each concrete element value (a `%__closure_N` struct
+                // or any other concrete `impl Callable` value) into the
+                // existential so the list is homogeneous. `maybeBoxAsProtocol`
+                // is a no-op for an element already boxed.
+                if (elem_type == .protocol_box) {
+                    for (elements) |*elem_local| {
+                        elem_local.* = try self.maybeBoxAsProtocol(elem_local.*, elem_type);
+                    }
+                }
                 try self.current_instrs.append(self.allocator, .{
                     .list_init = .{ .dest = dest, .elements = elements, .element_type = elem_type },
                 });

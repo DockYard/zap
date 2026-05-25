@@ -3711,6 +3711,11 @@ pub const ZirDriver = struct {
                 return null;
             },
             .term => return self.emitTermTypeRef() catch null,
+            // A `[fn(i64) -> i64]` list (or map value) of boxed closures
+            // lowers to a `List(ProtocolBox)` — the element is the runtime
+            // fat-pointer carrier. Without this arm `emitListCellRef`
+            // returns null and the list literal fails to emit.
+            .protocol_box => return self.emitProtocolBoxTypeRef() catch null,
             .tuple => {
                 // Tuple element types (e.g. keyword lists `[{Atom, String}]`):
                 // emit the tuple type body inline so the runtime container

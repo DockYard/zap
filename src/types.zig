@@ -8233,6 +8233,37 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// Resolve a collection element type. A `fn(A) -> B` element resolves
+    /// to the `Callable({A}, B)` boxed existential; every other element
+    /// type resolves normally. Mirrors
+    /// `HirBuilder.resolveCollectionElementType`.
+    fn resolveCollectionElementType(self: *TypeChecker, type_expr: *const ast.TypeExpr) anyerror!TypeId {
+        if (type_expr.* == .function) {
+            return self.callableConstraintFromFnTypeExpr(type_expr.function);
+        }
+        return self.resolveTypeExpr(type_expr);
+    }
+
+    /// Build the `Callable({params}, ret)` `protocol_constraint` TypeId
+    /// for a `fn(params) -> ret` type expression.
+    fn callableConstraintFromFnTypeExpr(self: *TypeChecker, ft: ast.TypeFunExpr) anyerror!TypeId {
+        var param_types: std.ArrayList(TypeId) = .empty;
+        for (ft.params) |param| {
+            try param_types.append(self.allocator, try self.resolveTypeExpr(param));
+        }
+        const args_tuple = try self.store.addType(.{ .tuple = .{ .elements = try param_types.toOwnedSlice(self.allocator) } });
+        const ret_type = try self.resolveTypeExpr(ft.return_type);
+        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+        const callable_name = try interner_mut.intern("Callable");
+        const type_params = try self.allocator.alloc(TypeId, 2);
+        type_params[0] = args_tuple;
+        type_params[1] = ret_type;
+        return try self.store.addType(.{ .protocol_constraint = .{
+            .protocol_name = callable_name,
+            .type_params = type_params,
+        } });
+    }
+
     // ============================================================
     // Type expression resolution
     // ============================================================
@@ -8464,7 +8495,13 @@ pub const TypeChecker = struct {
                 });
             },
             .list => |lt| {
-                const elem_type = try self.resolveTypeExpr(lt.element);
+                // A `fn(A) -> B` element type (`[fn(i64) -> i64]`)
+                // resolves to the `Callable({A}, B)` existential — a
+                // collection needs a uniform owning element representation.
+                // Mirrors `HirBuilder.resolveCollectionElementType` (both
+                // resolvers must agree — the Phase-0 three-paths
+                // invariant). A `fn`-type PARAMETER is untouched.
+                const elem_type = try self.resolveCollectionElementType(lt.element);
                 return try self.store.addType(.{
                     .list = .{ .element = elem_type },
                 });

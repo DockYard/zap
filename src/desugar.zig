@@ -64,6 +64,16 @@ pub const Desugarer = struct {
     /// them). This is the conservative Phase-1 box decision; full
     /// escape-driven box-vs-direct unification is Phase 3.
     closure_escapes: bool = false,
+    /// Set while desugaring an expression that occupies a HETEROGENEOUS
+    /// COLLECTION element position (a list/tuple element or a map value).
+    /// A closure literal there is boxed as `Callable` REGARDLESS of
+    /// whether it captures, because the collection needs one uniform
+    /// element representation: a `[fn(i64) -> i64]` mixing a non-capturing
+    /// literal and a capturing `make_adder(5)` must store both as boxed
+    /// `Callable` so the element type is homogeneous. (In a field/return
+    /// position only CAPTURING closures box — a non-capturing one stays on
+    /// Gap E's direct bare-fn-ptr path.)
+    closure_escapes_collection: bool = false,
     /// In-scope binding type annotations (binding name -> declared
     /// `TypeExpr`), maintained while walking a function body. A capturing
     /// closure's synthesized struct types each capture field from this
@@ -1204,15 +1214,22 @@ pub const Desugarer = struct {
                 // cannot fit a bare `fn`-ptr slot). Non-capturing closures
                 // and capturing closures consumed as direct call arguments
                 // stay on the existing #201/Gap E direct path.
-                if (self.closure_escapes and try self.closureLiteralCaptures(anon.decl)) {
+                const box_in_collection = self.closure_escapes_collection;
+                const box_capturing_slot = self.closure_escapes and try self.closureLiteralCaptures(anon.decl);
+                if (box_in_collection or box_capturing_slot) {
                     return try self.desugarEscapingClosure(anon);
                 }
                 // The closure's OWN body is not an escaping context for the
-                // expressions inside it; reset the flag while recursing so
+                // expressions inside it; reset the flags while recursing so
                 // a non-escaping inner closure is not spuriously boxed.
                 const saved_escapes = self.closure_escapes;
+                const saved_escapes_collection = self.closure_escapes_collection;
                 self.closure_escapes = false;
-                defer self.closure_escapes = saved_escapes;
+                self.closure_escapes_collection = false;
+                defer {
+                    self.closure_escapes = saved_escapes;
+                    self.closure_escapes_collection = saved_escapes_collection;
+                }
                 return try self.create(ast.Expr, .{
                     .anonymous_function = .{
                         .meta = anon.meta,
@@ -1371,8 +1388,8 @@ pub const Desugarer = struct {
                 return try self.create(ast.Expr, .{
                     .list_cons_expr = .{
                         .meta = lce.meta,
-                        .head = try self.desugarExprEscaping(lce.head),
-                        .tail = try self.desugarExprEscaping(lce.tail),
+                        .head = try self.desugarExprEscapingCollection(lce.head),
+                        .tail = try self.desugarExprEscapingCollection(lce.tail),
                     },
                 });
             },
@@ -1484,7 +1501,7 @@ pub const Desugarer = struct {
                 // (`[fn(i64) -> i64]`).
                 var new_elements: std.ArrayList(*const ast.Expr) = .empty;
                 for (le.elements) |elem| {
-                    try new_elements.append(self.allocator, try self.desugarExprEscaping(elem));
+                    try new_elements.append(self.allocator, try self.desugarExprEscapingCollection(elem));
                 }
                 return try self.create(ast.Expr, .{
                     .list = .{
@@ -1718,6 +1735,22 @@ pub const Desugarer = struct {
         const saved = self.closure_escapes;
         self.closure_escapes = true;
         defer self.closure_escapes = saved;
+        return self.desugarExpr(expr);
+    }
+
+    /// Desugar an expression in a heterogeneous-collection element
+    /// position (list/tuple element, map value). A closure literal here is
+    /// boxed as `Callable` regardless of capture so the collection's
+    /// element type is uniform. Restores both escape flags afterward.
+    fn desugarExprEscapingCollection(self: *Desugarer, expr: *const ast.Expr) anyerror!*const ast.Expr {
+        const saved = self.closure_escapes;
+        const saved_collection = self.closure_escapes_collection;
+        self.closure_escapes = true;
+        self.closure_escapes_collection = true;
+        defer {
+            self.closure_escapes = saved;
+            self.closure_escapes_collection = saved_collection;
+        }
         return self.desugarExpr(expr);
     }
 

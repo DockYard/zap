@@ -7188,7 +7188,15 @@ pub const HirBuilder = struct {
                 return store_ptr.addFunctionType(params, return_type, param_ownerships, ret_ownership) catch types_mod.TypeStore.UNKNOWN;
             },
             .list => |lt| {
-                const elem_type = self.resolveTypeExpr(lt.element);
+                // A `fn(A) -> B` element type (`[fn(i64) -> i64]`) is a
+                // boxing position: collection elements need a uniform,
+                // owning representation, so the element resolves to the
+                // `Callable({A}, B)` existential rather than a bare
+                // `FunctionType`. Closures stored in the list box to match
+                // (see the desugar's collection-escape path). A `fn`-type
+                // in a PARAMETER position is untouched (still FunctionType,
+                // the #201 direct path).
+                const elem_type = self.resolveCollectionElementType(lt.element);
                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                 return store_ptr.addType(.{ .list = .{ .element = elem_type } }) catch types_mod.TypeStore.UNKNOWN;
             },
@@ -7217,6 +7225,39 @@ pub const HirBuilder = struct {
             },
             else => types_mod.TypeStore.UNKNOWN,
         };
+    }
+
+    /// Resolve a collection element type expression. A `fn(A) -> B`
+    /// element resolves to the `Callable({A}, B)` boxed existential (so
+    /// collection elements share one owning representation); every other
+    /// element type resolves normally.
+    fn resolveCollectionElementType(self: *const HirBuilder, type_expr: *const ast.TypeExpr) TypeId {
+        if (type_expr.* == .function) {
+            return self.callableConstraintFromFnTypeExpr(type_expr.function);
+        }
+        return self.resolveTypeExpr(type_expr);
+    }
+
+    /// Build the `Callable({params}, ret)` `protocol_constraint` TypeId
+    /// for a `fn(params) -> ret` type expression — the existential a
+    /// boxed closure of that signature inhabits.
+    fn callableConstraintFromFnTypeExpr(self: *const HirBuilder, ft: ast.TypeFunExpr) TypeId {
+        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+        var param_types: std.ArrayList(TypeId) = .empty;
+        for (ft.params) |param| {
+            param_types.append(self.allocator, self.resolveTypeExpr(param)) catch return types_mod.TypeStore.UNKNOWN;
+        }
+        const args_tuple = store_ptr.addType(.{ .tuple = .{ .elements = param_types.toOwnedSlice(self.allocator) catch &.{} } }) catch return types_mod.TypeStore.UNKNOWN;
+        const ret_type = self.resolveTypeExpr(ft.return_type);
+        const callable_name = interner_mut.intern("Callable") catch return types_mod.TypeStore.UNKNOWN;
+        const type_params = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
+        type_params[0] = args_tuple;
+        type_params[1] = ret_type;
+        return store_ptr.addType(.{ .protocol_constraint = .{
+            .protocol_name = callable_name,
+            .type_params = type_params,
+        } }) catch types_mod.TypeStore.UNKNOWN;
     }
 
     /// Resolve a bare call to an imported struct via the current scope's imports.
