@@ -13863,3 +13863,45 @@ test "cyclic type alias produces a clean diagnostic instead of looping" {
     }
     try std.testing.expect(found_cycle_diag);
 }
+
+test "alias-applied and inline parametric instantiation share one TypeId (no monomorphization fork)" {
+    // The monomorphization-critical case: `type IntT = i64` then `Box(IntT)`
+    // must resolve to the EXACT same `.applied { Box, [i64] }` TypeId as the
+    // inline `Box(i64)`. If they differed, the monomorphizer would emit two
+    // distinct specializations of any `Box`-consuming generic function. The
+    // alias is a transparent name, so both fields share one id.
+    const source =
+        \\type IntT = i64
+        \\pub struct Box(t) { value :: t }
+        \\pub struct Holder {
+        \\  aliased :: Box(IntT)
+        \\  inline_form :: Box(i64)
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |type_err| {
+        std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
+    }
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const aliased_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "aliased").?;
+    const inline_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "inline_form").?;
+    try std.testing.expect(checker.store.getType(aliased_type) == .applied);
+    try std.testing.expectEqual(inline_type, aliased_type);
+}
