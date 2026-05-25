@@ -9866,34 +9866,34 @@ pub const IrBuilder = struct {
         // `runtime.zig`. Keep
         // `isArcManagedTypeId` and this method in lockstep — both
         // must agree on every type.
-        if (isArcManagedTypeId(store, type_id)) return true;
-        // FCC Phase 2 — a PARAMETRIC `protocol_constraint(P)` is owning iff
-        // its family is GENUINELY BOXED somewhere in the program (a concrete
-        // `impl P for T` coerced into the slot). This is the type-level half
-        // of the boxed-vs-devirtualized discriminator, scoped to families in
-        // `boxed_protocol_families` so a devirtualized `Enumerable(element)`
-        // local (same parametric `protocol_constraint` shape, never boxed)
-        // stays `.trivial` and does not trip ARC verifier V11. The
-        // free-function `isArcManagedTypeId` deliberately returns false for
-        // ALL parametric `protocol_constraint` (it has no program context),
-        // so the boxed case is recognised only here, on the builder.
-        return self.parametricProtocolFamilyIsBoxed(type_id);
+        // NOTE: `isArcManagedType` is intentionally NOT widened for
+        // parametric `protocol_constraint`. A `fn(A) -> B` value's HIR type
+        // is `protocol_constraint(Callable)` regardless of representation,
+        // but the #201 / Gap-E DEVIRTUALIZED path lowers it to a bare
+        // `.function` pointer (no box, no ARC), while the escaping path
+        // lowers it to a `.protocol_box`. Keying ARC-management on the HIR
+        // type alone would wrongly retain a bare-fn-ptr closure parameter
+        // (`f :: fn() -> i64`) — `retainAny` rejects a `fn()` value. The
+        // boxed-family classification is therefore applied only where the
+        // ZigType is known to be `.protocol_box` (see
+        // `parametricProtocolBoxFamilyIsBoxed`, consulted by
+        // `isArcManagedLocal` / `defaultParamConventionForParam` /
+        // `computeResultConvention`), never via this type-only predicate.
+        return isArcManagedTypeId(store, type_id);
     }
 
-    /// FCC Phase 2 — true iff `type_id` is a PARAMETRIC
-    /// `protocol_constraint(P)` whose mangled vtable family is recorded in
-    /// `boxed_protocol_families` (genuinely boxed somewhere in the program).
-    /// Bare `protocol_constraint` (`type_params.len == 0`) is handled by the
-    /// type-level predicate and returns false here.
-    fn parametricProtocolFamilyIsBoxed(self: *const IrBuilder, type_id: hir_mod.TypeId) bool {
+    /// FCC Phase 2 — true iff `zig_type` is a `.protocol_box(family)` whose
+    /// family is recorded in `boxed_protocol_families` (genuinely boxed
+    /// somewhere in the program). This is the type-level half of the
+    /// boxed-vs-devirtualized discriminator, gated on the BOX ZigType so it
+    /// applies only to genuinely-boxed existential locals/params/returns —
+    /// NOT a devirtualized `.function` closure (#201/Gap-E) nor a
+    /// devirtualized `Enumerable(element)` (which is never in the set, so it
+    /// stays `.trivial` and does not trip ARC verifier V11).
+    fn parametricProtocolBoxFamilyIsBoxed(self: *const IrBuilder, zig_type: ZigType) bool {
         if (self.boxed_protocol_families.count() == 0) return false;
-        const store = self.type_store orelse return false;
-        const typ = store.getType(type_id);
-        if (typ != .protocol_constraint) return false;
-        if (typ.protocol_constraint.type_params.len == 0) return false;
-        const zig = typeIdToZigTypeWithStore(type_id, self.type_store);
-        if (zig != .protocol_box) return false;
-        return self.boxed_protocol_families.contains(zig.protocol_box);
+        if (zig_type != .protocol_box) return false;
+        return self.boxed_protocol_families.contains(zig_type.protocol_box);
     }
 
     /// Returns whether the value held in `local` is ARC-managed at the
@@ -9904,17 +9904,51 @@ pub const IrBuilder = struct {
     fn isArcManagedLocal(self: *const IrBuilder, local: LocalId) bool {
         // FCC Phase 2 — a genuinely-boxed protocol existential (dest of a
         // `box_as_protocol`, or an alias of one) OWNS a heap-allocated
-        // typed inner and is ARC-managed regardless of how its
-        // (parametric) `protocol_constraint` HIR type classifies under the
-        // type-level predicate. This construction-site signal is the
-        // authoritative owner discriminator for boxed parametric
-        // existentials (`Callable`): the type-level `isArcManagedType`
-        // returns false for parametric `protocol_constraint` precisely so
-        // it does NOT catch devirtualized `Enumerable` locals (V11), so the
-        // boxed case must be recognised here.
-        if (self.boxed_existential_locals.contains(local)) return true;
+        // typed inner and is ARC-managed. Two construction-site signals, in
+        // order:
+        //   1. `boxed_existential_locals` — this local IS a `box_as_protocol`
+        //      dest (or an alias propagated through `emitLocalGet`): the
+        //      in-frame owner.
+        //   2. The local's tracked ZigType is `.protocol_box(family)` for a
+        //      family genuinely boxed somewhere in the program. This catches
+        //      a CALLER-side binding (`add5 = make_adder(5)`) whose box was
+        //      constructed in the callee — the binding is not itself a
+        //      `box_as_protocol` dest, but its `.protocol_box` ZigType +
+        //      boxed-family membership prove it owns a box.
+        // Gating signal 2 on the `.protocol_box` ZigType (not the parametric
+        // `protocol_constraint` HIR type) is essential: a #201/Gap-E
+        // DEVIRTUALIZED `fn(...)`-typed local has the same parametric
+        // `protocol_constraint` HIR type but a `.function` ZigType (bare fn
+        // ptr, no box) — it must stay `.trivial` or `retainAny` rejects the
+        // fn value. A devirtualized `Enumerable(element)` likewise never has
+        // its family in the set, so it stays `.trivial` (no V11).
+        // Both boxed signals additionally require the local's CURRENT
+        // ZigType to be `.protocol_box`: a closure whose value was boxed by
+        // `maybeBoxAsProtocol` (entering `boxed_existential_locals`) but
+        // then DEVIRTUALIZED by the #201 / Gap-E path to a bare
+        // `.function` pointer (`make_closure`) must NOT be retained/released
+        // as a box — `retainAny`/`releaseAny` reject a `fn()` value. The
+        // box-dest's `known_local_types` is `.protocol_box` only while it
+        // genuinely carries a box; the devirtualization rewrites it to
+        // `.function`. Requiring `.protocol_box` here is the precise gate.
+        if (self.localZigTypeIsBox(local)) {
+            if (self.boxed_existential_locals.contains(local)) return true;
+            if (self.known_local_types.get(local)) |zig_type| {
+                if (self.parametricProtocolBoxFamilyIsBoxed(zig_type)) return true;
+            }
+        }
         const hir_type = self.local_hir_types.get(local) orelse return false;
         return self.isArcManagedType(hir_type);
+    }
+
+    /// FCC Phase 2 — true iff `local`'s tracked ZigType is a `.protocol_box`
+    /// (a genuinely-boxed protocol existential). False for a devirtualized
+    /// `.function` closure (#201/Gap-E) or any non-box local. Used to gate
+    /// the boxed-existential ARC ownership signals so a closure that was
+    /// boxed then devirtualized to a bare fn pointer is not mis-managed.
+    fn localZigTypeIsBox(self: *const IrBuilder, local: LocalId) bool {
+        const zig_type = self.known_local_types.get(local) orelse return false;
+        return zig_type == .protocol_box;
     }
 
     /// Look up the TypeId of `field_name` on the struct named
@@ -9999,17 +10033,16 @@ pub const IrBuilder = struct {
         const hir_convention = defaultParamConvention(self.type_store, param.type_id);
         if (hir_convention != .trivial) return hir_convention;
         if (self.isArcManagedZigType(param.type_expr)) return .borrowed;
-        // FCC Phase 2 — a parameter typed as a genuinely-boxed PARAMETRIC
-        // protocol existential (`f :: fn(i64) -> i64`, i.e.
-        // `Callable({i64}, i64)`) is `.borrowed`: the caller owns the box
-        // and the callee only reads through it. `isArcManagedZigType` gates
-        // parametric protocols off via `protocolHasVTable` (bare-only), so
-        // recognise the boxed parametric case here. A devirtualized
-        // `Enumerable(element)` param's family is NOT in the set, so it
-        // stays `.trivial`.
-        if (param.type_id) |tid| {
-            if (self.parametricProtocolFamilyIsBoxed(tid)) return .borrowed;
-        }
+        // FCC Phase 2 — a parameter whose ZigType is a genuinely-boxed
+        // PARAMETRIC protocol box (`f :: fn(i64) -> i64` lowered to
+        // `.protocol_box(Callable_…)`) is `.borrowed`: the caller owns the
+        // box and the callee reads through it. Gated on the `.protocol_box`
+        // ZigType so a #201/Gap-E DEVIRTUALIZED `fn`-param (`.function`
+        // ZigType, bare fn ptr) stays `.trivial` — it carries no box.
+        // `isArcManagedZigType` gates parametric protocols off via
+        // `protocolHasVTable` (bare-only), so the boxed parametric case is
+        // recognised here.
+        if (self.parametricProtocolBoxFamilyIsBoxed(param.type_expr)) return .borrowed;
         return .trivial;
     }
 
@@ -11202,15 +11235,18 @@ pub const IrBuilder = struct {
         const base = defaultResultConvention(self.type_store, return_type_id);
         if (base != .trivial) return base;
         // FCC Phase 2 — a function returning a genuinely-boxed PARAMETRIC
-        // protocol existential (`-> fn(i64) -> i64`, i.e.
-        // `Callable({i64}, i64)`) returns an OWNER: it transfers the box to
-        // the caller, who destroys it. `defaultResultConvention` keys on the
-        // free `isArcManagedTypeId`, which returns false for parametric
-        // `protocol_constraint`, so recognise the boxed parametric case here
-        // (scoped to boxed families, so a devirtualized `Enumerable` return
-        // — if any — stays `.trivial`).
+        // protocol existential (`-> fn(i64) -> i64` lowered to
+        // `.protocol_box(Callable_…)`) returns an OWNER: it transfers the
+        // box to the caller, who destroys it. `defaultResultConvention`
+        // keys on the free `isArcManagedTypeId`, which returns false for
+        // parametric `protocol_constraint`, so recognise the boxed
+        // parametric case here — gated on the `.protocol_box` ZigType so a
+        // #201/Gap-E DEVIRTUALIZED `fn`-return (`.function` ZigType) stays
+        // `.trivial` (no box to transfer), and a devirtualized `Enumerable`
+        // return (family not in the set) likewise stays `.trivial`.
         if (return_type_id) |tid| {
-            if (self.parametricProtocolFamilyIsBoxed(tid)) return .owned;
+            const zig_type = typeIdToZigTypeWithStore(tid, self.type_store);
+            if (self.parametricProtocolBoxFamilyIsBoxed(zig_type)) return .owned;
         }
         return base;
     }
@@ -12712,6 +12748,32 @@ pub const IrBuilder = struct {
                             // `trackCallResultType`).
                             if (slot.return_type != .any and slot.return_type != .void) {
                                 try self.known_local_types.put(dest, slot.return_type);
+                            }
+                            // FCC Phase 2 — emit the post-dispatch releases
+                            // for every ARC arg shared into this dispatch
+                            // (receiver + non-receiver args), exactly as the
+                            // `call_direct`/`call_named` tail does at the
+                            // bottom of `.call` lowering (the
+                            // `shared_release_locals` loop). The dispatch
+                            // BORROWS its receiver and args (`arc_ownership`
+                            // records `consumes=false`), so each
+                            // `share_value{retain}` the classifier emits for
+                            // an ARC operand is a TRANSIENT borrow whose
+                            // matching release belongs right after the
+                            // dispatch — not at scope exit. This `return
+                            // dest` previously bypassed the shared-release
+                            // loop at the bottom of `.call`, so a boxed
+                            // closure invoked through `protocol_dispatch`
+                            // never got its receiver-share released at the
+                            // call site, deferring an unbalanced release to
+                            // the scope-exit drop set. The
+                            // `elideBorrowedPassThroughShares` pass collapses
+                            // this share/retain/dispatch/release quad to a
+                            // pure borrow when the box source is
+                            // lifetime-extended (a higher-scope owner),
+                            // matching the call-path borrow elision.
+                            for (shared_release_locals.items) |shared_local| {
+                                try self.current_instrs.append(self.allocator, .{ .release = .{ .value = shared_local } });
                             }
                             return dest;
                         }
