@@ -5474,11 +5474,19 @@ pub const ArcRuntime = struct {
             },
             .pointer => |p| {
                 if (p.size == .one) {
-                    // Only reached for an eagerly-freed pointee (an inline-
-                    // header cell is excluded by `elementHasEagerlyFreedChild`).
-                    // An indirect-storage cell is released through the generic
-                    // path, which deep-walks ITS children; null the slot after.
                     releaseArcAny(p.child, allocator, @constCast(slot.*));
+                    if (comptime !hasInlineArcHeader(p.child)) {
+                        // An indirect-storage (side-table) cell is eagerly freed
+                        // by the call above; null the slot so a repeated release
+                        // of an aliased container frees nothing. An inline-header
+                        // List/Map cell is NOT nulled — `releaseArcAny` routed to
+                        // its own `release`, whose per-element poison already
+                        // makes a second release idempotent, and the cell pointer
+                        // may still be aliased by another live owner.
+                        if (comptime @typeInfo(@TypeOf(slot.*)) == .optional) {
+                            slot.* = null;
+                        }
+                    }
                 }
             },
             .@"struct" => |s| {
