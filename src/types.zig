@@ -1525,7 +1525,25 @@ fn typeIdMangledNameBorrowed(
         .term_type => @as([]const u8, "Term"),
         .list => @as([]const u8, "List"),
         .map => @as([]const u8, "Map"),
-        .tuple => @as([]const u8, "Tuple"),
+        .tuple => |tup| blk: {
+            // Encode tuple element types so two tuples that differ only
+            // by element type mangle to DISTINCT names. This is what lets
+            // a parametric protocol existential (`Callable`) produce a
+            // distinct per-instantiation vtable for `Callable({i64}, i64)`
+            // vs `Callable({String}, Bool)` — the `args` tuple is the
+            // protocol's first type argument. Shape: `Tuple[_<elem>…]`;
+            // the empty tuple `{}` (zero-arg closure) mangles to bare
+            // `Tuple`, distinct from any non-empty tuple.
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "Tuple");
+            for (tup.elements) |elem| {
+                try buf.append(allocator, '_');
+                const elem_name = try typeIdMangledNameBorrowed(allocator, store, elem);
+                try buf.appendSlice(allocator, elem_name);
+            }
+            break :blk try buf.toOwnedSlice(allocator);
+        },
         .function => |ft| blk: {
             // #201 — encode the function type's effect AND signature so
             // two closure types that differ only by their `raises`
@@ -1555,15 +1573,31 @@ fn typeIdMangledNameBorrowed(
         .opaque_type => |ot| @constCast(store).interner.get(ot.name),
         // A protocol existential mangles to the protocol's bare name —
         // so `Option(Error)` joins to `Option_Error`, matching the
-        // per-instantiation TypeDef the IR emits for it (Phase
-        // 1.2.5.b). Inner `type_params` of the protocol_constraint
-        // are intentionally not appended: a protocol's vtable shape
-        // is independent of the existential boxing's payload type
-        // (the box always carries the runtime fat-pointer carrier),
-        // so parametric protocols still mangle by their bare name
-        // until and unless 1.2.5+ teaches them per-instantiation
-        // vtables of their own.
-        .protocol_constraint => |pc| @constCast(store).interner.get(pc.protocol_name),
+        // per-instantiation TypeDef the IR emits for it (Phase 1.2.5.b).
+        //
+        // BARE protocols (no type-params, e.g. `Error`) mangle to just
+        // the protocol name — their vtable shape is fixed, so one
+        // `ErrorVTable` serves every boxed `Error`.
+        //
+        // PARAMETRIC protocols (`Callable(args, result)`) DO append the
+        // instantiation's type arguments: the method signatures depend on
+        // the type args (`Callable.call` returns `result` and takes an
+        // `args` tuple), so `Callable({i64}, i64)` needs a DISTINCT vtable
+        // from `Callable({String}, Bool)`. Shape: `<Proto>_<arg0>_<arg1>`
+        // (FCC Phase 1 — parameterized protocol as a boxed existential).
+        .protocol_constraint => |pc| blk: {
+            const proto_name = @constCast(store).interner.get(pc.protocol_name);
+            if (pc.type_params.len == 0) break :blk proto_name;
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            try buf.appendSlice(allocator, proto_name);
+            for (pc.type_params) |arg| {
+                try buf.append(allocator, '_');
+                const arg_name = try typeIdMangledNameBorrowed(allocator, store, arg);
+                try buf.appendSlice(allocator, arg_name);
+            }
+            break :blk try buf.toOwnedSlice(allocator);
+        },
         .applied => |ap| blk: {
             // Compose `<Base>_<Arg0>_<Arg1>...` so two distinct
             // instantiations of the same parametric base produce
@@ -7063,8 +7097,29 @@ pub const TypeChecker = struct {
                                         // type. For non-parametric
                                         // structs the map is empty and
                                         // `applyToType` is a pass-through.
-                                        const expected_type = instantiation.substitution.applyToType(self.store, req_field.type_id);
                                         const val_type = try self.inferExpr(provided.value);
+                                        // Closure-capture field backfill: a
+                                        // desugar-synthesized `__closure_N`
+                                        // struct declares each capture field
+                                        // `any` (UNKNOWN) because the desugar
+                                        // cannot resolve types. Each closure
+                                        // struct has exactly ONE construction
+                                        // site (the desugar emits one struct
+                                        // per closure literal), so the field's
+                                        // concrete type is unambiguously the
+                                        // captured value's type at that site.
+                                        // Write it back into the registered
+                                        // StructType so the field gets a
+                                        // concrete layout (an `any`/UNKNOWN
+                                        // field has no representation and
+                                        // emits an empty struct). This is the
+                                        // FCC Phase-1 closure-env field typing.
+                                        if (req_field.type_id == TypeStore.UNKNOWN and val_type != TypeStore.UNKNOWN and
+                                            self.isClosureStructName(type_name_id))
+                                        {
+                                            self.backfillClosureFieldType(tid, req_field.name, val_type);
+                                        }
+                                        const expected_type = instantiation.substitution.applyToType(self.store, req_field.type_id);
                                         if (val_type != TypeStore.UNKNOWN and expected_type != TypeStore.UNKNOWN and
                                             !self.store.typeEquals(val_type, expected_type) and
                                             !self.acceptsIntegerLiteralForExpectedType(provided.value, expected_type))
@@ -7615,6 +7670,17 @@ pub const TypeChecker = struct {
                             defer self.endBorrowedBindings(borrowed) catch {};
                             return t.function.return_type;
                         }
+                        // A `Callable(args, result)` existential value is
+                        // invoked through the protocol-box `call` slot:
+                        // `f(x, y)` is sugar for `Callable.call(f, {x, y})`.
+                        // The call's type is the existential's `result`
+                        // type argument (the second `type_params` entry).
+                        // HIR lowers this implicit call to a
+                        // `protocol_dispatch` through the box vtable.
+                        if (self.callableResultType(prov.type_id)) |result_type| {
+                            for (call.args) |arg| _ = try self.inferExpr(arg);
+                            return result_type;
+                        }
                         if (self.isFirstClassFunctionStructType(prov.type_id)) {
                             try self.addHardError(
                                 "dynamic Function dispatch is not supported",
@@ -8088,6 +8154,59 @@ pub const TypeChecker = struct {
 
         for (call.args) |arg| _ = try self.inferExpr(arg);
         return TypeStore.UNKNOWN;
+    }
+
+    /// True iff `type_name_id` names a desugar-synthesized closure struct
+    /// (`__closure_N`). These are the only structs whose `any`-typed
+    /// capture fields are backfilled from their single construction site.
+    fn isClosureStructName(self: *const TypeChecker, type_name_id: ast.StringId) bool {
+        return std.mem.startsWith(u8, self.interner.get(type_name_id), "__closure_");
+    }
+
+    /// Write a concrete type into a closure struct's capture field whose
+    /// declared type is still `any` (UNKNOWN). Rebuilds the StructType's
+    /// field slice with the field's `type_id` replaced and stores it back
+    /// at `struct_type_id`, so downstream field/layout resolution sees a
+    /// concrete capture type. No-op if the type isn't a struct or the
+    /// field is absent.
+    fn backfillClosureFieldType(
+        self: *TypeChecker,
+        struct_type_id: TypeId,
+        field_name: ast.StringId,
+        concrete_type: TypeId,
+    ) void {
+        if (struct_type_id >= self.store.types.items.len) return;
+        const existing = self.store.getType(struct_type_id);
+        if (existing != .struct_type) return;
+        const st = existing.struct_type;
+        const new_fields = self.allocator.alloc(Type.StructField, st.fields.len) catch return;
+        for (st.fields, 0..) |f, idx| {
+            new_fields[idx] = if (f.name == field_name and f.type_id == TypeStore.UNKNOWN)
+                .{ .name = f.name, .type_id = concrete_type, .default_expr = f.default_expr }
+            else
+                f;
+        }
+        self.store.types.items[struct_type_id] = .{ .struct_type = .{
+            .name = st.name,
+            .fields = new_fields,
+            .type_params = st.type_params,
+        } };
+    }
+
+    /// If `type_id` is a `Callable(args, result)` existential, return its
+    /// `result` type argument — the return type of invoking the callable.
+    /// Used so an implicit call `f(x)` on a `Callable`-typed `f` infers
+    /// the callable's result instead of erroring as a dynamic dispatch.
+    /// Returns null for any non-`Callable` type.
+    fn callableResultType(self: *TypeChecker, type_id: TypeId) ?TypeId {
+        if (type_id >= self.store.types.items.len) return null;
+        const t = self.store.getType(type_id);
+        if (t != .protocol_constraint) return null;
+        const proto_name = self.interner.get(t.protocol_constraint.protocol_name);
+        if (!std.mem.eql(u8, proto_name, "Callable")) return null;
+        // `Callable(args, result)` — `type_params = [args_tuple, result]`.
+        if (t.protocol_constraint.type_params.len < 2) return null;
+        return t.protocol_constraint.type_params[1];
     }
 
     /// Bind a parametric protocol's formal type-parameter names to the

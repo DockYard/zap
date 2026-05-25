@@ -5202,6 +5202,21 @@ pub const HirBuilder = struct {
                 });
             },
             .call => |call| {
+                // First-class closure invocation: a call `f(x, y)` whose
+                // callee `f` is statically a `Callable(args, result)`
+                // existential value (a boxed closure) is sugar for
+                // `Callable.call(f, {x, y})` — dispatched through the
+                // protocol-box `call` vtable slot. Rewrite the AST call to
+                // that explicit shape and re-lower it so the existing
+                // protocol-dispatch path handles the boxed receiver. The
+                // rewrite fires only when `f`'s resolved binding type is a
+                // `Callable` existential; ordinary higher-order parameters
+                // (a bare `fn`-typed param, the #201 direct path) and
+                // function-family names are untouched.
+                if (try self.rewriteCallableValueCall(&call)) |rewritten| {
+                    return try self.buildExpr(rewritten);
+                }
+
                 // Check for union variant constructor: Result.Ok("hello")
                 // Parsed as call(struct_ref(["Result", "Ok"]), args).
                 //
@@ -7448,6 +7463,61 @@ pub const HirBuilder = struct {
             if (self.structNamesEqual(entry.name, name)) return true;
         }
         return false;
+    }
+
+    /// If `call`'s callee is a value statically typed as a
+    /// `Callable(args, result)` existential, rewrite the call into the
+    /// explicit `Callable.call(callee, {args...})` form and return it; the
+    /// caller re-lowers the rewritten AST so the regular protocol-dispatch
+    /// path handles the boxed receiver. Returns null when the callee is
+    /// not a `Callable`-typed value (leaving every other call shape — #201
+    /// direct higher-order params, function-family names, struct methods —
+    /// untouched). The args are packed into a brace-tuple matching the
+    /// `Callable` method's arity-as-tuple `arguments` parameter.
+    fn rewriteCallableValueCall(self: *HirBuilder, call: *const ast.CallExpr) !?*const ast.Expr {
+        // Only a bare value reference can name a `Callable` local or
+        // parameter. A dotted struct call (`Mod.f(...)`) or a function-ref
+        // is never a first-class closure value invocation. A closure
+        // stored in a struct field is read into a local first
+        // (`f = recv.op; f(x)`), so the `var_ref` case covers it.
+        const callee_type_id: types_mod.TypeId = switch (call.callee.*) {
+            .var_ref => |vr| self.resolveBindingType(vr.name, vr.meta.scopes),
+            else => return null,
+        };
+        if (callee_type_id == types_mod.TypeStore.UNKNOWN) return null;
+        if (callee_type_id >= self.type_store.types.items.len) return null;
+        const callee_type = self.type_store.getType(callee_type_id);
+        if (callee_type != .protocol_constraint) return null;
+        const proto_name = self.interner.get(callee_type.protocol_constraint.protocol_name);
+        if (!std.mem.eql(u8, proto_name, "Callable")) return null;
+
+        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+        const span = call.meta.span;
+
+        // `{args...}` — the call arguments packed into a brace-tuple.
+        const args_tuple = try self.create(ast.Expr, .{
+            .tuple = .{ .meta = .{ .span = span }, .elements = call.args },
+        });
+
+        // `Callable.call` callee.
+        const callable_id = try interner_mut.intern("Callable");
+        const call_method_id = try interner_mut.intern("call");
+        const parts = try self.allocator.alloc(ast.StringId, 1);
+        parts[0] = callable_id;
+        const callable_ref = try self.create(ast.Expr, .{
+            .struct_ref = .{ .meta = .{ .span = span }, .name = .{ .parts = parts, .span = span } },
+        });
+        const dispatch_callee = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = .{ .span = span }, .object = callable_ref, .field = call_method_id },
+        });
+
+        // `Callable.call(callee, {args...})`.
+        const dispatch_args = try self.allocator.alloc(*const ast.Expr, 2);
+        dispatch_args[0] = call.callee;
+        dispatch_args[1] = args_tuple;
+        return try self.create(ast.Expr, .{
+            .call = .{ .meta = .{ .span = span }, .callee = dispatch_callee, .args = dispatch_args },
+        });
     }
 
     /// Generic protocol-call dispatch: when a user writes `Protocol.method(arg, ...)`

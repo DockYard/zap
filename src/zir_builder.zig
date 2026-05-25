@@ -625,6 +625,21 @@ fn appendZigTypeForVTable(
             try buf.appendSlice(allocator, ") ");
             try appendZigTypeForVTable(allocator, buf, fn_type.return_type.*);
         },
+        // A Zap tuple renders as a Zig anonymous tuple type
+        // `struct { T0, T1, ... }`. This is the representation of a
+        // `Callable` method's `args` parameter (arity-as-tuple): a
+        // zero-arg closure's `{}` becomes `struct {}`, a one-arg `{i64}`
+        // becomes `struct { i64 }`, etc. Rendering it here lets a tuple-
+        // typed protocol method slot (the `call` slot of `Callable`)
+        // type-check against the per-impl adapter.
+        .tuple => |elements| {
+            try buf.appendSlice(allocator, "struct { ");
+            for (elements, 0..) |elem, i| {
+                if (i > 0) try buf.appendSlice(allocator, ", ");
+                try appendZigTypeForVTable(allocator, buf, elem);
+            }
+            try buf.appendSlice(allocator, " }");
+        },
         else => try buf.appendSlice(allocator, "anytype"),
     }
 }

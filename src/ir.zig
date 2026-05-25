@@ -385,7 +385,7 @@ fn primitiveNameToZigType(name: []const u8) ?ZigType {
 /// `.applied` forms whose mangling needs recursive type-store
 /// inspection). The caller falls back to the bare base name in
 /// that case.
-fn mangledNameForArgZigType(zig_type: ZigType) ?[]const u8 {
+fn mangledNameForArgZigType(allocator: std.mem.Allocator, zig_type: ZigType) ?[]const u8 {
     return switch (zig_type) {
         .bool_type => "Bool",
         .string => "String",
@@ -420,6 +420,21 @@ fn mangledNameForArgZigType(zig_type: ZigType) ?[]const u8 {
         // is produced by `populateAppliedSpecializations` under that
         // same key).
         .protocol_box => |name| name,
+        // A tuple mangles to `Tuple[_<elem>…]`, matching
+        // `types.typeIdMangledNameBorrowed`'s `.tuple` arm so a
+        // `Callable({i64}, i64)` existential's `.protocol_box` name
+        // (`Callable_Tuple_i64_i64`) lines up between the type-store
+        // mangler (construction/dispatch sites) and the vtable emitter.
+        .tuple => |elements| blk: {
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            buf.appendSlice(allocator, "Tuple") catch return null;
+            for (elements) |elem| {
+                buf.append(allocator, '_') catch return null;
+                const elem_name = mangledNameForArgZigType(allocator, elem) orelse return null;
+                buf.appendSlice(allocator, elem_name) catch return null;
+            }
+            break :blk buf.toOwnedSlice(allocator) catch null;
+        },
         else => null,
     };
 }
@@ -10163,10 +10178,12 @@ pub const IrBuilder = struct {
         // mirrors the protocol's method signatures, with each
         // receiver erased to `?*anyopaque` (the dispatch site only
         // has the box's `data_ptr`, not the concrete receiver type).
+        // Parametric protocols (`Callable(args, result)`) are emitted
+        // per-instantiation below (3.7.c), keyed by the concrete type
+        // arguments each `impl` supplies. The per-protocol pass here
+        // handles only BARE protocols (`Error`, `Stringable`), whose
+        // vtable shape is fixed.
         for (graph.protocols.items) |proto_entry| {
-            // Phase 1.2.5.b still defers parametric protocols — the
-            // vtable shape would need to be re-instantiated per
-            // protocol argument set, which is a separate upgrade.
             if (proto_entry.decl.type_params.len != 0) continue;
 
             const protocol_name = self.protocolNameToString(proto_entry.name);
@@ -10238,7 +10255,9 @@ pub const IrBuilder = struct {
             // methods in a different order still produces a correctly
             // aligned vtable.
             const proto_entry = graph.findProtocol(impl_entry.protocol_name) orelse continue;
-            // Parametric protocols are still deferred (see header).
+            // Parametric protocols are emitted per-instantiation in 3.7.c
+            // below (their vtable shape depends on the impl's concrete
+            // type arguments). Skip them in this bare-protocol pass.
             if (proto_entry.decl.type_params.len != 0) continue;
 
             const protocol_name = self.protocolNameToString(proto_entry.name);
@@ -10274,6 +10293,241 @@ pub const IrBuilder = struct {
                 );
             }
         }
+
+        // ── 3.7.c: parametric-protocol per-instantiation vtables ──
+        // A PARAMETRIC protocol used as a boxed existential (`Callable`)
+        // needs a DISTINCT vtable per instantiation, because the method
+        // signatures depend on the protocol's type arguments
+        // (`Callable.call` returns `result` and takes an `args` tuple).
+        // Each `impl Callable({A}, R) for T` supplies concrete type args
+        // via `decl.protocol_type_args`; bind the protocol's formal names
+        // (`args`, `result`) to those concrete AST type expressions, then
+        // emit one `<Proto>_<arg0>_<arg1>VTable` struct (deduped by
+        // instantiation across impls that share the same args) plus one
+        // `<...>VTable_for_<Target>` instance per impl. The mangled
+        // instantiation name matches `typeIdMangledName` so the
+        // construction site (`box_as_protocol`) and the dispatch site
+        // (`protocol_dispatch`) — both keyed on the `.protocol_box` name
+        // produced by `typeIdToZigTypeWithStore` — resolve to it.
+        var emitted_parametric_vtables = std.StringHashMap(void).init(self.allocator);
+        defer emitted_parametric_vtables.deinit();
+        for (graph.impls.items) |impl_entry| {
+            const proto_entry = graph.findProtocol(impl_entry.protocol_name) orelse continue;
+            if (proto_entry.decl.type_params.len == 0) continue; // bare protocol: handled above
+            // Parametric-target impls combined with parametric protocols
+            // (`impl Callable({t}, t) for Box(t)`) are a Phase-3 concern;
+            // Phase 1 covers concrete impl targets (the closure structs
+            // `__closure_N` and hand-written concrete impls).
+            if (impl_entry.decl.type_params.len != 0) continue;
+
+            const mangled_proto = self.mangledParametricProtocolName(
+                proto_entry,
+                impl_entry.decl.protocol_type_args,
+            ) orelse continue;
+            const target_name = self.protocolNameToString(impl_entry.target_type);
+
+            // Emit the per-instantiation vtable struct once.
+            if (!emitted_parametric_vtables.contains(mangled_proto)) {
+                try emitted_parametric_vtables.put(mangled_proto, {});
+                try self.emitParametricProtocolVTableDef(
+                    type_defs,
+                    proto_entry,
+                    mangled_proto,
+                    impl_entry.decl.protocol_type_args,
+                );
+            }
+
+            // Emit the per-impl instance.
+            try self.emitParametricProtocolVTableInstance(
+                type_defs,
+                proto_entry,
+                mangled_proto,
+                target_name,
+                impl_entry.decl.protocol_type_args,
+            );
+        }
+    }
+
+    /// Compose the per-instantiation mangled name for a parametric
+    /// protocol from an impl's `protocol_type_args` — e.g. `Callable` +
+    /// `[{i64}, i64]` -> `Callable_Tuple_i64_i64`. Mirrors
+    /// `typeIdMangledName`'s `protocol_constraint` arm so the name lines
+    /// up with the `.protocol_box` ZigType the construction/dispatch
+    /// sites carry. Returns null when an argument cannot be mangled.
+    fn mangledParametricProtocolName(
+        self: *IrBuilder,
+        proto_entry: *const scope_mod.ProtocolEntry,
+        protocol_type_args: []const *const ast.TypeExpr,
+    ) ?[]const u8 {
+        const proto_name = self.protocolNameToString(proto_entry.name);
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        buf.appendSlice(self.allocator, proto_name) catch return null;
+        for (protocol_type_args) |arg| {
+            buf.append(self.allocator, '_') catch return null;
+            const arg_zig = self.astTypeExprToZigTypeForProtocol(arg);
+            const arg_name = mangledNameForArgZigType(self.allocator, arg_zig) orelse return null;
+            buf.appendSlice(self.allocator, arg_name) catch return null;
+        }
+        return buf.toOwnedSlice(self.allocator) catch null;
+    }
+
+    /// Emit a `protocol_vtable_def` for a parametric protocol
+    /// instantiation. The method param/return ZigTypes are resolved with
+    /// the protocol's formal type-param names bound to the impl's
+    /// concrete `protocol_type_args` AST expressions, so the `call`
+    /// slot's `args` tuple and `result` return render concretely.
+    fn emitParametricProtocolVTableDef(
+        self: *IrBuilder,
+        type_defs: *std.ArrayList(TypeDef),
+        proto_entry: *const scope_mod.ProtocolEntry,
+        mangled_proto: []const u8,
+        protocol_type_args: []const *const ast.TypeExpr,
+    ) !void {
+        const vtable_type_name = try std.fmt.allocPrint(self.allocator, "{s}VTable", .{mangled_proto});
+        const methods = try self.allocator.alloc(ProtocolVTableMethod, proto_entry.decl.functions.len);
+        for (proto_entry.decl.functions, 0..) |fn_sig, method_index| {
+            const method_name = self.interner.get(fn_sig.name);
+            const arity: u32 = @intCast(fn_sig.params.len);
+            const extra_count = if (fn_sig.params.len > 0) fn_sig.params.len - 1 else 0;
+            const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
+            if (extra_count > 0) {
+                for (fn_sig.params[1..], 0..) |param, param_index| {
+                    extra_param_types[param_index] = self.protocolMethodTypeWithFormals(
+                        param.type_annotation,
+                        proto_entry.decl.type_params,
+                        protocol_type_args,
+                        .any,
+                    );
+                }
+            }
+            const return_zig_type = self.protocolMethodTypeWithFormals(
+                fn_sig.return_type,
+                proto_entry.decl.type_params,
+                protocol_type_args,
+                .void,
+            );
+            methods[method_index] = .{
+                .name = try cloneBytes(self.allocator, method_name),
+                .arity = arity,
+                .extra_param_types = extra_param_types,
+                .return_type = return_zig_type,
+            };
+        }
+        try type_defs.append(self.allocator, .{
+            .name = vtable_type_name,
+            .kind = .{ .protocol_vtable_def = .{
+                .protocol_name = try cloneBytes(self.allocator, mangled_proto),
+                .methods = methods,
+            } },
+        });
+    }
+
+    /// Emit a `protocol_vtable_instance_def` for a parametric protocol
+    /// instantiation's impl. Same shape as `emitProtocolVTableInstance`
+    /// but with the mangled instantiation name as the protocol key and
+    /// formal-substituted method types.
+    fn emitParametricProtocolVTableInstance(
+        self: *IrBuilder,
+        type_defs: *std.ArrayList(TypeDef),
+        proto_entry: *const scope_mod.ProtocolEntry,
+        mangled_proto: []const u8,
+        target_name: []const u8,
+        protocol_type_args: []const *const ast.TypeExpr,
+    ) !void {
+        const instance_type_name = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}VTable_for_{s}",
+            .{ mangled_proto, target_name },
+        );
+        const methods = try self.allocator.alloc(ProtocolVTableInstanceMethod, proto_entry.decl.functions.len);
+        for (proto_entry.decl.functions, 0..) |fn_sig, method_index| {
+            const method_name = self.interner.get(fn_sig.name);
+            const arity: u32 = @intCast(fn_sig.params.len);
+            const impl_function_name = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}__{s}__{d}",
+                .{ target_name, method_name, arity },
+            );
+            const extra_count = if (fn_sig.params.len > 0) fn_sig.params.len - 1 else 0;
+            const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
+            if (extra_count > 0) {
+                for (fn_sig.params[1..], 0..) |param, param_index| {
+                    extra_param_types[param_index] = self.protocolMethodTypeWithFormals(
+                        param.type_annotation,
+                        proto_entry.decl.type_params,
+                        protocol_type_args,
+                        .any,
+                    );
+                }
+            }
+            const return_zig_type = self.protocolMethodTypeWithFormals(
+                fn_sig.return_type,
+                proto_entry.decl.type_params,
+                protocol_type_args,
+                .void,
+            );
+            methods[method_index] = .{
+                .method_name = try cloneBytes(self.allocator, method_name),
+                .impl_function_name = impl_function_name,
+                .arity = arity,
+                .extra_param_types = extra_param_types,
+                .return_type = return_zig_type,
+            };
+        }
+        try type_defs.append(self.allocator, .{
+            .name = instance_type_name,
+            .kind = .{ .protocol_vtable_instance_def = .{
+                .protocol_name = try cloneBytes(self.allocator, mangled_proto),
+                .target_type_name = try cloneBytes(self.allocator, target_name),
+                .methods = methods,
+            } },
+        });
+    }
+
+    /// Resolve a parametric protocol method's param/return type
+    /// annotation to a `ZigType`, substituting any reference to a formal
+    /// type-parameter name (`args`, `result`) with the impl's concrete
+    /// type-argument AST expression at the matching position. `fallback`
+    /// is returned for an absent annotation (`.any` for params, `.void`
+    /// for returns), matching the non-parametric helpers.
+    fn protocolMethodTypeWithFormals(
+        self: *IrBuilder,
+        type_annotation: ?*const ast.TypeExpr,
+        formal_names: []const ast.StringId,
+        protocol_type_args: []const *const ast.TypeExpr,
+        fallback: ZigType,
+    ) ZigType {
+        const ann = type_annotation orelse return fallback;
+        // A bare reference to a formal type-param name resolves to the
+        // matching concrete type argument. A lowercase formal (`args`,
+        // `result`, `element`) parses as a `.variable`; an uppercase one
+        // as a nullary `.name`. `formalTypeParamIndex` handles both.
+        if (formalTypeParamIndex(ann, formal_names)) |idx| {
+            if (idx < protocol_type_args.len) {
+                return self.astTypeExprToZigTypeForProtocol(protocol_type_args[idx]);
+            }
+        }
+        return self.astTypeExprToZigTypeForProtocol(ann);
+    }
+
+    /// If `type_expr` is a bare reference to one of `formal_names` (a
+    /// lowercase `.variable` or an uppercase nullary `.name`), return its
+    /// index in the formal list. Used to substitute a parametric
+    /// protocol's formal type-params with concrete instantiation args.
+    fn formalTypeParamIndex(
+        type_expr: *const ast.TypeExpr,
+        formal_names: []const ast.StringId,
+    ) ?usize {
+        const formal_id: ast.StringId = switch (type_expr.*) {
+            .variable => |v| v.name,
+            .name => |n| if (n.args.len == 0) n.name else return null,
+            else => return null,
+        };
+        for (formal_names, 0..) |candidate, idx| {
+            if (candidate == formal_id) return idx;
+        }
+        return null;
     }
 
     /// Resolve the base nominal struct/tagged-union name for an
@@ -10382,23 +10636,53 @@ pub const IrBuilder = struct {
         protocol_name_text: []const u8,
         method_name_text: []const u8,
     ) ?ProtocolMethodSlot {
+        return self.findProtocolMethodSlotForReceiver(
+            protocol_name_text,
+            method_name_text,
+            types_mod.TypeStore.UNKNOWN,
+        );
+    }
+
+    /// Look up a protocol method's `(method_index, arity, return_type)`
+    /// slot. For a BARE protocol the return type is resolved directly. For
+    /// a PARAMETRIC protocol the formal type-params are bound to the
+    /// `receiver_type_id`'s `protocol_constraint` type arguments first, so
+    /// `Callable.call`'s `result` return resolves to the instantiation's
+    /// concrete return type (`i64`) rather than a formal type-var.
+    fn findProtocolMethodSlotForReceiver(
+        self: *IrBuilder,
+        protocol_name_text: []const u8,
+        method_name_text: []const u8,
+        receiver_type_id: hir_mod.TypeId,
+    ) ?ProtocolMethodSlot {
         const graph = self.scope_graph orelse return null;
         for (graph.protocols.items) |proto_entry| {
-            // Phase 1.2.5.b still defers parametric protocols — the
-            // vtable shape would need to be re-instantiated per
-            // protocol argument set, which is a separate upgrade.
-            // The matching `populateProtocolVTables` guard skips
-            // these too, so reaching the dispatch site for a
-            // parametric protocol is a no-op here.
-            if (proto_entry.decl.type_params.len != 0) continue;
-
             const proto_text = self.protocolNameToString(proto_entry.name);
             if (!std.mem.eql(u8, proto_text, protocol_name_text)) continue;
+
+            // Concrete type arguments carried by the receiver existential
+            // (`Callable({i64}, i64)` -> `[{i64}, i64]`), used to resolve
+            // a parametric protocol method's formal-typed return.
+            const receiver_type_args: []const hir_mod.TypeId = blk: {
+                if (proto_entry.decl.type_params.len == 0) break :blk &.{};
+                const store = self.type_store orelse break :blk &.{};
+                if (receiver_type_id >= store.types.items.len) break :blk &.{};
+                const rt = store.getType(receiver_type_id);
+                if (rt != .protocol_constraint) break :blk &.{};
+                break :blk rt.protocol_constraint.type_params;
+            };
 
             for (proto_entry.decl.functions, 0..) |fn_sig, idx| {
                 const fn_name = self.interner.get(fn_sig.name);
                 if (!std.mem.eql(u8, fn_name, method_name_text)) continue;
-                const return_zig_type = self.protocolReturnTypeToZigType(fn_sig.return_type);
+                const return_zig_type = if (proto_entry.decl.type_params.len == 0)
+                    self.protocolReturnTypeToZigType(fn_sig.return_type)
+                else
+                    self.protocolReturnTypeWithFormalTypeIds(
+                        fn_sig.return_type,
+                        proto_entry.decl.type_params,
+                        receiver_type_args,
+                    );
                 return .{
                     .method_index = @intCast(idx),
                     .arity = @intCast(fn_sig.params.len),
@@ -10408,6 +10692,24 @@ pub const IrBuilder = struct {
             return null;
         }
         return null;
+    }
+
+    /// Resolve a parametric protocol method's return type, substituting a
+    /// reference to a formal type-param name with the receiver's concrete
+    /// type-argument TypeId (mapped through `typeIdToZigTypeWithStore`).
+    fn protocolReturnTypeWithFormalTypeIds(
+        self: *IrBuilder,
+        return_type: ?*const ast.TypeExpr,
+        formal_names: []const ast.StringId,
+        receiver_type_args: []const hir_mod.TypeId,
+    ) ZigType {
+        const ret = return_type orelse return .void;
+        if (formalTypeParamIndex(ret, formal_names)) |idx| {
+            if (idx < receiver_type_args.len) {
+                return typeIdToZigTypeWithStore(receiver_type_args[idx], self.type_store);
+            }
+        }
+        return self.protocolReturnTypeToZigType(ret);
     }
 
     /// Convert a protocol method's parameter or return type
@@ -10515,6 +10817,18 @@ pub const IrBuilder = struct {
                 // Bare nominal — treat as struct ref.
                 break :blk .{ .struct_ref = self.allocator.dupe(u8, text) catch text };
             },
+            // A tuple type expression (`{i64}`, `{i64, String}`, `{}`) is
+            // the arity-as-tuple `args` parameter of a `Callable` method.
+            // Lower each element recursively into a `.tuple` ZigType so
+            // `appendZigTypeForVTable` renders it as a Zig anonymous tuple
+            // `struct { ... }` in the vtable slot signature.
+            .tuple => |tuple_expr| blk: {
+                const elems = self.allocator.alloc(ZigType, tuple_expr.elements.len) catch break :blk .any;
+                for (tuple_expr.elements, 0..) |elem, idx| {
+                    elems[idx] = self.astTypeExprToZigTypeForProtocol(elem);
+                }
+                break :blk .{ .tuple = elems };
+            },
             .variable => .any,
             else => .any,
         };
@@ -10544,7 +10858,7 @@ pub const IrBuilder = struct {
         for (name_expr.args) |arg| {
             buf.append(self.allocator, '_') catch return null;
             const arg_zig_type = self.astTypeExprToZigTypeForProtocol(arg);
-            const arg_name = mangledNameForArgZigType(arg_zig_type) orelse return null;
+            const arg_name = mangledNameForArgZigType(self.allocator, arg_zig_type) orelse return null;
             buf.appendSlice(self.allocator, arg_name) catch return null;
         }
         return buf.toOwnedSlice(self.allocator) catch null;
@@ -11224,14 +11538,20 @@ pub const IrBuilder = struct {
         if (value_zig_type != .struct_ref) return value_local;
         const target_name = value_zig_type.struct_ref;
 
-        // Look up `impl <expected_protocol> for <target_name>` in
-        // the scope graph. The protocol's `StructName` shape needs
-        // an `[StringId]` parts slice; we look up existing interned
-        // ids via `lookupExisting` (the interner is `*const` here
-        // since IR-build is a read pass over the interner; both
-        // names must already be interned for an impl to exist).
+        // Look up `impl <base_protocol> for <target_name>` in the scope
+        // graph. `expected_protocol` is the vtable-family name carried by
+        // the `.protocol_box` ZigType: for a BARE protocol it IS the
+        // protocol name (`Error`); for a PARAMETRIC protocol it is the
+        // mangled per-instantiation name (`Callable_Tuple_i64_i64`). The
+        // impl, the interned protocol id, and the `protocol_constraint`
+        // HIR type are all keyed on the BASE protocol name, so resolve it
+        // first. The mangled `expected_protocol` is still used for the
+        // box's `protocol_name` (the vtable instance lookup at the
+        // construction site keys on it — 3.7.c emits
+        // `<mangled>VTable_for_<Target>`).
         const graph = self.scope_graph orelse return value_local;
-        const protocol_id = self.interner.lookupExisting(expected_protocol) orelse return value_local;
+        const base_protocol = self.baseProtocolName(expected_protocol);
+        const protocol_id = self.interner.lookupExisting(base_protocol) orelse return value_local;
         const target_id = self.interner.lookupExisting(target_name) orelse return value_local;
         const proto_struct_name: ast.StructName = .{
             .parts = &[_]ast.StringId{protocol_id},
@@ -11291,6 +11611,29 @@ pub const IrBuilder = struct {
             try self.local_hir_types.put(box_dest, constraint_type_id);
         }
         return box_dest;
+    }
+
+    /// Resolve the BASE protocol name from a vtable-family name carried by
+    /// a `.protocol_box` ZigType. A BARE protocol's family name IS its
+    /// name (`Error` -> `Error`). A PARAMETRIC protocol's family name is
+    /// the mangled per-instantiation form (`Callable_Tuple_i64_i64`); the
+    /// base is the longest registered protocol name that the family name
+    /// equals or begins with at a `<Proto>_` boundary. Falls back to the
+    /// input when no registered protocol matches (it is then used as-is,
+    /// which still fails the downstream `lookupExisting` gracefully).
+    fn baseProtocolName(self: *const IrBuilder, family_name: []const u8) []const u8 {
+        const graph = self.scope_graph orelse return family_name;
+        var best: ?[]const u8 = null;
+        for (graph.protocols.items) |proto_entry| {
+            const proto_text = self.protocolNameToString(proto_entry.name);
+            if (std.mem.eql(u8, proto_text, family_name)) return proto_text;
+            if (std.mem.startsWith(u8, family_name, proto_text) and
+                family_name.len > proto_text.len and family_name[proto_text.len] == '_')
+            {
+                if (best == null or proto_text.len > best.?.len) best = proto_text;
+            }
+        }
+        return best orelse family_name;
     }
 
     /// Find the `protocol_constraint` TypeId in the store whose protocol
@@ -11826,12 +12169,26 @@ pub const IrBuilder = struct {
                                     self.type_store,
                                 );
                             if (receiver_zig_type != .protocol_box) break :dispatch_blk;
-                            if (!std.mem.eql(u8, receiver_zig_type.protocol_box, mod))
-                                break :dispatch_blk;
+                            const box_name = receiver_zig_type.protocol_box;
+                            // The box name is either the bare protocol name
+                            // (a BARE protocol like `Error`) or a mangled
+                            // per-instantiation name (`Callable_Tuple_i64_i64`)
+                            // for a PARAMETRIC protocol. Accept both: an exact
+                            // match, or a mangled name whose `<Proto>_` prefix
+                            // is the call's protocol `mod`. The dispatch's
+                            // vtable-module key is the box name (so the right
+                            // per-instantiation vtable is imported), while the
+                            // method slot is looked up on the bare protocol.
+                            const exact = std.mem.eql(u8, box_name, mod);
+                            const parametric = !exact and
+                                std.mem.startsWith(u8, box_name, mod) and
+                                box_name.len > mod.len and box_name[mod.len] == '_';
+                            if (!exact and !parametric) break :dispatch_blk;
 
-                            const slot = self.findProtocolMethodSlotByScope(
+                            const slot = self.findProtocolMethodSlotForReceiver(
                                 mod,
                                 nc.name,
+                                call.args[0].expr.type_id,
                             ) orelse break :dispatch_blk;
 
                             // The receiver flows in as the implicit
@@ -11852,7 +12209,12 @@ pub const IrBuilder = struct {
                             // accessible through the dedicated
                             // `receiver` field rather than re-pack it.
 
-                            const protocol_name_copy = try cloneBytes(self.allocator, mod);
+                            // Key the dispatch on the box's vtable family
+                            // name (the mangled per-instantiation name for a
+                            // parametric protocol, the bare name otherwise) so
+                            // the ZIR `protocol_dispatch` lowering imports
+                            // `<box_name>VTable` — the vtable 3.7.c emitted.
+                            const protocol_name_copy = try cloneBytes(self.allocator, box_name);
                             const method_name_copy = try cloneBytes(self.allocator, nc.name);
 
                             try self.current_instrs.append(self.allocator, .{
@@ -13503,22 +13865,28 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                             return .any;
                         },
                         .protocol_constraint => |pc| {
-                            // Phase 1.2.5.b: lower a protocol existential
-                            // to the runtime fat-pointer carrier. The
-                            // payload is the protocol's bare name; the
-                            // ZIR backend renders this as
-                            // `zap_runtime.ProtocolBox` at every
-                            // struct-field / union-variant / function-
-                            // parameter / return-type position.
+                            // Lower a protocol existential to the runtime
+                            // fat-pointer carrier. The ZIR backend renders
+                            // `.protocol_box` as `zap_runtime.ProtocolBox`
+                            // at every struct-field / union-variant /
+                            // function-parameter / return-type position.
                             //
-                            // The name is borrowed from the interner —
-                            // same lifetime contract as the `struct_type`
-                            // and `tagged_union` arms above. Interner
-                            // strings outlive the IR build, so any
-                            // downstream consumer that wants to retain
-                            // the name (e.g. `cloneZigType`) is
-                            // responsible for duplicating it.
-                            return .{ .protocol_box = ts.interner.get(pc.protocol_name) };
+                            // The carried NAME is the vtable-family key: a
+                            // BARE protocol (`Error`) uses its bare name
+                            // (one `ErrorVTable`); a PARAMETRIC protocol
+                            // (`Callable(args, result)`) uses the
+                            // per-instantiation mangled name
+                            // (`Callable_Tuple_i64_i64`) so each
+                            // instantiation gets its own vtable with the
+                            // concrete method signature. `typeIdMangledName`
+                            // produces the bare name for the zero-type-param
+                            // case, so both paths funnel through one helper.
+                            if (pc.type_params.len == 0) {
+                                return .{ .protocol_box = ts.interner.get(pc.protocol_name) };
+                            }
+                            const mangled = types_mod.typeIdMangledName(ts.allocator, ts, type_id) catch
+                                return .{ .protocol_box = ts.interner.get(pc.protocol_name) };
+                            return .{ .protocol_box = mangled };
                         },
                         else => {},
                     }

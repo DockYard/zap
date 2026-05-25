@@ -64,6 +64,14 @@ pub const Desugarer = struct {
     /// them). This is the conservative Phase-1 box decision; full
     /// escape-driven box-vs-direct unification is Phase 3.
     closure_escapes: bool = false,
+    /// In-scope binding type annotations (binding name -> declared
+    /// `TypeExpr`), maintained while walking a function body. A capturing
+    /// closure's synthesized struct types each capture field from this
+    /// map — e.g. capturing `n` inside `fn make(n :: i64)` gives the
+    /// closure struct field `n :: i64` (a concrete type the codegen can
+    /// lay out), instead of the un-resolvable `any`. Populated from
+    /// parameter annotations and from typed `name :: T = v` bindings.
+    capture_type_env: std.AutoHashMapUnmanaged(ast.StringId, *const ast.TypeExpr) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, interner: *ast.StringInterner, graph: ?*const scope_mod.ScopeGraph) Desugarer {
         return .{
@@ -951,6 +959,19 @@ pub const Desugarer = struct {
             // non-capturing tail closure keeps the bare `fn`-type (Gap E's
             // direct return path) — its return type is left unchanged.
             const return_is_fn = clause.return_type != null and clause.return_type.?.* == .function;
+            // Record this clause's parameter type annotations into the
+            // capture-type environment so a closure nested in the body can
+            // type a captured parameter concretely. Save/restore around
+            // the body so the bindings don't leak to sibling clauses or
+            // the enclosing scope.
+            const saved_capture_env = try self.capture_type_env.clone(self.allocator);
+            defer {
+                self.capture_type_env.deinit(self.allocator);
+                self.capture_type_env = saved_capture_env;
+            }
+            for (clause.params) |param| {
+                try self.recordParamCaptureTypes(param.pattern, param.type_annotation);
+            }
             const body = if (clause.body) |b|
                 try self.desugarFunctionClauseBody(b, return_is_fn)
             else
@@ -1758,6 +1779,24 @@ pub const Desugarer = struct {
         return captures.items.len > 0;
     }
 
+    /// Record a parameter's declared type into the capture-type
+    /// environment, keyed by the bound name. Only a simple `bind` pattern
+    /// (the common case `name :: Type`) contributes a typed entry;
+    /// destructuring patterns bind component names whose individual types
+    /// aren't directly available, so they are left to fall back to `any`.
+    fn recordParamCaptureTypes(
+        self: *Desugarer,
+        pattern: *const ast.Pattern,
+        type_annotation: ?*const ast.TypeExpr,
+    ) !void {
+        const ann = type_annotation orelse return;
+        switch (pattern.*) {
+            .bind => |b| try self.capture_type_env.put(self.allocator, b.name, ann),
+            .paren => |p| try self.recordParamCaptureTypes(p.inner, ann),
+            else => {},
+        }
+    }
+
     /// Collect the free variables (captures) of a closure literal in
     /// deterministic first-reference order. A name is a capture iff it is
     /// referenced by a `var_ref` in the body and is neither one of the
@@ -1992,10 +2031,16 @@ pub const Desugarer = struct {
         // ordering is the capture-collection order.
         const fields = try self.allocator.alloc(ast.StructFieldDecl, captures.items.len);
         for (captures.items, 0..) |capture_name, idx| {
+            // Type each capture field from the enclosing scope's declared
+            // type for that binding when known (a concrete type the
+            // codegen can lay out); fall back to `any` otherwise (the
+            // type checker then backfills the field type from the single
+            // construction site — see `backfillClosureFieldType`).
+            const field_type = self.capture_type_env.get(capture_name) orelse try self.anyTypeExpr(span);
             fields[idx] = .{
                 .meta = .{ .span = span },
                 .name = capture_name,
-                .type_expr = try self.anyTypeExpr(span),
+                .type_expr = field_type,
                 .default = null,
             };
         }

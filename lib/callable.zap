@@ -58,8 +58,8 @@ pub protocol Callable(args, result) {
     Invoke the callable with its arguments packed into the `args` tuple,
     returning a `result`. For a closure, `self` carries the captured
     environment and the body reads its parameters from the tuple slots
-    (`args.0`, `args.1`, ...).
+    (`arguments.0`, `arguments.1`, ...).
     """
 
-  fn call(self, args) -> result
+  fn call(self, arguments :: args) -> result
 }
