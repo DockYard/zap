@@ -8130,7 +8130,8 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Non-var_ref callee (lambda, etc.) — original path
+        // Non-var_ref callee (lambda, a `Callable` read out of a
+        // container/struct field/return, etc.) — original path.
         const callee_type = try self.inferExpr(call.callee);
         if (callee_type != TypeStore.UNKNOWN and callee_type != TypeStore.ERROR) {
             const ct = self.store.getType(callee_type);
@@ -8139,6 +8140,18 @@ pub const TypeChecker = struct {
                 const borrowed = try self.applyCallOwnership(call.args, ct.function);
                 defer self.endBorrowedBindings(borrowed) catch {};
                 return ct.function.return_type;
+            }
+            // A `Callable(args, result)` existential callee (a boxed
+            // closure read straight out of an expression — e.g.
+            // `List.get(ops, i)(v)`, `recv.field(v)`) is invoked through
+            // the protocol-box `call` slot: the call's type is the
+            // existential's `result` argument. HIR rewrites this to
+            // `Callable.call(callee, {args...})`. Mirrors the `var_ref`
+            // callee path above; without it a non-`var_ref` boxed-closure
+            // callee wrongly errors as a dynamic `Function` dispatch.
+            if (self.callableResultType(callee_type)) |result_type| {
+                for (call.args) |arg| _ = try self.inferExpr(arg);
+                return result_type;
             }
             if (self.isFirstClassFunctionStructType(callee_type)) {
                 try self.addHardError(

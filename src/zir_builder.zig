@@ -7338,6 +7338,44 @@ pub const ZirDriver = struct {
                     }
                 }
 
+                // A zero-field struct construction `%T{}` (a non-capturing
+                // closure's `__closure_N` has NO capture fields) must lower
+                // to `struct_init_empty`, NOT a zero-field `struct_init`:
+                // Sema's `zirStructInit` indexes the first (absent) field to
+                // read its type and panics on an empty field list. The
+                // dedicated `struct_init_empty` resolves the operand as the
+                // result type and yields an empty value of it. (Same fork
+                // primitive used for `zap_runtime.EmptyTuple{}`.) Typed to
+                // the struct so the boxed `Callable` `data_ptr` carries the
+                // correct nominal `__closure_N` identity. Closures can't
+                // resolve struct-level `decl_val` refs from inside their own
+                // environment, so an empty struct built INSIDE a closure body
+                // (a nested non-capturing closure) falls back to the anon
+                // empty struct.
+                if (values.items.len == 0) {
+                    const empty_struct = blk: {
+                        if (!self.current_function_is_closure) {
+                            if (self.findStructDef(si.type_name) != null) {
+                                if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
+                                    const typed = zir_builder_emit_struct_init_empty(self.handle, type_ref);
+                                    if (typed != error_ref) break :blk typed;
+                                }
+                            }
+                        }
+                        const anon = zir_builder_emit_struct_init_anon(self.handle, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, 0);
+                        break :blk anon;
+                    };
+                    if (empty_struct == error_ref) return error.EmitFailed;
+                    if (si.reuse_token) |_| _ = self.reuse_backed_struct_locals.remove(si.dest);
+                    if (self.isRecursiveStruct(si.type_name)) {
+                        const ptr_ref = try self.heapPromoteForIndirectField(empty_struct);
+                        try self.setLocal(si.dest, ptr_ref);
+                    } else {
+                        try self.setLocal(si.dest, empty_struct);
+                    }
+                    return;
+                }
+
                 if (si.reuse_token) |token_local| {
                     // Use struct_init_typed for named structs to preserve
                     // type identity. The `current_function_is_closure` guard

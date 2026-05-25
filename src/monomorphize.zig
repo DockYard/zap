@@ -532,6 +532,57 @@ const MonomorphContext = struct {
         };
     }
 
+    /// Like `isConcreteRuntimeType`, but a `protocol_constraint` existential
+    /// (`Callable({i64}, i64)`, `Error`) counts as concrete because it has a
+    /// fully-defined runtime representation — the `ProtocolBox` fat pointer.
+    ///
+    /// WHY a separate predicate (rather than flipping `isConcreteRuntimeType`):
+    /// `isConcreteRuntimeType` gates protocol-PARAMETER specialization
+    /// (`protocolParamConcreteType`, the effect/Enumerable paths), where a
+    /// bare existential param `e :: Error` must deliberately stay
+    /// box-dispatched and NOT pin to a concrete arg. That contract is
+    /// unchanged. This predicate is for the orthogonal question "is a derived
+    /// type ARGUMENT ready to monomorphize a generic container function?" —
+    /// e.g. `t -> Callable({i64}, i64)` when specializing `List.get` for a
+    /// `[fn(i64) -> i64]` (i.e. `List(ProtocolBox)`). The boxed element is a
+    /// concrete runtime type, so `List.get`/`List.set`/… MUST specialize for
+    /// it (otherwise the call resolves to an un-emitted generic
+    /// `List__get__2`). Containers recurse so `[fn(i64) -> i64]`'s element is
+    /// recognized as ready. A free `type_var` is still NOT ready.
+    fn typeArgIsMonomorphizationReady(self: *const MonomorphContext, type_id: TypeId) bool {
+        if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return false;
+        const typ = self.store.getType(type_id);
+        return switch (typ) {
+            .unknown, .error_type, .type_var => false,
+            // A boxed existential is concrete at runtime (ProtocolBox).
+            .protocol_constraint => true,
+            .list => |list_type| self.typeArgIsMonomorphizationReady(list_type.element),
+            .tuple => |tuple_type| {
+                for (tuple_type.elements) |element| {
+                    if (!self.typeArgIsMonomorphizationReady(element)) return false;
+                }
+                return true;
+            },
+            .function => |function_type| {
+                for (function_type.params) |param| {
+                    if (!self.typeArgIsMonomorphizationReady(param)) return false;
+                }
+                return self.typeArgIsMonomorphizationReady(function_type.return_type);
+            },
+            .map => |map_type| self.typeArgIsMonomorphizationReady(map_type.key) and
+                self.typeArgIsMonomorphizationReady(map_type.value),
+            .applied => |applied_type| {
+                if (!self.typeArgIsMonomorphizationReady(applied_type.base)) return false;
+                for (applied_type.args) |arg| {
+                    if (!self.typeArgIsMonomorphizationReady(arg)) return false;
+                }
+                return true;
+            },
+            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .term_type => true,
+            .struct_type, .union_type, .tagged_union, .opaque_type => true,
+        };
+    }
+
     fn resolveCallArgumentType(
         self: *const MonomorphContext,
         arg: hir.CallArg,
@@ -1122,10 +1173,15 @@ const MonomorphContext = struct {
                 // Skip if any type arg still contains type variables — this happens
                 // when scanning inside generic function bodies where args are unresolved.
                 // Creating such specializations produces bogus stubs (e.g. head__T).
+                // A boxed `protocol_constraint` existential (`Callable({i64},
+                // i64)` for a `[fn(i64) -> i64]` element) IS ready: it lowers
+                // to `ProtocolBox`, so a container generic like `List.get`
+                // must specialize for it. `typeArgIsMonomorphizationReady`
+                // accepts it while still rejecting genuine free type vars.
                 {
                     var has_unresolved_type = false;
                     for (type_args.items) |ta| {
-                        if (!self.isConcreteRuntimeType(ta)) {
+                        if (!self.typeArgIsMonomorphizationReady(ta)) {
                             has_unresolved_type = true;
                             break;
                         }

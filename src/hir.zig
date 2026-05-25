@@ -3189,7 +3189,7 @@ pub const HirBuilder = struct {
         var best_cost: u32 = std.math.maxInt(u32);
         var best_rank: u32 = std.math.maxInt(u32);
         for (family.clauses.items, 0..) |clause_ref, idx| {
-            const candidate = self.resolveClauseCallInfo(name, arity, resolved.declared_arity, clause_ref, @intCast(idx)) orelse continue;
+            const candidate = self.resolveClauseCallInfo(name, arity, resolved.declared_arity, clause_ref, @intCast(idx), args) orelse continue;
             const cost = self.callInfoMatchCost(candidate, args) orelse continue;
             if (best == null or cost < best_cost) {
                 best = candidate;
@@ -3205,7 +3205,7 @@ pub const HirBuilder = struct {
         }
 
         if (best) |resolved_call| return resolved_call;
-        return self.resolveClauseCallInfo(name, arity, resolved.declared_arity, family.clauses.items[0], 0);
+        return self.resolveClauseCallInfo(name, arity, resolved.declared_arity, family.clauses.items[0], 0, args);
     }
 
     /// Score a candidate by how "canonical" its parameter types are when the
@@ -3257,6 +3257,7 @@ pub const HirBuilder = struct {
         declared_arity: u32,
         clause_ref: scope_mod.FunctionClauseRef,
         family_clause_index: u32,
+        call_args: []const CallArg,
     ) ?ResolvedFunctionCall {
         if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
         const clause = clause_ref.decl.clauses[clause_ref.clause_index];
@@ -3282,7 +3283,25 @@ pub const HirBuilder = struct {
             final_param_types = param_types[0..arity];
             final_param_ownerships = param_ownerships[0..arity];
         }
-        const return_type = if (clause.return_type) |rt| self.resolveTypeExpr(rt) else types_mod.TypeStore.UNKNOWN;
+        var return_type = if (clause.return_type) |rt| self.resolveTypeExpr(rt) else types_mod.TypeStore.UNKNOWN;
+        // A generic clause whose return type still carries type variables
+        // (e.g. `List.get(list :: List(t), index) -> t`) must be specialized
+        // from the concrete argument types at the call site, not left as a
+        // bare `t`. Without this, `g = List.get(callable_list, i)` records
+        // `g`'s binding type as an unbound `type_var`, so the implicit-call
+        // rewrite (`rewriteCallableValueCall`) cannot see that `g` is a boxed
+        // `Callable` and the call wrongly falls to the legacy
+        // `{call_fn, env}` closure path. `substituteReturnTypeFromArgs`
+        // unifies the clause params against the arg types and applies the
+        // resulting substitution to the return type (so `t -> Callable({i64},
+        // i64)` for a `[fn(i64) -> i64]` element). This mirrors the
+        // `resolveGenericReturnType*` paths the non-`selected_call_info`
+        // branches already use; doing it here covers the
+        // `resolveCallInStruct`/`resolveCallInScope`-selected path that takes
+        // `info.return_type` verbatim.
+        if (self.type_store.containsTypeVars(return_type)) {
+            return_type = self.substituteReturnTypeFromArgs(&clause, call_args, return_type);
+        }
         _ = name;
         return .{
             .param_types = final_param_types,
@@ -5217,6 +5236,19 @@ pub const HirBuilder = struct {
                     return try self.buildExpr(rewritten);
                 }
 
+                // The same boxed-closure invocation but with a NON-`var_ref`
+                // callee — an expression that yields a `Callable` directly,
+                // e.g. an indexed read `List.get(ops, i)(v)` or a struct
+                // field read `recv.handler(v)`. The callee must be evaluated
+                // exactly once, so this binds it to a fresh local and lowers
+                // the implicit call against that local through the regular
+                // boxed-`Callable` dispatch path. Returns null for every
+                // non-`Callable` callee, leaving all other call shapes
+                // untouched.
+                if (try self.buildCallableNonVarRefCall(&call)) |built| {
+                    return built;
+                }
+
                 // Check for union variant constructor: Result.Ok("hello")
                 // Parsed as call(struct_ref(["Result", "Ok"]), args).
                 //
@@ -5845,10 +5877,29 @@ pub const HirBuilder = struct {
                     try elems.append(self.allocator, try self.buildExpr(elem));
                 }
                 const built_elems = try elems.toOwnedSlice(self.allocator);
-                const list_type_id = if (built_elems.len > 0)
-                    self.inferListElementType(built_elems)
-                else
-                    types_mod.TypeStore.UNKNOWN;
+                // When the list flows into a `[fn(A) -> B]` (i.e.
+                // `List(Callable({A}, B))`) expected position — a function
+                // return tail, a struct field default, an argument — the
+                // element type is the boxed `Callable` existential, NOT the
+                // structural unification of the element expressions. A
+                // heterogeneous closure list `[fn(x){...}, make_adder(5)]`
+                // mixes a synthesized `__closure_N` struct value with a
+                // `Callable` value; `inferListElementType` would collapse
+                // those distinct types to `Term`, producing `List(Term)`
+                // where `List(Callable)` is required. Adopting the expected
+                // `Callable` element keeps the list homogeneous in
+                // `ProtocolBox`; the IR `list_init` boxing wraps each element
+                // (closure struct or Callable) into the existential.
+                const list_type_id = blk: {
+                    if (self.expectedListCallableElementType()) |callable_elem| {
+                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                        break :blk store_ptr.addType(.{ .list = .{ .element = callable_elem } }) catch types_mod.TypeStore.UNKNOWN;
+                    }
+                    break :blk if (built_elems.len > 0)
+                        self.inferListElementType(built_elems)
+                    else
+                        types_mod.TypeStore.UNKNOWN;
+                };
                 return try self.create(Expr, .{
                     .kind = .{ .list_init = built_elems },
                     .type_id = list_type_id,
@@ -7469,6 +7520,27 @@ pub const HirBuilder = struct {
         return expected;
     }
 
+    /// If the current expected type is a `List(Callable(...))` — i.e. a
+    /// `[fn(A) -> B]` slot — return its `Callable` element TypeId; otherwise
+    /// null. Used so a list literal flowing into such a slot adopts the boxed
+    /// `Callable` element type instead of the structural unification of its
+    /// element expressions (which would degrade a mixed closure list to
+    /// `List(Term)`).
+    fn expectedListCallableElementType(self: *const HirBuilder) ?types_mod.TypeId {
+        if (self.expected_type_stack.items.len == 0) return null;
+        const expected = self.expected_type_stack.items[self.expected_type_stack.items.len - 1];
+        if (expected == types_mod.TypeStore.UNKNOWN) return null;
+        if (expected >= self.type_store.types.items.len) return null;
+        const expected_typ = self.type_store.getType(expected);
+        if (expected_typ != .list) return null;
+        const elem = expected_typ.list.element;
+        if (elem >= self.type_store.types.items.len) return null;
+        const elem_typ = self.type_store.getType(elem);
+        if (elem_typ != .protocol_constraint) return null;
+        if (!std.mem.eql(u8, self.interner.get(elem_typ.protocol_constraint.protocol_name), "Callable")) return null;
+        return elem;
+    }
+
     fn internDottedStructName(self: *HirBuilder, name: ast.StructName) !ast.StringId {
         if (name.parts.len == 0) return 0;
         if (name.parts.len == 1) return name.parts[0];
@@ -7504,6 +7576,86 @@ pub const HirBuilder = struct {
             if (self.structNamesEqual(entry.name, name)) return true;
         }
         return false;
+    }
+
+    /// Boxed-`Callable` invocation with a NON-`var_ref` callee — an
+    /// expression that directly yields a `Callable(args, result)`
+    /// existential (an indexed list read `List.get(ops, i)(v)`, a struct
+    /// field read `recv.handler(v)`, etc.). Returns null when the callee is
+    /// a `var_ref` (handled by `rewriteCallableValueCall`) or its built type
+    /// is not a `Callable` existential, so every other call shape is left to
+    /// the normal path.
+    ///
+    /// The callee expression is built ONCE and bound to a fresh synthetic
+    /// local (`__callable_recv_N`); the implicit call then lowers against
+    /// that local through the ordinary boxed-`Callable` dispatch (the
+    /// `var_ref` rewrite). Binding first guarantees single evaluation — re-
+    /// lowering the original callee AST would run any side effects (the
+    /// `List.get` read) twice. The result is a HIR block whose tail is the
+    /// dispatched call.
+    fn buildCallableNonVarRefCall(self: *HirBuilder, call: *const ast.CallExpr) anyerror!?*const Expr {
+        // A `var_ref` callee is the `rewriteCallableValueCall` path; a
+        // dotted call (`Mod.f(...)`) is a static function/struct-method
+        // call, never a first-class closure value. Only an expression that
+        // computes a value — a `.call` (e.g. `List.get(...)`) or a
+        // `.field_access` reading a closure-typed field — can be a boxed
+        // `Callable` callee here.
+        switch (call.callee.*) {
+            .call, .field_access => {},
+            else => return null,
+        }
+
+        // Build the callee once so we can read its resolved type and bind it.
+        const built_callee = try self.buildExpr(call.callee);
+        const callee_type_id = built_callee.type_id;
+        if (callee_type_id == types_mod.TypeStore.UNKNOWN) return null;
+        if (callee_type_id >= self.type_store.types.items.len) return null;
+        const callee_type = self.type_store.getType(callee_type_id);
+        if (callee_type != .protocol_constraint) return null;
+        if (!std.mem.eql(u8, self.interner.get(callee_type.protocol_constraint.protocol_name), "Callable")) return null;
+
+        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+        const span = call.meta.span;
+
+        // Fresh synthetic local + binding for the receiver. The unique
+        // counter keeps nested indexed-calls (`fs.get(0)(1)(2)`) distinct.
+        const recv_local = self.next_local;
+        self.next_local += 1;
+        const recv_name_text = try std.fmt.allocPrint(self.allocator, "__callable_recv_{d}", .{recv_local});
+        const recv_name_id = try interner_mut.intern(recv_name_text);
+
+        // `__callable_recv_N = <callee>` — single evaluation of the callee.
+        const recv_set: Stmt = .{ .local_set = .{ .index = recv_local, .value = built_callee, .name = recv_name_id } };
+
+        // Make the receiver resolvable as a `Callable`-typed binding for the
+        // duration of the inner-call build, then restore so it does not leak.
+        const bindings_base = self.current_assignment_bindings.items.len;
+        try self.current_assignment_bindings.append(self.allocator, .{
+            .name = recv_name_id,
+            .local_index = recv_local,
+            .type_id = callee_type_id,
+        });
+        defer self.current_assignment_bindings.shrinkRetainingCapacity(bindings_base);
+
+        // `__callable_recv_N(args)` — a `var_ref` implicit call that the
+        // boxed-`Callable` dispatch rewrites to `Callable.call(recv, {args})`.
+        const recv_ref = try self.create(ast.Expr, .{
+            .var_ref = .{ .meta = .{ .span = span }, .name = recv_name_id },
+        });
+        const inner_call_ast = try self.create(ast.Expr, .{
+            .call = .{ .meta = .{ .span = span }, .callee = recv_ref, .args = call.args },
+        });
+        const inner_call = try self.buildExpr(inner_call_ast);
+
+        const stmts = try self.allocator.alloc(Stmt, 2);
+        stmts[0] = recv_set;
+        stmts[1] = .{ .expr = inner_call };
+        const block = try self.create(Block, .{ .stmts = stmts, .result_type = inner_call.type_id });
+        return try self.create(Expr, .{
+            .kind = .{ .block = block.* },
+            .type_id = inner_call.type_id,
+            .span = span,
+        });
     }
 
     /// If `call`'s callee is a value statically typed as a
