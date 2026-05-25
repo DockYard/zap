@@ -3733,7 +3733,8 @@ pub const TypeChecker = struct {
         // still gated on actual invocation, so a captured-but-not-invoked
         // closure adds no spurious `raises` to THIS function.
         if (!self.closureParamInvokedInBody(body, param_name) and
-            !self.closureParamCapturedIntoNestedClosure(body, param_name))
+            !self.closureParamCapturedIntoNestedClosure(body, param_name) and
+            !self.closureParamStoredIntoAggregate(body, param_name))
         {
             return param_type;
         }
@@ -3773,6 +3774,125 @@ pub const TypeChecker = struct {
             }
         }
         return false;
+    }
+
+    /// True when `param_name` is stored DIRECTLY as a field/element value of a
+    /// NON-closure aggregate literal reachable from `body` — a user struct
+    /// (`%Holder{op: f}`), list (`[f]`), map (`%{:k => f}`), or tuple
+    /// (`{f, g}`). Such a store makes the aggregate a persistent owner of the
+    /// boxed closure (its drop deep-releases the boxed field/element), so the
+    /// higher-order parameter must take the BOXED `Callable` representation
+    /// (`ProtocolBox`) — there is no devirtualized aggregate-member
+    /// representation for a `fn`-typed field/element. Making the param
+    /// representation-polymorphic here lets the monomorphizer re-stamp it to
+    /// the boxed `Callable` (`boxedCallableRepresentationForParam`) for a
+    /// boxed-closure argument, and the IR aggregate-store then clone-on-shares
+    /// it into an independent owner. A `__closure_N` env-struct field value is
+    /// the nested-capture case (`closureParamCapturedIntoNestedClosure`), so
+    /// only NON-closure aggregates count here. A bare param REFERENCE returned
+    /// as the function's value (`return f` / `f` as the last statement) is
+    /// also an escape — the caller receives the boxed closure — detected via
+    /// the return-tail check.
+    fn closureParamStoredIntoAggregate(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
+        for (body, 0..) |stmt, stmt_index| {
+            switch (stmt) {
+                .expr => |expr| {
+                    if (self.exprStoresParamIntoAggregate(expr, param_name)) return true;
+                    // Return-tail escape: a bare `param_name` reference as the
+                    // function's trailing expression returns the boxed closure
+                    // to the caller — the same boxed representation a returned
+                    // closure literal takes.
+                    if (stmt_index == body.len - 1 and self.exprIsBareVarRef(expr, param_name)) return true;
+                },
+                .assignment => |assign| if (self.exprStoresParamIntoAggregate(assign.value, param_name)) return true,
+                .attribute => |attr| {
+                    if (attr.value) |value| {
+                        if (self.exprStoresParamIntoAggregate(value, param_name)) return true;
+                    }
+                },
+                .function_decl, .macro_decl, .import_decl => {},
+            }
+        }
+        return false;
+    }
+
+    /// True iff `expr` is exactly a bare `var_ref` to `name` (after peeling a
+    /// `paren`/`type_annotated` wrapper). Used for the return-tail escape.
+    fn exprIsBareVarRef(self: *const TypeChecker, expr: *const ast.Expr, name: ast.StringId) bool {
+        return switch (expr.*) {
+            .var_ref => |vr| vr.name == name,
+            .type_annotated => |ta| self.exprIsBareVarRef(ta.expr, name),
+            else => false,
+        };
+    }
+
+    /// Walk `expr` for a NON-closure aggregate literal (user `struct_expr`,
+    /// `list`, `map`, `tuple`) that has `param_name` as a DIRECT field/element
+    /// value. Recurses through ordinary sub-expression structure to reach
+    /// nested aggregates.
+    fn exprStoresParamIntoAggregate(self: *const TypeChecker, expr: *const ast.Expr, param_name: ast.StringId) bool {
+        switch (expr.*) {
+            .struct_expr => |se| {
+                const is_closure_env = se.struct_name.parts.len > 0 and
+                    self.isClosureStructName(se.struct_name.parts[se.struct_name.parts.len - 1]);
+                if (!is_closure_env) {
+                    for (se.fields) |field| if (self.exprIsBareVarRef(field.value, param_name)) return true;
+                }
+                if (se.update_source) |source| if (self.exprStoresParamIntoAggregate(source, param_name)) return true;
+                for (se.fields) |field| if (self.exprStoresParamIntoAggregate(field.value, param_name)) return true;
+                return false;
+            },
+            .list => |l| {
+                for (l.elements) |elem| if (self.exprIsBareVarRef(elem, param_name)) return true;
+                for (l.elements) |elem| if (self.exprStoresParamIntoAggregate(elem, param_name)) return true;
+                return false;
+            },
+            .list_cons_expr => |lce| {
+                if (self.exprIsBareVarRef(lce.head, param_name)) return true;
+                return self.exprStoresParamIntoAggregate(lce.head, param_name) or
+                    self.exprStoresParamIntoAggregate(lce.tail, param_name);
+            },
+            .tuple => |t| {
+                for (t.elements) |elem| if (self.exprIsBareVarRef(elem, param_name)) return true;
+                for (t.elements) |elem| if (self.exprStoresParamIntoAggregate(elem, param_name)) return true;
+                return false;
+            },
+            .map => |m| {
+                for (m.fields) |field| if (self.exprIsBareVarRef(field.value, param_name)) return true;
+                for (m.fields) |field| {
+                    if (self.exprStoresParamIntoAggregate(field.key, param_name)) return true;
+                    if (self.exprStoresParamIntoAggregate(field.value, param_name)) return true;
+                }
+                return false;
+            },
+            .call => |call| {
+                if (self.exprStoresParamIntoAggregate(call.callee, param_name)) return true;
+                for (call.args) |arg| if (self.exprStoresParamIntoAggregate(arg, param_name)) return true;
+                return false;
+            },
+            .binary_op => |bo| return self.exprStoresParamIntoAggregate(bo.lhs, param_name) or self.exprStoresParamIntoAggregate(bo.rhs, param_name),
+            .unary_op => |uo| return self.exprStoresParamIntoAggregate(uo.operand, param_name),
+            .field_access => |fa| return self.exprStoresParamIntoAggregate(fa.object, param_name),
+            .pipe => |pipe| return self.exprStoresParamIntoAggregate(pipe.lhs, param_name) or self.exprStoresParamIntoAggregate(pipe.rhs, param_name),
+            .unwrap => |uw| return self.exprStoresParamIntoAggregate(uw.expr, param_name),
+            .type_annotated => |ta| return self.exprStoresParamIntoAggregate(ta.expr, param_name),
+            .if_expr => |ie| {
+                if (self.exprStoresParamIntoAggregate(ie.condition, param_name)) return true;
+                for (ie.then_block) |stmt| if (self.stmtStoresParamIntoAggregate(stmt, param_name)) return true;
+                if (ie.else_block) |eb| for (eb) |stmt| if (self.stmtStoresParamIntoAggregate(stmt, param_name)) return true;
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn stmtStoresParamIntoAggregate(self: *const TypeChecker, stmt: ast.Stmt, param_name: ast.StringId) bool {
+        return switch (stmt) {
+            .expr => |expr| self.exprStoresParamIntoAggregate(expr, param_name),
+            .assignment => |assign| self.exprStoresParamIntoAggregate(assign.value, param_name),
+            .attribute => |attr| if (attr.value) |value| self.exprStoresParamIntoAggregate(value, param_name) else false,
+            .function_decl, .macro_decl, .import_decl => false,
+        };
     }
 
     /// Walk `expr` for a nested `anonymous_function` whose body references

@@ -133,5 +133,22 @@ pub struct Zap.ClosureBoxedTest {
         assert(hi("hi") == "hi alice")
       }
     }
+
+    test("borrowed boxed-closure stored into a list is balanced (no leak)") {
+      # FCC Phase 3 residual 5 (project-mode) — a locally-bound boxed closure
+      # (`add5`) that survives is stored into a list (an owning aggregate)
+      # AND used again. The list-store must clone-on-share the box into an
+      # independent inner; before the fix the list-drop double-freed the
+      # surviving binding's box under `Memory.Tracking`. Each owning path —
+      # the surviving `add5` binding and the list's clone — drops exactly
+      # once; net live-allocation delta is zero.
+      assert_no_leaks {
+        add5 = Zap.ClosureFactory.make_adder(5)
+        held = [add5]
+        picked = List.get(held, 0)
+        assert(picked(10) == 15)
+        assert(add5(100) == 105)
+      }
+    }
   }
 }

@@ -3155,6 +3155,19 @@ pub fn defaultParamConvention(
     const store = type_store orelse return .trivial;
     const tid = type_id orelse return .trivial;
     if (isArcManagedTypeId(store, tid)) return .borrowed;
+    // FCC unified model: a boxed `Callable({A}, R)` parameter is genuinely a
+    // borrowed `ProtocolBox` (the caller owns it across the call), so it is
+    // `.borrowed`, NOT `.trivial`. The type-level `isArcManagedTypeId`
+    // deliberately classifies a parametric `protocol_constraint` as
+    // NOT-ARC-managed (the devirtualized `Enumerable(element)` V11 contract),
+    // so a `Callable` param — which is ALWAYS boxed (there is no devirtualized
+    // param representation; the monomorphizer re-stamps an escaping/captured
+    // higher-order param to the boxed `Callable`) — must be recognised here.
+    // Keyed precisely on the `Callable` protocol name so a devirtualized
+    // `Enumerable` param stays `.trivial` (no V11 regression). Without this a
+    // `copy_value`/clone-on-share of a boxed-`Callable` arg into an owning
+    // aggregate would read a `.trivial` source and trip ARC verifier V11.
+    if (protocolConstraintIsBoxedCallable(store, tid)) return .borrowed;
     return .trivial;
 }
 
@@ -11887,6 +11900,120 @@ pub const IrBuilder = struct {
         return box_dest;
     }
 
+    /// FCC unified model — clone-on-share a boxed `Callable` value flowing
+    /// into an OWNING aggregate slot (a struct field, closure-env field,
+    /// list/cons element, map value, or union payload) when the value is a
+    /// REFERENCE to an existing binding rather than a fresh single-use
+    /// construction.
+    ///
+    /// A boxed `Callable` stored into an owning aggregate makes the aggregate
+    /// a genuine NEW OWNER of the box: the aggregate's drop deep-releases the
+    /// boxed field (via `structTypeHasArcManagedField` / the box-in-container
+    /// deep-release walk). So the box stored there must be an INDEPENDENT
+    /// owner, exactly as a binding alias (`g = box`) is:
+    ///   * a no-REFCOUNT_V1 manager gets an independent inner CLONE (the
+    ///     aggregate-drop frees the clone, the source binding/param frees the
+    ///     original — no double-free under `Memory.Tracking`);
+    ///   * a refcount manager bumps the inner's refcount.
+    /// This is the SAME `.protocol_box_share` clone-on-share that
+    /// `RetainKind.protocol_box_share` documents for "a box stashed into a
+    /// struct field"; it was previously only emitted for binding aliases.
+    ///
+    /// The move-vs-clone discriminator is the SOURCE EXPRESSION KIND, which
+    /// is exact and needs no use-count lookahead:
+    ///   * a binding REFERENCE (`local_get` / `param_get` / `capture_get`)
+    ///     reads a box another owner (the binding or the borrowed param)
+    ///     still holds, so the aggregate must clone — otherwise it aliases
+    ///     and double-frees the source's inner.
+    ///   * any OTHER expression (a call producing a fresh box, an inline
+    ///     closure literal, a freshly-boxed concrete struct) is a fresh
+    ///     single-use owner whose ownership transfers (moves) cleanly into
+    ///     the aggregate — no clone (the `#201`/Gap-E and fresh-box-in-list
+    ///     paths, which already balance, are untouched).
+    ///
+    /// Returns the LocalId to store into the aggregate: the fresh clone owner
+    /// when a clone was emitted, otherwise `value_local` unchanged. Boxing of
+    /// a concrete struct value is applied first via `maybeBoxAsProtocol`, so
+    /// callers pass the raw field/element value and the field/element's
+    /// expected ZigType.
+    fn boxedCallableAggregateOwnerLocal(
+        self: *IrBuilder,
+        value_local: LocalId,
+        value_expr: *const hir_mod.Expr,
+        expected_zig_type: ZigType,
+    ) anyerror!LocalId {
+        const boxed_local = try self.maybeBoxAsProtocol(value_local, expected_zig_type);
+
+        // Only a boxed `Callable` existential needs the aggregate-owner clone.
+        // A devirtualized `.function` closure (the #201/Gap-E direct path) is
+        // a bare code pointer with no heap inner — nothing to clone or
+        // double-free. A non-`Callable` protocol box (`Error`) reaches owning
+        // aggregates through its own already-correct ownership paths.
+        const boxed_zig = self.known_local_types.get(boxed_local) orelse return boxed_local;
+        if (boxed_zig != .protocol_box) return boxed_local;
+        if (!std.mem.eql(u8, self.baseProtocolName(boxed_zig.protocol_box), "Callable")) return boxed_local;
+
+        // A fresh single-use box (any non-reference expression) moves into the
+        // aggregate; only a reference to an existing binding/param must clone.
+        const is_binding_reference = switch (value_expr.kind) {
+            .local_get, .param_get, .capture_get => true,
+            else => false,
+        };
+        if (!is_binding_reference) return boxed_local;
+
+        // The clone's `copy_value` reads the source box, so ARC-verifier V11
+        // requires the SOURCE local to be ARC-classified (non-`.trivial`). A
+        // boxed-`Callable` PARAMETER is already `.borrowed` (its
+        // `defaultParamConvention` was taught the `Callable` exception); a
+        // boxed-`Callable` LOCAL binding (a `g = make_adder(5)` alias whose
+        // box value is read again here) must be recognised as a box OWNER.
+        // The latter is normally propagated into `boxed_existential_locals`
+        // through `emitLocalGet`, but a read whose source-tracking did not
+        // carry the marker (the daemon/Zest merged-store path) can leave it
+        // `.trivial`. Record the source defensively when it is NOT param-
+        // backed — a non-param boxed-`Callable` local that owns its inner is
+        // `.owned`; a param read stays `.borrowed` (never promoted to an
+        // owner, which would double-free with the caller).
+        if (!self.param_backed_locals.contains(boxed_local)) {
+            try self.boxed_existential_locals.put(self.allocator, boxed_local, {});
+        }
+
+        // Materialize an independent owner: copy the 16-byte `ProtocolBox`
+        // value into a fresh local, then emit a `.protocol_box_share` retain
+        // that REBINDS the fresh local to a clone (no-refcount) / refcount
+        // bump (refcount) — leaving the source binding/param's box untouched.
+        const clone_local = self.next_local;
+        self.next_local += 1;
+        try self.current_instrs.append(self.allocator, .{
+            .copy_value = .{ .dest = clone_local, .source = boxed_local },
+        });
+        try self.current_instrs.append(self.allocator, .{
+            .retain = .{
+                .value = clone_local,
+                .kind = .protocol_box_share,
+                .protocol_name = try cloneBytes(self.allocator, boxed_zig.protocol_box),
+            },
+        });
+        try self.known_local_types.put(clone_local, boxed_zig);
+        if (self.local_hir_types.get(boxed_local)) |hir_type| {
+            try self.local_hir_types.put(clone_local, hir_type);
+        }
+        // The clone is a genuinely-boxed existential OWNER (it owns the cloned
+        // inner). Record it in `boxed_existential_locals` (ZigType-gated to
+        // `.protocol_box`) so `isArcManagedLocal` classifies it `.owned` —
+        // both for ARC-verifier V11 (the `copy_value` dest must be non-
+        // `.trivial`) and so the aggregate-store-consumes rule in
+        // `arc_liveness.applyOwnsEffect` clears its owns bit AT THE
+        // struct_init/list_init/union_init store (the aggregate takes
+        // ownership). The clone therefore gets NO separate scope-exit drop;
+        // the enclosing aggregate's drop deep-releases the boxed field/element
+        // exactly once. This mirrors a fresh `box_as_protocol` dest moved into
+        // an aggregate — the only difference is the clone's inner is a copy of
+        // the borrowed source's, not a freshly-constructed one.
+        try self.boxed_existential_locals.put(self.allocator, clone_local, {});
+        return clone_local;
+    }
+
     /// Resolve the BASE protocol name from a vtable-family name carried by
     /// a `.protocol_box` ZigType. A BARE protocol's family name IS its
     /// name (`Error` -> `Error`). A PARAMETRIC protocol's family name is
@@ -12906,11 +13033,16 @@ pub const IrBuilder = struct {
                 // existential (`[fn(i64) -> i64]` -> `[Callable(...)]`),
                 // box each concrete element value (a `%__closure_N` struct
                 // or any other concrete `impl Callable` value) into the
-                // existential so the list is homogeneous. `maybeBoxAsProtocol`
-                // is a no-op for an element already boxed.
+                // existential so the list is homogeneous. A list is an OWNING
+                // aggregate, so a boxed `Callable` element REFERENCED from an
+                // existing binding/param is clone-on-shared into an
+                // independent owner (the list-drop deep-releases its own
+                // clone, the source binding/param frees the original); a fresh
+                // boxed element moves in. `maybeBoxAsProtocol` is a no-op for
+                // an element already boxed.
                 if (elem_type == .protocol_box) {
-                    for (elements) |*elem_local| {
-                        elem_local.* = try self.maybeBoxAsProtocol(elem_local.*, elem_type);
+                    for (elements, elems) |*elem_local, elem_expr| {
+                        elem_local.* = try self.boxedCallableAggregateOwnerLocal(elem_local.*, elem_expr, elem_type);
                     }
                 }
                 try self.current_instrs.append(self.allocator, .{
@@ -12920,12 +13052,19 @@ pub const IrBuilder = struct {
                 try self.known_local_types.put(dest, list_zig_type);
             },
             .list_cons => |lc| {
-                const head = try self.lowerExpr(lc.head);
+                var head = try self.lowerExpr(lc.head);
                 const tail = try self.lowerExpr(lc.tail);
                 const fallback_elem_type = self.listElementTypeFromTailLocal(tail) orelse
                     self.listElementTypeFromLocal(head);
                 const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type orelse .any);
                 if (elem_type == .any and fallback_elem_type == null) return error.ListElementTypeUnavailable;
+                // FCC unified model: a cons cell is an OWNING aggregate slot
+                // for its head, so a boxed `Callable` head REFERENCED from an
+                // existing binding/param is clone-on-shared into an
+                // independent owner (a fresh boxed head moves in unchanged).
+                if (elem_type == .protocol_box) {
+                    head = try self.boxedCallableAggregateOwnerLocal(head, lc.head, elem_type);
+                }
                 try self.current_instrs.append(self.allocator, .{
                     .list_cons = .{ .dest = dest, .head = head, .tail = tail, .element_type = elem_type },
                 });
@@ -13058,7 +13197,12 @@ pub const IrBuilder = struct {
                     var val = try self.lowerExpr(field.value);
                     const field_name_str = self.interner.get(field.name);
                     if (self.fieldZigTypeAndStorage(struct_type_name, field_name_str)) |field_info| {
-                        val = try self.maybeBoxAsProtocol(val, field_info.type_expr);
+                        // FCC unified model: a struct field (incl. a
+                        // closure-env capture field) is an OWNING aggregate
+                        // slot, so a boxed `Callable` REFERENCED from an
+                        // existing binding/param is clone-on-shared into an
+                        // independent owner; a fresh boxed value moves in.
+                        val = try self.boxedCallableAggregateOwnerLocal(val, field.value, field_info.type_expr);
                     }
                     try ir_fields.append(self.allocator, .{
                         .name = field_name_str,
@@ -13148,7 +13292,11 @@ pub const IrBuilder = struct {
                 // implementing P, wrap the value in a
                 // `runtime.ProtocolBox` via `box_as_protocol`.
                 if (self.variantPayloadZigTypeByName(type_name, variant_name_str)) |variant_payload_type| {
-                    value_local = try self.maybeBoxAsProtocol(value_local, variant_payload_type);
+                    // FCC unified model: a tagged-union payload is an OWNING
+                    // aggregate slot, so a boxed `Callable` payload REFERENCED
+                    // from an existing binding/param is clone-on-shared into an
+                    // independent owner; a fresh boxed payload moves in.
+                    value_local = try self.boxedCallableAggregateOwnerLocal(value_local, ui.value, variant_payload_type);
                 }
                 try self.current_instrs.append(self.allocator, .{
                     .union_init = .{
@@ -13367,7 +13515,17 @@ pub const IrBuilder = struct {
                 }
                 for (entries) |entry| {
                     const key = try self.lowerExpr(entry.key);
-                    const value = try self.lowerExpr(entry.value);
+                    var value = try self.lowerExpr(entry.value);
+                    // FCC unified model: a map is an OWNING aggregate slot for
+                    // its values, so a boxed `Callable` value REFERENCED from
+                    // an existing binding/param is clone-on-shared into an
+                    // independent owner; a fresh boxed value moves in. (A
+                    // `Map(Atom, fn(i64) -> i64)` value type lowers to
+                    // `.protocol_box(Callable_…)` via the residual-4 type
+                    // flow.)
+                    if (value_type == .protocol_box) {
+                        value = try self.boxedCallableAggregateOwnerLocal(value, entry.value, value_type);
+                    }
                     try ir_entries.append(self.allocator, .{ .key = key, .value = value });
                 }
                 try self.current_instrs.append(self.allocator, .{

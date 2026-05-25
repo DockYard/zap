@@ -2409,6 +2409,26 @@ const Analyzer = struct {
                     if (self.local_to_arc_index.get(ui.dest)) |idx| owns.set(idx);
                 }
             },
+            // FCC unified model: `box_as_protocol` CONSUMES its source value
+            // — the box `allocAny`'s the inner into a heap cell and claims
+            // ownership of it (the box's `__drop__` deep-releases the inner at
+            // refcount-zero). So the source local's ownership transfers to the
+            // box exactly as an aggregate-init operand's does: clear the
+            // source's owns bit (otherwise its scope-exit `.release` would
+            // deep-release the boxed inner the box ALSO owns — a double-free
+            // under `Memory.Tracking` when the inner is itself an ARC value,
+            // e.g. a closure env capturing another boxed `Callable`), then set
+            // the box dest's owns bit (the box is the new owner whose own
+            // scope-exit `.protocol_box_drop` is accounted for at its
+            // consumer). Mirrors `struct_init`/`union_init`. Matches the
+            // `arc_ownership.zig` rule that records the box source as an
+            // aggregate-store (consuming) use.
+            .box_as_protocol => |bx| {
+                self.clearOwnsForLocalAndAliases(bx.value, owns, consumed_owned_param_slots);
+                if (bx.dest < local_ownership.len and local_ownership[bx.dest] == .owned) {
+                    if (self.local_to_arc_index.get(bx.dest)) |idx| owns.set(idx);
+                }
+            },
             // Phase H.5: when a non-tail call targets a callee whose
             // matching `param_conventions[i]` is `.owned`, the callee
             // consumes the i-th arg local — its scope-exit drop is

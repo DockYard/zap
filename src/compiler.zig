@@ -9313,6 +9313,15 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
             .list_init => |li| std.debug.print(" dest={d}", .{li.dest}),
             .list_cons => |lc| std.debug.print(" dest={d} head={d} tail={d}", .{ lc.dest, lc.head, lc.tail }),
             .optional_dispatch => |od| std.debug.print(" scrutinee_param={d} payload_local={d}", .{ od.scrutinee_param, od.payload_local }),
+            .struct_init => |si| {
+                std.debug.print(" dest={d} type={s} fields=[", .{ si.dest, si.type_name });
+                for (si.fields, 0..) |f, fi| {
+                    if (fi > 0) std.debug.print(",", .{});
+                    std.debug.print("{s}=%{d}", .{ f.name, f.value });
+                }
+                std.debug.print("]", .{});
+            },
+            .box_as_protocol => |bp| std.debug.print(" dest={d} value={d} protocol={s}", .{ bp.dest, bp.value, bp.protocol_name }),
             else => {},
         }
         std.debug.print("\n", .{});
