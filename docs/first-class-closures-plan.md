@@ -68,8 +68,23 @@ aborts). Pure closures stay pure.
    naming function types for clean return-position syntax).
 3. **Bare function pointer is the devirtualized representation of `Callable`**
    (Option A — minimal churn, how Gap E already works) — not a separate type.
-4. **`callCallableN` is deleted** once the boxed `protocol_dispatch` path subsumes it
-   (no dead code per CLAUDE.md).
+4. **`callCallableN` is RETAINED — the dispatch audit (Phase 3 close-out)
+   corrected this.** It is NOT subsumed by the boxed `protocol_dispatch` path:
+   `callCallableN` is the zero-overhead DEVIRTUALIZED capturing path for a
+   parameter-derived closure whose runtime value is a bare fn-ptr OR a
+   non-escaping `{call_fn, env}` STACK struct (comptime-discriminated in
+   `runtime.zig`). `protocol_dispatch` only handles BOXED `Callable`
+   existentials (escaping/heterogeneous/stored), which never reach
+   `call_closure` (intercepted by `ir.lowerBoxedCallableInvocation`). Deleting
+   `callCallableN` would force boxing of every non-escaping capturing callback
+   and regress perf. Empirical reachability proof (per-branch ZAP_DISPATCH_TRACE
+   counters across the full corpus + script fixtures + unit tests) confirmed all
+   three named mechanisms (`isParamDerivedClosure`/`callCallableN`,
+   `callee_is_bare_fn_value` Gap E, `closure_function_map`/`{call_fn,env}`
+   destructure) are LIVE, each serving a distinct reachable representation. The
+   ONLY genuinely-dead code found and removed was the unused `findClosureTarget`
+   wrapper. The final 3-representation architecture is documented at the
+   `call_closure` dispatch site in `src/zir_builder.zig`.
 
 ## Phases (dependency order 0 → 5)
 

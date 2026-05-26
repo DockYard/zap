@@ -14,16 +14,20 @@
 # specialization. Fixed in src/monomorphize.zig (scanExpr + rewriteExpr now
 # descend into `call.target.closure`).
 #
-# NOTE: kept as a `zap run` fixture (NOT corpus-promoted) because BINDING the
-# boxed-`Callable` value-call RESULT and then comparing it
-# (`r = List.get(ops, 0)(v); assert(r == N)`) fails in PROJECT mode (`zap test`)
-# with `comparison of comptime_int with null` — the daemon does not resolve a
-# bound boxed-`Callable` value-call result to its concrete `result` type. That
-# is the SAME pre-existing project-mode value-call-result-type-flow gap that
-# keeps `map_of_fns.zap` (the `Map(_, Callable)` RETURN type) a `zap run`
-# fixture; the `zap run` script pipeline resolves the value-call result type,
-# the project-mode daemon does not yet. (A Phase-5 daemon value-call-result
-# resolution effort, shared with the Map-return gap.)
+# RESOLVED (FCC Phase 3 close-out): BINDING a boxed-`Callable` value-call RESULT
+# and comparing it (`r = List.get(ops, 0)(v); assert(r == N)`) now works in
+# PROJECT mode. The daemon value-call-result-type gap (`comparison of
+# comptime_int with null`) was rooted in the quoted-AST decoder
+# (`src/ast_data.zig` `ctValueToExpr`) collapsing a NESTED value-call callee to
+# `nil` inside a Zest macro body; the general nested-call-callee decode arm +
+# the `.closure`-target return-type resolution (`src/hir.zig`) fixed it. The
+# COMPARED form is now corpus-promoted as `test/zap/closure_boxed_inline_test.zap`
+# (both the inline `List.get(ops, i)(v) == N` and the bound `r = ...; r == N`
+# forms). The `Map(_, Callable)` / `[Callable]` RETURN type (the shared
+# sibling gap) is likewise resolved and corpus-promoted as
+# `test/zap/closure_container_return_test.zap` (fn->`Callable` container-element
+# redirect + `typeEqualsModuloCallable`). This fixture stays a `zap run`
+# fixture to keep the script-mode path covered too.
 
 pub struct AdderMaker {
   pub fn make_adder(n :: i64) -> fn(i64) -> i64 {
