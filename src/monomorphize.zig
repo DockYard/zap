@@ -330,7 +330,20 @@ const MonomorphContext = struct {
         param_type: TypeId,
         arg_type: TypeId,
     ) ?TypeId {
-        if (!self.isConcreteRuntimeType(arg_type)) return null;
+        // A collection whose element is a boxed `Callable` existential
+        // (`[fn(i64) -> i64]` = `List(ProtocolBox)`) is a fully-defined
+        // runtime type, so a parametric protocol parameter like
+        // `Enumerable(element)` MUST bind `element = Callable` for it and
+        // specialize — exactly as it does for `[i64]`. `isConcreteRuntimeType`
+        // deliberately rejects a `protocol_constraint` element to keep the
+        // bare-existential-PARAM (`e :: Error`) non-specialization rule, which
+        // the `type_params.len == 0` guard below still enforces independently.
+        // `typeArgIsMonomorphizationReady` accepts the boxed element while
+        // still rejecting genuine free type variables. This is the same path
+        // `[i64]` already takes; only the readiness predicate widens, so the
+        // `Enumerable` devirtualization contract for non-closure lists is
+        // untouched (the bound `element` stays `i64`/`String` there).
+        if (!self.typeArgIsMonomorphizationReady(arg_type)) return null;
 
         const param_typ = self.store.getType(param_type);
         if (param_typ != .protocol_constraint) return null;
@@ -366,7 +379,12 @@ const MonomorphContext = struct {
 
             for (constraint.protocol_constraint.type_params, impl_info.protocol_type_args) |constraint_arg, impl_arg| {
                 const concrete_protocol_arg = impl_subs.applyToType(self.store, impl_arg);
-                if (!self.isConcreteRuntimeType(concrete_protocol_arg)) continue;
+                // A boxed `Callable` element is monomorphization-ready (it is a
+                // `ProtocolBox` at runtime), so bind it as the protocol's
+                // `element` type-arg just like a concrete `i64`. See
+                // `protocolParamConcreteType` for why the widened predicate
+                // preserves the `Enumerable`-devirtualization contract.
+                if (!self.typeArgIsMonomorphizationReady(concrete_protocol_arg)) continue;
                 _ = try self.store.unify(constraint_arg, concrete_protocol_arg, subs);
             }
             return;
@@ -622,11 +640,21 @@ const MonomorphContext = struct {
         // If the argument is a param_get inside a specialized function,
         // use the specialized param's concrete type instead of the
         // expression type which may not have been substituted correctly.
+        //
+        // FCC unified model: a specialized combinator (`Enum.map` for a
+        // `[fn(..) -> ..]`) carries a parameter whose type is a `List` of boxed
+        // `Callable` existentials (`List(ProtocolBox)`) — fully runtime-defined
+        // but NOT `isConcreteRuntimeType` (its element is a `protocol_constraint`).
+        // When that parameter is forwarded into a recursive helper (`map_next`),
+        // its concrete `List(Callable)` type MUST flow so the helper specializes
+        // for the boxed element and the recursion targets the specialized copy.
+        // `typeArgIsMonomorphizationReady` accepts the boxed-element collection
+        // while still rejecting genuine free type variables.
         if (arg.expr.kind == .param_get and self.current_scan_params != null) {
             const pidx = arg.expr.kind.param_get;
             if (pidx < self.current_scan_params.?.len) {
                 const scan_param_type = self.current_scan_params.?[pidx].type_id;
-                if (self.isConcreteRuntimeType(scan_param_type)) {
+                if (self.typeArgIsMonomorphizationReady(scan_param_type)) {
                     arg_type = scan_param_type;
                 }
             }
@@ -721,7 +749,11 @@ const MonomorphContext = struct {
             },
             .param_get => |param_index| {
                 if (self.current_scan_params) |params| {
-                    if (param_index < params.len and self.isConcreteRuntimeType(params[param_index].type_id)) {
+                    // Accept a boxed-element collection (`List(Callable)`) — a
+                    // monomorphization-ready type that is not narrowly
+                    // `isConcreteRuntimeType` — so a specialized combinator's
+                    // boxed-`Callable` parameter type flows for nested calls.
+                    if (param_index < params.len and self.typeArgIsMonomorphizationReady(params[param_index].type_id)) {
                         type_id = params[param_index].type_id;
                     }
                 }
@@ -730,7 +762,17 @@ const MonomorphContext = struct {
                 if (!self.isConcreteRuntimeType(type_id)) {
                     if (self.call_rewrites.get(@intFromPtr(expr))) |rewritten_group_id| {
                         if (self.findFunctionGroupById(rewritten_group_id)) |group| {
-                            if (group.clauses.len > 0 and self.isConcreteRuntimeType(group.clauses[0].return_type)) {
+                            // FCC unified model: a devirtualized `Enumerable.next`
+                            // over a `[fn(..) -> ..]` resolves to `List.next`
+                            // whose return is `{Atom, Callable, List(Callable)}` —
+                            // a fully runtime-defined tuple that is NOT narrowly
+                            // `isConcreteRuntimeType` (its element is a
+                            // `protocol_constraint`). Adopt it so the projected
+                            // `next_state` records `List(Callable)` and the
+                            // recursive combinator call re-specializes for the
+                            // boxed element. `typeArgIsMonomorphizationReady`
+                            // accepts the boxed-element tuple, rejects free vars.
+                            if (group.clauses.len > 0 and self.typeArgIsMonomorphizationReady(group.clauses[0].return_type)) {
                                 type_id = group.clauses[0].return_type;
                             }
                         }
@@ -767,7 +809,14 @@ const MonomorphContext = struct {
         if (binding_index.* >= bindings.len) return;
         defer binding_index.* += 1;
 
-        if (!self.isConcreteRuntimeType(type_id)) return;
+        // FCC unified model: a case binding whose type is a `List` of boxed
+        // `Callable` existentials (the `next_state` projected from a
+        // protocol-impl `next/1` over a `[fn(..) -> ..]`) is a fully runtime-
+        // defined type that MUST be tracked so the recursive combinator call on
+        // it (`map_next(next_state, ...)`) re-specializes for the boxed element.
+        // `typeArgIsMonomorphizationReady` accepts it while rejecting genuine
+        // free type variables (a generic-context binding stays untracked).
+        if (!self.typeArgIsMonomorphizationReady(type_id)) return;
         try self.local_types.put(bindings[binding_index.*].local_index, type_id);
     }
 
@@ -1041,10 +1090,21 @@ const MonomorphContext = struct {
                     .named => |nc| blk: {
                         // Check for protocol dispatch: Enumerable.each(list, callback)
                         if (self.isProtocolCall(nc)) |proto_name| {
-                            // Find the concrete type from the first argument
+                            // Find the concrete type from the first argument.
+                            // FCC unified model: a receiver that is a collection
+                            // of boxed `Callable` existentials (`List(Callable)`,
+                            // the iteration state inside a specialized combinator
+                            // over a `[fn(..) -> ..]`) is a fully runtime-defined
+                            // type, so `Enumerable.next(state)` MUST devirtualize
+                            // to the concrete `List.next` impl here — otherwise the
+                            // clone keeps a generic protocol-dispatch target and
+                            // the ZIR backend emits a bare `Enumerable` namespace
+                            // reference (`zap_runtime has no member 'Enumerable'`).
+                            // `typeArgIsMonomorphizationReady` accepts the boxed-
+                            // element collection while rejecting free type vars.
                             if (call.args.len > 0) {
                                 const arg_type = self.resolveCallArgumentType(call.args[0], null, null, true);
-                                if (self.isConcreteRuntimeType(arg_type)) {
+                                if (self.typeArgIsMonomorphizationReady(arg_type)) {
                                     if (self.resolveProtocolDispatch(proto_name, nc.name, arg_type, @intCast(call.args.len))) |impl_gid| {
                                         protocol_resolved_target = true;
                                         break :blk impl_gid;
@@ -1100,6 +1160,12 @@ const MonomorphContext = struct {
                         _ = self.store.unify(param.type_id, arg_type, &subs) catch {};
                     }
                 }
+
+                // FCC unified model — re-stamp a closure-literal callback's
+                // higher-order parameter to the boxed `Callable` representation
+                // when this combinator iterates a `[fn(..) -> ..]` (boxed
+                // `Callable`) collection. See the helper for the full rationale.
+                try self.restampClosureArgParamsForBoxedCallable(first_clause.params, call.args, &subs);
 
                 // Type variables can appear only in the return type for
                 // constructor-shaped generic functions such as
@@ -1505,6 +1571,93 @@ const MonomorphContext = struct {
         if (resolved_typ != .protocol_constraint) return param_type;
         if (!std.mem.eql(u8, self.interner.get(resolved_typ.protocol_constraint.protocol_name), "Callable")) return param_type;
         return resolved_effect;
+    }
+
+    /// A parametric `protocol_constraint` whose protocol is exactly `Callable`
+    /// — the always-boxed first-class-closure existential. Keyed precisely on
+    /// the protocol NAME so a parametric NON-`Callable` constraint
+    /// (`Enumerable(i64)`) is excluded (it devirtualizes per-impl and must
+    /// never be treated as a boxed `ProtocolBox` body — the V11 contract).
+    fn protocolConstraintIsBoxedCallable(self: *const MonomorphContext, type_id: TypeId) bool {
+        if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return false;
+        const typ = self.store.getType(type_id);
+        if (typ != .protocol_constraint) return false;
+        if (typ.protocol_constraint.type_params.len == 0) return false;
+        return std.mem.eql(u8, self.interner.get(typ.protocol_constraint.protocol_name), "Callable");
+    }
+
+    /// Resolve the closure-literal `FunctionGroup` reachable from a callback
+    /// argument expression. A closure literal lowers (in `hir.zig`
+    /// `buildExpr.anonymous_function`) to a `block { function_group,
+    /// closure_create }`; a directly-referenced closure value is a bare
+    /// `closure_create`. Returns the lifted closure group in either shape, so
+    /// the combinator-element re-stamp can reach its parameters. Returns null
+    /// for any other argument (a `&Struct.fn/1` function reference, a
+    /// pre-bound `local_get`, etc.) — those are not closure literals and must
+    /// not be mutated.
+    fn closureFunctionGroupForArg(self: *MonomorphContext, expr: *const hir.Expr) ?*const hir.FunctionGroup {
+        switch (expr.kind) {
+            .closure_create => |cc| return self.findFunctionGroupById(cc.function_group_id),
+            .block => |b| {
+                for (b.stmts) |stmt| {
+                    if (stmt == .function_group) return stmt.function_group;
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// FCC unified model — when a combinator (`Enum.map`/`each`/`reduce`/…)
+    /// iterates a `[fn(A) -> R]` collection (a `List` of boxed `Callable`
+    /// existentials), its callback receives each element as a boxed `Callable`
+    /// (`ProtocolBox`), not a bare function pointer. A closure-literal callback
+    /// `fn(f :: fn(A) -> R) -> B { f(x) }` declares its higher-order parameter
+    /// `f` as a `fn(A) -> R` that the type checker made representation-
+    /// polymorphic (a fresh `effect_var`, since `f` is invoked in the body).
+    /// That polymorphism makes the lifted closure group GENERIC, so the IR
+    /// builder skips it and its `make_closure` references an un-emitted
+    /// function (`EmitFailed`). The closure is single-use (an anonymous literal
+    /// passed directly to the combinator), so re-stamp the offending parameter
+    /// IN PLACE to the boxed `Callable` representation the combinator binds for
+    /// `element`: this makes the closure NON-generic (a `protocol_constraint`
+    /// is specialize-ready) and routes the body's `f(x)` through the box `call`
+    /// slot (`protocol_dispatch`).
+    ///
+    /// Driven entirely by the combinator's own `subs`: the callback parameter's
+    /// substituted type (`fn(element) -> mapped` with `element = Callable`)
+    /// supplies the exact boxed-`Callable` types to stamp. Keyed twice for
+    /// precision: (1) the combinator's expected callback parameter at that
+    /// position must be a boxed `Callable` (`protocolConstraintIsBoxedCallable`
+    /// — so iterating `[i64]`/`[String]` leaves the closure param `i64`/`String`
+    /// untouched), and (2) the closure's current parameter must itself be an
+    /// effect-polymorphic `fn(..)` (a higher-order param that can be boxed —
+    /// so a first-order callback param is never disturbed). A `&Struct.fn/1`
+    /// function reference is not a closure literal and is skipped.
+    fn restampClosureArgParamsForBoxedCallable(
+        self: *MonomorphContext,
+        params: []const hir.TypedParam,
+        args: []const hir.CallArg,
+        subs: *const SubstitutionMap,
+    ) error{OutOfMemory}!void {
+        const pair_count = @min(params.len, args.len);
+        for (params[0..pair_count], args[0..pair_count]) |param, arg| {
+            const expected = try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, param.type_id));
+            const expected_typ = self.store.getType(expected);
+            if (expected_typ != .function) continue;
+
+            const closure_group = self.closureFunctionGroupForArg(arg.expr) orelse continue;
+            for (closure_group.clauses) |clause| {
+                const restamp_count = @min(clause.params.len, expected_typ.function.params.len);
+                for (clause.params[0..restamp_count], expected_typ.function.params[0..restamp_count]) |*closure_param, expected_param| {
+                    if (!self.protocolConstraintIsBoxedCallable(expected_param)) continue;
+                    const closure_param_typ = self.store.getType(closure_param.type_id);
+                    if (closure_param_typ != .function) continue;
+                    if (closure_param_typ.function.effect_var == null) continue;
+                    @constCast(closure_param).type_id = expected_param;
+                }
+            }
+        }
     }
 
     fn cloneGroupWithSubs(
@@ -2130,7 +2283,29 @@ fn containsTypeVar(store: *const TypeStore, type_id: TypeId) bool {
     const typ = store.getType(type_id);
     return switch (typ) {
         .type_var => true,
-        .protocol_constraint => true,
+        .protocol_constraint => |pc| {
+            // FCC unified model: a fully-applied `Callable({i64}, i64)`
+            // existential is a CONCRETE runtime type (a `ProtocolBox`), so a
+            // specialization clone whose parameter/return is a boxed `Callable`
+            // (`Enum.map` over a `[fn(..) -> ..]`) must be treated as NON-generic
+            // — otherwise `isGenericGroup` re-classifies the clone as generic
+            // and the transitive re-scan drops it, leaving its recursive helper
+            // (`map_next`) unspecialized (`mapped` collapses to `void`). Recurse
+            // into the `Callable` type args so a still-parametric `Callable(T, R)`
+            // remains generic. Every OTHER parametric protocol constraint —
+            // crucially `Enumerable(element)` / `Enumerable(i64)` — stays
+            // "generic-marking" (returns true): it devirtualizes per-impl at HIR
+            // build and must NEVER be lowered as a `ProtocolBox` body (the V11 /
+            // `Z9101` Enumerable-devirtualization contract). Keyed precisely on
+            // the `Callable` protocol name.
+            if (std.mem.eql(u8, store.interner.get(pc.protocol_name), "Callable")) {
+                for (pc.type_params) |tp| {
+                    if (containsTypeVar(store, tp)) return true;
+                }
+                return false;
+            }
+            return true;
+        },
         .list => |lt| containsTypeVar(store, lt.element),
         .tuple => |tt| {
             for (tt.elements) |elem| {

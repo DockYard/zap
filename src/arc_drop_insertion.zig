@@ -300,7 +300,9 @@ const ComponentReleaseCollector = struct {
                     // Non-ARC aggregate `object` with ARC-managed
                     // extracted `dest` is the canonical destructure-
                     // then-uniqueness pattern. Record both sides.
-                    if (!self.isArcManagedLocal(ig.object) and self.isArcManagedLocal(ig.dest)) {
+                    if (!self.isArcManagedLocal(ig.object) and self.isArcManagedLocal(ig.dest) and
+                        !self.isOwnedBoxExtraction(ig.dest))
+                    {
                         try self.non_arc_aggregates.put(self.allocator, ig.object, {});
                         const gop = try self.extractions_by_aggregate.getOrPut(self.allocator, ig.object);
                         if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -308,7 +310,9 @@ const ComponentReleaseCollector = struct {
                     }
                 },
                 .field_get => |fg| {
-                    if (!self.isArcManagedLocal(fg.object) and self.isArcManagedLocal(fg.dest)) {
+                    if (!self.isArcManagedLocal(fg.object) and self.isArcManagedLocal(fg.dest) and
+                        !self.isOwnedBoxExtraction(fg.dest))
+                    {
                         try self.non_arc_aggregates.put(self.allocator, fg.object, {});
                         const gop = try self.extractions_by_aggregate.getOrPut(self.allocator, fg.object);
                         if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -469,6 +473,22 @@ const ComponentReleaseCollector = struct {
 
     fn isArcManagedLocal(self: *const ComponentReleaseCollector, local: ir.LocalId) bool {
         return self.ownership.arc_managed_locals.contains(local);
+    }
+
+    /// FCC unified model: a boxed `Callable` HEAD or a `List(Callable)` TAIL
+    /// extracted from a temporary scrutinee tuple (`{:cont, value, next_state}`
+    /// over a `[fn(..) -> ..]`) is recorded in `deep_release_owned_locals`. Each
+    /// is a FRESH owned clone (`List.next`/`ownElement`/
+    /// `cloneRangeRetainingChildren`) MOVED OUT of the tuple, with its OWN
+    /// scope-exit DEEP release (a `.protocol_box_drop` for the head, a deep
+    /// `List` release for the tail) at its real last use. The aggregate-
+    /// component-release pass must therefore NOT also release it when the tuple
+    /// dies — doing both double-frees the box inner under `Memory.Tracking`.
+    /// The classic destructure pattern this pass serves (a plain `.owned`
+    /// String/scalar extracted from a tuple, with no separate deep release) is
+    /// NOT in the set, so it still gets the component release.
+    fn isOwnedBoxExtraction(self: *const ComponentReleaseCollector, dest: ir.LocalId) bool {
+        return self.function.deep_release_owned_locals.contains(dest);
     }
 
     fn scheduleComponentReleases(

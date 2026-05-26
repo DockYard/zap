@@ -736,6 +736,13 @@ pub const Function = struct {
     /// pointer) so the post-drop rewrite is a single map lookup
     /// per release with no extra indirection.
     protocol_box_locals: std.AutoHashMapUnmanaged(LocalId, []const u8) = .empty,
+    /// FCC unified model: locals extracted from a temporary scrutinee tuple
+    /// (`{:cont, value, next_state}` over a `[fn(..) -> ..]`) that own a fresh
+    /// clone bearing eagerly-freed boxed `Callable` children (the boxed head and
+    /// the `List(Callable)` tail). Each already gets its own scope-exit deep
+    /// release, so the aggregate-component-release pass excludes them
+    /// (`ComponentReleaseCollector.isOwnedBoxExtraction`) to avoid a double-free.
+    deep_release_owned_locals: std.AutoHashMapUnmanaged(LocalId, void) = .empty,
 };
 
 fn cloneFunction(allocator: std.mem.Allocator, function: Function) CloneError!Function {
@@ -765,6 +772,12 @@ fn cloneFunction(allocator: std.mem.Allocator, function: Function) CloneError!Fu
         .local_ownership = try cloneMutableSlice(OwnershipClass, allocator, function.local_ownership),
         .result_convention = function.result_convention,
         .protocol_box_locals = try cloneProtocolBoxLocals(allocator, function.protocol_box_locals),
+        .deep_release_owned_locals = blk: {
+            var out: std.AutoHashMapUnmanaged(LocalId, void) = .empty;
+            var iter = function.deep_release_owned_locals.iterator();
+            while (iter.next()) |entry| try out.put(allocator, entry.key_ptr.*, {});
+            break :blk out;
+        },
     };
 }
 
@@ -3032,6 +3045,41 @@ fn protocolConstraintIsBoxedCallable(
     return std.mem.eql(u8, type_store.interner.get(typ.protocol_constraint.protocol_name), "Callable");
 }
 
+/// True when `type_id` is, or transitively contains, a boxed `Callable`
+/// existential — i.e. an eagerly-freed `ProtocolBox` reached through a `List`,
+/// `Map`, `tuple`, or `Option`/`applied` wrapper. Used to recognise an
+/// iteration-state value (`next_state :: List(Callable)`) whose scope-exit
+/// release must deep-release cloned boxes, while leaving plain-data containers
+/// (`List(i64)`, `List(String)`) — which have no eagerly-freed children —
+/// untouched. Depth-guarded against cyclic type graphs.
+fn typeContainsBoxedCallable(
+    type_store: *const types_mod.TypeStore,
+    type_id: types_mod.TypeId,
+    depth: usize,
+) bool {
+    if (type_id >= type_store.types.items.len) return false;
+    if (depth > type_store.types.items.len) return false;
+    if (protocolConstraintIsBoxedCallable(type_store, type_id)) return true;
+    return switch (type_store.getType(type_id)) {
+        .list => |list_type| typeContainsBoxedCallable(type_store, list_type.element, depth + 1),
+        .map => |map_type| typeContainsBoxedCallable(type_store, map_type.key, depth + 1) or
+            typeContainsBoxedCallable(type_store, map_type.value, depth + 1),
+        .tuple => |tuple_type| blk: {
+            for (tuple_type.elements) |element| {
+                if (typeContainsBoxedCallable(type_store, element, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .applied => |applied_type| blk: {
+            for (applied_type.args) |arg| {
+                if (typeContainsBoxedCallable(type_store, arg, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
 fn structTypeHasArcManagedField(
     type_store: *const types_mod.TypeStore,
     type_id: types_mod.TypeId,
@@ -3355,6 +3403,19 @@ pub const IrBuilder = struct {
     /// `materialized_closure_locals`). Read by `isArcManagedLocal`. Cleared
     /// per function group.
     boxed_existential_locals: std.AutoHashMapUnmanaged(LocalId, void),
+    /// FCC unified model: locals extracted from a TEMPORARY scrutinee tuple
+    /// (`{:cont, value, next_state}` over a `[fn(..) -> ..]`) that own a fresh
+    /// clone bearing eagerly-freed boxed `Callable` children — the boxed head
+    /// (`ProtocolBox`) and the `List(Callable)` tail. Each already receives its
+    /// own scope-exit DEEP release (a `.protocol_box_drop` for the head, a deep
+    /// `List` release for the tail), so the aggregate-component-release pass
+    /// (`ComponentReleaseCollector`) must EXCLUDE them — releasing both the
+    /// component-release AND the owned drop double-frees under `Memory.Tracking`.
+    /// Distinct from the classic destructure pattern (a plain `.owned`
+    /// String/scalar extracted from a tuple), which has NO separate deep release
+    /// and correctly relies on the component release. Snapshotted onto
+    /// `ir.Function.deep_release_owned_locals`. Cleared per function group.
+    deep_release_owned_locals: std.AutoHashMapUnmanaged(LocalId, void),
     /// Locals whose value originated from a `param_get` instruction.
     /// Used by the call-builtin encoder to detect bridge calls inside
     /// generic Zap functions — those have `param: anytype` in the
@@ -3506,6 +3567,7 @@ pub const IrBuilder = struct {
             .local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(allocator),
             .materialized_closure_locals = .empty,
             .boxed_existential_locals = .empty,
+            .deep_release_owned_locals = .empty,
             .param_backed_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .rescue_unboxed_borrow_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(allocator),
@@ -3528,6 +3590,7 @@ pub const IrBuilder = struct {
         self.local_hir_types.deinit();
         self.materialized_closure_locals.deinit(self.allocator);
         self.boxed_existential_locals.deinit(self.allocator);
+        self.deep_release_owned_locals.deinit(self.allocator);
         self.param_backed_locals.deinit();
         self.rescue_unboxed_borrow_locals.deinit();
         self.term_tuple_locals.deinit();
@@ -4721,6 +4784,7 @@ pub const IrBuilder = struct {
         self.local_hir_types.clearRetainingCapacity();
         self.materialized_closure_locals.clearRetainingCapacity();
         self.boxed_existential_locals.clearRetainingCapacity();
+        self.deep_release_owned_locals.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
         self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
@@ -4808,6 +4872,7 @@ pub const IrBuilder = struct {
             .local_ownership = local_ownership,
             .result_convention = result_convention,
             .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
+            .deep_release_owned_locals = try self.cloneLocalIdSet(self.deep_release_owned_locals),
         });
     }
 
@@ -4835,6 +4900,7 @@ pub const IrBuilder = struct {
         self.local_hir_types.clearRetainingCapacity();
         self.materialized_closure_locals.clearRetainingCapacity();
         self.boxed_existential_locals.clearRetainingCapacity();
+        self.deep_release_owned_locals.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
         self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
@@ -5297,6 +5363,7 @@ pub const IrBuilder = struct {
             .local_ownership = local_ownership,
             .result_convention = result_convention,
             .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
+            .deep_release_owned_locals = try self.cloneLocalIdSet(self.deep_release_owned_locals),
         });
 
         // Generate a `__try` variant whenever the catch-basin pipeline asked
@@ -5334,6 +5401,7 @@ pub const IrBuilder = struct {
             self.local_hir_types.clearRetainingCapacity();
             self.materialized_closure_locals.clearRetainingCapacity();
             self.boxed_existential_locals.clearRetainingCapacity();
+            self.deep_release_owned_locals.clearRetainingCapacity();
             self.param_backed_locals.clearRetainingCapacity();
             self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
             self.term_tuple_locals.clearRetainingCapacity();
@@ -5442,6 +5510,7 @@ pub const IrBuilder = struct {
                 .local_ownership = try_local_ownership,
                 .result_convention = try_result_convention,
                 .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
+            .deep_release_owned_locals = try self.cloneLocalIdSet(self.deep_release_owned_locals),
             });
         }
     }
@@ -8610,6 +8679,21 @@ pub const IrBuilder = struct {
                 // slot types are concrete. Tell `index_get` which concrete
                 // type to coerce each slot back to via `Term.toCoerced`.
                 const term_tuple_decl: ?ZigType = self.term_tuple_locals.get(scrutinee_local);
+                // FCC unified model: resolve the scrutinee's tuple HIR type so a
+                // boxed-`Callable` element (`{:cont, value, next_state}` projected
+                // from `Enumerable.next` over a `[fn(..) -> ..]`, whose
+                // devirtualized `List.next` returns `head = ownElement(..)` — a
+                // fresh OWNED `ProtocolBox` clone) is classified a boxed-existential
+                // owner with a single scope-exit `.protocol_box_drop` at its real
+                // last use in the arm (the head box `List.next` cloned, released
+                // once). Keyed on the `Callable` protocol name — the devirtualized
+                // `Enumerable` state is never a boxed `Callable`.
+                const scrutinee_tuple_hir: ?hir_mod.TypeId = blk: {
+                    const ts = self.type_store orelse break :blk null;
+                    const scrutinee_hir = self.local_hir_types.get(scrutinee_local) orelse break :blk null;
+                    if (ts.getType(scrutinee_hir) != .tuple) break :blk null;
+                    break :blk scrutinee_hir;
+                };
                 var i: u32 = 0;
                 while (i < ct.expected_arity) : (i += 1) {
                     const elem_local = self.next_local;
@@ -8626,6 +8710,51 @@ pub const IrBuilder = struct {
                     });
                     if (coerce_to != .any) {
                         try self.known_local_types.put(elem_local, coerce_to);
+                    }
+                    if (scrutinee_tuple_hir) |tuple_hir| {
+                        const tuple_typ = self.type_store.?.getType(tuple_hir);
+                        if (i < tuple_typ.tuple.elements.len) {
+                            const elem_hir = tuple_typ.tuple.elements[i];
+                            const elem_zig = typeIdToZigTypeWithStore(elem_hir, self.type_store);
+                            if (protocolConstraintIsBoxedCallable(self.type_store.?, elem_hir)) {
+                                // The boxed-`Callable` head: `List.next`/`ownElement`
+                                // hands back a FRESH owned `ProtocolBox` clone, so
+                                // the extracted element owns its inner and gets one
+                                // scope-exit `.protocol_box_drop` at its real last
+                                // use in the arm. Recorded as a boxed-existential
+                                // owner (so it is `.owned` + routed through the box
+                                // vtable drop) AND in `deep_release_owned_locals` so
+                                // the aggregate-component-release pass excludes it
+                                // (`isOwnedBoxExtraction`) — released exactly once.
+                                // Keyed on the `Callable` protocol name; the
+                                // devirtualized `Enumerable` state is never boxed.
+                                try self.local_hir_types.put(elem_local, elem_hir);
+                                if (elem_zig == .protocol_box) {
+                                    try self.known_local_types.put(elem_local, elem_zig);
+                                }
+                                try self.boxed_existential_locals.put(self.allocator, elem_local, {});
+                                try self.deep_release_owned_locals.put(self.allocator, elem_local, {});
+                            } else if (typeContainsBoxedCallable(self.type_store.?, elem_hir, 0)) {
+                                // The `next_state` tail is a container of boxed
+                                // `Callable`s (`List(Callable)`) that `List.next`/
+                                // `cloneRangeRetainingChildren` clones — owning fresh
+                                // box clones of the remaining elements. Record its
+                                // HIR/ZigType so the standard ARC machinery owns it
+                                // (`.list` is type-level ARC-managed) and its
+                                // scope-exit deep-release frees the cloned boxes.
+                                // Recorded in `deep_release_owned_locals` so the
+                                // aggregate-component-release pass excludes it (it
+                                // already has its own deep release) — freed exactly
+                                // once. Plain-data tails (`List(i64)`/`List(String)`)
+                                // have no boxed children, so this never fires for
+                                // them (`typeContainsBoxedCallable` is false).
+                                try self.local_hir_types.put(elem_local, elem_hir);
+                                if (elem_zig != .any and elem_zig != .void) {
+                                    try self.known_local_types.put(elem_local, elem_zig);
+                                }
+                                try self.deep_release_owned_locals.put(self.allocator, elem_local, {});
+                            }
+                        }
                     }
                     const elem_id = if (i < ct.element_scrutinee_ids.len)
                         ct.element_scrutinee_ids[i]
@@ -11335,6 +11464,20 @@ pub const IrBuilder = struct {
             if (!has_vtable) continue;
             const protocol_name_copy = try cloneBytes(self.allocator, protocol_name);
             try out.put(self.allocator, local, protocol_name_copy);
+        }
+        return out;
+    }
+
+    /// Copy a `LocalId` set into a fresh function-owned map. Used to snapshot
+    /// `deep_release_owned_locals` onto each emitted `ir.Function`.
+    fn cloneLocalIdSet(
+        self: *IrBuilder,
+        source: std.AutoHashMapUnmanaged(LocalId, void),
+    ) !std.AutoHashMapUnmanaged(LocalId, void) {
+        var out: std.AutoHashMapUnmanaged(LocalId, void) = .empty;
+        var iter = source.iterator();
+        while (iter.next()) |entry| {
+            try out.put(self.allocator, entry.key_ptr.*, {});
         }
         return out;
     }

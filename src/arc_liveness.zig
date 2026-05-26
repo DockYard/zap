@@ -1131,16 +1131,35 @@ const Analyzer = struct {
             },
             .case_block => |cb| {
                 const arm_live_after = parent_live_after;
-                var pre_in = try self.processStream(cb.pre_instrs, arm_live_after);
-                defer pre_in.deinit(self.allocator);
+                // Control flows pre_instrs -> (one of) the arms / default, so the
+                // live-AFTER pre_instrs is the UNION of every arm's (and the
+                // default's) live-IN — NOT the case_block's external live-after.
+                // A local DEFINED in pre_instrs (a tuple-destructure binding such
+                // as the `value`/`next_state` of `{:cont, value, next_state}`) and
+                // USED only inside an arm is therefore live OUT of pre_instrs and
+                // must NOT be released there; its release lands at its real
+                // last-use inside the arm. Without threading the arms' live-in
+                // back, an OWNED pre_instrs binding (a boxed `Callable` element
+                // cloned by `List.next`/`ownElement`) is wrongly treated as dead
+                // at pre_instrs end and gets a spurious early `.protocol_box_drop`
+                // (a use-after-free under `Memory.Tracking`, masked under refcount
+                // ARC) plus a duplicate per-arm release. Trivial/borrow bindings
+                // (i64/String elements) schedule no release and are unaffected.
+                var arms_live_in = try LiveSet.init(self.allocator, @intCast(self.arc_locals.items.len));
+                defer arms_live_in.deinit(self.allocator);
                 for (cb.arms) |arm| {
                     var cond_in = try self.processStream(arm.cond_instrs, arm_live_after);
                     defer cond_in.deinit(self.allocator);
                     var body_in = try self.processStream(arm.body_instrs, arm_live_after);
                     defer body_in.deinit(self.allocator);
+                    arms_live_in.unionWith(&cond_in);
+                    arms_live_in.unionWith(&body_in);
                 }
                 var def_in = try self.processStream(cb.default_instrs, arm_live_after);
                 defer def_in.deinit(self.allocator);
+                arms_live_in.unionWith(&def_in);
+                var pre_in = try self.processStream(cb.pre_instrs, &arms_live_in);
+                defer pre_in.deinit(self.allocator);
             },
             .switch_literal => |sl| {
                 const arm_live_after = parent_live_after;
