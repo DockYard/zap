@@ -10827,6 +10827,33 @@ pub const IrBuilder = struct {
         const base_protocol = self.baseProtocolName(box_name);
         if (!std.mem.eql(u8, base_protocol, "Callable")) return false;
 
+        // FCC unified model — inline boxed-`Callable` invocation owns its box.
+        // When the callee is a FRESH box produced by a CALL (the inline
+        // `List.get(ops, i)(v)` extracts a CLONED boxed element — an owned
+        // single-use `ProtocolBox` — and immediately dispatches on it), the
+        // dispatch receiver below is a BORROW, so nothing else owns or frees
+        // that box. It must be recorded as a boxed-existential OWNER so
+        // `computeLocalOwnership` classifies it `.owned` and `arc_drop_insertion`
+        // schedules its scope-exit `.protocol_box_drop` (otherwise the cloned
+        // element leaks under `Memory.Tracking` — the box's `known_local_types`
+        // is `.protocol_box` here even when the call-result type-flow did not
+        // mark it at `trackCallResultType` time, because the inline `List.get`
+        // return type was not substituted to `Callable` without a binding).
+        // A binding-REFERENCE callee (`f0(v)` where `f0` is a local/param) is
+        // EXCLUDED: a bound local is already a recorded owner (its own
+        // scope-exit drop), and a borrowed PARAM (`f(v)` in the crux) is owned
+        // by the caller and must never be promoted to an owner here (that would
+        // double-free with the caller). Keyed on the callee EXPRESSION being a
+        // call — exact, no use-count lookahead.
+        switch (callee.kind) {
+            .call => {
+                if (!self.param_backed_locals.contains(callee_local)) {
+                    try self.boxed_existential_locals.put(self.allocator, callee_local, {});
+                }
+            },
+            else => {},
+        }
+
         // Resolve the `Callable` existential TypeId so the method slot's
         // parametric return type (`result`) and the `args` tuple type resolve
         // concretely. Prefer the HIR type when it is the `Callable` constraint.
@@ -13148,6 +13175,28 @@ pub const IrBuilder = struct {
                             // disagree on which bindings are ARC-managed.
                             if (self.local_hir_types.get(val)) |src_hir_type| {
                                 try self.local_hir_types.put(ls.index, src_hir_type);
+                            }
+                            // FCC unified model: propagate the boxed-existential
+                            // OWNER marker (and the Gap-E materialized-closure
+                            // marker) from the RHS into this binding local — the
+                            // SAME propagation the top-level statement
+                            // `local_set` arm performs. Without it, a binding
+                            // inside a nested block (a `zap run` script `main`
+                            // body lowers as a block, and the inline-indexed
+                            // `List.get(ops, i)(v)` hoists its cloned boxed
+                            // element into such a `local_set`) inherits the
+                            // box's ZigType but NOT its owner marker, so
+                            // `computeLocalOwnership` classifies it `.trivial`
+                            // and `arc_drop_insertion` schedules no scope-exit
+                            // `.protocol_box_drop` — the cloned element leaks
+                            // under `Memory.Tracking` (a NAMED binding through
+                            // the statement path already gets the drop; the two
+                            // paths must agree).
+                            if (self.boxed_existential_locals.contains(val)) {
+                                try self.boxed_existential_locals.put(self.allocator, ls.index, {});
+                            }
+                            if (self.materialized_closure_locals.contains(val)) {
+                                try self.materialized_closure_locals.put(self.allocator, ls.index, {});
                             }
                         },
                         .function_group => |group| {
