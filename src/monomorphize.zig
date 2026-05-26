@@ -1116,6 +1116,24 @@ const MonomorphContext = struct {
                     try self.scanExpr(arg.expr);
                 }
 
+                // An implicit value-call (`expr(args)`) carries its callee as a
+                // `.closure` target — an arbitrary expression that yields the
+                // callable. That callee expression may itself be a generic call
+                // that needs specialization (e.g. the inline
+                // `List.get(filtered, 0)(v)`: the callee `List.get(filtered, 0)`
+                // over a freshly-monomorphized `[Callable]` list must specialize
+                // `List.get` for the boxed element). The three resolvable
+                // target kinds below (`.direct`/`.dispatch`/`.named`) name a
+                // function group directly and have no callee subexpression;
+                // only the `.closure` target does. Scan it so its nested calls
+                // are specialized — otherwise the value-call's callee references
+                // an un-produced generic specialization at ZIR emission. A
+                // bound-local / param callee (`g = List.get(..); g(v)`) is
+                // already covered because its producing `local_set` was scanned.
+                if (call.target == .closure) {
+                    try self.scanExpr(call.target.closure);
+                }
+
                 // Check if this calls a generic function or a protocol function
                 var protocol_resolved_target = false;
                 const target_id = switch (call.target) {
@@ -2209,6 +2227,19 @@ const MonomorphContext = struct {
 
                 // Recurse into args
                 for (call.args) |arg| self.rewriteExpr(arg.expr);
+
+                // Recurse into the callee of an implicit value-call
+                // (`expr(args)` — a `.closure` target). The callee expression
+                // may itself be a generic call that the scan recorded for
+                // rewriting (e.g. the inline `List.get(filtered, 0)(v)`, whose
+                // callee `List.get(filtered, 0)` specializes for the boxed
+                // element). Without applying that rewrite here, the callee keeps
+                // its generic `.named` target and the backend emits a reference
+                // to the un-produced generic specialization. Mirrors the
+                // callee-scan in `scanExpr`.
+                if (call.target == .closure) {
+                    self.rewriteExpr(call.target.closure);
+                }
             },
             .binary => |b| {
                 self.rewriteExpr(b.lhs);
