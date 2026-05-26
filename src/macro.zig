@@ -1444,6 +1444,19 @@ pub const MacroEngine = struct {
                 };
             },
 
+            // Compound container literals — a tuple/list/map/struct
+            // literal holds arbitrary child expressions (a nested macro
+            // call, a closure literal whose body needs `if`->`case`
+            // lowering, a string interpolation, …). These MUST recurse so
+            // their children are macro-expanded; treating them as leaves
+            // left a raw `if_expr` inside e.g. a struct-field value or a
+            // list element, which then reached the HIR builder as an
+            // un-lowered `if_expr` (`unreachable`).
+            .tuple => return self.expandTupleExpr(expr),
+            .list => return self.expandListExpr(expr),
+            .map => return self.expandMapExpr(expr),
+            .struct_expr => return self.expandStructExpr(expr),
+
             // Leaf nodes — no expansion needed
             .int_literal,
             .float_literal,
@@ -1454,10 +1467,6 @@ pub const MacroEngine = struct {
             .nil_literal,
             .var_ref,
             .struct_ref,
-            .tuple,
-            .list,
-            .map,
-            .struct_expr,
             .field_access,
             .function_ref,
             .panic_expr,
@@ -1466,6 +1475,129 @@ pub const MacroEngine = struct {
             .binary_literal,
             => return .{ .expr = expr, .changed = false },
         }
+    }
+
+    /// Expand a tuple literal's element expressions. Mirrors
+    /// `expandCallExpr`: each element is expanded, the literal is rebuilt
+    /// only when some element changed.
+    fn expandTupleExpr(self: *MacroEngine, expr: *const ast.Expr) anyerror!ExpandedExpr {
+        const tuple = expr.tuple;
+        var changed = false;
+        var new_elements: std.ArrayList(*const ast.Expr) = .empty;
+        for (tuple.elements) |elem| {
+            const expanded = try self.expandExpr(elem);
+            if (expanded.changed) changed = true;
+            try new_elements.append(self.allocator, expanded.expr);
+        }
+        if (!changed) {
+            new_elements.deinit(self.allocator);
+            return .{ .expr = expr, .changed = false };
+        }
+        return .{
+            .expr = try self.create(ast.Expr, .{
+                .tuple = .{
+                    .meta = tuple.meta,
+                    .elements = try new_elements.toOwnedSlice(self.allocator),
+                },
+            }),
+            .changed = true,
+        };
+    }
+
+    /// Expand a list literal's element expressions.
+    fn expandListExpr(self: *MacroEngine, expr: *const ast.Expr) anyerror!ExpandedExpr {
+        const list = expr.list;
+        var changed = false;
+        var new_elements: std.ArrayList(*const ast.Expr) = .empty;
+        for (list.elements) |elem| {
+            const expanded = try self.expandExpr(elem);
+            if (expanded.changed) changed = true;
+            try new_elements.append(self.allocator, expanded.expr);
+        }
+        if (!changed) {
+            new_elements.deinit(self.allocator);
+            return .{ .expr = expr, .changed = false };
+        }
+        return .{
+            .expr = try self.create(ast.Expr, .{
+                .list = .{
+                    .meta = list.meta,
+                    .elements = try new_elements.toOwnedSlice(self.allocator),
+                },
+            }),
+            .changed = true,
+        };
+    }
+
+    /// Expand a map literal's key/value expressions and its optional
+    /// update source (`%{old | k => v}`).
+    fn expandMapExpr(self: *MacroEngine, expr: *const ast.Expr) anyerror!ExpandedExpr {
+        const map = expr.map;
+        var changed = false;
+        const new_update_source: ?*const ast.Expr = if (map.update_source) |src| blk: {
+            const expanded = try self.expandExpr(src);
+            if (expanded.changed) changed = true;
+            break :blk expanded.expr;
+        } else null;
+        var new_fields: std.ArrayList(ast.MapField) = .empty;
+        for (map.fields) |field| {
+            const key = try self.expandExpr(field.key);
+            if (key.changed) changed = true;
+            const value = try self.expandExpr(field.value);
+            if (value.changed) changed = true;
+            try new_fields.append(self.allocator, .{ .key = key.expr, .value = value.expr });
+        }
+        if (!changed) {
+            new_fields.deinit(self.allocator);
+            return .{ .expr = expr, .changed = false };
+        }
+        return .{
+            .expr = try self.create(ast.Expr, .{
+                .map = .{
+                    .meta = map.meta,
+                    .update_source = new_update_source,
+                    .fields = try new_fields.toOwnedSlice(self.allocator),
+                },
+            }),
+            .changed = true,
+        };
+    }
+
+    /// Expand a struct literal's field values and its optional update
+    /// source (`%Name{old | field: v}`). The `type_args` header is a
+    /// type expression carrier (no runtime sub-expressions) and is
+    /// preserved verbatim.
+    fn expandStructExpr(self: *MacroEngine, expr: *const ast.Expr) anyerror!ExpandedExpr {
+        const struct_expr = expr.struct_expr;
+        var changed = false;
+        const new_update_source: ?*const ast.Expr = if (struct_expr.update_source) |src| blk: {
+            const expanded = try self.expandExpr(src);
+            if (expanded.changed) changed = true;
+            break :blk expanded.expr;
+        } else null;
+        var new_fields: std.ArrayList(ast.StructField) = .empty;
+        for (struct_expr.fields) |field| {
+            const value = try self.expandExpr(field.value);
+            if (value.changed) changed = true;
+            try new_fields.append(self.allocator, .{ .name = field.name, .value = value.expr });
+        }
+        if (!changed) {
+            new_fields.deinit(self.allocator);
+            return .{ .expr = expr, .changed = false };
+        }
+        return .{
+            .expr = try self.create(ast.Expr, .{
+                .struct_expr = .{
+                    .meta = struct_expr.meta,
+                    .struct_name = struct_expr.struct_name,
+                    .type_args = struct_expr.type_args,
+                    .type_args_parens_present = struct_expr.type_args_parens_present,
+                    .update_source = new_update_source,
+                    .fields = try new_fields.toOwnedSlice(self.allocator),
+                },
+            }),
+            .changed = true,
+        };
     }
 
     fn expandErrorPipeChain(self: *MacroEngine, expr: *const ast.Expr) anyerror!ExpandedExpr {
