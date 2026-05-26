@@ -150,18 +150,42 @@ boxed case.
   (no boxing) for non-escaping cases, validated through the ZIR path (never
   generated-source strings). Bench: no perf regression on `#201` monomorphized calls.
 
-### Phase 4 — Effect-by-inference through fields/returns (the E1 fix)
-A raising closure stored-in / returned-as a `fn() -> T` field/return propagates its
-`raises` to an enclosing `rescue`. Pure closures stay pure. No new syntax.
-- Files: `src/types.zig` (`FunctionType.raises`/`effect_var`, `inferred_raises`,
-  `unify`/`substitute` effect arms); `src/ir.zig` (`closureCalleeRaises`,
-  `CallClosure.raises`); the `raise`/`rescue` discharge logic.
-- Risk: a `fn`-typed field can hold closures with differing effects → the field's
-  effect is a conservative join (may over-approximate); boxing erases the concrete
-  impl, so `Callable.call` must surface `error{ZapRaise}!T` whenever the field type
-  admits a raiser.
-- Verify: new `raise_closure/` field/return fixtures + a pure-field negative; both
-  managers.
+### Phase 4 — Effect-by-inference through fields/returns (the E1 fix) — **DONE**
+A raising closure stored-in / returned-as / collected-in a `fn() -> T`
+field/return/element propagates its `raises` to an enclosing `rescue`; an
+undischarged one is flagged. Pure closures stay pure. No new syntax.
+- Files: `src/types.zig` (`FunctionType.raises`/`effect_var`/**`raises_row`**,
+  `inferred_raises`, `applyReturnTypeClosureEffect`,
+  `addFunctionTypeWithEffectAndRow`, the two `substitute` arms, `typeStructEq`);
+  `src/hir.zig` (`applyReturnTypeClosureEffect` on the emitted clause return,
+  `applyReturnTypeClosureEffectForCallee` on the call-result type in
+  `resolveClauseCallInfo`); `src/ir.zig` (`closureCalleeRaises`,
+  `CallClosure.raises`, `callable_instantiation_raises`,
+  **`emitBoxedCallableRaisesUnwrap`** shared by both boxed-dispatch sites).
+- Risk realized + accepted: a `fn`-typed field/element holds closures of
+  differing effects → the boxed `Callable` instantiation's effect is a
+  conservative JOIN (a slot that can hold a raiser surfaces
+  `error{ZapRaise}!T`; a pure impl's adapter coerces its payload for free).
+  Documented by `mixed_field_join.zap`.
+- **Two representations, both carry the effect:**
+  1. **Boxed `Callable`** (field / list element / map value / capturing
+     return) — the per-instantiation `raises` JOIN
+     (`callable_instantiation_raises`) renders the vtable slot error-union'd;
+     both dispatch sites (`lowerBoxedCallableInvocation` implicit value-call,
+     and the `.named` `Callable.call(...)` explicit dispatch) discharge via the
+     shared `emitBoxedCallableRaisesUnwrap`.
+  2. **Bare fn-ptr** (non-capturing returned closure) — the `fn(..) -> T`
+     RETURN type carries `raises` (rendering `*const fn(..) anyerror!T`) via
+     three reconciled return-type resolutions (type-checker signature, HIR
+     emitted clause, HIR call-result); the value-call discharges via the
+     existing `call_closure` raises unwrap. The undischarged-flag uses the
+     concrete `raises_row` carried on the return type.
+- Verified green both managers: `raise_closure/` field (99), return (99),
+  return-capturing (77), list element (88), map value (88), list/map capturing
+  (66/44), mixed-join (7,42), undischarged return + param (compile-flag), pure
+  field/closure (42), plus the #201/Gap E set (higher_order 99, mixed 7,
+  transitive 55, direct 7) and `funcref_combinator` (12). `zig build test`
+  exit 0; `zap test` 927/0; golden 14/14.
 
 ### Phase 5 — Hardening, docs, corpus breadth
 `type`-alias-named function types in return position; nested closures; closure
