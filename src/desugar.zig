@@ -38,8 +38,19 @@ pub const Desugarer = struct {
     /// Monotonic counter for synthesized closure structs (`__closure_N`).
     /// Program-wide so every generated `Callable` impl target name is
     /// globally unique regardless of which struct/function the closure
-    /// literal appeared in.
+    /// literal appeared in. Used ONLY when `shared_closure_counter` is null
+    /// (the single-pass / unit-test path).
     closure_counter: u32 = 0,
+    /// Optional SHARED closure counter that persists ACROSS staged
+    /// per-struct desugar passes. In the project/daemon (`zap test`)
+    /// pipeline a fresh `Desugarer` is created per struct + for the
+    /// top-level program; without a shared counter each pass restarts at
+    /// `__closure_0`, so two files that each synthesize a closure both emit
+    /// `__closure_0` — a NAME COLLISION across the shared compilation (one
+    /// file's capturing `__closure_0{n}` then mismatches another's empty
+    /// `__closure_0{}`). When non-null, `nextClosureIndex` reads + bumps
+    /// THIS counter so closure names stay globally unique program-wide.
+    shared_closure_counter: ?*u32 = null,
     /// Synthesized `struct __closure_N { <captures> }` declarations,
     /// produced when a capturing closure literal appears in an escaping
     /// position (struct-field value, collection element, or `fn`-typed
@@ -114,6 +125,40 @@ pub const Desugarer = struct {
             .interner = interner,
             .graph = graph,
         };
+    }
+
+    /// Like `init`, but threads a SHARED closure counter that persists
+    /// across staged per-struct desugar passes so synthesized
+    /// `__closure_N` names stay globally unique program-wide (no cross-file
+    /// collisions in the project/daemon pipeline). The caller owns the
+    /// `*u32` and reuses it for every staged `Desugarer` of one compilation.
+    pub fn initWithSharedClosureCounter(
+        allocator: std.mem.Allocator,
+        interner: *ast.StringInterner,
+        graph: ?*const scope_mod.ScopeGraph,
+        shared_closure_counter: *u32,
+    ) Desugarer {
+        return .{
+            .allocator = allocator,
+            .interner = interner,
+            .graph = graph,
+            .shared_closure_counter = shared_closure_counter,
+        };
+    }
+
+    /// Return the next synthesized-closure index and advance the counter.
+    /// Uses the SHARED counter when present (the project/daemon staged
+    /// pipeline, where each struct gets a fresh `Desugarer`), else the
+    /// per-instance counter (single-pass / unit-test path).
+    fn nextClosureIndex(self: *Desugarer) u32 {
+        if (self.shared_closure_counter) |counter| {
+            const index = counter.*;
+            counter.* += 1;
+            return index;
+        }
+        const index = self.closure_counter;
+        self.closure_counter += 1;
+        return index;
     }
 
     // ============================================================
@@ -2136,8 +2181,7 @@ pub const Desugarer = struct {
         const return_type = clause.return_type orelse try self.anyTypeExpr(span);
 
         // ----- 3. Synthesize the closure struct name `__closure_N`.
-        const closure_index = self.closure_counter;
-        self.closure_counter += 1;
+        const closure_index = self.nextClosureIndex();
         const struct_name_text = try std.fmt.allocPrint(self.allocator, "__closure_{d}", .{closure_index});
         const struct_name_id = try interner_mut.intern(struct_name_text);
         const struct_name: ast.StructName = .{

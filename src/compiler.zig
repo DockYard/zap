@@ -4393,6 +4393,10 @@ fn stagedMacroExpandAndDesugar(
 
     var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
+    // Shared monotonic closure counter for the WHOLE staged compilation, so
+    // synthesized `__closure_N` names stay globally unique across every
+    // per-struct pass + the top-level program (no cross-file collisions).
+    var shared_closure_counter: u32 = 0;
 
     var staged_timer = ZapTimer.start();
     for (struct_order, 0..) |struct_name, struct_index| {
@@ -4406,6 +4410,7 @@ fn stagedMacroExpandAndDesugar(
             collector,
             diag_engine,
             &compiled_executor,
+            &shared_closure_counter,
         );
         const expand_ms = staged_timer.lapMs();
         try expanded_structs.append(alloc, .{ .name = original.name, .program = desugared });
@@ -4450,6 +4455,7 @@ fn stagedMacroExpandAndDesugar(
             collector,
             diag_engine,
             &compiled_executor,
+            &shared_closure_counter,
         );
         try expanded_structs.append(alloc, .{ .name = original.name, .program = desugared });
     }
@@ -4463,6 +4469,7 @@ fn stagedMacroExpandAndDesugar(
             collector,
             diag_engine,
             &compiled_executor,
+            &shared_closure_counter,
         );
         break :blk expanded;
     } else null;
@@ -4541,6 +4548,12 @@ fn stagedMacroExpandAndDesugarCached(
     var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
     var staged_ir_dirty = false;
+    // Shared monotonic closure counter for the WHOLE cached staged
+    // compilation, so freshly re-expanded structs + the top-level program
+    // get globally-unique `__closure_N` names (no cross-file collisions).
+    // Cache-HIT structs keep their already-baked closure names (they are not
+    // re-desugared), so this counter only sequences the re-expanded ones.
+    var shared_closure_counter: u32 = 0;
 
     var staged_timer = ZapTimer.start();
     for (ordered_structs.items, 0..) |original, struct_index| {
@@ -4569,6 +4582,7 @@ fn stagedMacroExpandAndDesugarCached(
             diag_engine,
             &compiled_executor,
             cache,
+            &shared_closure_counter,
         );
         const desugared = expanded.program;
         const expand_ms = staged_timer.lapMs();
@@ -4623,6 +4637,7 @@ fn stagedMacroExpandAndDesugarCached(
         diag_engine,
         &compiled_executor,
         cache,
+        &shared_closure_counter,
     );
 
     const extra_top_level_count: usize = if (top_level_program != null) 1 else 0;
@@ -4756,6 +4771,7 @@ fn cachedOrExpandTopLevelProgram(
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
     cache: *ExpansionCacheWork,
+    shared_closure_counter: *u32,
 ) CompileError!?ast.Program {
     if (top_level_items.len == 0) return null;
 
@@ -4774,6 +4790,7 @@ fn cachedOrExpandTopLevelProgram(
             collector,
             diag_engine,
             compiled_executor,
+            shared_closure_counter,
         );
         try updateImplDeclsInProgram(collector, &expanded);
         return expanded;
@@ -4796,6 +4813,7 @@ fn cachedOrExpandTopLevelProgram(
         collector,
         diag_engine,
         compiled_executor,
+        shared_closure_counter,
     );
     artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
     try updateImplDeclsInProgram(collector, &artifact.program);
@@ -4811,6 +4829,7 @@ fn cachedOrExpandStagedStruct(
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
     cache: *ExpansionCacheWork,
+    shared_closure_counter: *u32,
 ) CompileError!StagedExpansionResult {
     const cached = cache.state.expanded_structs.get(original.name);
     if (!cache.invalidated_structs.contains(original.name) and
@@ -4842,6 +4861,7 @@ fn cachedOrExpandStagedStruct(
         collector,
         diag_engine,
         compiled_executor,
+        shared_closure_counter,
     );
     artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
     try reCollectFunctionsInProgram(collector, &artifact.program);
@@ -4881,6 +4901,7 @@ fn expandAndDesugarTopLevelProgram(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+    shared_closure_counter: *u32,
 ) CompileError!ast.Program {
     const top_program = ast.Program{ .structs = &.{}, .top_items = top_items };
     const error_baseline = diag_engine.errorCount();
@@ -4899,7 +4920,7 @@ fn expandAndDesugarTopLevelProgram(
     }
     if (diag_engine.errorCount() > error_baseline) return error.MacroExpansionFailed;
 
-    var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
+    var desugarer = zap.Desugarer.initWithSharedClosureCounter(alloc, interner, &collector.graph, shared_closure_counter);
     const desugared = desugarer.desugarProgram(&expanded) catch {
         diag_engine.err("Error during top-level desugaring", .{ .start = 0, .end = 0 }) catch {};
         return error.DesugarFailed;
@@ -4918,6 +4939,7 @@ fn expandAndDesugarStagedStruct(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+    shared_closure_counter: *u32,
 ) CompileError!ast.Program {
     const error_baseline = diag_engine.errorCount();
 
@@ -4958,7 +4980,7 @@ fn expandAndDesugarStagedStruct(
     try reCollectFunctionsInProgram(collector, &expanded);
     try updateImplDeclsInProgram(collector, &expanded);
 
-    var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
+    var desugarer = zap.Desugarer.initWithSharedClosureCounter(alloc, interner, &collector.graph, shared_closure_counter);
     const desugared = desugarer.desugarProgram(&expanded) catch {
         diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
         return error.DesugarFailed;
