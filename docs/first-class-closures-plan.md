@@ -224,3 +224,73 @@ strings. **NEVER `zig build zir-test`** (the user runs it). Fork changes allowed
 Phase 3 is the make-or-break; enter only with the full pre-Phase-3 corpus green so any
 regression is unambiguously attributable to the unification. Gap analysis + resolution
 loop after each phase until clean before advancing.
+
+## Phase 3 representation-matrix close-out (final edges)
+
+The idiomatic factory/method-constructed forms unified across all positions ×
+bodies × modes × managers (capturing and non-capturing). Three residual
+construction-site edges remained and are now **all FIXED** (no documented
+limitations — every cell is green):
+
+### Edge 1 — capturing closure constructed INLINE in script `main`, stored into a boxed field
+A capturing closure built inline in the top-level script `main` body and stored
+into a `fn`-typed (boxed `Callable`) field failed with `EmitFailed`, while the
+SAME closure built inside a factory METHOD worked.
+
+**Root cause.** A synthesized `__closure_N` capture field is declared `any` (the
+desugar cannot resolve a captured binding's type) and backfilled to the concrete
+type at the closure's single construction site (`backfillClosureFieldType` in
+`src/types.zig`, during `inferExpr` of the `%__closure_N{...}` literal).
+Compilation is struct-by-struct (`compileStructsToPreFinalIr`) against a SHARED
+`TypeStore`, and type registration re-runs on every struct's pass. When the
+`__closure_N` module is itself type-checked AFTER the module that constructed it,
+re-resolving the `any` annotation to `UNKNOWN` CLOBBERS the backfill — emitting an
+`any`-field struct (no representation → `EmitFailed`). A closure built inline in
+`main` always hits this because the synthesized `__closure_N` module is ordered
+LAST (after `__ZapScriptMain`); a factory method is ordered after `__closure_N`,
+so its backfill is never clobbered — which is why the method form worked.
+
+**Fix** (`src/types.zig`, struct registration): when re-registering a
+`__closure_N` struct, a capture field that resolves to `UNKNOWN` carries forward
+any non-`UNKNOWN` type already recorded at this struct's `type_id` (the prior
+backfill). The placeholder `any` annotation is never the source of truth for a
+closure capture's type. Keyed precisely on the `__closure_` name — non-closure
+structs are unaffected. This makes the backfill order-independent, so it
+generalizes to ALL capturing-`main`-local boxed positions (field, list element,
+map value, if-branch box). Fixture: `capturing_inline_main_field.zap` → `15`.
+
+### Edge 2 — non-capturing closure as a generic-type-var param default that unifies to `Callable`
+`Map.get(map, key, default :: value)` with a closure-literal `default`, where
+`value` unifies to `Callable({i64}, i64)`: the closure was not boxed (a bare
+fn-ptr was passed where a `ProtocolBox` is expected).
+
+**Root cause.** The box decision is syntactic (desugar, PRE-unification), so it
+cannot observe that `value` resolves to `Callable`. The concrete-`fn`-typed-param
+case already boxes via the crux/monomorphizer (`boxedCallableRepresentationForParam`),
+but a bare generic type-variable param has no `effect_var` function type to key on.
+
+**Fix** (`src/desugar.zig`): a closure-literal call argument boxes when the callee
+parameter it flows into is a bare GENERIC TYPE-VARIABLE annotation (`.name` /
+`.variable`) rather than a `fn(A) -> R` function type. A closure value can only
+inhabit such a slot by boxing into a `Callable` existential (it cannot inhabit a
+concrete non-function type), so this is sound and pre-unification-safe. The callee
+param annotation is resolved via the scope graph (`calleeParamTypeAnnotation`); a
+`fn`-typed combinator callback (`Enum.map`'s `fn(element) -> mapped`) keeps the
+direct #201/Gap E path (its annotation is `.function` — never boxed; verified no
+`__closure_` synthesis for combinator args). Fixture:
+`generic_default_callable.zap` → `100`. (Capturing-closure-as-generic-default also
+works — the boxed-slot flag boxes regardless of capture.)
+
+### Edge 3 — nested closure capturing the OUTER closure's capture, inline in `main`
+`fn(x) { adder = fn(y) { y + n }; adder(x) }` where `n` is the outer closure's
+capture, inline in `main`. **Already green on entry** (closed by the factory-form
+Gap-1/3 fixes); promoted as `nested_capture_inline_main.zap` → `13`. Triple-nested
+capture inline in `main` also verified. No further work required.
+
+### Non-regression (load-bearing invariants preserved)
+- `Enum.*` / `Map.*` over non-closure types keep devirtualizing — no V11/Z9101
+  (Edge 2's fix keys on the param annotation SHAPE, not protocol membership).
+- The `#201` / Gap E direct ZIR shape is preserved: a combinator/`fn`-typed-param
+  closure argument synthesizes NO `__closure_N` (stays a bare fn-ptr).
+- `Callable`-specific changes are keyed precisely on the `__closure_` name (Edge 1)
+  and the `.function`-vs-generic param annotation (Edge 2).
