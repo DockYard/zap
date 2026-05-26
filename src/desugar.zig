@@ -1406,14 +1406,39 @@ pub const Desugarer = struct {
                                 .args = try self.allocSlice(*const ast.Expr, &.{
                                     result,
                                     try self.desugarExpr(field.key),
-                                    try self.desugarExpr(field.value),
+                                    // A map VALUE is a boxed-`Callable` slot:
+                                    // an inline closure literal there boxes
+                                    // regardless of capture (same rule as a
+                                    // struct field / collection element).
+                                    try self.desugarExprEscapingBoxedSlot(field.value),
                                 }),
                             },
                         });
                     }
                     return result;
                 }
-                return expr;
+                // A plain map literal `%{k => v}`: recurse into each
+                // key/value so transformations inside (pipes, interpolation,
+                // a closure literal needing if->case lowering, …) are not
+                // lost. A map VALUE is a boxed-`Callable` slot — an inline
+                // closure literal there boxes regardless of capture (a bare
+                // fn-ptr cannot fit the value's `ProtocolBox` slot), exactly
+                // like a struct-field value or a collection element. Keys
+                // desugar in the ambient (non-escaping) context.
+                var new_fields: std.ArrayList(ast.MapField) = .empty;
+                for (me.fields) |field| {
+                    try new_fields.append(self.allocator, .{
+                        .key = try self.desugarExpr(field.key),
+                        .value = try self.desugarExprEscapingBoxedSlot(field.value),
+                    });
+                }
+                return try self.create(ast.Expr, .{
+                    .map = .{
+                        .meta = me.meta,
+                        .update_source = null,
+                        .fields = try new_fields.toOwnedSlice(self.allocator),
+                    },
+                });
             },
 
             // For comprehension → block with recursive helper function + call

@@ -7715,6 +7715,25 @@ pub const TypeChecker = struct {
                                 type_name_id,
                                 se,
                             );
+                            // A `%__closure_N{...}` construction is the
+                            // BOXED `Callable` existential, not a plain
+                            // struct value: its expression type is the
+                            // `Callable({P...}, R)` `protocol_constraint`
+                            // its `impl Callable` declares. Returning the
+                            // constraint (instead of the bare `__closure_N`
+                            // struct type) makes a list/map of distinct
+                            // closure structs uniformly typed `Callable`
+                            // (so `List.get`/`Map.get` specialize to a
+                            // dispatchable element and the container element
+                            // type does not collapse to `Term`), and gives
+                            // `maybeBoxAsProtocol` a `Callable` slot to box
+                            // against in every position (field, element,
+                            // map value, return). The capture-field backfill
+                            // above still ran against the struct TypeId, so
+                            // the env layout is intact.
+                            if (self.closureStructCallableConstraint(type_name_id)) |callable_constraint| {
+                                return callable_constraint;
+                            }
                             // For a parametric instantiation
                             // `%Box(i64){...}` the literal's *type*
                             // is the applied form `Box(i64)`, not the
@@ -8668,6 +8687,45 @@ pub const TypeChecker = struct {
     /// capture fields are backfilled from their single construction site.
     fn isClosureStructName(self: *const TypeChecker, type_name_id: ast.StringId) bool {
         return std.mem.startsWith(u8, self.interner.get(type_name_id), "__closure_");
+    }
+
+    /// If `struct_type_name_id` names a desugar-synthesized closure struct
+    /// (`__closure_N`) that has an `impl Callable({P...}, R) for __closure_N`,
+    /// return the `Callable({P...}, R)` `protocol_constraint` TypeId — the
+    /// closure's BOXED representation. A `%__closure_N{...}` construction is
+    /// the boxed-`Callable` existential, so its expression type is the
+    /// `Callable` constraint, NOT the bare `__closure_N` struct type. Without
+    /// this, a `[fn(i64) -> i64]` list literal of two DISTINCT closure structs
+    /// (`__closure_0`, `__closure_1`) would unify its element type to `Term`
+    /// (or a single value would type as `Map(_, __closure_0)`) instead of the
+    /// uniform `Callable`, so `List.get`/`Map.get` could not specialize to a
+    /// dispatchable `Callable` element and `maybeBoxAsProtocol` had no
+    /// `Callable` slot to box against. Returns null for a non-closure struct
+    /// or a closure struct whose `impl Callable` (or its type args) cannot be
+    /// resolved. The protocol type args are resolved through `resolveTypeExpr`
+    /// so the `{P...}` arguments tuple and `R` result render concretely.
+    fn closureStructCallableConstraint(self: *TypeChecker, struct_type_name_id: ast.StringId) ?TypeId {
+        if (!self.isClosureStructName(struct_type_name_id)) return null;
+        const struct_name_text = self.interner.get(struct_type_name_id);
+        for (self.graph.impls.items) |entry| {
+            if (entry.target_type.parts.len != 1) continue;
+            if (!std.mem.eql(u8, self.interner.get(entry.target_type.parts[0]), struct_name_text)) continue;
+            if (entry.protocol_name.parts.len != 1) continue;
+            if (!std.mem.eql(u8, self.interner.get(entry.protocol_name.parts[0]), "Callable")) continue;
+            if (entry.decl.protocol_type_args.len != 2) continue;
+            const args_tuple = self.resolveTypeExpr(entry.decl.protocol_type_args[0]) catch return null;
+            const result = self.resolveTypeExpr(entry.decl.protocol_type_args[1]) catch return null;
+            if (args_tuple == TypeStore.UNKNOWN or result == TypeStore.UNKNOWN) return null;
+            const type_params = self.allocator.alloc(TypeId, 2) catch return null;
+            type_params[0] = args_tuple;
+            type_params[1] = result;
+            const protocol_name_id = entry.protocol_name.parts[0];
+            return self.store.addType(.{ .protocol_constraint = .{
+                .protocol_name = protocol_name_id,
+                .type_params = type_params,
+            } }) catch null;
+        }
+        return null;
     }
 
     /// Write a concrete type into a closure struct's capture field whose

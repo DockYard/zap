@@ -5973,6 +5973,21 @@ pub const HirBuilder = struct {
                     });
                 }
                 const built_entries = try entries.toOwnedSlice(self.allocator);
+                // A closure value's type is its boxed `Callable` existential:
+                // a map VALUE that is a closure literal (`%{:k => fn(x){...}}`)
+                // must type as `Callable`, not the bare `__closure_N` struct,
+                // so the value axis is uniform `Callable` (not `Term` for
+                // distinct closure structs, nor a single-struct `Map(_,
+                // __closure_0)` that mismatches the declared `Map(_,
+                // Callable)`). Stamp the redirected type back so `map_init`
+                // boxing wraps each value into the existential. Mirrors the
+                // list-element redirect.
+                for (built_entries) |entry| {
+                    const redirected = self.redirectClosureStructToCallable(entry.value.type_id);
+                    if (redirected != entry.value.type_id) {
+                        @constCast(entry.value).type_id = redirected;
+                    }
+                }
                 // Infer map type by unifying all entry types. If keys (or
                 // values) disagree across entries we promote the disagreeing
                 // axis to `Term`, so the runtime container instantiates as
@@ -7660,6 +7675,51 @@ pub const HirBuilder = struct {
         return elem;
     }
 
+    /// True iff `type_name_id` names a desugar-synthesized closure struct.
+    fn isClosureStructName(self: *const HirBuilder, type_name_id: ast.StringId) bool {
+        return std.mem.startsWith(u8, self.interner.get(type_name_id), "__closure_");
+    }
+
+    /// If `type_id` is a `__closure_N` struct type that has an
+    /// `impl Callable({P...}, R) for __closure_N`, return the
+    /// `Callable({P...}, R)` `protocol_constraint` TypeId — the closure's
+    /// BOXED representation. Otherwise return `type_id` unchanged. Mirrors
+    /// the type checker's `closureStructCallableConstraint`: a closure value
+    /// is its `Callable` existential, so a collection of distinct closure
+    /// structs unifies to the uniform `Callable` element (not `Term`) even
+    /// with NO annotated expected element type (a bare inline list/map
+    /// literal). Resolving the impl's `protocol_type_args` through
+    /// `resolveTypeExpr` renders the `{P...}` args tuple and `R` result
+    /// concretely.
+    fn redirectClosureStructToCallable(self: *HirBuilder, type_id: types_mod.TypeId) types_mod.TypeId {
+        if (type_id == types_mod.TypeStore.UNKNOWN) return type_id;
+        if (type_id >= self.type_store.types.items.len) return type_id;
+        const typ = self.type_store.getType(type_id);
+        if (typ != .struct_type) return type_id;
+        const struct_name_id = typ.struct_type.name;
+        if (!self.isClosureStructName(struct_name_id)) return type_id;
+        const struct_name_text = self.interner.get(struct_name_id);
+        for (self.graph.impls.items) |entry| {
+            if (entry.target_type.parts.len != 1) continue;
+            if (!std.mem.eql(u8, self.interner.get(entry.target_type.parts[0]), struct_name_text)) continue;
+            if (entry.protocol_name.parts.len != 1) continue;
+            if (!std.mem.eql(u8, self.interner.get(entry.protocol_name.parts[0]), "Callable")) continue;
+            if (entry.decl.protocol_type_args.len != 2) continue;
+            const args_tuple = self.resolveTypeExpr(entry.decl.protocol_type_args[0]);
+            const result = self.resolveTypeExpr(entry.decl.protocol_type_args[1]);
+            if (args_tuple == types_mod.TypeStore.UNKNOWN or result == types_mod.TypeStore.UNKNOWN) return type_id;
+            const type_params = self.allocator.alloc(types_mod.TypeId, 2) catch return type_id;
+            type_params[0] = args_tuple;
+            type_params[1] = result;
+            const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+            return store_ptr.addType(.{ .protocol_constraint = .{
+                .protocol_name = entry.protocol_name.parts[0],
+                .type_params = type_params,
+            } }) catch type_id;
+        }
+        return type_id;
+    }
+
     fn internDottedStructName(self: *HirBuilder, name: ast.StructName) !ast.StringId {
         if (name.parts.len == 0) return 0;
         if (name.parts.len == 1) return name.parts[0];
@@ -8082,9 +8142,23 @@ pub const HirBuilder = struct {
     ///   `[1, "x"]`               → `[Term]`
     ///   `[{:a, 1}, {:b, "s"}]`   → `[{Atom, Term}]` (component-wise)
     ///   `[{:a, 1}, {:b, "s", 7}]`→ `[Term]` (different arity → fall back)
-    fn inferListElementType(self: *const HirBuilder, built_elems: []const *const Expr) types_mod.TypeId {
+    fn inferListElementType(self: *HirBuilder, built_elems: []const *const Expr) types_mod.TypeId {
         if (built_elems.len == 0) return types_mod.TypeStore.UNKNOWN;
         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+
+        // A closure value's type is its boxed `Callable` existential, so a
+        // bare inline list of closure literals (`[fn(x){x+1}, fn(x){x+2}]`,
+        // no annotated expected element type) must unify to `Callable`, not
+        // `Term` (distinct `__closure_0`/`__closure_1` structs would
+        // otherwise collapse). Redirect each closure-struct element type to
+        // its `Callable` constraint and stamp it back so the element carries
+        // the boxed type the `list_init` lowering wraps.
+        for (built_elems) |elem| {
+            const redirected = self.redirectClosureStructToCallable(elem.type_id);
+            if (redirected != elem.type_id) {
+                @constCast(elem).type_id = redirected;
+            }
+        }
 
         // First pass: pick a starting concrete type.
         var element_type: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
