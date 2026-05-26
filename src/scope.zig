@@ -1046,6 +1046,22 @@ pub const ScopeGraph = struct {
         return null;
     }
 
+    /// Find the `impl` block whose own scope is exactly `scope_id`, returning
+    /// a mutable pointer to its registry entry. An impl method's owning
+    /// "struct" for naming purposes is the impl's `target_type` (the type the
+    /// methods are folded onto in HIR/IR). Used by the raises-row key
+    /// derivation so a method declared in a TOP-LEVEL `impl P for T` (e.g. the
+    /// synthesized `impl Callable for __closure_N`) resolves to the same
+    /// `<T>.<method>/<arity>` key the IR backend queries — a nested impl
+    /// inside a `defmodule` already resolves via the struct-scope walk, but a
+    /// top-level impl's scope chain never reaches a struct scope.
+    pub fn findImplByScope(self: *ScopeGraph, scope_id: ScopeId) ?*ImplEntry {
+        for (self.impls.items) |*entry| {
+            if (entry.scope_id == scope_id) return entry;
+        }
+        return null;
+    }
+
     /// Find a StructEntry by name, returning a mutable pointer.
     pub fn findStructEntryByName(self: *ScopeGraph, struct_name: ast.StructName) ?*StructEntry {
         for (self.structs.items) |*entry| {

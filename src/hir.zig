@@ -6757,9 +6757,29 @@ pub const HirBuilder = struct {
                 struct_prefix = joined;
                 break :outer;
             }
+            // A method declared in a TOP-LEVEL `impl P for T` (the synthesized
+            // `impl Callable for __closure_N`, or any free-standing impl) has a
+            // scope chain that never reaches a struct scope — its owning
+            // "struct" for the raises-row key is the impl's `target_type`,
+            // matching `TypeChecker.raisesRowKey` (the producer of the row this
+            // queries) and the IR backend's `current_struct_prefix`. Without
+            // this, a raising closure's `call` body wrongly resolved to the
+            // bare `call/<arity>` key, missed its stored `__closure_N.call`
+            // row, and lowered the `raise` to the Phase-2 `do_raise` ABORT
+            // instead of the propagating `recoverable_raise` — so a stored
+            // raising closure aborted at the raise instead of returning
+            // `error.ZapRaise` for the enclosing `rescue` to discharge.
+            for (self.graph.impls.items) |impl_entry| {
+                if (impl_entry.scope_id != sid) continue;
+                const joined = impl_entry.target_type.joinedWith(self.allocator, self.interner, ".") catch break :outer;
+                struct_prefix_buf = joined;
+                struct_prefix = joined;
+                break :outer;
+            }
             scope_cursor = self.graph.getScope(sid).parent;
         }
-        const result = self.type_store.functionRaises(struct_prefix, method_name, arity);        return result;
+        const result = self.type_store.functionRaises(struct_prefix, method_name, arity);
+        return result;
     }
 
     /// #201 — return `function_type` re-stamped with the closure's

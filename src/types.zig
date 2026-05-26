@@ -6562,6 +6562,20 @@ pub const TypeChecker = struct {
                 struct_prefix = joined;
                 break;
             }
+            // A method declared in a top-level `impl P for T` (the synthesized
+            // `impl Callable for __closure_N`, or any free-standing impl) has a
+            // scope chain that never reaches a struct scope — its owning
+            // "struct" for naming is the impl's `target_type`, which is exactly
+            // what the IR backend uses (`structNameToPrefix(target_type)` via
+            // the HIR struct module the methods are folded onto). Resolve it
+            // here so producer (this key) and consumer (`functionRaises`,
+            // queried with `current_struct_prefix`) agree.
+            if (self.graph.findImplByScope(sid)) |impl_entry| {
+                const joined = impl_entry.target_type.joinedWith(self.allocator, self.interner, ".") catch break;
+                struct_prefix_buf = joined;
+                struct_prefix = joined;
+                break;
+            }
             scope_cursor = self.graph.getScope(sid).parent;
         }
 

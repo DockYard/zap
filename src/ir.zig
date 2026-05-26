@@ -161,6 +161,19 @@ pub const ProtocolVTableMethod = struct {
     /// only signature (no value flows back); every other return
     /// shape lowers to its declared `ZigType` form.
     return_type: ZigType,
+    /// Phase 4 (effect by inference) — true when this method's vtable
+    /// slot must surface the recoverable-raise error union
+    /// (`error{ZapRaise}!<return_type>`, rendered `anyerror!T`) because
+    /// at least one reachable impl bound to this protocol instantiation
+    /// has an inferred non-empty `raises` row for the method. Boxing
+    /// erases the concrete impl, so the effect must ride on the shared
+    /// vtable slot type: the dispatch returns the error union whenever
+    /// the boxed `Callable` instantiation ADMITS a raiser (the
+    /// conservative join — a pure impl's adapter trivially coerces its
+    /// payload into the union, an over-approximation accepted by the
+    /// plan). `false` for a pure-only instantiation, so a program with
+    /// no raising closures of this type gains no spurious error union.
+    raises: bool = false,
 };
 
 /// Per-protocol vtable struct type. One IR `TypeDef` carries
@@ -221,6 +234,17 @@ pub const ProtocolVTableInstanceMethod = struct {
     /// The impl method's return type. Must match the protocol's
     /// return type at the same slot.
     return_type: ZigType,
+    /// Phase 4 (effect by inference) — true when this adapter must
+    /// surface the recoverable-raise error union
+    /// (`error{ZapRaise}!<return_type>`, rendered `anyerror!T`). It is
+    /// the JOIN over the whole instantiation: set whenever ANY impl
+    /// bound to this protocol instantiation raises (matching the shared
+    /// vtable slot's `ProtocolVTableMethod.raises`), NOT just when this
+    /// particular impl raises — so every adapter for a mixed
+    /// instantiation has the same error-union return as its slot. A
+    /// pure impl whose adapter is widened this way returns its payload
+    /// value, which coerces into the error union for free.
+    raises: bool = false,
 };
 
 /// Per-impl vtable instance constant. One IR `TypeDef` carries
@@ -451,6 +475,7 @@ fn cloneZigType(allocator: std.mem.Allocator, value: ZigType) CloneError!ZigType
         .function => |fn_type| .{ .function = .{
             .params = try cloneZigTypeSlice(allocator, fn_type.params),
             .return_type = try cloneZigTypePtr(allocator, fn_type.return_type),
+            .raises = fn_type.raises,
         } },
         .tagged_union => |name| .{ .tagged_union = try cloneBytes(allocator, name) },
         .optional => |item| .{ .optional = try cloneZigTypePtr(allocator, item) },
@@ -509,6 +534,7 @@ fn cloneProtocolVTableMethods(
             .arity = method.arity,
             .extra_param_types = try cloneZigTypeSlice(allocator, method.extra_param_types),
             .return_type = try cloneZigType(allocator, method.return_type),
+            .raises = method.raises,
         };
     }
     return cloned;
@@ -527,6 +553,7 @@ fn cloneProtocolVTableInstanceMethods(
             .arity = method.arity,
             .extra_param_types = try cloneZigTypeSlice(allocator, method.extra_param_types),
             .return_type = try cloneZigType(allocator, method.return_type),
+            .raises = method.raises,
         };
     }
     return cloned;
@@ -2890,6 +2917,20 @@ pub const ZigType = union(enum) {
     pub const FnType = struct {
         params: []const ZigType,
         return_type: *const ZigType,
+        /// Phase 4 (effect by inference) — true when this is the
+        /// devirtualized bare-fn-ptr representation of a RAISING closure
+        /// (a non-capturing closure whose body can raise, flowing through a
+        /// `fn(...) -> T` field/return/element position). The fn-pointer
+        /// type then renders `*const fn(P...) anyerror!T` (the
+        /// recoverable-raise error union) so the lifted `call` method's
+        /// actual `anyerror!T` return coerces into the slot, and the call
+        /// site unwraps/propagates the union exactly like the boxed
+        /// `Callable` dispatch. This is the bare-fn-ptr counterpart of the
+        /// per-instantiation vtable `raises` join: a single statically-known
+        /// closure carries its own effect directly on its `fn` type (no join
+        /// needed). `false` for a pure closure — no spurious error union,
+        /// the zero-overhead devirtualized path is unchanged.
+        raises: bool = false,
     };
 };
 
@@ -3536,6 +3577,25 @@ pub const IrBuilder = struct {
     /// base name.
     applied_name_to_spec: std.StringHashMapUnmanaged(usize) = .empty,
 
+    /// Phase 4 (effect by inference) — the per-`Callable`-instantiation
+    /// `raises` JOIN, keyed by the instantiation's mangled name (e.g.
+    /// `Callable_Tuple_i64`, identical to the `.protocol_box` name a boxed
+    /// `Callable` value carries via `typeIdToZigTypeWithStore`). Each value
+    /// is a per-protocol-method-index `[]bool`: `true` at index `i` when at
+    /// least one impl bound to this instantiation has a non-empty inferred
+    /// `raises` row for the protocol's `i`-th method. SINGLE source of
+    /// truth, computed once (`computeCallableInstantiationRaises`, right
+    /// after `populateAppliedSpecializations` so it precedes function-body
+    /// lowering) and read by BOTH the dispatch-site lowering
+    /// (`lowerBoxedCallableInvocation` decides whether to unwrap/propagate
+    /// the dispatch's error union) AND `populateProtocolVTables` (decides
+    /// whether the vtable slot / dispatch helper / per-impl adapter render
+    /// the error-union return). Boxing erases the concrete impl, so the
+    /// effect must ride on the shared instantiation type — this map is that
+    /// effect carrier. Empty when there is no TypeStore (bare-`Program`
+    /// unit tests).
+    callable_instantiation_raises: std.StringHashMap([]bool) = undefined,
+
     /// One precomputed entry per concrete `.applied { base, args }`
     /// TypeId observed in the TypeStore. See `applied_specializations`
     /// for why this data is precomputed.
@@ -3605,6 +3665,7 @@ pub const IrBuilder = struct {
             .applied_specializations = .empty,
             .applied_id_to_spec = std.AutoHashMap(types_mod.TypeId, usize).init(allocator),
             .applied_name_to_spec = .empty,
+            .callable_instantiation_raises = std.StringHashMap([]bool).init(allocator),
         };
     }
 
@@ -3626,6 +3687,14 @@ pub const IrBuilder = struct {
         self.applied_specializations.deinit(self.allocator);
         self.applied_id_to_spec.deinit();
         self.applied_name_to_spec.deinit(self.allocator);
+        {
+            var raises_it = self.callable_instantiation_raises.iterator();
+            while (raises_it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            self.callable_instantiation_raises.deinit();
+        }
     }
 
     fn localBackedByParam(self: *const IrBuilder, local: LocalId) bool {
@@ -4494,6 +4563,17 @@ pub const IrBuilder = struct {
         // layout reads from this table — see
         // `populateAppliedSpecializations` for the contract.
         try self.populateAppliedSpecializations();
+
+        // Phase 4 (effect by inference) — compute the per-`Callable`-
+        // instantiation `raises` JOIN before any function body is lowered,
+        // so the dispatch-site lowering can decide whether a boxed
+        // `Callable` invocation's result is an error union to unwrap and
+        // propagate. The same map drives the vtable slot/adapter/dispatch
+        // error-union rendering in `populateProtocolVTables`. The
+        // producer of every `call`-method `raises` row (the TypeChecker's
+        // `inferred_raises`) has already run by the time IR builds, so the
+        // join is complete here.
+        try self.computeCallableInstantiationRaises();
 
         // First pass: register all qualified function names for bare call resolution.
         // Mangle the raw symbol so operator-named functions (`+`, `<>`, etc.) become
@@ -10440,6 +10520,73 @@ pub const IrBuilder = struct {
         }
     }
 
+    /// Phase 4 (effect by inference) — populate
+    /// `self.callable_instantiation_raises`: the per-`Callable`-
+    /// instantiation `raises` JOIN, computed once before function-body
+    /// lowering so both the dispatch-site unwrap decision
+    /// (`lowerBoxedCallableInvocation`) and the vtable error-union
+    /// rendering (`populateProtocolVTables`) read one shared, consistent
+    /// answer.
+    ///
+    /// For every concrete-target impl of a PARAMETRIC protocol (the
+    /// `Callable` closure impls, plus any hand-written parametric-protocol
+    /// impl with a concrete target), the key is the instantiation's mangled
+    /// name (`Callable_Tuple_i64` — the same string a boxed value carries as
+    /// its `.protocol_box` ZigType, so the dispatch site can look it up
+    /// directly). The value is a per-protocol-method-index `[]bool`: index
+    /// `i` is `true` when ANY impl bound to this instantiation has a
+    /// non-empty inferred `raises` row for the protocol's `i`-th method
+    /// (`functionRaises(target, method, arity)`). Boxing erases the concrete
+    /// impl, so a single instantiation that admits even one raiser must
+    /// surface the recoverable-raise error union at its shared dispatch slot
+    /// — the JOIN (a conservative over-approximation for mixed
+    /// instantiations, accepted by the plan). A pure-only instantiation
+    /// joins to `false`, so pure closures stay pure (no spurious error
+    /// union, no spurious `raises` requirement).
+    ///
+    /// Silently no-ops without a scope graph or TypeStore (bare-`Program`
+    /// unit tests have no protocol/`raises` surface).
+    fn computeCallableInstantiationRaises(self: *IrBuilder) !void {
+        const graph = self.scope_graph orelse return;
+        if (self.type_store == null) return;
+        for (graph.impls.items) |impl_entry| {
+            const proto_entry = graph.findProtocol(impl_entry.protocol_name) orelse continue;
+            // Only PARAMETRIC protocols carry per-instantiation vtables (the
+            // effect-bearing `Callable` family); bare protocols dispatch
+            // through a fixed-shape vtable and are out of scope here.
+            if (proto_entry.decl.type_params.len == 0) continue;
+            // Concrete impl targets only — parametric-target impls
+            // (`impl Callable({t}, t) for Box(t)`) are a later concern and
+            // never reach the closure boxing path.
+            if (impl_entry.decl.type_params.len != 0) continue;
+
+            const mangled_proto = self.mangledParametricProtocolName(
+                proto_entry,
+                impl_entry.decl.protocol_type_args,
+            ) orelse continue;
+            defer self.allocator.free(mangled_proto);
+            // `protocolNameToString` returns interner-backed memory for a
+            // single-part name (the `__closure_N` common case), never freed.
+            const target_name = self.protocolNameToString(impl_entry.target_type);
+
+            const gop = try self.callable_instantiation_raises.getOrPut(mangled_proto);
+            if (!gop.found_existing) {
+                // The stored key must outlive this iteration's freed
+                // `mangled_proto`, so clone it for the map to own.
+                gop.key_ptr.* = try cloneBytes(self.allocator, mangled_proto);
+                gop.value_ptr.* = try self.allocator.alloc(bool, proto_entry.decl.functions.len);
+                @memset(gop.value_ptr.*, false);
+            }
+            for (proto_entry.decl.functions, 0..) |fn_sig, method_index| {
+                const method_name = self.interner.get(fn_sig.name);
+                const arity: u32 = @intCast(fn_sig.params.len);
+                if (self.implMethodRaises(target_name, method_name, arity)) {
+                    gop.value_ptr.*[method_index] = true;
+                }
+            }
+        }
+    }
+
     /// Phase 1.2.5.a step 3.7 + Phase 1.2.5.b extensions: emit a
     /// `protocol_vtable_def` TypeDef for every `pub protocol`
     /// reachable from the program, and a
@@ -10615,6 +10762,14 @@ pub const IrBuilder = struct {
         // construction site (`box_as_protocol`) and the dispatch site
         // (`protocol_dispatch`) — both keyed on the `.protocol_box` name
         // produced by `typeIdToZigTypeWithStore` — resolve to it.
+        // Phase 4 (effect by inference) — the per-instantiation `raises`
+        // JOIN was precomputed once (`computeCallableInstantiationRaises`,
+        // before function-body lowering) into
+        // `self.callable_instantiation_raises`, keyed by the same mangled
+        // instantiation name used below. Reading the shared map here keeps
+        // the vtable slot/adapter/dispatch error-union rendering in
+        // lockstep with the dispatch-site unwrap decision (single source of
+        // truth — no recomputation, no drift).
         var emitted_parametric_vtables = std.StringHashMap(void).init(self.allocator);
         defer emitted_parametric_vtables.deinit();
         for (graph.impls.items) |impl_entry| {
@@ -10632,6 +10787,8 @@ pub const IrBuilder = struct {
             ) orelse continue;
             const target_name = self.protocolNameToString(impl_entry.target_type);
 
+            const raises_row: ?[]const bool = self.callable_instantiation_raises.get(mangled_proto);
+
             // Emit the per-instantiation vtable struct once.
             if (!emitted_parametric_vtables.contains(mangled_proto)) {
                 try emitted_parametric_vtables.put(mangled_proto, {});
@@ -10640,6 +10797,7 @@ pub const IrBuilder = struct {
                     proto_entry,
                     mangled_proto,
                     impl_entry.decl.protocol_type_args,
+                    raises_row,
                 );
             }
 
@@ -10650,8 +10808,26 @@ pub const IrBuilder = struct {
                 mangled_proto,
                 target_name,
                 impl_entry.decl.protocol_type_args,
+                raises_row,
             );
         }
+    }
+
+    /// Phase 4 — true when the impl method identified by `target_name` /
+    /// `method_name` / `arity` has a non-empty inferred `raises` row (the
+    /// concrete closure body or hand-written impl method can raise). The
+    /// per-instantiation JOIN over this predicate decides whether a boxed
+    /// `Callable` vtable slot surfaces the recoverable-raise error union.
+    /// Returns false when there is no TypeStore (unit tests that build a
+    /// bare `Program`) — those have no `raises` surface.
+    fn implMethodRaises(
+        self: *const IrBuilder,
+        target_name: []const u8,
+        method_name: []const u8,
+        arity: u32,
+    ) bool {
+        const store = self.type_store orelse return false;
+        return store.functionRaises(target_name, method_name, arity);
     }
 
     /// Compose the per-instantiation mangled name for a parametric
@@ -10689,6 +10865,7 @@ pub const IrBuilder = struct {
         proto_entry: *const scope_mod.ProtocolEntry,
         mangled_proto: []const u8,
         protocol_type_args: []const *const ast.TypeExpr,
+        raises_row: ?[]const bool,
     ) !void {
         const vtable_type_name = try std.fmt.allocPrint(self.allocator, "{s}VTable", .{mangled_proto});
         const methods = try self.allocator.alloc(ProtocolVTableMethod, proto_entry.decl.functions.len);
@@ -10713,11 +10890,13 @@ pub const IrBuilder = struct {
                 protocol_type_args,
                 .void,
             );
+            const method_raises = if (raises_row) |row| (method_index < row.len and row[method_index]) else false;
             methods[method_index] = .{
                 .name = try cloneBytes(self.allocator, method_name),
                 .arity = arity,
                 .extra_param_types = extra_param_types,
                 .return_type = return_zig_type,
+                .raises = method_raises,
             };
         }
         try type_defs.append(self.allocator, .{
@@ -10740,6 +10919,7 @@ pub const IrBuilder = struct {
         mangled_proto: []const u8,
         target_name: []const u8,
         protocol_type_args: []const *const ast.TypeExpr,
+        raises_row: ?[]const bool,
     ) !void {
         const instance_type_name = try std.fmt.allocPrint(
             self.allocator,
@@ -10773,12 +10953,19 @@ pub const IrBuilder = struct {
                 protocol_type_args,
                 .void,
             );
+            // The adapter's error-union return is the INSTANTIATION JOIN
+            // (the shared vtable slot's `raises`), not this impl's own
+            // effect — so a pure impl's adapter in a mixed instantiation
+            // still matches its slot type (its payload coerces into the
+            // union). Keyed by protocol-method index, matching the slot.
+            const method_raises = if (raises_row) |row| (method_index < row.len and row[method_index]) else false;
             methods[method_index] = .{
                 .method_name = try cloneBytes(self.allocator, method_name),
                 .impl_function_name = impl_function_name,
                 .arity = arity,
                 .extra_param_types = extra_param_types,
                 .return_type = return_zig_type,
+                .raises = method_raises,
             };
         }
         try type_defs.append(self.allocator, .{
@@ -11066,7 +11253,58 @@ pub const IrBuilder = struct {
             try self.known_local_types.put(dest, slot.return_type);
         }
         try self.trackCallResultType(dest, type_params[1]);
+
+        // Phase 4 (effect by inference) — when this `Callable` instantiation
+        // ADMITS a raiser (the per-instantiation JOIN), its `call` vtable
+        // slot returns the recoverable-raise error union (`anyerror!T`), so
+        // the `protocol_dispatch` result in `dest` is an error union.
+        // Unwrap it in place to the payload `T` and route the error case per
+        // this function's lexical context, EXACTLY mirroring the direct
+        // `call_closure` raising path: inside a `try` body → `catch` to the
+        // enclosing landing pad; in an error-union fn → `try` (propagate,
+        // ERT chain); otherwise → abort via the unhandled-raise crash
+        // report. A pure-only instantiation joins to `false` (no error
+        // union, no unwrap) so pure closures stay pure. Keyed on the
+        // `call`-method slot index in the shared join map — the SAME map the
+        // vtable rendering reads, so dispatch and slot type can never drift.
+        if (self.callableInstantiationMethodRaises(box_name, slot.method_index)) {
+            const mode: ErrorUnionUnwrapMode = if (self.in_try_body)
+                .route_to_handler
+            else if (self.current_function_raises)
+                .propagate
+            else
+                .abort_unhandled;
+            const payload_zig = if (slot.return_type != .any and slot.return_type != .void)
+                slot.return_type
+            else
+                typeIdToZigTypeWithStore(type_params[1], self.type_store);
+            try self.current_instrs.append(self.allocator, .{
+                .unwrap_error_union = .{
+                    .dest = dest,
+                    .source = dest,
+                    .mode = mode,
+                    .payload_type = payload_zig,
+                },
+            });
+        }
         return true;
+    }
+
+    /// Phase 4 — true when the boxed `Callable` instantiation named
+    /// `box_name` (the `.protocol_box` mangled name) has its `method_index`
+    /// protocol method joined to raising in
+    /// `self.callable_instantiation_raises`. Consulted at the dispatch site
+    /// to decide whether the `protocol_dispatch` result is an error union to
+    /// unwrap. Out-of-range index or a missing instantiation entry (a
+    /// pure-only or unrecorded instantiation) is non-raising.
+    fn callableInstantiationMethodRaises(
+        self: *const IrBuilder,
+        box_name: []const u8,
+        method_index: u32,
+    ) bool {
+        const row = self.callable_instantiation_raises.get(box_name) orelse return false;
+        if (method_index >= row.len) return false;
+        return row[method_index];
     }
 
     fn findProtocolMethodSlotForReceiver(
@@ -14565,7 +14803,12 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                             }
                             const ret_ptr = ts.allocator.create(ZigType) catch return .any;
                             ret_ptr.* = typeIdToZigTypeWithStore(ft.return_type, type_store);
-                            return .{ .function = .{ .params = zig_params, .return_type = ret_ptr } };
+                            // Phase 4 — carry the closure's inferred effect onto
+                            // the devirtualized bare-fn-ptr type so a raising
+                            // returned/stored non-capturing closure renders
+                            // `*const fn(...) anyerror!T` and its call site
+                            // unwraps/propagates.
+                            return .{ .function = .{ .params = zig_params, .return_type = ret_ptr, .raises = ft.raises } };
                         },
                         .union_type => |ut| {
                             // T | nil → ?T (Zig optional)

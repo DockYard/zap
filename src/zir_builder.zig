@@ -147,6 +147,15 @@ extern "c" fn zir_builder_emit_ret_null(handle: ?*ZirBuilderHandle) i32;
 // union via `emit_try` (native `try` — builds the error return trace) or
 // route it to a `try`/`rescue` landing pad via `emit_catch`.
 extern "c" fn zir_builder_set_error_union_return_type(handle: ?*ZirBuilderHandle, error_name_ptr: [*]const u8, error_name_len: u32) i32;
+// Phase 4 (effect by inference) — build a standalone `error_set!T` error-union
+// TYPE expression from an error-set ref and a payload type ref, for the
+// devirtualized bare-fn-ptr representation of a raising closure
+// (`*const fn(...) anyerror!T`). Distinct from
+// `set_error_union_return_type`, which wraps the enclosing function's own
+// return; this composes a nested type used inside a func-ptr type. Pass the
+// well-known `anyerror_type` ref as `error_set` to match every other
+// recoverable-raise site.
+extern "c" fn zir_builder_emit_error_union_type(handle: ?*ZirBuilderHandle, error_set: u32, payload: u32) u32;
 extern "c" fn zir_builder_emit_ret_error(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_try(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_catch(handle: ?*ZirBuilderHandle, operand: u32, catch_value: u32) u32;
@@ -555,7 +564,7 @@ fn appendZigTypeForVTable(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     zig_type: ir.ZigType,
-) !void {
+) std.mem.Allocator.Error!void {
     switch (zig_type) {
         .void => try buf.appendSlice(allocator, "void"),
         .never => try buf.appendSlice(allocator, "noreturn"),
@@ -624,7 +633,9 @@ fn appendZigTypeForVTable(
                 try appendZigTypeForVTable(allocator, buf, param_type);
             }
             try buf.appendSlice(allocator, ") ");
-            try appendZigTypeForVTable(allocator, buf, fn_type.return_type.*);
+            // Phase 4 — a raising devirtualized closure's bare-fn-ptr type
+            // carries the recoverable-raise error union on its return.
+            try appendVTableReturnType(allocator, buf, fn_type.return_type.*, fn_type.raises);
         },
         // A Zap tuple renders as a Zig anonymous tuple type
         // `struct { T0, T1, ... }`. This is the representation of a
@@ -659,6 +670,28 @@ fn appendZigTypeForVTable(
         },
         else => try buf.appendSlice(allocator, "anytype"),
     }
+}
+
+/// Render a protocol-method vtable slot's RETURN type, surfacing the
+/// recoverable-raise error union when the (joined) method effect is raising.
+/// Phase 4 (effect by inference): a boxed `Callable` whose instantiation
+/// ADMITS a raiser dispatches through a `call` slot typed
+/// `error{ZapRaise}!T`. The recoverable-raise plumbing models that union as
+/// `anyerror!T` everywhere else (the fork's `set_error_union_return_type`
+/// builds `error_union_type{anyerror, payload}`; `unwrap_error_union` at the
+/// dispatch site unwraps an `anyerror` payload), so the vtable slot, the
+/// dispatch helper, and every per-impl adapter render `anyerror!` + the
+/// payload to stay ABI-compatible with the impl method's actual return and
+/// with the call-site unwrap. A pure (`raises == false`) slot renders the
+/// payload type unchanged — no spurious error union.
+fn appendVTableReturnType(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    zig_type: ir.ZigType,
+    raises: bool,
+) std.mem.Allocator.Error!void {
+    if (raises) try buf.appendSlice(allocator, "anyerror!");
+    try appendZigTypeForVTable(allocator, buf, zig_type);
 }
 
 /// Map a primitive Zap type to a well-known ZIR type Ref.
@@ -1412,7 +1445,23 @@ pub const ZirDriver = struct {
         for (fn_type.params) |param_type| {
             try param_refs.append(self.allocator, try self.emitClosureSignatureTypeRef(param_type));
         }
-        const ret_ref = try self.emitClosureSignatureTypeRef(fn_type.return_type.*);
+        const payload_ret_ref = try self.emitClosureSignatureTypeRef(fn_type.return_type.*);
+        // Phase 4 — a RAISING devirtualized closure's bare-fn-ptr type renders
+        // `*const fn(P...) anyerror!T`: wrap the payload return in the
+        // recoverable-raise error union so the lifted `call` method's actual
+        // `anyerror!T` return matches the slot and the call site unwraps. A
+        // pure closure (`raises == false`) keeps the plain payload return — no
+        // spurious error union, the zero-overhead devirtualized shape is
+        // unchanged.
+        const ret_ref = if (fn_type.raises) blk: {
+            const eu = zir_builder_emit_error_union_type(
+                self.handle,
+                @intFromEnum(Zir.Inst.Ref.anyerror_type),
+                payload_ret_ref,
+            );
+            if (eu == error_ref) return error.EmitFailed;
+            break :blk eu;
+        } else payload_ret_ref;
         const ref = zir_builder_emit_func_ptr_type(
             self.handle,
             param_refs.items.ptr,
@@ -2072,7 +2121,7 @@ pub const ZirDriver = struct {
                 try appendZigTypeForVTable(self.allocator, &buf, param_zt);
             }
             try buf.appendSlice(self.allocator, ") ");
-            try appendZigTypeForVTable(self.allocator, &buf, method.return_type);
+            try appendVTableReturnType(self.allocator, &buf, method.return_type, method.raises);
             try buf.appendSlice(self.allocator, ",\n");
         }
         try buf.appendSlice(self.allocator, "};\n\n");
@@ -2196,7 +2245,7 @@ pub const ZirDriver = struct {
                 try appendZigTypeForVTable(self.allocator, &buf, param_zt);
             }
             try buf.appendSlice(self.allocator, ") ");
-            try appendZigTypeForVTable(self.allocator, &buf, method.return_type);
+            try appendVTableReturnType(self.allocator, &buf, method.return_type, method.raises);
             try buf.appendSlice(self.allocator, " {\n");
             try buf.appendSlice(self.allocator, "    const vt: *const ");
             try buf.appendSlice(self.allocator, type_def.name);
@@ -2340,7 +2389,7 @@ pub const ZirDriver = struct {
                 try appendZigTypeForVTable(self.allocator, &buf, param_zt);
             }
             try buf.appendSlice(self.allocator, ") ");
-            try appendZigTypeForVTable(self.allocator, &buf, method.return_type);
+            try appendVTableReturnType(self.allocator, &buf, method.return_type, method.raises);
             try buf.appendSlice(self.allocator, " {\n");
             // `    const inner: *const <target_type_ref> = @ptrCast(@alignCast(data_ptr.?));`
             try buf.appendSlice(self.allocator, "    const inner: *const ");

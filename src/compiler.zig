@@ -9269,6 +9269,8 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
         @memset(spaces[0..used], ' ');
         std.debug.print("{s}[{d}] {s}", .{ spaces[0..used], idx, @tagName(instr) });
         switch (instr) {
+            .unwrap_error_union => |ueu| std.debug.print(" dest={d} source={d} mode={s}", .{ ueu.dest, ueu.source, @tagName(ueu.mode) }),
+            .protocol_dispatch => |pd| std.debug.print(" dest={d} receiver={d} method={s}", .{ pd.dest, pd.receiver, pd.method_name }),
             .local_get => |lg| std.debug.print(" dest={d} source={d}", .{ lg.dest, lg.source }),
             .share_value => |sv| std.debug.print(" dest={d} source={d} mode={s}", .{ sv.dest, sv.source, @tagName(sv.mode) }),
             .move_value => |mv| std.debug.print(" dest={d} source={d}", .{ mv.dest, mv.source }),
