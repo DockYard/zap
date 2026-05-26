@@ -481,8 +481,29 @@ pub const TypeStore = struct {
         effect_var: ?TypeId,
         raises_row: []const TypeId,
     ) !TypeId {
+        // Build the candidate with the caller's (borrowed) row and dedup FIRST,
+        // so an existing equal function type is reused WITHOUT allocating a dup
+        // that the intern pool would then discard (no leak on a dedup hit). The
+        // row is interned into store-owned memory ONLY on a genuine insert; like
+        // the sibling `params` slice, that allocation lives for the TypeStore's
+        // (per-compilation) lifetime.
+        const candidate: Type = .{
+            .function = .{
+                .params = params,
+                .return_type = return_type,
+                .param_ownerships = param_ownerships,
+                .return_ownership = return_ownership,
+                .raises = raises,
+                .effect_var = effect_var,
+                .raises_row = raises_row,
+            },
+        };
+        for (self.types.items, 0..) |existing, idx| {
+            if (typeStructEq(existing, candidate)) return @intCast(idx);
+        }
         const owned_row = try self.allocator.dupe(TypeId, raises_row);
-        return try self.addType(.{
+        const id: TypeId = @intCast(self.types.items.len);
+        try self.types.append(self.allocator, .{
             .function = .{
                 .params = params,
                 .return_type = return_type,
@@ -493,6 +514,7 @@ pub const TypeStore = struct {
                 .raises_row = owned_row,
             },
         });
+        return id;
     }
 
     pub fn qualify(_: *const TypeStore, type_id: TypeId, ownership: Ownership) QualifiedType {
