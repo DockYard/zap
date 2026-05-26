@@ -9252,7 +9252,7 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
             .move_value => |mv| std.debug.print(" dest={d} source={d}", .{ mv.dest, mv.source }),
             .borrow_value => |bv| std.debug.print(" dest={d} source={d}", .{ bv.dest, bv.source }),
             .copy_value => |cv| std.debug.print(" dest={d} source={d}", .{ cv.dest, cv.source }),
-            .retain => |r| std.debug.print(" value={d}", .{r.value}),
+            .retain => |r| std.debug.print(" value={d} kind={s}", .{ r.value, @tagName(r.kind) }),
             .release => |r| std.debug.print(" value={d} kind={s}", .{ r.value, @tagName(r.kind) }),
             .map_init => |mi| std.debug.print(" dest={d}", .{mi.dest}),
             .ret => |r| std.debug.print(" value={?d}", .{r.value}),

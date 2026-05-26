@@ -3034,7 +3034,33 @@ fn isArcManagedTypeIdDepth(
 /// so its owning `ProtocolBox` must be deep-released by the enclosing
 /// aggregate's drop. Keyed precisely on the `Callable` protocol name so it
 /// never matches the devirtualized `Enumerable` param.
-fn protocolConstraintIsBoxedCallable(
+/// True when the `:zig.` runtime container-builder primitive `name` STORES the
+/// argument at `slot` DIRECTLY into the freshly-built cell — i.e. the slot is a
+/// consuming ELEMENT position (not a borrow). The canonical case is
+/// `:zig.List.cons(value, list)`'s head (slot 0): cons writes `value` into the
+/// new cons cell verbatim, with no `ownElement` clone. The element-encoded
+/// forms (`List:<T>.cons`, `ListNested:<T>.cons`) share the primitive. Slot 1
+/// (the tail list) is excluded here — it is not an element position and a tail
+/// is never a boxed `Callable` value anyway.
+///
+/// Used by the `.builtin` call lowering to clone-on-share a boxed `Callable`
+/// element into an independent owner the cell consumes (the INSERT counterpart
+/// of `List.get`/`reverse`/`next` `ownElement` clone-on-extract). This is the
+/// runtime primitive's ABI, recognised exactly as the same `.builtin` arm
+/// already recognises `List.`/`Map.` method names for type-specialised
+/// encoding — NOT a Zap user-function name.
+fn builtinConsumesElementAtSlot(name: []const u8, slot: usize) bool {
+    if (slot != 0) return false;
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const method = name[dot_index + 1 ..];
+    const prefix = name[0..dot_index];
+    if (!std.mem.eql(u8, method, "cons")) return false;
+    return std.mem.eql(u8, prefix, "List") or
+        std.mem.startsWith(u8, prefix, "List:") or
+        std.mem.startsWith(u8, prefix, "ListNested:");
+}
+
+pub fn protocolConstraintIsBoxedCallable(
     type_store: *const types_mod.TypeStore,
     type_id: types_mod.TypeId,
 ) bool {
@@ -13091,6 +13117,48 @@ pub const IrBuilder = struct {
                             }
                             break :blk map_resolved;
                         } else map_resolved;
+
+                        // FCC container-builder element clone-on-share (the
+                        // filter/reject double-free fix). A consuming
+                        // container-builder runtime call (`:zig.List.cons`'s
+                        // head, slot 0) STORES its boxed `Callable` element
+                        // DIRECTLY into the freshly-built cell (no `ownElement`
+                        // clone), CONSUMING it (`alwaysConsumingBuiltinArg`
+                        // clears the arg's owns bit in `applyOwnsEffect`). The
+                        // ONLY caller of `:zig.List.cons` is the `lib/list.zap`
+                        // `List.prepend(list, value)` wrapper, where the element
+                        // is its `value` PARAMETER — which the caller passes by
+                        // borrow (the wrapper's slot stays `.borrowed`) and the
+                        // caller scope-exit-drops. Under no-REFCOUNT_V1 the cell
+                        // and the caller would then both free ONE inner — a
+                        // `List.reverse`/`ownElement` SIGSEGV. So the element
+                        // must become an INDEPENDENT owner the cell consumes:
+                        // route it through `boxedCallableAggregateOwnerLocal`,
+                        // the SAME clone-on-share the `list_cons`/`list_init` IR
+                        // nodes use (a binding-reference box — `param_get` here
+                        // — is deep-cloned; a fresh box moves in unchanged). The
+                        // clone is recorded as a boxed-existential owner and the
+                        // builtin's element consume (`alwaysConsumingBuiltinArg`)
+                        // clears its owns bit, so it gets NO separate scope-exit
+                        // drop — the cell's deep-release frees the clone's inner
+                        // exactly once, independent of the borrowed source. This
+                        // is the INSERT counterpart of `List.get`/`reverse`/`next`
+                        // `ownElement` clone-on-EXTRACT. Keyed on the `Callable`
+                        // box (a `[i64]`/`[String]` element is `.trivial`/arena,
+                        // never `.protocol_box`; an `Error` box is a different
+                        // protocol name `boxedCallableAggregateOwnerLocal`
+                        // rejects).
+                        for (lowered_args, 0..) |arg_local, slot| {
+                            if (!builtinConsumesElementAtSlot(resolved_name, slot)) continue;
+                            const arg_zig = self.known_local_types.get(arg_local) orelse continue;
+                            if (arg_zig != .protocol_box) continue;
+                            if (slot >= call.args.len) continue;
+                            lowered_args[slot] = try self.boxedCallableAggregateOwnerLocal(
+                                arg_local,
+                                call.args[slot].expr,
+                                arg_zig,
+                            );
+                        }
 
                         // Track the call result's type from the HIR expression.
                         // The ZIR backend also consumes this metadata for
