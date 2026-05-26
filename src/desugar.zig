@@ -2224,14 +2224,34 @@ pub const Desugarer = struct {
         };
         const call_name_id = try interner_mut.intern("call");
         const call_clauses = try self.allocator.alloc(ast.FunctionClause, 1);
+        // The synthesized `call` method BODY is a fresh function body, NOT
+        // the outer escaping position that triggered this boxing. Reset the
+        // escape flags while desugaring it so an inner closure bound to a
+        // LOCAL inside the body (`adder = fn(y){...}; adder(x)`) is NOT
+        // spuriously boxed by the OUTER closure's still-set
+        // `closure_escapes`/`closure_escapes_boxed_slot`/`..._collection`
+        // flags — it stays on the #201/Gap E direct path (its own position
+        // inside the method body re-derives whether it escapes). Without the
+        // reset the inner closure boxed to a `__closure_N` while its
+        // direct-call site expected a `{call_fn, env}` struct, a
+        // representation mismatch ("no field 'call_fn' in struct
+        // '__closure_N'").
+        const saved_escapes = self.closure_escapes;
+        const saved_escapes_collection = self.closure_escapes_collection;
+        const saved_escapes_boxed_slot = self.closure_escapes_boxed_slot;
+        self.closure_escapes = false;
+        self.closure_escapes_collection = false;
+        self.closure_escapes_boxed_slot = false;
+        const desugared_call_body = try self.desugarBlock(try call_body.toOwnedSlice(self.allocator));
+        self.closure_escapes = saved_escapes;
+        self.closure_escapes_collection = saved_escapes_collection;
+        self.closure_escapes_boxed_slot = saved_escapes_boxed_slot;
         call_clauses[0] = .{
             .meta = .{ .span = span },
             .params = try self.allocSlice(ast.Param, &.{ self_param, args_param }),
             .return_type = return_type,
             .refinement = null,
-            // The closure body may itself contain pipes, interpolations, or
-            // nested escaping closures: desugar it.
-            .body = try self.desugarBlock(try call_body.toOwnedSlice(self.allocator)),
+            .body = desugared_call_body,
             .raises = clause.raises,
         };
         const call_decl = try self.create(ast.FunctionDecl, .{
