@@ -11267,27 +11267,51 @@ pub const IrBuilder = struct {
         // union, no unwrap) so pure closures stay pure. Keyed on the
         // `call`-method slot index in the shared join map — the SAME map the
         // vtable rendering reads, so dispatch and slot type can never drift.
-        if (self.callableInstantiationMethodRaises(box_name, slot.method_index)) {
-            const mode: ErrorUnionUnwrapMode = if (self.in_try_body)
-                .route_to_handler
-            else if (self.current_function_raises)
-                .propagate
-            else
-                .abort_unhandled;
-            const payload_zig = if (slot.return_type != .any and slot.return_type != .void)
-                slot.return_type
-            else
-                typeIdToZigTypeWithStore(type_params[1], self.type_store);
-            try self.current_instrs.append(self.allocator, .{
-                .unwrap_error_union = .{
-                    .dest = dest,
-                    .source = dest,
-                    .mode = mode,
-                    .payload_type = payload_zig,
-                },
-            });
-        }
+        const payload_zig = if (slot.return_type != .any and slot.return_type != .void)
+            slot.return_type
+        else
+            typeIdToZigTypeWithStore(type_params[1], self.type_store);
+        try self.emitBoxedCallableRaisesUnwrap(dest, box_name, slot.method_index, payload_zig);
         return true;
+    }
+
+    /// Phase 4 (effect by inference) — after a boxed `Callable` dispatch whose
+    /// result is in `dest`, emit the recoverable-raise unwrap when the boxed
+    /// instantiation `box_name` admits a raiser at `method_index` (the
+    /// per-instantiation JOIN). The `call` vtable slot then returns
+    /// `error{ZapRaise}!T` (`anyerror!T`), so `dest` is an error union: unwrap
+    /// it in place to the payload `T` and route the error case per this
+    /// function's lexical context — inside a `try` body → `catch` to the
+    /// enclosing landing pad; in an error-union fn → `try` (propagate, ERT
+    /// chain); otherwise → abort via the unhandled-raise crash report. This is
+    /// the SINGLE discharge point shared by BOTH boxed-`Callable` dispatch
+    /// sites: the implicit value-call path (`lowerBoxedCallableInvocation`) and
+    /// the explicit `Callable.call(receiver, args)` named-dispatch path (the
+    /// `rewriteCallableValueCall` rewrite of a boxed value-call, plus any
+    /// hand-written `Callable.call`). A pure-only instantiation joins to
+    /// `false`, so no unwrap is emitted and pure closures stay pure.
+    fn emitBoxedCallableRaisesUnwrap(
+        self: *IrBuilder,
+        dest: LocalId,
+        box_name: []const u8,
+        method_index: u32,
+        payload_type: ZigType,
+    ) !void {
+        if (!self.callableInstantiationMethodRaises(box_name, method_index)) return;
+        const mode: ErrorUnionUnwrapMode = if (self.in_try_body)
+            .route_to_handler
+        else if (self.current_function_raises)
+            .propagate
+        else
+            .abort_unhandled;
+        try self.current_instrs.append(self.allocator, .{
+            .unwrap_error_union = .{
+                .dest = dest,
+                .source = dest,
+                .mode = mode,
+                .payload_type = payload_type,
+            },
+        });
     }
 
     /// Phase 4 — true when the boxed `Callable` instantiation named
@@ -13074,6 +13098,20 @@ pub const IrBuilder = struct {
                             if (slot.return_type != .any and slot.return_type != .void) {
                                 try self.known_local_types.put(dest, slot.return_type);
                             }
+                            // Phase 4 (effect by inference) — an explicit
+                            // `Callable.call(receiver, args)` dispatch on a
+                            // boxed `Callable` (the `rewriteCallableValueCall`
+                            // rewrite of `f(x)` where `f` is a boxed value, or
+                            // a hand-written call) reaches HERE, not
+                            // `lowerBoxedCallableInvocation`. When the boxed
+                            // instantiation admits a raiser, the dispatch result
+                            // is `error{ZapRaise}!T` — unwrap/propagate it,
+                            // exactly like the implicit value-call path.
+                            const payload_zig = if (slot.return_type != .any and slot.return_type != .void)
+                                slot.return_type
+                            else
+                                typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                            try self.emitBoxedCallableRaisesUnwrap(dest, box_name, slot.method_index, payload_zig);
                             return dest;
                         }
 
