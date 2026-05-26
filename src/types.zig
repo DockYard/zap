@@ -8180,6 +8180,20 @@ pub const TypeChecker = struct {
                         // Infer return type from the param types: for list-processing
                         // helpers, the return type matches the parameter's list type.
                         const inferred_return = if (signature.return_type == TypeStore.UNKNOWN) blk: {
+                            // A for-comprehension `__for_N(state :: List(E))`
+                            // returns `[BodyType]`, where the body MAPS the
+                            // element — `[i64]` for `for f <- [fn(i64)->i64] {
+                            // f(10) }`, NOT the input `[fn(i64)->i64]`. The
+                            // "return == input list" guess below is only sound
+                            // when the body type happens to equal the element
+                            // type (an identity comprehension over `[i64]`); for
+                            // a transforming comprehension over a boxed-`Callable`
+                            // list it wrongly pins `[Callable]` and short-circuits
+                            // the eager body-type resolution. Leave UNKNOWN for a
+                            // `__for_N` helper so the eager helper check below
+                            // computes the real body type. Non-comprehension
+                            // generated list helpers keep the guess.
+                            if (self.isSyntheticHelperName(vr.name)) break :blk signature.return_type;
                             // If the first param is a list type, the return is likely a list too.
                             if (inferred_params.len > 0 and inferred_params[0] != TypeStore.UNKNOWN) {
                                 const param_type = self.store.getType(inferred_params[0]);
