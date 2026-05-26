@@ -5403,8 +5403,41 @@ pub const TypeChecker = struct {
                             }
                         }
                     }
+                    // A synthesized `__closure_N` capture-environment struct
+                    // declares each capture field with the `any` placeholder
+                    // annotation, because the desugar cannot resolve a captured
+                    // binding's type. The concrete capture type is established by
+                    // the closure's single construction site
+                    // (`backfillClosureFieldType`, see `inferExpr` of the
+                    // `%__closure_N{...}` literal). Compilation is struct-by-struct
+                    // (`compileStructsToPreFinalIr`) against a shared TypeStore, and
+                    // type registration re-runs on every struct's pass — so when the
+                    // `__closure_N` module is itself type-checked AFTER the module
+                    // that constructed it (which always happens for a closure built
+                    // inline in the script `main` body, whose `__closure_N` module is
+                    // ordered last), re-resolving the `any` annotation to UNKNOWN here
+                    // would CLOBBER the already-backfilled concrete capture type,
+                    // emitting an empty/`any`-field struct (EmitFailed). Carry the
+                    // prior concrete capture type forward: a capture field that
+                    // resolves to UNKNOWN keeps any non-UNKNOWN type already recorded
+                    // for it at this struct's `type_id`. The placeholder annotation is
+                    // never the source of truth for a closure capture's type.
+                    const prior_struct: ?Type.StructType = if (self.isClosureStructName(name) and type_id < self.store.types.items.len) blk: {
+                        const existing = self.store.types.items[type_id];
+                        break :blk if (existing == .struct_type) existing.struct_type else null;
+                    } else null;
                     for (sd.fields) |field| {
-                        const field_type = self.resolveFieldTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
+                        var field_type = self.resolveFieldTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
+                        if (field_type == TypeStore.UNKNOWN) {
+                            if (prior_struct) |ps| {
+                                for (ps.fields) |prior_field| {
+                                    if (prior_field.name == field.name and prior_field.type_id != TypeStore.UNKNOWN) {
+                                        field_type = prior_field.type_id;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         const default = field.default;
                         var found_parent = false;
                         for (fields.items) |*pf| {

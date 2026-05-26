@@ -1217,14 +1217,31 @@ pub const Desugarer = struct {
                 });
             },
             .call => |call| {
+                const call_arity: u32 = @intCast(call.args.len);
                 var new_args: std.ArrayList(*const ast.Expr) = .empty;
-                for (call.args) |arg| {
+                for (call.args, 0..) |arg, arg_index| {
                     // A function reference passed as a call argument is a
                     // callable value: eta-expand it into a forwarding
                     // anonymous function (see `etaExpandFunctionRefArg`).
                     // Every other argument desugars normally.
                     if (arg.* == .function_ref) {
                         try new_args.append(self.allocator, try self.etaExpandFunctionRefArg(arg.function_ref));
+                    } else if (arg.* == .anonymous_function and
+                        paramAnnotationRequiresClosureBox(self.calleeParamTypeAnnotation(call.callee, call_arity, arg_index)))
+                    {
+                        // A closure-literal argument whose callee parameter is
+                        // a bare generic type-variable (not a `fn(A) -> R`
+                        // function type) flows into a `Callable` existential
+                        // after unification (e.g. `Map.get(m, k, default ::
+                        // value)` with `value` = `Callable`). The box decision
+                        // is syntactic (pre-unification), so it keys on the
+                        // parameter annotation shape: box the closure here,
+                        // exactly as a boxed-slot field/map value does, so the
+                        // call passes a `ProtocolBox` rather than a bare
+                        // fn-ptr. A `fn`-typed combinator callback (`Enum.map`'s
+                        // `fn(element) -> mapped`) keeps the direct #201/Gap E
+                        // path (its annotation is `.function`).
+                        try new_args.append(self.allocator, try self.desugarExprEscapingBoxedSlot(arg));
                     } else {
                         try new_args.append(self.allocator, try self.desugarExpr(arg));
                     }
@@ -3183,6 +3200,87 @@ pub const Desugarer = struct {
             }
         }
         return null;
+    }
+
+    /// Resolve the declared type annotation of parameter `param_index` of the
+    /// function the call `callee` targets, when statically resolvable from the
+    /// scope graph. Handles a qualified callee `Mod.fn(...)`
+    /// (`field_access(struct_ref(Mod), fn)`) and a bare/imported callee
+    /// `fn(...)` (`var_ref` resolved through this struct's imports). Returns
+    /// `null` when the callee is dynamic (a value call, a closure, an unknown
+    /// function) or the parameter has no annotation — the caller then leaves
+    /// the argument on its default desugaring path.
+    ///
+    /// Used by the `.call` arm to decide whether a closure-literal argument
+    /// must box: a closure value type-checks ONLY against a `fn(A) -> R`
+    /// parameter (the `#201`/Gap E direct path — annotation is `.function`) or
+    /// a `Callable` existential (the boxed path). A parameter annotated as a
+    /// bare GENERIC TYPE VARIABLE (e.g. `Map.get`'s `default :: value`, where
+    /// `value` unifies to the map's `Callable` value type only AFTER
+    /// unification — too late for the desugar's syntactic box decision) is
+    /// therefore the boxed case. The box decision keys on this annotation
+    /// SHAPE so it survives the desugar (pre-unification) without forcing the
+    /// direct-path combinator callbacks (`Enum.map`'s `fn(element) -> mapped`)
+    /// to box.
+    fn calleeParamTypeAnnotation(
+        self: *const Desugarer,
+        callee: *const ast.Expr,
+        arg_count: u32,
+        param_index: usize,
+    ) ?*const ast.TypeExpr {
+        const graph = self.graph orelse return null;
+
+        const target_scope_id: scope_mod.ScopeId = switch (callee.*) {
+            .field_access => |fa| blk: {
+                // Qualified `Mod.method` — the object must be a struct
+                // reference naming the owning module.
+                if (fa.object.* != .struct_ref) return null;
+                break :blk graph.findStructScope(fa.object.struct_ref.name) orelse return null;
+            },
+            .var_ref => |vr| blk: {
+                // Bare call — defined locally in this struct, or imported.
+                const local_scope_id = self.current_struct_scope orelse return null;
+                const key = scope_mod.FamilyKey{ .name = vr.name, .arity = arg_count };
+                if (graph.getScope(local_scope_id).function_families.get(key) != null) {
+                    break :blk local_scope_id;
+                }
+                const source_struct = self.resolveImportedStruct(vr.name, arg_count) orelse return null;
+                break :blk graph.findStructScope(source_struct) orelse return null;
+            },
+            else => return null,
+        };
+
+        const method_name: ast.StringId = switch (callee.*) {
+            .field_access => |fa| fa.field,
+            .var_ref => |vr| vr.name,
+            else => return null,
+        };
+
+        const key = scope_mod.FamilyKey{ .name = method_name, .arity = arg_count };
+        const family_id = graph.getScope(target_scope_id).function_families.get(key) orelse return null;
+        const family = graph.getFamily(family_id);
+        if (family.clauses.items.len == 0) return null;
+        const decl = family.clauses.items[0].decl;
+        if (decl.clauses.len == 0) return null;
+        const params = decl.clauses[0].params;
+        if (param_index >= params.len) return null;
+        return params[param_index].type_annotation;
+    }
+
+    /// True iff the declared parameter type annotation is one a closure value
+    /// can only satisfy by BOXING into a `Callable` existential — i.e. NOT a
+    /// `fn(A) -> R` function type (the direct `#201`/Gap E path) and NOT
+    /// absent. A bare generic type-variable annotation (`.name` /
+    /// `.variable`) that a closure flows into can only unify to `Callable`
+    /// (a closure cannot inhabit a concrete non-function type), so the closure
+    /// argument must box. A `.function` annotation keeps the direct path.
+    fn paramAnnotationRequiresClosureBox(annotation: ?*const ast.TypeExpr) bool {
+        const ann = annotation orelse return false;
+        return switch (ann.*) {
+            .function => false,
+            .name, .variable => true,
+            else => false,
+        };
     }
 
     // ============================================================
