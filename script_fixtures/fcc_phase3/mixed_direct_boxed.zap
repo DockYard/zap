@@ -11,9 +11,16 @@
 # `[fn(i64) -> i64]` list element, forcing a boxed `ProtocolBox(Callable)`
 # existential, dispatched through the box `call` slot.
 #
-# Both coexist in one `main`; each is lowered to its correct representation. The
-# direct callback's un-boxed representation is validated through the ZIR path
-# (ZAP_DUMP_IR_FN), never source strings.
+# Both coexist in one `main`; each is lowered to its correct representation,
+# validated through the ZIR/IR path (ZAP_DUMP_IR_FN), never source strings:
+#   - DIRECT: `main` lowers the inline callback as `make_closure` (the
+#     {call_fn, env} direct-closure struct) passed as a `.share` call arg; the
+#     `Enum_map_next__i64_i64_List` specialization's callback param is `.trivial`
+#     (a bare fn-ptr `ZigType.function`) and the callback fires via `call_closure`
+#     — NO `box_as_protocol`, NO `protocol_dispatch`, NO `ProtocolBox`.
+#   - BOXED: `make_adder(100)` -> a list element -> the extracted value is a
+#     `ProtocolBox` (`copy_value` + `retain{protocol_box_retain}`) dispatched via
+#     `protocol_dispatch` through the box `call` slot.
 #
 # Expected (both managers):
 #   doubled = [2, 4, 6]; sum 12
