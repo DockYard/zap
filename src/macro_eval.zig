@@ -2873,7 +2873,12 @@ fn appendReflectionTypeExpr(
             }
         },
         .function => |function_type| {
-            buf.char('(');
+            // A function-TYPE annotation reflects in the current surface
+            // syntax `fn(P...) -> R`, matching the form the parser accepts
+            // and `signature.appendTypeExpr`. (A function DECLARATION return
+            // type `name(P...) -> R` is rendered by the clause-signature path
+            // above and stays unparenthesized.)
+            buf.str("fn(");
             for (function_type.params, 0..) |param, index| {
                 if (index > 0) buf.str(", ");
                 appendReflectionTypeExpr(buf, param, interner, graph);

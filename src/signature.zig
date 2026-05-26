@@ -167,7 +167,11 @@ pub fn appendTypeExpr(buf: *Buffer, type_expr: *const ast.TypeExpr, interner: *c
             buf.char('}');
         },
         .function => |f| {
-            buf.char('(');
+            // A function-TYPE annotation renders in the current surface
+            // syntax `fn(P...) -> R` (the form the parser accepts), NOT the
+            // legacy `(P... -> R)`. Distinct from a function DECLARATION
+            // signature `name(P...) -> R` built by `buildFunctionSignature`.
+            buf.str("fn(");
             for (f.params, 0..) |param, i| {
                 if (i > 0) buf.str(", ");
                 appendTypeExpr(buf, param, interner);

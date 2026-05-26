@@ -901,8 +901,9 @@ pub const TypeStore = struct {
     /// `List(function)` (or vice-versa), and a `%{Atom => fn(i64) -> i64}` body
     /// produces `Map(Atom, Callable)` vs a declared `Map(Atom, function)`. Bare
     /// `typeEquals` rejects those as distinct, so a function returning such a
-    /// container failed return-type checking (`expected %{Atom => (i64 -> i64)},
-    /// got %{Atom => Callable}`). This recurses through list element, map
+    /// container failed return-type checking (`expected %{Atom => fn(i64) -> i64},
+    /// got %{Atom => fn(i64) -> i64}` — same surface form, distinct internal
+    /// representation). This recurses through list element, map
     /// key/value, tuple element, optional inner, and nested function
     /// param/return positions, accepting `fn`↔`Callable` at each. Falls back to
     /// `typeEquals` for every non-container, non-fn/Callable pair.
@@ -4562,6 +4563,30 @@ pub const TypeChecker = struct {
         try self.addError(msg, span);
     }
 
+    /// Render a function/closure type in the CURRENT surface syntax
+    /// `fn(P0, P1) -> R` (and `fn(P...) -> R raises` for a raising closure
+    /// type). Shared by the bare-`function` and boxed-`Callable` arms of
+    /// `typeToString` so a `fn`-typed value and its boxed `Callable`
+    /// existential render identically — diagnostics must never expose the
+    /// internal `(P -> R)` or `Callable({P}, R)` forms.
+    fn renderFunctionTypeSurface(
+        self: *const TypeChecker,
+        params: []const TypeId,
+        return_type: TypeId,
+        raises: bool,
+    ) []const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        buf.appendSlice(self.allocator, "fn(") catch return "{type}";
+        for (params, 0..) |param, idx| {
+            if (idx > 0) buf.appendSlice(self.allocator, ", ") catch return "{type}";
+            buf.appendSlice(self.allocator, self.typeToString(param)) catch return "{type}";
+        }
+        buf.appendSlice(self.allocator, ") -> ") catch return "{type}";
+        buf.appendSlice(self.allocator, self.typeToString(return_type)) catch return "{type}";
+        if (raises) buf.appendSlice(self.allocator, " raises") catch return "{type}";
+        return buf.toOwnedSlice(self.allocator) catch return "{type}";
+    }
+
     /// Convert a TypeId to a human-readable string
     pub fn typeToString(self: *const TypeChecker, type_id: TypeId) []const u8 {
         if (type_id == TypeStore.BOOL) return "Bool";
@@ -4612,18 +4637,26 @@ pub const TypeChecker = struct {
                     return buf.toOwnedSlice(self.allocator) catch return "{type}";
                 },
                 .function => |ft| {
-                    var buf: std.ArrayList(u8) = .empty;
-                    buf.appendSlice(self.allocator, "(") catch return "{type}";
-                    for (ft.params, 0..) |param, idx| {
-                        if (idx > 0) buf.appendSlice(self.allocator, ", ") catch return "{type}";
-                        buf.appendSlice(self.allocator, self.typeToString(param)) catch return "{type}";
-                    }
-                    buf.appendSlice(self.allocator, " -> ") catch return "{type}";
-                    buf.appendSlice(self.allocator, self.typeToString(ft.return_type)) catch return "{type}";
-                    buf.appendSlice(self.allocator, ")") catch return "{type}";
-                    return buf.toOwnedSlice(self.allocator) catch return "{type}";
+                    // Render in the CURRENT surface syntax `fn(P...) -> R`
+                    // (a raising closure type carries `raises`, surfaced as
+                    // the `fn(P...) -> R raises` form the parser accepts).
+                    return self.renderFunctionTypeSurface(ft.params, ft.return_type, ft.raises);
                 },
-                .protocol_constraint => |pc| return self.interner.get(pc.protocol_name),
+                .protocol_constraint => |pc| {
+                    // A `Callable({P...}, R)` constraint is the boxed
+                    // representation of a `fn(P...) -> R` value (FCC unified
+                    // model). Display the SURFACE function syntax rather than
+                    // the internal protocol name so diagnostics never leak the
+                    // `Callable(...)` desugaring — a `fn`-typed slot and its
+                    // boxed `Callable` form must read identically to the user.
+                    if (self.store.callableArgsAndResult(type_id)) |callable| {
+                        const args_tuple = self.store.getType(callable.args_tuple);
+                        if (args_tuple == .tuple) {
+                            return self.renderFunctionTypeSurface(args_tuple.tuple.elements, callable.result, false);
+                        }
+                    }
+                    return self.interner.get(pc.protocol_name);
+                },
                 .union_type => |ut| {
                     var buf: std.ArrayList(u8) = .empty;
                     for (ut.members, 0..) |member, i| {
@@ -9554,6 +9587,77 @@ test "typeToString renders tuple element types" {
     const rendered = checker.typeToString(tuple_type);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("{i64, String, Bool}", rendered);
+}
+
+test "typeToString renders a function type in current surface syntax fn(P) -> R" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const params = try std.testing.allocator.dupe(TypeId, &.{TypeStore.I64});
+    defer std.testing.allocator.free(params);
+    const fn_type = try store.addType(.{ .function = .{ .params = params, .return_type = TypeStore.I64 } });
+
+    const rendered = checker.typeToString(fn_type);
+    defer std.testing.allocator.free(rendered);
+    // NOT the legacy `(i64 -> i64)`.
+    try std.testing.expectEqualStrings("fn(i64) -> i64", rendered);
+}
+
+test "typeToString renders a raising function type with the raises suffix" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const fn_type = try store.addType(.{ .function = .{ .params = &.{}, .return_type = TypeStore.I64, .raises = true } });
+
+    const rendered = checker.typeToString(fn_type);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("fn() -> i64 raises", rendered);
+}
+
+test "typeToString renders a boxed Callable as the surface fn(P) -> R syntax" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    // Build `Callable({i64}, i64)` — the boxed representation of `fn(i64) -> i64`.
+    const args_elements = try std.testing.allocator.dupe(TypeId, &.{TypeStore.I64});
+    defer std.testing.allocator.free(args_elements);
+    const args_tuple = try store.addType(.{ .tuple = .{ .elements = args_elements } });
+    const type_params = try std.testing.allocator.dupe(TypeId, &.{ args_tuple, TypeStore.I64 });
+    defer std.testing.allocator.free(type_params);
+    const callable_name = try interner.intern("Callable");
+    const callable = try store.addType(.{ .protocol_constraint = .{
+        .protocol_name = callable_name,
+        .type_params = type_params,
+    } });
+
+    const rendered = checker.typeToString(callable);
+    defer std.testing.allocator.free(rendered);
+    // The internal `Callable({i64}, i64)` form must display as the surface syntax.
+    try std.testing.expectEqualStrings("fn(i64) -> i64", rendered);
 }
 
 fn rerunWithEscapeAnalysis(
