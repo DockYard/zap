@@ -2975,7 +2975,8 @@ pub const HirBuilder = struct {
                 if (first_clause.clause_index < first_clause.decl.clauses.len) {
                     const clause = first_clause.decl.clauses[first_clause.clause_index];
                     if (clause.return_type) |rt| {
-                        return self.resolveTypeExpr(rt);
+                        const resolved = self.resolveTypeExpr(rt);
+                        return @constCast(self).applyReturnTypeClosureEffectForCallee(resolved, &clause);
                     }
                 }
             }
@@ -2992,7 +2993,8 @@ pub const HirBuilder = struct {
                 if (first_clause.clause_index < first_clause.decl.clauses.len) {
                     const clause = first_clause.decl.clauses[first_clause.clause_index];
                     if (clause.return_type) |rt| {
-                        return self.resolveTypeExpr(rt);
+                        const resolved = self.resolveTypeExpr(rt);
+                        return @constCast(self).applyReturnTypeClosureEffectForCallee(resolved, &clause);
                     }
                 }
             }
@@ -3309,6 +3311,12 @@ pub const HirBuilder = struct {
                 return_type = substituted;
             }
         }
+        // Phase 4 (effect by inference — RETURN position): when this callee
+        // returns a raising closure, its `fn(..) -> T` result carries that
+        // effect so the call result is a raising closure value — which the
+        // use-site invocation must unwrap (`ir.closureCalleeRaises`). Keeps the
+        // call result in lockstep with the callee's widened emitted signature.
+        return_type = self.applyReturnTypeClosureEffectForCallee(return_type, &clause);
         _ = name;
         return .{
             .param_types = final_param_types,
@@ -4667,9 +4675,19 @@ pub const HirBuilder = struct {
         else
             try self.buildBlock(&.{});
 
+        // Phase 4 (effect by inference — RETURN position): a returned raising
+        // closure is a bare fn-ptr whose call lowers to `anyerror!T`, so the
+        // declared `fn(..) -> T` return type must carry that effect (rendering
+        // `*const fn(..) anyerror!T`) or the body's value cannot inhabit the
+        // declared slot. Reconcile the declared return type against the body's
+        // tail closure-value type (which `applyClosureValueEffect` already
+        // stamped with `raises`). A pure returned closure / non-function return
+        // is left untouched.
+        const effective_return_type = try self.applyReturnTypeClosureEffect(return_type, body.result_type);
+
         return .{
             .params = try params.toOwnedSlice(self.allocator),
-            .return_type = return_type,
+            .return_type = effective_return_type,
             .debug_span = firstExecutableSpan(body) orelse clause.meta.span,
             .decision = decision,
             .body = body,
@@ -6782,6 +6800,87 @@ pub const HirBuilder = struct {
         return result;
     }
 
+    /// Phase 4 (effect by inference — RETURN position) — the CALL-SITE
+    /// counterpart of `applyReturnTypeClosureEffect`. Widen a callee's resolved
+    /// declared `fn(..) -> T` return type to carry the returned closure's
+    /// `raises` so a call to that function yields a raising `fn(..) -> T` value.
+    ///
+    /// HIR resolves a call's result type independently from the callee's
+    /// emitted signature (re-resolving the annotation via `resolveTypeExpr`),
+    /// so without this the call result is the PURE `fn(..) -> T`. The use-site
+    /// `ir.closureCalleeRaises` reads that pure type and skips the unwrap,
+    /// leaking the returned closure's `anyerror!T` (`expected 'i64', found
+    /// 'anyerror!i64'`). Applying the widen here keeps the call result in
+    /// lockstep with the callee's widened signature so the use site unwraps.
+    ///
+    /// Detection inspects the callee clause's tail expression for a returned
+    /// closure and checks whether it raises via `functionEmitsErrorUnion`,
+    /// queried at the CLOSURE's own clause scope (not the callee's) so the
+    /// raises-row struct-prefix key resolves to the closure's lifted target —
+    /// matching `TypeChecker.raisesRowKeyForDecl`, which keys a closure row by
+    /// its own clause meta. A pure returned closure / non-function return is
+    /// left untouched (no spurious effect, zero-overhead path preserved).
+    fn applyReturnTypeClosureEffectForCallee(
+        self: *HirBuilder,
+        declared_return_type: types_mod.TypeId,
+        clause: *const ast.FunctionClause,
+    ) types_mod.TypeId {
+        const declared = self.type_store.getType(declared_return_type);
+        if (declared != .function) return declared_return_type;
+        if (declared.function.raises) return declared_return_type;
+
+        const tail_decl = self.calleeTailClosureDecl(clause) orelse return declared_return_type;
+        if (tail_decl.clauses.len == 0) return declared_return_type;
+        const tail_arity: u32 = @intCast(tail_decl.clauses[0].params.len);
+        const closure_scope = self.graph.resolveClauseScope(tail_decl.clauses[0].meta) orelse
+            tail_decl.clauses[0].meta.scope_id;
+        if (!self.functionEmitsErrorUnion(tail_decl, closure_scope, tail_arity)) return declared_return_type;
+
+        return self.type_store.addFunctionTypeWithEffect(
+            declared.function.params,
+            declared.function.return_type,
+            declared.function.param_ownerships,
+            declared.function.return_ownership,
+            true,
+            declared.function.effect_var,
+        ) catch declared_return_type;
+    }
+
+    /// Resolve a callee clause's tail expression to the `FunctionDecl` of the
+    /// closure it returns, when the tail is a returned closure. Handles a
+    /// closure literal directly in tail position and a tail `var_ref` to a
+    /// local bound to a closure literal earlier in the body. Returns null when
+    /// the tail is not a returned closure (the common non-closure return).
+    fn calleeTailClosureDecl(
+        self: *HirBuilder,
+        clause: *const ast.FunctionClause,
+    ) ?*const ast.FunctionDecl {
+        _ = self;
+        const body = clause.body orelse return null;
+        if (body.len == 0) return null;
+        const tail_expr = switch (body[body.len - 1]) {
+            .expr => |e| e,
+            else => return null,
+        };
+        switch (tail_expr.*) {
+            .anonymous_function => |anon| return anon.decl,
+            .var_ref => |vr| {
+                var idx = body.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (body[idx] != .assignment) continue;
+                    const assign = body[idx].assignment;
+                    if (assign.pattern.* != .bind) continue;
+                    if (assign.pattern.bind.name != vr.name) continue;
+                    if (assign.value.* == .anonymous_function) return assign.value.anonymous_function.decl;
+                    return null;
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
     /// #201 — return `function_type` re-stamped with the closure's
     /// concrete `raises` effect. `resolveFunctionValueType` /
     /// `buildResolvedFunctionType` rebuild a closure's function type
@@ -6809,6 +6908,70 @@ pub const HirBuilder = struct {
             typ.function.return_ownership,
             true,
             typ.function.effect_var,
+        );
+    }
+
+    /// Phase 4 (effect by inference — RETURN position) — widen a function's
+    /// DECLARED `fn(..) -> T` return type to carry the inferred `raises` of the
+    /// closure it actually returns. A returned NON-capturing raising closure is
+    /// a bare fn-ptr whose lifted `call` body lowers to `error{ZapRaise}!T`
+    /// (`anyerror!T`), but the surface return annotation `fn(..) -> T` resolves
+    /// (via `resolveTypeExpr`) to the PURE `*const fn(..) T`. The two differ
+    /// only by the effect bit, so the body's actual returned value
+    /// (`*const fn(..) anyerror!T`) cannot inhabit the declared slot —
+    /// `expected '*const fn () i64', found '*const fn () anyerror!i64'`.
+    ///
+    /// `applyClosureValueEffect` already stamps the closure VALUE's function
+    /// type with its `raises`, so the body block's `result_type` carries it.
+    /// Here we reconcile the DECLARED return type against that body result: when
+    /// both are function types of the same shape (identical params + payload
+    /// return) and the body's returned closure raises while the declared return
+    /// is still pure, return the `raises = true` variant of the declared type.
+    /// The IR backend reads `clause.return_type` directly
+    /// (`typeIdToZigTypeWithStore`), so this single widen makes the function's
+    /// emitted signature render `*const fn(..) anyerror!T`, matching the body —
+    /// the bare-fn-ptr RETURN counterpart of the boxed `Callable`
+    /// per-instantiation `raises` join.
+    ///
+    /// A returned PURE closure (`body_result_type.raises == false`) leaves the
+    /// declared return untouched: no spurious error union, the zero-overhead
+    /// devirtualized return shape is unchanged. A non-function declared return
+    /// (the boxed `Callable` field/element path, or any ordinary value return)
+    /// is likewise untouched — that effect rides on the boxed instantiation,
+    /// not the bare-fn-ptr type.
+    fn applyReturnTypeClosureEffect(
+        self: *HirBuilder,
+        declared_return_type: types_mod.TypeId,
+        body_result_type: types_mod.TypeId,
+    ) !types_mod.TypeId {
+        const declared = self.type_store.getType(declared_return_type);
+        if (declared != .function) return declared_return_type;
+        if (declared.function.raises) return declared_return_type;
+
+        const result = self.type_store.getType(body_result_type);
+        if (result != .function) return declared_return_type;
+        if (!result.function.raises) return declared_return_type;
+
+        // Only widen when the returned closure's type matches the declared
+        // return shape modulo the effect bit — same arity, same parameter
+        // types, same payload return type. This keeps the widen precise: a
+        // body that returns a DIFFERENT function type than declared is a
+        // genuine type error surfaced elsewhere, not an effect to carry.
+        if (declared.function.params.len != result.function.params.len) return declared_return_type;
+        for (declared.function.params, result.function.params) |declared_param, result_param| {
+            if (!self.type_store.typeEqualsModuloCallable(declared_param, result_param)) return declared_return_type;
+        }
+        if (!self.type_store.typeEqualsModuloCallable(declared.function.return_type, result.function.return_type)) {
+            return declared_return_type;
+        }
+
+        return try self.type_store.addFunctionTypeWithEffect(
+            declared.function.params,
+            declared.function.return_type,
+            declared.function.param_ownerships,
+            declared.function.return_ownership,
+            true,
+            declared.function.effect_var,
         );
     }
 

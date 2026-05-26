@@ -3077,10 +3077,16 @@ pub const TypeChecker = struct {
             try param_ownerships.append(self.allocator, self.resolveParamOwnership(param, param_type));
         }
 
-        const return_type = if (clause.return_type) |rt|
+        const declared_return_type = if (clause.return_type) |rt|
             try self.resolveTypeExpr(rt)
         else
             TypeStore.UNKNOWN;
+        // Phase 4 (effect by inference — RETURN position): when this clause
+        // returns a raising closure, its declared `fn(..) -> T` return type
+        // carries that effect (the returned bare-fn-ptr's `call` lowers to
+        // `anyerror!T`), so the call result of this function is a raising
+        // closure value — which the use-site invocation must unwrap.
+        const return_type = try self.applyReturnTypeClosureEffect(declared_return_type, &clause);
 
         // When the call site supplied fewer arguments than the
         // declared arity, the caller is relying on default values for
@@ -3745,6 +3751,55 @@ pub const TypeChecker = struct {
         const key = self.raisesRowKeyForClosureDecl(decl) orelse return false;
         const row = self.store.inferred_raises.get(key) orelse return false;
         return row.len > 0;
+    }
+
+    /// Phase 4 (effect by inference — RETURN position) — widen a clause's
+    /// DECLARED `fn(..) -> T` return type to carry the inferred `raises` of the
+    /// closure it returns, so a CALL SITE sees `make()` yield a raising
+    /// `fn(..) -> T`. A returned raising closure is a bare fn-ptr whose `call`
+    /// lowers to `anyerror!T`; the call-site invocation of that returned
+    /// closure must unwrap/propagate the union, which `ir.closureCalleeRaises`
+    /// decides from the callee value's static function type. That static type
+    /// is the call result of `make()` — i.e. this signature's `return_type`.
+    /// Without this widen the call result is the PURE `fn(..) -> T`, the unwrap
+    /// is skipped, and the raising call's `anyerror!T` leaks as
+    /// `expected 'i64', found 'anyerror!i64'` at the use site. This is the
+    /// type-inference counterpart of the HIR `applyReturnTypeClosureEffect`
+    /// (which widens the EMITTED signature): the two resolve return types in
+    /// independent passes and must agree.
+    ///
+    /// Detection reuses the existing tail-closure resolution
+    /// (`closureDeclFromExpr` → `closureDeclRaises`), which handles both a
+    /// closure literal in tail position and a tail `var_ref` to a local bound
+    /// to a closure. A returned PURE closure / non-function return is left
+    /// untouched — no spurious effect, the zero-overhead path is preserved.
+    fn applyReturnTypeClosureEffect(
+        self: *TypeChecker,
+        declared_return_type: TypeId,
+        clause: *const ast.FunctionClause,
+    ) !TypeId {
+        const declared = self.store.getType(declared_return_type);
+        if (declared != .function) return declared_return_type;
+        if (declared.function.raises) return declared_return_type;
+
+        const body = clause.body orelse return declared_return_type;
+        if (body.len == 0) return declared_return_type;
+        const tail_stmt = body[body.len - 1];
+        const tail_expr = switch (tail_stmt) {
+            .expr => |e| e,
+            else => return declared_return_type,
+        };
+        const tail_decl = self.closureDeclFromExpr(tail_expr) orelse return declared_return_type;
+        if (!self.closureDeclRaises(tail_decl)) return declared_return_type;
+
+        return try self.store.addFunctionTypeWithEffect(
+            declared.function.params,
+            declared.function.return_type,
+            declared.function.param_ownerships,
+            declared.function.return_ownership,
+            true,
+            declared.function.effect_var,
+        );
     }
 
     /// #201 — when `param` is a closure-typed parameter that the
