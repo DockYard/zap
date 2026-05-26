@@ -29,7 +29,7 @@ rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
 # (nonzero rc, NO leak marker, NO SIGSEGV/ICE).
 EXPECT_ABORT_RE='^(unhandled_aborts|unhandled_cross_fn|discriminate_no_match_reraise|reraise_propagates|reraise_nonterminal|after_reraise|after_mixed_divergent_arm|after_reraise_propagate_fn|min_both_noreturn_case)\.zap$'
 # Fixtures that intentionally fail to compile (type error).
-EXPECT_TYPEERR_RE='^(undischarged_flagged)\.zap$'
+EXPECT_TYPEERR_RE='^(undischarged_flagged|return_undischarged_flagged)\.zap$'
 
 leak_marker='memory leak:|leak summary:|LEAK DETECTED|leaked [0-9]'
 crash_marker='Segmentation fault|bus error|SIGSEGV|SIGABRT|panic: |reached unreachable|cast causes pointer|integer overflow|@panic|Internal compiler error|ICE'

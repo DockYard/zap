@@ -168,6 +168,30 @@ pub const Type = union(enum) {
         /// ordinary (non-effect-polymorphic) function types — the
         /// common case.
         effect_var: ?TypeId = null,
+        /// Phase 4 (effect by inference — discharge check) — the
+        /// CONCRETE inferred `raises` error-type row of the closure a
+        /// `fn(..) -> T` RETURN type yields. Populated ONLY when a
+        /// function's declared return type is widened to carry a
+        /// returned closure's effect (`applyReturnTypeClosureEffect`):
+        /// it records WHICH `Error` types the returned closure raises,
+        /// not just the `raises` bool. Consumed at a closure-VALUE call
+        /// site (`action()` where `action = make()`): invoking a
+        /// returned raising closure folds this row into the enclosing
+        /// function's live `current_raises`, so an UNDISCHARGED
+        /// invocation (no `rescue`) in a function whose declared
+        /// `raises` row does not admit it is FLAGGED by
+        /// `reconcileRaisesRow` — exactly like a direct raise. Empty for
+        /// every other function type (the common case): a pure return, a
+        /// higher-order parameter (its effect rides on `effect_var`), or
+        /// a bare closure VALUE type (whose effect the parameter-arg path
+        /// resolves from the closure literal directly). PARTICIPATES in
+        /// `typeStructEq` identity so `addType` dedup preserves it instead
+        /// of collapsing the widened return type onto a pre-existing
+        /// bool-only raising function type. Only a function's declared
+        /// RETURN type ever carries a non-empty row, so the extra
+        /// distinction never forks an ordinary closure VALUE or parameter
+        /// specialization.
+        raises_row: []const TypeId = &.{},
     };
 
     pub const AppliedType = struct {
@@ -383,7 +407,7 @@ pub const TypeStore = struct {
             .type_var => false,
             .list => |l| l.element == b.list.element,
             .tuple => |t| std.mem.eql(TypeId, t.elements, b.tuple.elements),
-            .function => |f| f.return_type == b.function.return_type and std.mem.eql(TypeId, f.params, b.function.params) and ownershipSlicesEqual(f.param_ownerships, b.function.param_ownerships) and f.return_ownership == b.function.return_ownership and f.raises == b.function.raises and f.effect_var == b.function.effect_var,
+            .function => |f| f.return_type == b.function.return_type and std.mem.eql(TypeId, f.params, b.function.params) and ownershipSlicesEqual(f.param_ownerships, b.function.param_ownerships) and f.return_ownership == b.function.return_ownership and f.raises == b.function.raises and f.effect_var == b.function.effect_var and std.mem.eql(TypeId, f.raises_row, b.function.raises_row),
             .map => |m| m.key == b.map.key and m.value == b.map.value,
             .struct_type => |s| s.name == b.struct_type.name,
             .tagged_union => |t| t.name == b.tagged_union.name,
@@ -432,6 +456,41 @@ pub const TypeStore = struct {
                 .return_ownership = return_ownership,
                 .raises = raises,
                 .effect_var = effect_var,
+            },
+        });
+    }
+
+    /// Phase 4 (effect by inference — discharge check) — construct (or dedupe)
+    /// a function type carrying the CONCRETE returned-closure `raises` error
+    /// row (which `Error` types a `fn(..) -> T` RETURN type's returned closure
+    /// raises). Used only by `applyReturnTypeClosureEffect`: the widened return
+    /// type then surfaces those error types at a closure-VALUE call site so an
+    /// undischarged invocation is flagged against the caller's declared row.
+    /// The row is interned into store-owned memory (it originates from
+    /// `inferred_raises`, whose lifetime is independent) and deduped through
+    /// `addType` — `raises_row` participates in `typeStructEq`, so the same
+    /// (params, return, raises, row) reuses one `TypeId` and the row is never
+    /// double-freed.
+    pub fn addFunctionTypeWithEffectAndRow(
+        self: *TypeStore,
+        params: []const TypeId,
+        return_type: TypeId,
+        param_ownerships: ?[]const Ownership,
+        return_ownership: Ownership,
+        raises: bool,
+        effect_var: ?TypeId,
+        raises_row: []const TypeId,
+    ) !TypeId {
+        const owned_row = try self.allocator.dupe(TypeId, raises_row);
+        return try self.addType(.{
+            .function = .{
+                .params = params,
+                .return_type = return_type,
+                .param_ownerships = param_ownerships,
+                .return_ownership = return_ownership,
+                .raises = raises,
+                .effect_var = effect_var,
+                .raises_row = owned_row,
             },
         });
     }
@@ -1359,6 +1418,10 @@ pub const SubstitutionMap = struct {
                     .return_ownership = function_type.return_ownership,
                     .raises = new_raises,
                     .effect_var = new_effect_var,
+                    // Phase 4 — the returned-closure error row is concrete
+                    // Error TypeIds (no type vars), so it is preserved verbatim
+                    // across substitution.
+                    .raises_row = function_type.raises_row,
                 } }) catch type_id;
             },
             .map => |map_type| {
@@ -1508,6 +1571,7 @@ pub const SubstitutionMap = struct {
                     .return_ownership = function_type.return_ownership,
                     .raises = new_raises,
                     .effect_var = new_effect_var,
+                    .raises_row = function_type.raises_row,
                 } }) catch type_id;
             },
             .map => |map_type| {
@@ -3790,15 +3854,22 @@ pub const TypeChecker = struct {
             else => return declared_return_type,
         };
         const tail_decl = self.closureDeclFromExpr(tail_expr) orelse return declared_return_type;
-        if (!self.closureDeclRaises(tail_decl)) return declared_return_type;
+        // Resolve the returned closure's CONCRETE inferred `raises` row (which
+        // `Error` types it raises) so the widened return type carries it for
+        // the use-site discharge check. An empty/missing row means a pure
+        // closure — leave the declared return untouched.
+        const row_key = self.raisesRowKeyForClosureDecl(tail_decl) orelse return declared_return_type;
+        const closure_row = self.store.inferred_raises.get(row_key) orelse return declared_return_type;
+        if (closure_row.len == 0) return declared_return_type;
 
-        return try self.store.addFunctionTypeWithEffect(
+        return try self.store.addFunctionTypeWithEffectAndRow(
             declared.function.params,
             declared.function.return_type,
             declared.function.param_ownerships,
             declared.function.return_ownership,
             true,
             declared.function.effect_var,
+            closure_row,
         );
     }
 
@@ -8269,6 +8340,17 @@ pub const TypeChecker = struct {
                             for (call.args) |arg| _ = try self.inferExpr(arg);
                             const borrowed = try self.applyCallOwnership(call.args, t.function);
                             defer self.endBorrowedBindings(borrowed) catch {};
+                            // Phase 4 (effect by inference — discharge check):
+                            // invoking a closure VALUE whose function type
+                            // carries a returned-closure `raises_row` (a bare
+                            // fn-ptr returned from a `fn(..) -> T` factory) folds
+                            // that row into this function's live row — so an
+                            // undischarged invocation in a function whose declared
+                            // `raises` row does not admit it is flagged, exactly
+                            // like a direct raise.
+                            for (t.function.raises_row) |error_type| {
+                                try self.recordRaisedErrorType(error_type, call.meta.span);
+                            }
                             return t.function.return_type;
                         }
                         // A `Callable(args, result)` existential value is
