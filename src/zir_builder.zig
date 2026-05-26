@@ -3225,6 +3225,17 @@ pub const ZirDriver = struct {
 
     fn shouldEmitStruct(self: *const ZirDriver, struct_name: []const u8) bool {
         const selected = self.selected_structs orelse return true;
+        // A synthesized closure struct (`__closure_N`) is freshly produced
+        // by the desugar on EVERY compile (program-wide unique counter) and
+        // is never adopted from a prior sidecar — so it can never be an
+        // "unchanged" struct the selective filter may skip. It must always
+        // be emitted alongside the selection, or its `impl Callable.call`
+        // body + per-instantiation vtable would reference an un-emitted
+        // symbol (EmitFailed). This is the seam that made a boxed closure
+        // constructed INLINE in a selected struct (e.g. the script `main`
+        // body) emit an empty `comptime {}` module while the SAME closure
+        // built inside a separately-selected method emitted correctly.
+        if (std.mem.startsWith(u8, struct_name, "__closure_")) return true;
         for (selected) |selected_name| {
             if (std.mem.eql(u8, selected_name, struct_name)) return true;
         }
