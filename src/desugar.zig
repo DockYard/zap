@@ -58,11 +58,18 @@ pub const Desugarer = struct {
     /// `Callable` existential (`%__closure_N{captures}` + `impl Callable`);
     /// a capturing closure seen WITHOUT this flag (e.g. a direct call
     /// argument consumed by the callee) is left untouched for the existing
-    /// #201 `make_closure`/`call_closure` direct path. Non-capturing
-    /// closures are never boxed here regardless of position (a code
-    /// pointer has no environment to manage — Gap E's direct path owns
-    /// them). This is the conservative Phase-1 box decision; full
-    /// escape-driven box-vs-direct unification is Phase 3.
+    /// #201 `make_closure`/`call_closure` direct path.
+    ///
+    /// This flag alone is the RETURN-TAIL / capturing-only signal: a
+    /// non-capturing closure in a position that sets ONLY this flag (the
+    /// `fn`-typed return tail) stays a bare fn-ptr (Gap E's zero-overhead
+    /// direct return). A non-capturing closure flowing into a BOXED slot
+    /// (field value, map value, collection element) DOES box — those
+    /// positions additionally set `closure_escapes_boxed_slot` /
+    /// `closure_escapes_collection`, which force the box regardless of
+    /// captures (the slot's declared type is the boxed `Callable` and a
+    /// bare fn-ptr cannot fit it). The escape-driven box-vs-direct
+    /// representation decision is Phase 3.
     closure_escapes: bool = false,
     /// Set while desugaring an expression that occupies a HETEROGENEOUS
     /// COLLECTION element position (a list/tuple element or a map value).
@@ -70,10 +77,28 @@ pub const Desugarer = struct {
     /// whether it captures, because the collection needs one uniform
     /// element representation: a `[fn(i64) -> i64]` mixing a non-capturing
     /// literal and a capturing `make_adder(5)` must store both as boxed
-    /// `Callable` so the element type is homogeneous. (In a field/return
-    /// position only CAPTURING closures box — a non-capturing one stays on
-    /// Gap E's direct bare-fn-ptr path.)
+    /// `Callable` so the element type is homogeneous. (A `fn`-typed
+    /// field/map value is the same boxed-representation case — see
+    /// `closure_escapes_boxed_slot`. Only the `fn`-typed RETURN-TAIL keeps
+    /// the capturing-only rule, so a non-capturing returned closure stays
+    /// on Gap E's direct bare-fn-ptr path.)
     closure_escapes_collection: bool = false,
+    /// Set while desugaring an expression that occupies a BOXED-SLOT
+    /// position whose declared type IS the boxed `Callable({A}, R)`
+    /// representation of `fn(A) -> R`: a struct-literal field value or a
+    /// map value. A closure literal there is boxed as `Callable`
+    /// REGARDLESS of whether it captures, exactly as a collection element
+    /// is — the slot has ONE representation (the `ProtocolBox`) and a bare
+    /// fn-ptr cannot fit it. A non-capturing closure gets an EMPTY-env
+    /// `__closure_N` + `impl Callable` (a `ProtocolBox` whose `call` slot
+    /// is the code and whose `data_ptr` is null/empty — trivial drop).
+    ///
+    /// DISTINCT from `closure_escapes`, which ALSO covers the `fn`-typed
+    /// RETURN-TAIL position: a non-capturing closure RETURNED directly
+    /// stays a bare fn-ptr (Gap E's zero-overhead direct return), so the
+    /// return-tail position sets ONLY `closure_escapes`, never this flag.
+    /// The boxed-slot positions (field value, map value) set BOTH.
+    closure_escapes_boxed_slot: bool = false,
     /// In-scope binding type annotations (binding name -> declared
     /// `TypeExpr`), maintained while walking a function body. A capturing
     /// closure's synthesized struct types each capture field from this
@@ -1214,9 +1239,21 @@ pub const Desugarer = struct {
                 // cannot fit a bare `fn`-ptr slot). Non-capturing closures
                 // and capturing closures consumed as direct call arguments
                 // stay on the existing #201/Gap E direct path.
+                // Box decision (escape-driven representation):
+                //   - a HETEROGENEOUS-COLLECTION element → box regardless
+                //     of capture (uniform element representation);
+                //   - a BOXED-SLOT field/map value → box regardless of
+                //     capture (the slot's type IS the boxed `Callable`;
+                //     a non-capturing closure becomes an EMPTY-env box);
+                //   - any other ESCAPING position (the `fn`-typed
+                //     RETURN-TAIL) → box only when it CAPTURES (Gap E keeps
+                //     a non-capturing returned closure as a bare fn-ptr).
+                // Everything else (direct call argument, non-escaping
+                // local) → the #201/Gap E direct path, untouched.
                 const box_in_collection = self.closure_escapes_collection;
+                const box_in_boxed_slot = self.closure_escapes_boxed_slot;
                 const box_capturing_slot = self.closure_escapes and try self.closureLiteralCaptures(anon.decl);
-                if (box_in_collection or box_capturing_slot) {
+                if (box_in_collection or box_in_boxed_slot or box_capturing_slot) {
                     return try self.desugarEscapingClosure(anon);
                 }
                 // The closure's OWN body is not an escaping context for the
@@ -1224,11 +1261,14 @@ pub const Desugarer = struct {
                 // a non-escaping inner closure is not spuriously boxed.
                 const saved_escapes = self.closure_escapes;
                 const saved_escapes_collection = self.closure_escapes_collection;
+                const saved_escapes_boxed_slot = self.closure_escapes_boxed_slot;
                 self.closure_escapes = false;
                 self.closure_escapes_collection = false;
+                self.closure_escapes_boxed_slot = false;
                 defer {
                     self.closure_escapes = saved_escapes;
                     self.closure_escapes_collection = saved_escapes_collection;
+                    self.closure_escapes_boxed_slot = saved_escapes_boxed_slot;
                 }
                 return try self.create(ast.Expr, .{
                     .anonymous_function = .{
@@ -1404,7 +1444,12 @@ pub const Desugarer = struct {
                 for (se.fields) |field| {
                     try new_fields.append(self.allocator, .{
                         .name = field.name,
-                        .value = try self.desugarExprEscaping(field.value),
+                        // A struct-field value is a BOXED-SLOT position: a
+                        // `fn`-typed field stores the boxed `Callable`
+                        // representation, so a closure literal here boxes
+                        // regardless of capture (a bare fn-ptr cannot fit
+                        // the `ProtocolBox` slot).
+                        .value = try self.desugarExprEscapingBoxedSlot(field.value),
                     });
                 }
 
@@ -1735,6 +1780,25 @@ pub const Desugarer = struct {
         const saved = self.closure_escapes;
         self.closure_escapes = true;
         defer self.closure_escapes = saved;
+        return self.desugarExpr(expr);
+    }
+
+    /// Desugar an expression in a BOXED-SLOT position — a struct-literal
+    /// field value or a map value whose declared type is the boxed
+    /// `Callable({A}, R)` representation of `fn(A) -> R`. A closure literal
+    /// here is boxed as `Callable` regardless of capture (the slot has one
+    /// representation, the `ProtocolBox`; a bare fn-ptr cannot fit it),
+    /// exactly as a collection element is. Sets both `closure_escapes` and
+    /// `closure_escapes_boxed_slot`; restores both afterward.
+    fn desugarExprEscapingBoxedSlot(self: *Desugarer, expr: *const ast.Expr) anyerror!*const ast.Expr {
+        const saved = self.closure_escapes;
+        const saved_boxed_slot = self.closure_escapes_boxed_slot;
+        self.closure_escapes = true;
+        self.closure_escapes_boxed_slot = true;
+        defer {
+            self.closure_escapes = saved;
+            self.closure_escapes_boxed_slot = saved_boxed_slot;
+        }
         return self.desugarExpr(expr);
     }
 
