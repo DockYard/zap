@@ -1119,6 +1119,32 @@ pub fn ctValueToExpr(
                 } };
                 return expr;
             }
+
+            // Nested value-call callee — the form is itself a CALL node, e.g.
+            // `f()(10)`: the encoder put the inner call `f()`
+            // (`{:f, meta, []}`) in the OUTER call's form slot. Decode the
+            // form 3-tuple recursively as a full expression (yielding the
+            // inner `.call`/`.field_access`-callee call) and use it as the
+            // outer call's callee. Without this, a nested value-call inside a
+            // quoted (Zest `test`/`describe`/`case`) body fell through to the
+            // `nil_literal` fallback below and the WHOLE value-call collapsed
+            // to `nil` — the project-mode `r = f()(10)` → `r == N` "comparison
+            // of comptime_int with null" / "expects i8, got Nil" gap. (The
+            // `.` and `__aliases__` arms above are the special-cased callee
+            // shapes; this is the general nested-call/expression callee.)
+            const decoded_callee = try ctValueToExpr(alloc, interner, form);
+            const arg_elems = if (args == .list) args.list.elems else &[_]CtValue{};
+            var call_args: std.ArrayListUnmanaged(*const ast.Expr) = .empty;
+            for (arg_elems) |arg| {
+                try call_args.append(alloc, try ctValueToExpr(alloc, interner, arg));
+            }
+            const expr = try alloc.create(ast.Expr);
+            expr.* = .{ .call = .{
+                .meta = node_meta,
+                .callee = decoded_callee,
+                .args = try call_args.toOwnedSlice(alloc),
+            } };
+            return expr;
         }
 
         // Truly unrecognized non-atom form — fallback

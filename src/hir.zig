@@ -5610,6 +5610,27 @@ pub const HirBuilder = struct {
                         }
                         break :blk types_mod.TypeStore.UNKNOWN;
                     },
+                    // FCC unified model — a `.closure` value-call (the callee is a
+                    // closure VALUE: a higher-order param, a non-capturing closure
+                    // read back from a call result / field / element, or a local
+                    // closure binding). Its result type is the callee's function
+                    // type's `return_type`. The named/direct arms above only cover
+                    // statically-named calls, so without this a `.closure` value-call
+                    // fell to the `else => UNKNOWN` arm and the call expression was
+                    // typed UNKNOWN. The SCRIPT pipeline recovered it via a later
+                    // re-inference, but the project/Zest daemon emits before that and
+                    // so surfaced the missing type as `?T`/null at a downstream
+                    // comparison (`r == 30` → "comparison of comptime_int with null").
+                    // Resolving the concrete `return_type` from the callee's function
+                    // type here types the call result correctly in BOTH modes — the
+                    // same fix philosophy as `buildCallableNonVarRefCall` stamping the
+                    // boxed `Callable`'s `result` type-arg for the indexed-call form.
+                    .closure => blk: {
+                        const callee = callee_expr orelse break :blk types_mod.TypeStore.UNKNOWN;
+                        const callee_ty = self.type_store.getType(callee.type_id);
+                        if (callee_ty == .function) break :blk callee_ty.function.return_type;
+                        break :blk types_mod.TypeStore.UNKNOWN;
+                    },
                     else => types_mod.TypeStore.UNKNOWN,
                 };
 
