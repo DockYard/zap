@@ -13148,6 +13148,32 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 return;
             }
             const mut: *Self = @constCast(m);
+            // Box-in-container deep-release under a no-REFCOUNT_V1 manager — the
+            // exact `List.release` analog (FCC residual-4: Map-of-boxes). The
+            // `headerRelease` below is a comptime no-op in that mode, so the
+            // `mapDeepWalk` -> `bufferFreeDeep` K/V teardown never fires and the
+            // buffer cell is reclaimed at process teardown (not per-drop). Sound
+            // for K/V reclaimed at teardown (atoms, scalars, `String` arena
+            // slices, nested inline-header cells), but a boxed-`Callable` value
+            // inner is `allocAny`'d and IS eagerly freed + leak-tracked — without
+            // this walk every un-extracted boxed map value leaks. Deep-release
+            // each populated entry's eagerly-freed K/V children and POISON the
+            // slot so a repeated release of an aliased cell (shared across
+            // owners, each emitting a no-op `release`) frees nothing — idempotent
+            // exactly-once without a refcount. Comptime-elided whole when neither
+            // K nor V has an eagerly-freed child, and skipped under REFCOUNT_V1
+            // (the deep_walk callback + refcount bumps handle it).
+            if (comptime !refcount_v1_active and
+                (ArcRuntime.elementHasEagerlyFreedChild(K) or ArcRuntime.elementHasEagerlyFreedChild(V)))
+            {
+                if (m.capacity != 0 and m.len != 0) {
+                    const entries = mut.entriesPtr();
+                    for (0..m.len) |i| {
+                        ArcRuntime.releaseAndPoisonEagerChildren(K, std.heap.c_allocator, &entries[i].key);
+                        ArcRuntime.releaseAndPoisonEagerChildren(V, std.heap.c_allocator, &entries[i].value);
+                    }
+                }
+            }
             ArcRuntime.headerRelease(&mut.header, mapDeepWalk);
         }
 
@@ -13300,12 +13326,24 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 return default;
             };
             const idx = findEntry(self, key) orelse {
-                retainEntryValue(default);
-                return default;
+                // Key absent: the result IS the caller-supplied `default`. Give
+                // the new owner an independent copy (clone-on-share under
+                // no-REFCOUNT_V1) exactly as the found path does — the caller's
+                // `default` argument is its own owner that the caller scope-exit
+                // drops, so the returned value must not alias its eagerly-freed
+                // inner.
+                return ownEntryValue(default);
             };
+            // FCC residual-4 (Map-of-boxes): clone-on-share the extracted boxed
+            // `Callable` value so the new owner (`inc = Map.get(handlers, :inc)`)
+            // owns an INDEPENDENT inner. The map retains its own value (deep-
+            // released at the map's drop); without the clone both the map-drop
+            // and the extracted-owner-drop free one inner — the `invalid free`
+            // double-free under `Memory.Tracking`. A scalar/`String`/struct value
+            // has no eagerly-freed child, so `ownEntryValue` is the existing
+            // refcount-bump there (no behaviour change).
             const value = self.entryAtConst(idx).value;
-            retainEntryValue(value);
-            return value;
+            return ownEntryValue(value);
         }
 
         /// Vestigial helper kept for HAMT-era callers that hardcoded a
@@ -13797,6 +13835,35 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         inline fn retainEntryValue(value: V) void {
             retainAnyShape(V, value);
+        }
+
+        /// Produce an INDEPENDENTLY-OWNED copy of an extracted map VALUE for a
+        /// new owner (the result of `Map.get`/`Map.fetch`). The Map analog of
+        /// `List.ownElement` (FCC residual-4: Map-of-boxes), and the EXTRACT
+        /// counterpart of the `Map.release` deep-release above.
+        ///
+        ///   * REFCOUNT_V1 — bump the value's refcount and return the SAME value
+        ///     (`retainEntryValue`). The new owner is a real second reference the
+        ///     last drop reclaims; the map and the extracted owner each
+        ///     decrement once.
+        ///   * no-REFCOUNT_V1 — there is no refcount, so a second owner cannot be
+        ///     a `+1` on a shared cell. A boxed-`Callable` value inner (a
+        ///     `ProtocolBox`'s `data_ptr`) IS eagerly freed by each owner's drop,
+        ///     so the extracted owner must own an INDEPENDENT inner or the
+        ///     map-drop and the extracted-owner-drop double-free it.
+        ///     `cloneChildrenAnyInPlace` deep-clones exactly the eagerly-freed
+        ///     children (`ProtocolBox` inners, indirect-storage cells) and leaves
+        ///     everything reclaimed-at-teardown (inline-header cells, arena
+        ///     slices, scalars) aliased — the same rule `List.ownElement` uses.
+        ///     Comptime-elided for value types with no eagerly-freed child.
+        inline fn ownEntryValue(value: V) V {
+            if (comptime !refcount_v1_active and ArcRuntime.elementHasEagerlyFreedChild(V)) {
+                var owned: V = value;
+                ArcRuntime.cloneChildrenAnyInPlace(V, std.heap.c_allocator, &owned);
+                return owned;
+            }
+            retainEntryValue(value);
+            return value;
         }
 
         fn releaseAnyShape(comptime T: type, value: T, allocator: std.mem.Allocator) void {

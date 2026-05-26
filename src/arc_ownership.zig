@@ -1244,7 +1244,18 @@ fn recordInstructionUses(
         .map_init => |mi| {
             for (mi.entries) |entry| {
                 try summary.recordUse(allocator, entry.key, false);
-                try summary.recordUse(allocator, entry.value, false);
+                // FCC residual-4 (Map-of-boxes): a boxed `Callable` map VALUE
+                // is consumed into the map cell (see the `map_init` consume in
+                // `arc_liveness.applyOwnsEffect`), so it is an aggregate-store
+                // position — a `local_get` whose only use is the map value can
+                // lower as `move_value` (transfer ownership into the cell)
+                // instead of the conservative `copy_value` + retain. A NON-box
+                // value keeps the Map.put-retains contract (`recordUse(false)`).
+                if (mi.value_type == .protocol_box) {
+                    try summary.recordAggregateStoreUse(allocator, entry.value);
+                } else {
+                    try summary.recordUse(allocator, entry.value, false);
+                }
             }
         },
         .struct_init => |si| {

@@ -2428,6 +2428,36 @@ const Analyzer = struct {
                     if (self.local_to_arc_index.get(ui.dest)) |idx| owns.set(idx);
                 }
             },
+            // FCC residual-4 (Map-of-boxes): a `map_init` whose VALUE type is a
+            // boxed `Callable` (`%{Atom => fn(i64) -> i64}` =
+            // `Map(Atom, Callable)`) CONSUMES its value operands into the map
+            // cell — exactly like `list_init`/`list_cons` consume their boxed
+            // elements. A boxed `Callable` inner (a `ProtocolBox`'s `data_ptr`)
+            // IS eagerly freed under no-REFCOUNT_V1, so a fresh box value moved
+            // into the map must NOT also keep its construction-local scope-exit
+            // `.protocol_box_drop`: the map's own deep-release (`Map.release` ->
+            // value deep-walk) frees the box inner exactly once. Without the
+            // consume the construction-local AND the map both free one inner —
+            // the `invalid free` double-free under `Memory.Tracking`.
+            //
+            // This is the precise FCC carve-out from the general Map.put-retains
+            // contract: a NON-box value type (`%{Atom => i64}`, `%{Atom =>
+            // String}`, `%{Atom => Point}`) keeps the existing
+            // refcount-retaining behaviour (its operands fall through to the
+            // generic def-only handler — owns bits stay set, `Map.put` retains).
+            // Keyed on the `.protocol_box` value ZigType, which only the boxed
+            // `Callable` residual-4 type flow produces for a map value. The keys
+            // are never consumed here (atoms/strings are non-box).
+            .map_init => |mi| {
+                if (mi.value_type == .protocol_box) {
+                    for (mi.entries) |entry| {
+                        self.clearOwnsForLocalAndAliases(entry.value, owns, consumed_owned_param_slots);
+                    }
+                }
+                if (mi.dest < local_ownership.len and local_ownership[mi.dest] == .owned) {
+                    if (self.local_to_arc_index.get(mi.dest)) |idx| owns.set(idx);
+                }
+            },
             // FCC unified model: `box_as_protocol` CONSUMES its source value
             // — the box `allocAny`'s the inner into a heap cell and claims
             // ownership of it (the box's `__drop__` deep-releases the inner at
