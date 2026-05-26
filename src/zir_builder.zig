@@ -5336,11 +5336,6 @@ pub const ZirDriver = struct {
         return self.param_derived_closure_locals.contains(local);
     }
 
-    fn findClosureTarget(self: *const ZirDriver, local: ir.LocalId) ?ir.FunctionId {
-        const target = self.findClosureCallTarget(local) orelse return null;
-        return target.function_id;
-    }
-
     const ClosureCallTarget = struct {
         function_id: ir.FunctionId,
         captures: []const ir.LocalId,
@@ -8401,6 +8396,54 @@ pub const ZirDriver = struct {
                 try self.setLocal(cd.dest, ref);
             },
             .call_closure => |cc| {
+                // =====================================================================
+                // FCC — the FINAL closure-dispatch architecture (escape-driven).
+                //
+                // A `fn(A) -> R` value is a `Callable({A}, R)` existential. Escape
+                // analysis collapses it to ONE of THREE runtime representations; each
+                // is reachable (proven by ZAP_DISPATCH_TRACE across the full corpus +
+                // script fixtures + unit tests) and serves a distinct case. Do NOT
+                // delete any of them — each is the zero-overhead lowering for its case:
+                //
+                //  (1) NON-CAPTURING closure read from STORAGE (field/return/element).
+                //      Its type stayed `ZigType.function` (a bare `*const fn(..)` code
+                //      pointer — non-capturing has no environment to box). Invoked with
+                //      a DIRECT `call_ref`. This is "Gap E": `cc.callee_is_bare_fn_value`
+                //      (set by `ir.closureCalleeIsMaterializedValue`). Zero overhead.
+                //      e.g. `p = M.picker(); p(7)` where `picker` returns a non-capturing
+                //      `fn(i64)->i64`.
+                //
+                //  (2) PARAMETER-derived closure (a higher-order callback param — `#201`).
+                //      The runtime value may be a bare fn-ptr OR a `{call_fn, env}` stack
+                //      struct (a non-escaping CAPTURING closure devirtualized onto the
+                //      stack — no box), so it dispatches through `Kernel.callCallableN`,
+                //      which discriminates both shapes at comptime (`isZapClosure` /
+                //      `isBareFunction`, see `runtime.zig`). This is the DEVIRTUALIZED
+                //      capturing path and the single most-used branch. Deleting it would
+                //      force boxing of every non-escaping capturing callback and regress
+                //      perf — it is NOT subsumed by the boxed `protocol_dispatch` path.
+                //      `callee_is_param` (`isParamDerivedClosure`). Arity > 3 falls back
+                //      to a direct `call_ref` (the helper set covers 0..3). A call-site
+                //      SPECIALIZATION (lambda-set singleton / contified / switch_dispatch
+                //      from `escape_lattice` + `contification_rewrite` + `lambda_sets`)
+                //      may further refine this to a direct named/tail/switch call.
+                //
+                //  (3) 0-CAPTURE closure / capturing closure bound to a LOCAL and called
+                //      via that local (NOT a param, NOT read from storage). Resolved
+                //      through `closure_function_map` (0-capture → direct named call,
+                //      `emitNamedCallToTarget`) or, for a capturing one, the dynamic
+                //      `{call_fn, env}` struct destructure tail. e.g. `f = fn(x){x+1};
+                //      f(10)` (0-capture, `closure_function_map`) and `n = 5;
+                //      f = fn(x){x+n}; f(10)` (capturing-local, struct destructure).
+                //
+                // The FOURTH representation — a BOXED `ProtocolBox(Callable)` for an
+                // ESCAPING / heterogeneous / stored / returned-CAPTURING closure — never
+                // reaches here: `ir.lowerBoxedCallableInvocation` intercepts a callee
+                // whose representation is `.protocol_box(Callable)` BEFORE this
+                // `call_closure` is emitted and routes it to `protocol_dispatch` through
+                // the box vtable `call` slot. So everything below operates on the
+                // NON-boxed (devirtualized) representations only.
+                // =====================================================================
                 const lattice = @import("escape_lattice.zig");
                 const callee_is_param = self.isParamDerivedClosure(cc.callee);
 
