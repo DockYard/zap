@@ -805,9 +805,65 @@ pub const TypeStore = struct {
         if (args_tuple != .tuple) return false;
         if (fn_type.params.len != args_tuple.tuple.elements.len) return false;
         for (fn_type.params, args_tuple.tuple.elements) |fn_param, tuple_element| {
-            if (!self.typeEquals(fn_param, tuple_element)) return false;
+            if (!self.typeEqualsModuloCallable(fn_param, tuple_element)) return false;
         }
-        return self.typeEquals(fn_type.return_type, callable.result);
+        return self.typeEqualsModuloCallable(fn_type.return_type, callable.result);
+    }
+
+    /// Structural type equivalence that treats a `fn(A...) -> R` `FunctionType`
+    /// and its `Callable({A...}, R)` desugaring as the SAME type AT EVERY
+    /// NESTING LEVEL — the container-aware extension of `functionCallableEquiv`
+    /// (the FCC unified model: a `fn` type and its `Callable` existential are
+    /// one type in two representations). `typeEquals` is structural but
+    /// representation-sensitive: a `[fn(i64) -> i64]` body produces
+    /// `List(Callable)` while the declared return type may resolve to
+    /// `List(function)` (or vice-versa), and a `%{Atom => fn(i64) -> i64}` body
+    /// produces `Map(Atom, Callable)` vs a declared `Map(Atom, function)`. Bare
+    /// `typeEquals` rejects those as distinct, so a function returning such a
+    /// container failed return-type checking (`expected %{Atom => (i64 -> i64)},
+    /// got %{Atom => Callable}`). This recurses through list element, map
+    /// key/value, tuple element, optional inner, and nested function
+    /// param/return positions, accepting `fn`↔`Callable` at each. Falls back to
+    /// `typeEquals` for every non-container, non-fn/Callable pair.
+    pub fn typeEqualsModuloCallable(self: *const TypeStore, a: TypeId, b: TypeId) bool {
+        if (a == b) return true;
+        if (self.typeEquals(a, b)) return true;
+        // Direct `fn` ↔ `Callable` equivalence at this level.
+        if (self.functionCallableEquiv(a, b)) return true;
+        const ta = self.getType(a);
+        const tb = self.getType(b);
+        if (std.meta.activeTag(ta) != std.meta.activeTag(tb)) return false;
+        return switch (ta) {
+            .list => self.typeEqualsModuloCallable(ta.list.element, tb.list.element),
+            .map => self.typeEqualsModuloCallable(ta.map.key, tb.map.key) and
+                self.typeEqualsModuloCallable(ta.map.value, tb.map.value),
+            .applied => blk: {
+                // Parametric application — `Option(fn(i64) -> i64)` vs
+                // `Option(Callable({i64}, i64))`, etc. Equal base + each type
+                // arg equal modulo fn↔Callable.
+                if (!self.typeEqualsModuloCallable(ta.applied.base, tb.applied.base)) break :blk false;
+                if (ta.applied.args.len != tb.applied.args.len) break :blk false;
+                for (ta.applied.args, tb.applied.args) |aa, ab| {
+                    if (!self.typeEqualsModuloCallable(aa, ab)) break :blk false;
+                }
+                break :blk true;
+            },
+            .tuple => blk: {
+                if (ta.tuple.elements.len != tb.tuple.elements.len) break :blk false;
+                for (ta.tuple.elements, tb.tuple.elements) |ea, eb| {
+                    if (!self.typeEqualsModuloCallable(ea, eb)) break :blk false;
+                }
+                break :blk true;
+            },
+            .function => blk: {
+                if (ta.function.params.len != tb.function.params.len) break :blk false;
+                for (ta.function.params, tb.function.params) |pa, pb| {
+                    if (!self.typeEqualsModuloCallable(pa, pb)) break :blk false;
+                }
+                break :blk self.typeEqualsModuloCallable(ta.function.return_type, tb.function.return_type);
+            },
+            else => false,
+        };
     }
 
     /// Score a call argument against an expected parameter type.
@@ -6824,7 +6880,7 @@ pub const TypeChecker = struct {
             declared_return != TypeStore.ERROR and
             self.store.getType(declared_return) != .type_var;
         if (declared_is_checkable and body_type != TypeStore.UNKNOWN and body_type != TypeStore.ERROR) {
-            const return_matches_declared = self.store.typeEquals(body_type, declared_return) or
+            const return_matches_declared = self.store.typeEqualsModuloCallable(body_type, declared_return) or
                 if (last_expr) |expr| self.exprTailIntegerLiteralCanSatisfyExpectedType(expr, declared_return) else false;
             if (!return_matches_declared) {
                 const expected = self.typeToString(declared_return);
@@ -8784,12 +8840,25 @@ pub const TypeChecker = struct {
                 // those sugar mappings.
                 if (tn.args.len > 0) {
                     if (self.isNativeTypeName(.map, tn.name) and tn.args.len == 2) {
-                        const key_t = try self.resolveTypeExpr(tn.args[0]);
-                        const value_t = try self.resolveTypeExpr(tn.args[1]);
+                        // FCC unified model — a `fn(A) -> R` map value/key is a
+                        // first-class-closure position INSIDE a container, so it
+                        // escapes and takes the boxed `Callable({A}, R)`
+                        // existential representation (same redirect as a
+                        // `fn`-typed struct FIELD via `resolveFieldTypeExpr`).
+                        // Without this the declared value stayed `.function`
+                        // (bare fn-ptr) while a `%{k => fn(..){..}}` body literal
+                        // produced a boxed `Callable` — a `Map(_, function)` vs
+                        // `Map(_, ProtocolBox)` mismatch that broke a
+                        // `Map(K, fn(A) -> R)` RETURN type. A bare top-level
+                        // `fn`-typed PARAM is NOT a container element and is
+                        // resolved elsewhere, so the #201 devirtualized
+                        // direct-call param path is untouched.
+                        const key_t = try self.callableConstraintFromFunctionTypeId(try self.resolveTypeExpr(tn.args[0]));
+                        const value_t = try self.callableConstraintFromFunctionTypeId(try self.resolveTypeExpr(tn.args[1]));
                         return try self.store.addType(.{ .map = .{ .key = key_t, .value = value_t } });
                     }
                     if (self.isNativeTypeName(.list, tn.name) and tn.args.len == 1) {
-                        const elem_t = try self.resolveTypeExpr(tn.args[0]);
+                        const elem_t = try self.callableConstraintFromFunctionTypeId(try self.resolveTypeExpr(tn.args[0]));
                         return try self.store.addType(.{ .list = .{ .element = elem_t } });
                     }
                 }
@@ -9056,8 +9125,17 @@ pub const TypeChecker = struct {
                     const value_var = try self.store.freshVar();
                     return try self.store.addType(.{ .map = .{ .key = key_var, .value = value_var } });
                 }
-                const key_t = try self.resolveTypeExpr(mt.fields[0].key);
-                const value_t = try self.resolveTypeExpr(mt.fields[0].value);
+                // FCC unified model — a `fn(A) -> R` map key/value is a
+                // first-class-closure position inside a container and so takes
+                // the boxed `Callable({A}, R)` existential representation (the
+                // `%{Atom => fn(i64) -> i64}` sigil form; mirrors the `Map(..)`
+                // name form and the `[fn]` list element via
+                // `resolveCollectionElementType`). Matches a
+                // `%{k => fn(..){..}}` body literal's boxed value, fixing the
+                // `Map(K, fn(A) -> R)` RETURN type. A bare `fn` PARAM is not a
+                // container element, so the #201 direct-call path is untouched.
+                const key_t = try self.callableConstraintFromFunctionTypeId(try self.resolveTypeExpr(mt.fields[0].key));
+                const value_t = try self.callableConstraintFromFunctionTypeId(try self.resolveTypeExpr(mt.fields[0].value));
                 return try self.store.addType(.{ .map = .{ .key = key_t, .value = value_t } });
             },
             .struct_type => TypeStore.UNKNOWN,

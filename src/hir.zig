@@ -7123,12 +7123,20 @@ pub const HirBuilder = struct {
                 // safely without triggering compiler-special handling.
                 if (n.args.len > 0) {
                     if (self.isNativeTypeName(.map, n.name) and n.args.len == 2) {
-                        const key_t = self.resolveTypeExpr(n.args[0]);
-                        const value_t = self.resolveTypeExpr(n.args[1]);
+                        // FCC unified model — a `fn(A) -> R` map key/value is a
+                        // container-element first-class-closure position, so it
+                        // takes the boxed `Callable({A}, R)` existential
+                        // (`resolveCollectionElementType` redirects `fn` ->
+                        // `Callable`; non-`fn` resolves normally). Keeps the HIR
+                        // and TypeChecker resolvers in agreement (the Phase-0
+                        // three-paths invariant) for a `Map(K, fn(A) -> R)`
+                        // RETURN type. A bare `fn` PARAM is untouched.
+                        const key_t = self.resolveCollectionElementType(n.args[0]);
+                        const value_t = self.resolveCollectionElementType(n.args[1]);
                         return store_ptr.addType(.{ .map = .{ .key = key_t, .value = value_t } }) catch types_mod.TypeStore.UNKNOWN;
                     }
                     if (self.isNativeTypeName(.list, n.name) and n.args.len == 1) {
-                        const elem_t = self.resolveTypeExpr(n.args[0]);
+                        const elem_t = self.resolveCollectionElementType(n.args[0]);
                         return store_ptr.addType(.{ .list = .{ .element = elem_t } }) catch types_mod.TypeStore.UNKNOWN;
                     }
                 }
@@ -7281,8 +7289,13 @@ pub const HirBuilder = struct {
             },
             .map => |mt| {
                 if (mt.fields.len > 0) {
-                    const key_type = self.resolveTypeExpr(mt.fields[0].key);
-                    const value_type = self.resolveTypeExpr(mt.fields[0].value);
+                    // FCC unified model — `%{K => fn(A) -> R}` sigil: a `fn`
+                    // map key/value is a container-element first-class-closure
+                    // position and takes the boxed `Callable` existential
+                    // (parity with the `Map(..)` name form + the TypeChecker
+                    // resolver). A bare `fn` PARAM is untouched.
+                    const key_type = self.resolveCollectionElementType(mt.fields[0].key);
+                    const value_type = self.resolveCollectionElementType(mt.fields[0].value);
                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                     return store_ptr.addType(.{ .map = .{ .key = key_type, .value = value_type } }) catch types_mod.TypeStore.UNKNOWN;
                 }
