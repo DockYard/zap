@@ -992,13 +992,47 @@ const MonomorphContext = struct {
 
     /// Resolve a named cross-struct call (e.g., List.head) to a function group ID
     /// by searching all structs in the HIR program.
+    /// True when `mod_name` (a possibly multi-segment struct name such as
+    /// `Zap.CombinatorFactory`) is the struct addressed by `qualifier`, the
+    /// textual `struct_name` carried on a `hir.NamedCall`. A cross-struct
+    /// call's qualifier is produced by the HIR builder's `structNameToString`
+    /// (segments joined with `_`, e.g. `Zap_CombinatorFactory`), but a call
+    /// may also be qualified by the bare last segment or by the canonical
+    /// dotted form. Mirror `HirBuilder.structNameMatchesCallQualifier` so the
+    /// monomorphizer resolves cross-struct calls to multi-segment user structs
+    /// identically to the HIR layer — without this, a generic method addressed
+    /// as `Zap_Foo.method` never matches `mod.name.parts == ["Zap", "Foo"]`
+    /// (whose last segment is `Foo`), so the call is never specialized and the
+    /// caller emits a reference to a function that is never produced.
+    fn structNameMatchesQualifier(self: *const MonomorphContext, mod_name: ast.StructName, qualifier: []const u8) bool {
+        if (mod_name.parts.len == 0) return false;
+
+        const last_part = self.interner.get(mod_name.parts[mod_name.parts.len - 1]);
+        if (std.mem.eql(u8, last_part, qualifier)) return true;
+
+        // Single-segment names are fully covered by the last-part check above.
+        if (mod_name.parts.len == 1) return false;
+
+        const underscore_joined = mod_name.joinedWith(self.allocator, self.interner, "_") catch return false;
+        defer self.allocator.free(underscore_joined);
+        if (std.mem.eql(u8, underscore_joined, qualifier)) return true;
+
+        const dotted = mod_name.joinedWith(self.allocator, self.interner, ".") catch return false;
+        defer self.allocator.free(dotted);
+        if (std.mem.eql(u8, dotted, qualifier)) return true;
+
+        return false;
+    }
+
     fn resolveNamedCall(self: *const MonomorphContext, nc: hir.NamedCall, arity: u32) ?u32 {
         const target_struct = nc.struct_name orelse return null;
         for (self.program.structs) |mod| {
-            // Check if this struct's name matches the target
-            if (mod.name.parts.len == 0) continue;
-            const last_part = self.interner.get(mod.name.parts[mod.name.parts.len - 1]);
-            if (!std.mem.eql(u8, last_part, target_struct)) continue;
+            // Check if this struct's name matches the target. The qualifier may
+            // be the bare last segment, the `_`-joined form (the HIR builder's
+            // `structNameToString` output for cross-struct calls), or the
+            // canonical dotted form — match all three for multi-segment user
+            // structs (e.g. `Zap.CombinatorFactory`).
+            if (!self.structNameMatchesQualifier(mod.name, target_struct)) continue;
             // Search for the function by name and arity
             for (mod.functions) |*group| {
                 const group_name = self.interner.get(group.name);
