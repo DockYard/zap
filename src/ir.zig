@@ -4989,6 +4989,79 @@ pub const IrBuilder = struct {
         });
     }
 
+    /// Build a function group (an anonymous/nested closure) encountered
+    /// MID-WAY through lowering an ENCLOSING function's body, restoring the
+    /// enclosing function's full per-function lowering + ownership-tracking
+    /// state afterward.
+    ///
+    /// `buildFunctionGroup` (→ `buildTypedClauseEntrypoint` / the inline-group
+    /// path) resets every per-function map at its start
+    /// (`clearRetainingCapacity` on `known_local_types`, `local_hir_types`,
+    /// `materialized_closure_locals`, `boxed_existential_locals`,
+    /// `deep_release_owned_locals`, `param_backed_locals`,
+    /// `rescue_unboxed_borrow_locals`, `term_tuple_locals`, and resets the
+    /// `current_param_*` lists). Those maps drive `computeLocalOwnership` /
+    /// `snapshotProtocolBoxLocals` — which run at the ENCLOSING function's
+    /// finalize. Without a save/restore, building a nested closure (e.g. an
+    /// `Enum.map` callback) WIPES the enclosing function's tracking state, so
+    /// a boxed-`Callable` local bound BEFORE the nested closure (`f =
+    /// make_adder(5)` followed by `Enum.map([..], fn(x){..})`) loses its
+    /// `boxed_existential_locals` membership and is mis-classified `.trivial`:
+    /// no scope-exit `.protocol_box_drop` (a leak under `Memory.Tracking`) and
+    /// a borrow (not a retain) at its dispatch site. Save/restore the FULL set
+    /// so ownership analysis is independent of where the nested closure
+    /// appears in the body.
+    fn buildNestedFunctionGroup(self: *IrBuilder, group: *const hir_mod.FunctionGroup) !void {
+        const saved_instrs = self.current_instrs;
+        const saved_next_local = self.next_local;
+        const saved_known_local_types = self.known_local_types;
+        const saved_local_hir_types = self.local_hir_types;
+        const saved_materialized_closure_locals = self.materialized_closure_locals;
+        const saved_boxed_existential_locals = self.boxed_existential_locals;
+        const saved_deep_release_owned_locals = self.deep_release_owned_locals;
+        const saved_param_backed_locals = self.param_backed_locals;
+        const saved_rescue_unboxed_borrow_locals = self.rescue_unboxed_borrow_locals;
+        const saved_term_tuple_locals = self.term_tuple_locals;
+        const saved_current_param_types = self.current_param_types;
+        const saved_current_param_hir_types = self.current_param_hir_types;
+        self.current_instrs = .empty;
+        self.known_local_types = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
+        self.local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(self.allocator);
+        self.materialized_closure_locals = .empty;
+        self.boxed_existential_locals = .empty;
+        self.deep_release_owned_locals = .empty;
+        self.param_backed_locals = std.AutoHashMap(LocalId, void).init(self.allocator);
+        self.rescue_unboxed_borrow_locals = std.AutoHashMap(LocalId, void).init(self.allocator);
+        self.term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
+        self.current_param_types = .empty;
+        self.current_param_hir_types = .empty;
+        defer {
+            self.known_local_types.deinit();
+            self.known_local_types = saved_known_local_types;
+            self.local_hir_types.deinit();
+            self.local_hir_types = saved_local_hir_types;
+            self.materialized_closure_locals.deinit(self.allocator);
+            self.materialized_closure_locals = saved_materialized_closure_locals;
+            self.boxed_existential_locals.deinit(self.allocator);
+            self.boxed_existential_locals = saved_boxed_existential_locals;
+            self.deep_release_owned_locals.deinit(self.allocator);
+            self.deep_release_owned_locals = saved_deep_release_owned_locals;
+            self.param_backed_locals.deinit();
+            self.param_backed_locals = saved_param_backed_locals;
+            self.rescue_unboxed_borrow_locals.deinit();
+            self.rescue_unboxed_borrow_locals = saved_rescue_unboxed_borrow_locals;
+            self.term_tuple_locals.deinit();
+            self.term_tuple_locals = saved_term_tuple_locals;
+            self.current_param_types.deinit(self.allocator);
+            self.current_param_types = saved_current_param_types;
+            self.current_param_hir_types.deinit(self.allocator);
+            self.current_param_hir_types = saved_current_param_hir_types;
+        }
+        try self.buildFunctionGroup(group);
+        self.current_instrs = saved_instrs;
+        self.next_local = saved_next_local;
+    }
+
     fn buildFunctionGroup(self: *IrBuilder, group: *const hir_mod.FunctionGroup) !void {
         if (group.clauses.len == 0) return;
 
@@ -10141,22 +10214,7 @@ pub const IrBuilder = struct {
                     last_local = ls.index;
                 },
                 .function_group => |group| {
-                    const saved_instrs = self.current_instrs;
-                    const saved_next_local = self.next_local;
-                    const saved_known_local_types = self.known_local_types;
-                    const saved_local_hir_types = self.local_hir_types;
-                    self.current_instrs = .empty;
-                    self.known_local_types = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
-                    self.local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(self.allocator);
-                    defer {
-                        self.known_local_types.deinit();
-                        self.known_local_types = saved_known_local_types;
-                        self.local_hir_types.deinit();
-                        self.local_hir_types = saved_local_hir_types;
-                    }
-                    try self.buildFunctionGroup(group);
-                    self.current_instrs = saved_instrs;
-                    self.next_local = saved_next_local;
+                    try self.buildNestedFunctionGroup(group);
                 },
             }
         }
@@ -13858,23 +13916,11 @@ pub const IrBuilder = struct {
                         },
                         .function_group => |group| {
                             // Anonymous functions and nested functions defined
-                            // inside block expressions must be built as IR functions.
-                            const saved_instrs = self.current_instrs;
-                            const saved_next_local = self.next_local;
-                            const saved_known_local_types = self.known_local_types;
-                            const saved_local_hir_types = self.local_hir_types;
-                            self.current_instrs = .empty;
-                            self.known_local_types = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
-                            self.local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(self.allocator);
-                            defer {
-                                self.known_local_types.deinit();
-                                self.known_local_types = saved_known_local_types;
-                                self.local_hir_types.deinit();
-                                self.local_hir_types = saved_local_hir_types;
-                            }
-                            try self.buildFunctionGroup(group);
-                            self.current_instrs = saved_instrs;
-                            self.next_local = saved_next_local;
+                            // inside block expressions must be built as IR
+                            // functions, with the enclosing function's full
+                            // ownership-tracking state saved/restored across the
+                            // nested build (see `buildNestedFunctionGroup`).
+                            try self.buildNestedFunctionGroup(group);
                         },
                     }
                 }

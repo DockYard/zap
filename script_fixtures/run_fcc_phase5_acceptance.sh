@@ -87,6 +87,10 @@ run_clean closure_captures_boxed_closure.zap "15"
 run_clean nested_closure_returning_closure.zap "30" "50"
 # Mixed BOXED + DIRECT representations coexisting in one program.
 run_clean mixed_boxed_and_direct.zap "12" "110" "25"
+# A boxed-closure LOCAL live across `Enum.*` combinators: the combinator's
+# nested-closure callback build must not wipe the enclosing function's
+# boxed-existential ownership state (else the boxed local leaks under Tracking).
+run_clean boxed_local_across_combinator.zap "12" "7" "15" "101"
 
 echo "== FCC Phase 5: final matrix — all positions × {raising, pure} (Item 7) =="
 # RAISING capturing closures across field/list/map/return, each rescued.
