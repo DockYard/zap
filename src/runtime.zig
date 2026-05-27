@@ -4462,6 +4462,40 @@ pub const ArcRuntime = struct {
         return T == ProtocolBox;
     }
 
+    /// True iff `T` is a single-item pointer (optionally optional /
+    /// `const`) whose pointee is `anyopaque` — a DELIBERATELY type-erased
+    /// pointer such as `Term.list: ?*const anyopaque` /
+    /// `Term.map: ?*const anyopaque`.
+    ///
+    /// The generic ARC field-walk classifies a `.pointer` with `size ==
+    /// .one` as an independently-Arc-managed child and recurses into it
+    /// (deep-release, deep-retain, deep-clone). For an erased-opaque
+    /// pointer that is impossible AND wrong: the runtime cannot recover
+    /// the pointee's size, alignment, or owned children, so it can neither
+    /// `releaseArcAny`/`allocAny` the cell (both need `@sizeOf`/`@alignOf`
+    /// of the pointee, which are unavailable for `anyopaque` — that is the
+    /// concrete `@alignOf(anyopaque)` / by-value `anyopaque`-parameter
+    /// compile error) nor know its child layout. By contract the
+    /// concrete-typed owner that erased the pointer (collection-specific
+    /// code that knows the real `List(Term)` / `Map(K, Term)` type) owns
+    /// its lifecycle; the generic walk MUST skip it.
+    ///
+    /// This is the plain-pointer analog of the `isProtocolBox` guard:
+    /// `ProtocolBox.data_ptr` is `?*anyopaque` too, but a box is reached
+    /// through its vtable header; a bare erased pointer field has no such
+    /// adapter, so the only correct generic action is to leave it alone.
+    fn pointerChildIsErasedOpaque(comptime PtrOrOptionalPtr: type) bool {
+        const info = @typeInfo(PtrOrOptionalPtr);
+        const ptr_info = switch (info) {
+            .optional => |opt| @typeInfo(opt.child),
+            else => info,
+        };
+        return switch (ptr_info) {
+            .pointer => |p| p.size == .one and p.child == anyopaque,
+            else => false,
+        };
+    }
+
     /// True iff `T` is a by-VALUE aggregate that the generic ARC
     /// dispatchers (`retainAny` / `releaseAny` / `freeAny` /
     /// `retainAnyPersistent`) should treat as "deep-walk my ARC children"
@@ -4507,6 +4541,9 @@ pub const ArcRuntime = struct {
 
     fn fieldTypeHasArcChild(comptime FieldType: type) bool {
         if (comptime isProtocolBox(FieldType)) return true;
+        // An erased-opaque pointer (`?*const anyopaque`) is not an
+        // Arc-managed child — the generic walk cannot release/clone it.
+        if (comptime pointerChildIsErasedOpaque(FieldType)) return false;
         return switch (@typeInfo(FieldType)) {
             .optional => |opt| fieldTypeHasArcChild(opt.child),
             .pointer => |p| p.size == .one,
@@ -4536,6 +4573,11 @@ pub const ArcRuntime = struct {
     /// (so the whole machinery comptime-elides) for plain-data element types.
     pub fn elementHasEagerlyFreedChild(comptime T: type) bool {
         if (comptime isProtocolBox(T)) return true;
+        // An erased-opaque pointer (`?*const anyopaque`) is not eagerly
+        // freed (nor freeable at all) by the generic walk — see
+        // `pointerChildIsErasedOpaque`. Excluding it here keeps the whole
+        // eager-walk machinery comptime-elided for carriers like `Term`.
+        if (comptime pointerChildIsErasedOpaque(T)) return false;
         return switch (@typeInfo(T)) {
             .optional => |opt| elementHasEagerlyFreedChild(opt.child),
             .pointer => |p| blk: {
@@ -5071,6 +5113,11 @@ pub const ArcRuntime = struct {
             field_ptr.* = cloneProtocolBoxValue(field_ptr.*);
             return;
         }
+        // An erased-opaque pointer (`?*const anyopaque`) cannot be cloned
+        // by the generic walk: `allocAny(anyopaque, ...)` is uninstantiable
+        // and the pointee's owned children are unknown. Its concrete-typed
+        // owner manages structural sharing; leave the field untouched.
+        if (comptime pointerChildIsErasedOpaque(FieldType)) return;
         switch (@typeInfo(FieldType)) {
             .optional => |opt| {
                 if (field_ptr.*) |inner| {
@@ -5418,6 +5465,11 @@ pub const ArcRuntime = struct {
             releaseProtocolBoxValue(value);
             return;
         }
+        // An erased-opaque pointer (`?*const anyopaque`) cannot be released
+        // by the generic walk: `releaseArcAny(anyopaque, ...)` is
+        // uninstantiable (no `@sizeOf`/`@alignOf` for `anyopaque`). Its
+        // concrete-typed owner reclaims it; skip it here.
+        if (comptime pointerChildIsErasedOpaque(FieldType)) return;
         switch (@typeInfo(FieldType)) {
             .optional => |opt| {
                 if (value) |inner| releaseFieldChildAny(opt.child, allocator, inner);
@@ -5473,7 +5525,12 @@ pub const ArcRuntime = struct {
                 }
             },
             .pointer => |p| {
-                if (p.size == .one) {
+                // An erased-opaque pointer (`?*const anyopaque`) is not a
+                // releasable ARC child (`elementHasEagerlyFreedChild`
+                // already excludes it, so this is reached only via a
+                // direct recursive call); skip it rather than instantiate
+                // the uninstantiable `releaseArcAny(anyopaque)`.
+                if (comptime p.size == .one and p.child != anyopaque) {
                     releaseArcAny(p.child, allocator, @constCast(slot.*));
                     if (comptime !hasInlineArcHeader(p.child)) {
                         // An indirect-storage (side-table) cell is eagerly freed
@@ -5547,6 +5604,11 @@ pub const ArcRuntime = struct {
             retainProtocolBoxValue(value);
             return;
         }
+        // An erased-opaque pointer (`?*const anyopaque`) is not an
+        // Arc-managed child — `retainAnyPersistent` of a `*anyopaque`
+        // would dispatch on an unknown pointee. Its concrete-typed owner
+        // accounts for shares; skip it here.
+        if (comptime pointerChildIsErasedOpaque(FieldType)) return;
         switch (@typeInfo(FieldType)) {
             .optional => |opt| {
                 if (value) |inner| retainFieldChildAny(opt.child, inner);
@@ -19574,6 +19636,49 @@ test "List(?*const Map) owned-unchecked mutators balance ARC element lifetimes" 
     appended = null;
 
     try std.testing.expectEqual(before_releases + 15, arc_releases_total);
+}
+
+test "erased-opaque pointer child is NOT classified as an ARC-managed child" {
+    // A single-item pointer to `anyopaque` (e.g. `Term.list: ?*const anyopaque`,
+    // `Term.map: ?*const anyopaque`) is a DELIBERATELY type-erased pointer:
+    // the generic ARC field-walk cannot recover the pointee's size,
+    // alignment, or owned children, so it can neither deep-release nor
+    // clone it. Such a field MUST NOT be treated as an ARC-managed child
+    // by ANY of the comptime walkers/discriminators — its lifecycle is the
+    // responsibility of the concrete-typed owner that erased it.
+    //
+    // The two discriminators below drive every release / retain / clone
+    // walk; if either returns `true` for an erased-opaque pointer, the
+    // walker instantiates `releaseArcAny(anyopaque)` / `allocAny(anyopaque)`,
+    // which fails to compile under a no-REFCOUNT_V1 manager
+    // (`@alignOf(anyopaque)` / a by-value `anyopaque` parameter).
+    comptime {
+        if (ArcRuntime.elementHasEagerlyFreedChild(?*const anyopaque))
+            @compileError("?*const anyopaque must not be an eagerly-freed ARC child");
+        if (ArcRuntime.elementHasEagerlyFreedChild(*anyopaque))
+            @compileError("*anyopaque must not be an eagerly-freed ARC child");
+        if (ArcRuntime.elementHasEagerlyFreedChild(*const anyopaque))
+            @compileError("*const anyopaque must not be an eagerly-freed ARC child");
+    }
+    // `Term` is the canonical erased-opaque carrier: a `union(enum)` whose
+    // `.list` / `.map` variants are `?*const anyopaque`. The generic ARC
+    // walkers must compile over it (instantiating every variant arm at
+    // comptime) and treat the erased variants as having no ARC child, so
+    // `Term` itself reports no eagerly-freed child.
+    comptime {
+        if (ArcRuntime.elementHasEagerlyFreedChild(Term))
+            @compileError("Term carries only erased-opaque pointers; it has no eagerly-freed ARC child");
+    }
+    // Force instantiation of the release / clone walkers over `Term`. Under
+    // the buggy classification these fail to COMPILE for a no-REFCOUNT_V1
+    // manager; once erased-opaque pointers are excluded they compile and
+    // are no-ops for the erased variants (verified by the value surviving
+    // unchanged).
+    var erased_term: Term = .{ .list = null };
+    ArcRuntime.releaseAndPoisonEagerChildren(Term, std.heap.page_allocator, &erased_term);
+    ArcRuntime.cloneChildrenAnyInPlace(Term, std.heap.page_allocator, &erased_term);
+    try std.testing.expect(erased_term == .list);
+    try std.testing.expect(erased_term.list == null);
 }
 
 test "List(?*const Map(u32, Term)) releases generated manifest-shaped maps once" {
