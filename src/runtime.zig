@@ -4159,6 +4159,25 @@ pub const ArcRuntime = struct {
         );
     }
 
+    /// Byte size to request from the manager's `core.allocate` /
+    /// `core.deallocate` for a non-refcounted (header-less) cell of type `T`.
+    ///
+    /// A zero-size `T` — an empty closure environment (a non-capturing
+    /// closure's boxed inner), an empty struct, `void`-shaped payload — has
+    /// `@sizeOf(T) == 0`. The refcounted path never sees a zero-size cell (the
+    /// inline `ArcHeader` / side-table slab adds a header so the cell is always
+    /// > 0), but the BULK_OR_NEVER / INDIVIDUAL_NO_REFCOUNT path routes the
+    /// raw `@sizeOf(T)` straight to `core.allocate`, and the spec (§4.2) makes
+    /// `size > 0` the runtime's responsibility — Zig's allocators (and hence
+    /// every manager built on `std.mem.Allocator`, e.g. the Arena manager's
+    /// `ArenaAllocator`) `assert(n > 0)`. Clamp to a minimum of one byte so a
+    /// zero-size type still receives a unique, valid, properly-aligned cell
+    /// pointer (the subsequent `slot.* = value` is a zero-byte store, and the
+    /// matching free passes the SAME clamped size to `core.deallocate`).
+    inline fn nonRefcountedCellSize(comptime T: type) usize {
+        return @max(@sizeOf(T), 1);
+    }
+
     /// Allocate and wrap a value in an Arc. Returns a pointer directly
     /// to the slab slot holding `value`; the slot's side-table refcount
     /// is initialised to 1 by the pool's `create`.
@@ -4226,7 +4245,9 @@ pub const ArcRuntime = struct {
             }
             const ctx = active_manager_state.context orelse
                 @panic("zap runtime: allocAny dispatched with null manager context");
-            const size = @sizeOf(T);
+            // Header-less cell: clamp zero-size types to one byte (see
+            // `nonRefcountedCellSize`). `core.allocate` asserts `size > 0`.
+            const size = nonRefcountedCellSize(T);
             const alignment_bytes = @alignOf(T);
             const raw = blk: {
                 if (comptime !active_manager_source_available) {
@@ -4905,7 +4926,10 @@ pub const ArcRuntime = struct {
         }
         const ctx = active_manager_state.context orelse
             @panic("zap runtime: freeAny dispatched with null manager context");
-        const size = @sizeOf(T);
+        // Header-less cell: pass the SAME clamped size the matching `allocAny`
+        // requested (see `nonRefcountedCellSize`) so a tracking manager pairs
+        // alloc/free exactly and `core.deallocate` never sees a zero size.
+        const size = nonRefcountedCellSize(T);
         const alignment_bytes = @alignOf(T);
         const raw: [*]u8 = @ptrCast(@constCast(ptr));
         if (comptime !active_manager_source_available) {
