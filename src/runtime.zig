@@ -6731,6 +6731,20 @@ pub fn List(comptime T: type) type {
             }
             // Optimistically count as kept-alive; the deep_walk callback
             // rolls this back to "freed" on the zero-transition.
+            //
+            // NOTE on buffer reclamation under INDIVIDUAL_NO_REFCOUNT: the
+            // backing buffer is reclaimed at process teardown, not per-drop —
+            // `headerRelease` is a comptime no-op there, so `listDeepWalk` never
+            // fires. This is the documented Tracking allocation model (see
+            // `src/memory/arc/manager.zig`). Eagerly freeing the buffer here is
+            // NOT yet sound: not every aliasing site routes through
+            // `cloneForShare` (e.g. `List.append`'s `retain(a)` pass-through, the
+            // Range/`Enum.take_next` element flows), so a per-drop free
+            // double-frees an aliased buffer. Promoting buffers to per-drop free
+            // requires the full no-refcount static-ownership model to guarantee a
+            // unique owner per buffer (tracked separately); clone-on-share above
+            // already makes a SHARED original safe by giving each owner its own
+            // buffer, which is what the observable COW correctness depends on.
             incrementRuntimeStatCounter(&list_release_kept_alive_total);
             ArcRuntime.headerRelease(&mut.header, listDeepWalk);
         }
@@ -13688,6 +13702,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     }
                 }
             }
+            // Buffer reclamation under INDIVIDUAL_NO_REFCOUNT is at process
+            // teardown (the `List.release` analog): `headerRelease` is a
+            // comptime no-op, so `mapDeepWalk` never fires. Per-drop buffer free
+            // is not yet sound (aliasing sites that bypass `cloneForShare` would
+            // double-free); clone-on-share above already makes a SHARED Map safe
+            // by giving each owner its own buffer.
             ArcRuntime.headerRelease(&mut.header, mapDeepWalk);
         }
 
