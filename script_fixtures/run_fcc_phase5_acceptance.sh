@@ -88,6 +88,13 @@ run_clean nested_closure_returning_closure.zap "30" "50"
 # Mixed BOXED + DIRECT representations coexisting in one program.
 run_clean mixed_boxed_and_direct.zap "12" "110" "25"
 
+echo "== FCC Phase 5: final matrix — all positions × {raising, pure} (Item 7) =="
+# RAISING capturing closures across field/list/map/return, each rescued.
+run_clean matrix_raising_all_positions.zap "11" "22" "33" "44"
+# PURE capturing across field/list/map/return + a DIRECT combinator callback;
+# no spurious raises, leak-free both managers.
+run_clean matrix_pure_all_positions.zap "20" "11" "12" "14" "15"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "FCC PHASE 5 ACCEPTANCE: ALL PASS"

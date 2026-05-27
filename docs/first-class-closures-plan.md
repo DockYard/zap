@@ -421,9 +421,28 @@ capability is blocked by this.
 The full {capturing, non-capturing, raising, pure} × {field, list, map, return,
 param, bound-local, nested} × {`zap run`, `zap test`} × {`Memory.ARC`,
 `Memory.Tracking`} × {discharge, undischarged, mixed} matrix is closed: every
-cell works (correct, leak-free, no crash, effect correct) or is the documented
-Item-6 follow-up. No regression: `zig build test` exit 0; `zap test` corpus
-927/0; golden 14/14; `fcc_phase2`/`fcc_phase5` acceptance ALL PASS; the 16
+cell works (correct, leak-free, no crash, effect correct) or is one of the two
+documented pre-existing residuals. No regression: `zig build test` exit 0;
+`zap test` corpus 927/0; golden 14/14; `run_error_matrix.sh` 102/0 both
+managers; `fcc_phase2`/`fcc_phase5` acceptance ALL PASS; the 16
 `raise_closure/*` fixtures correct (14 clean + 2 compile-flag); `#201`/Gap E
 direct ZIR shape + `Enumerable`/`Map.*` devirtualization + pure-no-spurious-raise
 preserved.
+
+**Residual Tracking-leak edge (DOCUMENTED — pre-existing, narrow, ARC-ordering).**
+Under `Memory.Tracking` ONLY, a boxed-`Callable` LOCAL that is created-and-used
+EARLIER in a function body, followed LATER in the SAME scope by an `Enum.*`
+combinator call, leaks the boxed local's env (`1 x %__closure_N`, refcount 1 —
+a clean leak, no corruption). It is purely a drop-ORDERING interaction: the
+SAME closure used SOLO, followed by a plain statement, or with the combinator
+FIRST (the `mixed_boxed_and_direct` order) is all leak-free; only the
+boxed-then-combinator ordering loses the boxed local's scope-exit
+`.protocol_box_drop` (the combinator's lowering perturbs the `arc_liveness`
+`owned_at_ret`/`live_before_ret` set for the earlier boxed local). Orthogonal
+to FCC's representation/effect model — it lives in the Phase-2/3 ARC
+drop-insertion / liveness path (`src/arc_drop_insertion.zig` /
+`src/arc_liveness.zig`) and pre-dates Phase 5 (no Phase-5 change touches drop
+insertion or liveness). Tracked as a separate ARC follow-up. **Workaround**
+(verified): order the combinator BEFORE the boxed-closure local, or scope the
+boxed local so its last use is not separated from `ret` by a combinator. Does
+not affect `Memory.ARC` (refcounting releases it correctly).
