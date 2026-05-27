@@ -9268,7 +9268,28 @@ pub const ZirDriver = struct {
                     return;
                 }
 
-                if (!self.shouldSkipArc(ret.value)) {
+                // Phase 4.c symmetry: under a no-REFCOUNT_V1 manager
+                // (`Memory.Tracking`), `shouldSkipArc` elides ALL refcount
+                // retains — correct for a refcount increment, but a
+                // `.persistent` retain of an ARC-managed local is the
+                // share-side mirror of the deep-walk `.release` carve-out
+                // (`emit_deep_walk_under_no_refcount`): it creates a genuine
+                // SECOND owner that the IR pairs with a scope-exit `.release`,
+                // and that release IS emitted under no-REFCOUNT_V1. So the
+                // share MUST be emitted too — otherwise the new owner aliases
+                // the source's eagerly-freed cell and BOTH releases
+                // `core.deallocate` it (the double-free segfault under
+                // `Memory.Tracking`). The share lowers to `shareAnyPersistent`,
+                // which under no-REFCOUNT_V1 deep-CLONES a value owning an
+                // eagerly-freed child (indirect-storage recursive struct,
+                // boxed inner) so each owner reaches a single free, and is a
+                // no-op identity otherwise. `.normal` retains stay skipped: a
+                // transient borrow has no scope-exit release to balance and
+                // must NOT clone (a clone there would leak).
+                const emit_share_under_no_refcount = !self.shouldEmitRefcountOps() and
+                    ret.kind == .persistent and
+                    self.arc_managed_locals.contains(ret.value);
+                if (!self.shouldSkipArc(ret.value) or emit_share_under_no_refcount) {
                     // Phase 1 Class A: dispatch on the IR-level kind
                     // enum so callers control the helper choice
                     // (normal vs persistent) rather than every retain
