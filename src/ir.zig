@@ -8403,9 +8403,10 @@ pub const IrBuilder = struct {
         // `case_block` lowering (`current_case_dest` forces `i64`), which the
         // hand-rolled `if_expr` rescue dispatch does not. Concretize the tail
         // to the joined result type here so every arm yields the SAME concrete
-        // type to the merge. A no-op when the tail already carries the joined
-        // type or the join is non-numeric (a `String`/struct arm value is
-        // already concrete).
+        // type to the merge. A no-op (returns the tail unchanged) when the join
+        // is non-numeric (a `String`/struct arm value is already concrete) or
+        // has no usable type; for a concrete-numeric join it always emits an
+        // `@as` (an identity `@as` is a codegen no-op — see the helper).
         const coerced_body_result = try self.coerceRescueArmTailToJoined(body_result, joined_type);
 
         try self.current_instrs.append(self.allocator, .{
@@ -8422,16 +8423,17 @@ pub const IrBuilder = struct {
     /// which the `int_lit`/`float_lit` lowering emits UNTYPED (a
     /// `comptime_int`/`comptime_float`) for the default `i64`/`f64`. Such a
     /// comptime-only value cannot flow across the runtime arm-vs-arm `condbr`
-    /// merge. When the joined type is a concrete integer or float, emit an
-    /// `@as(<joined>, tail)` (via the existing numeric-widen instruction, which
-    /// lowers to exactly that) so the literal concretizes and a differing-but-
-    /// peer-coercible numeric arm widens to the common type. Returns the tail
-    /// unchanged when:
-    ///   * the join is not a concrete numeric type (a `String`/struct/optional
-    ///     arm value is already a concrete runtime value — no comptime-only
-    ///     hazard, and `@as` to those is unnecessary), or
-    ///   * the tail already carries the exact joined concrete numeric type (the
-    ///     coercion would be an identity `@as`).
+    /// merge. When the joined type is a concrete integer or float, ALWAYS emit
+    /// an `@as(<joined>, tail)` (via the existing numeric-widen instruction,
+    /// which lowers to exactly that) so the literal concretizes and a
+    /// differing-but-peer-coercible numeric arm widens to the common type. The
+    /// coercion is emitted unconditionally for a concrete-numeric join — see
+    /// the body for why the tail's TRACKED type must NOT be trusted to skip it
+    /// (a literal is tracked `.i64` yet emitted as a bare `comptime_int`). An
+    /// `@as` to a type the value already has is a codegen identity. Returns the
+    /// tail unchanged only when the join is not a concrete numeric type (a
+    /// `String`/struct/optional arm value is already a concrete runtime value —
+    /// no comptime-only hazard) or has no usable type.
     fn coerceRescueArmTailToJoined(
         self: *IrBuilder,
         tail: LocalId,
