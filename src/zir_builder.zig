@@ -1199,6 +1199,17 @@ pub const ZirDriver = struct {
         return elision.shouldEmitRefcountOps(self.declared_caps);
     }
 
+    /// The active manager's reclamation model (Axis A), decoded from
+    /// `declared_caps` via the single source of truth in
+    /// `src/memory/elision.zig`. Codegen sites on the no-refcount path use
+    /// this to split three-way — `.bulk_or_never` (and `.traced`) elide every
+    /// individual free / deep-walk, `.individual_no_refcount` (Tracking) keeps
+    /// the individual-free + deep-walk emission — never keying off a manager
+    /// name.
+    fn reclamationModel(self: *const ZirDriver) elision.ReclamationModel {
+        return elision.reclamationModel(self.declared_caps);
+    }
+
     // -- Helpers --------------------------------------------------------------
 
     /// Map an IR ZigType to a ZIR Ref, recursively emitting tuple_decl for nested tuples.
@@ -2361,25 +2372,34 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, "}\n\n");
 
         // `share(box) zap_runtime.ProtocolBox` — the single chokepoint the
-        // box-local `.protocol_box_retain` share lowering calls when a box
+        // box-local `.protocol_box_share` share lowering calls when a box
         // gains a second owner. Comptime-specialized on the active manager's
-        // REFCOUNT_V1 capability:
-        //   * REFCOUNT_V1 manager — bump the inner's refcount and return the
-        //     SAME box; the two owners share one refcounted inner that the
-        //     last drop frees. (Identity rebind at the call site.)
-        //   * no-REFCOUNT_V1 manager — there is no refcount, so a second
-        //     owner of the same inner would double-free at scope exit. Return
-        //     an independent CLONE so each owner drops its own inner exactly
-        //     once (no double-free under `Memory.Tracking`, no leak).
+        // reclamation model (three-way, capability-driven — never a manager
+        // name):
+        //   * REFCOUNTED — bump the inner's refcount and return the SAME box;
+        //     the two owners share one refcounted inner that the last drop
+        //     frees. (Identity rebind at the call site.)
+        //   * INDIVIDUAL_NO_REFCOUNT (`Memory.Tracking`, CLONE_ON_SHARE) —
+        //     there is no refcount, so a second owner of the same inner would
+        //     double-free at its individual scope-exit free. Return an
+        //     independent CLONE so each owner frees its own inner exactly once
+        //     (no double-free, no leak).
+        //   * BULK_OR_NEVER / TRACED (Arena/NoOp/Leak/GC) — there is no
+        //     individual free at all (the manager reclaims in bulk at exit,
+        //     never, or via tracing), so a second owner aliasing the same
+        //     inner is SAFE and cloning would be a pointless allocation.
+        //     Return the SAME box — pure elision, zero overhead.
         // Keeping the policy inside this comptime-specialized helper lets the
-        // `.protocol_box_retain` ZIR handler stay uniform: it always rebinds
+        // `.protocol_box_share` ZIR handler stay uniform: it always rebinds
         // the new owner local to `share(box)`.
         try buf.appendSlice(self.allocator, "pub fn share(box: zap_runtime.ProtocolBox) zap_runtime.ProtocolBox {\n");
         try buf.appendSlice(self.allocator, "    if (comptime zap_runtime.refcount_v1_active) {\n");
         try buf.appendSlice(self.allocator, "        retain(box);\n");
         try buf.appendSlice(self.allocator, "        return box;\n");
-        try buf.appendSlice(self.allocator, "    } else {\n");
+        try buf.appendSlice(self.allocator, "    } else if (comptime zap_runtime.eager_individual_free) {\n");
         try buf.appendSlice(self.allocator, "        return clone(box);\n");
+        try buf.appendSlice(self.allocator, "    } else {\n");
+        try buf.appendSlice(self.allocator, "        return box;\n");
         try buf.appendSlice(self.allocator, "    }\n");
         try buf.appendSlice(self.allocator, "}\n\n");
 
@@ -9540,28 +9560,39 @@ pub const ZirDriver = struct {
                     return;
                 }
 
-                // Phase 4.c box-in-struct fix: under a no-REFCOUNT_V1
-                // manager (`Memory.Tracking`), `shouldSkipArc` elides ALL
-                // refcount releases — correct for a refcount decrement,
-                // but a by-VALUE aggregate that transitively OWNS a heap-
-                // promoted ARC child (a `ProtocolBox` in an `Option(Error)`
-                // / struct field, an indirect-storage recursive field)
-                // still needs its scope-exit release EMITTED so the
-                // runtime's `releaseAny` → `releaseChildrenAny` deep-walk
-                // reclaims that child via `core.deallocate` (the child went
-                // through `core.allocate` on the no-REFCOUNT_V1 `allocAny`
-                // path). Without it the child leaks under `Memory.Tracking`
-                // even though it is correctly freed under `Memory.ARC`
-                // (whose release is not elided). This is EXACTLY the release
-                // ARC would emit — the IR is cap-independent, only the ZIR
-                // elision differs — so it cannot introduce a double-free
-                // that ARC does not already have: a box consumed into the
-                // container had its own `.protocol_box_drop` suppressed by
-                // the ownership-transfer analysis (the container is the sole
-                // owner at scope exit). For the aggregate the runtime takes
-                // the `isByValueAggregate` deep-walk branch (frees owned
-                // children, never the stack value), so emitting it is safe.
-                const emit_deep_walk_under_no_refcount = !self.shouldEmitRefcountOps() and
+                // Phase 4.c box-in-struct fix: under INDIVIDUAL_NO_REFCOUNT
+                // (`Memory.Tracking`), `shouldSkipArc` elides ALL refcount
+                // releases — correct for a refcount decrement, but a by-VALUE
+                // aggregate that transitively OWNS a heap-promoted ARC child (a
+                // `ProtocolBox` in an `Option(Error)` / struct field, an
+                // indirect-storage recursive field) still needs its scope-exit
+                // release EMITTED so the runtime's `releaseAny` →
+                // `releaseChildrenAny` deep-walk reclaims that child via
+                // `core.deallocate` (the child went through `core.allocate` on
+                // the no-REFCOUNT_V1 `allocAny` path). Without it the child
+                // leaks under `Memory.Tracking` even though it is correctly
+                // freed under `Memory.ARC` (whose release is not elided). This
+                // is EXACTLY the release ARC would emit — the IR is
+                // cap-independent, only the ZIR elision differs — so it cannot
+                // introduce a double-free that ARC does not already have: a box
+                // consumed into the container had its own `.protocol_box_drop`
+                // suppressed by the ownership-transfer analysis (the container
+                // is the sole owner at scope exit). For the aggregate the
+                // runtime takes the `isByValueAggregate` deep-walk branch
+                // (frees owned children, never the stack value), so emitting it
+                // is safe.
+                //
+                // Phase 2 three-way split: this deep-walk emission is the
+                // INDIVIDUAL_NO_REFCOUNT individual-free path and fires ONLY
+                // under that model. Under BULK_OR_NEVER / TRACED there is no
+                // individual free — the manager reclaims in bulk (Arena at
+                // exit), never (NoOp/Leak), or via tracing — so NOTHING is
+                // emitted (the runtime's `releaseAny`/`releaseChildrenAny` are
+                // comptime no-ops under those models anyway, but eliding the
+                // emission too keeps the ZIR free of any `releaseAny` call site
+                // and guarantees zero refcount overhead). Under REFCOUNTED the
+                // `shouldSkipArc` path below handles the release.
+                const emit_deep_walk_under_no_refcount = self.reclamationModel() == .individual_no_refcount and
                     rel.kind == .release and
                     self.arc_managed_locals.contains(rel.value);
                 if (!self.shouldSkipArc(rel.value) or emit_deep_walk_under_no_refcount) {

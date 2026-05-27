@@ -12621,8 +12621,12 @@ pub const IrBuilder = struct {
 
         // Materialize an independent owner: copy the 16-byte `ProtocolBox`
         // value into a fresh local, then emit a `.protocol_box_share` retain
-        // that REBINDS the fresh local to a clone (no-refcount) / refcount
-        // bump (refcount) — leaving the source binding/param's box untouched.
+        // that REBINDS the fresh local via the comptime-specialized
+        // `<Protocol>VTable.share` helper — a refcount bump (REFCOUNTED), an
+        // independent clone (INDIVIDUAL_NO_REFCOUNT), or an identity no-op
+        // (BULK_OR_NEVER / TRACED) — leaving the source binding/param's box
+        // untouched. The IR op itself is cap-independent; the model split lives
+        // entirely in the runtime helper.
         const clone_local = self.next_local;
         self.next_local += 1;
         try self.current_instrs.append(self.allocator, .{

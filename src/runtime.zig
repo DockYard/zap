@@ -629,6 +629,97 @@ pub const runtime_declared_caps: u64 = RUNTIME_DECLARED_CAPS_DEFAULT;
 pub const refcount_v1_active: bool = (runtime_declared_caps & 0x0000_0000_0000_0001) != 0;
 
 // ============================================================
+// Capability-driven memory model — reclamation-model axis (runtime side)
+//
+// `src/memory/elision.zig` is the compiler-side single source of truth for
+// decoding `declared_caps` into a `ReclamationModel`. `runtime.zig` is
+// `@embedFile`'d into every Zap binary as a standalone source unit that can
+// only import `std`/`builtin`, so it cannot import `elision.zig` and must
+// replicate the decode here. The bit encoding is canonical in
+// `src/memory/abi.zig` ("Capability axes in `declared_caps`"); the comptime
+// asserts below tripwire any drift between the two decoders.
+//
+// The runtime needs this axis (not just `refcount_v1_active`) because the
+// no-REFCOUNT_V1 codegen path lumps three incompatible free-models that the
+// runtime's deep-walk / individual-free helper bodies must treat differently:
+//
+//   * `.refcounted`             — retain/release dispatch, free-at-zero.
+//   * `.bulk_or_never`          — Arena/NoOp/Leak: the manager reclaims in
+//                                 bulk (Arena at exit) or never (NoOp/Leak),
+//                                 so the runtime elides EVERY individual free
+//                                 and deep-walk. The refcount vtable is never
+//                                 dispatched, so a manager that does not
+//                                 service it (Arena/NoOp/Leak) no longer
+//                                 panics.
+//   * `.individual_no_refcount` — Tracking: no refcount, but each allocation
+//                                 is freed individually (deep-walk + the
+//                                 eager-children poison) so a tracking manager
+//                                 observes balanced alloc/free pairs.
+//   * `.traced`                 — codegen reuses the `.bulk_or_never` elision
+//                                 (reserved-and-rejected at build until the GC
+//                                 manager ships; reached here only if a future
+//                                 GC build sets the bits).
+// ============================================================
+
+/// Runtime mirror of `elision.ReclamationModel`. See `src/memory/elision.zig`.
+pub const ReclamationModel = enum {
+    refcounted,
+    bulk_or_never,
+    individual_no_refcount,
+    traced,
+};
+
+/// Decode the active manager's reclamation model from `runtime_declared_caps`.
+/// Byte-for-byte mirror of `elision.reclamationModel` — `refcount_v1_active`
+/// (bit 0) is checked first so `.refcounted` is returned iff bit 0 is set, and
+/// the Axis-A field (bits 1..2) selects the free model when bit 0 is clear.
+fn decodeReclamationModel(caps: u64) ReclamationModel {
+    if ((caps & 0x0000_0000_0000_0001) != 0) return .refcounted;
+    // Axis-A field: bits 1..2 (mask 0b11 shifted right by 1).
+    const field = (caps >> 1) & 0b11;
+    return switch (field) {
+        0b00 => .bulk_or_never, // RECLAMATION_BULK_OR_NEVER
+        0b01 => .individual_no_refcount, // RECLAMATION_INDIVIDUAL_NO_REFCOUNT
+        0b10 => .traced, // RECLAMATION_TRACED
+        0b11 => .bulk_or_never, // RECLAMATION_RESERVED → conservative elide
+        else => unreachable, // 2-bit field; the four arms are exhaustive.
+    };
+}
+
+/// The active manager's reclamation model, decoded at comptime. Every
+/// runtime free / release / deep-walk body keys off this value — never off a
+/// manager name — exactly as the compiler-side codegen gates off
+/// `elision.reclamationModel`.
+pub const reclamation_model: ReclamationModel = decodeReclamationModel(runtime_declared_caps);
+
+/// Comptime-true when individual frees + the eager-children deep-walk should
+/// run: ONLY under `.individual_no_refcount` (Tracking). Under `.bulk_or_never`
+/// / `.traced` every individual free and deep-walk is elided (the manager
+/// reclaims in bulk, never, or via tracing); under `.refcounted` reclamation
+/// flows through the refcount vtable instead. This is the gate the no-refcount
+/// free path (`releaseAny`/`freeAny`/`releaseArcAny`/`releaseChildrenAny`/
+/// `releaseAndPoisonEagerChildren` and the List/Map eager-children loops) keys
+/// off, replacing the old coarse `!refcount_v1_active`.
+pub const eager_individual_free: bool = reclamation_model == .individual_no_refcount;
+
+comptime {
+    // Tripwire drift against `src/memory/abi.zig` canonical encodings and the
+    // host-default expectation. The host default is REFCOUNTED (ARC).
+    if (refcount_v1_active != (reclamation_model == .refcounted)) @compileError(
+        "runtime: refcount_v1_active must agree with reclamation_model == .refcounted (elision.zig invariant)",
+    );
+    // `eager_individual_free` must be disjoint from both refcounted and
+    // bulk/never — it is exclusively the INDIVIDUAL_NO_REFCOUNT model.
+    if (eager_individual_free and refcount_v1_active) @compileError(
+        "runtime: eager_individual_free and refcount_v1_active are mutually exclusive",
+    );
+    if (decodeReclamationModel(0x1) != .refcounted) @compileError("runtime: caps 0x1 must decode REFCOUNTED");
+    if (decodeReclamationModel(0x0) != .bulk_or_never) @compileError("runtime: caps 0x0 must decode BULK_OR_NEVER");
+    if (decodeReclamationModel(0x2) != .individual_no_refcount) @compileError("runtime: caps 0x2 must decode INDIVIDUAL_NO_REFCOUNT");
+    if (decodeReclamationModel(0x4) != .traced) @compileError("runtime: caps 0x4 must decode TRACED");
+}
+
+// ============================================================
 // Phase 7e — explicit memory startup prologue marker
 //
 // Host tests and any runtime source imported directly from `src/runtime.zig`
@@ -4687,22 +4778,31 @@ pub const ArcRuntime = struct {
             releaseChildrenAny(@TypeOf(ptr), allocator, ptr);
             return;
         }
+        if (comptime reclamation_model == .bulk_or_never or reclamation_model == .traced) {
+            // BULK_OR_NEVER / TRACED — pure elision (see `releaseAny`). No
+            // individual free; the manager reclaims in bulk, never, or via
+            // tracing. The refcount/core deallocate vtable is never dispatched.
+            // (`allocator` stays "used" via the comptime-dead dispatcher path
+            // below, so no discard is needed — and adding one is flagged as a
+            // pointless discard of a used parameter.)
+            return;
+        }
         if (comptime !refcount_v1_active) {
-            // Phase 6 lifecycle pairing: under no-REFCOUNT_V1, every
-            // `allocAny` call routed through `core.allocate` (see the
-            // non-REFCOUNT_V1 branch of `allocAny` above). Spec §4.5
-            // mandates the matching call is `core.deallocate(ctx, ptr,
-            // size, alignment)` — there are no refcounted cells in
-            // this mode, so all allocations are "raw" and the alloc/
-            // free pair flows entirely through the core vtable. The
-            // refcount instrumentation (retain/release counters, deep-
-            // walk callbacks, side-table refcount layout) is elided,
-            // but the allocation lifecycle pairing is preserved so
-            // tracking managers can observe matched alloc/free pairs.
+            // INDIVIDUAL_NO_REFCOUNT (Tracking) — Phase 6 lifecycle pairing:
+            // every `allocAny` call routed through `core.allocate` (see the
+            // non-REFCOUNT_V1 branch of `allocAny` above). Spec §4.5 mandates
+            // the matching call is `core.deallocate(ctx, ptr, size,
+            // alignment)` — there are no refcounted cells in this mode, so all
+            // allocations are "raw" and the alloc/free pair flows entirely
+            // through the core vtable. The refcount instrumentation
+            // (retain/release counters, deep-walk callbacks, side-table
+            // refcount layout) is elided, but the allocation lifecycle pairing
+            // is preserved so tracking managers can observe matched alloc/free
+            // pairs.
             //
-            // `_ = allocator;` would conflict with the REFCOUNT_V1
-            // branch below (Zig errors on discard-of-used-param), so
-            // leave the parameter untouched.
+            // `_ = allocator;` would conflict with the REFCOUNT_V1 branch below
+            // (Zig errors on discard-of-used-param), so leave the parameter
+            // untouched.
             return freeAnyNonRefcountedImpl(allocator, ptr);
         }
         if (active_manager_state.shutdown_complete) {
@@ -5208,16 +5308,25 @@ pub const ArcRuntime = struct {
             releaseChildrenAny(@TypeOf(ptr), allocator, ptr);
             return;
         }
+        if (comptime reclamation_model == .bulk_or_never or reclamation_model == .traced) {
+            // BULK_OR_NEVER / TRACED — pure elision. The manager reclaims in
+            // bulk (Arena at program exit), never (NoOp/Leak), or via tracing
+            // collection. There is no individual free, no deep-walk, and the
+            // refcount vtable is never dispatched — so a manager that does not
+            // service refcount (Arena/NoOp/Leak) is never reached here and
+            // never panics. Zero refcount overhead. (`allocator` stays "used"
+            // via the comptime-dead path below, so no discard is needed.)
+            return;
+        }
         if (comptime !refcount_v1_active) {
-            // Phase 6 lifecycle pairing: under no-REFCOUNT_V1, the
-            // matching `allocAny` call routed through `core.allocate`
-            // (spec §4.5 — all allocations are "raw" in this mode).
-            // The refcount instrumentation (`releaseArcAny` deep walk,
-            // `arc_releases_total` counter, side-table refcount
-            // decrement) is elided, but the allocation lifecycle
-            // pairing flows through `core.deallocate` so tracking
-            // managers see balanced alloc/free pairs. Phase 7
-            // diagnostic managers depend on this.
+            // INDIVIDUAL_NO_REFCOUNT (Tracking) — Phase 6 lifecycle pairing:
+            // the matching `allocAny` call routed through `core.allocate`
+            // (spec §4.5 — all allocations are "raw" in this mode). The
+            // refcount instrumentation (`releaseArcAny` deep walk,
+            // `arc_releases_total` counter, side-table refcount decrement) is
+            // elided, but the allocation lifecycle pairing flows through
+            // `core.deallocate` so tracking managers see balanced alloc/free
+            // pairs. Phase 7 diagnostic managers depend on this.
             return freeAnyNonRefcountedImpl(allocator, ptr);
         }
         if (active_manager_state.shutdown_complete) {
@@ -5307,19 +5416,28 @@ pub const ArcRuntime = struct {
             }
             return;
         }
-        // Phase 6 lifecycle pairing: under a no-REFCOUNT_V1 manager
-        // (`Memory.Tracking`) this side-table / indirect-storage child was
-        // heap-promoted by the non-REFCOUNT_V1 branch of `allocAny`
-        // (`core.allocate`), so its matching free is `core.deallocate`
-        // after deep-walking ITS own owned children — exactly
-        // `freeAnyNonRefcountedImpl`. The refcount machinery below
-        // (side-table `release_sized`, v1.0 `release` slot) does not exist
-        // in this mode: dispatching through it would `@panic` ("active
-        // manager does not declare REFCOUNT_V1"). This mirrors the
-        // identical guard at the top of `releaseAny` / `freeAny`; the
-        // generic deep-walk reaches `releaseArcAny` for a `?*const T`
-        // recursive-struct / nested-Arc child via `releaseFieldChildAny`,
-        // so the no-refcount free path must be honored here too.
+        if (comptime reclamation_model == .bulk_or_never or reclamation_model == .traced) {
+            // BULK_OR_NEVER / TRACED — pure elision (see `releaseAny`). The
+            // generic deep-walk does not reach here under these models
+            // (`releaseChildrenAny` no-ops first), but `releaseArcAny` is also
+            // an inline-header deep-walk leaf, so honour the elision here too:
+            // no individual free, no further deep-walk, refcount vtable never
+            // dispatched. (`allocator` stays "used" via the comptime-dead
+            // INDIVIDUAL_NO_REFCOUNT path below, so no discard is needed.)
+            return;
+        }
+        // INDIVIDUAL_NO_REFCOUNT (Tracking) — Phase 6 lifecycle pairing: this
+        // side-table / indirect-storage child was heap-promoted by the
+        // non-REFCOUNT_V1 branch of `allocAny` (`core.allocate`), so its
+        // matching free is `core.deallocate` after deep-walking ITS own owned
+        // children — exactly `freeAnyNonRefcountedImpl`. The refcount machinery
+        // below (side-table `release_sized`, v1.0 `release` slot) does not
+        // exist in this mode: dispatching through it would `@panic` ("active
+        // manager does not declare REFCOUNT_V1"). This mirrors the identical
+        // guard at the top of `releaseAny` / `freeAny`; the generic deep-walk
+        // reaches `releaseArcAny` for a `?*const T` recursive-struct /
+        // nested-Arc child via `releaseFieldChildAny`, so the no-refcount free
+        // path must be honored here too.
         if (comptime !refcount_v1_active) {
             return freeAnyNonRefcountedImpl(allocator, @as(?*const T, ptr));
         }
@@ -5437,6 +5555,15 @@ pub const ArcRuntime = struct {
     /// any indirect-storage Arc'd children encountered. Non-aggregates are
     /// a no-op; flat aggregates compile to nothing.
     pub fn releaseChildrenAny(comptime T: type, allocator: std.mem.Allocator, value: T) void {
+        // BULK_OR_NEVER / TRACED — pure elision: no deep-walk at all. The
+        // manager reclaims in bulk (Arena at exit), never (NoOp/Leak), or via
+        // tracing. Eliding the whole walk here makes the `isByValueAggregate`
+        // entry of `releaseAny`/`freeAny` and every owned-child / ProtocolBox
+        // walk a comptime no-op, so the refcount/box-drop vtable is never
+        // dispatched under these models. Zero refcount overhead.
+        if (comptime reclamation_model == .bulk_or_never or reclamation_model == .traced) {
+            return;
+        }
         // A `ProtocolBox` reached as a top-level deep-walk subject (the
         // cell IS a box) routes through its vtable header drop, never the
         // generic field walk — its `data_ptr`/`vtable` fields are not
@@ -5526,6 +5653,16 @@ pub const ArcRuntime = struct {
     /// independent inner — nulling the container's slot never dangles an
     /// extracted value.
     pub fn releaseAndPoisonEagerChildren(comptime T: type, allocator: std.mem.Allocator, slot: *T) void {
+        // Eager individual-free + poison is exclusively the
+        // INDIVIDUAL_NO_REFCOUNT (Tracking) reclamation model. The four
+        // List/Map callers already gate on `eager_individual_free`, so this is
+        // not reached under BULK_OR_NEVER / TRACED (bulk/never/traced reclaim,
+        // no individual free) or REFCOUNTED (the deep_walk callback handles it
+        // via refcounts). Guard the body too so a recursive reach under any
+        // non-eager model is a comptime no-op.
+        if (comptime !eager_individual_free) {
+            return;
+        }
         if (comptime !elementHasEagerlyFreedChild(T)) return;
         if (comptime isProtocolBox(T)) {
             releaseProtocolBoxValue(slot.*);
@@ -5587,6 +5724,16 @@ pub const ArcRuntime = struct {
     /// later own and release it (e.g. `List.next` returning `cell.head`
     /// when the cell still owns the same value).
     pub fn retainChildrenAny(comptime T: type, value: T) void {
+        // A retain is meaningful only under REFCOUNTED — it bumps a refcount.
+        // Under every non-refcounted model (BULK_OR_NEVER / TRACED /
+        // INDIVIDUAL_NO_REFCOUNT) there is no refcount, so the leaf retains
+        // (`retainProtocolBoxValue` → vtable adapter → `retainAny`,
+        // `retainAnyPersistent`) are already no-ops; eliding the whole walk
+        // here removes the redundant field traversal / runtime tag-switch too.
+        // Symmetric with `releaseChildrenAny`'s elision.
+        if (comptime !refcount_v1_active) {
+            return;
+        }
         if (comptime isProtocolBox(T)) {
             retainProtocolBoxValue(value);
             return;
@@ -6338,7 +6485,11 @@ pub fn List(comptime T: type) type {
             // emitting a no-op `release`) frees nothing. Comptime-elided whole
             // for element types with no eagerly-freed child, and skipped under
             // REFCOUNT_V1 (the deep_walk callback handles it via refcounts).
-            if (comptime !refcount_v1_active and ArcRuntime.elementHasEagerlyFreedChild(T)) {
+            //
+            // Gated on `eager_individual_free` (INDIVIDUAL_NO_REFCOUNT only):
+            // under BULK_OR_NEVER / TRACED there is no individual free, so the
+            // whole loop — including the `mut.dataPtr()` access — is elided.
+            if (comptime eager_individual_free and ArcRuntime.elementHasEagerlyFreedChild(T)) {
                 if (v.len != 0) {
                     const data = mut.dataPtr();
                     for (0..v.len) |i| {
@@ -7393,7 +7544,14 @@ pub fn List(comptime T: type) type {
         ///     the same rule the boxed-closure clone-on-share already uses.
         ///     Elided at comptime for element types with no ARC children.
         inline fn ownElement(value: T) T {
-            if (comptime !refcount_v1_active and ArcRuntime.elementHasEagerlyFreedChild(T)) {
+            // Clone-on-share is the CLONE_ON_SHARE axis of the
+            // INDIVIDUAL_NO_REFCOUNT (Tracking) model only. Under
+            // BULK_OR_NEVER / TRACED the extracted owner aliases the source
+            // inner (Arena reclaims in bulk at exit; NoOp/Leak never free;
+            // tracing reclaims via collection), so no clone is needed and the
+            // walk is elided — zero overhead. Under REFCOUNTED the refcount
+            // bump (`retainElement`) handles the second owner.
+            if (comptime eager_individual_free and ArcRuntime.elementHasEagerlyFreedChild(T)) {
                 var owned: T = value;
                 ArcRuntime.cloneChildrenAnyInPlace(T, std.heap.c_allocator, &owned);
                 return owned;
@@ -13241,7 +13399,11 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // exactly-once without a refcount. Comptime-elided whole when neither
             // K nor V has an eagerly-freed child, and skipped under REFCOUNT_V1
             // (the deep_walk callback + refcount bumps handle it).
-            if (comptime !refcount_v1_active and
+            //
+            // Gated on `eager_individual_free` (INDIVIDUAL_NO_REFCOUNT only):
+            // under BULK_OR_NEVER / TRACED there is no individual free, so the
+            // whole loop — including the `mut.entriesPtr()` access — is elided.
+            if (comptime eager_individual_free and
                 (ArcRuntime.elementHasEagerlyFreedChild(K) or ArcRuntime.elementHasEagerlyFreedChild(V)))
             {
                 if (m.capacity != 0 and m.len != 0) {
@@ -13935,7 +14097,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
         ///     slices, scalars) aliased — the same rule `List.ownElement` uses.
         ///     Comptime-elided for value types with no eagerly-freed child.
         inline fn ownEntryValue(value: V) V {
-            if (comptime !refcount_v1_active and ArcRuntime.elementHasEagerlyFreedChild(V)) {
+            // Clone-on-share is the CLONE_ON_SHARE axis of the
+            // INDIVIDUAL_NO_REFCOUNT (Tracking) model only — see
+            // `List.ownElement`. Under BULK_OR_NEVER / TRACED the extracted
+            // owner aliases the source inner (no clone, zero overhead); under
+            // REFCOUNTED the refcount bump (`retainEntryValue`) handles it.
+            if (comptime eager_individual_free and ArcRuntime.elementHasEagerlyFreedChild(V)) {
                 var owned: V = value;
                 ArcRuntime.cloneChildrenAnyInPlace(V, std.heap.c_allocator, &owned);
                 return owned;
