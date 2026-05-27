@@ -155,30 +155,57 @@ unprovable share — deferred).
     ownership; **zero `invalid free`** (was many); **ARC 942/0 byte-identical; golden 14/14;
     host `zig build test` exit 0.** Tracking corpus: 942 tests, 10 failures (down from a
     whole-corpus SEGFAULT) — 0 crashes, 0 invalid-frees, no program-exit leaks.
-  - **GAP A (9 of 10 failures) — free-at-last-use placement.** The boxed-closure
-    `assert_no_leaks` fixtures (`closure_boxed_test.zap`, `combinator_boxed_test.zap`) sample
-    `live_allocation_count()` MID-SCOPE; the box `protocol_box_drop` sits at function
-    scope-exit (correct — the box IS reclaimed, NO program-exit leak), but AFTER the sample,
-    so the mid-scope delta is non-zero. The fix is exactly this phase's step-2 free-at-last-use
-    drop placement (relocate the drop to the local's `arc_liveness.last_use_map` site under
-    `individual_no_refcount`); scope-exit placement is correct for `refcounted` (the refcount
-    closes the window) but the leak-checkpoint is inactive there. A box bound inside a nested
-    `if`/`switch` arm with no `case_break` is genuinely never dropped (a real leak) — the same
-    free-at-last-use placement covers it.
-  - **GAP B (1 of 10 failures) — List/Map COW under `clone_on_share`.** `mutationMayMoveInPlace`
-    returns `true` unconditionally under `!refcount_v1_active` (always mutate in place, no COW),
-    but `cloneEagerChildValue`/`cloneFieldChildInPlace` do NOT clone inline-header List/Map cells
-    on share (they alias — "never eagerly freed" reasoning from the bulk-free era). So an aliased
-    list (`original_alias = values`) shares the buffer and an in-place `List.set` CORRUPTS the
-    alias (`generic_list_test.zap` "copy-on-write preserves aliased original string list":
-    `alias_len` reads garbage). The coherent fix is the FULL clone-on-share model extended to
-    inline-header collections: (1) `cloneEagerChildValue`/`cloneFieldChildInPlace` deep-clone the
-    List/Map buffer under `clone_on_share_active`; (2) `List.release`/`Map.release` directly free
-    the buffer under `eager_individual_free` (each owner unique post-clone → frees its own, no
-    double-free) instead of relying on the `ArcHeaderEmpty.release`-returns-false zero-transition
-    that never fires; (3) `mutationMayMoveInPlace` stays `true` (post-clone uniqueness makes
-    in-place mutation sound). This is a bounded List/Map runtime-free-model change; deferred to
-    keep the green baseline stable.
+  - **GAP A — free-at-last-use placement (RESOLVED for the free-at-last-use cases; 7 of 9).**
+    The boxed-closure `assert_no_leaks` fixtures sample `live_allocation_count()` MID-SCOPE; a
+    box `protocol_box_drop` (or a list-of-boxes `.release`) parked at function scope-exit is
+    counted as a live "leak" though it is reclaimed at exit. **Fix (commit `74ce510`):** new pass
+    `arc_drop_insertion.relocateOwnedDropsToLastUse`, run after `rewriteProtocolBoxReleases`,
+    gated on `reclamationModel == individual_no_refcount` (ARC byte-identical). It relocates each
+    scope-exit drop to immediately after the proven last use of the dropped local's FORWARD ALIAS
+    CLOSURE (copy/borrow/move/local_get/share-derived — necessary because a box parked in `add5`
+    is read only by a `copy_value` feeding a transient `protocol_box_retain` borrow that the
+    dispatch call consumes, so `last_use_map[add5]` alone would free the box before the borrow's
+    use). Count-preserving timing move (inverts the refcounted release-elision over the same
+    `arc_liveness` use facts). **Safety guards:** `protocol_box_drop` relocates always (each owner
+    holds an independent box); a plain `.release` relocates only when the pre-drop region is
+    straight-line AND the local is not embedded into an aggregate or persistently shared
+    (`streamRegionIsStraightLine` + `localIsEmbeddedOrShared`), avoiding the recursive-struct /
+    `Zest` case-dispatcher `shareAnyPersistent` deep-clone hazard (a relocated drop ahead of a
+    deep-clone read would UAF). All 7 `closure_boxed_test.zap` boxed-closure fixtures now green.
+    **REMAINING (2 of 9 — `combinator_boxed_test.zap` `Enum.filter`/`Enum.reject`):** NOT a
+    free-at-last-use case. The user predicate is a 0-capture closure lowered to a BARE FN-PTR; it
+    is auto-boxed into a `Callable` existential (an 8-byte `__closure_N`) lazily at the
+    bare-fn→`Callable` coercion inside the devirtualized `Enum.filter`/`filter_next` recursion,
+    where the `Callable` predicate param is classified `.trivial` and threaded through every
+    recursion as non-owning — so the coercion box has NO owner and NO scope-exit drop anywhere
+    (it is not even in `protocol_box_locals`). This is a distinct **boxed-`Callable` combinator
+    coercion-ownership** bug (param-convention `.trivial`-misclassification + auto-box coercion
+    ownership), not a misplaced/relocatable drop. Its proper fix changes `arc_param_convention`
+    for boxed-`Callable` params and the coercion-box ownership — a broad cascade that must keep
+    ARC byte-identical — so it is deferred to the verification-matrix / combinator-bridge phase
+    (the `combinator_boxed_test.zap` header already flags boxed-`Callable` combinator handling as
+    a separate effort).
+  - **GAP B — List/Map COW under `clone_on_share` (RESOLVED).** `mutationMayMoveInPlace` returns
+    `true` unconditionally under `!refcount_v1_active` (always mutate in place), but the
+    pre-existing clone-on-share DELIBERATELY aliased inline-header List/Map cell buffers ("never
+    eagerly freed" bulk-free-era reasoning). So an aliased list (`original_alias = values`) shared
+    the buffer and an in-place `List.set` / push-grow `bufferFreeShallow` corrupted/freed it out
+    from under the alias (`generic_list_test.zap` "copy-on-write preserves aliased original string
+    list" read a garbage length — a use-after-free). **Fix (commit `cc23e97`):** extend
+    clone-on-share to inline-header cells — every share hands the new owner an INDEPENDENT deep
+    clone of the buffer via new `List.cloneForShare` / `Map.cloneForShare`, wired into every share
+    site (`shareAnyPersistent`, `cloneEagerChildValue`, `cloneFieldChildInPlace`,
+    `List.ownElement`, `Map.ownEntryKey`/`ownEntryValue`) through the new comptime predicate
+    `valuePointsToInlineHeaderCell` + `cloneInlineHeaderCellForShare` dispatch. Each owner uniquely
+    owns its buffer, in-place mutation stays sound (`mutationMayMoveInPlace` unchanged), and an
+    aliased original is never corrupted. Gated strictly on `clone_on_share_active`: comptime-dead
+    under REFCOUNTED (ARC) and BULK_OR_NEVER/TRACED. The COW test is green. **Per-drop buffer free
+    on release (step 3) is NOT yet adopted** (commit `0a995ea` documents why): not every aliasing
+    site routes through `cloneForShare` (`List.append`'s `retain(a)` pass-through, the
+    Range/`Enum.take_next` element flows), so a per-drop `List/Map.release` buffer free
+    double-frees an aliased buffer (verified: trace/breakpoint trap). Buffers stay reclaimed at
+    process teardown — the documented Tracking allocation model — pending the full no-refcount
+    static-ownership model that guarantees a unique owner per buffer.
 - **Phase 4 — per-manager corpus + custom-manager test.** Lock in the verification matrix.
 - **Phase 5 — `TRACED` conservative GC manager (in scope).** Add `lib/memory/gc.zap` (zero-method
   marker) + `src/memory/gc/manager.zig` (conservative stop-the-world mark-sweep: managed heap;
