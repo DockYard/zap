@@ -12074,53 +12074,8 @@ pub const IrBuilder = struct {
     fn emitArcRetainOnAggregateExtract(self: *IrBuilder, dest: LocalId) !void {
         if (!self.isArcManagedLocal(dest)) return;
         try self.current_instrs.append(self.allocator, .{
-            .retain = .{ .value = dest, .kind = self.extractRetainKind(dest) },
+            .retain = .{ .value = dest },
         });
-    }
-
-    /// Choose the retain flavor for an aggregate-extraction co-ownership
-    /// retain. The extracted binding is a SCOPE-LIVED second owner (its
-    /// matching scope-exit `.release` comes from `arc_drop_insertion`), so
-    /// it is a `.persistent` retain by nature — EXCEPT for inline-header
-    /// collection cells (`List`/`Map`), which must stay `.normal`.
-    ///
-    /// Why the List/Map carve-out: `.persistent` lowers (in zir_builder) to
-    /// `shareAnyPersistent`, which under REFCOUNT_V1 routes an inline-header
-    /// cell through the type's own `retain` method (firing Map's share-event
-    /// workload tracking) whereas `.normal`/`retainAny` does a plain
-    /// `headerRetain`. Routing List/Map extractions through `.persistent`
-    /// would therefore change ARC share-event accounting. For every OTHER
-    /// ARC type — an indirect-storage (side-table) recursive struct, a
-    /// by-value aggregate, an opaque cell — `.persistent` and `.normal` are
-    /// byte-for-byte identical under REFCOUNT_V1 (both dispatch the side-
-    /// table `retain_sized`, or both `retainChildrenAny` for a by-value
-    /// aggregate), so the carve-out is the ONLY place the two kinds diverge
-    /// under ARC. The change is thus ARC-invariant.
-    ///
-    /// Under a no-REFCOUNT_V1 manager (`Memory.Tracking`) the distinction is
-    /// load-bearing: `shareAnyPersistent` deep-CLONES an extracted indirect-
-    /// storage cell so the extracted owner and the still-live parent each
-    /// reach a single `core.deallocate` — without it both releases free the
-    /// SAME cell (the parent via its field deep-walk, the extraction via its
-    /// scope-exit release) = double-free segfault. This is the field-
-    /// EXTRACTION analog of the field-STORE `.protocol_box_share` /
-    /// persistent-share clone-on-share, and of the container `ownElement`
-    /// path. A List/Map extraction never needs the clone (an inline-header
-    /// cell is not eagerly freed under no-REFCOUNT_V1), so `.normal` is both
-    /// ARC-correct and Tracking-safe for it.
-    fn extractRetainKind(self: *const IrBuilder, dest: LocalId) RetainKind {
-        const hir_type = self.local_hir_types.get(dest) orelse return .normal;
-        const store = self.type_store orelse return .normal;
-        if (hir_type >= store.types.items.len) return .normal;
-        return switch (store.getType(hir_type)) {
-            // Inline-header collection cells: keep the plain transient
-            // retain so ARC share-event accounting is unchanged; they are
-            // never eagerly freed under no-REFCOUNT_V1, so no clone needed.
-            .list, .map => .normal,
-            // Every other ARC-managed extraction is a scope-lived co-owner
-            // that must clone-on-share under no-REFCOUNT_V1.
-            else => .persistent,
-        };
     }
 
     /// Pre-scan HIR block to find error_pipe expressions with

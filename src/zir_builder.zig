@@ -9420,80 +9420,34 @@ pub const ZirDriver = struct {
                     return;
                 }
 
-                // Phase 4.c symmetry: under a no-REFCOUNT_V1 manager
-                // (`Memory.Tracking`), `shouldSkipArc` elides ALL refcount
-                // retains — correct for a refcount increment, but a
-                // `.persistent` retain of an ARC-managed local is the
-                // share-side mirror of the deep-walk `.release` carve-out
-                // (`emit_deep_walk_under_no_refcount`): it creates a genuine
-                // SECOND owner that the IR pairs with a scope-exit `.release`,
-                // and that release IS emitted under no-REFCOUNT_V1. So the
-                // share MUST be emitted too — otherwise the new owner aliases
-                // the source's eagerly-freed cell and BOTH releases
-                // `core.deallocate` it (the double-free segfault under
-                // `Memory.Tracking`). The share lowers to `shareAnyPersistent`,
-                // which under no-REFCOUNT_V1 deep-CLONES a value owning an
-                // eagerly-freed child (indirect-storage recursive struct,
-                // boxed inner) so each owner reaches a single free, and is a
-                // no-op identity otherwise. `.normal` retains stay skipped: a
-                // transient borrow has no scope-exit release to balance and
-                // must NOT clone (a clone there would leak).
-                const emit_share_under_no_refcount = !self.shouldEmitRefcountOps() and
-                    ret.kind == .persistent and
-                    self.arc_managed_locals.contains(ret.value);
-                if (!self.shouldSkipArc(ret.value) or emit_share_under_no_refcount) {
+                if (!self.shouldSkipArc(ret.value)) {
                     // Phase 1 Class A: dispatch on the IR-level kind
                     // enum so callers control the helper choice
                     // (normal vs persistent) rather than every retain
                     // emission site re-deciding between runtime
-                    // helpers. The dispatch source moves from ZIR to IR.
-                    //
-                    //   * `.normal`     → `retainAny` (void). A transient
-                    //     borrow-pass retain balanced by an immediate
-                    //     post-call release; no second long-lived owner.
-                    //   * `.persistent` → `shareAnyPersistent` (value-
-                    //     returning) + REBIND of the new-owner local to the
-                    //     result. A persistent retain stashes the value in
-                    //     long-lived storage (struct field, list slot,
-                    //     closure capture) and so creates a genuine SECOND
-                    //     owner with its own scope-exit release. Under
-                    //     REFCOUNT_V1 `shareAnyPersistent` bumps the cell's
-                    //     refcount and returns the SAME value (identity
-                    //     rebind) — byte-for-byte the old persistent path,
-                    //     including the type's own `retain` (Map share-event
-                    //     tracking). Under a no-REFCOUNT_V1 manager (no
-                    //     refcount to express a `+1` owner) it returns an
-                    //     INDEPENDENT clone for any value owning an eagerly-
-                    //     freed child (an indirect-storage recursive struct,
-                    //     a boxed existential) so each owner reaches a single
-                    //     `core.deallocate` — no double-free under
-                    //     `Memory.Tracking`. This is the value-level analog
-                    //     of the `.protocol_box_share` clone-on-share rebind
-                    //     above and the container `ownElement` path.
+                    // helpers. The set of helpers stays the same; only
+                    // the dispatch source moves from ZIR to IR. The
+                    // `.normal` kind lowers to `retainAny`; the
+                    // `.persistent` kind to `retainAnyPersistent`
+                    // (which routes through the type's own `retain`
+                    // method when one exists, enabling the Map
+                    // workload share-event tracking).
+                    const helper_name: []const u8 = switch (ret.kind) {
+                        .normal => "retainAny",
+                        .persistent => "retainAnyPersistent",
+                        .protocol_box_retain, .protocol_box_share => unreachable, // handled above
+                    };
                     const val_ref = self.refForLocal(ret.value) catch return;
 
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
                     const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
+                    const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, helper_name.ptr, @intCast(helper_name.len));
+                    if (retain_fn == error_ref) return error.EmitFailed;
 
-                    switch (ret.kind) {
-                        .normal => {
-                            const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
-                            if (retain_fn == error_ref) return error.EmitFailed;
-                            const args = [_]u32{val_ref};
-                            _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
-                        },
-                        .persistent => {
-                            const share_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "shareAnyPersistent", 18);
-                            if (share_fn == error_ref) return error.EmitFailed;
-                            const args = [_]u32{val_ref};
-                            const shared_ref = zir_builder_emit_call_ref(self.handle, share_fn, &args, 1);
-                            if (shared_ref == error_ref) return error.EmitFailed;
-                            try self.setLocal(ret.value, shared_ref);
-                        },
-                        .protocol_box_retain, .protocol_box_share => unreachable, // handled above
-                    }
+                    const args = [_]u32{val_ref};
+                    _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
                 }
             },
             .release => |rel| {
