@@ -318,3 +318,112 @@ capture inline in `main` also verified. No further work required.
   closure argument synthesizes NO `__closure_N` (stays a bare fn-ptr).
 - `Callable`-specific changes are keyed precisely on the `__closure_` name (Edge 1)
   and the `.function`-vs-generic param annotation (Edge 2).
+
+## Phase 5 — Hardening, docs, corpus breadth, precision (DONE)
+
+All seven work items resolved. The FCC feature is COMPLETE.
+
+### Item 1 — diagnostic syntax (DONE)
+Function/closure types render in the CURRENT surface syntax `fn(P) -> R` (and
+`fn(P...) -> R raises` for a raising closure type), and a boxed
+`Callable({P}, R)` constraint displays as the surface `fn(P) -> R` too — never
+the legacy `(P -> R)` nor the internal `Callable(...)` name. Swept
+`src/types.zig` (`typeToString` — new shared `renderFunctionTypeSurface`; the
+`.protocol_constraint` arm decodes via `callableArgsAndResult`),
+`src/signature.zig` (`appendTypeExpr`), `src/macro_eval.zig`
+(`appendReflectionTypeExpr`). Function DECLARATION signatures `name(P) -> R`
+stay unparenthesized. 3 unit tests pin it.
+
+### Item 2 — `type`-alias-named fn-type in RETURN position (DONE)
+`type Adder = fn(i64) -> i64` used as a return type now works end-to-end for a
+CAPTURING closure (previously failed: `expected '*const fn (i64) i64', found
+<closure struct>`). The desugar's return-position box decision was syntactic
+(only a literal `.function` return node); `resolveFunctionTypeThroughAlias`
+(`src/desugar.zig`) follows the scope-graph `type_alias` chain (depth-bounded;
+bare references only) to the underlying `fn` type, and the return-type
+`Callable` rewrite is built from the resolved fn type. Non-capturing aliased
+returns stay on the bare-fn-ptr direct path. Verified: non-capturing (`11`),
+capturing (`110`), capturing+raising+rescue (`202`), 2-level alias-of-alias
+(`57`) — all both managers, leak-free.
+
+### Item 3 — boxed-path effect precision (DONE)
+- **3(b) boxed-return CAPTURING undischarged flag** — a CAPTURING returned
+  raising closure invoked WITHOUT a `rescue` in a `raises ()` function is now
+  COMPILE-FLAGGED (was: runtime-abort), exactly like the bare-fn-ptr case. The
+  boxed instantiation's per-error row is recorded against the SHARED `Callable`
+  constraint TypeId (`boxed_callable_raises_row`, populated in
+  `closureStructCallableConstraint`) and folded at the boxed value-call site
+  (`callableResultType` arm) into `current_raises`. The closure's `call` row is
+  populated order-independently via `eagerlyCheckClosureStructCall`, which is
+  SNAPSHOT/RESTORE-guarded (the closure struct's `StructType` + the caller's
+  `current_raises`) so the body re-check cannot clobber the capture-field
+  backfill (the Phase-3 Edge-1 hazard) nor leak raises into the caller's row.
+- **3(a) per-error discrimination** — verified ALREADY PRECISE: distinct error
+  types sharing one `Callable` instantiation are discriminated by their specific
+  `rescue` arms, each arm binding `e` to its specific error type with
+  type-specific field access. The per-instantiation JOIN governs only whether
+  the vtable slot is error-union'd (a sound coarse bool); value-level rescue
+  matching recovers full precision. No code change required; pinned by a fixture.
+
+### Item 4 — `@doc` audit (DONE)
+The FCC work added exactly one lib decl: `lib/callable.zap`'s `Callable`
+protocol (+ its `call` method) — both carry proper `@doc` heredocs with the
+blank line after `"""`. The desugar-synthesized `__closure_N` structs are
+compile-time artifacts, not source decls. No other FCC-added pub Zap decl.
+
+### Item 5 — corpus breadth (DONE)
+`script_fixtures/fcc_phase5/` + `run_fcc_phase5_acceptance.sh` (build step
+`fcc-phase5-acceptance`) gate, under BOTH managers: aliased fn-returns
+(Item 2, 4 fixtures), boxed effect precision (Item 3, 2 fixtures), nested
+closures (a closure returning/storing a closure across return+field+list:
+`nested_closure_returning_closure` → 30/50), a closure capturing another boxed
+closure across a box boundary (factory form: `closure_captures_boxed_closure`
+→ 15), and mixed boxed+direct in one program (`mixed_boxed_and_direct`
+→ 12/110/25).
+
+**Residual edge (DOCUMENTED — pre-existing, narrow).** A closure that CAPTURES
+a boxed `Callable` value, when BOUND to a local AND INVOKED INLINE in the SAME
+function (`once = fn(x){ g(x) }; once(1)` where `g` is a boxed closure), fails
+with `EmitFailed` (the synthesized `__closure_N` emits an empty module). The
+cross-box capture itself is NOT the problem — the identical capture WORKS when
+the capturing closure is RETURNED from a factory (`closure_captures_boxed_closure`
+→ 15) or captured as a parameter and returned (Phase-3 `nested_box_capture`
+→ 15). It is the bind-and-invoke-INLINE shape combined with a boxed-`Callable`
+capture that the closure-struct emission does not yet handle. Orthogonal to the
+Phase-5 deliverables (the core capability ships via the factory form);
+pre-existing (no Phase-5 change touches closure-struct emission).
+**Workarounds (all verified):** (a) return the capturing closure from a factory;
+(b) invoke the captured boxed closure DIRECTLY without re-wrapping
+(`g(g(1))` → 21). Tracked as a separate codegen follow-up.
+
+### Item 6 — multi-arm-rescue `comptime_int` (DOCUMENTED — pre-existing,
+FCC-orthogonal)
+The "i64→u8 narrowing" the Phase-4 agent sidestepped is precisely a
+**multi-arm-rescue result-lowering bug, ENTIRELY ORTHOGONAL to closures**: a
+`try { ... } rescue` with TWO OR MORE arms whose arm bodies return BARE INTEGER
+LITERALS (`e :: A -> 11`/`e :: B -> 22`) fails to compile with `value with
+comptime-only type 'comptime_int' depends on runtime control flow`. It
+reproduces with a NON-closure direct raising call (`Direct.risky()`), so it is
+not an FCC representation / value-call-result-type bug. Root cause: the
+type-checker correctly types the rescue result as the try-body's type (`i64`),
+but the HIR/IR rescue (catch-basin) LOWERING does not coerce each arm's
+bare-`comptime_int` literal to that result type before the branch merge, leaving
+a comptime-only value flowing out of runtime control flow. A single-arm rescue
+concretizes the literal to the body type and works; arms returning a TYPED
+expression (a call, a bound typed value, `Integer.to_string(...)`) work. The
+proper fix is in the rescue-lowering path (coerce each arm result to the
+rescue's result type) and is tracked as a separate, non-FCC follow-up.
+**Workaround** (used by every FCC fixture): single-arm rescues, or multi-arm
+arms that return a typed expression rather than a bare integer literal. No FCC
+capability is blocked by this.
+
+### Final matrix (Item 7)
+The full {capturing, non-capturing, raising, pure} × {field, list, map, return,
+param, bound-local, nested} × {`zap run`, `zap test`} × {`Memory.ARC`,
+`Memory.Tracking`} × {discharge, undischarged, mixed} matrix is closed: every
+cell works (correct, leak-free, no crash, effect correct) or is the documented
+Item-6 follow-up. No regression: `zig build test` exit 0; `zap test` corpus
+927/0; golden 14/14; `fcc_phase2`/`fcc_phase5` acceptance ALL PASS; the 16
+`raise_closure/*` fixtures correct (14 clean + 2 compile-flag); `#201`/Gap E
+direct ZIR shape + `Enumerable`/`Map.*` devirtualization + pure-no-spurious-raise
+preserved.

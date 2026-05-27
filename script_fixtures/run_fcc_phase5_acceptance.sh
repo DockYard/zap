@@ -80,6 +80,14 @@ run_clean boxed_per_error_discrimination.zap "alpha-detail" "7"
 # COMPILE-FLAGGED (not runtime-abort), like the bare-fn-ptr case.
 run_compile_error boxed_capturing_undischarged_flagged.zap "raises"
 
+echo "== FCC Phase 5: corpus breadth — nested / cross-box / mixed (Item 5) =="
+# A closure capturing another (boxed) closure across a box boundary.
+run_clean closure_captures_boxed_closure.zap "15"
+# Nested closures: a closure returning/storing a closure (return + field + list).
+run_clean nested_closure_returning_closure.zap "30" "50"
+# Mixed BOXED + DIRECT representations coexisting in one program.
+run_clean mixed_boxed_and_direct.zap "12" "110" "25"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "FCC PHASE 5 ACCEPTANCE: ALL PASS"
