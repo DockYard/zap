@@ -9172,6 +9172,16 @@ fn runArcScopeExitDropInsertion(
         // pass just inserted) and flips the `kind` + `protocol_name`
         // payload where the value local hits the sidecar.
         zap.arc_drop_insertion.rewriteProtocolBoxReleases(function);
+        // Phase 3 (INDIVIDUAL_NO_REFCOUNT static free-at-last-use): relocate
+        // each scope-exit owned-local drop to immediately after its proven
+        // last use, so a boxed value is reclaimed BEFORE a mid-scope
+        // `assert_no_leaks` checkpoint samples it (and a value bound in a dead
+        // nested arm is reclaimed promptly). Count-preserving timing move; a
+        // no-op for every reclamation model except INDIVIDUAL_NO_REFCOUNT, so
+        // ARC drop placement is byte-identical. Runs after
+        // `rewriteProtocolBoxReleases` so the `.protocol_box_drop` kind is
+        // already stamped onto the releases it relocates.
+        zap.arc_drop_insertion.relocateOwnedDropsToLastUse(alloc, function, options.declared_caps) catch return error.OutOfMemory;
     }
 }
 

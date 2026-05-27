@@ -1,6 +1,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
+const elision = @import("memory/elision.zig");
 
 // ============================================================
 // ARC drop insertion (Phase 6 of the k-nucleotide RSS gap plan).
@@ -1232,6 +1233,297 @@ pub fn insertScopeExitDrops(
             block_ptr.instructions = new_slice;
         }
     }
+}
+
+// ============================================================
+// Free-at-last-use drop relocation (INDIVIDUAL_NO_REFCOUNT only).
+//
+// `insertScopeExitDrops` places every owned local's `.release` /
+// `.protocol_box_drop` immediately before the function's ret-equivalent
+// terminator — the SCOPE-EXIT placement. Under `refcounted` (ARC) the
+// refcount closes the live window, so scope-exit timing is correct and a
+// mid-scope `live_allocation_count()` leak checkpoint is inactive. Under
+// `individual_no_refcount` (Tracking) there is no refcount: an owned value
+// is reclaimed exactly at its scope-exit drop, but a `Zest`
+// `assert_no_leaks { ... }` block samples `live_allocation_count()` MID-
+// scope (its bindings are function-level locals, not block-scoped), so a box
+// still parked at the terminator is counted as a live "leak" even though it
+// is reclaimed at exit (no program-exit leak). A box bound inside a dead
+// nested arm is also genuinely never reclaimed promptly.
+//
+// This pass implements the plan's `individual_no_refcount` step-2 "static
+// free-at-last-use": relocate each scope-exit drop to immediately after the
+// PROVEN last use of the dropped local — the inversion of the refcounted
+// release-elision (which uses the same `arc_liveness` last-use facts to
+// ELIDE a release). It is a count-preserving timing move: the exact set of
+// drop instructions is unchanged, so it can neither introduce a double-free
+// nor drop a value the analysis already proved standalone (a consumed-into-
+// container / transferred-onward local never received a scope-exit drop in
+// the first place — `dropsForTerminator` excludes them).
+//
+// Borrow-aware last use: a boxed closure's owner local (`add5` = local L) is
+// commonly read only by a `copy_value` that feeds a transient
+// `protocol_box_retain` borrow which is what the `protocol_dispatch` call
+// actually consumes. `last_use_map[L]` is therefore the `copy_value`, BEFORE
+// the call — freeing there would use-after-free the borrow. So the last use
+// is computed over L's FORWARD ALIAS CLOSURE (every local derived from L via
+// `copy_value`/`borrow_value`/`local_get`/`move_value`/`share_value`,
+// transitively): the drop lands after the last instruction that reads any
+// alias.
+//
+// Scope: the relocation is applied only within the top-level block stream
+// (where scope-exit drops live and where the failing straight-line
+// `assert_no_leaks` fixtures sit). A drop whose alias closure has its last
+// use inside a NESTED sub-stream (an `if`/`case` arm) — a control-flow join —
+// is left at the terminator: the existing scope-exit placement is already
+// correct there, so leaving it is conservative (no regression) and never
+// double/misses. ARC is byte-identical (the whole pass is a no-op unless the
+// active manager declares `INDIVIDUAL_NO_REFCOUNT`).
+// ============================================================
+
+/// Relocate scope-exit owned-local drops to their proven last use under an
+/// `individual_no_refcount` manager. No-op for every other reclamation model
+/// (ARC `refcounted`, Arena/NoOp/Leak `bulk_or_never`, GC `traced`), so it is
+/// safe to call unconditionally from the pipeline.
+pub fn relocateOwnedDropsToLastUse(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    declared_caps: u64,
+) !void {
+    if (elision.reclamationModel(declared_caps) != .individual_no_refcount) return;
+
+    for (function.body, 0..) |_, block_index| {
+        const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
+        const relocated = try relocateDropsInTopLevelStream(allocator, block_ptr.instructions);
+        if (relocated) |new_slice| block_ptr.instructions = new_slice;
+    }
+}
+
+/// A scope-exit drop pending relocation: the original instruction and the
+/// index (within the rebuilt stream, BEFORE the trailing drop run) after
+/// which it should be re-inserted.
+const PendingRelocation = struct {
+    drop: ir.Instruction,
+    after_index: usize,
+};
+
+/// Rebuild one top-level stream relocating its trailing scope-exit drops to
+/// their last-use sites. Returns a fresh slice when any drop moved, else
+/// `null` (caller keeps the original).
+fn relocateDropsInTopLevelStream(
+    allocator: std.mem.Allocator,
+    stream: []const ir.Instruction,
+) error{OutOfMemory}!?[]const ir.Instruction {
+    if (stream.len == 0) return null;
+
+    // The terminator is the last instruction; the scope-exit drops are the
+    // maximal run of `.release` instructions immediately before it.
+    const terminator_index = stream.len - 1;
+    if (!isReturnEquivalentTerminator(stream[terminator_index])) return null;
+
+    var drop_run_start = terminator_index;
+    while (drop_run_start > 0 and stream[drop_run_start - 1] == .release) {
+        drop_run_start -= 1;
+    }
+    if (drop_run_start == terminator_index) return null; // no scope-exit drops
+
+    // Pre-drop region is `stream[0..drop_run_start]`; the drop run is
+    // `stream[drop_run_start..terminator_index]`.
+    var relocations: std.ArrayListUnmanaged(PendingRelocation) = .empty;
+    defer relocations.deinit(allocator);
+    var kept_drops: std.ArrayListUnmanaged(ir.Instruction) = .empty;
+    defer kept_drops.deinit(allocator);
+
+    // A plain `.release` (a `List`/`Map`/indirect-storage owner) is only safe
+    // to relocate when its value cannot be read again after the proposed
+    // last-use point through a path the top-level last-use scan cannot see:
+    // chiefly a `shareAnyPersistent` deep-clone (GAP-B clone-on-share / a
+    // recursive struct stored into another owner) that follows the value's
+    // children. The provably-safe condition is that the dropped local is
+    // PURELY LOCALLY CONSUMED in this stream — never embedded into an
+    // aggregate (`struct_init`/`list_init`/…), never the source of a
+    // `share_value` or a persistent / box-share `retain`, and the pre-drop
+    // region is straight-line (no nested sub-streams that could host a hidden
+    // use). A boxed-existential drop (`.protocol_box_drop`) is always
+    // relocatable: each owner holds an INDEPENDENT box (transient borrows are
+    // `protocol_box_retain`, persistent shares clone via `protocol_box_share`),
+    // so freeing the box after its last use cannot dangle another owner.
+    const region_is_straight_line = streamRegionIsStraightLine(stream[0..drop_run_start]);
+
+    for (stream[drop_run_start..terminator_index]) |drop_instr| {
+        const drop_local = drop_instr.release.value;
+        const relocatable = drop_instr.release.kind == .protocol_box_drop or
+            (region_is_straight_line and
+            !localIsEmbeddedOrShared(stream[0..drop_run_start], drop_local));
+        if (!relocatable) {
+            try kept_drops.append(allocator, drop_instr);
+            continue;
+        }
+        const last_use = lastUseInPreDropRegion(
+            allocator,
+            stream[0..drop_run_start],
+            drop_local,
+        ) catch null;
+        if (last_use) |use_index| {
+            try relocations.append(allocator, .{ .drop = drop_instr, .after_index = use_index });
+        } else {
+            // No top-level use found (unused owned local, or last use in a
+            // nested sub-stream / the terminator args). Leave at scope exit.
+            try kept_drops.append(allocator, drop_instr);
+        }
+    }
+
+    if (relocations.items.len == 0) return null; // nothing moved
+
+    // Rebuild: walk the pre-drop region, emitting each instruction followed
+    // by any drops whose `after_index` equals its index; then the kept drops;
+    // then the terminator.
+    var out: std.ArrayListUnmanaged(ir.Instruction) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, stream.len);
+
+    for (stream[0..drop_run_start], 0..) |instr, idx| {
+        try out.append(allocator, instr);
+        for (relocations.items) |reloc| {
+            if (reloc.after_index == idx) try out.append(allocator, reloc.drop);
+        }
+    }
+    for (kept_drops.items) |drop_instr| try out.append(allocator, drop_instr);
+    try out.append(allocator, stream[terminator_index]);
+
+    return try out.toOwnedSlice(allocator);
+}
+
+/// True when no instruction in `region` hosts a nested sub-stream
+/// (`if_expr`, `case_block`, `switch_*`, `union_switch*`, `try_call_named`,
+/// `guard_block`, `optional_dispatch`). When the pre-drop region is
+/// straight-line, the top-level last-use scan sees every use of a local, so a
+/// plain-`.release` relocation cannot strand a hidden nested use. Branchy
+/// functions (e.g. the `Zest` case dispatcher) keep their plain-`.release`
+/// drops at scope exit.
+fn streamRegionIsStraightLine(region: []const ir.Instruction) bool {
+    for (region) |instr| {
+        switch (instr) {
+            .if_expr,
+            .case_block,
+            .switch_literal,
+            .switch_return,
+            .union_switch,
+            .union_switch_return,
+            .try_call_named,
+            .guard_block,
+            .optional_dispatch,
+            => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// True when `local` is embedded into an aggregate or shared into a longer-
+/// lived owner anywhere in `region` — i.e. it appears as a value operand of
+/// an aggregate constructor (`struct_init`/`list_init`/`list_cons`/
+/// `union_init`/`map_init`/`tuple_init`/`box_as_protocol`) or is the source
+/// of a `share_value` or a persistent / box-share `retain`. Such a value may
+/// be deep-cloned by a later `shareAnyPersistent` that follows its children,
+/// so freeing it ahead of scope exit could dangle the clone. A
+/// purely-locally-consumed `List`/`Map` (built, borrowed via `List.get`/
+/// `length`, then dropped) is NOT embedded-or-shared and is safe to relocate.
+fn localIsEmbeddedOrShared(region: []const ir.Instruction, local: ir.LocalId) bool {
+    for (region) |instr| {
+        switch (instr) {
+            .struct_init => |x| for (x.fields) |f| {
+                if (f.value == local) return true;
+            },
+            .list_init => |x| for (x.elements) |e| {
+                if (e == local) return true;
+            },
+            .tuple_init => |x| for (x.elements) |e| {
+                if (e == local) return true;
+            },
+            .list_cons => |x| {
+                if (x.head == local or x.tail == local) return true;
+            },
+            .union_init => |x| {
+                if (x.value == local) return true;
+            },
+            .map_init => |x| for (x.entries) |e| {
+                if (e.key == local or e.value == local) return true;
+            },
+            .box_as_protocol => |x| {
+                if (x.value == local) return true;
+            },
+            .share_value => |x| {
+                if (x.source == local) return true;
+            },
+            .retain => |x| {
+                if (x.value == local and
+                    (x.kind == .persistent or x.kind == .protocol_box_share))
+                {
+                    return true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Compute the last index in `region` (a top-level pre-drop instruction
+/// slice) at which `drop_local` or any local in its forward alias closure is
+/// used. Returns `null` when no use exists in this region (the local's uses
+/// are all in nested sub-streams, or it is unused).
+///
+/// The forward alias closure follows ownership-neutral copies
+/// (`copy_value`/`borrow_value`/`local_get`/`move_value`/`share_value`): a
+/// box parked in `add5` is read only by a `copy_value` whose result feeds the
+/// dispatch call, so the box's effective extent is that of the copy.
+fn lastUseInPreDropRegion(
+    allocator: std.mem.Allocator,
+    region: []const ir.Instruction,
+    drop_local: ir.LocalId,
+) error{OutOfMemory}!?usize {
+    var closure: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+    defer closure.deinit(allocator);
+    try closure.put(allocator, drop_local, {});
+
+    // Grow the alias closure to a fixed point. Forward pass each iteration:
+    // any copy whose SOURCE is in the closure adds its DEST.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (region) |instr| {
+            const alias: ?struct { src: ir.LocalId, dest: ir.LocalId } = switch (instr) {
+                .copy_value => |x| .{ .src = x.source, .dest = x.dest },
+                .borrow_value => |x| .{ .src = x.source, .dest = x.dest },
+                .local_get => |x| .{ .src = x.source, .dest = x.dest },
+                .move_value => |x| .{ .src = x.source, .dest = x.dest },
+                .share_value => |x| .{ .src = x.source, .dest = x.dest },
+                else => null,
+            };
+            if (alias) |a| {
+                if (closure.contains(a.src) and !closure.contains(a.dest)) {
+                    try closure.put(allocator, a.dest, {});
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Scan for the last instruction whose use set intersects the closure.
+    var last_use: ?usize = null;
+    for (region, 0..) |instr, idx| {
+        var uses = arc_liveness.UseList{};
+        defer uses.deinit(std.heap.page_allocator);
+        arc_liveness.collectUses(instr, &uses);
+        for (uses.slice()) |used_local| {
+            if (closure.contains(used_local)) {
+                last_use = idx;
+                break;
+            }
+        }
+    }
+    return last_use;
 }
 
 const StreamRebuilder = struct {
