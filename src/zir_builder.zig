@@ -181,6 +181,15 @@ extern "c" fn zir_builder_set_root_fields(handle: ?*ZirBuilderHandle, name_ptrs:
 extern "c" fn zir_builder_set_root_field_static(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, type_ref: u32) i32;
 extern "c" fn zir_builder_begin_root_field_body(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_end_root_field_body(handle: ?*ZirBuilderHandle, final_ref: u32) i32;
+// Streaming NAMED struct-decl API (the non-root analogue of the root-field-body
+// API above). Emits `pub const <name> = struct { … };` whose fields may carry
+// compound (multi-instruction) type bodies — used for `__ClosureEnv_N` env
+// structs holding captured `ProtocolBox`/`List`/`Map`/struct/fn-ptr fields.
+extern "c" fn zir_builder_begin_named_struct_decl(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
+extern "c" fn zir_builder_named_struct_field_static(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32, type_ref: u32) i32;
+extern "c" fn zir_builder_begin_named_struct_field_body(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
+extern "c" fn zir_builder_end_named_struct_field_body(handle: ?*ZirBuilderHandle, final_ref: u32) i32;
+extern "c" fn zir_builder_end_named_struct_decl(handle: ?*ZirBuilderHandle) i32;
 /// Phase 2.b — record a `pub const <name> = <expr>;` namespace declaration
 /// in the current struct scope. Between the begin/end pair, the usual
 /// `zir_builder_emit_*` calls build the initializer expression; `end`
@@ -962,6 +971,21 @@ pub const ZirDriver = struct {
     /// Maps (closure_function_id, capture_index) for captured callable values
     /// whose runtime representation originated from a function parameter.
     capture_param_derived_closure_map: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Maps a devirtualized closure's `FunctionId` → the CONSTRUCTION-SITE
+    /// `ZigType` of each of its captures (the actual representation of the
+    /// value flowing into the env at the `make_closure` site), populated by a
+    /// pre-pass over the whole IR program in `buildProgram`. The env-struct
+    /// field types (`emitClosureEnvTypeDecls`) MUST match the env VALUE the
+    /// `make_closure` lowering builds — but a capture's declared
+    /// `Capture.type_expr` (the closure's SURFACE param type) does not always
+    /// reflect boxing: a `fn(P) -> R`-typed binding whose runtime value is a
+    /// boxed `Callable` carries a `.function` `type_expr` even though the value
+    /// is a `ProtocolBox`. The construction site is authoritative — a capture
+    /// local recorded in the OWNING function's `protocol_box_locals` is boxed
+    /// (`.protocol_box`), regardless of its surface type. Keyed per closure;
+    /// absent → fall back to the declared `Capture.type_expr`. Owned slices
+    /// freed in `deinit`.
+    closure_construction_capture_types: std.AutoHashMapUnmanaged(ir.FunctionId, []ir.ZigType) = .empty,
     /// Compilation context for per-struct ZIR injection.
     compilation_ctx: ?*ZirContext = null,
     /// Shared CLI progress reporter, owned by the command driver.
@@ -1009,6 +1033,11 @@ pub const ZirDriver = struct {
         self.param_derived_closure_locals.deinit(self.allocator);
         self.capture_closure_function_map.deinit(self.allocator);
         self.capture_param_derived_closure_map.deinit(self.allocator);
+        {
+            var cct_iter = self.closure_construction_capture_types.valueIterator();
+            while (cct_iter.next()) |slice_ptr| self.allocator.free(slice_ptr.*);
+            self.closure_construction_capture_types.deinit(self.allocator);
+        }
         self.reuse_backed_struct_locals.deinit(self.allocator);
         self.term_typed_locals.deinit(self.allocator);
         self.destructive_scrutinee_locals.deinit(self.allocator);
@@ -1901,23 +1930,113 @@ pub const ZirDriver = struct {
         return std.fmt.bufPrint(buf, "__ClosureEnv_{d}", .{function_id}) catch "__ClosureEnv";
     }
 
-    fn mapClosureEnvFieldTypeRef(self: *const ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
-        const simple = mapReturnType(zig_type);
-        if (simple != 0) return simple;
-        return switch (zig_type) {
-            .struct_ref => |name| blk: {
-                const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-                    name[dot_idx + 1 ..]
-                else
-                    name;
-                if (self.findEnumDef(name) or self.findEnumDef(short_name)) {
-                    break :blk @intFromEnum(Zir.Inst.Ref.u32_type);
+    /// Pre-pass: walk every function's body for `make_closure` and record, per
+    /// captured closure `FunctionId`, the CONSTRUCTION-SITE `ZigType` of each
+    /// capture. The env-struct field types and the env VALUE the `make_closure`
+    /// builds must agree; a capture's declared `Capture.type_expr` (the surface
+    /// param type) does NOT reflect boxing — a `fn(P) -> R` binding whose
+    /// runtime value is a boxed `Callable` carries a `.function` `type_expr`
+    /// while its value is a `ProtocolBox`. The construction site is
+    /// authoritative: a capture local in the OWNING function's
+    /// `protocol_box_locals` is genuinely boxed, so its env field is
+    /// `.protocol_box(<vtable-family>)` regardless of the surface type. All
+    /// other capture types already match their declared `type_expr`
+    /// (primitives, `List`/`Map`, nominal structs, non-capturing fn-ptrs).
+    fn collectClosureConstructionCaptureTypes(self: *ZirDriver, program: ir.Program) !void {
+        var iter = self.closure_construction_capture_types.valueIterator();
+        while (iter.next()) |slice_ptr| self.allocator.free(slice_ptr.*);
+        self.closure_construction_capture_types.clearRetainingCapacity();
+
+        for (program.functions) |owner| {
+            // Resolve which of the owning function's locals carry a genuinely
+            // BOXED `Callable` (`.protocol_box`) at runtime, so a capture of one
+            // gets a `.protocol_box` env field even when its surface type is
+            // `.function`. Two boxed-value sources:
+            //   * `protocol_box_locals` — a `box_as_protocol` dest / its alias /
+            //     a box-returning call's result (snapshotted on the function).
+            //   * a `param_get` of a `.protocol_box`-typed parameter (a boxed
+            //     `Callable` arg — e.g. a `fn(P) -> R` param the monomorphizer
+            //     boxed; NOT recorded in `protocol_box_locals`), propagated
+            //     across `local_set`/`local_get`/`move`/`share` aliases.
+            var boxed_locals: std.AutoHashMapUnmanaged(ir.LocalId, []const u8) = .empty;
+            defer boxed_locals.deinit(self.allocator);
+            {
+                var pb_iter = owner.protocol_box_locals.iterator();
+                while (pb_iter.next()) |e| {
+                    try boxed_locals.put(self.allocator, e.key_ptr.*, e.value_ptr.*);
                 }
-                return error.EmitFailed;
-            },
-            .tagged_union => @intFromEnum(Zir.Inst.Ref.u32_type),
-            else => error.EmitFailed,
-        };
+            }
+            for (owner.body) |block| {
+                for (block.instructions) |instr| {
+                    switch (instr) {
+                        .param_get => |pg| {
+                            if (pg.index < owner.params.len) {
+                                const pt = owner.params[pg.index].type_expr;
+                                if (pt == .protocol_box) {
+                                    try boxed_locals.put(self.allocator, pg.dest, pt.protocol_box);
+                                }
+                            }
+                        },
+                        .local_set => |ls| {
+                            if (boxed_locals.get(ls.value)) |name|
+                                try boxed_locals.put(self.allocator, ls.dest, name);
+                        },
+                        .local_get => |lg| {
+                            if (boxed_locals.get(lg.source)) |name|
+                                try boxed_locals.put(self.allocator, lg.dest, name);
+                        },
+                        else => {},
+                    }
+                }
+            }
+
+            for (owner.body) |block| {
+                for (block.instructions) |instr| {
+                    const mc = switch (instr) {
+                        .make_closure => |m| m,
+                        else => continue,
+                    };
+                    if (mc.captures.len == 0) continue;
+                    const target = self.findFunctionById(mc.function) orelse continue;
+                    if (target.captures.len != mc.captures.len) continue;
+
+                    const types = try self.allocator.alloc(ir.ZigType, mc.captures.len);
+                    errdefer self.allocator.free(types);
+                    for (mc.captures, 0..) |cap_local, i| {
+                        // A boxed-`Callable` capture is a `ProtocolBox` at
+                        // runtime — override the (possibly `.function`) declared
+                        // capture type so the env field matches the env value.
+                        if (boxed_locals.get(cap_local)) |protocol_name| {
+                            types[i] = .{ .protocol_box = protocol_name };
+                        } else {
+                            types[i] = target.captures[i].type_expr;
+                        }
+                    }
+                    // A closure has a single construction site; last write wins
+                    // (idempotent — identical types across duplicate monomorph
+                    // copies). Free any prior slice for this id first.
+                    if (self.closure_construction_capture_types.fetchRemove(mc.function)) |old| {
+                        self.allocator.free(old.value);
+                    }
+                    try self.closure_construction_capture_types.put(self.allocator, mc.function, types);
+                }
+            }
+        }
+    }
+
+    /// The CONSTRUCTION-SITE `ZigType` for capture `index` of closure
+    /// `function_id`, or the declared `Capture.type_expr` fallback. See
+    /// `collectClosureConstructionCaptureTypes`.
+    fn closureCaptureFieldType(
+        self: *const ZirDriver,
+        function_id: ir.FunctionId,
+        index: usize,
+        declared: ir.ZigType,
+    ) ir.ZigType {
+        if (self.closure_construction_capture_types.get(function_id)) |types| {
+            if (index < types.len) return types[index];
+        }
+        return declared;
     }
 
     fn emitClosureEnvTypeDecls(self: *ZirDriver) !void {
@@ -1950,30 +2069,62 @@ pub const ZirDriver = struct {
             var env_name_buf: [64]u8 = undefined;
             const env_name = self.closureEnvTypeName(func.id, &env_name_buf);
 
-            var field_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
-            defer field_name_ptrs.deinit(self.allocator);
-            var field_name_lens: std.ArrayListUnmanaged(u32) = .empty;
-            defer field_name_lens.deinit(self.allocator);
-            var field_type_refs: std.ArrayListUnmanaged(u32) = .empty;
-            defer field_type_refs.deinit(self.allocator);
-
-            for (func.captures, 0..) |capture, capture_index| {
-                const field_name = indexFieldName(capture_index);
-                try field_name_ptrs.append(self.allocator, field_name.ptr);
-                try field_name_lens.append(self.allocator, field_name.len);
-                try field_type_refs.append(self.allocator, try self.mapClosureEnvFieldTypeRef(capture.type_expr));
-            }
-
-            if (zir_builder_add_struct_type(
+            // Emit the env struct via the streaming NAMED struct-decl API so
+            // each capture field's type can be a COMPOUND type body, not just
+            // a primitive static Ref. A captured boxed `Callable` (lowering to
+            // `ProtocolBox`), `List`/`Map`, nominal struct, or non-capturing
+            // closure (`fn`-ptr) needs `emitImportedTypeRef`'s multi-instruction
+            // body — the bulk `add_struct_type` (primitives + enums only via
+            // the removed `mapClosureEnvFieldTypeRef`) could not express it and
+            // raised `EmitFailed`, so a closure capturing such a value and
+            // bound-then-invoked INLINE (devirtualized, no box) failed to
+            // compile.
+            if (zir_builder_begin_named_struct_decl(
                 self.handle,
                 env_name.ptr,
                 @intCast(env_name.len),
-                field_name_ptrs.items.ptr,
-                field_name_lens.items.ptr,
-                field_type_refs.items.ptr,
-                null,
-                @intCast(func.captures.len),
             ) != 0) {
+                return error.EmitFailed;
+            }
+
+            for (func.captures, 0..) |capture, capture_index| {
+                const field_name = indexFieldName(capture_index);
+                const field_type = self.closureCaptureFieldType(func.id, capture_index, capture.type_expr);
+                const simple = mapReturnType(field_type);
+                if (simple != 0) {
+                    if (zir_builder_named_struct_field_static(
+                        self.handle,
+                        field_name.ptr,
+                        @intCast(field_name.len),
+                        simple,
+                    ) != 0) {
+                        return error.EmitFailed;
+                    }
+                    continue;
+                }
+                // Compound capture type — record its type-expression body.
+                if (zir_builder_begin_named_struct_field_body(
+                    self.handle,
+                    field_name.ptr,
+                    @intCast(field_name.len),
+                ) != 0) {
+                    return error.EmitFailed;
+                }
+                const final_ref = self.emitImportedTypeRef(field_type) catch |err| {
+                    // Best-effort: close the field body so the builder is not
+                    // left mid-recording; propagate the original error.
+                    _ = zir_builder_end_named_struct_field_body(
+                        self.handle,
+                        @intFromEnum(Zir.Inst.Ref.void_value),
+                    );
+                    return err;
+                };
+                if (zir_builder_end_named_struct_field_body(self.handle, final_ref) != 0) {
+                    return error.EmitFailed;
+                }
+            }
+
+            if (zir_builder_end_named_struct_decl(self.handle) != 0) {
                 return error.EmitFailed;
             }
         }
@@ -3305,6 +3456,7 @@ pub const ZirDriver = struct {
         self.program = program;
         self.capture_closure_function_map.clearRetainingCapacity();
         self.capture_param_derived_closure_map.clearRetainingCapacity();
+        try self.collectClosureConstructionCaptureTypes(program);
 
         const ctx = self.compilation_ctx;
 

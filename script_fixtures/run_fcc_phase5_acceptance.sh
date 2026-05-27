@@ -83,6 +83,11 @@ run_compile_error boxed_capturing_undischarged_flagged.zap "raises"
 echo "== FCC Phase 5: corpus breadth — nested / cross-box / mixed (Item 5) =="
 # A closure capturing another (boxed) closure across a box boundary.
 run_clean closure_captures_boxed_closure.zap "15"
+# The INLINE-bound-then-invoked form of the same (Phase-5 residual edge #2):
+# a devirtualized closure whose env holds a captured boxed `Callable`
+# (`ProtocolBox`) — a compound env field type the env-struct emission now
+# supports (was EmitFailed).
+run_clean closure_captures_boxed_closure_inline.zap "6"
 # Nested closures: a closure returning/storing a closure (return + field + list).
 run_clean nested_closure_returning_closure.zap "30" "50"
 # Mixed BOXED + DIRECT representations coexisting in one program.
