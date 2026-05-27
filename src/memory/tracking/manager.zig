@@ -280,6 +280,26 @@ const ZMEM_MAGIC: u32 = switch (builtin.target.cpu.arch.endian()) {
     .big => 0x5A4D454D,
 };
 
+/// Tracking's declared capabilities — **Axis A == INDIVIDUAL_NO_REFCOUNT**,
+/// **Axis B == CLONE_ON_SHARE**.
+///
+/// Tracking is a diagnostic wrapper that frees each allocation individually
+/// (to detect leaks / double-frees / use-after-free) but keeps NO reference
+/// count. In the capability-axis encoding (see `src/memory/abi.zig`) that is
+/// bit 0 clear, the Axis-A field (bits 1..2) at `0b01`
+/// (`RECLAMATION_INDIVIDUAL_NO_REFCOUNT`), and the Axis-B bit (bit 3) clear for
+/// the default `CLONE_ON_SHARE` sharing strategy — `declared_caps == 0x2`. The
+/// Zap-side abi module's `CAPS_INDIVIDUAL_NO_REFCOUNT` constant equals this
+/// value; this manager redeclares it locally because the production-manager
+/// rule forbids importing sibling compiler modules.
+///
+/// Phase-0 note: the compiler's codegen still gates only on
+/// `shouldEmitRefcountOps` (== false here, exactly as it was when Tracking
+/// declared `0x0`), so this richer declaration is a pure description with zero
+/// behavior change. The `individual_no_refcount` static free-at-last-use path
+/// is wired up in a later phase of the capability-driven memory model.
+const CAP_DECLARED_CAPS: u64 = 0x0000_0000_0000_0002;
+
 /// Object-format-conditional section name. Mach-O places the section
 /// inside the `__DATA` segment; ELF and COFF use a top-level
 /// `.zapmem` section (spec §3.1).
@@ -1452,7 +1472,7 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .size = @sizeOf(ZapMemoryManagerMetaV1),
         ._reserved2 = 0,
         .desc_count = 0,
-        .declared_caps = 0, // No capabilities declared — Tracking is a pure diagnostic wrapper.
+        .declared_caps = CAP_DECLARED_CAPS, // Axis A == INDIVIDUAL_NO_REFCOUNT, Axis B == CLONE_ON_SHARE (0x2).
         .core_vtable_offset = @offsetOf(ZapMemorySection, "core"),
         .reserved = 0,
     },
@@ -1460,7 +1480,7 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .abi_major = 1,
         .abi_minor = 0,
         .size = @sizeOf(ZapMemoryManagerCoreV1),
-        .declared_caps = 0,
+        .declared_caps = CAP_DECLARED_CAPS,
         .init = trackingInit,
         .deinit = trackingDeinit,
         .allocate = trackingAllocate,

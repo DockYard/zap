@@ -2251,6 +2251,9 @@ const REAL_LEAK_BACKEND_SOURCE = @embedFile("memory/leak/manager.zig");
 const REAL_TRACKING_BACKEND_SOURCE = @embedFile("memory/tracking/manager.zig");
 const REAL_NO_OP_BACKEND_SOURCE = @embedFile("memory/no_op/manager.zig");
 
+const ReclamationModel = zap.memory_elision.ReclamationModel;
+const SharingStrategy = zap.memory_elision.SharingStrategy;
+
 const StdlibManagerCase = struct {
     /// Manager type as it appears in `Zap.Manifest.memory`.
     type_name: []const u8,
@@ -2261,9 +2264,15 @@ const StdlibManagerCase = struct {
     adapter_path: []const u8,
     /// Real backend source embedded from `src/memory/<x>/manager.zig`.
     backend_source: []const u8,
-    /// Whether the real backend declares the `REFCOUNT_V1` capability.
-    /// True only for `Memory.ARC`; the other four declare none.
-    declares_refcount: bool,
+    /// The exact `declared_caps` value the real backend declares. Parsed
+    /// from the backend source so the assertion stays tied to the real
+    /// production source the build driver compiles, not a restated copy.
+    expected_caps: u64,
+    /// Axis A — the reclamation model `expected_caps` decodes to.
+    expected_model: ReclamationModel,
+    /// Axis B — the sharing strategy `expected_caps` decodes to (only
+    /// codegen-meaningful when `expected_model == .individual_no_refcount`).
+    expected_sharing: SharingStrategy,
 };
 
 const stdlib_manager_matrix = [_]StdlibManagerCase{
@@ -2271,31 +2280,41 @@ const stdlib_manager_matrix = [_]StdlibManagerCase{
         .type_name = "Memory.ARC",
         .adapter_path = "lib/memory/arc.zap",
         .backend_source = REAL_ARC_BACKEND_SOURCE,
-        .declares_refcount = true,
+        .expected_caps = zap.memory_abi.CAPS_REFCOUNTED, // 0x1
+        .expected_model = .refcounted,
+        .expected_sharing = .clone_on_share,
     },
     .{
         .type_name = "Memory.Arena",
         .adapter_path = "lib/memory/arena.zap",
         .backend_source = REAL_ARENA_BACKEND_SOURCE,
-        .declares_refcount = false,
+        .expected_caps = zap.memory_abi.CAPS_BULK_OR_NEVER, // 0x0
+        .expected_model = .bulk_or_never,
+        .expected_sharing = .clone_on_share,
     },
     .{
         .type_name = "Memory.Leak",
         .adapter_path = "lib/memory/leak.zap",
         .backend_source = REAL_LEAK_BACKEND_SOURCE,
-        .declares_refcount = false,
+        .expected_caps = zap.memory_abi.CAPS_BULK_OR_NEVER, // 0x0
+        .expected_model = .bulk_or_never,
+        .expected_sharing = .clone_on_share,
     },
     .{
         .type_name = "Memory.Tracking",
         .adapter_path = "lib/memory/tracking.zap",
         .backend_source = REAL_TRACKING_BACKEND_SOURCE,
-        .declares_refcount = false,
+        .expected_caps = zap.memory_abi.CAPS_INDIVIDUAL_NO_REFCOUNT, // 0x2
+        .expected_model = .individual_no_refcount,
+        .expected_sharing = .clone_on_share,
     },
     .{
         .type_name = "Memory.NoOp",
         .adapter_path = "lib/memory/no_op.zap",
         .backend_source = REAL_NO_OP_BACKEND_SOURCE,
-        .declares_refcount = false,
+        .expected_caps = zap.memory_abi.CAPS_BULK_OR_NEVER, // 0x0
+        .expected_model = .bulk_or_never,
+        .expected_sharing = .clone_on_share,
     },
 };
 
@@ -2313,21 +2332,65 @@ fn readWorkspaceFile(alloc: std.mem.Allocator, rel_path: []const u8) ![]const u8
     );
 }
 
-/// True iff the real backend source declares the `REFCOUNT_V1`
-/// capability bit in its `ZapMemoryManagerMetaV1.declared_caps`. ARC
-/// declares `CAP_REFCOUNT_V1_BIT`; the other four set `declared_caps = 0`.
-/// Asserting against the embedded backend text keeps the invariant tied
-/// to the real source the build driver compiles, not a restated copy.
-fn realBackendDeclaresRefcount(backend_source: []const u8) bool {
-    const declares_bit =
-        std.mem.indexOf(u8, backend_source, ".declared_caps = CAP_REFCOUNT_V1_BIT") != null;
-    const declares_zero =
-        std.mem.indexOf(u8, backend_source, ".declared_caps = 0") != null;
-    // Exactly one of the two forms must appear so a future refactor that
-    // changes the constant name fails loudly instead of silently
-    // mis-classifying the manager.
-    std.debug.assert(declares_bit != declares_zero);
-    return declares_bit;
+/// Parse the `declared_caps` value a real backend `.zig` source declares in
+/// its `.zapmem` `ZapMemoryManagerMetaV1`/`ZapMemoryManagerCoreV1`.
+///
+/// Each backend assigns `.declared_caps = <CONST>` where `<CONST>` is a local
+/// `const NAME: u64 = 0x...;` (ARC uses `CAP_REFCOUNT_V1_BIT`; the other four
+/// use `CAP_DECLARED_CAPS`, because the production-manager rule forbids
+/// importing the shared abi module). This reads the named constant's hex
+/// literal directly from the real source so the axis assertions stay tied to
+/// the source the build driver compiles, not a restated copy. Both the meta
+/// and core declarations reference the same constant, so a single parse covers
+/// the (separately ABI-validated) agreement between them.
+fn realBackendDeclaredCaps(backend_source: []const u8) !u64 {
+    // Find which constant the `.declared_caps` field is assigned to.
+    const field_needle = ".declared_caps = ";
+    const field_at = std.mem.indexOf(u8, backend_source, field_needle) orelse
+        return error.DeclaredCapsFieldNotFound;
+    const after_field = backend_source[field_at + field_needle.len ..];
+    // The identifier runs until a non-identifier byte (',', whitespace, ...).
+    var name_end: usize = 0;
+    while (name_end < after_field.len) : (name_end += 1) {
+        const c = after_field[name_end];
+        const is_ident = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '_';
+        if (!is_ident) break;
+    }
+    const const_name = after_field[0..name_end];
+    if (const_name.len == 0) return error.DeclaredCapsConstNameEmpty;
+
+    // Locate `const <const_name>: u64 = <literal>;` and parse the literal.
+    var decl_buf: [128]u8 = undefined;
+    const decl_needle = std.fmt.bufPrint(&decl_buf, "const {s}: u64 = ", .{const_name}) catch
+        return error.DeclaredCapsConstNameTooLong;
+    const decl_at = std.mem.indexOf(u8, backend_source, decl_needle) orelse
+        return error.DeclaredCapsConstDeclNotFound;
+    const after_decl = backend_source[decl_at + decl_needle.len ..];
+    const semi = std.mem.indexOfScalar(u8, after_decl, ';') orelse
+        return error.DeclaredCapsConstUnterminated;
+    var literal = after_decl[0..semi];
+    literal = std.mem.trim(u8, literal, " ");
+    return parseZigU64Literal(literal);
+}
+
+/// Parse a Zig integer literal as it appears in backend source: hex
+/// (`0x...`), decimal, with optional `_` digit separators. The backend
+/// capability constants are written as `0x0000_0000_0000_000N`.
+fn parseZigU64Literal(literal: []const u8) !u64 {
+    var digits_buf: [64]u8 = undefined;
+    var len: usize = 0;
+    for (literal) |c| {
+        if (c == '_') continue;
+        if (len >= digits_buf.len) return error.LiteralTooLong;
+        digits_buf[len] = c;
+        len += 1;
+    }
+    const cleaned = digits_buf[0..len];
+    if (cleaned.len > 2 and (std.mem.startsWith(u8, cleaned, "0x") or std.mem.startsWith(u8, cleaned, "0X"))) {
+        return std.fmt.parseInt(u64, cleaned[2..], 16);
+    }
+    return std.fmt.parseInt(u64, cleaned, 10);
 }
 
 test "stdlib manager matrix: each real adapter resolves to its own backend source" {
@@ -2365,14 +2428,31 @@ test "stdlib manager matrix: each real adapter resolves to its own backend sourc
         try testing.expectEqualStrings(case.adapter_path, resolved);
 
         // Selection -> backend -> caps: the real backend the driver would
-        // compile for this manager declares REFCOUNT_V1 iff it is ARC.
+        // compile for this manager declares the expected `declared_caps`.
+        const parsed_caps = try realBackendDeclaredCaps(case.backend_source);
+        try testing.expectEqual(case.expected_caps, parsed_caps);
+
+        // Selection -> backend -> caps -> axes: the declared caps decode to
+        // the manager's expected reclamation model (Axis A) and sharing
+        // strategy (Axis B), via the single-source-of-truth elision queries.
         try testing.expectEqual(
-            case.declares_refcount,
-            realBackendDeclaresRefcount(case.backend_source),
+            case.expected_model,
+            zap.memory_elision.reclamationModel(parsed_caps),
         );
         try testing.expectEqual(
-            case.declares_refcount,
+            case.expected_sharing,
+            zap.memory_elision.sharingStrategy(parsed_caps),
+        );
+
+        // No behavior change: `shouldEmitRefcountOps` is true iff REFCOUNTED,
+        // i.e. iff this is ARC — identical to the pre-axes binary gate.
+        try testing.expectEqual(
             std.mem.eql(u8, case.type_name, "Memory.ARC"),
+            zap.memory_elision.shouldEmitRefcountOps(parsed_caps),
+        );
+        try testing.expectEqual(
+            case.expected_model == .refcounted,
+            zap.memory_elision.shouldEmitRefcountOps(parsed_caps),
         );
     }
 }
@@ -2405,7 +2485,12 @@ test "stdlib manager matrix: omitted memory: selects Memory.ARC adapter and REFC
         "Memory.ARC",
     );
     try testing.expectEqualStrings("lib/memory/arc.zap", resolved);
-    try testing.expect(realBackendDeclaresRefcount(REAL_ARC_BACKEND_SOURCE));
+    // The default manager (ARC) declares the REFCOUNTED caps (0x1) and
+    // resolves to the refcounted reclamation model.
+    const arc_caps = try realBackendDeclaredCaps(REAL_ARC_BACKEND_SOURCE);
+    try testing.expectEqual(zap.memory_abi.CAPS_REFCOUNTED, arc_caps);
+    try testing.expectEqual(ReclamationModel.refcounted, zap.memory_elision.reclamationModel(arc_caps));
+    try testing.expect(zap.memory_elision.shouldEmitRefcountOps(arc_caps));
     try testing.expectEqual(
         zap.memory_abi.REFCOUNT_V1_BIT,
         @as(u64, 0x0000_0000_0000_0001),

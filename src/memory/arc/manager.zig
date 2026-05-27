@@ -246,6 +246,15 @@ const ZMEM_MAGIC: u32 = switch (builtin.target.cpu.arch.endian()) {
 const REFC_TAG: u32 = std.mem.readInt(u32, "REFC", builtin.target.cpu.arch.endian());
 
 /// `REFCOUNT_V1` bit in `declared_caps` (spec §7.1 — bit 0).
+///
+/// ARC's reclamation model is **Axis A == REFCOUNTED**. In the
+/// capability-axis encoding (see `src/memory/abi.zig`) REFCOUNTED is signalled
+/// by this `REFCOUNT_V1` flag with the Axis-A field (bits 1..2) held at its
+/// `0b00` REFCOUNTED encoding — so ARC's full `declared_caps` is exactly
+/// `0x1`, byte-identical to the pre-axes ABI. The Zap-side abi module's
+/// `CAPS_REFCOUNTED` constant equals this value; this manager redeclares it
+/// locally because the production-manager rule forbids importing sibling
+/// compiler modules.
 const CAP_REFCOUNT_V1_BIT: u64 = 0x0000_0000_0000_0001;
 
 /// Object-format-conditional section name. Mach-O places the section

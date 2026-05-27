@@ -160,6 +160,19 @@ const ZMEM_MAGIC: u32 = switch (builtin.target.cpu.arch.endian()) {
     .big => 0x5A4D454D,
 };
 
+/// Leak's declared capabilities — **Axis A == BULK_OR_NEVER**.
+///
+/// Leak never frees (individual frees and bulk reclamation are both no-ops;
+/// the OS reclaims at process exit). It shares the BULK_OR_NEVER reclamation
+/// model with Arena and NoOp: in the capability-axis encoding (see
+/// `src/memory/abi.zig`) that is bit 0 clear with the Axis-A field at its zero
+/// encoding — `declared_caps == 0x0`. The compiler elides every retain/release
+/// and individual free; no `ArcHeader` is laid out. The Zap-side abi module's
+/// `CAPS_BULK_OR_NEVER` constant equals this value; this manager redeclares it
+/// locally because the production-manager rule forbids importing sibling
+/// compiler modules.
+const CAP_DECLARED_CAPS: u64 = 0x0000_0000_0000_0000;
+
 /// Object-format-conditional section name. Mach-O places the section
 /// inside the `__DATA` segment; ELF and COFF use a top-level
 /// `.zapmem` section (spec §3.1).
@@ -327,7 +340,7 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .size = @sizeOf(ZapMemoryManagerMetaV1),
         ._reserved2 = 0,
         .desc_count = 0,
-        .declared_caps = 0, // No capabilities declared — Leak is a pure allocator that never frees.
+        .declared_caps = CAP_DECLARED_CAPS, // Axis A == BULK_OR_NEVER (0x0); Leak never frees.
         .core_vtable_offset = @offsetOf(ZapMemorySection, "core"),
         .reserved = 0,
     },
@@ -335,7 +348,7 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .abi_major = 1,
         .abi_minor = 0,
         .size = @sizeOf(ZapMemoryManagerCoreV1),
-        .declared_caps = 0,
+        .declared_caps = CAP_DECLARED_CAPS,
         .init = leakInit,
         .deinit = leakDeinit,
         .allocate = leakAllocate,

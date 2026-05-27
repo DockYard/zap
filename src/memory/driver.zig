@@ -1654,6 +1654,87 @@ const ValidatedSection = struct {
     refcount_sized_extension: bool,
 };
 
+/// Axis-aware validation of a manager's `declared_caps` value.
+///
+/// `declared_caps` is the structured capability bitmask (`src/memory/abi.zig`):
+/// the REFCOUNT_V1 flag (bit 0), the Axis-A reclamation-model field (bits
+/// 1..2), and the Axis-B sharing-strategy bit (bit 3). This enforces the
+/// model's well-formedness at build time so a malformed or future-ABI manager
+/// is rejected with a clear diagnostic rather than mis-driving codegen:
+///
+///   * **Unknown bits** — any bit outside `KNOWN_CAPS_MASK` (bits 4..63) is
+///     reserved and unimplemented (`ReservedCapabilityDeclared`).
+///   * **Reserved Axis-A codes** — `TRACED` (`0b10`) is reserved until the
+///     tracing-GC manager ships (plan Phase 5); the `0b11` code carries no
+///     assigned model. Both are rejected (`ReservedCapabilityDeclared`).
+///   * **Inconsistent combos** (`ValidationFailed`):
+///       - `REFCOUNT_V1` (bit 0) set but the Axis-A field is not the
+///         `REFCOUNTED` encoding (`0b00`) — a manager cannot be both
+///         refcounted and a free-model.
+///       - The Axis-B `MOVE_ONLY` bit set when Axis A is not
+///         `INDIVIDUAL_NO_REFCOUNT` — sharing strategy is meaningless for the
+///         other reclamation models.
+fn validateDeclaredCaps(
+    manager_name: []const u8,
+    declared_caps: u64,
+    diag: *DriverDiagnostic,
+) ResolveError!void {
+    // 1. Unknown / still-reserved bits outside the defined axes (bits 4..63).
+    if ((declared_caps & ~abi.KNOWN_CAPS_MASK) != 0) {
+        diag.write(
+            "manager '{s}' declares a reserved-but-unimplemented capability bit (declared_caps=0x{x}, known-bit mask=0x{x})",
+            .{ manager_name, declared_caps, abi.KNOWN_CAPS_MASK },
+        );
+        return ResolveError.ReservedCapabilityDeclared;
+    }
+
+    const refcount_v1 = (declared_caps & abi.REFCOUNT_V1_BIT) != 0;
+    const axis_a = (declared_caps >> abi.RECLAMATION_MODEL_SHIFT) & abi.RECLAMATION_MODEL_MASK;
+    const move_only = (declared_caps & abi.SHARING_MOVE_ONLY_BIT) != 0;
+
+    // 2a. Consistency: REFCOUNT_V1 implies the REFCOUNTED Axis-A encoding.
+    if (refcount_v1 and axis_a != abi.RECLAMATION_REFCOUNTED) {
+        diag.write(
+            "manager '{s}' declares REFCOUNT_V1 (bit 0) but Axis-A reclamation field is 0b{b:0>2}, not REFCOUNTED (declared_caps=0x{x})",
+            .{ manager_name, axis_a, declared_caps },
+        );
+        return ResolveError.ValidationFailed;
+    }
+
+    // 2b. Reserved Axis-A codes. When bit 0 is clear the field selects the
+    // free model; TRACED is reserved until the GC manager ships and 0b11 is
+    // undefined. (When bit 0 is set, 2a already forced the field to 0b00.)
+    if (!refcount_v1) {
+        switch (axis_a) {
+            abi.RECLAMATION_BULK_OR_NEVER, abi.RECLAMATION_INDIVIDUAL_NO_REFCOUNT => {},
+            abi.RECLAMATION_TRACED => {
+                diag.write(
+                    "manager '{s}' declares the TRACED reclamation model (Axis A = 0b10), which is reserved until the tracing-GC manager ships (declared_caps=0x{x})",
+                    .{ manager_name, declared_caps },
+                );
+                return ResolveError.ReservedCapabilityDeclared;
+            },
+            abi.RECLAMATION_RESERVED => {
+                diag.write(
+                    "manager '{s}' declares the reserved Axis-A reclamation code 0b11, which has no assigned model (declared_caps=0x{x})",
+                    .{ manager_name, declared_caps },
+                );
+                return ResolveError.ReservedCapabilityDeclared;
+            },
+            else => unreachable, // 2-bit field; the arms above are exhaustive.
+        }
+    }
+
+    // 3. Axis B (MOVE_ONLY) is only meaningful for INDIVIDUAL_NO_REFCOUNT.
+    if (move_only and (refcount_v1 or axis_a != abi.RECLAMATION_INDIVIDUAL_NO_REFCOUNT)) {
+        diag.write(
+            "manager '{s}' sets the Axis-B MOVE_ONLY sharing bit (bit 3) but Axis A is not INDIVIDUAL_NO_REFCOUNT (declared_caps=0x{x})",
+            .{ manager_name, declared_caps },
+        );
+        return ResolveError.ValidationFailed;
+    }
+}
+
 fn validateSection(
     manager_name: []const u8,
     section_bytes: []const u8,
@@ -1742,17 +1823,12 @@ fn validateSection(
         return ResolveError.ValidationFailed;
     }
 
-    // Reject reserved capability bits. Phase 3 only knows REFCOUNT_V1
-    // (bit 0); spec section 7 reserves bits 1..9. A v1.0 manager must
-    // not declare any reserved bit.
-    const reserved_mask: u64 = 0x3FE; // bits 1..9 inclusive
-    if ((meta.declared_caps & reserved_mask) != 0) {
-        diag.write(
-            "manager '{s}' declares a reserved-but-unimplemented capability (declared_caps=0x{x})",
-            .{ manager_name, meta.declared_caps },
-        );
-        return ResolveError.ReservedCapabilityDeclared;
-    }
+    // Axis-aware capability validation. `declared_caps` encodes the
+    // REFCOUNT_V1 flag (bit 0), the Axis-A reclamation-model field (bits
+    // 1..2), and the Axis-B sharing-strategy bit (bit 3) — see
+    // `src/memory/abi.zig`. Reject still-unknown bits, the not-yet-shipped
+    // / undefined Axis-A codes, and inconsistent axis combinations.
+    try validateDeclaredCaps(manager_name, meta.declared_caps, diag);
 
     var core: abi.ZapMemoryManagerCoreV1 = undefined;
     @memcpy(
@@ -2876,7 +2952,9 @@ test "validateSection rejects reserved capability bit" {
         .size = @sizeOf(abi.ZapMemoryManagerMetaV1),
         ._reserved2 = 0,
         .desc_count = 0,
-        .declared_caps = 0x2, // GCOL bit, reserved
+        // Bit 4 is outside the defined capability axes (bits 0..3) — a
+        // reserved-but-unimplemented bit a v1.x manager must not declare.
+        .declared_caps = 0x10,
         .core_vtable_offset = @sizeOf(abi.ZapMemoryManagerMetaV1),
         .reserved = 0,
     };
@@ -2887,6 +2965,84 @@ test "validateSection rejects reserved capability bit" {
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
     const result = validateSection("ReservedBit", &bytes, &diag);
     try std.testing.expectError(ResolveError.ReservedCapabilityDeclared, result);
+}
+
+test "validateDeclaredCaps accepts the defined axis values" {
+    var diag_buf: [256]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    // REFCOUNTED (ARC) — byte-identical to the pre-axes ABI.
+    try validateDeclaredCaps("ARC", abi.CAPS_REFCOUNTED, &diag);
+    // BULK_OR_NEVER (Arena/NoOp/Leak) — the all-zero value.
+    try validateDeclaredCaps("BulkOrNever", abi.CAPS_BULK_OR_NEVER, &diag);
+    // INDIVIDUAL_NO_REFCOUNT with the default CLONE_ON_SHARE (Tracking).
+    try validateDeclaredCaps("Tracking", abi.CAPS_INDIVIDUAL_NO_REFCOUNT, &diag);
+    // INDIVIDUAL_NO_REFCOUNT with MOVE_ONLY (Axis B is legal here).
+    try validateDeclaredCaps(
+        "TrackingMoveOnly",
+        abi.CAPS_INDIVIDUAL_NO_REFCOUNT | abi.SHARING_MOVE_ONLY_BIT,
+        &diag,
+    );
+}
+
+test "validateDeclaredCaps rejects unknown high bits" {
+    var diag_buf: [256]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    // Bit 4 (and any bit above bit 3) is undefined.
+    try std.testing.expectError(
+        ResolveError.ReservedCapabilityDeclared,
+        validateDeclaredCaps("UnknownBit", 0x10, &diag),
+    );
+    try std.testing.expectError(
+        ResolveError.ReservedCapabilityDeclared,
+        validateDeclaredCaps("HighBit", 0x8000_0000_0000_0000, &diag),
+    );
+}
+
+test "validateDeclaredCaps rejects the reserved TRACED model until GC ships" {
+    var diag_buf: [256]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const traced: u64 = abi.RECLAMATION_TRACED << abi.RECLAMATION_MODEL_SHIFT; // 0x4
+    try std.testing.expectError(
+        ResolveError.ReservedCapabilityDeclared,
+        validateDeclaredCaps("Traced", traced, &diag),
+    );
+}
+
+test "validateDeclaredCaps rejects the undefined Axis-A 0b11 code" {
+    var diag_buf: [256]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const reserved_code: u64 = abi.RECLAMATION_RESERVED << abi.RECLAMATION_MODEL_SHIFT; // 0x6
+    try std.testing.expectError(
+        ResolveError.ReservedCapabilityDeclared,
+        validateDeclaredCaps("ReservedCode", reserved_code, &diag),
+    );
+}
+
+test "validateDeclaredCaps rejects REFCOUNT_V1 paired with a non-REFCOUNTED Axis-A field" {
+    var diag_buf: [256]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    // bit 0 set + Axis-A = INDIVIDUAL_NO_REFCOUNT (0b01) → 0x3, contradictory.
+    const inconsistent: u64 = abi.REFCOUNT_V1_BIT | abi.CAPS_INDIVIDUAL_NO_REFCOUNT;
+    try std.testing.expectError(
+        ResolveError.ValidationFailed,
+        validateDeclaredCaps("RefcountedButIndividual", inconsistent, &diag),
+    );
+}
+
+test "validateDeclaredCaps rejects MOVE_ONLY without INDIVIDUAL_NO_REFCOUNT" {
+    var diag_buf: [256]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    // Axis B set on a BULK_OR_NEVER manager (0x8) — meaningless combo.
+    try std.testing.expectError(
+        ResolveError.ValidationFailed,
+        validateDeclaredCaps("BulkMoveOnly", abi.SHARING_MOVE_ONLY_BIT, &diag),
+    );
+    // Axis B set on a REFCOUNTED manager (0x9) — also rejected.
+    try std.testing.expectError(
+        ResolveError.ValidationFailed,
+        validateDeclaredCaps("RefcountedMoveOnly", abi.CAPS_REFCOUNTED | abi.SHARING_MOVE_ONLY_BIT, &diag),
+    );
 }
 
 /// Helper for the descriptor-bounds tests. Builds a section that
@@ -3782,14 +3938,15 @@ test "real Arena manager source compiles and exports a valid section (system zig
     // section parser / symbol-table inspector is caught the next time
     // a contributor runs `zig build test`.
     //
-    // Arena declares no capabilities (`declared_caps == 0` — see spec
-    // §4.5 on capability-free managers). The expected value below
-    // matches the section's literal `declared_caps` field in
+    // Arena frees in bulk at deinit; individual frees are no-ops. In the
+    // capability-axis encoding that is Axis A == BULK_OR_NEVER, the all-zero
+    // `declared_caps` value (`abi.CAPS_BULK_OR_NEVER == 0`). The expected
+    // value below matches the section's literal `declared_caps` field in
     // `src/memory/arena/manager.zig`.
     try verifyRealManagerObject(
         "real_arena",
         "src/memory/arena/manager.zig",
-        0,
+        abi.CAPS_BULK_OR_NEVER,
     );
 }
 
@@ -3801,7 +3958,9 @@ test "real ARC manager source compiles and exports a valid section (system zig)"
     //
     // ARC declares the `REFCOUNT_V1` capability bit (0x1) in its
     // `.zapmem` section's `declared_caps` field; the expected value
-    // below pins that contract.
+    // below pins that contract. In the capability-axis encoding this is
+    // Axis A == REFCOUNTED, and `abi.CAPS_REFCOUNTED == REFCOUNT_V1_BIT`
+    // (byte-identical to the pre-axes ABI).
     try verifyRealManagerObject(
         "real_arc",
         "src/memory/arc/manager.zig",
@@ -3818,26 +3977,32 @@ test "real Leak manager source compiles and exports a valid section (system zig)
     // section parser / symbol-table inspector is caught the next time
     // a contributor runs `zig build test`.
     //
-    // Leak declares no capabilities (`declared_caps == 0`). The
-    // expected value below matches the section's literal
-    // `declared_caps` field in `src/memory/leak/manager.zig`.
+    // Leak never frees (the OS reclaims at exit). Like Arena it declares
+    // Axis A == BULK_OR_NEVER, the all-zero `declared_caps` value
+    // (`abi.CAPS_BULK_OR_NEVER == 0`). The expected value below matches the
+    // section's literal `declared_caps` field in
+    // `src/memory/leak/manager.zig`.
     try verifyRealManagerObject(
         "real_leak",
         "src/memory/leak/manager.zig",
-        0,
+        abi.CAPS_BULK_OR_NEVER,
     );
 }
 
 test "real Tracking manager source compiles and exports a valid section (system zig)" {
     // Sibling of the Leak test above for the production Tracking
     // manager at `src/memory/tracking/manager.zig`. Tracking is the
-    // diagnostic leak/UAF/OOB CI tool; like Leak it declares zero
-    // capabilities at the section level (its hash-map bookkeeping and
-    // canary checks are internal, not declared via `REFCOUNT_V1`).
+    // diagnostic leak/UAF/OOB CI tool. It frees each allocation
+    // individually but keeps NO reference count, so in the
+    // capability-axis encoding it declares Axis A == INDIVIDUAL_NO_REFCOUNT
+    // with the default CLONE_ON_SHARE sharing strategy — `declared_caps ==
+    // 0x2` (`abi.CAPS_INDIVIDUAL_NO_REFCOUNT`). This both pins the section's
+    // literal `declared_caps` value and proves the new axis-aware
+    // validation accepts a valid INDIVIDUAL_NO_REFCOUNT manager end-to-end.
     try verifyRealManagerObject(
         "real_tracking",
         "src/memory/tracking/manager.zig",
-        0,
+        abi.CAPS_INDIVIDUAL_NO_REFCOUNT,
     );
 }
 
