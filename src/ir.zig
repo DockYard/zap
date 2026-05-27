@@ -359,6 +359,13 @@ fn isConcreteIntegerZigType(zig_type: ZigType) bool {
     };
 }
 
+fn isFloatZigType(zig_type: ZigType) bool {
+    return switch (zig_type) {
+        .f16, .f32, .f64, .f80, .f128 => true,
+        else => false,
+    };
+}
+
 /// Map a primitive type's source name to the matching IR
 /// `ZigType` shape. Mirrors `TypeStore.resolveTypeName` so the
 /// protocol-vtable populator (which resolves AST `TypeNameExpr`
@@ -7849,7 +7856,17 @@ pub const IrBuilder = struct {
             // Live normal-completion edge: the body produced a real tail value.
             // When there is no joined type to coerce toward (a `try` whose
             // value is discarded), pass it through unchanged; when it already
-            // carries the joined type, likewise use it directly.
+            // carries the joined type, likewise use it directly. Otherwise
+            // COERCE the live tail to the joined type — never fall through to
+            // the dead-edge `typed_undef` (that would silently replace a real
+            // body value with `undefined`). A bare-literal body (`try { 99 }`)
+            // lowers to an untyped `comptime_int` whose `local_hir_types` entry
+            // is absent/UNKNOWN, so it does not match `joined` (`i64`) above;
+            // `coerceRescueArmTailToJoined` concretizes it via `@as(i64, 99)`
+            // exactly like a literal arm tail, giving the landing-pad merge a
+            // clean concrete peer on the normal-completion edge too. A no-op
+            // for a body tail that already carries the joined concrete type or
+            // a non-numeric join.
             if (!body_diverges) {
                 if (joined == types_mod.TypeStore.UNKNOWN or
                     joined == types_mod.TypeStore.NIL or
@@ -7860,6 +7877,12 @@ pub const IrBuilder = struct {
                 if (body_result) |br| {
                     const tail_type = self.local_hir_types.get(br) orelse types_mod.TypeStore.UNKNOWN;
                     if (tail_type == joined) break :blk br;
+                    const coerced_tail = try self.coerceRescueArmTailToJoinedInto(&else_branch_instrs, br, joined);
+                    if (coerced_tail != br) break :blk coerced_tail;
+                    // Coercion was a no-op (non-numeric join, or the tail is
+                    // already the joined concrete type by ZigType even though
+                    // its HIR type id differs): pass the live tail through.
+                    break :blk br;
                 }
             }
 
@@ -8367,10 +8390,110 @@ pub const IrBuilder = struct {
         // a borrowed-inner binding's last use precedes the box's deep-free.
         try self.emitRescueBoxRelease(error_local);
 
+        // Coerce the arm's tail value to the whole `try`/`rescue` result type
+        // BEFORE yielding it to `handler_dest`. A bare integer/float literal
+        // arm (`e :: A -> 1`) lowers to an UNTYPED `comptime_int`/`comptime_float`
+        // (the `int_lit` lowering suppresses a concrete hint for the default
+        // `i64`/`f64` so straight-line uses stay flexible). The multi-arm
+        // dispatch then merges sibling arm tails through nested `if_expr`s
+        // (arm-vs-arm), and a `comptime_int` flowing across that runtime
+        // `condbr` merge trips Zig's "value with comptime-only type
+        // 'comptime_int' depends on runtime control flow". This is the same
+        // branch-merge peer-coercion a regular `case` gets for free via the
+        // `case_block` lowering (`current_case_dest` forces `i64`), which the
+        // hand-rolled `if_expr` rescue dispatch does not. Concretize the tail
+        // to the joined result type here so every arm yields the SAME concrete
+        // type to the merge. A no-op when the tail already carries the joined
+        // type or the join is non-numeric (a `String`/struct arm value is
+        // already concrete).
+        const coerced_body_result = try self.coerceRescueArmTailToJoined(body_result, joined_type);
+
         try self.current_instrs.append(self.allocator, .{
-            .local_set = .{ .dest = handler_dest, .value = body_result },
+            .local_set = .{ .dest = handler_dest, .value = coerced_body_result },
         });
         return .{ .result = handler_dest, .diverges = false };
+    }
+
+    /// Coerce a rescue arm's lowered tail value to the whole `try`/`rescue`
+    /// joined result type so every arm yields the SAME concrete type to the
+    /// multi-arm branch merge (see the call site in `emitRescueArmBody`).
+    ///
+    /// The only tail shapes that need coercion are bare integer/float literals,
+    /// which the `int_lit`/`float_lit` lowering emits UNTYPED (a
+    /// `comptime_int`/`comptime_float`) for the default `i64`/`f64`. Such a
+    /// comptime-only value cannot flow across the runtime arm-vs-arm `condbr`
+    /// merge. When the joined type is a concrete integer or float, emit an
+    /// `@as(<joined>, tail)` (via the existing numeric-widen instruction, which
+    /// lowers to exactly that) so the literal concretizes and a differing-but-
+    /// peer-coercible numeric arm widens to the common type. Returns the tail
+    /// unchanged when:
+    ///   * the join is not a concrete numeric type (a `String`/struct/optional
+    ///     arm value is already a concrete runtime value — no comptime-only
+    ///     hazard, and `@as` to those is unnecessary), or
+    ///   * the tail already carries the exact joined concrete numeric type (the
+    ///     coercion would be an identity `@as`).
+    fn coerceRescueArmTailToJoined(
+        self: *IrBuilder,
+        tail: LocalId,
+        joined_type: types_mod.TypeId,
+    ) anyerror!LocalId {
+        return self.coerceRescueArmTailToJoinedInto(&self.current_instrs, tail, joined_type);
+    }
+
+    /// `coerceRescueArmTailToJoined` variant that appends the coercion
+    /// instruction into an explicit instruction list rather than
+    /// `self.current_instrs`. The landing-pad normal-completion (else) edge
+    /// builds its own `else_branch_instrs` list, so its body-tail coercion
+    /// must land there — not in the surrounding stream.
+    fn coerceRescueArmTailToJoinedInto(
+        self: *IrBuilder,
+        target: *std.ArrayListUnmanaged(Instruction),
+        tail: LocalId,
+        joined_type: types_mod.TypeId,
+    ) anyerror!LocalId {
+        if (joined_type == types_mod.TypeStore.UNKNOWN or
+            joined_type == types_mod.TypeStore.NIL or
+            joined_type == types_mod.TypeStore.NEVER)
+        {
+            return tail;
+        }
+        const joined_zig = typeIdToZigTypeWithStore(joined_type, self.type_store);
+
+        // Always emit the `@as(<joined>, tail)` when the join is a concrete
+        // numeric type — do NOT short-circuit on the tail's TRACKED
+        // `known_local_types`. A bare integer/float literal is tracked as
+        // `.i64`/`.f64` (the `int_lit`/`float_lit` lowering records the
+        // resolved type) yet is EMITTED as an untyped `comptime_int`/
+        // `comptime_float` (the concrete `i64`/`f64` ZIR hint is suppressed so
+        // straight-line uses stay flexible). Trusting the tracked `.i64` and
+        // skipping the coercion would leave the literal a `comptime_int` that
+        // still trips the runtime-control-flow merge — exactly the bug. An
+        // `@as(i64, <already-i64 value>)` is a harmless identity in codegen,
+        // and `@as(i64, <comptime_int>)` performs the load-bearing
+        // concretization, so coercing unconditionally is both correct and
+        // cheap. The join is the peer-resolved result type, so a differing
+        // arm only ever widens toward it (never a narrowing `@as`).
+        if (isConcreteIntegerZigType(joined_zig)) {
+            const coerced = self.next_local;
+            self.next_local += 1;
+            try target.append(self.allocator, .{
+                .int_widen = .{ .dest = coerced, .source = tail, .dest_type = joined_zig },
+            });
+            try self.known_local_types.put(coerced, joined_zig);
+            try self.local_hir_types.put(coerced, joined_type);
+            return coerced;
+        }
+        if (isFloatZigType(joined_zig)) {
+            const coerced = self.next_local;
+            self.next_local += 1;
+            try target.append(self.allocator, .{
+                .float_widen = .{ .dest = coerced, .source = tail, .dest_type = joined_zig },
+            });
+            try self.known_local_types.put(coerced, joined_zig);
+            try self.local_hir_types.put(coerced, joined_type);
+            return coerced;
+        }
+        return tail;
     }
 
     /// Emit the per-arm owner-drop of a recovered rescue box on a CATCHING
