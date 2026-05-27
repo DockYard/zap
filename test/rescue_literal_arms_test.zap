@@ -65,6 +65,22 @@ pub struct RescueLiteralArmsTest {
     test("string-literal arms still work — second arm") {
       assert(classify_string(1) == "beta")
     }
+
+    test("differing-but-peer-coercible numeric arms — i32-typed arm widens to i64") {
+      assert(classify_widen(0) == 7)
+    }
+
+    test("differing-but-peer-coercible numeric arms — bare-literal sibling arm") {
+      assert(classify_widen(1) == 99)
+    }
+
+    test("after block runs and the rescued bare-literal value is returned") {
+      assert(after_with_literal_arms(0) == 1)
+    }
+
+    test("nested rescue — inner bare-literal arms, outer bare-literal arms") {
+      assert(nested_literal_rescue(0) == 100)
+    }
   }
 
   # Raises one of two/three concrete error types selected at runtime, so
@@ -144,6 +160,50 @@ pub struct RescueLiteralArmsTest {
     try { risky_pair_string(n) } rescue {
       e :: AlphaError -> "alpha"
       e :: BetaError -> "beta"
+    }
+  }
+
+  # An i32-returning helper so one rescue arm has a narrower-but-peer-
+  # coercible numeric type than the i64 body/result. The arm's i32 value
+  # must widen to the i64 join via the same `@as` coercion as a literal.
+  fn small_i32() -> i32 {
+    7
+  }
+
+  # Differing-but-peer-coercible numeric arms: arm A yields i32 (widened),
+  # arm B yields a bare literal. The whole rescue result is i64 (body type).
+  fn classify_widen(n :: i64) -> i64 {
+    try { risky_pair(n) } rescue {
+      e :: AlphaError -> small_i32()
+      e :: BetaError -> 99
+    }
+  }
+
+  # `after` (finally) block present alongside bare-literal arms: the
+  # cleanup runs on the value-yielding rescue fall-through, and the
+  # coerced literal arm value is still what flows out.
+  fn after_with_literal_arms(n :: i64) -> i64 {
+    try { risky_pair(n) } rescue {
+      e :: AlphaError -> 1
+      e :: BetaError -> 2
+    } after {
+      IO.puts("cleanup ran")
+    }
+  }
+
+  # Nested `try`/`rescue`: the inner rescue has bare-literal arms and is
+  # the tail of the outer try body; the outer rescue also has bare-literal
+  # arms. Both merges must concretize their literals. The inner rescues
+  # AlphaError -> 100, so no error escapes to the outer rescue.
+  fn nested_literal_rescue(n :: i64) -> i64 {
+    try {
+      try { risky_pair(n) } rescue {
+        e :: AlphaError -> 100
+        e :: BetaError -> 200
+      }
+    } rescue {
+      e :: AlphaError -> 1
+      e :: BetaError -> 2
     }
   }
 }
