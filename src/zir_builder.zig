@@ -1120,6 +1120,21 @@ pub const ZirDriver = struct {
             self.arc_returned_locals.contains(local);
     }
 
+    /// Cancel the provisional `arc_share_skipped` release-suppression for a
+    /// local that a `.persistent` retain just cloned into an independent owner
+    /// via `shareAnyPersistent`. ONLY meaningful under `clone_on_share_active`:
+    /// there `shouldSkipArc` is unconditionally true, so the `copy_value`
+    /// handler provisionally suppresses every dest's release; a dest that
+    /// actually CLONES is a genuine new owner whose release must fire (else the
+    /// clone leaks), so it is removed here. A no-op under every other model —
+    /// under REFCOUNTED an entry in `arc_share_skipped` marks a genuinely
+    /// escape-elided retain whose release MUST stay suppressed, so this must
+    /// NOT touch it; the `clone_on_share_active` guard guarantees that.
+    fn unmarkShareSkippedForClone(self: *ZirDriver, local: ir.LocalId) void {
+        if (!self.cloneOnShareActive()) return;
+        _ = self.arc_share_skipped.remove(local);
+    }
+
     /// Check if a function contains tail calls to itself (via IR tail_call instructions).
     /// The IR builder already detects and marks tail-recursive calls as tail_call.
     /// Check if ARC operations should be skipped for a value.
@@ -6175,6 +6190,20 @@ pub const ZirDriver = struct {
                         // skipped at ZIR-time via `shouldSkipArc`. The
                         // matching `.release` is suppressed by
                         // `isReleaseSuppressed`.
+                        //
+                        // Under `clone_on_share_active` (Tracking) `shouldSkipArc`
+                        // is unconditionally true, so EVERY copy_value dest lands
+                        // here provisionally. That is correct for a TRANSIENT
+                        // borrow (a `.normal` / `protocol_box_retain` retain that
+                        // does NOT clone — the dest aliases the source's cell and
+                        // its scope-exit release/drop must be suppressed to avoid
+                        // a double-free). But a PERSISTENT share clones via
+                        // `shareAnyPersistent` into a genuine independent owner
+                        // whose release MUST fire; the `.persistent` branch of the
+                        // `.retain` handler REMOVES such a dest from this set
+                        // (`unmarkShareSkippedForClone`). The copy_value site
+                        // cannot see the paired retain kind, so it provisionally
+                        // suppresses and the retain handler is the authority.
                         try self.arc_share_skipped.put(self.allocator, cv.dest, {});
                     }
                 }
@@ -9535,6 +9564,23 @@ pub const ZirDriver = struct {
                             const shared_ref = zir_builder_emit_call_ref(self.handle, share_fn, &args, 1);
                             if (shared_ref == error_ref) return error.EmitFailed;
                             try self.setLocal(ret.value, shared_ref);
+                            // Under `clone_on_share_active` a `.persistent` retain
+                            // emits a REAL `shareAnyPersistent` clone (above), so
+                            // `ret.value` is now an INDEPENDENT owner. Its
+                            // scope-exit `.release` must FIRE to free the clone
+                            // (a standalone owner) — or be omitted by drop-insertion
+                            // (a clone consumed into a container, freed by the
+                            // container's deep-walk). Either way the provisional
+                            // `arc_share_skipped` suppression that the `copy_value`
+                            // handler installed (because `shouldSkipArc` is
+                            // unconditionally true under this model) is WRONG for a
+                            // clone and would LEAK it, so remove it. Transient
+                            // borrows (`.normal` / `protocol_box_retain`) do NOT
+                            // clone and keep their suppression. Under REFCOUNTED
+                            // this is a no-op: `arc_share_skipped` only carries
+                            // genuinely escape-elided dests there, never a
+                            // refcount-bumping persistent retain's dest.
+                            self.unmarkShareSkippedForClone(ret.value);
                         },
                         .protocol_box_retain, .protocol_box_share => unreachable, // handled above
                     }
