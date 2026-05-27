@@ -135,6 +135,50 @@ unprovable share — deferred).
   New `arc_materialize` branch (free-at-last-use from `arc_liveness`); clone-on-share re-gated;
   `bcd739c` free path re-gated; verifier accepts the model. Verify: recursive-struct fixture green
   under Tracking; Tracking leak-detection green over the corpus; ARC green.
+
+  **Phase 3 STATUS (checkpoint — primary goals met, two bounded gaps remain):**
+  - **DONE: clone-on-share re-gated on the CAPABILITY** (`reclamation_model ==
+    individual_no_refcount && sharing_strategy == clone_on_share`, runtime
+    `clone_on_share_active`), not `!REFCOUNT_V1`. Fires ONLY for Tracking; never for
+    Arena/NoOp/Leak. `shareAnyPersistent`/`cloneEagerChildValue` (runtime),
+    `emit_share_under_clone_on_share` (zir_builder `.retain` → `shareAnyPersistent` +
+    rebind), `extractRetainKind` (ir), V10 verifier entry. ARC byte-for-byte unchanged
+    (clone branch comptime-dead under refcounted).
+  - **DONE: consumed-vs-standalone owner model.** A `.persistent` retain that emits a real
+    `shareAnyPersistent` clone REMOVES its dest from `arc_share_skipped`
+    (`unmarkShareSkippedForClone`, gated on `clone_on_share_active`), so a standalone clone's
+    release fires (no leak) while a clone consumed into a container is freed by the container's
+    deep-walk (drop-insertion already omits its release) and a transient borrow
+    (`.normal`/`protocol_box_retain`, no clone) keeps its suppression (no double-free).
+  - **GREEN: recursive-struct double-free SEGFAULT eliminated** (chain_sum / LinkedNode /
+    `head=%LinkedNode{next:tail}`+tail-live); deep multi-frame chains; two-binding shared
+    ownership; **zero `invalid free`** (was many); **ARC 942/0 byte-identical; golden 14/14;
+    host `zig build test` exit 0.** Tracking corpus: 942 tests, 10 failures (down from a
+    whole-corpus SEGFAULT) — 0 crashes, 0 invalid-frees, no program-exit leaks.
+  - **GAP A (9 of 10 failures) — free-at-last-use placement.** The boxed-closure
+    `assert_no_leaks` fixtures (`closure_boxed_test.zap`, `combinator_boxed_test.zap`) sample
+    `live_allocation_count()` MID-SCOPE; the box `protocol_box_drop` sits at function
+    scope-exit (correct — the box IS reclaimed, NO program-exit leak), but AFTER the sample,
+    so the mid-scope delta is non-zero. The fix is exactly this phase's step-2 free-at-last-use
+    drop placement (relocate the drop to the local's `arc_liveness.last_use_map` site under
+    `individual_no_refcount`); scope-exit placement is correct for `refcounted` (the refcount
+    closes the window) but the leak-checkpoint is inactive there. A box bound inside a nested
+    `if`/`switch` arm with no `case_break` is genuinely never dropped (a real leak) — the same
+    free-at-last-use placement covers it.
+  - **GAP B (1 of 10 failures) — List/Map COW under `clone_on_share`.** `mutationMayMoveInPlace`
+    returns `true` unconditionally under `!refcount_v1_active` (always mutate in place, no COW),
+    but `cloneEagerChildValue`/`cloneFieldChildInPlace` do NOT clone inline-header List/Map cells
+    on share (they alias — "never eagerly freed" reasoning from the bulk-free era). So an aliased
+    list (`original_alias = values`) shares the buffer and an in-place `List.set` CORRUPTS the
+    alias (`generic_list_test.zap` "copy-on-write preserves aliased original string list":
+    `alias_len` reads garbage). The coherent fix is the FULL clone-on-share model extended to
+    inline-header collections: (1) `cloneEagerChildValue`/`cloneFieldChildInPlace` deep-clone the
+    List/Map buffer under `clone_on_share_active`; (2) `List.release`/`Map.release` directly free
+    the buffer under `eager_individual_free` (each owner unique post-clone → frees its own, no
+    double-free) instead of relying on the `ArcHeaderEmpty.release`-returns-false zero-transition
+    that never fires; (3) `mutationMayMoveInPlace` stays `true` (post-clone uniqueness makes
+    in-place mutation sound). This is a bounded List/Map runtime-free-model change; deferred to
+    keep the green baseline stable.
 - **Phase 4 — per-manager corpus + custom-manager test.** Lock in the verification matrix.
 - **Phase 5 — `TRACED` conservative GC manager (in scope).** Add `lib/memory/gc.zap` (zero-method
   marker) + `src/memory/gc/manager.zig` (conservative stop-the-world mark-sweep: managed heap;
