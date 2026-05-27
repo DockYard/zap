@@ -4771,6 +4771,60 @@ pub const ArcRuntime = struct {
         return false;
     }
 
+    /// True iff `V` is a (possibly-optional) single-item pointer to an
+    /// inline-header collection cell (`List(E)` / `Map(K, V)`) that exposes a
+    /// `cloneForShare` clone-on-share entry. Drives the inline-header arm of
+    /// the clone-on-share dispatch (`shareAnyPersistent`, `cloneEagerChildValue`,
+    /// `cloneFieldChildInPlace`, container `ownElement` / `ownEntryValue`):
+    /// under `clone_on_share_active` a persistent second owner of such a cell
+    /// must receive an INDEPENDENT deep clone of the backing buffer, because the
+    /// cell has no refcount to express a shared owner and an aliased buffer is
+    /// mutated/freed out from under the other owner (the `generic_list_test`
+    /// aliased-original use-after-free).
+    ///
+    /// Distinct from `elementHasEagerlyFreedChild`: that predicate asks whether
+    /// a value owns an *eagerly-freed descendant* (and is deliberately FALSE for
+    /// an inline-header cell whose own buffer is reclaimed at teardown). This
+    /// predicate asks whether the value IS such a cell — the buffer itself is
+    /// the newly-owned allocation a share must duplicate. The two are unioned in
+    /// the clone-on-share gate so both a `[fn..]` (eager child) and a
+    /// `[String]` (no eager child, but a buffer to clone) are handled.
+    ///
+    /// Always `false` (so the dispatch comptime-elides) for non-pointer values
+    /// and pointers to non-inline-header pointees.
+    pub fn valuePointsToInlineHeaderCell(comptime V: type) bool {
+        const info = @typeInfo(V);
+        const ptr_info = switch (info) {
+            .optional => |opt| @typeInfo(opt.child),
+            else => info,
+        };
+        if (ptr_info != .pointer) return false;
+        if (ptr_info.pointer.size != .one) return false;
+        return hasInlineArcHeader(ptr_info.pointer.child) and
+            @hasDecl(ptr_info.pointer.child, "cloneForShare");
+    }
+
+    /// Deep-clone-on-share an inline-header collection cell value, returning the
+    /// independent owner the new owner must hold. Dispatches to the cell's
+    /// `cloneForShare` (`List`/`Map`). `V` is `?*const Cell` or `*const Cell`;
+    /// a null optional is returned unchanged. Only ever reached under
+    /// `clone_on_share_active` and guarded by `valuePointsToInlineHeaderCell(V)`,
+    /// so it is comptime-elided everywhere else.
+    pub inline fn cloneInlineHeaderCellForShare(comptime V: type, value: V) V {
+        const info = @typeInfo(V);
+        switch (info) {
+            .optional => {
+                const inner = value orelse return value;
+                // `Cell.cloneForShare` takes `?*const Cell` and returns
+                // `?*const Cell`; coercing the unwrapped `*const Cell` in and
+                // the optional result back out keeps the static type `V`.
+                return inner.cloneForShare();
+            },
+            .pointer => return value.cloneForShare().?,
+            else => @compileError("cloneInlineHeaderCellForShare expects a pointer-to-inline-header-cell value"),
+        }
+    }
+
     /// Element type of an Arc value pointer. The ZIR backend calls every
     /// public release helper with `(allocator, ptr)` — Zig's call-site
     /// inference cannot recover a `comptime T` slot from runtime arguments,
@@ -5285,24 +5339,31 @@ pub const ArcRuntime = struct {
                 if (p.size == .one) {
                     if (comptime hasInlineArcHeader(p.child)) {
                         // An inline-header List/Map-class cell (a captured
-                        // `List(t)` / `Map(k, v)`). These carry their own
-                        // structural sharing (buffers, chains) that a generic
-                        // field-walk cannot duplicate, so the cloned env keeps
-                        // the SAME cell pointer and instead registers a new
-                        // persistent owner via the cell's refcount. This is
-                        // balanced under BOTH managers:
+                        // `List(t)` / `Map(k, v)`, or a cell stored into a struct
+                        // field) carries its own structural sharing (buffers,
+                        // chains) a generic field-walk cannot duplicate.
+                        //   * clone-on-share (Tracking) — the cell has no
+                        //     refcount, so a second owner aliasing the SAME
+                        //     buffer is unsound: an in-place mutation / grow-free
+                        //     on one owner corrupts the other (the
+                        //     `generic_list_test` aliased-original UAF). Hand the
+                        //     new owner an INDEPENDENT deep clone via the cell's
+                        //     `cloneForShare`, so each owner uniquely owns its
+                        //     buffer and `List`/`Map.release` frees exactly one.
+                        if (comptime clone_on_share_active and valuePointsToInlineHeaderCell(FieldType)) {
+                            field_ptr.* = cloneInlineHeaderCellForShare(FieldType, field_ptr.*);
+                            return;
+                        }
+                        // Every other model keeps the SAME cell pointer and
+                        // registers a new persistent owner via the cell's
+                        // refcount. Balanced:
                         //   * REFCOUNT_V1 — `retainAnyPersistent` bumps the
-                        //     cell's refcount, so the cloned env is a real
-                        //     second owner the last drop reclaims.
-                        //   * no-REFCOUNT_V1 — the bump is a no-op, BUT an
-                        //     inline-header cell is never eagerly freed under
-                        //     no-REFCOUNT_V1 (`ArcHeaderEmpty.release` always
-                        //     returns false; the cell is reclaimed at teardown,
-                        //     not per-drop), so two envs aliasing the same cell
-                        //     cannot double-free it. Unlike a boxed-existential
-                        //     inner — which IS eagerly freed and so must be
-                        //     cloned — a shared List/Map child is sound to
-                        //     alias here.
+                        //     cell's refcount, so the cloned env is a real second
+                        //     owner the last drop reclaims.
+                        //   * bulk_or_never / traced — the bump is a no-op, and
+                        //     the cell is reclaimed in bulk / never / via
+                        //     tracing, so two envs aliasing the same cell never
+                        //     double-free it.
                         retainAnyPersistent(@as(*const p.child, @constCast(field_ptr.*)));
                         return;
                     }
@@ -6013,11 +6074,18 @@ pub const ArcRuntime = struct {
             .pointer => |p| {
                 if (comptime p.size != .one) return value;
                 if (comptime hasInlineArcHeader(p.child)) {
-                    // Inline-header List/Map cell: never eagerly freed under
-                    // no-REFCOUNT_V1, so two owners aliasing it cannot
-                    // double-free. Keep the SAME pointer (same rule as
-                    // `cloneFieldChildInPlace`); the persistent retain that
-                    // `shareAnyPersistent` issues is the second owner.
+                    // Inline-header List/Map cell. Under clone-on-share a second
+                    // owner must get an INDEPENDENT deep clone of the buffer —
+                    // the cell has no refcount, so aliasing the SAME buffer lets
+                    // one owner's in-place mutation / grow-free corrupt the
+                    // other (the `generic_list_test` aliased-original UAF). The
+                    // cell's `cloneForShare` deep-clones the buffer (recursively
+                    // cloning eagerly-freed element children, aliasing reclaim-
+                    // at-teardown ones). Comptime-guarded so a cell type lacking
+                    // `cloneForShare` (none today) would fall through.
+                    if (comptime valuePointsToInlineHeaderCell(V)) {
+                        return cloneInlineHeaderCellForShare(V, value);
+                    }
                     return value;
                 }
                 // Indirect-storage / side-table ARC struct: allocate an
@@ -6072,6 +6140,15 @@ pub const ArcRuntime = struct {
     /// `.protocol_box_share` lowering rebinds to `<Protocol>VTable.share`.
     pub inline fn shareAnyPersistent(value: anytype) @TypeOf(value) {
         const V = @TypeOf(value);
+        // A persistent share of an inline-header `List`/`Map` cell must deep-
+        // clone its backing buffer under clone-on-share (the cell has no
+        // refcount, so a second owner aliasing the SAME buffer is a mutate/
+        // free-out-from-under hazard — `generic_list_test`). This is unioned
+        // with the eagerly-freed-child case so a `[String]` (buffer to clone,
+        // no eager child) is handled alongside a `[fn..]` (eager child).
+        if (comptime clone_on_share_active and valuePointsToInlineHeaderCell(V)) {
+            return cloneInlineHeaderCellForShare(V, value);
+        }
         if (comptime clone_on_share_active and elementHasEagerlyFreedChild(V)) {
             return cloneEagerChildValue(V, std.heap.c_allocator, value);
         }
@@ -6701,6 +6778,35 @@ pub fn List(comptime T: type) type {
                 new_data[i] = ownElement(old_data[i]);
             }
             return fresh;
+        }
+
+        /// Clone-on-share entry for an inline-header `List` cell under the
+        /// `INDIVIDUAL_NO_REFCOUNT` + `CLONE_ON_SHARE` (Tracking) model.
+        ///
+        /// A `List` cell has no refcount under this model, so a persistent
+        /// second owner (a binding alias `b = a`, a list stored into a struct
+        /// field or another collection, a closure capture) cannot be expressed
+        /// as a `+1`. Aliasing the SAME backing buffer is unsound: an in-place
+        /// `set`/`push`/`pop` on one owner (`mutationMayMoveInPlace` is always
+        /// `true` here) mutates — or, on a grow, `bufferFreeShallow`-frees — the
+        /// buffer the other owner still references (a use-after-free; the exact
+        /// `generic_list_test` aliased-original corruption). So every share
+        /// hands the new owner an INDEPENDENT deep clone: each owner uniquely
+        /// owns its buffer, in-place mutation stays sound, and `List.release`
+        /// frees exactly one buffer per owner — no double-free, no leak.
+        ///
+        /// Element children follow the same rule as `cloneBufferRetainingChildren`
+        /// via `ownElement`: an eagerly-freed child (a boxed `Callable`, an
+        /// indirect-storage cell) is itself deep-cloned so the clone shares no
+        /// descendant; a reclaim-at-teardown child (`String` arena slice,
+        /// scalar, nested inline-header cell) is bit-copied (the buffer is the
+        /// only newly-owned allocation). The whole helper is only ever reached
+        /// under `clone_on_share_active` — see `ArcRuntime.shareAnyPersistent`
+        /// and the inline-header arms of `cloneEagerChildValue` /
+        /// `cloneFieldChildInPlace` / `ownElement` that dispatch here.
+        pub fn cloneForShare(vec: ?*const Self) ?*const Self {
+            const v = vec orelse return null;
+            return cloneBufferRetainingChildren(v, if (v.cap == 0) 1 else v.cap);
         }
 
         /// Clone WITHOUT retaining element children. Used on the
@@ -7706,6 +7812,19 @@ pub fn List(comptime T: type) type {
             // tracing reclaims via collection), so no clone is needed and the
             // walk is elided — zero overhead. Under REFCOUNTED the refcount
             // bump (`retainElement`) handles the second owner.
+            //
+            // A nested inline-header element (`[[String]]`, `[Map(_, _)]`) is
+            // itself a buffer-owning cell with no refcount: a second owner of
+            // the element must get its own buffer or the two owners' releases /
+            // in-place mutations collide. `cloneForShare` deep-clones it. This
+            // is the element-level mirror of the `shareAnyPersistent` /
+            // `cloneFieldChildInPlace` inline-header arms; checked first so a
+            // cell element (which may ALSO have an eagerly-freed grandchild) is
+            // cloned by its own `cloneForShare` (which recurses) rather than the
+            // generic child-walk.
+            if (comptime clone_on_share_active and ArcRuntime.valuePointsToInlineHeaderCell(T)) {
+                return ArcRuntime.cloneInlineHeaderCellForShare(T, value);
+            }
             if (comptime eager_individual_free and ArcRuntime.elementHasEagerlyFreedChild(T)) {
                 var owned: T = value;
                 ArcRuntime.cloneChildrenAnyInPlace(T, std.heap.c_allocator, &owned);
@@ -13589,6 +13708,46 @@ pub fn Map(comptime K: type, comptime V: type) type {
             release(@as(?*const Self, ptr));
         }
 
+        /// Clone-on-share entry for an inline-header `Map` cell under the
+        /// `INDIVIDUAL_NO_REFCOUNT` + `CLONE_ON_SHARE` (Tracking) model — the
+        /// exact `List.cloneForShare` analog. A persistent second owner gets an
+        /// INDEPENDENT deep clone of the buffer (deep-cloning eagerly-freed K/V
+        /// children via `cloneBufferRetainingChildren`'s `retainEntryKey` /
+        /// `retainEntryValue`, which under `clone_on_share_active` clone rather
+        /// than bump) so each owner uniquely owns its buffer: in-place mutation
+        /// stays sound and `Map.release` frees exactly one buffer per owner.
+        /// Only reached under `clone_on_share_active`.
+        pub fn cloneForShare(map: ?*const Self) ?*const Self {
+            const m = map orelse return null;
+            // A `MapIter` cell (`capacity == 0`) is never a persistent owner of
+            // a user-visible Map value, so the share path never reaches one;
+            // assert the invariant rather than silently mis-cloning.
+            std.debug.assert(m.capacity != 0);
+            const fresh = bufferAlloc(m.capacity, m.hash_seed, @returnAddress()) orelse return null;
+            incrementRuntimeStatCounter(&dense_map_retaining_clone_total);
+            addRuntimeStatCounter(&dense_map_retaining_clone_bytes, bufferSize(m.capacity, m.capacity));
+            const old_entries = m.entriesPtr();
+            const new_entries = fresh.entriesPtr();
+            for (0..m.len) |i| {
+                new_entries[i] = old_entries[i];
+                // Deep-OWN each K/V (not a bare retain): a boxed-`Callable` value
+                // or an inline-header collection value must be an INDEPENDENT
+                // owner in the clone, or the two cells' releases double-free the
+                // shared inner. `ownEntryKey`/`ownEntryValue` clone eagerly-freed
+                // children and inline-header cells under clone-on-share; under
+                // REFCOUNTED they bump the refcount (byte-identical to a retain).
+                new_entries[i].key = ownEntryKey(new_entries[i].key);
+                new_entries[i].value = ownEntryValue(new_entries[i].value);
+            }
+            fresh.len = m.len;
+            const old_buckets = m.bucketsPtr();
+            const new_buckets = fresh.bucketsPtr();
+            for (0..m.capacity) |i| {
+                new_buckets[i] = old_buckets[i];
+            }
+            return fresh;
+        }
+
         // -------------------------------------------------------------------
         // Clone helpers (deep-retain-children vs move-children)
         // -------------------------------------------------------------------
@@ -14251,12 +14410,39 @@ pub fn Map(comptime K: type, comptime V: type) type {
         ///     everything reclaimed-at-teardown (inline-header cells, arena
         ///     slices, scalars) aliased — the same rule `List.ownElement` uses.
         ///     Comptime-elided for value types with no eagerly-freed child.
+        /// Produce an INDEPENDENTLY-OWNED copy of a map KEY for a new owner —
+        /// the key-side mirror of `ownEntryValue`, used by the share clone
+        /// (`cloneForShare`). Keys are usually atoms/scalars/`String` slices
+        /// (no eagerly-freed child, no buffer), so this comptime-elides to a
+        /// bare `retainEntryKey` for them; it deep-clones only when a key type
+        /// carries an eagerly-freed child or is itself an inline-header cell.
+        inline fn ownEntryKey(key: K) K {
+            if (comptime clone_on_share_active and ArcRuntime.valuePointsToInlineHeaderCell(K)) {
+                return ArcRuntime.cloneInlineHeaderCellForShare(K, key);
+            }
+            if (comptime clone_on_share_active and ArcRuntime.elementHasEagerlyFreedChild(K)) {
+                var owned: K = key;
+                ArcRuntime.cloneChildrenAnyInPlace(K, std.heap.c_allocator, &owned);
+                return owned;
+            }
+            retainEntryKey(key);
+            return key;
+        }
+
         inline fn ownEntryValue(value: V) V {
             // Clone-on-share is the CLONE_ON_SHARE axis of the
             // INDIVIDUAL_NO_REFCOUNT (Tracking) model only — see
             // `List.ownElement`. Under BULK_OR_NEVER / TRACED the extracted
             // owner aliases the source inner (no clone, zero overhead); under
             // REFCOUNTED the refcount bump (`retainEntryValue`) handles it.
+            //
+            // A nested inline-header value (`Map(_, [String])`, `Map(_, Map(_, _))`)
+            // is itself a buffer-owning cell with no refcount; the extracted
+            // owner gets its own buffer via `cloneForShare` — the value-level
+            // mirror of `List.ownElement`'s inline-header arm.
+            if (comptime clone_on_share_active and ArcRuntime.valuePointsToInlineHeaderCell(V)) {
+                return ArcRuntime.cloneInlineHeaderCellForShare(V, value);
+            }
             if (comptime eager_individual_free and ArcRuntime.elementHasEagerlyFreedChild(V)) {
                 var owned: V = value;
                 ArcRuntime.cloneChildrenAnyInPlace(V, std.heap.c_allocator, &owned);
