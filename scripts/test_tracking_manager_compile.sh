@@ -12,13 +12,17 @@
 #      expected location.
 #   3. Is accepted by `src/memory/driver.zig`'s symbol/section validator
 #      (the same code path the build driver uses at link time).
-#   4. The section's `declared_caps` field is **0** — Tracking declares
-#      no capabilities (Phase 7 ships a CI diagnostic manager whose
-#      purpose is to detect leaks, use-after-free, and out-of-bounds
-#      writes through canary bytes and per-allocation hash-map
-#      bookkeeping). This matches the Arena/Leak managers' declared_caps
-#      signature; the difference is intent — Tracking wraps an inner
-#      allocator with diagnostic checks.
+#   4. The section's `declared_caps` field is **0x2** — Tracking declares
+#      the INDIVIDUAL_NO_REFCOUNT reclamation model with the default
+#      CLONE_ON_SHARE sharing strategy (capability-driven memory model, see
+#      `src/memory/abi.zig`). It does NOT declare REFCOUNT_V1 (bit 0 clear);
+#      the value is the free-model selector (Axis-A field 0b01 in bits 1..2),
+#      not a refcount capability. Tracking is a CI diagnostic manager whose
+#      purpose is to detect leaks, use-after-free, and out-of-bounds writes
+#      through canary bytes and per-allocation hash-map bookkeeping; the
+#      INDIVIDUAL_NO_REFCOUNT model tells the compiler to emit per-allocation
+#      individual frees (so the manager observes balanced alloc/free pairs)
+#      rather than the bulk/never elision Arena/Leak declare (0x0).
 #
 # This is the Phase 7 Tracking counterpart of `test_leak_manager_compile.sh`
 # (Phase 7 Leak), `test_arena_manager_compile.sh` (Phase 5 Arena),
@@ -35,7 +39,7 @@
 #   ./scripts/test_tracking_manager_compile.sh
 #
 # Exit codes:
-#   0 — symbol found, section present, declared_caps == 0
+#   0 — symbol found, section present, declared_caps == 0x2
 #   1 — symbol missing, section absent, or declared_caps wrong (test failure)
 #   2 — toolchain not available or build failed (environment issue)
 
@@ -250,7 +254,7 @@ esac
 # both ELF and Mach-O hosts.
 # ---------------------------------------------------------------------------
 
-echo ">>> Verifying declared_caps == 0 (Tracking declares no capabilities)..."
+echo ">>> Verifying declared_caps == 0x2 (Tracking declares INDIVIDUAL_NO_REFCOUNT / CLONE_ON_SHARE)..."
 
 SECTION_PAYLOAD="$TMPDIR_PATH/zapmem.bin"
 
@@ -298,21 +302,25 @@ extract_section() {
 }
 
 if extract_section; then
-    # Read all 8 bytes of declared_caps starting at offset 16. We
-    # accept the test only when every byte is zero — any non-zero bit
-    # in `declared_caps` would mean the Tracking manager is
-    # advertising a capability it does not implement, which spec §3.5
-    # makes a build-time error.
+    # Read all 8 bytes of declared_caps starting at offset 16. The
+    # capability-driven memory model (src/memory/abi.zig) makes Tracking's
+    # reclamation model INDIVIDUAL_NO_REFCOUNT with the default CLONE_ON_SHARE
+    # sharing strategy — Axis-A field 0b01 in bits 1..2, bit 0 (REFCOUNT_V1)
+    # clear, bit 3 (MOVE_ONLY) clear — i.e. `declared_caps == 0x2`, which is
+    # the little-endian byte sequence `02 00 00 00 00 00 00 00`. (Tracking does
+    # NOT declare REFCOUNT_V1; the non-zero value is the free-model selector,
+    # not a refcount capability, so spec §3.5's "advertised-but-unimplemented
+    # capability" rule is not tripped.)
     DECLARED_CAPS_HEX=$(od -A n -j 16 -N 8 -t x1 "$SECTION_PAYLOAD" | tr -d ' \n')
     if [ -z "$DECLARED_CAPS_HEX" ]; then
         echo "ERROR: failed to read declared_caps bytes from section payload." >&2
         exit 1
     fi
-    if [ "$DECLARED_CAPS_HEX" = "0000000000000000" ]; then
-        echo "    OK: declared_caps == 0 (raw bytes: $DECLARED_CAPS_HEX)"
+    if [ "$DECLARED_CAPS_HEX" = "0200000000000000" ]; then
+        echo "    OK: declared_caps == 0x2 (INDIVIDUAL_NO_REFCOUNT / CLONE_ON_SHARE; raw bytes: $DECLARED_CAPS_HEX)"
     else
-        echo "ERROR: declared_caps is non-zero (raw bytes: $DECLARED_CAPS_HEX)." >&2
-        echo "       Expected the Tracking manager to declare zero capabilities." >&2
+        echo "ERROR: declared_caps is not 0x2 (raw bytes: $DECLARED_CAPS_HEX)." >&2
+        echo "       Expected the Tracking manager to declare INDIVIDUAL_NO_REFCOUNT / CLONE_ON_SHARE (0x2)." >&2
         exit 1
     fi
 
