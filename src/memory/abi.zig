@@ -51,6 +51,145 @@ pub const REFC_TAG: u32 = std.mem.readInt(u32, "REFC", builtin.target.cpu.arch.e
 /// `REFCOUNT_V1` bit in `declared_caps` (spec section 7.1). Bit 0.
 pub const REFCOUNT_V1_BIT: u64 = 0x0000_0000_0000_0001;
 
+// ===========================================================================
+// Capability axes in `declared_caps` (capability-driven memory model).
+//
+// `declared_caps` is a structured `u64`. Beyond the single `REFCOUNT_V1`
+// capability flag (bit 0), the value encodes two orthogonal *axes* that the
+// compiler reads — never the manager's name — to gate memory-op codegen:
+//
+//   bit  0      : REFCOUNT_V1 capability flag (the historical refcounted
+//                 signal). Set iff the manager implements the refcount vtable.
+//   bits 1..2   : Axis A — reclamation model (the FREE-MODEL selector, a
+//                 2-bit field). Only consulted when bit 0 is clear; when bit 0
+//                 is set the model is REFCOUNTED and this field MUST be the
+//                 REFCOUNTED encoding (`0b00`).
+//   bit  3      : Axis B — sharing strategy. Only meaningful when Axis A ==
+//                 INDIVIDUAL_NO_REFCOUNT.
+//   bits 4..63  : reserved (must be zero; rejected at build).
+//
+// ---------------------------------------------------------------------------
+// Axis A — reclamation model (mutually exclusive). Four models:
+//
+//   | Model                  | bit 0 | bits 1..2 | declared_caps |
+//   |------------------------|-------|-----------|---------------|
+//   | REFCOUNTED             |   1   |   0b00    | 0x1           |
+//   | BULK_OR_NEVER          |   0   |   0b00    | 0x0           |
+//   | INDIVIDUAL_NO_REFCOUNT |   0   |   0b01    | 0x2           |
+//   | TRACED                 |   0   |   0b10    | 0x4           |
+//   | (reserved)             |   0   |   0b11    | 0x6           |
+//
+// REFCOUNTED is signalled by **bit 0** (the canonical refcount capability
+// flag), with the Axis-A field held at its zero encoding (`0b00`). This is
+// what keeps the model byte-compatible with the pre-axes ABI: `Memory.ARC`
+// stays `declared_caps = 0x1` and every other v1.0 manager that declared
+// `0x0` is, by construction, BULK_OR_NEVER (bit 0 clear, field `0b00`) — the
+// strictly-conservative "elide all individual frees" model. The Axis-A field
+// is therefore a *free-model* selector consulted only when bit 0 is clear; its
+// `0b00` value means "bulk/never free" (the safe default for a non-refcounted
+// manager). `reclamationModel`/`shouldEmitRefcountOps` in
+// `src/memory/elision.zig` are the single source of truth for the decode and
+// are proven to return numerically identical results to the pre-axes
+// `(caps & REFCOUNT_V1_BIT) != 0` gate for every value a v1.0 manager could
+// declare (see the elision unit tests).
+//
+// The `0b11` Axis-A code is reserved (no model assigned) and rejected at
+// build by `driver.zig`'s axis-aware validation; it exists only so the 2-bit
+// field has a defined forward-compatible "unknown model" slot.
+//
+// ---------------------------------------------------------------------------
+// Axis B — sharing strategy (only when Axis A == INDIVIDUAL_NO_REFCOUNT):
+//
+//   | Strategy        | bit 3 | meaning                                      |
+//   |-----------------|-------|----------------------------------------------|
+//   | CLONE_ON_SHARE  |   0   | a persistent second owner gets a deep clone  |
+//   | MOVE_ONLY       |   1   | sharing forbidden; ownership strictly moves  |
+//
+// Bit 3 set when Axis A != INDIVIDUAL_NO_REFCOUNT is an inconsistent combo
+// and is rejected at build.
+//
+// ABI: this is a pure reinterpretation of bits inside the existing `u64`
+// `declared_caps` field — no struct layout, offset, or fork C-ABI change.
+// ===========================================================================
+
+/// Bit position of the low bit of the Axis-A (reclamation-model) field within
+/// `declared_caps`. The field is `RECLAMATION_MODEL_MASK` wide starting here.
+pub const RECLAMATION_MODEL_SHIFT: u6 = 1;
+
+/// Width mask (pre-shift) of the Axis-A reclamation-model field: 2 bits.
+pub const RECLAMATION_MODEL_MASK: u64 = 0b11;
+
+/// The Axis-A reclamation-model field, shifted into place within
+/// `declared_caps` (bits 1..2). Used by validation to isolate the field.
+pub const RECLAMATION_MODEL_FIELD_MASK: u64 = RECLAMATION_MODEL_MASK << RECLAMATION_MODEL_SHIFT;
+
+/// Axis-A encoding (pre-shift, 2-bit) — REFCOUNTED. Carried by `Memory.ARC`
+/// together with `REFCOUNT_V1_BIT`. Numerically `0b00`, so an ARC manager's
+/// `declared_caps` is `REFCOUNT_V1_BIT | (RECLAMATION_REFCOUNTED << SHIFT)`
+/// `== 0x1` (byte-identical to the pre-axes ABI).
+pub const RECLAMATION_REFCOUNTED: u64 = 0b00;
+
+/// Axis-A encoding (pre-shift, 2-bit) — BULK_OR_NEVER. Bulk free at program
+/// exit (Arena) or never free (NoOp/Leak); individual frees are elided. This
+/// is the field's zero value, so a non-refcounted manager declaring `0x0`
+/// resolves to BULK_OR_NEVER.
+pub const RECLAMATION_BULK_OR_NEVER: u64 = 0b00;
+
+/// Axis-A encoding (pre-shift, 2-bit) — INDIVIDUAL_NO_REFCOUNT. Static
+/// free-at-last-use, no refcount header (Tracking). Pairs with Axis B.
+pub const RECLAMATION_INDIVIDUAL_NO_REFCOUNT: u64 = 0b01;
+
+/// Axis-A encoding (pre-shift, 2-bit) — TRACED. Tracing GC reclaims; codegen
+/// reuses the BULK_OR_NEVER elision (no retain/release/free, no header).
+/// Reserved-and-rejected at build until the GC manager ships (plan Phase 5).
+pub const RECLAMATION_TRACED: u64 = 0b10;
+
+/// Axis-A encoding (pre-shift, 2-bit) — reserved/unknown model. No reclamation
+/// model is assigned to `0b11`; the build rejects any manager declaring it.
+pub const RECLAMATION_RESERVED: u64 = 0b11;
+
+/// `declared_caps` value for a fully-declared BULK_OR_NEVER manager
+/// (Arena/NoOp/Leak): bit 0 clear, Axis-A field `0b00`. Equals `0x0`.
+pub const CAPS_BULK_OR_NEVER: u64 = RECLAMATION_BULK_OR_NEVER << RECLAMATION_MODEL_SHIFT;
+
+/// `declared_caps` value for a fully-declared INDIVIDUAL_NO_REFCOUNT manager
+/// with the default `CLONE_ON_SHARE` sharing strategy (Tracking). Equals `0x2`.
+pub const CAPS_INDIVIDUAL_NO_REFCOUNT: u64 = RECLAMATION_INDIVIDUAL_NO_REFCOUNT << RECLAMATION_MODEL_SHIFT;
+
+/// `declared_caps` value for a REFCOUNTED manager (`Memory.ARC`): the
+/// REFCOUNT_V1 capability flag plus the REFCOUNTED Axis-A encoding. Equals
+/// `0x1` — byte-identical to the pre-axes ABI so the host runtime default and
+/// every ARC build are unchanged.
+pub const CAPS_REFCOUNTED: u64 = REFCOUNT_V1_BIT | (RECLAMATION_REFCOUNTED << RECLAMATION_MODEL_SHIFT);
+
+/// Axis-B sharing-strategy bit within `declared_caps` (bit 3). Clear =
+/// `CLONE_ON_SHARE` (default), set = `MOVE_ONLY`. Only meaningful when Axis A
+/// == INDIVIDUAL_NO_REFCOUNT.
+pub const SHARING_MOVE_ONLY_BIT: u64 = 0x0000_0000_0000_0008;
+
+/// Mask of every `declared_caps` bit that carries a defined meaning in the
+/// capability model: the REFCOUNT_V1 flag (bit 0), the Axis-A field (bits
+/// 1..2), and the Axis-B bit (bit 3). Any bit OUTSIDE this mask is reserved
+/// and rejected at build. Bits 4..63 = `0xFFFF_FFFF_FFFF_FFF0`.
+pub const KNOWN_CAPS_MASK: u64 =
+    REFCOUNT_V1_BIT | RECLAMATION_MODEL_FIELD_MASK | SHARING_MOVE_ONLY_BIT;
+
+comptime {
+    // The defined axes must occupy bits 0..3 and nothing else.
+    if (KNOWN_CAPS_MASK != 0x0000_0000_0000_000F) @compileError(
+        "abi: KNOWN_CAPS_MASK must cover exactly bits 0..3 (REFCOUNT_V1 | Axis-A field | Axis-B)",
+    );
+    if (RECLAMATION_MODEL_FIELD_MASK != 0x6) @compileError(
+        "abi: RECLAMATION_MODEL_FIELD_MASK must be bits 1..2 (0x6)",
+    );
+    if (CAPS_REFCOUNTED != REFCOUNT_V1_BIT) @compileError(
+        "abi: a REFCOUNTED manager's declared_caps must equal REFCOUNT_V1_BIT (0x1) to stay byte-identical to the pre-axes ABI",
+    );
+    if (CAPS_BULK_OR_NEVER != 0) @compileError(
+        "abi: BULK_OR_NEVER must be the all-zero declared_caps value (0x0)",
+    );
+}
+
 /// `.zapmem` metadata header. Spec section 3.5. The exact 32-byte
 /// layout is normative for ABI v1.0; the `comptime` assertion below
 /// guards against accidental drift.
@@ -349,4 +488,34 @@ test "REFC_TAG round-trips through native endian" {
 
 test "REFCOUNT_V1_BIT is bit 0" {
     try std.testing.expectEqual(@as(u64, 1), REFCOUNT_V1_BIT);
+}
+
+test "capability-axis bit assignments" {
+    // Axis-A field occupies bits 1..2.
+    try std.testing.expectEqual(@as(u6, 1), RECLAMATION_MODEL_SHIFT);
+    try std.testing.expectEqual(@as(u64, 0b11), RECLAMATION_MODEL_MASK);
+    try std.testing.expectEqual(@as(u64, 0x6), RECLAMATION_MODEL_FIELD_MASK);
+    // Axis-B is bit 3.
+    try std.testing.expectEqual(@as(u64, 0x8), SHARING_MOVE_ONLY_BIT);
+    // The defined axes cover exactly bits 0..3.
+    try std.testing.expectEqual(@as(u64, 0x0000_0000_0000_000F), KNOWN_CAPS_MASK);
+}
+
+test "capability-axis declared_caps values" {
+    // REFCOUNTED is byte-identical to the pre-axes ABI (bit 0 only).
+    try std.testing.expectEqual(@as(u64, 0x1), CAPS_REFCOUNTED);
+    try std.testing.expectEqual(REFCOUNT_V1_BIT, CAPS_REFCOUNTED);
+    // BULK_OR_NEVER is the all-zero value (Arena/NoOp/Leak).
+    try std.testing.expectEqual(@as(u64, 0x0), CAPS_BULK_OR_NEVER);
+    // INDIVIDUAL_NO_REFCOUNT with default CLONE_ON_SHARE (Tracking) is 0x2.
+    try std.testing.expectEqual(@as(u64, 0x2), CAPS_INDIVIDUAL_NO_REFCOUNT);
+    // The Axis-A field of each value decodes as expected.
+    try std.testing.expectEqual(
+        RECLAMATION_REFCOUNTED,
+        (CAPS_REFCOUNTED >> RECLAMATION_MODEL_SHIFT) & RECLAMATION_MODEL_MASK,
+    );
+    try std.testing.expectEqual(
+        RECLAMATION_INDIVIDUAL_NO_REFCOUNT,
+        (CAPS_INDIVIDUAL_NO_REFCOUNT >> RECLAMATION_MODEL_SHIFT) & RECLAMATION_MODEL_MASK,
+    );
 }

@@ -1,0 +1,181 @@
+# Capability-Driven, Manager-Agnostic Memory Codegen — Implementation Plan
+
+Status: **proposed, awaiting approval.** Branch `feat/error-system-deflate`.
+
+## Principle (non-negotiable)
+
+Memory management in Zap is **pluggable**: `Memory.ARC`, `Memory.Tracking`, `Memory.Arena`,
+`Memory.NoOp`, `Memory.Leak`, and arbitrary **custom** managers (`impl Memory.Manager for X`).
+The compiler must run a **manager-agnostic** ownership/lifetime analysis and gate every memory
+operation on **adapter-declared capabilities** — **never** on a manager name and **never** by
+hardcoding one manager's strategy. (CLAUDE.md: "implement features in Zap code; never hardcode
+behavior in the compiler.")
+
+## The bug this fixes
+
+The compiler's capability model is a **coarse binary** — `REFCOUNT_V1` (declared only by ARC)
+vs. nothing — funnelled through `src/memory/elision.zig` `shouldEmitRefcountOps(caps)`. But
+`no-REFCOUNT_V1` lumps **three incompatible free-models**:
+
+- **Tracking** — individual free, no refcount (sharing → double-free hazard).
+- **Arena** — bulk free (individual frees are no-ops; reclaim at program exit).
+- **NoOp / Leak** — never free individually.
+
+Several codegen sites (`emit_share_under_no_refcount`, `emit_deep_walk_under_no_refcount`, the
+runtime `shareAnyPersistent`/eager-deep-walk, the recent clone-on-share commits) gate on
+*absence of `REFCOUNT_V1`* and therefore impose **Tracking's individual-free + clone-on-share
+strategy on Arena/NoOp/Leak** — exactly the hardcoding the principle forbids. Today Arena/NoOp
+**panic on first refcount dispatch** (the planned "Phase 6" elision is unbuilt).
+
+## Capability model (the missing axis)
+
+Adapters declare a structured `u64` `declared_caps` (`src/memory/abi.zig`
+`ZapMemoryManagerMetaV1`, offset 16; only bit 0 = `REFCOUNT_V1` defined; bits 1–9 reserved).
+Add:
+
+**Axis A — reclamation model** (mutually exclusive; proposed bits 1–2):
+
+| Value | Managers | Codegen |
+|---|---|---|
+| `REFCOUNTED` | ARC | retain/release dispatch, free-at-0, inline `ArcHeader` |
+| `BULK_OR_NEVER` | Arena, NoOp, Leak | **elide** retain/release **and** individual free; no `ArcHeader` |
+| `INDIVIDUAL_NO_REFCOUNT` | Tracking | elide refcount; **static free-at-last-use**; declared sharing strategy; no `ArcHeader` |
+| `TRACED` | GC (conservative, in scope) | **codegen ≡ `BULK_OR_NEVER`** (elide retain/release/free, no `ArcHeader`); the manager reclaims via tracing collection. **Immutability ⇒ no write barriers, ever.** A **conservative** collector (scan stack/registers/globals) needs **no compiler root-map/safepoint codegen** → the work is the manager backend. (Precise/generational GC adds compiler stack-maps + safepoints later — still no barriers.) |
+
+**Axis B — sharing strategy** (only when Axis A = `INDIVIDUAL_NO_REFCOUNT`; proposed bit 3):
+
+| Value | Meaning |
+|---|---|
+| `CLONE_ON_SHARE` | a persistent second owner gets an independent deep clone (Tracking default) |
+| `MOVE_ONLY` | sharing forbidden; ownership strictly moves (relies on move-analysis completeness) — deferred |
+
+`REFCOUNT_V1` (bit 0) implies Axis A = `REFCOUNTED` (validated at build; inconsistent combos
+rejected, mirroring `driver.zig`'s existing cap-mismatch rejection). Layout stays a **2-way**
+decision (header iff `REFCOUNTED`) — both non-refcounted models want no inline refcount header,
+so the ABI/offset surface only ever has two shapes.
+
+Mapping incl. custom: a custom manager **selects the axis values whose codegen contract it
+satisfies**; the compiler reads the bits, never the name. A tracing **GC** needs a new Axis-A
+value (`TRACED`) **plus write-barrier/root codegen that does not exist** → reserve the value,
+reject at build until built (forward-compat per ABI §4.2.4).
+
+## Adapter declaration mechanism (grounded in the done resolution path)
+
+Manager **resolution** is already done (zero-method `Memory.Manager` marker; backend resolved
+from the adapter's source file by package convention — `builder.zig`
+`resolveMemoryManagerBackendFromSourceGraph`). Capabilities are declared by the
+**convention-resolved backend `.zig`** (not the `.zap` marker — keeps "no manager names in the
+compiler"): each `src/memory/<x>/manager.zig` sets `declared_caps` in its `.zapmem` metadata.
+The value flows `driver.zig` (parse + validate) → `CompileOptions.declared_caps` →
+`ZirDriver.declared_caps` → the runtime-source rewrite (`RUNTIME_DECLARED_CAPS_DEFAULT`).
+Add the queries to `src/memory/elision.zig` (the single source of truth): keep
+`shouldEmitRefcountOps` (now = Axis A == REFCOUNTED), add `reclamationModel(caps)` and
+`sharingStrategy(caps)`. Replace `driver.zig`'s blanket `reserved_mask = 0x3FE` rejection with
+axis-aware validation (accept defined Axis A/B bits; reject still-unknown bits; reject
+inconsistent combos).
+
+## Codegen-gating inventory (every decision site → capability-driven)
+
+- **`src/arc_materialize.zig` `materializeAnalysisArcOps` (the master switch)** — three-way:
+  `refcounted` → retain/release/reuse (today); `bulk_or_never` → emit none; `individual_no_refcount`
+  → static **free-at-last-use** (no retain, no reuse token).
+- **`src/zir_builder.zig`** — `shouldSkipArc`/`shouldEmitRefcountOps` (split three-way); retain
+  emission guard; `emit_share_under_no_refcount` (re-gate → `individual_no_refcount && clone_on_share`);
+  `emit_deep_walk_under_no_refcount` (re-gate → `individual_no_refcount`); protocol-box-drop
+  under no-refcount (three-way); the runtime-branch source emission.
+- **`src/arc_drop_insertion.zig`** — `.protocol_box_share` vs `.protocol_box_retain` (split so
+  clone is `individual_no_refcount && clone_on_share`, `bulk_or_never` neither).
+- **`src/arc_verifier.zig`** — accept all three models; do not flag elided ops as missing under
+  `bulk_or_never`.
+- **`src/runtime.zig`** — conditional layout (`ArcHeader`, keep 2-way); `shareAnyPersistent`/
+  `cloneInnerForShare` (three-way: refcount-bump / clone / identity-no-op); the eager deep-walk
+  (`releaseAndPoisonEagerChildren`/`releaseChildrenAny`/`freeAny`) three-way; introduce a comptime
+  `reclamation_model` from `runtime_declared_caps`.
+
+## Conditional layout + ABI
+
+Layout is already conditional and **stays 2-way** (header iff `REFCOUNTED`; `ArcHeaderEmpty` is
+0 bytes, so any non-refcounted manager already drops the header). No three-way layout, no fork
+C-ABI change (the `u64` `declared_caps` has room). New exercise: header-less **individual free**
+under Tracking — verify `freeAny`/`core.deallocate` size matches the header-less cell.
+
+## Static ownership + sharing (for `INDIVIDUAL_NO_REFCOUNT`)
+
+`arc_liveness.zig` already produces manager-agnostic, path-sensitive `last_use_sites` /
+`last_use_map` / `consume_share_sites` (CFG-aware transfer at calls/returns), and
+`arc_ownership.shouldMoveIntoOwnedConsume`. Under `refcounted` these drive *release-elision*;
+under `individual_no_refcount`, **invert the consumer**: at the proven last use of an owning
+local not transferred onward, emit a **free** (Perceus-without-refcount). Shared ownership is
+resolved by the declared Axis-B strategy: `CLONE_ON_SHARE` (deep clone the second owner —
+exactly the reverted commits' behavior, re-gated) or `MOVE_ONLY` (compile error on an
+unprovable share — deferred).
+
+## Revert + rebuild
+
+1. **Revert** `4a27388`, `bf91c8d`, `5be0101` (the mis-gated clone-on-share; reverse order).
+   ARC stays green (they touched only no-refcount paths); Tracking's recursive-struct double-free
+   SEGFAULT reappears transiently — accepted.
+2. **Keep** `cd7c85e` (erased-opaque-pointer type-classification guard — model-agnostic,
+   comptime-dead under ARC). **Re-gate** `bcd739c` (its no-refcount individual-free path is
+   Tracking semantics → move under `individual_no_refcount`).
+3. **Rebuild** clone-on-share + eager-deep-walk-free as `individual_no_refcount [&& clone_on_share]`
+   at the same sites, now reading the Axis queries (won't fire under Arena/NoOp/Leak).
+
+## Phased plan (each phase independently green; ARC green throughout)
+
+- **Phase 0 — capability model + queries (no behavior change).** Axis A/B bit constants
+  (`abi.zig`), `elision.zig` queries, axis-aware `driver.zig` validation, the 5 backends'
+  `declared_caps`, the `builder.zig` matrix + test helper. `shouldEmitRefcountOps` numerically
+  identical for ARC. Verify `zig build test` green + per-manager axis-mapping tests.
+- **Phase 1 — revert the 3 clone-on-share commits.** ARC green; Tracking SEGFAULT transiently back.
+- **Phase 2 — `bulk_or_never` = pure elision.** Re-gate all conflated sites so Arena/NoOp/Leak
+  elide retain/release AND individual free; runtime helpers no-op under it. Verify: Arena/NoOp/Leak
+  no longer panic; **zero retain/release in the ZIR** for an Arena build; ARC green.
+- **Phase 3 — `individual_no_refcount` = static free-at-last-use + clone-on-share (Tracking).**
+  New `arc_materialize` branch (free-at-last-use from `arc_liveness`); clone-on-share re-gated;
+  `bcd739c` free path re-gated; verifier accepts the model. Verify: recursive-struct fixture green
+  under Tracking; Tracking leak-detection green over the corpus; ARC green.
+- **Phase 4 — per-manager corpus + custom-manager test.** Lock in the verification matrix.
+- **Phase 5 — `TRACED` conservative GC manager (in scope).** Add `lib/memory/gc.zap` (zero-method
+  marker) + `src/memory/gc/manager.zig` (conservative stop-the-world mark-sweep: managed heap;
+  on threshold/OOM, conservatively scan stack + registers + globals for word-aligned heap
+  pointers, mark reachable, sweep unmarked; interior-pointer-aware; single-/stop-the-world). It
+  declares Axis A = `TRACED`, whose **codegen reuses Phase-2 `BULK_OR_NEVER` elision** (no
+  retain/release/free, no `ArcHeader`, alloc routes through the manager) — so the COMPILER needs
+  no new emission (immutability ⇒ no barriers; conservative ⇒ no root maps/safepoints). Verify: a
+  GC build runs to completion reclaiming garbage (a loop allocating-and-dropping stays bounded in
+  RSS, unlike NoOp/Leak); the corpus runs under GC; ARC green. (Precise GC = future.)
+
+## Verification matrix
+
+| Manager | Axis A / B | Assert | How |
+|---|---|---|---|
+| ARC | REFCOUNTED | byte-identical to today; corpus green | host + Zest, every phase |
+| Arena | BULK_OR_NEVER | runs, no panic; **zero retain/release ZIR ops**; bulk-free at exit | run + ZIR inspection |
+| NoOp | BULK_OR_NEVER | runs to first alloc → documented OOM; no refcount dispatch | NoOp build |
+| Leak | BULK_OR_NEVER | runs; no retain/release vtable refs | Leak build + symbol/ZIR check |
+| Tracking | INDIVIDUAL_NO_REFCOUNT / CLONE_ON_SHARE | corpus green under canary; no LEAK/INVALID-FREE/UAF; recursive-struct no double-free | Zest corpus under Tracking |
+| **custom** (test fixture) | declares own A/B | compiler reads caps, no name special-casing; codegen matches the declared axes | a custom backend declaring e.g. BULK_OR_NEVER → same codegen as Arena |
+
+## Risks
+
+ARC no-regression (highest — Axis A==REFCOUNTED must be byte-identical; host default keeps
+`REFCOUNT_V1`); move-analysis inversion (free-insertion + join-point correctness in the new
+`arc_materialize` branch — medium); custom-manager extensibility (axis enum must suffice; GC
+reserved-and-rejected); layout/ABI (low — stays 2-way); fork-touch (low — `u64` has room,
+ZIR-only). `zig build test` + `zap test` (ARC) green at every phase. NEVER `zig build zir-test`.
+
+## Decisions (defaults proposed; confirm before Phase 0)
+
+1. **Axis encoding** — Axis A (`REFCOUNTED`/`BULK_OR_NEVER`/`INDIVIDUAL_NO_REFCOUNT`) in bits 1–2,
+   Axis B (`CLONE_ON_SHARE`/`MOVE_ONLY`) in bit 3; shrink `reserved_mask`. Raw bits (not a FourCC
+   descriptor) — simpler, compiler reads static data only.
+2. **Tracking sharing default** = `CLONE_ON_SHARE` (matches the reverted behavior); `MOVE_ONLY` deferred.
+3. **GC/tracing** — **IN SCOPE** (user decision). Implemented as a **conservative stop-the-world
+   mark-sweep** manager: immutability ⇒ no write barriers; conservative root scan ⇒ no compiler
+   root-map/safepoint codegen; codegen reuses the `BULK_OR_NEVER` elision. The deliverable is a
+   `lib/memory/gc.zap` adapter + a conservative mark-sweep backend (`src/memory/gc/manager.zig`)
+   declaring `TRACED`. Precise/generational GC (compiler stack-maps + safepoints, still no
+   barriers) is a future enhancement on the same `TRACED` capability — out of scope for v1.
+4. **Conditional layout** — stays the existing 2-way header/no-header split; no per-type specialization.
+5. **`bcd739c`** — re-gate in the rebuild; **`cd7c85e`** untouched.
