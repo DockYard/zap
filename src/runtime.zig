@@ -5307,6 +5307,22 @@ pub const ArcRuntime = struct {
             }
             return;
         }
+        // Phase 6 lifecycle pairing: under a no-REFCOUNT_V1 manager
+        // (`Memory.Tracking`) this side-table / indirect-storage child was
+        // heap-promoted by the non-REFCOUNT_V1 branch of `allocAny`
+        // (`core.allocate`), so its matching free is `core.deallocate`
+        // after deep-walking ITS own owned children — exactly
+        // `freeAnyNonRefcountedImpl`. The refcount machinery below
+        // (side-table `release_sized`, v1.0 `release` slot) does not exist
+        // in this mode: dispatching through it would `@panic` ("active
+        // manager does not declare REFCOUNT_V1"). This mirrors the
+        // identical guard at the top of `releaseAny` / `freeAny`; the
+        // generic deep-walk reaches `releaseArcAny` for a `?*const T`
+        // recursive-struct / nested-Arc child via `releaseFieldChildAny`,
+        // so the no-refcount free path must be honored here too.
+        if (comptime !refcount_v1_active) {
+            return freeAnyNonRefcountedImpl(allocator, @as(?*const T, ptr));
+        }
         // Arc(T) side-table path. Dispatch through the active manager's
         // `release_sized` slot; on the zero-transition the manager
         // invokes the per-T `deep_walk` callback (which recursively
