@@ -73,6 +73,13 @@ run_clean aliased_fn_return_capturing.zap "110"
 run_clean aliased_fn_return_raising.zap "202"
 run_clean aliased_fn_return_alias_of_alias.zap "57"
 
+echo "== FCC Phase 5: boxed-path effect precision (Item 3) =="
+# 3(a): per-error-type rescue discrimination on the boxed path is precise.
+run_clean boxed_per_error_discrimination.zap "alpha-detail" "7"
+# 3(b): a CAPTURING returned raising closure invoked undischarged is
+# COMPILE-FLAGGED (not runtime-abort), like the bare-fn-ptr case.
+run_compile_error boxed_capturing_undischarged_flagged.zap "raises"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "FCC PHASE 5 ACCEPTANCE: ALL PASS"

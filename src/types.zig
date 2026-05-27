@@ -1931,6 +1931,26 @@ pub const TypeChecker = struct {
     /// signature. Entries are dedup'd by structural type equality.
     current_raises: std.ArrayListUnmanaged(TypeId) = .empty,
 
+    /// Phase 5 (effect precision — boxed-return CAPTURING undischarged flag).
+    /// Per-`Callable`-constraint-TypeId `raises` error row: the concrete error
+    /// types a closure of that boxed `Callable({A}, R)` instantiation can
+    /// raise. Populated when `closureStructCallableConstraint` builds the boxed
+    /// constraint for a `%__closure_N{...}` whose `call` body raises; consumed
+    /// at the boxed value-call site (`action(100)` → the `callableResultType`
+    /// arm of `inferCall`) to fold the row into `current_raises`, so an
+    /// UNDISCHARGED invocation in a `raises ()` function is compile-FLAGGED —
+    /// exactly like the bare-fn-ptr `raises_row` path. Keyed by the SHARED
+    /// constraint TypeId (the same instantiation the IR backend's per-
+    /// instantiation `raises` JOIN keys by `type_params`), so distinct closures
+    /// of the same `({A}, R)` shape contribute a conservative union — the
+    /// type-checker counterpart of that runtime JOIN (sound: it flags
+    /// undischarged exactly when the shared slot can raise). Bare-fn-ptr
+    /// returned closures carry their row on the `.function` type and never use
+    /// this. Rows are TypeChecker-owned slices freed at teardown. Robust to
+    /// `inferExpr` AST-pointer memoization: the constraint TypeId is stable, so
+    /// the first construction populates it and every value-call reads it.
+    boxed_callable_raises_row: std.AutoHashMapUnmanaged(TypeId, []const TypeId) = .empty,
+
     // Number of stdlib lines prepended (bindings in these lines are skipped for unused checks)
     stdlib_line_count: u32 = 0,
 
@@ -2060,6 +2080,9 @@ pub const TypeChecker = struct {
         self.type_var_scope.deinit();
         self.eager_helper_in_flight.deinit();
         self.alias_resolution_stack.deinit(self.allocator);
+        var boxed_row_it = self.boxed_callable_raises_row.valueIterator();
+        while (boxed_row_it.next()) |row| self.allocator.free(row.*);
+        self.boxed_callable_raises_row.deinit(self.allocator);
     }
 
     pub fn setAnalysisContext(self: *TypeChecker, context: *const escape_lattice.AnalysisContext, program: *const ir.Program) void {
@@ -8356,7 +8379,97 @@ pub const TypeChecker = struct {
 
         const borrowed = try self.applyCallOwnership(call.args, signature.toFunctionType());
         defer self.endBorrowedBindings(borrowed) catch {};
+
+        // Phase 5 (effect precision — boxed-return CAPTURING undischarged flag):
+        // when this call returns a BOXED capturing raising closure (the return
+        // type resolved to a `Callable` existential, not a bare `.function`
+        // fn-ptr), stash the returned closure's concrete `raises` row so the
+        // assignment that binds the call result records it per-binding. The
+        // bare-fn-ptr case carries its row on the `.function` return type and
+        // is handled at the value-call site directly; this transient is the
+        // boxed analog. Set LAST (after arg inference) so an outer RHS call
+        // wins over any nested-argument call.
         return signature.return_type;
+    }
+
+    /// Eagerly type-check a `__closure_N` closure struct's `call` method so its
+    /// inferred `raises` row populates `inferred_raises` regardless of the
+    /// struct-by-struct module ordering (the synthesized closure module is
+    /// ordered last, so a factory's CALLER may be checked before the closure's
+    /// own module). Guarded against re-entry via `eager_helper_in_flight`. The
+    /// sole intended side-effect is populating `inferred_raises` for
+    /// `<struct>.call/2`; two pieces of shared state that the body-check would
+    /// otherwise perturb are SNAPSHOTTED and RESTORED so this is otherwise
+    /// transparent:
+    ///   - the closure struct's `StructType` entry (the body-check resolves
+    ///     `self.<capture>` which can re-resolve a still-`any` capture field to
+    ///     UNKNOWN and CLOBBER the construction-site backfill — the Phase-3
+    ///     Edge-1 hazard); and
+    ///   - `current_raises` (the closure's raises must reach the ENCLOSING
+    ///     function only through the recorded boxed row at the value-call, not
+    ///     by leaking into the caller's accumulator here).
+    /// No-op when the struct/`call` cannot be resolved or is already in flight.
+    fn eagerlyCheckClosureStructCall(self: *TypeChecker, struct_name_id: ast.StringId) void {
+        if (self.eager_helper_in_flight.contains(struct_name_id)) return;
+        const struct_scope = self.graph.findStructScope(.{
+            .parts = &.{struct_name_id},
+            .span = .{ .start = 0, .end = 0 },
+        }) orelse return;
+        const interner_mut: *ast.StringInterner = @constCast(self.interner);
+        const call_name = interner_mut.intern("call") catch return;
+        const call_decl = self.lookupFunctionDecl(struct_scope, call_name, 2) orelse return;
+
+        // Snapshot the closure struct's StructType so a re-resolution of an
+        // `any` capture field cannot clobber the backfill (Edge-1 hazard).
+        const struct_type_id = self.graph.resolveTypeByName(struct_name_id);
+        const saved_struct_type: ?Type = if (struct_type_id) |tid|
+            (if (tid < self.store.types.items.len) self.store.types.items[tid] else null)
+        else
+            null;
+
+        // Snapshot the caller's live raises accumulator and scope.
+        const saved_raises_len = self.current_raises.items.len;
+        const prev_scope = self.current_scope;
+        self.current_scope = struct_scope;
+        defer self.current_scope = prev_scope;
+        self.eager_helper_in_flight.put(struct_name_id, {}) catch return;
+        defer _ = self.eager_helper_in_flight.remove(struct_name_id);
+
+        self.checkFunctionDecl(call_decl) catch {};
+
+        // Restore: trim any raises the closure body appended to the caller's
+        // accumulator, and restore the closure struct's backfilled type.
+        if (self.current_raises.items.len > saved_raises_len) {
+            self.current_raises.shrinkRetainingCapacity(saved_raises_len);
+        }
+        if (struct_type_id) |tid| {
+            if (saved_struct_type) |st| {
+                if (tid < self.store.types.items.len) self.store.types.items[tid] = st;
+            }
+        }
+    }
+
+    /// If `expr` is a `%__closure_N{...}` construction synthesized by the
+    /// escaping-closure desugar, return the closure struct's name id; else
+    /// null. The boxed-closure tail in a factory's return position.
+    fn tailClosureStructName(self: *const TypeChecker, expr: *const ast.Expr) ?ast.StringId {
+        if (expr.* != .struct_expr) return null;
+        const name = expr.struct_expr.struct_name;
+        if (name.parts.len != 1) return null;
+        const name_id = name.parts[name.parts.len - 1];
+        if (!self.isClosureStructName(name_id)) return null;
+        return name_id;
+    }
+
+    /// Resolve the inferred `raises` error row of a `__closure_N` closure
+    /// struct's `call` method (the closure body). The `Callable` protocol's
+    /// `call(self, arguments)` lowers to a 2-arity method, so the row is keyed
+    /// `"<struct>.call/2"` — the same key the IR backend reads. Returns null
+    /// when the struct has no recorded row (a pure closure).
+    fn closureStructCallRaisesRow(self: *const TypeChecker, struct_name_id: ast.StringId) ?[]const TypeId {
+        const struct_text = self.interner.get(struct_name_id);
+        const key = self.store.raisesRowKeyString(struct_text, "call", 2) orelse return null;
+        return self.store.inferred_raises.get(key);
     }
 
     fn inferCall(self: *TypeChecker, call: *const ast.CallExpr) !TypeId {
@@ -8417,6 +8530,22 @@ pub const TypeChecker = struct {
                         // `protocol_dispatch` through the box vtable.
                         if (self.callableResultType(prov.type_id)) |result_type| {
                             for (call.args) |arg| _ = try self.inferExpr(arg);
+                            // Phase 5 (effect precision — boxed-return CAPTURING
+                            // undischarged flag): invoking a BOXED `Callable`
+                            // value bound to a returned CAPTURING raising closure
+                            // folds that closure's recorded `raises` row into the
+                            // live row — so an undischarged invocation (no
+                            // `rescue`) in a function whose declared `raises` row
+                            // does not admit it is FLAGGED, exactly like the
+                            // bare-fn-ptr path above. Keyed by the SHARED
+                            // `Callable` constraint TypeId (the row cannot ride
+                            // that TypeId itself), populated when the closure was
+                            // boxed (`recordBoxedCallableRaisesRow`).
+                            if (self.boxed_callable_raises_row.get(prov.type_id)) |row| {
+                                for (row) |error_type| {
+                                    try self.recordRaisedErrorType(error_type, call.meta.span);
+                                }
+                            }
                             return result_type;
                         }
                         if (self.isFirstClassFunctionStructType(prov.type_id)) {
@@ -8959,12 +9088,66 @@ pub const TypeChecker = struct {
             type_params[0] = args_tuple;
             type_params[1] = result;
             const protocol_name_id = entry.protocol_name.parts[0];
-            return self.store.addType(.{ .protocol_constraint = .{
+            const constraint = self.store.addType(.{ .protocol_constraint = .{
                 .protocol_name = protocol_name_id,
                 .type_params = type_params,
             } }) catch null;
+            // Phase 5 (effect precision): record this closure's `call` `raises`
+            // row keyed by the boxed constraint TypeId so a later value-call
+            // of a binding holding this `Callable` can fold the row for the
+            // undischarged-flag check. The synthesized `__closure_N` module is
+            // ordered last, so eagerly check its `call` body first to populate
+            // the row order-independently.
+            if (constraint) |constraint_id| {
+                self.recordBoxedCallableRaisesRow(constraint_id, struct_type_name_id);
+            }
+            return constraint;
         }
         return null;
+    }
+
+    /// Phase 5 — record the `__closure_N` closure's `call` inferred `raises`
+    /// row against the boxed `Callable` constraint TypeId it inhabits, merging
+    /// (union) with any row already recorded for that shared instantiation. A
+    /// pure closure (empty row) records nothing. The row is duplicated into a
+    /// TypeChecker-owned slice (freed at teardown).
+    fn recordBoxedCallableRaisesRow(self: *TypeChecker, constraint_id: TypeId, struct_name_id: ast.StringId) void {
+        // The synthesized `__closure_N` module is ordered last, so its `call`
+        // row may not yet be in `inferred_raises` when a factory's caller is
+        // checked. Eagerly populate it (snapshot/restore-guarded so the closure
+        // struct's backfill and the caller's raises accumulator are untouched).
+        if (self.closureStructCallRaisesRow(struct_name_id) == null or
+            (self.closureStructCallRaisesRow(struct_name_id).?.len == 0))
+        {
+            self.eagerlyCheckClosureStructCall(struct_name_id);
+        }
+        const row = self.closureStructCallRaisesRow(struct_name_id) orelse return;
+        if (row.len == 0) return;
+
+        // Union with any existing row for this shared instantiation (distinct
+        // closures of the same `({A}, R)` shape share the constraint TypeId).
+        var merged: std.ArrayListUnmanaged(TypeId) = .empty;
+        defer merged.deinit(self.allocator);
+        if (self.boxed_callable_raises_row.get(constraint_id)) |existing| {
+            merged.appendSlice(self.allocator, existing) catch return;
+        }
+        for (row) |error_type| {
+            var already = false;
+            for (merged.items) |seen| {
+                if (self.store.typeEquals(seen, error_type)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) merged.append(self.allocator, error_type) catch return;
+        }
+        const owned = self.allocator.dupe(TypeId, merged.items) catch return;
+        const gop = self.boxed_callable_raises_row.getOrPut(self.allocator, constraint_id) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
+        gop.value_ptr.* = owned;
     }
 
     /// Write a concrete type into a closure struct's capture field whose
