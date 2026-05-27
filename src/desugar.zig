@@ -1038,7 +1038,17 @@ pub const Desugarer = struct {
             // return slot and `maybeBoxAsProtocol` auto-boxes it. A
             // non-capturing tail closure keeps the bare `fn`-type (Gap E's
             // direct return path) — its return type is left unchanged.
-            const return_is_fn = clause.return_type != null and clause.return_type.?.* == .function;
+            //
+            // A `type`-alias-named return type (`type Adder = fn(i64) -> i64`)
+            // is the SAME first-class-closure position as a literal `fn`
+            // return: resolve the annotation through any alias chain to the
+            // underlying `fn(P...) -> R` and treat it identically, so a
+            // capturing closure returned through an alias boxes too.
+            const resolved_return_fn: ?*const ast.TypeExpr = if (clause.return_type) |rt|
+                self.resolveFunctionTypeThroughAlias(rt)
+            else
+                null;
+            const return_is_fn = resolved_return_fn != null;
             // Record this clause's parameter type annotations into the
             // capture-type environment so a closure nested in the body can
             // type a captured parameter concretely. Save/restore around
@@ -1056,8 +1066,12 @@ pub const Desugarer = struct {
                 try self.desugarFunctionClauseBody(b, return_is_fn)
             else
                 null;
+            // When the tail boxed, rewrite the return annotation to the
+            // `Callable({A}, B)` existential. Build it from the RESOLVED
+            // function type (an alias node is not a `.function`), so an
+            // aliased `fn`-return boxes identically to a literal one.
             const return_type = if (return_is_fn and body != null and self.tailIsBoxedClosure(body.?))
-                try self.callableTypeFromFunctionType(clause.return_type.?)
+                try self.callableTypeFromFunctionType(resolved_return_fn.?)
             else
                 clause.return_type;
             try new_clauses.append(self.allocator, .{
@@ -3281,6 +3295,49 @@ pub const Desugarer = struct {
             .name, .variable => true,
             else => false,
         };
+    }
+
+    /// Resolve a declared type annotation through any chain of `type` aliases
+    /// to the underlying `fn(P...) -> R` function-TYPE expression, returning
+    /// it (or null when the annotation does not name — directly or through
+    /// aliases — a function type). A `type Adder = fn(i64) -> i64` return
+    /// annotation is the same first-class-closure position as a literal
+    /// `fn(i64) -> i64` annotation: a capturing closure returned through it
+    /// escapes the frame and must box as `Callable`. The desugar runs before
+    /// type resolution, so it consults the scope graph's `type_alias` table
+    /// directly (the collector registers `TypeKind.type_alias = td.body`).
+    /// A depth bound guards against cyclic aliases (the type checker emits the
+    /// clean cycle diagnostic; the desugar must merely not loop). Parameterized
+    /// aliases (`type Wrap(t) = fn(t) -> t`) are intentionally NOT followed for
+    /// the box decision: substituting `args` into the body is the type
+    /// checker's job, and the closure boxing for such a position is already
+    /// driven by the parameter/generic-default path.
+    fn resolveFunctionTypeThroughAlias(self: *const Desugarer, annotation: *const ast.TypeExpr) ?*const ast.TypeExpr {
+        var current = annotation;
+        var depth: usize = 0;
+        while (depth < 32) : (depth += 1) {
+            switch (current.*) {
+                .function => return current,
+                .name => |n| {
+                    // Only a BARE alias reference (no type arguments) maps to
+                    // a non-parameterized alias body we can follow verbatim.
+                    if (n.args.len != 0) return null;
+                    const graph = self.graph orelse return null;
+                    const type_id = graph.resolveTypeByName(n.name) orelse return null;
+                    if (type_id >= graph.types.items.len) return null;
+                    const kind = graph.types.items[type_id].kind;
+                    switch (kind) {
+                        .type_alias => |body| {
+                            current = body;
+                            continue;
+                        },
+                        else => return null,
+                    }
+                },
+                else => return null,
+            }
+        }
+        return null;
     }
 
     // ============================================================

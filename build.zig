@@ -449,6 +449,17 @@ pub fn build(b: *std.Build) void {
     abort_json_cmd.step.dependOn(b.getInstallStep());
     abort_json_step.dependOn(&abort_json_cmd.step);
 
+    // FCC Phase 5 acceptance: the hardening / breadth / precision corpus for
+    // first-class closures (aliased fn-returns, nested/cross-box closures,
+    // mixed boxed+direct, the boxed-effect-precision cases). Each fixture runs
+    // under BOTH managers asserting expected output + leak-freedom. A
+    // standalone step (matching the other FCC acceptance harnesses) the
+    // no-regression gate runs explicitly.
+    const fcc_phase5_step = b.step("fcc-phase5-acceptance", "Run the FCC Phase 5 hardening/breadth/precision corpus under both managers");
+    const fcc_phase5_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_fcc_phase5_acceptance.sh" });
+    fcc_phase5_cmd.step.dependOn(b.getInstallStep());
+    fcc_phase5_step.dependOn(&fcc_phase5_cmd.step);
+
     // -----------------------------------------------------------------------
     // ZIR integration tests (need the built binary)
     // -----------------------------------------------------------------------
