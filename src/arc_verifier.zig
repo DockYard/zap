@@ -3604,7 +3604,7 @@ const V10ForbiddenPattern = struct {
 
 const v10_forbidden_patterns: []const V10ForbiddenPattern = &.{
     .{ .needle = "\"retainAny\"", .label = "ArcRuntime.retainAny" },
-    .{ .needle = "\"retainAnyPersistent\"", .label = "ArcRuntime.retainAnyPersistent" },
+    .{ .needle = "\"shareAnyPersistent\"", .label = "ArcRuntime.shareAnyPersistent" },
     .{ .needle = "\"retainAnyOpt\"", .label = "ArcRuntime.retainAnyOpt" },
     .{ .needle = "\"retainChildrenAny\"", .label = "ArcRuntime.retainChildrenAny" },
     .{ .needle = "\"releaseAny\"", .label = "ArcRuntime.releaseAny" },
@@ -3672,8 +3672,15 @@ fn v10CountForbiddenEmissions(source: []const u8, verbose: bool) usize {
 ///
 ///     1. `.retain` IR handler `retainAny` branch (kind=.normal):
 ///        1 × "retainAny"
-///     2. `.retain` IR handler `retainAnyPersistent` branch
-///        (kind=.persistent): 1 × "retainAnyPersistent"
+///     2. `.retain` IR handler `shareAnyPersistent` branch
+///        (kind=.persistent): 1 × "shareAnyPersistent". The persistent
+///        retain creates a genuine second owner and REBINDS the new-owner
+///        local to the share result — under REFCOUNTED a refcount bump
+///        returning the same value (identity), under `individual_no_refcount`
+///        + `clone_on_share` an independent clone-on-share so each owner
+///        reaches a single free. (Was `retainAnyPersistent`, which
+///        `shareAnyPersistent` now wraps; the canonical-dispatch count is
+///        unchanged.)
 ///     3. `.release` IR handler deep branch: 1 × "releaseAny"
 ///        (kind=.release in ReleaseKind dispatch)
 ///     4. `.release` IR handler shallow branch: 1 × "freeAny"

@@ -1210,6 +1210,29 @@ pub const ZirDriver = struct {
         return elision.reclamationModel(self.declared_caps);
     }
 
+    /// The active manager's sharing strategy (Axis B), decoded via the single
+    /// source of truth in `src/memory/elision.zig`. Only consulted when
+    /// `reclamationModel() == .individual_no_refcount`; codegen uses it to
+    /// decide whether a persistent share clones (`clone_on_share`) or is a
+    /// move-only compile error upstream (`move_only`) — never keying off a
+    /// manager name.
+    fn sharingStrategy(self: *const ZirDriver) elision.SharingStrategy {
+        return elision.sharingStrategy(self.declared_caps);
+    }
+
+    /// Comptime-equivalent of the runtime `clone_on_share_active`: true when a
+    /// persistent second owner must receive an independent deep CLONE rather
+    /// than an aliasing (elided) retain — ONLY under `individual_no_refcount`
+    /// with the `clone_on_share` sharing strategy. The single gate the
+    /// value-level clone-on-share emission (`emit_share_under_clone_on_share`
+    /// in the `.retain` handler) keys off, mirroring the runtime
+    /// `shareAnyPersistent` comptime gate so the ZIR emission and the runtime
+    /// helper agree on exactly when a share clones.
+    fn cloneOnShareActive(self: *const ZirDriver) bool {
+        return self.reclamationModel() == .individual_no_refcount and
+            self.sharingStrategy() == .clone_on_share;
+    }
+
     // -- Helpers --------------------------------------------------------------
 
     /// Map an IR ZigType to a ZIR Ref, recursively emitting tuple_decl for nested tuples.
@@ -9440,34 +9463,81 @@ pub const ZirDriver = struct {
                     return;
                 }
 
-                if (!self.shouldSkipArc(ret.value)) {
+                // Capability-gated symmetry (CapMem Phase 3): under an
+                // `individual_no_refcount` + `clone_on_share` manager
+                // (`Memory.Tracking`), `shouldSkipArc` elides ALL refcount
+                // retains — correct for a refcount increment, but a
+                // `.persistent` retain of an ARC-managed local is the
+                // share-side mirror of the deep-walk `.release` carve-out
+                // (`emit_deep_walk_under_no_refcount`): it creates a genuine
+                // SECOND owner that the IR pairs with a scope-exit `.release`,
+                // and that release IS emitted under this model. So the share
+                // MUST be emitted too — otherwise the new owner aliases the
+                // source's eagerly-freed cell and BOTH frees `core.deallocate`
+                // it (the double-free segfault). The share lowers to
+                // `shareAnyPersistent`, which under `clone_on_share_active`
+                // deep-CLONES a value owning an eagerly-freed child
+                // (indirect-storage recursive struct, boxed inner) so each
+                // owner reaches a single free, and is a no-op identity
+                // otherwise. `.normal` retains stay skipped: a transient borrow
+                // has no scope-exit release to balance and must NOT clone (a
+                // clone there would leak).
+                //
+                // Gated on the CAPABILITY axes (`cloneOnShareActive`), not the
+                // mere absence of REFCOUNT_V1, so it fires ONLY for Tracking —
+                // NEVER for Arena/NoOp/Leak (`bulk_or_never`, which alias-share
+                // soundly and reclaim in bulk / never) or `traced`.
+                const emit_share_under_clone_on_share = self.cloneOnShareActive() and
+                    ret.kind == .persistent and
+                    self.arc_managed_locals.contains(ret.value);
+                if (!self.shouldSkipArc(ret.value) or emit_share_under_clone_on_share) {
                     // Phase 1 Class A: dispatch on the IR-level kind
                     // enum so callers control the helper choice
                     // (normal vs persistent) rather than every retain
-                    // emission site re-deciding between runtime
-                    // helpers. The set of helpers stays the same; only
-                    // the dispatch source moves from ZIR to IR. The
-                    // `.normal` kind lowers to `retainAny`; the
-                    // `.persistent` kind to `retainAnyPersistent`
-                    // (which routes through the type's own `retain`
-                    // method when one exists, enabling the Map
-                    // workload share-event tracking).
-                    const helper_name: []const u8 = switch (ret.kind) {
-                        .normal => "retainAny",
-                        .persistent => "retainAnyPersistent",
-                        .protocol_box_retain, .protocol_box_share => unreachable, // handled above
-                    };
+                    // emission site re-deciding between runtime helpers.
+                    //
+                    //   * `.normal`     → `retainAny` (void). A transient
+                    //     borrow-pass retain balanced by an immediate post-call
+                    //     release; no second long-lived owner, no rebind.
+                    //   * `.persistent` → `shareAnyPersistent` (value-returning)
+                    //     + REBIND of the new-owner local to the result. A
+                    //     persistent retain stashes the value in long-lived
+                    //     storage (struct field, list slot, closure capture) and
+                    //     so creates a genuine SECOND owner with its own
+                    //     scope-exit release. Under REFCOUNTED `shareAnyPersistent`
+                    //     bumps the cell's refcount and returns the SAME value
+                    //     (identity rebind) — byte-for-byte the old persistent
+                    //     path, including the type's own `retain` (Map share-event
+                    //     tracking). Under `clone_on_share_active` it returns an
+                    //     INDEPENDENT clone for any value owning an eagerly-freed
+                    //     child so each owner reaches a single free. This is the
+                    //     value-level analog of the `.protocol_box_share`
+                    //     clone-on-share rebind above and the container
+                    //     `ownElement` path.
                     const val_ref = self.refForLocal(ret.value) catch return;
 
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
                     const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
                     if (arc_runtime == error_ref) return error.EmitFailed;
-                    const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, helper_name.ptr, @intCast(helper_name.len));
-                    if (retain_fn == error_ref) return error.EmitFailed;
 
-                    const args = [_]u32{val_ref};
-                    _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                    switch (ret.kind) {
+                        .normal => {
+                            const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
+                            if (retain_fn == error_ref) return error.EmitFailed;
+                            const args = [_]u32{val_ref};
+                            _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                        },
+                        .persistent => {
+                            const share_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "shareAnyPersistent", 18);
+                            if (share_fn == error_ref) return error.EmitFailed;
+                            const args = [_]u32{val_ref};
+                            const shared_ref = zir_builder_emit_call_ref(self.handle, share_fn, &args, 1);
+                            if (shared_ref == error_ref) return error.EmitFailed;
+                            try self.setLocal(ret.value, shared_ref);
+                        },
+                        .protocol_box_retain, .protocol_box_share => unreachable, // handled above
+                    }
                 }
             },
             .release => |rel| {

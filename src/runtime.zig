@@ -702,6 +702,37 @@ pub const reclamation_model: ReclamationModel = decodeReclamationModel(runtime_d
 /// off, replacing the old coarse `!refcount_v1_active`.
 pub const eager_individual_free: bool = reclamation_model == .individual_no_refcount;
 
+/// Runtime mirror of `elision.SharingStrategy` (Axis B). Only meaningful when
+/// `reclamation_model == .individual_no_refcount`; for every other reclamation
+/// model the bit is required clear (validated at build) so this resolves to
+/// `clone_on_share`. See `src/memory/elision.zig`.
+pub const SharingStrategy = enum {
+    clone_on_share,
+    move_only,
+};
+
+/// Decode Axis B (sharing strategy) from `runtime_declared_caps` bit 3. Mirror
+/// of `elision.sharingStrategy`.
+fn decodeSharingStrategy(caps: u64) SharingStrategy {
+    return if ((caps & 0x0000_0000_0000_0008) != 0) .move_only else .clone_on_share;
+}
+
+/// The active manager's sharing strategy, decoded at comptime.
+pub const sharing_strategy: SharingStrategy = decodeSharingStrategy(runtime_declared_caps);
+
+/// Comptime-true when a persistent second owner must receive an independent
+/// deep CLONE rather than an aliasing refcount bump: ONLY under
+/// `.individual_no_refcount` (Tracking) with the `clone_on_share` sharing
+/// strategy. This is the gate the value-level clone-on-share helper
+/// (`shareAnyPersistent`) and the synthetic `<Protocol>VTable.share` clone
+/// branch key off — never a manager name. Under `.refcounted` a share is a
+/// refcount bump; under `.bulk_or_never` / `.traced` a share is a no-op alias
+/// (the manager reclaims in bulk / never / via tracing, so two aliases never
+/// double-free); under `.individual_no_refcount` + `move_only` sharing is a
+/// compile error upstream, never reaching a runtime share.
+pub const clone_on_share_active: bool =
+    reclamation_model == .individual_no_refcount and sharing_strategy == .clone_on_share;
+
 comptime {
     // Tripwire drift against `src/memory/abi.zig` canonical encodings and the
     // host-default expectation. The host default is REFCOUNTED (ARC).
@@ -5948,6 +5979,106 @@ pub const ArcRuntime = struct {
     /// the symmetric transient case.
     ///
     /// Validation pattern mirrors `retainAny`.
+    /// Value-returning deep-clone of an eagerly-freed ARC child, the
+    /// structural mirror of `releaseFieldChildAny` / `cloneFieldChildInPlace`
+    /// but operating on (and returning) a VALUE rather than walking a field
+    /// pointer. Used by `shareAnyPersistent` to give a second owner its own
+    /// independent copy of an indirect-storage cell under an
+    /// `individual_no_refcount` + `clone_on_share` manager. `V` is the static
+    /// type of the shared value (`?*const T`, `*const T`, a `ProtocolBox`, or a
+    /// by-value aggregate that buries one).
+    ///
+    /// Mirrors the shape dispatch exactly:
+    ///   * `ProtocolBox` value           → `cloneProtocolBoxValue` (vtable clone)
+    ///   * `?*const T` / `*const T`       → `allocAny` a fresh cell + recurse
+    ///     into ITS owned children, UNLESS `T` is an inline-header List/Map
+    ///     cell (never eagerly freed under no-REFCOUNT_V1 — alias is sound,
+    ///     same rule as `cloneFieldChildInPlace`) or an erased-opaque pointee
+    ///     (uninstantiable; its concrete owner manages sharing).
+    ///   * by-value aggregate             → `cloneChildrenAnyInPlace` in place
+    /// Every other shape (scalars, slices including `String`) is returned as
+    /// the bit-copy — it owns no eagerly-freed descendant. Only reached when
+    /// `elementHasEagerlyFreedChild(V)` is comptime-true, so the whole body is
+    /// elided for flat values.
+    fn cloneEagerChildValue(comptime V: type, allocator: std.mem.Allocator, value: V) V {
+        if (comptime isProtocolBox(V)) {
+            return cloneProtocolBoxValue(value);
+        }
+        if (comptime pointerChildIsErasedOpaque(V)) return value;
+        switch (@typeInfo(V)) {
+            .optional => |opt| {
+                const inner = value orelse return value;
+                return cloneEagerChildValue(opt.child, allocator, inner);
+            },
+            .pointer => |p| {
+                if (comptime p.size != .one) return value;
+                if (comptime hasInlineArcHeader(p.child)) {
+                    // Inline-header List/Map cell: never eagerly freed under
+                    // no-REFCOUNT_V1, so two owners aliasing it cannot
+                    // double-free. Keep the SAME pointer (same rule as
+                    // `cloneFieldChildInPlace`); the persistent retain that
+                    // `shareAnyPersistent` issues is the second owner.
+                    return value;
+                }
+                // Indirect-storage / side-table ARC struct: allocate an
+                // independent cell, bit-copy the pointee, then recurse to
+                // clone ITS owned children so the clone shares no descendant.
+                const fresh = allocAny(p.child, allocator, value.*);
+                cloneChildrenAnyInPlace(p.child, allocator, fresh);
+                return fresh;
+            },
+            .@"struct", .@"union" => {
+                var owned: V = value;
+                cloneChildrenAnyInPlace(V, allocator, &owned);
+                return owned;
+            },
+            else => return value,
+        }
+    }
+
+    /// Create a genuine SECOND owner of an ARC value being stashed into
+    /// long-lived storage (a struct field, list-element slot, or closure
+    /// capture), returning the value the new owner must hold. The
+    /// value-level analog of the `<Protocol>VTable.share` clone-on-share
+    /// helper (`ReleaseKind`/`RetainKind.protocol_box_share`), and the
+    /// non-container sibling of the container `ownElement` path
+    /// (`List`/`Map`).
+    ///
+    /// Comptime-specialized on the active manager's capability axes, so it is
+    /// a strict superset of `retainAnyPersistent`:
+    ///   * `clone_on_share_active` (Tracking, `individual_no_refcount` +
+    ///     `clone_on_share`) — there is no refcount, so a second owner of one
+    ///     cell cannot be expressed as a `+1`. For a value that owns an
+    ///     eagerly-freed child (an indirect-storage recursive struct such as
+    ///     `LinkedNode.next`, a boxed existential, or an aggregate burying one)
+    ///     return an independent CLONE so each owner's scope-exit release frees
+    ///     exactly one cell — no double-free. For a value with no eagerly-freed
+    ///     child (inline-header `List`/`Map`, flat scalars) the clone is
+    ///     unnecessary and `shareAnyPersistent` returns the value unchanged
+    ///     after the (elided) retain.
+    ///   * every other model — bump the shared cell's refcount via
+    ///     `retainAnyPersistent` and return the SAME value (identity). Under
+    ///     `refcounted` (ARC) the last drop reclaims the cell — byte-for-byte
+    ///     the pre-existing persistent-retain path. Under `bulk_or_never` /
+    ///     `traced` `retainAnyPersistent` is itself a no-op and aliasing is
+    ///     sound (the manager reclaims in bulk / never / via tracing), so no
+    ///     clone is needed and none is emitted.
+    ///
+    /// The matching scope-exit `.release` the IR schedules for the new owner
+    /// then reaches a single, unambiguous free under EVERY model — the
+    /// invariant the no-refcount free path depends on. The ZIR
+    /// `.retain { kind = .persistent }` lowering REBINDS the new-owner local
+    /// to this result (under `clone_on_share_active`), exactly as the
+    /// `.protocol_box_share` lowering rebinds to `<Protocol>VTable.share`.
+    pub inline fn shareAnyPersistent(value: anytype) @TypeOf(value) {
+        const V = @TypeOf(value);
+        if (comptime clone_on_share_active and elementHasEagerlyFreedChild(V)) {
+            return cloneEagerChildValue(V, std.heap.c_allocator, value);
+        }
+        retainAnyPersistent(value);
+        return value;
+    }
+
     pub inline fn retainAnyPersistent(ptr: anytype) void {
         // G-box ABI: deep-retain the ARC children of a by-value aggregate
         // (see `retainAny`). A `ProtocolBox` carries no inline ArcHeader,
@@ -18437,6 +18568,61 @@ test "releaseChildrenAny releases ?*const Map(K, V) field" {
     // hits the zero-transition. The generic wrapper short-circuits the
     // bump for inline-header types, so we expect exactly one release tick.
     try std.testing.expectEqual(before_releases + 1, arc_releases_total);
+}
+
+test "shareAnyPersistent creates an independent second owner of an indirect-storage cell" {
+    // A `.retain { kind = .persistent }` of an indirect-storage recursive
+    // struct (the codegen shape for `head = %LinkedNode{next: tail}` where
+    // the local `tail` is ALSO still live) must produce a genuine second
+    // owner. Under REFCOUNTED that is a refcount bump returning the SAME
+    // pointer (identity rebind); under `individual_no_refcount` +
+    // `clone_on_share` — which has no refcount — it must return an
+    // INDEPENDENT deep CLONE so each owner reaches a single, unambiguous
+    // `core.deallocate`. Without it, the local and the field alias one cell
+    // and both releases free it = double-free segfault (the
+    // `zap test -Dmemory=Memory.Tracking` corpus crash in
+    // `freeAnyNonRefcountedImpl`).
+    const Node = extern struct { value: i64, next: ?*const @This() };
+
+    // Shape/contract assertions — config-INDEPENDENT, so they pin the fix
+    // under BOTH the host ARC build and a clone-on-share build:
+    comptime {
+        // The helper must exist and be return-type-preserving for the
+        // indirect-storage pointer shape the codegen actually emits.
+        if (@TypeOf(ArcRuntime.shareAnyPersistent(@as(?*const Node, null))) != ?*const Node)
+            @compileError("shareAnyPersistent must return its argument type for ?*const T");
+        // An indirect-storage struct pointer owns an eagerly-freed child, so
+        // the clone-on-share branch must engage for it under Tracking.
+        if (!ArcRuntime.elementHasEagerlyFreedChild(?*const Node))
+            @compileError("?*const recursive-struct must be an eagerly-freed ARC child");
+        // A plain scalar struct value owns nothing eagerly freed → identity.
+        const Flat = extern struct { a: i64, b: i64 };
+        if (ArcRuntime.elementHasEagerlyFreedChild(Flat))
+            @compileError("flat scalar struct has no eagerly-freed child");
+    }
+
+    // A `null` indirect-storage child shares to itself under every manager
+    // (an absent cell owns nothing). Verifiable on the host ARC build.
+    try std.testing.expect(ArcRuntime.shareAnyPersistent(@as(?*const Node, null)) == null);
+
+    // Build a real indirect-storage cell and share it. Under the host ARC
+    // build `shareAnyPersistent` bumps the side-table refcount and returns
+    // the SAME pointer (identity): the two scope-exit releases below
+    // (source + shared owner) then balance the refcount to zero and free
+    // the cell exactly once — proving the persistent-retain path is intact.
+    const tail: *Node = ArcRuntime.allocAny(Node, std.testing.allocator, .{ .value = 9, .next = null });
+    const shared = ArcRuntime.shareAnyPersistent(@as(?*const Node, tail));
+    try std.testing.expect(shared != null);
+    if (comptime refcount_v1_active) {
+        // ARC: identity rebind — the second owner aliases the same cell,
+        // reclaimed by the last of the two releases.
+        try std.testing.expectEqual(@as(?*const Node, tail), shared);
+    }
+    // Release both owners. Under ARC the refcount goes 2 -> 1 -> 0 (one
+    // free); the clone branch is comptime-dead here, so this also exercises
+    // that `shareAnyPersistent` left the persistent-retain semantics intact.
+    ArcRuntime.releaseAny(std.testing.allocator, shared);
+    ArcRuntime.releaseAny(std.testing.allocator, @as(?*const Node, tail));
 }
 
 test "Atom well-known values" {
