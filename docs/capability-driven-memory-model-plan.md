@@ -269,6 +269,60 @@ unprovable share — deferred).
   GC build runs to completion reclaiming garbage (a loop allocating-and-dropping stays bounded in
   RSS, unlike NoOp/Leak); the corpus runs under GC; ARC green. (Precise GC = future.)
 
+  **Phase 5 STATUS (COMPLETE — single-platform v1: darwin/aarch64 + linux/x86_64):**
+  - **DONE: driver accepts TRACED.** `src/memory/driver.zig` `validateDeclaredCaps` accepts the
+    Axis-A TRACED code (`0b10`, `declared_caps == 0x4`); only `0b11` stays reserved. The
+    `abi.zig`/`elision.zig`/`driver.zig` comments no longer say "reserved until GC" — they now
+    record that the conservative collector backend has shipped. No new compiler emission: TRACED
+    reuses the BULK_OR_NEVER codegen verbatim (`elision.reclamationModel(0x4) == .traced`, gated
+    identically to `.bulk_or_never` at every memory-op site).
+  - **DONE: `lib/memory/gc.zap`** — zero-method `Memory.GC` + `Memory.Manager` impl marker; resolves
+    by package convention to `src/memory/gc/manager.zig`; the compiler reads the TRACED caps, never
+    the name.
+  - **DONE: `src/memory/gc/manager.zig`** — production conservative stop-the-world mark-sweep
+    collector (`declared_caps == 0x4`). Size-segregated 64 KiB `mmap` slabs (18 classes 16..8192 B)
+    + dedicated large-object regions above 8 KiB, all `page_allocator`-backed so sweep `munmap`s
+    pages back to the OS. Base-sorted `ObjectRecord` table → O(log n) binary-search interior-pointer
+    resolution (an interior address pins the whole object). 2× multiplicative growth threshold
+    (`MIN_HEAP_BYTES` floor). Collection: clear marks + sort; `flushRegisters` (inline-asm GPR spill,
+    aarch64 `stp x0..x29` / x86_64 `mov rax..r15`) into a 32-word stack buffer; scan registers +
+    live stack span `[currentStackPointer, stack_bottom)` + writable globals; transitive mark via
+    explicit worklist (no native recursion); sweep frees unmarked cells / unmaps large objects.
+    `stack_bottom` captured at `gcInit` via an inline-asm SP read (NOT `@frameAddress` — unsafe under
+    frame-pointer elision in `ReleaseFast`). Globals: Mach-O walks `_mh_execute_header` load commands
+    for WRITE-`initprot` segments (ASLR slide from `__TEXT`); ELF scans `[__data_start, _end)`.
+    `deallocate` + every refcount slot is a no-op/`@panic` stub (codegen elides them under TRACED).
+  - **DONE: selection wiring.** `main.zig` `SCRIPT_MEMORY_MANAGERS` + diagnostic list `Memory.GC`;
+    `builder.zig`'s stdlib resolution matrix includes it; `-Dmemory=Memory.GC` works in script mode.
+  - **PROVEN: bounded-RSS reclamation** (`script_fixtures/gc_bounded_rss_loop.zap`, 2 M iterations ×
+    a 4-node chain = 8 M transient allocations, program-binary RSS isolated from the compiler):
+    **`Memory.GC` peak RSS ≈ 2.8 MiB (bounded — the collector reclaims)** vs **`Memory.Leak` ≈
+    5.9 GiB (unbounded — never reclaims)**, a ≈2000× difference, with byte-identical correct output
+    (`20000000`). This is the proof the collector reclaims garbage.
+  - **PROVEN: no premature free** (`script_fixtures/gc_live_graph_stress.zap`, a live 500-node chain
+    held across 200 k churn iterations each dropping a fresh 500-node garbage chain = 100 M transient
+    nodes): the exact final sum **125250** (= 500·501/2), deterministic across runs, proves the mark
+    worklist + interior `next` tracing keeps every live node and reclaims only garbage.
+  - **CHARACTERIZED: corpus under GC == corpus under Arena (942 tests / 1 failure).**
+    `zap test -Dmemory=Memory.GC` reports the SAME single failure as `Memory.Arena`/`Leak`:
+    `generic_list_test.zap` "copy-on-write preserves aliased original string list". This is the
+    pre-existing **GAP B** BULK_OR_NEVER property, NOT a GC premature free — the clone-on-share COW
+    fix (`cc23e97`) is gated on `clone_on_share_active` and is comptime-DEAD under BULK_OR_NEVER and
+    TRACED, so `List.set`/`List.push` mutate the shared buffer in place and corrupt the alias. The
+    airtight exoneration: `Memory.Arena`, which physically cannot free a live object mid-run (bulk
+    free at process exit), corrupts the alias with the SAME non-deterministic garbage. The GC commits
+    are purely additive (a new adapter + backend + the driver-accept + the harness; they touch no
+    codegen, runtime, or List/Map/String file), so GC inherits Arena's corpus result exactly — the
+    correct outcome of "TRACED reuses BULK_OR_NEVER codegen". Asserted by the
+    `script_fixtures/run_custom_manager_proof.sh` GC-corpus-parity row and documented at the test.
+  - **NO REGRESSION:** host `zig build test` exit 0; ARC `zap test` 942/0 + V8 verifier; Tracking
+    942/0; Arena/NoOp/Leak run; golden 14/14; FCC; the full matrix harness PASSES all 6 managers.
+  - **FUTURE (out of v1 scope):** multi-threaded collection (stop-the-world thread enumeration +
+    per-thread register/stack capture); precise/generational collection (compiler stack-maps +
+    safepoints on the same TRACED capability — still no write barriers, since Zap is immutable);
+    additional platforms (the register flush + global-segment bounds are arch/OS-specific; an
+    unsupported target soundly falls back to the stack-only scan).
+
 ## Verification matrix
 
 | Manager | Axis A / B | Assert | How |

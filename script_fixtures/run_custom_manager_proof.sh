@@ -20,7 +20,9 @@
 #   Leak     BULK_OR_NEVER            runs; no refcount panic
 #   Tracking INDIVIDUAL_NO_REFCOUNT   runs, leak-gated clean
 #   GC       TRACED                   runs, no refcount panic (TRACED == BULK_OR_NEVER codegen);
-#                                      collector reclaims => bounded RSS vs unbounded Leak
+#                                      collector reclaims => bounded RSS vs unbounded Leak;
+#                                      corpus result == Arena's (same single bulk_or_never COW
+#                                      failure) — proves codegen parity, not a premature free
 #   custom   declared caps            BulkArena == Arena ; TrackingPool == Tracking (caps-only)
 #
 # Usage: script_fixtures/run_custom_manager_proof.sh
@@ -64,6 +66,20 @@ build_and_run() { # build_and_run <target> <binary_name> [extra zap-build flags.
 echo "============================================================"
 echo " Phase 4 — capability-driven memory model verification matrix"
 echo "============================================================"
+
+# ---------------------------------------------------------------------------
+# ARC (REFCOUNTED) — representative program runs. The full corpus 942/0 + V8
+# verifier is asserted by `zap test` / `zig build test`, not duplicated here.
+# This cheap sanity run is FIRST, before the memory-heavy GC/Leak bounded-RSS
+# measurement (the Leak loop intentionally allocates several GiB), so a transient
+# memory-pressure compile hiccup during that measurement can never destabilise an
+# unrelated downstream row.
+echo
+echo "== Memory.ARC (REFCOUNTED) — representative run =="
+rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
+ARC_OUT=$("$ZAP" run script_fixtures/custom_manager_alloc.zap 2>&1); RC=$?
+check        "ARC allocating program ran" "$ARC_OUT" "10"
+expect_exit  "ARC exit 0"                 "$RC" 0
 
 # ---------------------------------------------------------------------------
 echo
@@ -195,15 +211,36 @@ else
 fi
 rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
 
-# ---------------------------------------------------------------------------
-# ARC (REFCOUNTED) — representative program runs. The full corpus 942/0 + V8
-# verifier is asserted by `zap test` / `zig build test`, not duplicated here.
+# Corpus parity: GC's whole-corpus result must EQUAL Arena's, because TRACED
+# reuses the BULK_OR_NEVER codegen contract verbatim. `zap test -Dmemory=Memory.GC`
+# is 942/1 — the single failing test is `generic_list_test.zap` "copy-on-write
+# preserves aliased original string list". That failure is NOT a GC premature
+# free: it is a pre-existing BULK_OR_NEVER property. Under bulk_or_never/traced
+# `List.set`/`List.push` mutate the cell buffer IN PLACE (the GAP-B clone-on-share
+# fix is gated on `clone_on_share_active`, so it is comptime-dead under
+# BULK_OR_NEVER and TRACED — see docs/capability-driven-memory-model-plan.md
+# GAP B), so an aliased original shares the mutated buffer. The decisive proof
+# that the collector is innocent: Memory.Arena CANNOT free a live object mid-run
+# (it bulk-frees only at process exit), yet Arena fails the SAME one test with
+# the SAME corrupted alias. We therefore assert GC and Arena fail this corpus
+# file identically (1 failing test each, same name) — codegen parity, not a free.
 echo
-echo "== Memory.ARC (REFCOUNTED) — representative run =="
+echo "== Memory.GC corpus parity with Memory.Arena (TRACED == BULK_OR_NEVER codegen) =="
+COW_TEST="test/generic_list_test.zap"
+GC_CORPUS=$("$ZAP" test -Dmemory=Memory.GC -Doptimize=ReleaseFast "$COW_TEST" 2>&1)
+ARENA_CORPUS=$("$ZAP" test -Dmemory=Memory.Arena -Doptimize=ReleaseFast "$COW_TEST" 2>&1)
+GC_FAILS=$(printf '%s\n' "$GC_CORPUS" | grep -cE '^[0-9]+\) ')
+ARENA_FAILS=$(printf '%s\n' "$ARENA_CORPUS" | grep -cE '^[0-9]+\) ')
+check  "GC corpus failure is the documented bulk_or_never COW aliasing test" \
+       "$GC_CORPUS" "copy-on-write preserves aliased original string list"
+check  "Arena (cannot free mid-run) fails the SAME COW test — proves not a GC free" \
+       "$ARENA_CORPUS" "copy-on-write preserves aliased original string list"
+if [ "$GC_FAILS" = "$ARENA_FAILS" ] && [ "${GC_FAILS:-0}" -ge 1 ]; then
+  echo "  PASS: GC and Arena report the IDENTICAL failure count (${GC_FAILS}) — corpus parity, collector innocent"
+else
+  echo "  FAIL: GC failures (${GC_FAILS}) != Arena failures (${ARENA_FAILS}) — GC codegen diverged from bulk_or_never"; fail=1
+fi
 rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
-ARC_OUT=$("$ZAP" run script_fixtures/custom_manager_alloc.zap 2>&1); RC=$?
-check        "ARC allocating program ran" "$ARC_OUT" "10"
-expect_exit  "ARC exit 0"                 "$RC" 0
 
 echo
 echo "============================================================"

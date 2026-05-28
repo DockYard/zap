@@ -35,9 +35,11 @@ pub const ReclamationModel = enum {
     /// Individual free, no refcount (Tracking). Static free-at-last-use; the
     /// declared `sharingStrategy` resolves shared ownership; no `ArcHeader`.
     individual_no_refcount,
-    /// Tracing garbage collection. The manager reclaims via collection;
-    /// codegen reuses the `bulk_or_never` elision (no retain/release/free, no
-    /// `ArcHeader`). Reserved-and-rejected at build until the GC manager ships.
+    /// Tracing garbage collection (`Memory.GC`). The manager reclaims via
+    /// stop-the-world conservative mark-sweep collection; codegen reuses the
+    /// `bulk_or_never` elision (no retain/release/free, no `ArcHeader`).
+    /// Accepted at build — the conservative collector backend
+    /// (`src/memory/gc/manager.zig`) has shipped (plan Phase 5).
     traced,
 };
 

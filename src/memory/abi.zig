@@ -141,7 +141,10 @@ pub const RECLAMATION_INDIVIDUAL_NO_REFCOUNT: u64 = 0b01;
 
 /// Axis-A encoding (pre-shift, 2-bit) — TRACED. Tracing GC reclaims; codegen
 /// reuses the BULK_OR_NEVER elision (no retain/release/free, no header).
-/// Reserved-and-rejected at build until the GC manager ships (plan Phase 5).
+/// Declared by `Memory.GC` (the conservative stop-the-world mark-sweep
+/// collector, `src/memory/gc/manager.zig`) and accepted at build (plan Phase 5
+/// shipped). A fully-declared TRACED manager's `declared_caps` is
+/// `RECLAMATION_TRACED << RECLAMATION_MODEL_SHIFT == 0x4`.
 pub const RECLAMATION_TRACED: u64 = 0b10;
 
 /// Axis-A encoding (pre-shift, 2-bit) — reserved/unknown model. No reclamation
