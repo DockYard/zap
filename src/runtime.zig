@@ -6840,23 +6840,44 @@ pub fn List(comptime T: type) type {
 
         /// True when a consuming mutation (`push` / `pop` / `set`) may take
         /// the in-place / move-and-free-old fast path rather than the
-        /// deep-own retaining clone.
+        /// value-semantic retaining clone. The decision is per reclamation
+        /// model — the only runtime signal available differs by manager, and
+        /// the wrong answer is silent aliased-buffer corruption, not a leak:
         ///
-        ///   * REFCOUNT_V1 — exactly when the receiver is the sole owner
-        ///     (`header.count() == 1`); a shared cell must be cloned so the
-        ///     other owners still observe the pre-mutation value.
-        ///   * no-REFCOUNT_V1 — ALWAYS. There is no refcount to detect
-        ///     sharing, and the no-refcount model is move/value-semantics:
-        ///     a mutation consumes its receiver. Crucially, `header.count()`
-        ///     is always 0 in this mode, so WITHOUT this the mutation would
-        ///     misroute to the retaining clone and (for box elements) leak
-        ///     the moved-from buffer's eagerly-freed inners. Moving instead
-        ///     transfers each element's single inner to the new buffer and
-        ///     frees the old buffer shallowly — exactly one owner per inner.
+        ///   * `.refcounted` (REFCOUNT_V1) — in-place exactly when the
+        ///     receiver is the sole owner (`header.count() == 1`); a shared
+        ///     cell must be cloned so the other owners still observe the
+        ///     pre-mutation value. This is the classic ARC copy-on-write.
+        ///
+        ///   * `.individual_no_refcount` (Tracking) — ALWAYS in-place. There
+        ///     is no refcount, but clone-on-share (Axis B) already handed each
+        ///     owner an independent buffer at the share point, so the receiver
+        ///     is unique by construction and a mutation soundly consumes it.
+        ///     Note `header.count()` is a 0-byte no-op returning 0 here, so the
+        ///     `.refcounted` test would misfire (`0 == 1` → false) and misroute
+        ///     to the clone — leaking each box element's eagerly-freed inner.
+        ///     In-place moving transfers exactly one owner per inner.
+        ///
+        ///   * `.bulk_or_never` (Arena/NoOp/Leak) and `.traced` (GC) — NEVER
+        ///     in-place from this runtime gate. There is no refcount AND
+        ///     clone-on-share is comptime-dead under these models, so an
+        ///     aliased list genuinely shares one buffer and there is no
+        ///     runtime signal proving uniqueness. Mutating in place here would
+        ///     corrupt every alias (a wrong answer / use-after-free), so we
+        ///     fall back to the value-semantic clone. The old buffer is never
+        ///     freed (releases/frees are elided) — the manager reclaims it in
+        ///     bulk or by tracing — so the alias stays valid. Sites that the
+        ///     static analysis can PROVE unique are rewritten at Release to
+        ///     `set_owned_unchecked`/`push_owned_unchecked`/`pop_owned_unchecked`
+        ///     (the optimize-mode unchecked-uniqueness rewrite), which bypass
+        ///     this gate and mutate in place unconditionally; this gate is only
+        ///     the fallback for the not-statically-proven remainder, where copy
+        ///     is the only sound choice.
         inline fn mutationMayMoveInPlace(self: *const Self) bool {
-            return comptime_or_unique: {
-                if (comptime !refcount_v1_active) break :comptime_or_unique true;
-                break :comptime_or_unique self.header.count() == 1;
+            return switch (comptime reclamation_model) {
+                .refcounted => self.header.count() == 1,
+                .individual_no_refcount => true, // clone-on-share guarantees a unique buffer per owner
+                .bulk_or_never, .traced => false, // no uniqueness signal at runtime; proven-unique sites already use *_owned_unchecked
             };
         }
 
