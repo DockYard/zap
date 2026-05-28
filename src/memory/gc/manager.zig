@@ -563,6 +563,39 @@ const RegisterBuffer = [32]usize;
 /// also be live on the stack of the caller (or in a callee-saved register), so
 /// the stack scan covers them. We nonetheless spill the full GPR file on the
 /// supported arches for maximum conservatism.
+/// Read the current stack pointer directly. Used for both stack-span bounds:
+/// the stack BOTTOM (highest live address, captured at `init`) and the stack
+/// TOP (lowest live address, captured inside `collect`).
+///
+/// `@frameAddress()` is unsuitable here: it returns the frame-pointer register,
+/// which the optimiser is free to omit (`-fomit-frame-pointer`, the default
+/// under `ReleaseFast`/`ReleaseSmall`), yielding a stale or wrong value. The
+/// stack pointer, by contrast, is always live and accurate regardless of
+/// frame-pointer elision, so reading it via inline asm gives a correct
+/// conservative bound in every optimisation mode. On architectures without an
+/// asm form below, the address of a stack local is used — also a true stack
+/// address (it is conservative as a bound even if it omits a few words of the
+/// current frame, because mutator roots live in frames above it).
+inline fn currentStackPointer() usize {
+    switch (builtin.target.cpu.arch) {
+        .aarch64, .aarch64_be => {
+            return asm volatile ("mov %[out], sp"
+                : [out] "=r" (-> usize),
+            );
+        },
+        .x86_64 => {
+            return asm volatile ("movq %%rsp, %[out]"
+                : [out] "=r" (-> usize),
+            );
+        },
+        else => {
+            var marker: usize = 0;
+            marker = @intFromPtr(&marker);
+            return marker;
+        },
+    }
+}
+
 inline fn flushRegisters(buffer: *RegisterBuffer) void {
     switch (builtin.target.cpu.arch) {
         .aarch64, .aarch64_be => {
@@ -742,14 +775,20 @@ fn scanElfGlobals(ctx: *GcContext) void {
 ///      objects, compacting the record table in place (preserving sort order).
 ///   5. Reset the next-collection threshold from the surviving live bytes.
 ///
-/// `approx_sp` is the caller's stack pointer (the top of the live stack span);
-/// `collect` is always invoked from `allocate`, so `approx_sp` is taken there
-/// via `@frameAddress()` and is at a lower (or equal) address than every root
-/// frame above it.
-fn collect(ctx: *GcContext, approx_sp: usize) void {
+/// The collector captures the live stack TOP (lowest live address) itself via
+/// `currentStackPointer()` at entry, rather than trusting a frame address from
+/// the caller — `@frameAddress()` is unreliable under frame-pointer elision
+/// (the default in `ReleaseFast`). Every mutator frame holding a root sits at a
+/// higher address than this frame's SP (the stack grows down through
+/// `gcAllocate` → `collect`), so scanning `[sp, stack_bottom)` covers them all.
+fn collect(ctx: *GcContext) void {
     if (ctx.collecting) return; // defensive; collection never re-enters allocate
     ctx.collecting = true;
     defer ctx.collecting = false;
+
+    // Capture the live stack top FIRST, before any helper-call frame is pushed,
+    // so the scanned span includes every mutator frame and this frame's spills.
+    const stack_top = currentStackPointer();
 
     // Phase 1: clear marks + sort for lookup.
     for (ctx.records.items) |*record| record.marked = false;
@@ -757,17 +796,21 @@ fn collect(ctx: *GcContext, approx_sp: usize) void {
     ctx.worklist.clearRetainingCapacity();
 
     // Phase 2: roots. Registers first (so a pointer live only in a register is
-    // captured before the stack scan, which also covers spilled copies).
+    // captured before the stack scan, which also covers spilled copies). The
+    // mutator's callee-saved registers are preserved across the call into
+    // `collect`, so flushing here captures them; caller-saved registers holding
+    // a live root were spilled to the mutator stack (covered by the stack scan).
     var registers: RegisterBuffer = [_]usize{0} ** 32;
     flushRegisters(&registers);
     const reg_start = @intFromPtr(&registers);
     scanRange(ctx, reg_start, reg_start + @sizeOf(RegisterBuffer));
 
-    // Live stack span: [current SP, stack_bottom). The stack grows down, so the
+    // Live stack span: [stack_top, stack_bottom). The stack grows down, so the
     // captured `stack_bottom` (highest address) is the exclusive upper bound and
-    // `approx_sp` (lowest live address) is the inclusive lower bound.
-    if (ctx.stack_bottom > approx_sp) {
-        scanRange(ctx, approx_sp, ctx.stack_bottom);
+    // `stack_top` (this frame's SP, the lowest live address) is the inclusive
+    // lower bound.
+    if (ctx.stack_bottom > stack_top) {
+        scanRange(ctx, stack_top, ctx.stack_bottom);
     }
 
     // Globals (mutable data + bss).
@@ -926,10 +969,12 @@ fn gcInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
         .live_bytes = 0,
         .next_collect_bytes = MIN_HEAP_BYTES,
         // Capture the stack bottom: the highest address the live stack reaches.
-        // The frame address of `init` is the deepest frame guaranteed to sit
-        // below `main`'s prologue caller, and above every later allocation
-        // frame (the stack grows down).
-        .stack_bottom = @frameAddress(),
+        // `init` runs from the entry-point prologue (or, in the lazy-fallback
+        // runtime, the first allocation), so its stack pointer sits above every
+        // later allocation/collection frame (the stack grows down). The SP is
+        // read directly (not `@frameAddress()`, which is unreliable under
+        // frame-pointer elision), giving a correct upper bound in every mode.
+        .stack_bottom = currentStackPointer(),
         .collecting = false,
     };
     return @ptrCast(ctx);
@@ -970,24 +1015,24 @@ fn gcDeinit(ctx: *anyopaque) callconv(.c) void {
 /// when the live-byte total has crossed the growth threshold, then serves the
 /// request from the GC heap and records it as live.
 ///
-/// The collection's stack-span upper bound is `stack_bottom`; its lower bound
-/// (top of live stack) is this frame's address, captured via `@frameAddress()`.
-/// Because `collect` is called from inside `gcAllocate`, every mutator frame
-/// holding a live root is at an address >= this frame's, so the span
-/// `[approx_sp, stack_bottom)` covers them all.
+/// `collect` captures the live stack span bounds itself (reading the stack
+/// pointer directly), so it needs no frame hint from this caller. Because it is
+/// called from inside `gcAllocate`, every mutator frame holding a live root sits
+/// at a higher address than the collector frame's SP, so the scanned span
+/// `[stack_top, stack_bottom)` covers them all.
 fn gcAllocate(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8 {
     const gc: *GcContext = @ptrCast(@alignCast(ctx));
     std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
 
     if (gc.live_bytes >= gc.next_collect_bytes) {
-        collect(gc, @frameAddress());
+        collect(gc);
     }
 
     if (gcHeapAlloc(gc, size, alignment)) |ptr| return ptr;
 
     // Allocation failed. If we have not just collected, a collection may free
     // enough to satisfy the request; try once more after a forced collection.
-    collect(gc, @frameAddress());
+    collect(gc);
     return gcHeapAlloc(gc, size, alignment);
 }
 
