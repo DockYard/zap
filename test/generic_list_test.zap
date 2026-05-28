@@ -173,16 +173,18 @@ pub struct GenericListTest {
 
     # NOTE (capability-driven memory model): this test asserts value-semantic
     # copy-on-write — the pre-mutation `original_alias` snapshot must survive a
-    # later in-place-looking `List.set`/`List.push` on `values`. It passes under
-    # `Memory.ARC` (refcounted COW) and `Memory.Tracking` (clone-on-share, GAP B
-    # commit cc23e97). It DELIBERATELY FAILS under the BULK_OR_NEVER managers
-    # (`Memory.Arena`/`NoOp`/`Leak`) and `Memory.GC` (TRACED reuses BULK_OR_NEVER
-    # codegen): there `mutationMayMoveInPlace` mutates the shared buffer in place
-    # and the clone-on-share fix is comptime-dead, so the alias is corrupted.
-    # This is the corpus's single bulk_or_never/traced failure (942/1); it is a
-    # shared codegen property, NOT a GC premature free — `Memory.Arena`, which
-    # cannot free a live object mid-run, corrupts the alias identically. See
-    # docs/capability-driven-memory-model-plan.md GAP B.
+    # later in-place-looking `List.set`/`List.push` on `values`. It now PASSES
+    # under ALL six managers — `Memory.ARC` (refcounted COW, `header.count()==1`),
+    # `Memory.Tracking` (clone-on-share hands each owner a unique buffer), and the
+    # BULK_OR_NEVER managers (`Memory.Arena`/`NoOp`/`Leak`) plus `Memory.GC`
+    # (TRACED) via the capability-aware `mutationMayMoveInPlace` (Phase 6): under
+    # bulk_or_never/traced the runtime gate returns `false` (no uniqueness signal,
+    # clone-on-share comptime-dead), so the not-statically-proven `List.set` falls
+    # back to a value-semantic clone instead of corrupting the shared buffer. At
+    # Release the unchecked-uniqueness rewrite mutates statically-proven-unique
+    # sites in place and leaves the aliased `List.set` checked (→ copy), so this
+    # passes at both Debug and Release. See docs/capability-driven-memory-model-
+    # plan.md GAP B / Phase 6.
     test("copy-on-write preserves aliased original string list") {
       values = List.new_empty(2) :: List(String)
       values = List.push(values, "original")

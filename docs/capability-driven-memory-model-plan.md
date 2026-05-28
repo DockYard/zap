@@ -185,27 +185,41 @@ unprovable share — deferred).
     ARC byte-identical — so it is deferred to the verification-matrix / combinator-bridge phase
     (the `combinator_boxed_test.zap` header already flags boxed-`Callable` combinator handling as
     a separate effort).
-  - **GAP B — List/Map COW under `clone_on_share` (RESOLVED).** `mutationMayMoveInPlace` returns
-    `true` unconditionally under `!refcount_v1_active` (always mutate in place), but the
-    pre-existing clone-on-share DELIBERATELY aliased inline-header List/Map cell buffers ("never
-    eagerly freed" bulk-free-era reasoning). So an aliased list (`original_alias = values`) shared
-    the buffer and an in-place `List.set` / push-grow `bufferFreeShallow` corrupted/freed it out
-    from under the alias (`generic_list_test.zap` "copy-on-write preserves aliased original string
-    list" read a garbage length — a use-after-free). **Fix (commit `cc23e97`):** extend
-    clone-on-share to inline-header cells — every share hands the new owner an INDEPENDENT deep
-    clone of the buffer via new `List.cloneForShare` / `Map.cloneForShare`, wired into every share
-    site (`shareAnyPersistent`, `cloneEagerChildValue`, `cloneFieldChildInPlace`,
-    `List.ownElement`, `Map.ownEntryKey`/`ownEntryValue`) through the new comptime predicate
+  - **GAP B — List/Map COW under `clone_on_share` (RESOLVED for Tracking; the BULK_OR_NEVER/TRACED
+    corner CLOSED in Phase 6).** `mutationMayMoveInPlace` originally returned `true` unconditionally
+    under `!refcount_v1_active` (always mutate in place), but the pre-existing clone-on-share
+    DELIBERATELY aliased inline-header List/Map cell buffers ("never eagerly freed" bulk-free-era
+    reasoning). So an aliased list (`original_alias = values`) shared the buffer and an in-place
+    `List.set` / push-grow `bufferFreeShallow` corrupted/freed it out from under the alias
+    (`generic_list_test.zap` "copy-on-write preserves aliased original string list" read a garbage
+    length — a use-after-free). **Tracking fix (commit `cc23e97`):** extend clone-on-share to
+    inline-header cells — every share hands the new owner an INDEPENDENT deep clone of the buffer
+    via new `List.cloneForShare` / `Map.cloneForShare`, wired into every share site
+    (`shareAnyPersistent`, `cloneEagerChildValue`, `cloneFieldChildInPlace`, `List.ownElement`,
+    `Map.ownEntryKey`/`ownEntryValue`) through the new comptime predicate
     `valuePointsToInlineHeaderCell` + `cloneInlineHeaderCellForShare` dispatch. Each owner uniquely
-    owns its buffer, in-place mutation stays sound (`mutationMayMoveInPlace` unchanged), and an
-    aliased original is never corrupted. Gated strictly on `clone_on_share_active`: comptime-dead
-    under REFCOUNTED (ARC) and BULK_OR_NEVER/TRACED. The COW test is green. **Per-drop buffer free
-    on release (step 3) is NOT yet adopted** (commit `0a995ea` documents why): not every aliasing
-    site routes through `cloneForShare` (`List.append`'s `retain(a)` pass-through, the
-    Range/`Enum.take_next` element flows), so a per-drop `List/Map.release` buffer free
-    double-frees an aliased buffer (verified: trace/breakpoint trap). Buffers stay reclaimed at
-    process teardown — the documented Tracking allocation model — pending the full no-refcount
-    static-ownership model that guarantees a unique owner per buffer.
+    owns its buffer, in-place mutation stays sound, and an aliased original is never corrupted.
+    Gated strictly on `clone_on_share_active` (INDIVIDUAL_NO_REFCOUNT only). **BULK_OR_NEVER/TRACED
+    corner — CLOSED in Phase 6 (capability-aware `mutationMayMoveInPlace`).** Because clone-on-share
+    is comptime-dead under BULK_OR_NEVER (Arena/NoOp/Leak) and TRACED (GC), the `true`-always gate
+    still corrupted aliases there: with no refcount and no clone-on-share, an aliased list genuinely
+    shares one buffer, so an in-place `List.set` was a wrong answer / use-after-free (the corpus's
+    single 942/1 failure under Arena/GC). The fix rewrites `mutationMayMoveInPlace` to switch on
+    `reclamation_model`: `.refcounted → header.count()==1`, `.individual_no_refcount → true`
+    (clone-on-share guarantees a unique buffer), `.bulk_or_never, .traced → false`. The `false`
+    branch takes the value-semantic clone (`cloneBufferRetainingChildren`, retain elided → shared
+    children, fine since children aren't freed individually) and never frees the old buffer (frees
+    elided) — the alias stays valid; the manager reclaims in bulk / by tracing. Statically-proven-
+    unique sites stay O(1): the optimize-mode unchecked-uniqueness rewrite emits
+    `set/push/pop_owned_unchecked` at Release, which bypass this gate. The COW test now passes under
+    ALL six managers at BOTH Debug and Release (corpus 942/0 under Arena/GC, was 942/1); the Release
+    run is the soundness proof that the rewrite leaves the aliased site checked → copy. **Per-drop
+    buffer free on release (step 3) is NOT yet adopted** (commit `0a995ea` documents why): not every
+    aliasing site routes through `cloneForShare` (`List.append`'s `retain(a)` pass-through, the
+    Range/`Enum.take_next` element flows), so a per-drop `List/Map.release` buffer free double-frees
+    an aliased buffer (verified: trace/breakpoint trap). Buffers stay reclaimed at process teardown —
+    the documented Tracking allocation model — pending the full no-refcount static-ownership model
+    that guarantees a unique owner per buffer.
 - **Phase 4 — per-manager corpus + custom-manager test. DONE.** Lock in the verification matrix.
 
   **Phase 4 STATUS (COMPLETE):**
@@ -303,25 +317,73 @@ unprovable share — deferred).
     held across 200 k churn iterations each dropping a fresh 500-node garbage chain = 100 M transient
     nodes): the exact final sum **125250** (= 500·501/2), deterministic across runs, proves the mark
     worklist + interior `next` tracing keeps every live node and reclaims only garbage.
-  - **CHARACTERIZED: corpus under GC == corpus under Arena (942 tests / 1 failure).**
-    `zap test -Dmemory=Memory.GC` reports the SAME single failure as `Memory.Arena`/`Leak`:
-    `generic_list_test.zap` "copy-on-write preserves aliased original string list". This is the
-    pre-existing **GAP B** BULK_OR_NEVER property, NOT a GC premature free — the clone-on-share COW
-    fix (`cc23e97`) is gated on `clone_on_share_active` and is comptime-DEAD under BULK_OR_NEVER and
-    TRACED, so `List.set`/`List.push` mutate the shared buffer in place and corrupt the alias. The
-    airtight exoneration: `Memory.Arena`, which physically cannot free a live object mid-run (bulk
-    free at process exit), corrupts the alias with the SAME non-deterministic garbage. The GC commits
-    are purely additive (a new adapter + backend + the driver-accept + the harness; they touch no
-    codegen, runtime, or List/Map/String file), so GC inherits Arena's corpus result exactly — the
-    correct outcome of "TRACED reuses BULK_OR_NEVER codegen". Asserted by the
-    `script_fixtures/run_custom_manager_proof.sh` GC-corpus-parity row and documented at the test.
+  - **RESOLVED (Phase 6): corpus under GC == corpus under Arena == 942 tests / 0 failures.**
+    Previously CHARACTERIZED as 942/1 — `zap test -Dmemory=Memory.GC` reported the same single
+    failure as `Memory.Arena`/`Leak` (`generic_list_test.zap` "copy-on-write preserves aliased
+    original string list"), a GAP-B BULK_OR_NEVER property (the clone-on-share COW fix `cc23e97` is
+    comptime-dead under BULK_OR_NEVER/TRACED, so `List.set`/`List.push` mutated the shared buffer in
+    place and corrupted the alias — proven not a GC free because `Memory.Arena`, which cannot free a
+    live object mid-run, corrupted the alias identically). **Phase 6 closes this** by making
+    `mutationMayMoveInPlace` capability-aware (`.bulk_or_never, .traced → false`): the runtime gate
+    now takes the value-semantic clone for the not-statically-proven aliased mutation, so the alias
+    survives. The collector / Arena bulk-free reclaim the extra garbage. Now `zap test
+    -Dmemory=Memory.GC` and `-Dmemory=Memory.Arena` are both 942/0 at BOTH Debug and Release; the
+    `script_fixtures/run_custom_manager_proof.sh` GC-corpus-parity row asserts the COW test PASSES
+    under both and GC failure count == Arena failure count == 0.
   - **NO REGRESSION:** host `zig build test` exit 0; ARC `zap test` 942/0 + V8 verifier; Tracking
-    942/0; Arena/NoOp/Leak run; golden 14/14; FCC; the full matrix harness PASSES all 6 managers.
+    942/0; Arena/NoOp/Leak/GC `zap test` 942/0 (Debug + Release); golden 14/14; FCC; the full matrix
+    harness PASSES all 6 managers. (Pre-existing, orthogonal: ARC at `-Doptimize=ReleaseFast` trips an
+    `arc_verifier` V11 diagnostic on a combinator/boxed-`Callable` function — a separate combinator
+    ARC-optimizer shape, present before Phase 6 and unrelated to `mutationMayMoveInPlace`; the
+    `.refcounted` arm is byte-identical to the prior `refcount_v1_active` branch.)
   - **FUTURE (out of v1 scope):** multi-threaded collection (stop-the-world thread enumeration +
     per-thread register/stack capture); precise/generational collection (compiler stack-maps +
     safepoints on the same TRACED capability — still no write barriers, since Zap is immutable);
     additional platforms (the register flush + global-segment bounds are arch/OS-specific; an
     unsupported target soundly falls back to the stack-only scan).
+- **Phase 6 — capability-aware in-place mutation (immutability under BULK_OR_NEVER/TRACED). DONE.**
+  Closes the last hole in the capability-driven memory model: Zap's immutability guarantee
+  (`List.set`/`push`/`pop` return a NEW list, leaving the original intact) was violated under
+  BULK_OR_NEVER (Arena/NoOp/Leak) and TRACED (GC). The single corruption site was
+  `List.mutationMayMoveInPlace` (`src/runtime.zig`), which gated the in-place fast path on the
+  coarse `!refcount_v1_active` and returned `true` (always mutate in place) for all three
+  non-refcounted models — sound ONLY under INDIVIDUAL_NO_REFCOUNT (clone-on-share already hands
+  each owner a unique buffer). Under BULK_OR_NEVER/TRACED clone-on-share is comptime-dead, so an
+  aliased list shared one buffer and an in-place mutation corrupted the alias (a wrong answer /
+  use-after-free, the corpus's single 942/1 failure).
+
+  **Fix:** rewrite the gate to switch on `reclamation_model` (the comptime constant already
+  mirrored from `elision.reclamationModel`): `.refcounted → header.count()==1` (classic ARC COW,
+  unchanged), `.individual_no_refcount → true` (clone-on-share guarantees a unique buffer,
+  unchanged), `.bulk_or_never, .traced → false` (no runtime uniqueness signal → value-semantic
+  copy). The `false` branch clones the buffer (retain elided → shared children, fine since children
+  aren't freed individually) and never frees the old buffer (frees elided) — the alias stays valid;
+  the manager reclaims in bulk / by tracing. **Optimal static behaviour preserved:** the
+  optimize-mode unchecked-uniqueness rewrite (`arc_ownership.rewriteUncheckedUniquenessSites`, gated
+  by `policy.rewrite_unchecked_uniqueness` — ON at Release, OFF at Debug) emits
+  `set/push/pop_owned_unchecked`, which mutate in place unconditionally and bypass this gate. So at
+  Release proven-unique mutations stay O(1) in-place and only the not-statically-proven remainder
+  copies; at Debug everything copies. `List.append`/`concat`/`cons` and `Map.put`/`delete`/`merge`
+  are untouched — they gate on raw `header.count()==1`, which is `0==1`=false under non-refcounted
+  (`ArcHeaderEmpty.count()` returns 0), so they already took the clone path soundly.
+
+  **Phase 6 STATUS (COMPLETE):**
+  - **DONE: the fix** (`src/runtime.zig` `List.mutationMayMoveInPlace`; ARC + Tracking arms
+    byte-identical to before; only bulk_or_never/traced flip `true`→`false`).
+  - **PROVEN: corpus 942/0 under ALL six managers at BOTH Debug and Release.** ARC/Tracking/Arena/
+    Leak/GC `zap test` 942/0 at Debug and at `-Doptimize=ReleaseFast` (NoOp can't allocate → OOM,
+    unchanged). The Release runs are the soundness proof that the unchecked-uniqueness rewrite is
+    sound under BULK_OR_NEVER/TRACED: it leaves the aliased `List.set` checked (→ copy) while the
+    non-aliased pushes may be unchecked.
+  - **PROVEN: the COW test** (`generic_list_test.zap` "copy-on-write preserves aliased original
+    string list") passes under ARC/Tracking/Arena/Leak/GC at both modes (was the 942/1 failure).
+  - **NO REGRESSION:** host `zig build test` (ARC + V8 verifier) exit 0; GC bounded-RSS (≈2.8 MiB
+    vs Leak ≈4.3 GiB) and no-premature-free (125250) still hold; golden 14/14; custom-manager
+    matrix PASSES (GC corpus == Arena corpus == 942/0).
+  - **OUT OF SCOPE (pre-existing, orthogonal):** ARC at `-Doptimize=ReleaseFast` trips an
+    `arc_verifier` V11 diagnostic on a combinator/boxed-`Callable` function (`CombinatorMapBoxedTest`)
+    — verified present on the unmodified tree before Phase 6, unrelated to list mutation; a separate
+    combinator ARC-optimizer effort (#311-class).
 
 ## Verification matrix
 

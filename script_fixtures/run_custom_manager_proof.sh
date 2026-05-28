@@ -21,8 +21,9 @@
 #   Tracking INDIVIDUAL_NO_REFCOUNT   runs, leak-gated clean
 #   GC       TRACED                   runs, no refcount panic (TRACED == BULK_OR_NEVER codegen);
 #                                      collector reclaims => bounded RSS vs unbounded Leak;
-#                                      corpus result == Arena's (same single bulk_or_never COW
-#                                      failure) — proves codegen parity, not a premature free
+#                                      corpus result == Arena's (both 942/0 — the value-semantic
+#                                      COW test now passes under both via the capability-aware
+#                                      mutationMayMoveInPlace, Phase 6) — proves codegen parity
 #   custom   declared caps            BulkArena == Arena ; TrackingPool == Tracking (caps-only)
 #
 # Usage: script_fixtures/run_custom_manager_proof.sh
@@ -212,33 +213,37 @@ fi
 rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
 
 # Corpus parity: GC's whole-corpus result must EQUAL Arena's, because TRACED
-# reuses the BULK_OR_NEVER codegen contract verbatim. `zap test -Dmemory=Memory.GC`
-# is 942/1 — the single failing test is `generic_list_test.zap` "copy-on-write
-# preserves aliased original string list". That failure is NOT a GC premature
-# free: it is a pre-existing BULK_OR_NEVER property. Under bulk_or_never/traced
-# `List.set`/`List.push` mutate the cell buffer IN PLACE (the GAP-B clone-on-share
-# fix is gated on `clone_on_share_active`, so it is comptime-dead under
-# BULK_OR_NEVER and TRACED — see docs/capability-driven-memory-model-plan.md
-# GAP B), so an aliased original shares the mutated buffer. The decisive proof
-# that the collector is innocent: Memory.Arena CANNOT free a live object mid-run
-# (it bulk-frees only at process exit), yet Arena fails the SAME one test with
-# the SAME corrupted alias. We therefore assert GC and Arena fail this corpus
-# file identically (1 failing test each, same name) — codegen parity, not a free.
+# reuses the BULK_OR_NEVER codegen contract verbatim. As of Phase 6 both are
+# 942/0 — `zap test -Dmemory=Memory.GC` and `-Dmemory=Memory.Arena` are fully
+# green. The previously-failing test (`generic_list_test.zap` "copy-on-write
+# preserves aliased original string list") now PASSES under both: the
+# capability-aware `mutationMayMoveInPlace` returns `false` under bulk_or_never/
+# traced (no runtime uniqueness signal; clone-on-share comptime-dead), so a
+# not-statically-proven aliased `List.set` falls back to a value-semantic clone
+# instead of corrupting the shared buffer (see docs/capability-driven-memory-
+# model-plan.md GAP B / Phase 6). We assert the COW test PASSES under both AND
+# that GC's failure count EQUALS Arena's (both 0) — codegen parity, run at
+# Release (-Doptimize=ReleaseFast) so the unchecked-uniqueness rewrite is the
+# in-place fast path and the aliased site is left checked → copy.
 echo
 echo "== Memory.GC corpus parity with Memory.Arena (TRACED == BULK_OR_NEVER codegen) =="
 COW_TEST="test/generic_list_test.zap"
+COW_NAME="copy-on-write preserves aliased original string list"
 GC_CORPUS=$("$ZAP" test -Dmemory=Memory.GC -Doptimize=ReleaseFast "$COW_TEST" 2>&1)
 ARENA_CORPUS=$("$ZAP" test -Dmemory=Memory.Arena -Doptimize=ReleaseFast "$COW_TEST" 2>&1)
 GC_FAILS=$(printf '%s\n' "$GC_CORPUS" | grep -cE '^[0-9]+\) ')
 ARENA_FAILS=$(printf '%s\n' "$ARENA_CORPUS" | grep -cE '^[0-9]+\) ')
-check  "GC corpus failure is the documented bulk_or_never COW aliasing test" \
-       "$GC_CORPUS" "copy-on-write preserves aliased original string list"
-check  "Arena (cannot free mid-run) fails the SAME COW test — proves not a GC free" \
-       "$ARENA_CORPUS" "copy-on-write preserves aliased original string list"
-if [ "$GC_FAILS" = "$ARENA_FAILS" ] && [ "${GC_FAILS:-0}" -ge 1 ]; then
-  echo "  PASS: GC and Arena report the IDENTICAL failure count (${GC_FAILS}) — corpus parity, collector innocent"
+# The COW test name must NOT appear in a failure block under either manager.
+refute "GC: value-semantic COW test no longer fails (capability-aware in-place gate)" \
+       "$GC_CORPUS" "$COW_NAME"
+refute "Arena: value-semantic COW test no longer fails (capability-aware in-place gate)" \
+       "$ARENA_CORPUS" "$COW_NAME"
+check  "GC corpus is fully green (942 tests, 0 failures)"    "$GC_CORPUS"    "0 failures"
+check  "Arena corpus is fully green (942 tests, 0 failures)" "$ARENA_CORPUS" "0 failures"
+if [ "$GC_FAILS" = "$ARENA_FAILS" ] && [ "${GC_FAILS:-1}" -eq 0 ]; then
+  echo "  PASS: GC and Arena report the IDENTICAL failure count (${GC_FAILS} = 0) — corpus parity, both fully green"
 else
-  echo "  FAIL: GC failures (${GC_FAILS}) != Arena failures (${ARENA_FAILS}) — GC codegen diverged from bulk_or_never"; fail=1
+  echo "  FAIL: GC failures (${GC_FAILS}) != Arena failures (${ARENA_FAILS}) or non-zero — expected both 942/0"; fail=1
 fi
 rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
 
