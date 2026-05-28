@@ -332,15 +332,21 @@ unprovable share — deferred).
     under both and GC failure count == Arena failure count == 0.
   - **NO REGRESSION:** host `zig build test` exit 0; ARC `zap test` 942/0 + V8 verifier; Tracking
     942/0; Arena/NoOp/Leak/GC `zap test` 942/0 (Debug + Release); golden 14/14; FCC; the full matrix
-    harness PASSES all 6 managers. (Pre-existing, orthogonal: ARC at `-Doptimize=ReleaseFast` trips an
-    `arc_verifier` V11 diagnostic on a combinator/boxed-`Callable` function — a separate combinator
-    ARC-optimizer shape, present before Phase 6 and unrelated to `mutationMayMoveInPlace`; the
-    `.refcounted` arm is byte-identical to the prior `refcount_v1_active` branch.)
-  - **FUTURE (out of v1 scope):** multi-threaded collection (stop-the-world thread enumeration +
-    per-thread register/stack capture); precise/generational collection (compiler stack-maps +
+    harness PASSES all 6 managers. (The ARC `-Doptimize=ReleaseFast` `arc_verifier` V11 diagnostic on a
+    combinator/boxed-`Callable` function that surfaced here was a separate, pre-existing combinator
+    ARC-optimizer shape unrelated to `mutationMayMoveInPlace` — since RESOLVED by the Perceus
+    owned-scrutinee gate `6f06685`; see the Phase 6 STATUS note below.)
+  - **FUTURE (out of v1 scope):** precise/generational collection (compiler stack-maps +
     safepoints on the same TRACED capability — still no write barriers, since Zap is immutable);
     additional platforms (the register flush + global-segment bounds are arch/OS-specific; an
     unsupported target soundly falls back to the stack-only scan).
+  - **EXPLICIT NON-GOAL — multi-threaded shared-heap collection.** Zap's concurrency direction is a
+    BEAM-style per-process model: each process owns its heap AND its memory manager and collects
+    independently (one collector instance per process over a private heap; messages copy between
+    heaps, which fits immutability), so cross-thread root scanning / global stop-the-world is not
+    planned. The existing single-threaded collector is the correct shape for per-process collection,
+    and the capability axis is the natural per-process manager knob (a short-lived process can use
+    Arena → bulk-free at process death → zero collection; a long-lived one uses GC or ARC).
 - **Phase 6 — capability-aware in-place mutation (immutability under BULK_OR_NEVER/TRACED). DONE.**
   Closes the last hole in the capability-driven memory model: Zap's immutability guarantee
   (`List.set`/`push`/`pop` return a NEW list, leaving the original intact) was violated under
@@ -380,10 +386,12 @@ unprovable share — deferred).
   - **NO REGRESSION:** host `zig build test` (ARC + V8 verifier) exit 0; GC bounded-RSS (≈2.8 MiB
     vs Leak ≈4.3 GiB) and no-premature-free (125250) still hold; golden 14/14; custom-manager
     matrix PASSES (GC corpus == Arena corpus == 942/0).
-  - **OUT OF SCOPE (pre-existing, orthogonal):** ARC at `-Doptimize=ReleaseFast` trips an
-    `arc_verifier` V11 diagnostic on a combinator/boxed-`Callable` function (`CombinatorMapBoxedTest`)
-    — verified present on the unmodified tree before Phase 6, unrelated to list mutation; a separate
-    combinator ARC-optimizer effort (#311-class).
+  - **RESOLVED (`6f06685`, task #320):** ARC at `-Doptimize=ReleaseFast` previously tripped an
+    `arc_verifier` V11 diagnostic on the combinator/boxed-`Callable` function (`CombinatorMapBoxedTest`).
+    Root cause (a false-positive, not a real leak): the Perceus reuse pass emitted a spurious `.reset`
+    on the by-value tuple returned by `List.next` (a `.trivial` local, not a heap ARC cell). Fix:
+    `src/perceus.zig` `scrutineeReuseEligible` gates reuse-pair generation on an `.owned` scrutinee
+    (excludes `.trivial`/`.borrowed`). ARC-Release corpus now 942/0; ARC-Debug byte-identical.
 
 ## Verification matrix
 

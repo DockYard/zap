@@ -98,8 +98,12 @@
 //! global-segment bounds are arch/OS-specific; unsupported targets fall back to
 //! scanning only the stack (still sound — registers are flushed to the stack on
 //! any normal call, and globals that hold the sole reference to a live object
-//! are rare). Multi-threaded and precise/generational collection are tracked as
-//! future enhancements on the same TRACED capability.
+//! are rare). Precise/generational collection is a future enhancement on the
+//! same TRACED capability. Multi-threaded shared-heap collection is an explicit
+//! NON-GOAL: Zap's concurrency direction is a BEAM-style per-process model where
+//! each process owns its heap and its own memory manager and collects
+//! independently — one collector instance per private heap — so cross-thread
+//! root scanning / global stop-the-world is not planned.
 
 const std = @import("std");
 const builtin = @import("builtin");
