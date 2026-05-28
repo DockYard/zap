@@ -139,6 +139,16 @@ check        "GC allocating program ran to completion" "$GC_OUT" "10"
 expect_exit  "GC exit 0"                                "$RC" 0
 refute       "no refcount panic-stub fired under GC (TRACED elides refcount)" "$GC_OUT" "does not implement REFCOUNT_V1"
 
+# Collector soundness under pressure: a LIVE 500-node graph must survive many
+# collections triggered by concurrent garbage allocation (200k iterations each
+# dropping a 500-node chain). A single mis-traced live node corrupts the sum or
+# segfaults; the exact sum 125250 (= 500*501/2) proves no live object was freed.
+rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
+GC_STRESS=$("$ZAP" run -Dmemory=Memory.GC -Doptimize=ReleaseFast script_fixtures/gc_live_graph_stress.zap 2>&1); RC=$?
+check        "GC preserves a live deep graph across collections (no premature free)" "$GC_STRESS" "125250"
+expect_exit  "GC live-graph stress exit 0"                                            "$RC" 0
+refute       "GC live-graph stress did not segfault"                                  "$GC_STRESS" "segmentation"
+
 # Build the bounded-RSS loop binary under each manager, then time the binary
 # alone (compiler RSS excluded). Returns peak-RSS bytes via global RSS_BYTES.
 peak_rss_of_loop() { # peak_rss_of_loop <manager>
