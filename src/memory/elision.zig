@@ -184,3 +184,33 @@ test "sharingStrategy decodes Axis B bit 3" {
         sharingStrategy(abi.CAPS_INDIVIDUAL_NO_REFCOUNT | abi.SHARING_MOVE_ONLY_BIT),
     );
 }
+
+test "custom manager caps map identically to the matching stdlib manager (adapter-bounded)" {
+    // The formal companion to the end-to-end custom-manager acceptance proof
+    // (`script_fixtures/run_custom_manager_proof.sh` and the `zir-test`
+    // integration tests). The codegen-projection functions are TOTAL pure
+    // functions of `declared_caps`, so two managers declaring the same caps —
+    // regardless of name — are indistinguishable to every codegen gate.
+    //
+    // `Custom.BulkArena` (test fixture) declares `declared_caps == 0x0`,
+    // byte-identical to `Memory.Arena`. Therefore its reclamation model,
+    // sharing strategy, and refcount-emission decision are identical to Arena's.
+    const custom_bulk_caps: u64 = 0x0; // == Custom.BulkArena's `.zapmem` declared_caps
+    try std.testing.expectEqual(reclamationModel(abi.CAPS_BULK_OR_NEVER), reclamationModel(custom_bulk_caps));
+    try std.testing.expectEqual(sharingStrategy(abi.CAPS_BULK_OR_NEVER), sharingStrategy(custom_bulk_caps));
+    try std.testing.expectEqual(shouldEmitRefcountOps(abi.CAPS_BULK_OR_NEVER), shouldEmitRefcountOps(custom_bulk_caps));
+    try std.testing.expectEqual(ReclamationModel.bulk_or_never, reclamationModel(custom_bulk_caps));
+    try std.testing.expect(!shouldEmitRefcountOps(custom_bulk_caps));
+
+    // `Custom.TrackingPool` (test fixture) declares `declared_caps == 0x2`,
+    // byte-identical to `Memory.Tracking`. Therefore its codegen contract is
+    // identical to Tracking's: individual_no_refcount + clone_on_share, no
+    // refcount ops.
+    const custom_tracking_caps: u64 = 0x2; // == Custom.TrackingPool's `.zapmem` declared_caps
+    try std.testing.expectEqual(reclamationModel(abi.CAPS_INDIVIDUAL_NO_REFCOUNT), reclamationModel(custom_tracking_caps));
+    try std.testing.expectEqual(sharingStrategy(abi.CAPS_INDIVIDUAL_NO_REFCOUNT), sharingStrategy(custom_tracking_caps));
+    try std.testing.expectEqual(shouldEmitRefcountOps(abi.CAPS_INDIVIDUAL_NO_REFCOUNT), shouldEmitRefcountOps(custom_tracking_caps));
+    try std.testing.expectEqual(ReclamationModel.individual_no_refcount, reclamationModel(custom_tracking_caps));
+    try std.testing.expectEqual(SharingStrategy.clone_on_share, sharingStrategy(custom_tracking_caps));
+    try std.testing.expect(!shouldEmitRefcountOps(custom_tracking_caps));
+}

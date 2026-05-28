@@ -639,6 +639,217 @@ test "ZIR memory manager: dependency third-party adapter builds and runs" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+// ============================================================
+// Custom-manager capability-driven-codegen acceptance proof
+// (CapMem Phase 4 — `docs/capability-driven-memory-model-plan.md`
+// "Verification matrix", the **custom** row).
+//
+// These tests prove the adapter-bounded principle end-to-end: the
+// compiler keys every memory-codegen decision off the manager's
+// declared `declared_caps` bits and NEVER off its name. Two custom
+// managers — neither one of the five stdlib managers, both with names
+// unknown to the compiler — declare the same capability bitmasks as
+// their stdlib counterparts and therefore receive byte-identical
+// codegen contracts:
+//
+//   * `Custom.BulkArena`    declares BULK_OR_NEVER (declared_caps=0x0,
+//                            identical to `Memory.Arena`)
+//   * `Custom.TrackingPool` declares INDIVIDUAL_NO_REFCOUNT |
+//                            CLONE_ON_SHARE (declared_caps=0x2,
+//                            identical to `Memory.Tracking`)
+//
+// The backends are self-contained (`std`+`builtin` only) and declare
+// only the capability bits — no name appears in any compiler path.
+// Each backend's refcount slots are `@panic` stubs: if the compiler
+// WRONGLY emitted a retain/release ZIR op for a non-refcounted manager
+// (e.g. because it special-cased a name it did not recognise and fell
+// back to refcounted codegen), the program would panic at the first
+// refcounted-type operation instead of running to completion. Running
+// to completion with the expected output is therefore the empirical
+// proof that the elision (BULK_OR_NEVER) / static-free (INDIVIDUAL_
+// NO_REFCOUNT) codegen was selected from the caps bits alone.
+// ============================================================
+
+// The custom-manager backend `.zig` files are the SINGLE SOURCE OF TRUTH for
+// both this integration test and the standalone acceptance harness
+// (`script_fixtures/run_custom_manager_proof.sh`); they live in the on-disk
+// proof project so the harness can build it directly by the package
+// convention. `src/` is the compiler module's `@embedFile` package root, so
+// these (outside `src/`) are read at run time from the repo-relative path (the
+// host test suite runs with cwd == repo root, the same assumption
+// `resolveZapBinary` relies on for `zig-out/bin/zap`).
+const CUSTOM_BULK_ARENA_MANAGER_PATH =
+    "script_fixtures/custom_manager_proof/src/custom/bulk_arena/manager.zig";
+const CUSTOM_TRACKING_POOL_MANAGER_PATH =
+    "script_fixtures/custom_manager_proof/src/custom/tracking_pool/manager.zig";
+
+fn readCustomManagerBackend(relative_path: []const u8) TestError![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(
+        getTestIo(),
+        relative_path,
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    ) catch return error.Unexpected;
+}
+
+fn customManagerBuildSource(manager_type_name: []const u8) []const u8 {
+    // The manifest selects the custom manager by Type. The adapter `.zap`
+    // (an empty `impl Memory.Manager for X {}` marker) lives under
+    // `lib/custom/<stem>.zap` — the dotted struct name `Custom.<Stem>` MUST map
+    // to that directory path (discovery enforces struct-name-to-path) — so the
+    // package-convention backend resolver binds its sibling
+    // `src/custom/<stem>/manager.zig`.
+    return std.fmt.allocPrint(
+        std.testing.allocator,
+        \\pub struct TestProg.Builder {{
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {{
+        \\    case env.target {{
+        \\      :test_prog ->
+        \\        %Zap.Manifest{{
+        \\          name: "test_prog",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: &TestProg.main/0,
+        \\          paths: ["lib/**/*.zap"],
+        \\          memory: {s}
+        \\        }}
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }}
+        \\  }}
+        \\}}
+    ,
+        .{manager_type_name},
+    ) catch @panic("OOM building custom-manager manifest source");
+}
+
+test "ZIR custom manager: BULK_OR_NEVER caps give Arena-identical elision (no name special-casing)" {
+    // A program that builds and walks a refcounted recursive struct AND a
+    // `List` — both refcounted-type surfaces that, under a manager declaring
+    // REFCOUNTED, would emit retain/release ZIR ops. `Custom.BulkArena`
+    // declares BULK_OR_NEVER (declared_caps=0x0), so the compiler must elide
+    // ALL of them. The custom manager's retain/release slots are `@panic`
+    // stubs, so any wrongly-emitted refcount op aborts the run. Running to
+    // completion with the expected output proves the elision was selected
+    // from the caps bits, not the (unknown) name.
+    const build_source = customManagerBuildSource("Custom.BulkArena");
+    defer std.testing.allocator.free(build_source);
+
+    const adapter_source =
+        \\pub struct Custom.BulkArena {
+        \\}
+        \\
+        \\pub impl Memory.Manager for Custom.BulkArena {}
+    ;
+
+    const source =
+        \\pub struct Node {
+        \\  value :: i64
+        \\  next :: Node | nil
+        \\}
+        \\
+        \\pub struct TestProg {
+        \\  pub fn sum(nil) -> i64 {
+        \\    0 :: i64
+        \\  }
+        \\
+        \\  pub fn sum(node :: Node) -> i64 {
+        \\    node.value + TestProg.sum(node.next)
+        \\  }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    tail = %Node{value: 9, next: nil}
+        \\    head = %Node{value: 5, next: tail}
+        \\    total = TestProg.sum(head) + TestProg.sum(tail)
+        \\    items = [1, 2, 3]
+        \\    list_len = List.length(items)
+        \\    IO.puts(Integer.to_string(total + list_len))
+        \\    0
+        \\  }
+        \\}
+    ;
+
+    const backend_source = try readCustomManagerBackend(CUSTOM_BULK_ARENA_MANAGER_PATH);
+    defer std.testing.allocator.free(backend_source);
+
+    var result = try compileAndRunCustomProject(build_source, source, &.{
+        .{ .path = "lib/custom/bulk_arena.zap", .data = adapter_source },
+        .{ .path = "src/custom/bulk_arena/manager.zig", .data = backend_source },
+    });
+    defer result.deinit();
+
+    // sum(head)=5+9=14, sum(tail)=9, total=23; list_len=3; 23+3=26.
+    try std.testing.expectEqualStrings("26\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    // No refcount panic-stub fired (the caps-driven elision held).
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "does not implement REFCOUNT_V1") == null);
+}
+
+test "ZIR custom manager: INDIVIDUAL_NO_REFCOUNT caps give Tracking-identical static-free + clone-on-share" {
+    // The recursive-struct + shared-ownership shape under a manager declaring
+    // INDIVIDUAL_NO_REFCOUNT | CLONE_ON_SHARE (declared_caps=0x2). The compiler
+    // must elide refcount ops AND emit static free-at-last-use + clone-on-share
+    // — exactly `Memory.Tracking`'s codegen — selected from the caps bits
+    // alone. `Custom.TrackingPool` really frees each block on `core.deallocate`
+    // and prints a `Custom.TrackingPool LEAK:` survivor line at deinit if any
+    // block outlives its proven last use. The program must therefore run to
+    // completion with the expected output AND leave no survivor line: proof
+    // that the static-free codegen reclaimed every allocation.
+    const build_source = customManagerBuildSource("Custom.TrackingPool");
+    defer std.testing.allocator.free(build_source);
+
+    const adapter_source =
+        \\pub struct Custom.TrackingPool {
+        \\}
+        \\
+        \\pub impl Memory.Manager for Custom.TrackingPool {}
+    ;
+
+    const source =
+        \\pub struct Node {
+        \\  value :: i64
+        \\  next :: Node | nil
+        \\}
+        \\
+        \\pub struct TestProg {
+        \\  pub fn sum(nil) -> i64 {
+        \\    0 :: i64
+        \\  }
+        \\
+        \\  pub fn sum(node :: Node) -> i64 {
+        \\    node.value + TestProg.sum(node.next)
+        \\  }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    a = %Node{value: 4, next: nil}
+        \\    b = %Node{value: 3, next: a}
+        \\    c = %Node{value: 2, next: b}
+        \\    list = %Node{value: 1, next: c}
+        \\    IO.puts(Integer.to_string(TestProg.sum(list)))
+        \\    0
+        \\  }
+        \\}
+    ;
+
+    const backend_source = try readCustomManagerBackend(CUSTOM_TRACKING_POOL_MANAGER_PATH);
+    defer std.testing.allocator.free(backend_source);
+
+    var result = try compileAndRunCustomProject(build_source, source, &.{
+        .{ .path = "lib/custom/tracking_pool.zap", .data = adapter_source },
+        .{ .path = "src/custom/tracking_pool/manager.zig", .data = backend_source },
+    });
+    defer result.deinit();
+
+    // sum(1->2->3->4) = 10.
+    try std.testing.expectEqualStrings("10\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    // No refcount panic-stub fired (refcount ops elided under the caps).
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "does not implement REFCOUNT_V1") == null);
+    // No survivor line: the static free-at-last-use codegen reclaimed all
+    // allocations — the INDIVIDUAL_NO_REFCOUNT leak gate is clean.
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Custom.TrackingPool LEAK:") == null);
+}
+
 test "CLI: zap test runs Zest cases discovered by project-root relative pattern" {
     const allocator = std.testing.allocator;
 
