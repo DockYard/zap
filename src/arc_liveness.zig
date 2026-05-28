@@ -3183,6 +3183,41 @@ pub fn alwaysConsumingBuiltinArg(name: []const u8, slot: usize) bool {
     return false;
 }
 
+/// Returns the argument slot of a `List.cons`-family builtin that is the
+/// CONS TAIL — the existing list that the new cell prepends onto — when
+/// `name` is a `List.cons` builtin, else `null`.
+///
+/// `:zig.List.cons(head, tail)` allocates a fresh cons cell whose `next`
+/// is `tail`. Under the runtime's rc-1 in-place fast path (commit
+/// fb32ef1) a refcount-1 tail is mutated in place and returned AS the
+/// result cell — so when the tail is at last-use the cons PRESERVES the
+/// tail's uniqueness INTO the cons result. This is strictly stronger than
+/// `alwaysConsumingBuiltinArg`, which marks BOTH cons slots consuming for
+/// the post-call-release accounting: the head is merely consumed (stored
+/// into the new cell, no derivative), while the tail is consumed AND its
+/// uniqueness flows to the dest.
+///
+/// The uniqueness stack uses this in three places: the signature
+/// inference (`uniqueness_fixpoint.classifyBuiltinCall`) upgrades the
+/// tail-position parameter to `preservesUniqueness`; the production
+/// uniqueness dataflow and the tentative pre-flight
+/// (`uniqueness.Analyzer.applyEffect` / `arc_param_convention`
+/// `TentativeAnalyzer.applyEffect` and `computeRewrittenShareSet`) treat
+/// a tail-at-last-use cons as a uniqueness-preserving move into the
+/// result, mirroring the `list_cons` IR-node rc-1 gate.
+///
+/// Cons is the head=slot 0, tail=slot 1 calling convention
+/// (`List.prepend(list, value) -> :zig.List.cons(value, list)`), so the
+/// tail is always slot 1.
+pub fn consBuiltinTailSlot(name: []const u8) ?usize {
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    const method_full = name[dot_index + 1 ..];
+    const prefix = name[0..dot_index];
+    const method = stripOwnedUncheckedSuffix(method_full);
+    if (std.mem.eql(u8, method, "cons") and isListBuiltinPrefix(prefix)) return 1;
+    return null;
+}
+
 /// Does `name`/`slot` name the recoverable-raise side-channel STASH
 /// primitive that takes ownership of a boxed `Error` and transfers it
 /// OUT of the caller into the thread-local raise side-channel?

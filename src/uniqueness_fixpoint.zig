@@ -1467,6 +1467,54 @@ const FlowWalker = struct {
             }
             return;
         }
+        // `:zig.List.cons(head, tail)` — the cons tail (slot 1) is the
+        // existing list the new cell prepends onto. Under the runtime's
+        // rc-1 in-place fast path a refcount-1 tail is mutated in place
+        // and returned AS the result cell, so the tail's uniqueness
+        // flows through to the cons result: the tail position is
+        // `preserves_uniqueness`, and the result carries the tail's
+        // parameter slot forward. The head (slot 0) is stored into the
+        // new cell as an element (clone-on-insert gives the cell its own
+        // owner), so it `aliases` out — the head is NOT recoverable as a
+        // unique value through the return.
+        //
+        // This is the signature-inference half of the cons-tail-at-last-
+        // use linearity that `consBuiltinTailSlot` names. The
+        // per-instruction enforcement (the tail-at-last-use gate
+        // mirroring the `list_cons` IR-node rc-1 path) lives in the
+        // uniqueness dataflow (`uniqueness.Analyzer.applyEffect` and the
+        // tentative pre-flight); the verifier is the final safety net.
+        // Closing this is what lets a `List.prepend(accumulator, value)`
+        // wrapper inherit its `list` slot's uniqueness into the return,
+        // so a recursive combinator accumulator threaded through cons
+        // stays unique-on-entry and can be promoted to `.owned`.
+        if (arc_liveness.consBuiltinTailSlot(name)) |tail_slot| {
+            for (args, 0..) |arg, idx| {
+                if (self.carrier_of.get(arg)) |slot| {
+                    if (idx == tail_slot) {
+                        try self.upgradeParam(slot, ParamSig.preservesUniqueness(null));
+                    } else {
+                        // Head position (or any non-tail arg): stored as
+                        // an element; the parameter aliases out.
+                        try self.upgradeParam(slot, ParamSig.aliasesOut());
+                    }
+                }
+            }
+            // Carry the tail's parameter through to the dest so the
+            // cons result is recognised as preserving that parameter's
+            // uniqueness for the enclosing function's return witness.
+            if (tail_slot < args.len) {
+                if (self.carrier_of.get(args[tail_slot])) |slot| {
+                    try self.carrier_of.put(self.allocator, dest, slot);
+                } else {
+                    _ = self.carrier_of.remove(dest);
+                }
+            } else {
+                _ = self.carrier_of.remove(dest);
+            }
+            return;
+        }
+
         // Non-mutating builtin: any param flowing in is borrowed —
         // the parameter is *not* consumed, no flow upgrades. The
         // dest does not carry a parameter (fresh, not parameter-

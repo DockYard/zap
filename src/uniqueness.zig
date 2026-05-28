@@ -1090,6 +1090,38 @@ const Analyzer = struct {
                         }
                     }
                     try self.unique.put(self.allocator, cb.dest, {});
+                } else if (arc_liveness.consBuiltinTailSlot(cb.name)) |tail_slot| {
+                    // `:zig.List.cons(head, tail)` — the rc-1 in-place
+                    // fast path: when the cons tail is at last-use, the
+                    // runtime mutates the tail's refcount-1 buffer in
+                    // place and returns the same cell as the dest. The
+                    // dest therefore inherits the tail's uniqueness.
+                    // This is the per-instruction counterpart of the
+                    // `list_cons` IR-node rc-1 gate above, and the
+                    // soundness condition for the cons-tail-preserves-
+                    // uniqueness signature: the dest is unique ONLY when
+                    // the tail was unique AND at its last use here.
+                    //
+                    // Not at last-use → the cons retains a fresh alias to
+                    // the tail's cell (rc>=2), so the dest is not unique.
+                    const tail_unique_at_last_use = blk: {
+                        if (tail_slot >= cb.args.len) break :blk false;
+                        const tail = cb.args[tail_slot];
+                        if (!self.unique.contains(tail)) break :blk false;
+                        const o = self.ownership orelse break :blk false;
+                        break :blk o.isLastUseAt(tail, my_id);
+                    };
+                    if (tail_slot < cb.args.len) {
+                        // The tail's uniqueness flows into the dest (or is
+                        // lost); either way the tail local is no longer a
+                        // first-class owner after the cons.
+                        _ = self.unique.remove(cb.args[tail_slot]);
+                    }
+                    if (tail_unique_at_last_use) {
+                        try self.unique.put(self.allocator, cb.dest, {});
+                    } else {
+                        _ = self.unique.remove(cb.dest);
+                    }
                 } else if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
                     // Fresh allocator: runtime contract is rc=1 by
                     // construction. The dest is unique on every reach.

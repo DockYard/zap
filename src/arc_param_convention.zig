@@ -1821,6 +1821,33 @@ const TentativeAnalyzer = struct {
                         }
                     }
                     try self.unique.put(self.allocator, cb.dest, {});
+                } else if (arc_liveness.consBuiltinTailSlot(cb.name)) |tail_slot| {
+                    // Mirror `uniqueness.Analyzer.applyEffect`'s cons-
+                    // tail-at-last-use gate (Layer 2) so the pre-flight
+                    // observes the same uniqueness as the production
+                    // dataflow the verifier runs: a `:zig.List.cons` dest
+                    // inherits the tail's uniqueness ONLY when the tail
+                    // was unique AND at its last use here (the rc-1 in-
+                    // place fast path). This is what lets a
+                    // `List.prepend(accumulator, value)` result be unique
+                    // when the accumulator is unique-on-entry, so the
+                    // recursive combinator call passes a unique arg to
+                    // its `.owned` accumulator slot.
+                    const tail_unique_at_last_use = blk: {
+                        if (tail_slot >= cb.args.len) break :blk false;
+                        const tail = cb.args[tail_slot];
+                        if (!self.unique.contains(tail)) break :blk false;
+                        const o = self.ownership orelse break :blk false;
+                        break :blk o.isLastUseAt(tail, my_id);
+                    };
+                    if (tail_slot < cb.args.len) {
+                        _ = self.unique.remove(cb.args[tail_slot]);
+                    }
+                    if (tail_unique_at_last_use) {
+                        try self.unique.put(self.allocator, cb.dest, {});
+                    } else {
+                        _ = self.unique.remove(cb.dest);
+                    }
                 } else if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
                     try self.unique.put(self.allocator, cb.dest, {});
                 } else {
@@ -2507,6 +2534,24 @@ fn siteAuditEligible(
                     if (consume_last_use_opt != null) &fn_ownership.last_use_map else null;
                 const consume_last_use: arc_liveness.InstructionId = consume_last_use_opt orelse 0;
                 if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id, last_use_map_opt, consume_last_use)) return false;
+                // Reflexive self-loop bootstrap. When a self-recursive
+                // call passes the SAME slot straight back to itself
+                // (chain root is `param_get` of `slot_index`, and this
+                // very call targets the enclosing function), the chain
+                // is trivially consistent: the parameter the recursion
+                // consumes is the same parameter the recursion receives,
+                // so there is exactly one linear owner threaded across
+                // the recursion. This breaks the lift_set chicken-and-
+                // egg for a single-function PU cycle (the reject branch
+                // of `Enum.filter_next`/`reject_next` re-passes the
+                // borrowed accumulator unchanged) without needing the
+                // slot to already be in lift_set. Soundness is still
+                // gated by the uniqueness pre-flight
+                // (`liftSetSurvivesUniquenessCheck`) and the final
+                // verifier — this only makes the slot a CANDIDATE.
+                if (site.is_self_recursive and param_slot == slot_index) {
+                    return true;
+                }
                 // The audit's chain-consistency core: when the chain
                 // root is a `param_get` of a `.borrowed` parameter,
                 // the audit succeeds only when that parameter slot is
@@ -3216,6 +3261,21 @@ fn streamHasOwnedBuiltinConsumingAlias(
                         containsAlias(alias_set, arg))
                     {
                         return true;
+                    }
+                    // Cons tail: `:zig.List.cons(head, tail)` consumes the
+                    // tail into the new cell (rc-1 in-place mutation when
+                    // the tail is at last-use). A `List.prepend(list,
+                    // value)` wrapper forwards its `list` slot straight
+                    // into the cons tail, so that slot is consumed via an
+                    // owned sink — a valid promotion anchor. This is the
+                    // wrapper-around-builtin half of the cons-tail
+                    // linearity (peer to the owned-mutating-builtin and
+                    // list-element-consuming anchors above) that makes
+                    // `List.prepend`'s list slot promotable to `.owned`,
+                    // which in turn lets a combinator accumulator threaded
+                    // through `List.prepend` stay unique.
+                    if (arc_liveness.consBuiltinTailSlot(cb.name)) |tail_slot| {
+                        if (tail_slot == slot and containsAlias(alias_set, arg)) return true;
                     }
                 }
             },
