@@ -1664,9 +1664,13 @@ const ValidatedSection = struct {
 ///
 ///   * **Unknown bits** — any bit outside `KNOWN_CAPS_MASK` (bits 4..63) is
 ///     reserved and unimplemented (`ReservedCapabilityDeclared`).
-///   * **Reserved Axis-A codes** — `TRACED` (`0b10`) is reserved until the
-///     tracing-GC manager ships (plan Phase 5); the `0b11` code carries no
-///     assigned model. Both are rejected (`ReservedCapabilityDeclared`).
+///   * **Reserved Axis-A codes** — only the `0b11` code carries no assigned
+///     model; it is rejected (`ReservedCapabilityDeclared`). `BULK_OR_NEVER`
+///     (`0b00`), `INDIVIDUAL_NO_REFCOUNT` (`0b01`), and `TRACED` (`0b10`) are
+///     all defined and accepted. `TRACED` (the conservative tracing-GC model,
+///     plan Phase 5) reuses the `BULK_OR_NEVER` codegen contract — no
+///     retain/release/free, no `ArcHeader` — and the GC manager reclaims at
+///     runtime, so accepting it needs no new compiler emission.
 ///   * **Inconsistent combos** (`ValidationFailed`):
 ///       - `REFCOUNT_V1` (bit 0) set but the Axis-A field is not the
 ///         `REFCOUNTED` encoding (`0b00`) — a manager cannot be both
@@ -1702,18 +1706,20 @@ fn validateDeclaredCaps(
     }
 
     // 2b. Reserved Axis-A codes. When bit 0 is clear the field selects the
-    // free model; TRACED is reserved until the GC manager ships and 0b11 is
-    // undefined. (When bit 0 is set, 2a already forced the field to 0b00.)
+    // free model; BULK_OR_NEVER, INDIVIDUAL_NO_REFCOUNT, and TRACED are all
+    // defined and accepted, while 0b11 is undefined and rejected. (When bit 0
+    // is set, 2a already forced the field to 0b00.) TRACED's codegen contract
+    // is byte-identical to BULK_OR_NEVER — the compiler elides every
+    // retain/release/free and lays out no `ArcHeader`, and the tracing-GC
+    // manager reclaims at runtime (plan Phase 5). Immutability means there are
+    // no write barriers to emit and a conservative collector needs no compiler
+    // root maps or safepoints, so accepting the model requires no new emission.
     if (!refcount_v1) {
         switch (axis_a) {
-            abi.RECLAMATION_BULK_OR_NEVER, abi.RECLAMATION_INDIVIDUAL_NO_REFCOUNT => {},
-            abi.RECLAMATION_TRACED => {
-                diag.write(
-                    "manager '{s}' declares the TRACED reclamation model (Axis A = 0b10), which is reserved until the tracing-GC manager ships (declared_caps=0x{x})",
-                    .{ manager_name, declared_caps },
-                );
-                return ResolveError.ReservedCapabilityDeclared;
-            },
+            abi.RECLAMATION_BULK_OR_NEVER,
+            abi.RECLAMATION_INDIVIDUAL_NO_REFCOUNT,
+            abi.RECLAMATION_TRACED,
+            => {},
             abi.RECLAMATION_RESERVED => {
                 diag.write(
                     "manager '{s}' declares the reserved Axis-A reclamation code 0b11, which has no assigned model (declared_caps=0x{x})",
@@ -2983,6 +2989,12 @@ test "validateDeclaredCaps accepts the defined axis values" {
         abi.CAPS_INDIVIDUAL_NO_REFCOUNT | abi.SHARING_MOVE_ONLY_BIT,
         &diag,
     );
+    // TRACED (the conservative tracing-GC manager, plan Phase 5).
+    try validateDeclaredCaps(
+        "GC",
+        abi.RECLAMATION_TRACED << abi.RECLAMATION_MODEL_SHIFT,
+        &diag,
+    );
 }
 
 test "validateDeclaredCaps rejects unknown high bits" {
@@ -2999,13 +3011,20 @@ test "validateDeclaredCaps rejects unknown high bits" {
     );
 }
 
-test "validateDeclaredCaps rejects the reserved TRACED model until GC ships" {
+test "validateDeclaredCaps accepts the TRACED model (conservative tracing GC, Phase 5)" {
     var diag_buf: [256]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
     const traced: u64 = abi.RECLAMATION_TRACED << abi.RECLAMATION_MODEL_SHIFT; // 0x4
+    // Phase 5: the conservative tracing-GC manager (`Memory.GC`) declares
+    // TRACED, whose codegen contract reuses BULK_OR_NEVER elision (no
+    // retain/release/free, no `ArcHeader`). It is a fully-defined Axis-A model
+    // and MUST validate. The MOVE_ONLY (Axis B) bit, however, is only legal for
+    // INDIVIDUAL_NO_REFCOUNT — pairing it with TRACED is still an inconsistent
+    // combo and is rejected by rule 3 below.
+    try validateDeclaredCaps("GC", traced, &diag);
     try std.testing.expectError(
-        ResolveError.ReservedCapabilityDeclared,
-        validateDeclaredCaps("Traced", traced, &diag),
+        ResolveError.ValidationFailed,
+        validateDeclaredCaps("GCMoveOnly", traced | abi.SHARING_MOVE_ONLY_BIT, &diag),
     );
 }
 

@@ -629,6 +629,7 @@ const SCRIPT_MEMORY_MANAGERS = [_][]const u8{
     "Memory.NoOp",
     "Memory.Leak",
     "Memory.Tracking",
+    "Memory.GC",
 };
 
 /// Pure helper: map a Zig-style optimize mode name (`Debug`,
@@ -1345,7 +1346,7 @@ fn cmdRunScript(
     if (overrides.memory) |mgr| {
         if (!validateScriptMemoryManager(mgr)) {
             std.debug.print(
-                "Error: unsupported memory manager '{s}' — script mode is single-file with no dependency graph and supports only the stdlib managers: Memory.ARC, Memory.Arena, Memory.NoOp, Memory.Leak, Memory.Tracking\n",
+                "Error: unsupported memory manager '{s}' — script mode is single-file with no dependency graph and supports only the stdlib managers: Memory.ARC, Memory.Arena, Memory.NoOp, Memory.Leak, Memory.Tracking, Memory.GC\n",
                 .{mgr},
             );
             std.process.exit(1);
@@ -11172,12 +11173,14 @@ test "optimizePolicyForBuildConfig maps frontend backend and memory optimize mod
     }
 }
 
-test "validateScriptMemoryManager: accepts exactly the five stdlib managers" {
+test "validateScriptMemoryManager: accepts exactly the six stdlib managers" {
     try testing.expect(validateScriptMemoryManager("Memory.ARC"));
     try testing.expect(validateScriptMemoryManager("Memory.Arena"));
     try testing.expect(validateScriptMemoryManager("Memory.NoOp"));
     try testing.expect(validateScriptMemoryManager("Memory.Leak"));
     try testing.expect(validateScriptMemoryManager("Memory.Tracking"));
+    // Phase 5: the conservative tracing-GC manager (TRACED reclamation model).
+    try testing.expect(validateScriptMemoryManager("Memory.GC"));
 }
 
 test "validateScriptMemoryManager: rejects third-party / unknown managers" {
