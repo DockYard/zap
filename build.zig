@@ -468,7 +468,7 @@ pub fn build(b: *std.Build) void {
     // Tracking + custom) contracts; custom BULK_OR_NEVER == Arena, custom
     // INDIVIDUAL_NO_REFCOUNT == Tracking. (The `zir-test` step adds the
     // build+run integration tests for the two custom managers.)
-    const custom_manager_proof_step = b.step("custom-manager-proof", "Run the capability-driven memory model verification matrix + custom-manager acceptance proof");
+    const custom_manager_proof_step = b.step("custom-manager-proof", "Run the capability-driven memory model verification matrix (all 6 managers incl. the TRACED GC bounded-RSS proof) + custom-manager acceptance proof");
     const custom_manager_proof_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_custom_manager_proof.sh" });
     custom_manager_proof_cmd.step.dependOn(b.getInstallStep());
     custom_manager_proof_step.dependOn(&custom_manager_proof_cmd.step);

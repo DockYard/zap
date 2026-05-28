@@ -19,6 +19,8 @@
 #   NoOp     BULK_OR_NEVER            non-alloc runs; alloc -> documented OOM (not a refcount panic)
 #   Leak     BULK_OR_NEVER            runs; no refcount panic
 #   Tracking INDIVIDUAL_NO_REFCOUNT   runs, leak-gated clean
+#   GC       TRACED                   runs, no refcount panic (TRACED == BULK_OR_NEVER codegen);
+#                                      collector reclaims => bounded RSS vs unbounded Leak
 #   custom   declared caps            BulkArena == Arena ; TrackingPool == Tracking (caps-only)
 #
 # Usage: script_fixtures/run_custom_manager_proof.sh
@@ -119,6 +121,69 @@ LEAK_OUT=$("$ZAP" run -Dmemory=Memory.Leak script_fixtures/custom_manager_noallo
 check        "Leak program ran"             "$LEAK_OUT" "42"
 expect_exit  "Leak exit 0"                  "$RC" 0
 refute       "no refcount panic under Leak" "$LEAK_OUT" "does not implement REFCOUNT_V1"
+
+# ---------------------------------------------------------------------------
+# GC (TRACED) — the conservative tracing collector. TRACED reuses the
+# BULK_OR_NEVER codegen (zero retain/release/free emitted, no ArcHeader), so the
+# collector is the only new behaviour. Two contracts: (1) a GC build runs to
+# completion with correct output and no refcount panic; (2) the headline payoff
+# — a long allocate-and-drop loop stays BOUNDED in resident memory under GC
+# (the collector reclaims) while the SAME program under Leak grows without
+# bound. RSS is measured on the produced program binary, isolated from the
+# compiler, by building the script binary once then timing it directly.
+echo
+echo "== Memory.GC (TRACED) — conservative mark-sweep =="
+rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
+GC_OUT=$("$ZAP" run -Dmemory=Memory.GC -Doptimize=ReleaseFast script_fixtures/custom_manager_alloc.zap 2>&1); RC=$?
+check        "GC allocating program ran to completion" "$GC_OUT" "10"
+expect_exit  "GC exit 0"                                "$RC" 0
+refute       "no refcount panic-stub fired under GC (TRACED elides refcount)" "$GC_OUT" "does not implement REFCOUNT_V1"
+
+# Build the bounded-RSS loop binary under each manager, then time the binary
+# alone (compiler RSS excluded). Returns peak-RSS bytes via global RSS_BYTES.
+peak_rss_of_loop() { # peak_rss_of_loop <manager>
+  local manager="$1"
+  rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
+  # Build + cache the binary (and prove it runs correctly).
+  local out
+  out=$("$ZAP" run -Dmemory="$manager" -Doptimize=ReleaseFast script_fixtures/gc_bounded_rss_loop.zap 2>&1)
+  LOOP_OUT="$out"
+  LOOP_RC=$?
+  local bin
+  bin=$(find "${HOME}/.cache/zap/scripts" -name script -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | head -1)
+  RSS_BIN="$bin"
+  local timing
+  timing=$( { /usr/bin/time -l "$bin" >/dev/null; } 2>&1 )
+  RSS_BYTES=$(printf '%s\n' "$timing" | awk '/maximum resident set size/ {print $1}')
+}
+
+peak_rss_of_loop "Memory.GC"
+GC_RSS=${RSS_BYTES:-0}
+check        "GC bounded-RSS loop produced correct sum" "$LOOP_OUT" "20000000"
+expect_exit  "GC bounded-RSS loop exit 0"               "$LOOP_RC" 0
+
+peak_rss_of_loop "Memory.Leak"
+LEAK_RSS=${RSS_BYTES:-0}
+check        "Leak bounded-RSS loop produced correct sum" "$LOOP_OUT" "20000000"
+
+echo "   GC peak RSS:   ${GC_RSS} bytes"
+echo "   Leak peak RSS: ${LEAK_RSS} bytes"
+# Contract A: GC stays bounded — a 64 MiB ceiling for 8M transient allocations
+# (the live set is ~hundreds of bytes; 64 MiB is generous slack for slabs/heap).
+GC_CEIL=$((64 * 1024 * 1024))
+if [ "${GC_RSS:-0}" -gt 0 ] && [ "${GC_RSS}" -le "${GC_CEIL}" ]; then
+  echo "  PASS: GC reclaims — peak RSS ${GC_RSS} <= ${GC_CEIL} (bounded)"
+else
+  echo "  FAIL: GC peak RSS ${GC_RSS} exceeds the ${GC_CEIL}-byte bound (collector not reclaiming?)"; fail=1
+fi
+# Contract B: GC's reclamation is dramatic vs the never-freeing Leak manager —
+# GC must use at most 1/10th of Leak's resident memory for the identical loop.
+if [ "${LEAK_RSS:-0}" -gt 0 ] && [ "${GC_RSS:-0}" -gt 0 ] && [ $((GC_RSS * 10)) -lt "${LEAK_RSS}" ]; then
+  echo "  PASS: GC RSS (${GC_RSS}) < 1/10 of Leak RSS (${LEAK_RSS}) — collector reclaims, Leak grows unbounded"
+else
+  echo "  FAIL: GC RSS (${GC_RSS}) not << Leak RSS (${LEAK_RSS}) — expected the GC to reclaim"; fail=1
+fi
+rm -rf "${HOME}/.cache/zap/scripts" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # ARC (REFCOUNTED) — representative program runs. The full corpus 942/0 + V8
