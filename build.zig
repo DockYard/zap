@@ -460,6 +460,30 @@ pub fn build(b: *std.Build) void {
     fcc_phase5_cmd.step.dependOn(b.getInstallStep());
     fcc_phase5_step.dependOn(&fcc_phase5_cmd.step);
 
+    // CapMem Phase 4 custom-manager + verification matrix: the adapter-bounded
+    // acceptance proof. Two custom (non-stdlib) managers whose names are
+    // unknown to the compiler get codegen byte-identical to the stdlib managers
+    // declaring the same `declared_caps` — proving codegen reads the caps bits,
+    // never the manager name. Asserts all 6 managers' (ARC/Arena/NoOp/Leak/
+    // Tracking + custom) contracts; custom BULK_OR_NEVER == Arena, custom
+    // INDIVIDUAL_NO_REFCOUNT == Tracking. (The `zir-test` step adds the
+    // build+run integration tests for the two custom managers.)
+    const custom_manager_proof_step = b.step("custom-manager-proof", "Run the capability-driven memory model verification matrix + custom-manager acceptance proof");
+    const custom_manager_proof_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_custom_manager_proof.sh" });
+    custom_manager_proof_cmd.step.dependOn(b.getInstallStep());
+    custom_manager_proof_step.dependOn(&custom_manager_proof_cmd.step);
+
+    // CapMem Phase 4 recursive-struct Tracking-leak characterization (gap #302 /
+    // task #302): a TRACKED-KNOWN-GAP harness asserting the corpus still passes
+    // 942/0 under Memory.Tracking while the deinit report surfaces the known
+    // 12-alloc/336-byte recursive-struct leak. A future owner-model fix that
+    // removes the leak FAILS this harness — the signal to retire the
+    // characterization and flip the corpus leak-free.
+    const recursive_struct_leak_step = b.step("recursive-struct-leak-characterization", "Assert the tracked recursive-struct Tracking leak (gap #302) is present and the corpus still passes 942/0");
+    const recursive_struct_leak_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_recursive_struct_leak_characterization.sh" });
+    recursive_struct_leak_cmd.step.dependOn(b.getInstallStep());
+    recursive_struct_leak_step.dependOn(&recursive_struct_leak_cmd.step);
+
     // -----------------------------------------------------------------------
     // ZIR integration tests (need the built binary)
     // -----------------------------------------------------------------------
