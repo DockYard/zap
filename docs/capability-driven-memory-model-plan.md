@@ -206,7 +206,59 @@ unprovable share — deferred).
     double-frees an aliased buffer (verified: trace/breakpoint trap). Buffers stay reclaimed at
     process teardown — the documented Tracking allocation model — pending the full no-refcount
     static-ownership model that guarantees a unique owner per buffer.
-- **Phase 4 — per-manager corpus + custom-manager test.** Lock in the verification matrix.
+- **Phase 4 — per-manager corpus + custom-manager test. DONE.** Lock in the verification matrix.
+
+  **Phase 4 STATUS (COMPLETE):**
+  - **DONE: custom-manager caps-driven-codegen proof (the adapter-bounded acceptance test).**
+    Two TEST-FIXTURE custom managers — neither a stdlib manager, both names unknown to the
+    compiler — declare the same `declared_caps` as their stdlib peers and get byte-identical
+    codegen purely from the caps bits:
+    `script_fixtures/custom_manager_proof/src/custom/bulk_arena/manager.zig` (`Custom.BulkArena`,
+    BULK_OR_NEVER, `declared_caps == 0x0`, a bespoke chunked-bump allocator ≠ the stdlib Arena);
+    `.../tracking_pool/manager.zig` (`Custom.TrackingPool`, INDIVIDUAL_NO_REFCOUNT | CLONE_ON_SHARE,
+    `declared_caps == 0x2`, an individual-free allocator with a live counter + deinit leak gate).
+    Each backend's refcount slots are `@panic` stubs, so a wrongly-emitted refcount op (the failure
+    mode if codegen special-cased an unrecognised name and fell back to refcounted codegen) aborts
+    the run; running to completion with the expected output proves the elision (BULK_OR_NEVER) /
+    static-free (INDIVIDUAL_NO_REFCOUNT) codegen was selected from the caps alone. Verified: the
+    custom BULK_OR_NEVER program produces output IDENTICAL to `Memory.Arena`; the custom
+    INDIVIDUAL_NO_REFCOUNT program produces output IDENTICAL to `Memory.Tracking` with no leak
+    survivor. The `.zapmem` section bytes confirm `declared_caps == 0x0`/`0x2` (== Arena/Tracking).
+  - **DONE: no-name-special-casing-in-codegen audit.** `src/arc_materialize.zig`,
+    `arc_drop_insertion.zig`, `arc_verifier.zig`, `arc_liveness.zig`, `memory/elision.zig` contain
+    ZERO manager-name string compares; every memory-codegen gate keys off
+    `elision.reclamationModel(caps)` / `sharingStrategy(caps)` / `shouldEmitRefcountOps(caps)`.
+    Resolution-by-name (`builder.zig`) and the script-mode stdlib allowlist (`main.zig`
+    `SCRIPT_MEMORY_MANAGERS`, the 5 stdlib names — single-file mode has no dependency graph) are
+    the convention, NOT codegen. `memory/elision.zig` carries a unit test proving the custom caps
+    (0x0/0x2) map identically through the projection functions to the stdlib peers.
+  - **DONE: verification matrix.** `script_fixtures/run_custom_manager_proof.sh` asserts all 6
+    managers' contracts and PASSES: ARC (representative run; corpus 942/0 + V8 verifier asserted by
+    `zap test` / `zig build test`); Arena/NoOp/Leak (BULK_OR_NEVER — run, no refcount panic; NoOp
+    allocating → documented OOM, not a refcount panic); Tracking (INDIVIDUAL_NO_REFCOUNT — runs,
+    leak-gated clean); custom BulkArena == Arena and custom TrackingPool == Tracking. The
+    `zir-test` step adds build+run integration tests for both custom managers.
+  - **CHARACTERIZED + TRACKED: recursive-struct Tracking leak (gap #302).** Under `Memory.Tracking`
+    a recursive indirect-storage struct (`LinkedNode.next`) double-walked by two self-recursive
+    `.borrowed`-param functions leaks 6 `%LinkedNode{}` deinit survivors (part of the corpus's
+    stable 12-alloc / 336-byte total). EVERY corpus assertion still PASSES (942/0) and ARC is
+    byte-clean — the leak is a deinit-time survivor, not an assertion failure. ROOT CAUSE: `src/ir.zig`
+    `extractRetainKind` classifies every non-list/map aggregate extraction (`node.next`) as
+    `RetainKind.persistent`, which under clone-on-share DEEP-CLONES the recursive struct even when
+    the extracted value flows only into a `.borrowed` (non-owning) recursive call and is released at
+    its last use (a transient borrow). The spurious per-recursion-level clones and the outer clone's
+    deep-walk-free do not reconcile, orphaning cells. The decision is made at IR-BUILD time from the
+    extracted TYPE alone, with no knowledge of the downstream consumer's ownership convention; a
+    SOUND fix must defer/refine it with post-`arc_liveness` escape + consumer-convention analysis
+    (downgrade `.persistent` → borrow when the extract feeds ONLY borrowing consumers, ARC
+    byte-identical) — the consumed-vs-standalone owner model of **task #302**, a broad cascade with
+    high ARC-regression risk, NOT a localized Phase-3 patch. Forcing `.normal` unconditionally would
+    double-free the shapes that genuinely need the clone (a child extracted and STORED as a true
+    co-owner). Surfaced + tracked by
+    `script_fixtures/run_recursive_struct_leak_characterization.sh` (asserts corpus 942/0 + the
+    12-alloc deinit leak present; a future fix that removes the leak FAILS the harness — the signal
+    to retire the characterization and flip the corpus to leak-free) and documented inline at the
+    leaking tests in `test/struct_test.zap`.
 - **Phase 5 — `TRACED` conservative GC manager (in scope).** Add `lib/memory/gc.zap` (zero-method
   marker) + `src/memory/gc/manager.zig` (conservative stop-the-world mark-sweep: managed heap;
   on threshold/OOM, conservatively scan stack + registers + globals for word-aligned heap

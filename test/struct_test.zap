@@ -317,6 +317,25 @@ pub struct StructTest {
     n.value
   }
 
+  ## KNOWN GAP #302 (recursive-struct Tracking leak; tracked, NOT a regression).
+  ## Under `-Dmemory=Memory.Tracking` (INDIVIDUAL_NO_REFCOUNT | CLONE_ON_SHARE)
+  ## the `LinkedNode` recursive-struct tests below (notably "recursive build
+  ## outlives constructing frames" — a chain double-walked by `chain_length` +
+  ## `chain_sum`) leak 6 `%LinkedNode{}` deinit survivors (part of the 12-alloc /
+  ## 336-byte corpus total). EVERY assertion still PASSES (the leak is a
+  ## deinit-time survivor, not an assertion failure) and ARC is byte-clean, so
+  ## the tests are deliberately NOT wrapped in `assert_no_leaks` — that would
+  ## both fail the corpus and over-report GAP-A mid-scope sampling artifacts.
+  ## Root cause: `src/ir.zig` `extractRetainKind` marks every non-list/map
+  ## aggregate extraction (`node.next`) `RetainKind.persistent`, which under
+  ## clone-on-share DEEP-CLONES the recursive struct even when the extracted
+  ## value flows only into a `.borrowed` (non-owning) recursive call; the
+  ## spurious per-level clones and the outer clone's deep-walk-free do not
+  ## reconcile, orphaning cells. The sound fix (downgrade `.persistent` ->
+  ## borrow when the extract feeds only borrowing consumers, via post-
+  ## `arc_liveness` escape analysis, ARC byte-identical) is the
+  ## consumed-vs-standalone owner model of task #302. The leak is surfaced +
+  ## tracked by `script_fixtures/run_recursive_struct_leak_characterization.sh`.
   describe("Recursive struct field auto-deref") {
     test("indirect-storage field reads as source-level optional") {
       head = build_two_node_list()
