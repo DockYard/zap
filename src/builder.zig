@@ -2250,6 +2250,7 @@ const REAL_ARENA_BACKEND_SOURCE = @embedFile("memory/arena/manager.zig");
 const REAL_LEAK_BACKEND_SOURCE = @embedFile("memory/leak/manager.zig");
 const REAL_TRACKING_BACKEND_SOURCE = @embedFile("memory/tracking/manager.zig");
 const REAL_NO_OP_BACKEND_SOURCE = @embedFile("memory/no_op/manager.zig");
+const REAL_GC_BACKEND_SOURCE = @embedFile("memory/gc/manager.zig");
 
 const ReclamationModel = zap.memory_elision.ReclamationModel;
 const SharingStrategy = zap.memory_elision.SharingStrategy;
@@ -2314,6 +2315,15 @@ const stdlib_manager_matrix = [_]StdlibManagerCase{
         .backend_source = REAL_NO_OP_BACKEND_SOURCE,
         .expected_caps = zap.memory_abi.CAPS_BULK_OR_NEVER, // 0x0
         .expected_model = .bulk_or_never,
+        .expected_sharing = .clone_on_share,
+    },
+    .{
+        .type_name = "Memory.GC",
+        .adapter_path = "lib/memory/gc.zap",
+        .backend_source = REAL_GC_BACKEND_SOURCE,
+        // TRACED — the conservative tracing-GC reclamation model (Axis A = 0b10).
+        .expected_caps = zap.memory_abi.RECLAMATION_TRACED << zap.memory_abi.RECLAMATION_MODEL_SHIFT, // 0x4
+        .expected_model = .traced,
         .expected_sharing = .clone_on_share,
     },
 };

@@ -945,16 +945,17 @@ fn largeObjectAlloc(ctx: *GcContext, size: usize, alignment: u32) ?[*]u8 {
 
 /// Initialise the manager. Allocates a `GcContext` on `page_allocator`,
 /// initialises empty slab chains and the record table, and **captures the
-/// stack bottom** from this frame's address.
+/// stack bottom** by reading the current stack pointer.
 ///
 /// `init` is invoked by the runtime's startup prologue (`memoryStartupForEntry`,
 /// called from the compiler-emitted entry in `main`) before any user allocation,
 /// or — in the lazy-fallback runtime — at the first allocation. Either site is a
 /// frame at a higher (or equal) stack address than every subsequent allocation
-/// frame, so `@frameAddress()` here is a sound upper bound for the live stack
-/// span scanned at every later collection. Spec §4.2 forbids a manager from
-/// triggering compiler-emitted allocation during `init`; this manager only uses
-/// `page_allocator` here, satisfying the constraint.
+/// frame, so the stack pointer read here (via `currentStackPointer`) is a sound
+/// upper bound for the live stack span scanned at every later collection. Spec
+/// §4.2 forbids a manager from triggering compiler-emitted allocation during
+/// `init`; this manager only uses `page_allocator` here, satisfying the
+/// constraint.
 fn gcInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
     _ = options;
     const backing = std.heap.page_allocator;
