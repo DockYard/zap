@@ -277,32 +277,43 @@ pub const PerceusAnalyzer = struct {
         };
 
         for (self.current_decon_sites.items) |decon| {
-            // Find constructions in the branch bodies of this match
-            const constructions = try self.findCompatibleConstructionsForMatch(
-                func,
-                &decon,
-            );
+            // Phase 3 gate: only an OWNED, ARC-managed heap-cell scrutinee
+            // can back a reuse pair. A `.trivial` (by-value / non-ARC) or
+            // `.borrowed` (caller-owned) scrutinee has no reusable
+            // allocation — emitting `.reset`/`.reuse_alloc` for it is
+            // unsound (and trips ARC verifier V11). Skip construction
+            // discovery + reuse-pair generation in that case; the
+            // deconstruction still flows through normal drop insertion.
+            // Drop specialization (Phase 4) is independently gated per
+            // field by `fieldLocalNeedsDrop`, so it stays unconditional.
+            if (scrutineeReuseEligible(func, decon.scrutinee)) {
+                // Find constructions in the branch bodies of this match
+                const constructions = try self.findCompatibleConstructionsForMatch(
+                    func,
+                    &decon,
+                );
 
-            stats.construction_sites += @intCast(constructions.len);
+                stats.construction_sites += @intCast(constructions.len);
 
-            // Phase 3: Generate reuse pairs
-            for (constructions) |con| {
-                const kind = self.determineReuseKind(&decon);
-                try self.generateReusePair(&decon, &con, func.id, kind);
-                stats.total_reuse_pairs += 1;
-                switch (kind) {
-                    .static_reuse => stats.static_reuses += 1,
-                    .dynamic_reuse => stats.dynamic_reuses += 1,
+                // Phase 3: Generate reuse pairs
+                for (constructions) |con| {
+                    const kind = self.determineReuseKind(&decon);
+                    try self.generateReusePair(&decon, &con, func.id, kind);
+                    stats.total_reuse_pairs += 1;
+                    switch (kind) {
+                        .static_reuse => stats.static_reuses += 1,
+                        .dynamic_reuse => stats.dynamic_reuses += 1,
+                    }
                 }
+                // Free each ConstructionSite's path slice (allocator.dupe'd
+                // in scanInstructionForConstructions) before freeing the
+                // array itself. generateReusePair has already copied paths
+                // it needed into the analysis-context-owned InsertionPoint
+                // records, so these transient site-level paths can be
+                // released here.
+                for (constructions) |con| self.allocator.free(con.path);
+                self.allocator.free(constructions);
             }
-            // Free each ConstructionSite's path slice (allocator.dupe'd
-            // in scanInstructionForConstructions) before freeing the
-            // array itself. generateReusePair has already copied paths
-            // it needed into the analysis-context-owned InsertionPoint
-            // records, so these transient site-level paths can be
-            // released here.
-            for (constructions) |con| self.allocator.free(con.path);
-            self.allocator.free(constructions);
 
             // Phase 4: Generate drop specializations
             try self.generateDropSpecialization(&decon, func);
@@ -1713,6 +1724,44 @@ pub const PerceusAnalyzer = struct {
         return func.local_ownership[local] == .owned;
     }
 
+    /// True iff a deconstruction-site scrutinee is eligible to back a
+    /// Perceus reuse pair — i.e. it is an OWNED, ARC-managed heap cell
+    /// that this function uniquely owns.
+    ///
+    /// Reuse lowers to `ArcRuntime.resetAny(alloc, scrutinee)` +
+    /// `reuseAllocByType(...)`: `resetAny` reads the cell's inline
+    /// `ArcHeader` refcount (returning the allocation as a reuse token
+    /// when rc==1, else releasing it), and `reuseAllocByType`
+    /// repopulates that same storage field-by-field via `field_ptr` +
+    /// `store`. Both steps are only sound when the scrutinee is a
+    /// genuine heap allocation with a refcount header AND is owned by
+    /// this function:
+    ///
+    ///   * `.trivial` — a by-value / non-ARC value (e.g. the
+    ///     `std.meta.Tuple{u32, T, ?*const List}` that `List.next`
+    ///     returns by value). It has no allocation and no `ArcHeader`,
+    ///     so `resetAny` would read a non-existent header. Reusing it is
+    ///     meaningless and unsound; the scrutinee's ARC contents are
+    ///     instead extracted (`index_get`) and released individually by
+    ///     the consumer. This is also exactly the shape ARC verifier V11
+    ///     rejects: a `.reset` whose source local is classified
+    ///     `.trivial` is skipped by the `arc_liveness.identifyArcLocals`
+    ///     seed walk, breaking `arc_managed_locals` completeness.
+    ///   * `.borrowed` — the cell is owned by the CALLER across the
+    ///     call; resetting/reusing its storage would corrupt a value the
+    ///     caller still holds live.
+    ///
+    /// Only `.owned` satisfies both invariants. Mirrors the
+    /// `fieldLocalNeedsDrop` ownership convention above: when the
+    /// function carries no `local_ownership` table (the analyzer's unit
+    /// tests construct bare `ir.Function`s with an empty slice), defer to
+    /// the other reuse gates (type compatibility, construction kind) so
+    /// the pairing algorithm stays independently testable.
+    fn scrutineeReuseEligible(func: *const ir.Function, scrutinee: ir.LocalId) bool {
+        if (scrutinee >= func.local_ownership.len) return true;
+        return func.local_ownership[scrutinee] == .owned;
+    }
+
     fn extractFieldDropFromInstr(instr: *const ir.Instruction) ?struct { field_name: []const u8, local: ir.LocalId } {
         return switch (instr.*) {
             .field_get => |fg| .{ .field_name = fg.field, .local = fg.dest },
@@ -2306,6 +2355,133 @@ test "nested case pre-instructions tuple reconstruction yields reuse pair" {
     };
     const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
     const functions = [_]ir.Function{makeFunction(0, "transform_tuple_nested", &blocks)};
+    var program = try makeTestProgram(&functions);
+    _ = &program;
+
+    var analyzer = PerceusAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    const result = try analyzer.analyze();
+    defer result.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), result.reuse_pairs.len);
+    try testing.expectEqual(@as(ir.LocalId, 20), result.reuse_pairs[0].reuse.dest);
+}
+
+test "trivial (by-value) scrutinee yields NO reuse pair" {
+    // Regression for task #320 (ARC ReleaseFast V11 on the FCC
+    // `for f <- ops` combinator). The deconstruction scrutinee is the
+    // by-value `std.meta.Tuple{u32, T, ?*const List}` returned by
+    // `List.next` — classified `.trivial` in `local_ownership` because
+    // it is NOT a heap-allocated ARC cell. Even though the `:cont`
+    // guard reconstructs a same-arity tuple (a type-compatible reuse
+    // target), Perceus must NOT emit a reuse pair: `resetAny` on a
+    // by-value tuple would read a non-existent `ArcHeader`, and the
+    // resulting `.reset` source classified `.trivial` is exactly what
+    // ARC verifier V11 rejects. The same shape as the
+    // "nested case pre-instructions tuple reconstruction yields reuse
+    // pair" test above — the ONLY difference is the scrutinee's
+    // ownership class — so this proves the gate keys on ownership, not
+    // on IR shape.
+    const allocator = testing.allocator;
+
+    const guard_body = [_]ir.Instruction{
+        .{ .index_get = .{ .dest = 11, .object = 1, .index = 0 } },
+        .{ .index_get = .{ .dest = 12, .object = 1, .index = 1 } },
+        .{ .tuple_init = .{ .dest = 20, .elements = &.{ 11, 12 } } },
+        .{ .case_break = .{ .value = 20 } },
+    };
+    const pre_instrs = [_]ir.Instruction{
+        .{ .guard_block = .{ .condition = 1, .body = &guard_body } },
+    };
+    const block_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 1, .index = 0 } },
+        .{ .case_block = .{ .dest = 30, .pre_instrs = &pre_instrs, .arms = &.{}, .default_instrs = &.{}, .default_result = null } },
+    };
+    const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
+    // Scrutinee %1 is `.trivial` (a by-value `List.next` tuple).
+    var local_ownership = [_]ir.OwnershipClass{.trivial} ** 31;
+    var function = makeFunction(0, "trivial_tuple_scrutinee", &blocks);
+    function.local_ownership = &local_ownership;
+    const functions = [_]ir.Function{function};
+    var program = try makeTestProgram(&functions);
+    _ = &program;
+
+    var analyzer = PerceusAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    const result = try analyzer.analyze();
+    defer result.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 0), result.reuse_pairs.len);
+}
+
+test "borrowed scrutinee yields NO reuse pair" {
+    // Companion to the `.trivial` regression: a `.borrowed` scrutinee is
+    // a heap cell owned by the CALLER across the call. Resetting/reusing
+    // its storage would corrupt a value the caller still holds live, so
+    // Perceus must skip the reuse pair even though the cell is a real
+    // ARC allocation and the construction is type-compatible.
+    const allocator = testing.allocator;
+
+    const guard_body = [_]ir.Instruction{
+        .{ .index_get = .{ .dest = 11, .object = 1, .index = 0 } },
+        .{ .index_get = .{ .dest = 12, .object = 1, .index = 1 } },
+        .{ .tuple_init = .{ .dest = 20, .elements = &.{ 11, 12 } } },
+        .{ .case_break = .{ .value = 20 } },
+    };
+    const pre_instrs = [_]ir.Instruction{
+        .{ .guard_block = .{ .condition = 1, .body = &guard_body } },
+    };
+    const block_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 1, .index = 0 } },
+        .{ .case_block = .{ .dest = 30, .pre_instrs = &pre_instrs, .arms = &.{}, .default_instrs = &.{}, .default_result = null } },
+    };
+    const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
+    var local_ownership = [_]ir.OwnershipClass{.trivial} ** 31;
+    local_ownership[1] = .borrowed;
+    var function = makeFunction(0, "borrowed_scrutinee", &blocks);
+    function.local_ownership = &local_ownership;
+    const functions = [_]ir.Function{function};
+    var program = try makeTestProgram(&functions);
+    _ = &program;
+
+    var analyzer = PerceusAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    const result = try analyzer.analyze();
+    defer result.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 0), result.reuse_pairs.len);
+}
+
+test "owned scrutinee with same-arity construction yields reuse pair" {
+    // Positive control: the SAME nested-pre-instructions tuple shape as
+    // the two negative tests above, but with the scrutinee classified
+    // `.owned` (a heap ARC cell this function uniquely owns). Reuse is
+    // sound here, so the pair must still be generated — proving the gate
+    // suppresses only ineligible scrutinees, not legitimate reuse.
+    const allocator = testing.allocator;
+
+    const guard_body = [_]ir.Instruction{
+        .{ .index_get = .{ .dest = 11, .object = 1, .index = 0 } },
+        .{ .index_get = .{ .dest = 12, .object = 1, .index = 1 } },
+        .{ .tuple_init = .{ .dest = 20, .elements = &.{ 11, 12 } } },
+        .{ .case_break = .{ .value = 20 } },
+    };
+    const pre_instrs = [_]ir.Instruction{
+        .{ .guard_block = .{ .condition = 1, .body = &guard_body } },
+    };
+    const block_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 1, .index = 0 } },
+        .{ .case_block = .{ .dest = 30, .pre_instrs = &pre_instrs, .arms = &.{}, .default_instrs = &.{}, .default_result = null } },
+    };
+    const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
+    var local_ownership = [_]ir.OwnershipClass{.trivial} ** 31;
+    local_ownership[1] = .owned;
+    var function = makeFunction(0, "owned_tuple_scrutinee", &blocks);
+    function.local_ownership = &local_ownership;
+    const functions = [_]ir.Function{function};
     var program = try makeTestProgram(&functions);
     _ = &program;
 
