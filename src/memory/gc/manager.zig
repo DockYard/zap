@@ -638,17 +638,83 @@ fn scanGlobals(ctx: *GcContext) void {
     }
 }
 
-/// Mach-O: ld64 synthesises segment-boundary symbols on demand. A symbol named
-/// `segment$start$__DATA` / `segment$end$__DATA` resolves to the inclusive start
-/// and exclusive end of the `__DATA` segment (see ld64's `$start$`/`$end$`
-/// linker-synthesised symbol feature). These names are not valid Zig
-/// identifiers, so they are bound via `@extern` with an explicit `.name`.
-/// Scanning the whole `__DATA` segment is the conservative superset of `__data`
-/// + `__bss` + `__common` — every mutable global in one range.
+/// The main executable's Mach-O header. The static linker always emits this
+/// symbol for the main executable image (it is not a libc symbol), so it is
+/// available in a `link_libc = false` manager object. We walk its load commands
+/// at collection time to find the writable segments to scan for roots.
+extern const _mh_execute_header: std.macho.mach_header_64;
+
+/// Mach-O: walk the main executable's load commands and scan every **writable**
+/// segment (the conservative superset of `__DATA`, `__DATA_DIRTY`, bss, and
+/// `__common` — every mutable global). Read-only segments (`__TEXT`,
+/// `__DATA_CONST`, `__LINKEDIT`) are skipped: an immutable global there cannot
+/// hold a runtime-assigned heap pointer.
+///
+/// Each segment's load-command `vmaddr` is the *static* (pre-ASLR) address; the
+/// runtime address is `vmaddr + slide`, where `slide` is the ASLR displacement
+/// of the loaded image. We recover `slide` from the `__TEXT` segment, whose
+/// `vmaddr` corresponds to the runtime address of the mach header itself.
 fn scanMachoGlobals(ctx: *GcContext) void {
-    const seg_start = @extern(*const u8, .{ .name = "segment$start$__DATA" });
-    const seg_end = @extern(*const u8, .{ .name = "segment$end$__DATA" });
-    scanRange(ctx, @intFromPtr(seg_start), @intFromPtr(seg_end));
+    const header = &_mh_execute_header;
+    if (header.magic != std.macho.MH_MAGIC_64) return;
+
+    // The load commands follow the header contiguously in memory.
+    const header_addr = @intFromPtr(header);
+    var command_addr = header_addr + @sizeOf(std.macho.mach_header_64);
+
+    // Load commands are emitted with 1-byte alignment relative to the header,
+    // so each command is read through an `align(1)` pointer and copied to a
+    // naturally-aligned local before its fields are used.
+
+    // First pass: recover the ASLR slide from the __TEXT segment.
+    var slide: usize = 0;
+    {
+        var cursor = command_addr;
+        var index: u32 = 0;
+        while (index < header.ncmds) : (index += 1) {
+            const lc = (@as(*align(1) const std.macho.load_command, @ptrFromInt(cursor))).*;
+            if (lc.cmd == .SEGMENT_64) {
+                const seg = (@as(*align(1) const std.macho.segment_command_64, @ptrFromInt(cursor))).*;
+                if (segmentNameEquals(seg.segname, "__TEXT")) {
+                    slide = header_addr -% @as(usize, @intCast(seg.vmaddr));
+                    break;
+                }
+            }
+            cursor += lc.cmdsize;
+        }
+    }
+
+    // Second pass: scan every writable segment's live range.
+    var index: u32 = 0;
+    while (index < header.ncmds) : (index += 1) {
+        const lc = (@as(*align(1) const std.macho.load_command, @ptrFromInt(command_addr))).*;
+        if (lc.cmd == .SEGMENT_64) {
+            const seg = (@as(*align(1) const std.macho.segment_command_64, @ptrFromInt(command_addr))).*;
+            // A segment is mutable when its initial VM protection grants write
+            // access. (We read the `initprot.WRITE` bit directly rather than via
+            // `segment_command_64.isWriteable`, whose body references a
+            // lower-cased field name absent from this std revision's
+            // `vm_prot_t`.)
+            if (seg.initprot.WRITE and seg.vmsize > 0) {
+                const start = @as(usize, @intCast(seg.vmaddr)) +% slide;
+                const end = start +% @as(usize, @intCast(seg.vmsize));
+                scanRange(ctx, start, end);
+            }
+        }
+        command_addr += lc.cmdsize;
+    }
+}
+
+/// Compare a fixed-width Mach-O `segname` (NUL-padded 16-byte field) to a
+/// name literal. Mach-O segment names are at most 16 bytes and NUL-padded; a
+/// match requires every byte of `name` to be present and the field to be NUL
+/// (or end) immediately after.
+fn segmentNameEquals(segname: [16]u8, name: []const u8) bool {
+    if (name.len > segname.len) return false;
+    for (name, 0..) |byte, i| {
+        if (segname[i] != byte) return false;
+    }
+    return name.len == segname.len or segname[name.len] == 0;
 }
 
 /// ELF: `__data_start` bounds the start of the initialised data section and
