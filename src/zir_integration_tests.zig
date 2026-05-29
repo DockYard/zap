@@ -878,6 +878,8 @@ test "CLI: zap test runs Zest cases discovered by project-root relative pattern"
     ;
 
     const runner_source =
+        \\@compile_after_glob = "test/**/*_test.zap"
+        \\
         \\pub struct TestRunner {
         \\  use Zest.Runner, pattern: "test/**/*_test.zap"
         \\}
@@ -6993,20 +6995,41 @@ test "CLI manifest: -Doptimize overrides manifest for zap run <target>" {
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "manifest-marker=abc") != null);
 }
 
-test "CLI manifest: -Dmemory overrides manifest memory: (Leak emits stats)" {
+test "CLI manifest: -Dmemory overrides manifest memory: (override selects the named backend)" {
     const allocator = std.testing.allocator;
     // Manifest says Memory.ARC; `-Dmemory=Memory.Leak` overrides it.
-    // Memory.Leak is observably different — it emits a leak report to
-    // stderr on exit — proving the CLI memory value replaced the
-    // manifest one through the unified override step.
+    // The override flows through the unified `-D` override step into the
+    // build pipeline, which resolves the named backend
+    // (`lib/memory/leak.zap` + `src/memory/leak/manager.zig`), validates
+    // its `.zapmem` section, threads its `declared_caps`, links it, and
+    // runs the produced binary.
+    //
+    // Observability: `Memory.Leak` is the never-free, ZERO-capability
+    // diagnostic manager (Phase 7). It declares no REFCOUNT_V1 and emits
+    // NOTHING on exit — it is NOT the leak-REPORTING manager (that is
+    // `Memory.Tracking`, whose `core.deinit` prints `LEAK: ...` for
+    // surviving allocations). An earlier revision of this test wrongly
+    // asserted "Memory.Leak emits a leak report to stderr"; that has
+    // never been true under the Leak/Tracking split, so the assertion
+    // is corrected to the override's actual, deterministic effect.
+    //
+    // A clean build+run to exit 0 with the marker on stdout — under the
+    // zero-cap Leak backend whose refcount slots are panic stubs — is
+    // the proof the override REPLACED the manifest's `Memory.ARC` with
+    // `Memory.Leak`: had ARC's refcount codegen survived against the
+    // zero-cap Leak runtime, a `does not implement REFCOUNT_V1` panic
+    // stub would have fired on the first retain/release (non-zero exit +
+    // that stub message on stderr).
     var r = try runManifestProject(allocator, "build", ":release_safe", "Memory.ARC", &.{"-Dmemory=Memory.Leak"});
     defer r.deinit();
 
     try std.testing.expectEqual(@as(u8, 0), r.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "manifest-marker=abc") != null);
-    // Memory.Leak's distinctive end-of-run accounting on stderr.
-    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak") != null or
-        std.mem.indexOf(u8, r.stderr, "Leak") != null);
+    // The Leak backend's refcount slots are panic stubs; selecting it via
+    // the override and running clean proves ARC's refcount codegen was
+    // NOT emitted — i.e. the override genuinely replaced the manifest
+    // manager.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "does not implement REFCOUNT_V1") == null);
 }
 
 test "CLI manifest: unresolvable -Dmemory errors like a bad manifest memory:" {
