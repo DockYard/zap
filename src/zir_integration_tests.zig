@@ -2397,22 +2397,28 @@ test "ZIR (acceptance D): case destructuring on Option(i64) extracts payload" {
 }
 
 test "ZIR (acceptance F): case destructuring on Result(T, E) extracts payload" {
-    // Acceptance test F — destructuring half. Result(T, E) is
-    // declared locally in the test fixture (the stdlib `Result(T, E)`
-    // lands in Phase 1.3). Confirms the parametric tagged-union
-    // case-arm destructuring works with multiple type parameters and
-    // distinct payload types per variant.
+    // Acceptance test F — destructuring half. The fixture declares a
+    // local multi-arg parametric union to exercise case-arm
+    // destructuring with multiple type parameters and distinct payload
+    // types per variant. It is named `ResultTE` (not `Result`) on
+    // purpose: Zap's type namespace is flat/global (one type per
+    // filename-derived name), and the stdlib now ships `Result(t, e)`
+    // in `lib/result.zap`. A local `pub union Result` would redefine
+    // that global type and collide — the fixture is testing the
+    // generic feature, not stdlib-`Result` redefinition (cf. the
+    // sibling `Pair`/`Tri` fixtures, which already use non-colliding
+    // names for the same reason).
     var result = try compileAndRun(
-        \\pub union Result(T, E) {
+        \\pub union ResultTE(T, E) {
         \\  Ok :: T
         \\  Err :: E
         \\}
         \\pub struct TestProg {
         \\  pub fn unwrap_ok() -> i64 {
-        \\    r = Result(i64, String).Ok(42)
+        \\    r = ResultTE(i64, String).Ok(42)
         \\    case r {
-        \\      Result.Ok(v) -> v
-        \\      Result.Err(_) -> 0
+        \\      ResultTE.Ok(v) -> v
+        \\      ResultTE.Err(_) -> 0
         \\    }
         \\  }
         \\  pub fn main() -> u8 {
@@ -2680,28 +2686,35 @@ test "ZIR (Phase 1.1.5.f Blocker A): union_init across multiple call sites stays
 }
 
 test "ZIR (Phase 1.1.5.f Blocker A): multi-arg parametric Result(T,E) destructures via runtime scrutinee" {
-    // Acceptance F (Result(T, E)) with multiple type params. Confirms
-    // the consistent threading rule extends to multi-arg parametric
-    // unions and that the per-instantiation mangled name
-    // (`Result_i64_String`) flows through to `@unionInit` for both
-    // payload variants (Ok :: i64, Err :: String). Same runtime-
-    // scrutinee shape as the single-arg case to keep the construction-
-    // side fix isolated from the comptime-fold pattern-match issue.
+    // Acceptance F with multiple type params. Confirms the consistent
+    // threading rule extends to multi-arg parametric unions and that
+    // the per-instantiation mangled name (`ResultTE_i64_String`) flows
+    // through to `@unionInit` for both payload variants
+    // (Ok :: i64, Err :: String). Same runtime-scrutinee shape as the
+    // single-arg case to keep the construction-side fix isolated from
+    // the comptime-fold pattern-match issue.
+    //
+    // The local union is named `ResultTE` (not `Result`) on purpose:
+    // Zap's type namespace is flat/global, and the stdlib now ships
+    // `Result(t, e)` in `lib/result.zap`. A local `pub union Result`
+    // would redefine that global type and collide; this fixture tests
+    // the generic multi-arg destructuring feature, not stdlib-`Result`
+    // redefinition.
     var result = try compileAndRun(
-        \\pub union Result(t, e) {
+        \\pub union ResultTE(t, e) {
         \\  Ok :: t
         \\  Err :: e
         \\}
         \\pub struct TestProg {
-        \\  pub fn unwrap_ok(r :: Result(i64, String)) -> i64 {
+        \\  pub fn unwrap_ok(r :: ResultTE(i64, String)) -> i64 {
         \\    case r {
-        \\      Result.Ok(v) -> v
-        \\      Result.Err(_) -> -1
+        \\      ResultTE.Ok(v) -> v
+        \\      ResultTE.Err(_) -> -1
         \\    }
         \\  }
         \\  pub fn main() -> u8 {
-        \\    Kernel.inspect(unwrap_ok(Result(i64, String).Ok(42)))
-        \\    Kernel.inspect(unwrap_ok(Result(i64, String).Err("bad")))
+        \\    Kernel.inspect(unwrap_ok(ResultTE(i64, String).Ok(42)))
+        \\    Kernel.inspect(unwrap_ok(ResultTE(i64, String).Err("bad")))
         \\    "done"
         \\    0
         \\  }
