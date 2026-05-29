@@ -14886,13 +14886,50 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
                 return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             };
             if (self.next_idx >= source.len) {
-                // Iteration complete. Release the iter cell — this
-                // routes back into `Map.release` -> `releaseFromMapPtr`
-                // via the `capacity == 0` discriminator. On rc=0 the
-                // iter cell is returned to its slab pool and the
-                // source map's rc is dropped by 1 (balancing the
-                // retain done by `create`).
-                MapT.release(map_ptr);
+                // Iteration complete — free the iter cell.
+                //
+                // Under REFCOUNTED this routes through `Map.release` ->
+                // `releaseFromMapPtr` -> `headerRelease`; on the rc=0
+                // transition `iterDeepWalk` returns the cell to its pool
+                // and drops the source map's refcount by 1 (balancing the
+                // `headerRetain` `create` did). Byte-identical to the
+                // historical path.
+                //
+                // Under INDIVIDUAL_NO_REFCOUNT (`Memory.Tracking`) there is
+                // no refcount: `create`'s `headerRetain(&source.header)`
+                // was a comptime no-op (the source map was NOT +1'd), and
+                // `headerRelease` is a comptime no-op too — so the
+                // historical `MapT.release(map_ptr)` would NEVER reclaim the
+                // iter cell, leaking the 40-byte `MapIter` for every
+                // completed Map walk (`for`-comprehension / `Enum.reduce`
+                // over a Map). The iter is private, uniquely-owned cursor
+                // state with a single, well-defined last use: this DONE
+                // transition (proven exactly-once — the for-comp/reduce
+                // recursion never reads `state` after `Map.next` returns
+                // DONE, and the borrowed-pass-through release on the iter
+                // is elided under no-REFCOUNT_V1). So free the cell HERE,
+                // exactly once, via the manager's `core.deallocate` —
+                // matching the cell's `core.allocate` in `create`. Do NOT
+                // touch the source map: it was never retained in this mode,
+                // and its lifetime is owned by the iterating binding (the
+                // caller's scope-exit free reclaims it). Freeing it here
+                // would over-free the source. The runtime's
+                // `dense_map_iter_free_total` counter is bumped for parity
+                // with the REFCOUNTED `iterDeepWalk` path.
+                //
+                // BULK_OR_NEVER / TRACED keep the historical no-op
+                // `MapT.release` (Arena bulk-reclaims the cell at exit,
+                // NoOp/Leak intentionally never free, GC collects it) — no
+                // individual free is emitted, matching every other
+                // allocation under those models.
+                if (comptime reclamation_model == .individual_no_refcount) {
+                    self.source_map = null;
+                    self.next_idx = 0;
+                    incrementRuntimeStatCounter(&dense_map_iter_free_total);
+                    ArcRuntime.freeInlineHeaderCell(Self, self);
+                } else {
+                    MapT.release(map_ptr);
+                }
                 return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             }
             const entry = source.entryAtConst(self.next_idx).*;
