@@ -10447,8 +10447,12 @@ fn manifestLeadingFlagEnd(args: []const []const u8) usize {
 /// Used by the manifest path to decide whether a `parseBuildOverrides`
 /// `.err` is a real user error (bad value for a known flag → abort) or
 /// merely an unknown custom key destined for `System.get_build_opt`
-/// (Zig `b.option` parity → ignore here). `-D<key>` with no `=` is
-/// treated as a manifest build option, not a recognized-flag error.
+/// (Zig `b.option` parity → ignore here). A `-D<key>` with no `=` is a
+/// bare manifest build option (→ ignore) ONLY when `<key>` is
+/// unrecognized; a recognized build flag with no value (`-Doptimize`,
+/// `-Dmemory`, …) is a missing-required-value error (→ abort). The lone
+/// `leaks-fatal` recognized key has a valid bare presence form and is
+/// excluded from the valueless-error check.
 fn isRecognizedBuildFlagError(args: []const []const u8, leading_end: usize) bool {
     const end = @min(leading_end, args.len);
     var i: usize = 0;
@@ -10460,7 +10464,26 @@ fn isRecognizedBuildFlagError(args: []const []const u8, leading_end: usize) bool
         const a = args[i];
         i += 1;
         const kv = a[2..];
-        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse {
+            // A `-D<key>` with no `=value`. For an UNRECOGNIZED key this
+            // is a bare manifest build option (Zig `b.option` parity) and
+            // is NOT an error — `parseBuildOverrides` would have returned
+            // `.err` only because the key is unknown, and that case must
+            // not abort the manifest build. But a RECOGNIZED build flag
+            // (`-Doptimize`, `-Dmemory`, …) genuinely REQUIRES its value:
+            // the valueless form is the "build flag is missing a value"
+            // error `parseBuildOverrides` reports, so classify it as a
+            // recognized-flag error here so the manifest path surfaces
+            // the precise diagnostic instead of falling through to a
+            // confusing "Unknown target" panic. `leaks-fatal` is the one
+            // recognized key whose bare form is VALID (a presence toggle),
+            // so it never reaches here as an `.err` and is excluded.
+            for (BUILD_FLAG_KEYS) |recognized| {
+                if (std.mem.eql(u8, recognized, "leaks-fatal")) continue;
+                if (std.mem.eql(u8, kv, recognized)) return true;
+            }
+            continue;
+        };
         const key = kv[0..eq];
         for (BUILD_FLAG_KEYS) |recognized| {
             if (std.mem.eql(u8, key, recognized)) {
