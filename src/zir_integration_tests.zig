@@ -6179,52 +6179,41 @@ test "CLI script Phase 0 Gap E: ReleaseFast default publishes sibling dSYM + str
         return error.TestUnexpectedResult;
     }
 
-    // (c) `atos` round-trip via the sibling dSYM resolves the Zap
-    // user code to `<file>.zap:<line>`. The hoisted script main
-    // wrapper lives at symbol `_script.main`; resolving its address
-    // through the dSYM must produce the original Zap source
-    // coordinates so Phase 2's crash printer / lldb / addr2line can
-    // surface user-meaningful frames on optimized builds.
-    const nm_result = std.process.run(allocator, getTestIo(), .{
-        .argv = &.{ "nm", published },
-        .stdout_limit = .limited(8 * 1024 * 1024),
-        .stderr_limit = .limited(64 * 1024),
+    // (c) The published sibling dSYM resolves the script's `main` to
+    // its original `<file>.zap:<line>` so Phase 2's crash printer /
+    // lldb / addr2line can surface user-meaningful frames on
+    // optimized builds.
+    //
+    // ReleaseFast INLINES the Zap `main` into the Zig entry glue
+    // (`_start.main`), so there is no standalone `_script.main`
+    // Mach-O symbol to grep, and `atos` cannot reach the Zap source
+    // either: `atos` reports the flat line-number-program row for an
+    // address, and for the fully-inlined entry every row attributes
+    // to a library file (`start.zig`, `fmt.zig`). The Zap source
+    // mapping survives only as the `script.main` subprogram DIE
+    // (`DW_AT_decl_file = <file>.zap`) and the `DW_AT_call_file` on
+    // the inline-subroutine DIEs — i.e. exactly what an
+    // inline-AWARE symbolizer walks. So resolve through `lldb image
+    // lookup -n script.main`, which reads the DWARF function by name
+    // and prints the full inline chain. lldb auto-loads the sibling
+    // `.dSYM` by matching the binary's UUID; with the `.dSYM`
+    // removed this lookup yields no Zap frame, so this still proves
+    // the PUBLISHED dSYM (not embedded debug-info — the binary is
+    // stripped, asserted in (a)) carries the mapping. This is
+    // strictly stronger than the old `atos` round-trip: it verifies
+    // the inlined Zap frame itself, not merely a line-table row.
+    const lldb_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ "xcrun", "lldb", "--batch", "-o", "image lookup -n script.main", published },
+        .stdout_limit = .limited(1 * 1024 * 1024),
+        .stderr_limit = .limited(256 * 1024),
     }) catch return error.RunFailed;
-    defer allocator.free(nm_result.stdout);
-    defer allocator.free(nm_result.stderr);
+    defer allocator.free(lldb_result.stdout);
+    defer allocator.free(lldb_result.stderr);
 
-    var script_main_addr: ?[]const u8 = null;
-    var addr_buf: [64]u8 = undefined;
-    var line_iter = std.mem.splitScalar(u8, nm_result.stdout, '\n');
-    while (line_iter.next()) |line| {
-        if (std.mem.indexOf(u8, line, " _script.main") == null) continue;
-        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
-        const addr_hex = line[0..space];
-        if (addr_hex.len == 0 or addr_hex.len > 16) continue;
-        const written = std.fmt.bufPrint(&addr_buf, "0x{s}", .{addr_hex}) catch continue;
-        script_main_addr = written;
-        break;
-    }
-    const addr = script_main_addr orelse {
+    if (std.mem.indexOf(u8, lldb_result.stdout, "phase0_release_fast.zap") == null) {
         std.debug.print(
-            "Phase 0 Gap E: could not locate `_script.main` in nm output for ReleaseFast default:\n{s}\n",
-            .{nm_result.stdout},
-        );
-        return error.TestUnexpectedResult;
-    };
-
-    const atos_result = std.process.run(allocator, getTestIo(), .{
-        .argv = &.{ "atos", "-o", dwarf_inner, "-arch", "arm64", "-l", "0x100000000", addr },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    }) catch return error.RunFailed;
-    defer allocator.free(atos_result.stdout);
-    defer allocator.free(atos_result.stderr);
-
-    if (std.mem.indexOf(u8, atos_result.stdout, "phase0_release_fast.zap") == null) {
-        std.debug.print(
-            "Phase 0 Gap E: atos did not resolve `_script.main` at {s} to a phase0_release_fast.zap location.\n  stdout: {s}\n  stderr: {s}\n",
-            .{ addr, atos_result.stdout, atos_result.stderr },
+            "Phase 0 Gap E: lldb did not resolve `script.main` to a phase0_release_fast.zap location via the published dSYM.\n  stdout: {s}\n  stderr: {s}\n",
+            .{ lldb_result.stdout, lldb_result.stderr },
         );
         return error.TestUnexpectedResult;
     }
@@ -6238,9 +6227,24 @@ fn aarch64MainHasFramePointerSetup(
     allocator: std.mem.Allocator,
     binary_path: []const u8,
 ) TestError!bool {
+    // Only the prologue is needed (the FP setup lands within the
+    // first ~30 lines), but `otool -tv -p _main` disassembles from
+    // `_main` to the end of the text section. As the script binary's
+    // text grew (error system, closures, etc.) that listing now
+    // exceeds 2 MB, so reading it whole overflows the subprocess
+    // stdout limit with `error.StreamTooLong`. Pipe through `head` so
+    // the closed pipe makes `otool` stop early; the bounded slice is
+    // a few KB and still contains the whole prologue.
+    const otool_cmd = std.fmt.allocPrint(
+        allocator,
+        "otool -tv -p _main '{s}' | head -n 80",
+        .{binary_path},
+    ) catch return error.OutOfMemory;
+    defer allocator.free(otool_cmd);
+
     const result = std.process.run(allocator, getTestIo(), .{
-        .argv = &.{ "otool", "-tv", "-p", "_main", binary_path },
-        .stdout_limit = .limited(2 * 1024 * 1024),
+        .argv = &.{ "sh", "-c", otool_cmd },
+        .stdout_limit = .limited(256 * 1024),
         .stderr_limit = .limited(64 * 1024),
     }) catch return error.RunFailed;
     defer allocator.free(result.stdout);
