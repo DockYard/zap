@@ -317,25 +317,40 @@ pub struct StructTest {
     n.value
   }
 
-  ## KNOWN GAP #302 (recursive-struct Tracking leak; tracked, NOT a regression).
+  ## GAP #302 — RESOLVED (recursive-struct Tracking leak).
   ## Under `-Dmemory=Memory.Tracking` (INDIVIDUAL_NO_REFCOUNT | CLONE_ON_SHARE)
   ## the `LinkedNode` recursive-struct tests below (notably "recursive build
   ## outlives constructing frames" — a chain double-walked by `chain_length` +
-  ## `chain_sum`) leak 6 `%LinkedNode{}` deinit survivors (part of the 12-alloc /
-  ## 336-byte corpus total). EVERY assertion still PASSES (the leak is a
-  ## deinit-time survivor, not an assertion failure) and ARC is byte-clean, so
-  ## the tests are deliberately NOT wrapped in `assert_no_leaks` — that would
-  ## both fail the corpus and over-report GAP-A mid-scope sampling artifacts.
-  ## Root cause: `src/ir.zig` `extractRetainKind` marks every non-list/map
-  ## aggregate extraction (`node.next`) `RetainKind.persistent`, which under
-  ## clone-on-share DEEP-CLONES the recursive struct even when the extracted
-  ## value flows only into a `.borrowed` (non-owning) recursive call; the
-  ## spurious per-level clones and the outer clone's deep-walk-free do not
-  ## reconcile, orphaning cells. The sound fix (downgrade `.persistent` ->
-  ## borrow when the extract feeds only borrowing consumers, via post-
-  ## `arc_liveness` escape analysis, ARC byte-identical) is the
-  ## consumed-vs-standalone owner model of task #302. The leak is surfaced +
-  ## tracked by `script_fixtures/run_recursive_struct_leak_characterization.sh`.
+  ## `chain_sum`) USED to leak 6 `%LinkedNode{}` deinit survivors.
+  ##
+  ## Root cause (per-call-INSTANCE ownership ambiguity): `chain_length` and
+  ## `chain_sum` share ONE IR body that must serve two distinct call instances.
+  ## The "recursive build" test calls BOTH on the same `list`, so `chain_length`
+  ## is entered with a value the caller only borrows (the sibling `chain_sum`
+  ## reuses `list`, so the IR builder hands `chain_length` a fresh share-CLONE)
+  ## while `chain_sum` is the last use of `list` (moved in). Convention
+  ## inference left `chain_length` `.borrowed` (its top caller fails the
+  ## at-last-use consume gate), which SUPPRESSES its param scope-exit release —
+  ## but that release is exactly the one that must free the recursion's per-level
+  ## `node.next` clones, so they orphaned. `chain_sum` (move-entry, promoted to
+  ## `.owned`) frees them; identical IR, opposite outcome. ARC sidesteps this via
+  ## its runtime refcount; clone-on-share has no runtime signal, so ownership had
+  ## to be resolved STATICALLY per call instance.
+  ##
+  ## Fix (`src/arc_param_convention.zig` `specializeRecursiveOwnershipVariants`,
+  ## gated on clone-on-share so ARC stays byte-identical): the leaking
+  ## self-recursive walker is split into a second `.owned`-ENTRY variant and the
+  ## recursion edge is retargeted to it, so the recursion MOVES `node.next` (no
+  ## per-level clone) exactly like `chain_sum`. The original `.borrowed` variant
+  ## is preserved for the genuine borrowers. Leak-freedom is gated by
+  ## `script_fixtures/run_recursive_struct_leak_characterization.sh` (zero
+  ## `%LinkedNode{}` survivors under Tracking). The tests stay un-wrapped by
+  ## `assert_no_leaks` to avoid over-reporting GAP-A mid-scope sampling
+  ## artifacts; the deinit survivor count is the ground truth.
+  ##
+  ## (Separately, the corpus still reports a few 40-byte `AlphaError`/`BetaError`
+  ## survivors from the error-system `raise`/`rescue` corpus — a PRE-EXISTING,
+  ## systemic error-system leak unrelated to this recursive-struct gap.)
   describe("Recursive struct field auto-deref") {
     test("indirect-storage field reads as source-level optional") {
       head = build_two_node_list()

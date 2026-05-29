@@ -252,27 +252,37 @@ unprovable share — deferred).
     allocating → documented OOM, not a refcount panic); Tracking (INDIVIDUAL_NO_REFCOUNT — runs,
     leak-gated clean); custom BulkArena == Arena and custom TrackingPool == Tracking. The
     `zir-test` step adds build+run integration tests for both custom managers.
-  - **CHARACTERIZED + TRACKED: recursive-struct Tracking leak (gap #302).** Under `Memory.Tracking`
-    a recursive indirect-storage struct (`LinkedNode.next`) double-walked by two self-recursive
-    `.borrowed`-param functions leaks 6 `%LinkedNode{}` deinit survivors (part of the corpus's
-    stable 12-alloc / 336-byte total). EVERY corpus assertion still PASSES (942/0) and ARC is
-    byte-clean — the leak is a deinit-time survivor, not an assertion failure. ROOT CAUSE: `src/ir.zig`
-    `extractRetainKind` classifies every non-list/map aggregate extraction (`node.next`) as
-    `RetainKind.persistent`, which under clone-on-share DEEP-CLONES the recursive struct even when
-    the extracted value flows only into a `.borrowed` (non-owning) recursive call and is released at
-    its last use (a transient borrow). The spurious per-recursion-level clones and the outer clone's
-    deep-walk-free do not reconcile, orphaning cells. The decision is made at IR-BUILD time from the
-    extracted TYPE alone, with no knowledge of the downstream consumer's ownership convention; a
-    SOUND fix must defer/refine it with post-`arc_liveness` escape + consumer-convention analysis
-    (downgrade `.persistent` → borrow when the extract feeds ONLY borrowing consumers, ARC
-    byte-identical) — the consumed-vs-standalone owner model of **task #302**, a broad cascade with
-    high ARC-regression risk, NOT a localized Phase-3 patch. Forcing `.normal` unconditionally would
-    double-free the shapes that genuinely need the clone (a child extracted and STORED as a true
-    co-owner). Surfaced + tracked by
-    `script_fixtures/run_recursive_struct_leak_characterization.sh` (asserts corpus 942/0 + the
-    12-alloc deinit leak present; a future fix that removes the leak FAILS the harness — the signal
-    to retire the characterization and flip the corpus to leak-free) and documented inline at the
-    leaking tests in `test/struct_test.zap`.
+  - **RESOLVED: recursive-struct Tracking leak (gap #302) — per-call-path ownership
+    specialization.** Under `Memory.Tracking` a recursive indirect-storage struct (`LinkedNode.next`)
+    double-walked by `chain_length` + `chain_sum` USED to leak 6 `%LinkedNode{}` deinit survivors.
+    TRUE ROOT CAUSE (per-call-INSTANCE ownership ambiguity, NOT an `extractRetainKind` flavor bug —
+    a `.persistent`→`.normal` downgrade was empirically DISPROVEN: it eliminated the leak but caused
+    a hard double-free SEGFAULT because the `.persistent` clone of `node.next` is load-bearing):
+    `chain_length`/`chain_sum` share ONE IR body serving two call instances. The "recursive build"
+    test calls both on the same `list`, so the TOP call enters `chain_length` with a value the caller
+    only borrows (the sibling `chain_sum` reuses `list`, so the IR builder hands a fresh share-CLONE),
+    while `chain_sum` is the last use of `list` (moved in). `arc_param_convention.inferConventions`
+    left `chain_length` `.borrowed` (its top caller fails the at-last-use consume gate) which
+    SUPPRESSES its param scope-exit release — but that release is exactly the one that must free the
+    recursion's per-level `node.next` clones, so they orphaned. `chain_sum` (move-entry, promoted to
+    `.owned`) frees them; identical IR, opposite outcome. ARC sidesteps this via its runtime refcount;
+    clone-on-share has no runtime signal, so ownership is resolved STATICALLY per call instance.
+    FIX (`src/arc_param_convention.zig` `specializeRecursiveOwnershipVariants`, run after the
+    convention fixpoint, gated on clone-on-share AND on a whole-program/post-merge lowering pass so
+    the new `FunctionId` is globally unique; ARC byte-identical — no variant created under
+    REFCOUNTED): the leaking self-recursive walker is split into a second `.owned`-ENTRY variant; its
+    own recursion targets itself and the original `.borrowed` variant's recursion edge is retargeted
+    to it, so the recursion MOVES `node.next` (no per-level clone) exactly like `chain_sum`. The
+    `.borrowed` variant is preserved for the genuine borrowers (the top entry). Reuses the existing
+    convention machinery (the candidate signature is narrow: a `.borrowed` ARC slot whose
+    self-recursion threads that slot via a `share_value` clone of a `field_get` of a `param_get` of
+    the same slot — excludes accumulators, tail loops, external args). Leak-freedom gated by
+    `script_fixtures/run_recursive_struct_leak_characterization.sh` (corpus 942/0 + ZERO
+    `%LinkedNode{}` survivors under Tracking; the move-entry `chain_sum` co-owner shape stays sound,
+    no double-free). Documented inline at the tests in `test/struct_test.zap`. NOTE: a separate,
+    PRE-EXISTING systemic error-system leak (a few 40-byte `AlphaError`/`BetaError`-class survivors
+    from the `raise`/`rescue` corpus) is unrelated to this recursive-struct gap and tracked under the
+    error-system work.
 - **Phase 5 — `TRACED` conservative GC manager (in scope).** Add `lib/memory/gc.zap` (zero-method
   marker) + `src/memory/gc/manager.zig` (conservative stop-the-world mark-sweep: managed heap;
   on threshold/OOM, conservatively scan stack + registers + globals for word-aligned heap
