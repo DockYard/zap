@@ -499,6 +499,23 @@ pub const AssignmentBinding = struct {
     name: ast.StringId,
     local_index: u32,
     type_id: types_mod.TypeId = types_mod.TypeStore.UNKNOWN,
+    /// When the binding's right-hand side is a *bare untyped integer
+    /// literal* (`name = 8080`, lowered as a default-`I64` `int_lit`),
+    /// this points at that literal `Expr`. A bare integer literal carries
+    /// no genuine type expectation — the default `I64` stamp is a
+    /// placeholder until a use-context concretizes it. When such a binding
+    /// later appears as one operand of a binary operator whose other
+    /// operand has a concrete non-`I64` integer type (the canonical case
+    /// is the Zest `assert` rewrite, which binds the literal to a temporary
+    /// before comparing it against a narrower `u16` field), the literal
+    /// must adopt the peer operand's integer type. Restamping this source
+    /// `Expr`'s `type_id` propagates the adopted type through to the IR
+    /// builder's `local_hir_types` slot, so the value is stored, read, and
+    /// compared at the peer width — the proper "untyped literal adopts the
+    /// peer type" coercion rather than a silent unsigned→signed widening.
+    /// Null for every binding whose RHS is not a bare untyped integer
+    /// literal.
+    int_lit_source: ?*const Expr = null,
 };
 
 pub const ListConsHir = struct {
@@ -4981,10 +4998,22 @@ pub const HirBuilder = struct {
                     // with an extractor expression that reads from a local
                     // holding the parent compound value.
                     if (assign.pattern.* == .bind) {
+                        // Track a bare untyped integer-literal RHS so a
+                        // later binary-operator operand referencing this
+                        // binding can adopt its peer's concrete integer
+                        // type (range-checked). See
+                        // `AssignmentBinding.int_lit_source` and
+                        // `unifyIntLiteralOperandType`.
+                        const int_lit_source: ?*const Expr =
+                            if (value.kind == .int_lit and value.type_id == types_mod.TypeStore.I64)
+                                value
+                            else
+                                null;
                         try self.current_assignment_bindings.append(self.allocator, .{
                             .name = assign.pattern.bind.name,
                             .local_index = value_local,
                             .type_id = value.type_id,
+                            .int_lit_source = int_lit_source,
                         });
                     } else {
                         try self.lowerAssignmentDestructure(
@@ -5141,7 +5170,7 @@ pub const HirBuilder = struct {
                 // is selected. This is the comparison/arithmetic-site
                 // analog of the call-arg and field-default literal
                 // contextual typing (`propagateExpectedTypeToDefault`).
-                self.unifyIntLiteralOperandType(lhs_expr, rhs_expr);
+                try self.unifyIntLiteralOperandType(lhs_expr, rhs_expr, bo.meta.span);
 
                 // Protocol-driven dispatch: when either operand has a known
                 // concrete type and the corresponding `impl PROTOCOL for T`
@@ -8264,41 +8293,139 @@ pub const HirBuilder = struct {
         }
     }
 
-    /// Contextually retype a default-`I64` integer-literal operand of a
-    /// binary operator to the concrete integer type of its sibling
-    /// operand. A bare integer literal is stamped `I64` by `buildExpr`
-    /// unconditionally; when the other operand has a concrete integer
-    /// type that is not `I64` (e.g. a `u16` struct field), the two
-    /// operands disagree and the per-width `impl Comparator/Arithmetic
-    /// for Integer` overload family cannot select a matching clause —
-    /// widening never crosses signedness, so `(u16, i64)` matches no
-    /// `(X, X)` clause and resolution falls back to the first-declared
-    /// `i8` clause. Adopting the concrete operand's type onto the
-    /// literal makes both operands agree so the correct-width clause is
-    /// chosen, and surfaces a genuine out-of-range value as a real
-    /// codegen error against the intended type rather than silently
-    /// widening to `i64`. Symmetric: the literal may be either operand.
-    /// Only fires when exactly one operand is the default-`I64` literal
-    /// and the other is a concrete (non-type-variable) integer type, so
-    /// `1 == 2` (both literals) and `i64Field == 5` (already matching)
-    /// are left untouched.
-    fn unifyIntLiteralOperandType(self: *const HirBuilder, lhs: *const Expr, rhs: *const Expr) void {
-        const lhs_is_default_int_lit = lhs.kind == .int_lit and lhs.type_id == types_mod.TypeStore.I64;
-        const rhs_is_default_int_lit = rhs.kind == .int_lit and rhs.type_id == types_mod.TypeStore.I64;
+    /// Describes a binary-operator operand that is (directly or by way of a
+    /// single let-bound temporary) a bare untyped integer literal eligible
+    /// for peer-type adoption. `value` is the literal's `i64`-domain numeric
+    /// value (used for the range check). `operand` is the operand `Expr`
+    /// reaching the operator — its `type_id` is restamped on adoption so the
+    /// HIR-level operator dispatch sees the adopted type. `source_int_lit` is
+    /// the literal `Expr` whose `type_id` must also be restamped so the IR
+    /// builder's slot/`local_hir_types` for the value takes the adopted width
+    /// (identical to `operand` for the direct case; the let-binding's RHS for
+    /// the temp-bound case). `binding_local_index`, when set, is the
+    /// `current_assignment_bindings` local whose recorded `type_id` is updated
+    /// in lockstep so later references resolve to the adopted type.
+    const IntLiteralOperand = struct {
+        value: i64,
+        operand: *const Expr,
+        source_int_lit: *const Expr,
+        binding_local_index: ?u32,
+    };
+
+    /// Classify an operator operand as a bare untyped integer literal, either
+    /// written directly (`... == 8080`) or bound to a single let-temporary
+    /// whose RHS was such a literal (the Zest `assert` rewrite shape:
+    /// `right = 8080` then `left == right`). Returns null for everything else
+    /// — a non-default-typed literal, a non-literal expression, or a
+    /// `local_get` whose binding is not a tracked untyped integer literal.
+    fn classifyIntLiteralOperand(self: *const HirBuilder, operand: *const Expr) ?IntLiteralOperand {
+        switch (operand.kind) {
+            .int_lit => |value| {
+                if (operand.type_id != types_mod.TypeStore.I64) return null;
+                return .{
+                    .value = value,
+                    .operand = operand,
+                    .source_int_lit = operand,
+                    .binding_local_index = null,
+                };
+            },
+            .local_get => |local_index| {
+                // Most-recent-wins, mirroring `buildBindingReference`: the
+                // operand's `local_get` index pins exactly one binding.
+                var idx = self.current_assignment_bindings.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    const binding = self.current_assignment_bindings.items[idx];
+                    if (binding.local_index != local_index) continue;
+                    const source = binding.int_lit_source orelse return null;
+                    if (binding.type_id != types_mod.TypeStore.I64) return null;
+                    if (source.kind != .int_lit) return null;
+                    return .{
+                        .value = source.kind.int_lit,
+                        .operand = operand,
+                        .source_int_lit = source,
+                        .binding_local_index = local_index,
+                    };
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Contextually retype a bare untyped integer-literal operand of a binary
+    /// operator to the concrete integer type of its sibling operand — Zap's
+    /// "an untyped integer literal adopts its peer operand's type" coercion.
+    /// A bare integer literal is stamped `I64` by `buildExpr` unconditionally;
+    /// when the other operand has a concrete integer type that is not `I64`
+    /// (e.g. a `u16` struct field), the two operands disagree and the per-width
+    /// `impl Comparator/Arithmetic for Integer` overload family cannot select a
+    /// matching clause — widening never crosses signedness, so `(u16, i64)`
+    /// matches no `(X, X)` clause and resolution would fall back to the
+    /// first-declared `i8` clause. Adopting the concrete operand's type onto
+    /// the literal makes both operands agree so the correct-width clause is
+    /// chosen. The literal may appear directly (`field == 8080`) or behind a
+    /// single let-bound temporary (`right = 8080` then `left == right`, the
+    /// Zest `assert` rewrite shape) — `classifyIntLiteralOperand` recognises
+    /// both. Symmetric: the literal may be either operand. The adoption is
+    /// range-checked: if the literal's value does not fit the peer type, this
+    /// is a genuine type error reported against the operator span (Zap never
+    /// widens the PEER to fit the literal). Only fires when exactly one operand
+    /// is an untyped integer literal and the other is a concrete integer type,
+    /// so `1 == 2` (both literals) and `i64Field == 5` (already matching) are
+    /// left untouched.
+    fn unifyIntLiteralOperandType(self: *HirBuilder, lhs: *const Expr, rhs: *const Expr, op_span: ast.SourceSpan) !void {
+        const lhs_literal = self.classifyIntLiteralOperand(lhs);
+        const rhs_literal = self.classifyIntLiteralOperand(rhs);
         // Exactly one side must be the contextless literal; if both are
         // literals there is no concrete operand to take a type from, and
         // if neither is a literal there is nothing to retype.
-        if (lhs_is_default_int_lit == rhs_is_default_int_lit) return;
+        if ((lhs_literal != null) == (rhs_literal != null)) return;
 
-        const literal = if (lhs_is_default_int_lit) lhs else rhs;
-        const concrete = if (lhs_is_default_int_lit) rhs else lhs;
+        const literal = if (lhs_literal) |l| l else rhs_literal.?;
+        const concrete = if (lhs_literal != null) rhs else lhs;
 
         // The concrete operand must carry a known, non-i64 integer type.
         if (concrete.type_id == types_mod.TypeStore.UNKNOWN) return;
         if (concrete.type_id == types_mod.TypeStore.I64) return;
         if (self.type_store.getType(concrete.type_id) != .int) return;
 
-        @constCast(literal).type_id = concrete.type_id;
+        // Range check: an untyped integer literal adopts its peer's concrete
+        // integer type ONLY when its value fits that type. Zap never widens
+        // the PEER to accommodate the literal, so an out-of-range value is a
+        // genuine type error reported here against the intended type.
+        if (!self.type_store.intLiteralFitsInType(literal.value, concrete.type_id)) {
+            const int_info = self.type_store.getType(concrete.type_id).int;
+            const sign_char: u8 = switch (int_info.signedness) {
+                .signed => 'i',
+                .unsigned => 'u',
+            };
+            try self.errors.append(self.allocator, .{
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "integer literal {d} is out of range for type '{c}{d}' — the other operand of this comparison/arithmetic expression has type '{c}{d}', which cannot represent {d}",
+                    .{ literal.value, sign_char, int_info.bits, sign_char, int_info.bits, literal.value },
+                ),
+                .span = op_span,
+            });
+            return;
+        }
+
+        // Adopt the peer type. Restamp the operand `Expr` so the HIR operator
+        // dispatch resolves both operands to the matching-width clause, and
+        // restamp the source literal `Expr` so the IR builder's value slot
+        // (and its `local_hir_types` entry) takes the adopted width. For a
+        // let-bound temporary, also update the binding record so later
+        // references resolve to the adopted type.
+        @constCast(literal.operand).type_id = concrete.type_id;
+        @constCast(literal.source_int_lit).type_id = concrete.type_id;
+        if (literal.binding_local_index) |local_index| {
+            for (self.current_assignment_bindings.items) |*binding| {
+                if (binding.local_index == local_index) {
+                    binding.type_id = concrete.type_id;
+                }
+            }
+        }
     }
 
     fn isFieldlessStructType(self: *const HirBuilder, type_id: types_mod.TypeId) bool {

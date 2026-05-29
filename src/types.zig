@@ -790,12 +790,47 @@ pub const TypeStore = struct {
     /// value-preserving (no information loss):
     ///   Signed integers:   i8→i16→i32→i64→i128
     ///   Unsigned integers: u8→u16→u32→u64→u128
-    ///   Unsigned→signed:   uN→iM when M > N (the wider signed type holds the
-    ///                      whole unsigned range — e.g. u16→i64, u8→i16)
     ///   Floats:            f16→f32→f64→f80→f128
-    /// Signed→unsigned (would drop the sign) and int↔float are never implicit.
+    /// Widening stays STRICTLY within an integer family — Zap never crosses
+    /// signedness implicitly. Unsigned→signed (`uN→iM`) is deliberately NOT a
+    /// widening: a silent unsigned→signed promotion is a footgun, and the
+    /// mixed-width comparison case it used to serve (`u16Field == 8080`) is
+    /// instead handled by untyped-integer-literal peer-type adoption in the
+    /// HIR builder (`unifyIntLiteralOperandType`). Signed→unsigned (would drop
+    /// the sign) and int↔float are likewise never implicit.
     pub fn canWidenTo(self: *const TypeStore, from: TypeId, to: TypeId) bool {
         return self.wideningCost(from, to) != null;
+    }
+
+    /// Whether an untyped integer-literal value (carried as the HIR's
+    /// `i64`-domain `int_lit`) is representable by the integer type `to`.
+    /// Used by the HIR-builder peer-type adoption (`unifyIntLiteralOperandType`)
+    /// to decide whether a bare literal operand may legally adopt its peer's
+    /// concrete integer type, or whether the value is out of range and the
+    /// adoption must be reported as a compile error (Zap never silently widens
+    /// the PEER to fit the literal). Returns false when `to` is not an integer
+    /// type. For a signed target of `B` bits the value must lie in
+    /// `[-2^(B-1), 2^(B-1)-1]`; for an unsigned target it must be non-negative
+    /// and `<= 2^B - 1`. Targets ≥ 64 bits always hold any `i64`-domain value
+    /// of the matching sign class.
+    pub fn intLiteralFitsInType(self: *const TypeStore, value: i64, to: TypeId) bool {
+        const to_t = self.getType(to);
+        if (to_t != .int) return false;
+        const info = to_t.int;
+        switch (info.signedness) {
+            .signed => {
+                if (info.bits >= 64) return true;
+                const max: i64 = (@as(i64, 1) << @intCast(info.bits - 1)) - 1;
+                const min: i64 = -(@as(i64, 1) << @intCast(info.bits - 1));
+                return value >= min and value <= max;
+            },
+            .unsigned => {
+                if (value < 0) return false;
+                if (info.bits >= 64) return true;
+                const max: i64 = (@as(i64, 1) << @intCast(info.bits)) - 1;
+                return value <= max;
+            },
+        }
     }
 
     /// Return the bit-width delta for a valid implicit widening. Lower costs
@@ -811,24 +846,18 @@ pub const TypeStore = struct {
         if (from_t == .int and to_t == .int) {
             const f = from_t.int;
             const t = to_t.int;
-            if (f.signedness == t.signedness) {
-                // Same-signedness widening: any strictly-wider target.
-                if (t.bits > f.bits) return @as(u32, t.bits - f.bits);
-                return null;
-            }
-            // Cross-signedness is value-preserving in exactly one direction:
-            // an unsigned source promoted to a STRICTLY wider signed target,
-            // which can represent the whole unsigned range (u16 → i64, u8 →
-            // i16). The reverse (signed → unsigned) would drop negative
-            // values and stays forbidden. The strict `>` is required: u16 →
-            // i16 must NOT widen because i16 cannot hold 65535. This is the
-            // standard integer-promotion rule and lets mixed-width integer
-            // comparisons/arithmetic (notably the Zest `assert` rewrite,
-            // which binds a literal operand to an i64 temporary before
-            // comparing it against a narrower unsigned field) resolve to a
-            // common-type overload instead of failing clause selection and
-            // falling back to the first-declared (`i8`) clause.
-            if (f.signedness == .unsigned and t.signedness == .signed and t.bits > f.bits) {
+            // Widening stays STRICTLY within an integer family: a value of an
+            // integer type only widens to a same-signedness, strictly-wider
+            // target. Zap deliberately does NOT widen unsigned→signed
+            // (`uN→iM`) — that silent cross-signedness promotion is a footgun
+            // and is no longer needed for mixed-width comparisons: an untyped
+            // integer LITERAL adopts its peer operand's type instead (see
+            // `unifyIntLiteralOperandType`), so `u16Field == 8080` resolves as
+            // `u16 == u16` without any peer widening. Removing the rule makes
+            // function-overload selection correctly reject an unsigned value
+            // passed where only a signed overload exists, and prefer the exact
+            // unsigned-family overload over a cross-signedness fallback.
+            if (f.signedness == t.signedness and t.bits > f.bits) {
                 return @as(u32, t.bits - f.bits);
             }
             return null;
@@ -13877,17 +13906,20 @@ test "numeric widening is value-preserving across the integer and float families
     try std.testing.expect(store.canWidenTo(TypeStore.F64, TypeStore.F80));
     try std.testing.expect(store.canWidenTo(TypeStore.F80, TypeStore.F128));
 
-    // Unsigned -> strictly-wider signed is value-preserving (the wider
-    // signed type holds the whole unsigned range): the standard integer
-    // promotion. This is what lets a `u16` operand unify with an `i64`
-    // operand in a mixed-width comparison/arithmetic dispatch (notably
-    // the Zest `assert` rewrite binding a literal to an i64 temporary).
-    try std.testing.expect(store.canWidenTo(TypeStore.U32, TypeStore.I64));
-    try std.testing.expect(store.canWidenTo(TypeStore.U64, TypeStore.I128));
-    try std.testing.expect(store.canWidenTo(TypeStore.U8, TypeStore.I16));
+    // Widening stays STRICTLY within an integer family — Zap deliberately
+    // does NOT widen unsigned->signed (`uN->iM`), even to a strictly-wider
+    // signed target that could hold the whole unsigned range. A silent
+    // cross-signedness promotion is a footgun, and the mixed-width
+    // comparison case it used to serve (`u16Field == 8080`) is now handled
+    // by untyped-integer-literal peer-type adoption in the HIR builder
+    // (`unifyIntLiteralOperandType`), not by widening. So function-overload
+    // selection prefers the exact unsigned-family overload and correctly
+    // rejects an unsigned value passed where only a signed overload exists.
+    try std.testing.expect(!store.canWidenTo(TypeStore.U32, TypeStore.I64));
+    try std.testing.expect(!store.canWidenTo(TypeStore.U64, TypeStore.I128));
+    try std.testing.expect(!store.canWidenTo(TypeStore.U8, TypeStore.I16));
 
-    // Unsigned -> same-or-narrower signed is NOT value-preserving (the
-    // signed target cannot represent the unsigned maximum).
+    // Unsigned -> same-or-narrower signed is likewise not a widening.
     try std.testing.expect(!store.canWidenTo(TypeStore.U16, TypeStore.I16));
     try std.testing.expect(!store.canWidenTo(TypeStore.U32, TypeStore.I32));
     try std.testing.expect(!store.canWidenTo(TypeStore.U64, TypeStore.I32));
@@ -13897,6 +13929,37 @@ test "numeric widening is value-preserving across the integer and float families
     try std.testing.expect(!store.canWidenTo(TypeStore.I64, TypeStore.U128));
     try std.testing.expect(!store.canWidenTo(TypeStore.I32, TypeStore.F64));
     try std.testing.expect(!store.canWidenTo(TypeStore.F32, TypeStore.I64));
+}
+
+test "untyped integer-literal range check against adopted peer type" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    // Values that fit the peer's range may adopt it.
+    try std.testing.expect(store.intLiteralFitsInType(8080, TypeStore.U16)); // 8080 < 65535
+    try std.testing.expect(store.intLiteralFitsInType(255, TypeStore.U8));
+    try std.testing.expect(store.intLiteralFitsInType(0, TypeStore.U8));
+    try std.testing.expect(store.intLiteralFitsInType(127, TypeStore.I8));
+    try std.testing.expect(store.intLiteralFitsInType(-128, TypeStore.I8));
+    try std.testing.expect(store.intLiteralFitsInType(-1, TypeStore.I64));
+    // Targets >= 64 bits hold any i64-domain value of the matching sign.
+    try std.testing.expect(store.intLiteralFitsInType(9000, TypeStore.U64));
+    try std.testing.expect(store.intLiteralFitsInType(9000, TypeStore.I128));
+
+    // Out-of-range values may NOT adopt the peer (the peer is never widened
+    // to fit the literal — this is reported as a compile error instead).
+    try std.testing.expect(!store.intLiteralFitsInType(8080, TypeStore.U8)); // 8080 > 255
+    try std.testing.expect(!store.intLiteralFitsInType(256, TypeStore.U8));
+    try std.testing.expect(!store.intLiteralFitsInType(128, TypeStore.I8)); // i8 max is 127
+    try std.testing.expect(!store.intLiteralFitsInType(-129, TypeStore.I8));
+    try std.testing.expect(!store.intLiteralFitsInType(-1, TypeStore.U16)); // negative into unsigned
+    try std.testing.expect(!store.intLiteralFitsInType(-1, TypeStore.U64));
+
+    // Non-integer targets never accept a literal adoption.
+    try std.testing.expect(!store.intLiteralFitsInType(1, TypeStore.F64));
+    try std.testing.expect(!store.intLiteralFitsInType(1, TypeStore.BOOL));
 }
 
 // ============================================================
