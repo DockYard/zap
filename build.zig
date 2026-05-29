@@ -473,16 +473,16 @@ pub fn build(b: *std.Build) void {
     custom_manager_proof_cmd.step.dependOn(b.getInstallStep());
     custom_manager_proof_step.dependOn(&custom_manager_proof_cmd.step);
 
-    // CapMem Phase 4 recursive-struct Tracking-leak characterization (gap #302 /
-    // task #302): a TRACKED-KNOWN-GAP harness asserting the corpus still passes
-    // 942/0 under Memory.Tracking while the deinit report surfaces the known
-    // 12-alloc/336-byte recursive-struct leak. A future owner-model fix that
-    // removes the leak FAILS this harness — the signal to retire the
-    // characterization and flip the corpus leak-free.
-    const recursive_struct_leak_step = b.step("recursive-struct-leak-characterization", "Assert the tracked recursive-struct Tracking leak (gap #302) is present and the corpus still passes 942/0");
-    const recursive_struct_leak_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_recursive_struct_leak_characterization.sh" });
-    recursive_struct_leak_cmd.step.dependOn(b.getInstallStep());
-    recursive_struct_leak_step.dependOn(&recursive_struct_leak_cmd.step);
+    // Memory.Tracking whole-corpus leak-FREEDOM gate. Asserts the corpus passes
+    // 942/0 under Memory.Tracking AND the deinit leak report is EMPTY (zero
+    // deinit survivors — no `leak summary` / `memory leak:` lines), with no
+    // double-free / invalid-free / segfault. Locks down the two resolved
+    // owner-model leaks (gap #302 recursive-struct `%LinkedNode{}`, task #323
+    // `MapIter` cursor cell) as fixed: any re-introduced Tracking leak FAILS it.
+    const tracking_leak_freedom_step = b.step("tracking-leak-freedom", "Assert the Memory.Tracking corpus is fully leak-free (942/0, zero deinit survivors)");
+    const tracking_leak_freedom_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_tracking_leak_freedom.sh" });
+    tracking_leak_freedom_cmd.step.dependOn(b.getInstallStep());
+    tracking_leak_freedom_step.dependOn(&tracking_leak_freedom_cmd.step);
 
     // -----------------------------------------------------------------------
     // ZIR integration tests (need the built binary)

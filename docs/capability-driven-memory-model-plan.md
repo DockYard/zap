@@ -277,12 +277,28 @@ unprovable share — deferred).
     convention machinery (the candidate signature is narrow: a `.borrowed` ARC slot whose
     self-recursion threads that slot via a `share_value` clone of a `field_get` of a `param_get` of
     the same slot — excludes accumulators, tail loops, external args). Leak-freedom gated by
-    `script_fixtures/run_recursive_struct_leak_characterization.sh` (corpus 942/0 + ZERO
-    `%LinkedNode{}` survivors under Tracking; the move-entry `chain_sum` co-owner shape stays sound,
-    no double-free). Documented inline at the tests in `test/struct_test.zap`. NOTE: a separate,
-    PRE-EXISTING systemic error-system leak (a few 40-byte `AlphaError`/`BetaError`-class survivors
-    from the `raise`/`rescue` corpus) is unrelated to this recursive-struct gap and tracked under the
-    error-system work.
+    `script_fixtures/run_tracking_leak_freedom.sh`, which now asserts the WHOLE corpus is leak-free
+    under Tracking (corpus 942/0 + ZERO deinit survivors — `%LinkedNode{}` and everything else; the
+    move-entry `chain_sum` co-owner shape stays sound, no double-free). Documented inline at the tests
+    in `test/struct_test.zap`.
+- **Task #323 — `MapIter` cursor-cell leak under `INDIVIDUAL_NO_REFCOUNT` (RESOLVED).** The six
+    residual 40-byte Tracking survivors that an earlier note mis-attributed to the error-system
+    `raise`/`rescue` corpus (`AlphaError`/`BetaError`-class) were NOT boxed-error inners — a runtime
+    box-construct/release/clone trace proved every boxed-error inner is freed exactly once. The real
+    survivors were `MapIter(K,V)` cursor cells (40 B) created by `Map.next`'s first step for a
+    `for`-comprehension / `Enum.reduce` walk over a `Map`. Under REFCOUNTED the iter is reclaimed via
+    the inline-header refcount zero-transition (`headerRelease` → `iterDeepWalk` →
+    `freeInlineHeaderCell`); under `INDIVIDUAL_NO_REFCOUNT` `headerRelease` is a comptime no-op, so
+    the DONE-path `Map.release(iter)` never freed the cell — one leak per completed Map walk. FIX
+    (`MapIter.advanceFromMapPtr` in `src/runtime.zig`, gated on
+    `reclamation_model == .individual_no_refcount` so ARC is byte-identical): at the DONE transition,
+    free the iter cell directly through the manager's `core.deallocate` (`freeInlineHeaderCell`)
+    instead of the no-op refcount release. The source map is NOT touched (`create`'s `headerRetain`
+    was also a no-op in this mode, so it was never +1'd; its lifetime is owned by the iterating
+    binding). Exactly-once + no UAF + no double-free, proven by trace (6 advance-done == 6
+    map-release-iter, no pointer twice; the for-comp/reduce recursion never reads `state` after
+    `Map.next` returns DONE). BULK_OR_NEVER / TRACED keep the no-op release (bulk/never/GC
+    reclamation). Tracking corpus now FULLY leak-free (was 6 allocs / 240 B → 0).
 - **Phase 5 — `TRACED` conservative GC manager (in scope).** Add `lib/memory/gc.zap` (zero-method
   marker) + `src/memory/gc/manager.zig` (conservative stop-the-world mark-sweep: managed heap;
   on threshold/OOM, conservatively scan stack + registers + globals for word-aligned heap

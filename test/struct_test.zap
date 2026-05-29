@@ -343,14 +343,20 @@ pub struct StructTest {
   ## recursion edge is retargeted to it, so the recursion MOVES `node.next` (no
   ## per-level clone) exactly like `chain_sum`. The original `.borrowed` variant
   ## is preserved for the genuine borrowers. Leak-freedom is gated by
-  ## `script_fixtures/run_recursive_struct_leak_characterization.sh` (zero
-  ## `%LinkedNode{}` survivors under Tracking). The tests stay un-wrapped by
-  ## `assert_no_leaks` to avoid over-reporting GAP-A mid-scope sampling
-  ## artifacts; the deinit survivor count is the ground truth.
+  ## `script_fixtures/run_tracking_leak_freedom.sh`, which now asserts the WHOLE
+  ## corpus is leak-free under Tracking (zero deinit survivors — including these
+  ## `%LinkedNode{}` cells). The tests stay un-wrapped by `assert_no_leaks` to
+  ## avoid over-reporting GAP-A mid-scope sampling artifacts; the deinit survivor
+  ## count is the ground truth.
   ##
-  ## (Separately, the corpus still reports a few 40-byte `AlphaError`/`BetaError`
-  ## survivors from the error-system `raise`/`rescue` corpus — a PRE-EXISTING,
-  ## systemic error-system leak unrelated to this recursive-struct gap.)
+  ## (Historical note: the corpus once also reported six 40-byte survivors that
+  ## were mis-attributed to the error-system `raise`/`rescue` corpus
+  ## [`AlphaError`/`BetaError`]. A runtime trace proved every boxed-error inner
+  ## is freed; the real survivors were `MapIter(K,V)` cursor cells from
+  ## `for`-comprehension / `Enum.reduce` walks over a `Map`, whose
+  ## no-REFCOUNT_V1 free was elided. RESOLVED under task #323 by freeing the iter
+  ## cell at the `Map.next` DONE transition under `individual_no_refcount`. The
+  ## corpus is now fully leak-free under Tracking.)
   describe("Recursive struct field auto-deref") {
     test("indirect-storage field reads as source-level optional") {
       head = build_two_node_list()
