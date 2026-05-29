@@ -4061,7 +4061,7 @@ const Pipeline = struct {
         // a prerequisite for emitting `move_value` at non-tail call
         // sites in `arc_ownership` (Step 2) and is enforced by V7 in
         // `arc_verifier` (Step 4).
-        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store) catch
+        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store, self.options.declared_caps, true) catch
             return self.failWith("Error during ARC parameter convention inference", error.IrFailed);
         // Phase A of the Phase 6 redux plan: run the new ownership
         // classification + verifier passes between `arc_liveness` and
@@ -4149,7 +4149,7 @@ const Pipeline = struct {
         // closes that gap by running the same inference against the
         // merged program where every cross-struct call site is
         // visible.
-        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store) catch
+        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store, self.options.declared_caps, false) catch
             return self.failWith("Error during ARC parameter convention inference", error.IrFailed);
         // NOTE: `runArcOwnershipAndVerify` (which runs
         // `rewriteOwnedConsumeBuiltinSites`, `classifyAndNormalize`, and
@@ -5679,7 +5679,7 @@ fn finishMergedIr(
         var merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch
             return error.IrFailed;
         progressStage(options, "ARC: inferring parameter conventions", .{});
-        zap.arc_param_convention.inferConventions(alloc, &merged_ir, &merged_ownership, shared_store) catch {
+        zap.arc_param_convention.inferConventions(alloc, &merged_ir, &merged_ownership, shared_store, options.declared_caps, true) catch {
             merged_ownership.deinit();
             return error.IrFailed;
         };

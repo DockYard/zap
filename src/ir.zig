@@ -303,6 +303,17 @@ pub fn cloneProgram(allocator: std.mem.Allocator, program: Program) CloneError!P
     };
 }
 
+/// Public deep-clone of a single `Function`, allocating fresh copies of
+/// every owned slice/map field with `allocator`. Used by the gap-#302
+/// per-call-path ownership specialization pass
+/// (`arc_param_convention.specializeRecursiveOwnershipVariants`) to
+/// materialize an `.owned`-entry variant of a leaking self-recursive
+/// function. The caller is responsible for assigning the clone a fresh
+/// `id`/`name`/`local_name` and adjusting its `param_conventions`.
+pub fn cloneFunctionDeep(allocator: std.mem.Allocator, function: Function) CloneError!Function {
+    return cloneFunction(allocator, function);
+}
+
 fn cloneBytes(allocator: std.mem.Allocator, bytes: []const u8) CloneError![]const u8 {
     if (bytes.len == 0) return "";
     return try allocator.dupe(u8, bytes);

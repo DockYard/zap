@@ -5,6 +5,7 @@ const types_mod = @import("types.zig");
 const uniqueness_signature = @import("uniqueness_signature.zig");
 const uniqueness_fixpoint = @import("uniqueness_fixpoint.zig");
 const uniqueness_interprocedural = @import("uniqueness_interprocedural.zig");
+const elision = @import("memory/elision.zig");
 
 // ============================================================
 // Whole-program parameter-convention inference (Phase E.9).
@@ -111,11 +112,543 @@ const MutableConventions = []ir.ParamConvention;
 pub fn inferConventions(
     allocator: std.mem.Allocator,
     program: *ir.Program,
-    ownerships: *const arc_liveness.ProgramArcOwnership,
+    ownerships: *arc_liveness.ProgramArcOwnership,
     type_store: *const types_mod.TypeStore,
+    declared_caps: u64,
+    /// Whether to run gap-#302 ownership specialization. Only the
+    /// WHOLE-PROGRAM lowering paths (`runIrLowering` and the post-merge
+    /// `finishMergedIr`) may enable it: specialization synthesizes a new
+    /// function whose `FunctionId` must be globally unique, and only a
+    /// whole-program view yields a safe `max(id)+1`. The PER-STRUCT pass
+    /// (`runIrLoweringWithTryIdSeed`) passes `false` — its FunctionIds
+    /// live in a shared global space, so a per-struct `max(id)+1` would
+    /// collide with another struct's function after merge; the merged
+    /// re-run (which also sees every cross-struct call site) performs the
+    /// specialization once, correctly.
+    enable_specialization: bool,
 ) !void {
-    _ = type_store;
+    const clone_on_share = elision.reclamationModel(declared_caps) == .individual_no_refcount and
+        elision.sharingStrategy(declared_caps) == .clone_on_share;
 
+    // Pass 1: infer conventions on the program as-lowered.
+    try runConventionInferenceFixpoint(allocator, program, ownerships);
+
+    // Phase 4 (gap #302) — per-call-path ownership specialization.
+    //
+    // A self-recursive function over an indirect-storage recursive
+    // struct (`chain_length`/`chain_sum`) carries ONE IR body that must
+    // serve two distinct call instances under clone-on-share: a TOP
+    // call entered with a value the caller only borrows (its source is
+    // reused, so the IR builder hands the callee a fresh share-CLONE),
+    // and the RECURSION which threads `node.next` deeper. Pass 1 leaves
+    // such a function `.borrowed` whenever any caller fails the
+    // at-last-use consume gate (the borrowed top entry), but that same
+    // suppressed param release is the one that must free the recursion's
+    // per-level clones — so they orphan (the gap #302 leak).
+    //
+    // ARC sidesteps this with a runtime refcount; clone-on-share has no
+    // runtime signal, so ownership must be resolved STATICALLY per
+    // call instance. The fix splits the leaking function into a second
+    // `.owned`-ENTRY variant and retargets the recursion edge to it, so
+    // the recursion MOVES `node.next` (no per-level clone) exactly like
+    // the move-entry `chain_sum`. The original `.borrowed` variant is
+    // preserved for the genuine borrowers (the top entry, escape
+    // arguments). Gated on clone-on-share so ARC stays byte-identical.
+    if (clone_on_share and enable_specialization) {
+        const created = try specializeRecursiveOwnershipVariants(allocator, program, ownerships);
+        if (created) {
+            // The new variants need their own last-use ownership table
+            // before classification/verification/drop-insertion run.
+            // Recompute over the grown program, then re-run inference so
+            // the variants' own callees and any newly-unlocked
+            // promotions converge.
+            ownerships.deinit();
+            ownerships.* = try arc_liveness.runProgramArcOwnership(allocator, program, type_store);
+            try runConventionInferenceFixpoint(allocator, program, ownerships);
+        }
+    }
+}
+
+// ============================================================
+// Gap #302 — per-call-path ownership specialization (clone-on-share).
+// ============================================================
+
+/// A function-slot pair identifying the leak signature: a self-recursive
+/// function `F` whose ARC parameter slot `slot` stayed `.borrowed` after
+/// Pass-1 inference AND whose self-recursion threads that slot via a
+/// fresh `share_value` clone (the borrowed-entry + clone-recursion shape
+/// that orphans per-level clones under clone-on-share).
+const SpecializationCandidate = struct {
+    function_index: usize,
+    slot: usize,
+};
+
+/// Suffix appended to a leaking function's name to form its
+/// `.owned`-entry variant. The variant is a structural sibling reached
+/// only by the recursion edge; it never appears at a source call site,
+/// so the synthetic name only needs to be unique within the program.
+const owned_variant_suffix = "$owned302";
+
+/// Create `.owned`-entry variants for every self-recursive function that
+/// exhibits the gap-#302 leak signature, retarget the recursion edges to
+/// them, and append the variants to `program.functions`. Returns true
+/// when at least one variant was created (the caller then recomputes
+/// ownership over the grown program).
+///
+/// Mechanism (see the `inferConventions` block comment for the why):
+///   1. Identify candidates: `.borrowed` ARC slot + self-recursion that
+///      passes that slot via a `share_value` clone.
+///   2. For each candidate, deep-clone `F` into `F$owned` with the slot
+///      flipped to `.owned` and a fresh `FunctionId`/name, and rewrite
+///      `F$owned`'s OWN self-recursion to target `F$owned` (the owned
+///      variant recurses into itself — move-entry all the way down).
+///   3. Rewrite the ORIGINAL `F`'s self-recursion edge to target
+///      `F$owned`, so the borrowed top entry's first descent crosses
+///      into the move-entry variant and the clone cascade stops.
+///
+/// Convergence / mutual recursion: each candidate produces exactly one
+/// owned sibling; the recursion retarget is a finite name rewrite. A
+/// mutually-recursive group (A→B→A) would yield A$owned/B$owned with the
+/// cross-edges rewritten in lockstep — the same finite construction. No
+/// fixpoint is needed here because the variant set is bounded by the
+/// candidate count; the subsequent `runConventionInferenceFixpoint`
+/// re-run converges the conventions over the enlarged call graph.
+fn specializeRecursiveOwnershipVariants(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    ownerships: *const arc_liveness.ProgramArcOwnership,
+) !bool {
+    _ = ownerships;
+
+    // Collect candidates first (a read-only scan), so the program slice
+    // is not mutated mid-iteration.
+    var candidates: std.ArrayListUnmanaged(SpecializationCandidate) = .empty;
+    defer candidates.deinit(allocator);
+
+    // Dedup by function name: a function may appear multiple times in
+    // `program.functions` (per-struct lowering can emit copies with the
+    // same name but distinct ids). We create exactly ONE variant per
+    // (name, slot) and retarget the recursion edge in every copy, so
+    // the synthesized variant name never collides.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+
+    for (program.functions, 0..) |*function, fn_index| {
+        // Only self-recursive functions can exhibit the clone cascade.
+        if (!functionIsSelfRecursive(function)) continue;
+        for (function.param_conventions, 0..) |conv, slot| {
+            if (conv != .borrowed) continue;
+            if (!selfRecursionClonesSlot(function, slot)) continue;
+            // Dedup on (name, slot) so duplicate copies of the same
+            // function don't each spawn a same-named variant.
+            const key = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ function.name, slot });
+            const gop = try seen.getOrPut(allocator, key);
+            if (gop.found_existing) {
+                allocator.free(key);
+                continue;
+            }
+            try candidates.append(allocator, .{ .function_index = fn_index, .slot = slot });
+        }
+    }
+
+    if (candidates.items.len == 0) return false;
+
+    // Compute a fresh FunctionId base = max existing id + 1.
+    var next_id: ir.FunctionId = 0;
+    for (program.functions) |function| {
+        if (function.id >= next_id) next_id = function.id + 1;
+    }
+
+    // Build the owned variants. We must capture the original function
+    // names BEFORE growing the slice (a realloc invalidates pointers,
+    // but the name slices themselves are owned by the arena and stable).
+    const original_len = program.functions.len;
+    var variants: std.ArrayListUnmanaged(ir.Function) = .empty;
+    defer variants.deinit(allocator);
+
+    // Mutable view of the existing functions for the recursion-edge
+    // rewrite on the originals.
+    const existing: []ir.Function = @constCast(program.functions);
+
+    for (candidates.items) |cand| {
+        const original = &existing[cand.function_index];
+        // Capture the original identity BEFORE any rewrite mutates it.
+        const from_name = original.name;
+        const from_local = original.local_name;
+        const from_id = original.id;
+
+        var variant = try ir.cloneFunctionDeep(allocator, original.*);
+        variant.id = next_id;
+        next_id += 1;
+        // Distinct mangled name for the owned-entry variant.
+        variant.name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ from_name, owned_variant_suffix });
+        if (variant.local_name.len != 0) {
+            variant.local_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ from_local, owned_variant_suffix });
+        }
+        // Flip the leaking slot to `.owned` so the callee frees its
+        // (moved-in) argument at scope exit.
+        const variant_conventions: MutableConventions = @constCast(variant.param_conventions);
+        variant_conventions[cand.slot] = .owned;
+
+        // The owned variant recurses into ITSELF (move-entry all the way
+        // down). Rewrite every self-recursion call inside the variant
+        // from the ORIGINAL name(s) to the variant name(s).
+        retargetSelfRecursion(variant.body, from_name, from_local, from_id, variant.name, variant.local_name, variant.id);
+
+        // The ORIGINAL (borrowed) variant's recursion edge now crosses
+        // into the owned variant: rewrite its self-recursion calls to
+        // target the variant. A function may appear multiple times in
+        // `existing` (per-struct duplicate copies sharing a name); every
+        // copy that names `from_name`/`from_local`/`from_id` must be
+        // retargeted so no borrowed copy keeps the leaking self-edge.
+        for (existing) |*copy| {
+            if (nameMatches(copy.name, from_name, from_local) or copy.id == from_id) {
+                retargetSelfRecursion(copy.body, from_name, from_local, from_id, variant.name, variant.local_name, variant.id);
+            }
+        }
+
+        try variants.append(allocator, variant);
+    }
+
+    // Grow `program.functions` to hold the originals + variants.
+    const grown = try allocator.alloc(ir.Function, original_len + variants.items.len);
+    @memcpy(grown[0..original_len], existing[0..original_len]);
+    @memcpy(grown[original_len..], variants.items);
+    program.functions = grown;
+    return variants.items.len > 0;
+}
+
+/// Does `function` contain a self-recursive call (by name or id)?
+fn functionIsSelfRecursive(function: *const ir.Function) bool {
+    const Probe = struct {
+        name: []const u8,
+        local_name: []const u8,
+        id: ir.FunctionId,
+        found: bool,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (self.found) return;
+            if (callTargetsFunction(instr, self.name, self.local_name, self.id)) self.found = true;
+        }
+    };
+    var probe = Probe{ .name = function.name, .local_name = function.local_name, .id = function.id, .found = false };
+    ir.forEachInstruction(function, &probe, Probe.visit);
+    return probe.found;
+}
+
+/// Does the self-recursion of `function` thread parameter `slot` via the
+/// recursive-struct DESCENT shape that orphans under clone-on-share?
+///
+/// The precise signature (matching `chain_length`/`chain_sum`): a
+/// self-recursive call whose argument for `slot` is a `share_value`
+/// clone whose source traces (through the IR-builder alias forms) to a
+/// `field_get` whose object traces to a `param_get index=slot`. In other
+/// words, the recursion descends into a FIELD of the very parameter it
+/// is recursing on (`f(node.next)`), and clone-on-share lowers that
+/// borrowed descent as a deep clone that orphans per level.
+///
+/// This is deliberately narrow: it EXCLUDES accumulator recursions
+/// (combinators — the threaded value is not a field of the recursing
+/// param), tail-recursive loop bodies (no per-level clone), and any
+/// recursion whose argument is an external value. Only the
+/// indirect-storage recursive-struct walker matches.
+fn selfRecursionClonesSlot(function: *const ir.Function, slot: usize) bool {
+    const Probe = struct {
+        name: []const u8,
+        local_name: []const u8,
+        id: ir.FunctionId,
+        slot: usize,
+        function: *const ir.Function,
+        found: bool,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (self.found) return;
+            if (!callTargetsFunction(instr, self.name, self.local_name, self.id)) return;
+            const args = callArgsOf(instr) orelse return;
+            if (self.slot >= args.len) return;
+            if (recursionArgIsParamFieldClone(self.function, args[self.slot], self.slot)) self.found = true;
+        }
+    };
+    var probe = Probe{
+        .name = function.name,
+        .local_name = function.local_name,
+        .id = function.id,
+        .slot = slot,
+        .function = function,
+        .found = false,
+    };
+    ir.forEachInstruction(function, &probe, Probe.visit);
+    return probe.found;
+}
+
+/// True when `arg_local` is a `share_value` clone whose source resolves
+/// (through alias forms) to a `field_get` whose object resolves to a
+/// `param_get index=slot` — the recursive-struct field descent.
+fn recursionArgIsParamFieldClone(function: *const ir.Function, arg_local: ir.LocalId, slot: usize) bool {
+    // `arg_local` must be the dest of a `share_value` (the clone).
+    const share_source = shareValueSourceOf(function, arg_local) orelse return false;
+    // The clone source must resolve to a `field_get` (a field extract).
+    const field_object = fieldGetObjectOf(function, resolveAliasRoot(function, share_source)) orelse return false;
+    // The field's object must resolve to `param_get index=slot`.
+    return paramGetIndexOf(function, resolveAliasRoot(function, field_object)) == slot;
+}
+
+/// If `local_id` is the dest of a `share_value`, return its source.
+fn shareValueSourceOf(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalId {
+    const Probe = struct {
+        target: ir.LocalId,
+        result: ?ir.LocalId,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (self.result != null) return;
+            if (instr.* == .share_value and instr.share_value.dest == self.target) self.result = instr.share_value.source;
+        }
+    };
+    var probe = Probe{ .target = local_id, .result = null };
+    ir.forEachInstruction(function, &probe, Probe.visit);
+    return probe.result;
+}
+
+/// If `local_id` is the dest of a `field_get`, return its object local.
+fn fieldGetObjectOf(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalId {
+    const Probe = struct {
+        target: ir.LocalId,
+        result: ?ir.LocalId,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (self.result != null) return;
+            if (instr.* == .field_get and instr.field_get.dest == self.target) self.result = instr.field_get.object;
+        }
+    };
+    var probe = Probe{ .target = local_id, .result = null };
+    ir.forEachInstruction(function, &probe, Probe.visit);
+    return probe.result;
+}
+
+/// If `local_id` is the dest of a `param_get`, return its index.
+fn paramGetIndexOf(function: *const ir.Function, local_id: ir.LocalId) ?usize {
+    const Probe = struct {
+        target: ir.LocalId,
+        result: ?usize,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (self.result != null) return;
+            if (instr.* == .param_get and instr.param_get.dest == self.target) self.result = @intCast(instr.param_get.index);
+        }
+    };
+    var probe = Probe{ .target = local_id, .result = null };
+    ir.forEachInstruction(function, &probe, Probe.visit);
+    return probe.result;
+}
+
+/// Resolve a local through the IR-builder alias forms (`local_get`,
+/// `borrow_value`, `copy_value`, `move_value`) to its root. Note:
+/// `share_value` is intentionally NOT followed here (it is the clone
+/// boundary we anchor on separately).
+fn resolveAliasRoot(function: *const ir.Function, local_id: ir.LocalId) ir.LocalId {
+    var current = local_id;
+    var hops: usize = 0;
+    while (hops < 16) : (hops += 1) {
+        const next = aliasRootStep(function, current) orelse break;
+        current = next;
+    }
+    return current;
+}
+
+fn aliasRootStep(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalId {
+    const Probe = struct {
+        target: ir.LocalId,
+        result: ?ir.LocalId,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (self.result != null) return;
+            self.result = switch (instr.*) {
+                .local_get => |lg| if (lg.dest == self.target) lg.source else null,
+                .borrow_value => |bv| if (bv.dest == self.target) bv.source else null,
+                .copy_value => |cv| if (cv.dest == self.target) cv.source else null,
+                .move_value => |mv| if (mv.dest == self.target) mv.source else null,
+                else => null,
+            };
+        }
+    };
+    var probe = Probe{ .target = local_id, .result = null };
+    ir.forEachInstruction(function, &probe, Probe.visit);
+    return probe.result;
+}
+
+/// Return the args slice of any call-shaped instruction, or null.
+fn callArgsOf(instr: *const ir.Instruction) ?[]const ir.LocalId {
+    return switch (instr.*) {
+        .call_named => |c| c.args,
+        .call_direct => |c| c.args,
+        .tail_call => |c| c.args,
+        .try_call_named => |c| c.args,
+        .call_builtin => |c| c.args,
+        else => null,
+    };
+}
+
+/// Does `instr` call the function identified by (`name`, `local_name`,
+/// `id`)? Handles by-name calls (`call_named`/`tail_call`/
+/// `try_call_named`) and by-id calls (`call_direct`).
+fn callTargetsFunction(
+    instr: *const ir.Instruction,
+    name: []const u8,
+    local_name: []const u8,
+    id: ir.FunctionId,
+) bool {
+    return switch (instr.*) {
+        .call_named => |c| nameMatches(c.name, name, local_name),
+        .tail_call => |c| nameMatches(c.name, name, local_name),
+        .try_call_named => |c| nameMatches(c.name, name, local_name),
+        .call_direct => |c| c.function == id,
+        else => false,
+    };
+}
+
+fn nameMatches(candidate: []const u8, name: []const u8, local_name: []const u8) bool {
+    if (std.mem.eql(u8, candidate, name)) return true;
+    if (local_name.len != 0 and std.mem.eql(u8, candidate, local_name)) return true;
+    return false;
+}
+
+/// Rewrite every self-recursion call within `blocks` (recursively, into
+/// nested streams) that targets (`from_name`/`from_local`/`from_id`) so
+/// it instead targets (`to_name`/`to_local`/`to_id`). Mutates the
+/// instruction slices in place — they were freshly allocated by
+/// `cloneFunctionDeep` (variant) or are `@constCast`-able pipeline IR
+/// (original).
+fn retargetSelfRecursion(
+    blocks: []const ir.Block,
+    from_name: []const u8,
+    from_local: []const u8,
+    from_id: ir.FunctionId,
+    to_name: []const u8,
+    to_local: []const u8,
+    to_id: ir.FunctionId,
+) void {
+    for (blocks) |block| {
+        retargetStream(@constCast(block.instructions), from_name, from_local, from_id, to_name, to_local, to_id);
+    }
+}
+
+fn retargetStream(
+    stream: []ir.Instruction,
+    from_name: []const u8,
+    from_local: []const u8,
+    from_id: ir.FunctionId,
+    to_name: []const u8,
+    to_local: []const u8,
+    to_id: ir.FunctionId,
+) void {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .call_named => |*c| {
+                if (nameMatches(c.name, from_name, from_local)) {
+                    c.name = if (nameUsedLocal(c.name, from_name)) to_name else to_local;
+                }
+            },
+            .tail_call => |*c| {
+                if (nameMatches(c.name, from_name, from_local)) {
+                    c.name = if (nameUsedLocal(c.name, from_name)) to_name else to_local;
+                }
+            },
+            .try_call_named => |*c| {
+                if (nameMatches(c.name, from_name, from_local)) {
+                    c.name = if (nameUsedLocal(c.name, from_name)) to_name else to_local;
+                }
+            },
+            .call_direct => |*c| {
+                if (c.function == from_id) c.function = to_id;
+            },
+            else => {},
+        }
+        // Recurse into nested instruction streams, mirroring
+        // `ir.forEachInstructionChildren`'s structural coverage.
+        retargetNestedStreams(instr, from_name, from_local, from_id, to_name, to_local, to_id);
+    }
+}
+
+/// Pick the destination name that matches which form the call used: when
+/// the call referenced the qualified `name`, keep using the qualified
+/// variant name; otherwise it referenced `local_name` and we use the
+/// variant's local name. (`from_name` is the qualified name.)
+fn nameUsedLocal(candidate: []const u8, qualified_name: []const u8) bool {
+    return std.mem.eql(u8, candidate, qualified_name);
+}
+
+/// Mutable analog of `ir.forEachInstructionChildren`: recurse into every
+/// nested instruction stream a structured instruction carries and rewrite
+/// self-recursion edges inside them.
+fn retargetNestedStreams(
+    instr: *ir.Instruction,
+    from_name: []const u8,
+    from_local: []const u8,
+    from_id: ir.FunctionId,
+    to_name: []const u8,
+    to_local: []const u8,
+    to_id: ir.FunctionId,
+) void {
+    const R = struct {
+        fn go(
+            s: []const ir.Instruction,
+            fnm: []const u8,
+            flo: []const u8,
+            fid: ir.FunctionId,
+            tnm: []const u8,
+            tlo: []const u8,
+            tid: ir.FunctionId,
+        ) void {
+            retargetStream(@constCast(s), fnm, flo, fid, tnm, tlo, tid);
+        }
+    };
+    switch (instr.*) {
+        .if_expr => |ie| {
+            R.go(ie.then_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+            R.go(ie.else_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+        },
+        .case_block => |cb| {
+            R.go(cb.pre_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+            for (cb.arms) |arm| {
+                R.go(arm.cond_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+                R.go(arm.body_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+            }
+            R.go(cb.default_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+        },
+        .switch_literal => |sl| {
+            for (sl.cases) |c| R.go(c.body_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+            R.go(sl.default_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+        },
+        .switch_return => |sr| {
+            for (sr.cases) |c| R.go(c.body_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+            R.go(sr.default_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+        },
+        .union_switch => |us| {
+            for (us.cases) |c| R.go(c.body_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+        },
+        .union_switch_return => |usr| {
+            for (usr.cases) |c| R.go(c.body_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+        },
+        .try_call_named => |tc| {
+            R.go(tc.handler_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+            R.go(tc.success_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+        },
+        .guard_block => |gb| {
+            R.go(gb.body, from_name, from_local, from_id, to_name, to_local, to_id);
+        },
+        .optional_dispatch => |od| {
+            R.go(od.nil_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+            R.go(od.struct_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+        },
+        else => {},
+    }
+}
+
+/// Run the convention-inference fixpoint (indices → lift set → monotone
+/// promotion → side-channel stash) once over `program`. Idempotent and
+/// monotone: re-running after the program grows only adds `.owned`
+/// promotions, never demotes.
+fn runConventionInferenceFixpoint(
+    allocator: std.mem.Allocator,
+    program: *ir.Program,
+    ownerships: *const arc_liveness.ProgramArcOwnership,
+) !void {
     // Build a quick lookup: function-name → FunctionId. Used by call
     // sites that reference callees by name (call_named, tail_call) to
     // resolve back to the function's parameter conventions slot.
