@@ -5233,7 +5233,7 @@ fn runScriptInTmpWithFlags(
     const repo_lib = try resolveRepoStdlibDir(allocator);
     defer allocator.free(repo_lib);
 
-    const script_cache = std.fs.path.join(allocator, &.{ tmp_dir_path, "..", "zap-script-cache" }) catch
+    const script_cache = scriptCacheDirForTmp(allocator, tmp_dir_path) catch
         return error.OutOfMemory;
     defer allocator.free(script_cache);
 
@@ -5304,7 +5304,7 @@ fn runZapRunRaw(
     const repo_lib = try resolveRepoStdlibDir(allocator);
     defer allocator.free(repo_lib);
 
-    const script_cache = std.fs.path.join(allocator, &.{ tmp_dir_path, "..", "zap-script-cache" }) catch
+    const script_cache = scriptCacheDirForTmp(allocator, tmp_dir_path) catch
         return error.OutOfMemory;
     defer allocator.free(script_cache);
 
@@ -5754,6 +5754,26 @@ test "CLI script: no artifacts are written next to the script" {
 /// parent dir, so this helper walks the same tree the test driver
 /// established. The cache is per-test (cleaned with the tmp dir's
 /// parent, also a tmp), so we expect exactly one published binary.
+/// Per-test script-cache directory: a sibling of the test's tmp dir
+/// (so the in-tmp "no-litter" assertion stays exact — the cache lives
+/// OUTSIDE the tmp dir) whose name is suffixed with the tmp dir's own
+/// unique basename so EACH test gets its OWN cache. A single shared
+/// `zap-script-cache` under the common `.zig-cache/tmp/` parent let one
+/// test's published script binary leak into another's view: every
+/// script test writes `<cache>/zap/scripts/<hash>/script`, and
+/// `findPublishedScriptBinary` returns the FIRST `<hash>` the directory
+/// iterator yields — which, with a shared cache, could be a different
+/// test's script (e.g. `atos` resolving `exit0.zap:1` instead of the
+/// `phase0_split.zap` the Phase-0 test just built). Isolating per test
+/// guarantees the cache holds exactly the binary under test.
+/// Caller owns the returned slice.
+fn scriptCacheDirForTmp(allocator: std.mem.Allocator, tmp_dir_path: []const u8) ![]const u8 {
+    const unique = std.fs.path.basename(tmp_dir_path);
+    const cache_name = try std.fmt.allocPrint(allocator, "zap-script-cache-{s}", .{unique});
+    defer allocator.free(cache_name);
+    return std.fs.path.join(allocator, &.{ tmp_dir_path, "..", cache_name });
+}
+
 fn findPublishedScriptBinary(
     allocator: std.mem.Allocator,
     tmp_dir: *std.testing.TmpDir,
@@ -5762,7 +5782,10 @@ fn findPublishedScriptBinary(
         return error.Unexpected;
     defer allocator.free(tmp_dir_path);
 
-    const scripts_dir = std.fs.path.join(allocator, &.{ tmp_dir_path, "..", "zap-script-cache", "zap", "scripts" }) catch
+    const script_cache = scriptCacheDirForTmp(allocator, tmp_dir_path) catch
+        return error.OutOfMemory;
+    defer allocator.free(script_cache);
+    const scripts_dir = std.fs.path.join(allocator, &.{ script_cache, "zap", "scripts" }) catch
         return error.OutOfMemory;
     defer allocator.free(scripts_dir);
 
@@ -7852,7 +7875,7 @@ fn runScriptCrossBuild(
     const repo_lib = try resolveRepoStdlibDir(allocator);
     defer allocator.free(repo_lib);
 
-    const script_cache = std.fs.path.join(allocator, &.{ tmp_dir_path, "..", "zap-script-cache" }) catch
+    const script_cache = scriptCacheDirForTmp(allocator, tmp_dir_path) catch
         return error.OutOfMemory;
     defer allocator.free(script_cache);
 
