@@ -3166,6 +3166,36 @@ fn stripDarwinDebugMapOrExit(
     };
 }
 
+/// Publish the freshly-built `.dSYM` debug-symbol bundle from the staging
+/// directory into the shared content-key cache location, race-safely against
+/// concurrent invocations on the SAME script.
+///
+/// Race-safety strategy — sound because the script cache is CONTENT-KEYED
+/// (the published path is derived from a hash that covers script source +
+/// compiler identity + relevant flags, so the same path implies the same
+/// dSYM bytes):
+///
+/// 1. **Cache hit:** if the published dSYM bundle already exists at function
+///    entry, return success immediately. The existing bundle is byte-equivalent
+///    to the one we just staged for the same key — overwriting it is both
+///    wasteful and racy (`deleteTree` then `rename` is a TOCTOU window that
+///    triggers `error.DirNotEmpty` when a concurrent publisher repopulates
+///    the destination). Best-effort cleans up the redundant staged copy.
+///
+/// 2. **Atomic publish with race-loss acceptance:** otherwise, attempt
+///    `rename(staged, published)` directly (no preceding deletion).
+///    - On success: we won the race, the bundle is now atomically in place.
+///    - On `error.DirNotEmpty`: a concurrent publisher won the race and
+///      populated the destination directory between our existence check
+///      and the rename — POSIX `rename` cannot atomically replace a
+///      nonempty directory, so this is the only race-loss error variant
+///      that surfaces for a directory rename. Return success — the
+///      content-key invariant guarantees the winning bundle has the same
+///      bytes ours would have. Best-effort cleans up our staged copy.
+///    - On any other error: surface as `error.DebugSymbolPublishFailed`.
+///
+/// This is the standard "if it's already there, or it gets there, we're good"
+/// idiom for content-keyed atomic publishes.
 fn publishScriptDebugSymbolsIfNeeded(
     alloc: std.mem.Allocator,
     config: zap.builder.BuildConfig,
@@ -3183,16 +3213,30 @@ fn publishScriptDebugSymbolsIfNeeded(
 
     const published_dsym_path = try debugSymbolBundlePath(alloc, published_artifact_path);
     defer alloc.free(published_dsym_path);
+
+    // (1) Cache hit — the destination already holds an identical bundle
+    // (content-keyed cache). Skip the publish entirely; best-effort sweep
+    // the now-redundant staged copy so the staging dir's `deleteTree` at
+    // the caller is a no-op for this subtree.
     if (cwdPathExists(published_dsym_path)) {
-        std.Io.Dir.cwd().deleteTree(global_io, published_dsym_path) catch |err| {
-            std.debug.print("Error: could not replace script debug symbols at {s}: {}\n", .{ published_dsym_path, err });
-            return error.DebugSymbolPublishFailed;
-        };
+        std.Io.Dir.cwd().deleteTree(global_io, staged_dsym_path) catch {};
+        return;
     }
 
-    std.Io.Dir.cwd().rename(staged_dsym_path, std.Io.Dir.cwd(), published_dsym_path, global_io) catch |err| {
-        std.debug.print("Error: could not publish script debug symbols to {s}: {}\n", .{ published_dsym_path, err });
-        return error.DebugSymbolPublishFailed;
+    // (2) Atomic publish. POSIX `rename` cannot atomically replace a
+    // NONEMPTY directory with another directory and reports
+    // `error.DirNotEmpty` in that race-loss case — a concurrent publisher
+    // beat us with byte-identical content for this content-key. Accept
+    // and best-effort clean the redundant staged bundle.
+    std.Io.Dir.cwd().rename(staged_dsym_path, std.Io.Dir.cwd(), published_dsym_path, global_io) catch |err| switch (err) {
+        error.DirNotEmpty => {
+            std.Io.Dir.cwd().deleteTree(global_io, staged_dsym_path) catch {};
+            return;
+        },
+        else => {
+            std.debug.print("Error: could not publish script debug symbols to {s}: {}\n", .{ published_dsym_path, err });
+            return error.DebugSymbolPublishFailed;
+        },
     };
 }
 
@@ -3203,10 +3247,19 @@ fn publishScriptDebugSymbolsIfNeeded(
 /// `.bin` (see `zir_backend.want_sidecar`). The crash reporter
 /// (`src/runtime.zig`) loads `<exe>.zap-symbols` at the first `raise` to map
 /// mangled frames back to Zap symbols, so the sidecar must travel with the
-/// binary into its stable cache location. Best-effort: a missing sidecar (or
-/// a rename failure) only degrades crash reports to mangled names, never
-/// breaks the run — so failures are intentionally swallowed rather than
-/// aborting an otherwise-successful build.
+/// binary into its stable cache location.
+///
+/// Race-safety mirrors `publishScriptDebugSymbolsIfNeeded`: the cache is
+/// content-keyed, so the same `published` path always implies identical
+/// sidecar bytes. Cache-hit → return (best-effort sweep the staged copy).
+/// Otherwise rename directly. Unlike the dSYM directory case, a POSIX file
+/// `rename` atomically REPLACES an existing destination, so a concurrent
+/// winner with byte-identical content is just silently overwritten — there
+/// is no race-loss error variant to handle for a file rename.
+///
+/// Best-effort: a missing sidecar only degrades crash reports to mangled
+/// names, never breaks the run — so rename failures are intentionally
+/// swallowed rather than aborting an otherwise-successful build.
 fn publishScriptSymbolTableSidecar(
     alloc: std.mem.Allocator,
     staged_artifact_path: []const u8,
@@ -3220,10 +3273,20 @@ fn publishScriptSymbolTableSidecar(
     const published = std.fmt.allocPrint(alloc, "{s}{s}", .{ published_artifact_path, suffix }) catch return;
     defer alloc.free(published);
 
-    // Replace any stale sidecar from a previous publish of the same key.
+    // Cache hit — sidecar already published by a prior or concurrent
+    // run with the same content key (so the bytes match). Skip and
+    // best-effort clean up the redundant staged copy.
     if (cwdPathExists(published)) {
-        std.Io.Dir.cwd().deleteFile(global_io, published) catch {};
+        std.Io.Dir.cwd().deleteFile(global_io, staged) catch {};
+        return;
     }
+
+    // Atomic publish. POSIX `rename` of a file atomically REPLACES an
+    // existing destination, so a concurrent publisher that beat us with
+    // byte-identical content simply gets its copy replaced with our
+    // (identical) copy — no race-loss error to handle. Any other rename
+    // failure is intentionally swallowed: a missing sidecar only
+    // degrades crash reports to mangled names, never breaks the run.
     std.Io.Dir.cwd().rename(staged, std.Io.Dir.cwd(), published, global_io) catch {};
 }
 
