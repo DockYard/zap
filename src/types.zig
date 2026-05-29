@@ -7851,7 +7851,23 @@ pub const TypeChecker = struct {
                                             self.backfillClosureFieldType(tid, req_field.name, val_type);
                                         }
                                         const expected_type = instantiation.substitution.applyToType(self.store, req_field.type_id);
+                                        // A parametric struct literal that omits its
+                                        // type-args (`%Box{value: 99}` for `Box(t)`)
+                                        // leaves each formal type-var unbound: the
+                                        // substitution is empty, so `expected_type`
+                                        // stays a (possibly nested) type-var. The
+                                        // concrete instantiation is resolved later by
+                                        // the HIR's context-driven inference from the
+                                        // expected tail/return type (1.1.5.c,
+                                        // `inferAppliedFromExpectedType`), so the
+                                        // type-checker must NOT reject a concrete field
+                                        // value against an unbound formal here — an
+                                        // unbound generic formal accepts any value.
+                                        // This mirrors the same permissive type-var
+                                        // rule the call-match cost already applies
+                                        // (`callMatchCost`: type-var expected ⇒ cost 0).
                                         if (val_type != TypeStore.UNKNOWN and expected_type != TypeStore.UNKNOWN and
+                                            !self.store.containsTypeVars(expected_type) and
                                             !self.store.typeEquals(val_type, expected_type) and
                                             !self.acceptsIntegerLiteralForExpectedType(provided.value, expected_type))
                                         {
