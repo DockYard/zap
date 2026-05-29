@@ -279,7 +279,18 @@ pub fn build(b: *std.Build) void {
     // `compiler_rt` trees. Omitting `ubsan_rt.zig`/`fuzzer.zig` only worked
     // while resolution fell back to a full system Zig lib dir; now that the
     // embedded fork stdlib is authoritative it must be self-contained.
-    tar_step.addArgs(&.{ "std", "compiler_rt", "compiler_rt.zig", "ubsan_rt.zig", "fuzzer.zig", "c.zig", "c" });
+    //
+    // `libc` is REQUIRED for cross-compilation to libc targets: a
+    // `-Dtarget=<arch>-linux-musl` build sub-compiles musl's `crt1.o` and
+    // `libc.a` from the bundled `libc/musl/**` sources against the bundled
+    // `libc/include/**` headers (and `libc/glibc/**`, `libc/mingw/**`, etc.
+    // for the other libc targets Zig supports). Without it the embedded
+    // archive extracts a `libc`-less zig-lib and every libc cross-build
+    // fails with `libc/musl/crt/crt1.c file_hash FileNotFound`. The bundle
+    // claims to be authoritative/self-contained, so it must carry `libc`
+    // exactly as a full Zig lib dir does — there is no system-libc fallback
+    // for a foreign target.
+    tar_step.addArgs(&.{ "std", "compiler_rt", "compiler_rt.zig", "ubsan_rt.zig", "fuzzer.zig", "c.zig", "c", "libc" });
 
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(tar_output, "zig_lib.tar");

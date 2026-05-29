@@ -12589,13 +12589,40 @@ fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
 
     const lib_dir = try std.fs.path.join(allocator, &.{ home, ".cache", "zap", "zig-lib" });
 
-    const marker = try std.fs.path.join(allocator, &.{ lib_dir, "std", "std.zig" });
-    defer allocator.free(marker);
+    // Content-addressed staleness: the cache is valid only when it was
+    // extracted from THIS compiler binary's embedded archive. Keying the
+    // "already extracted" check on the mere PRESENCE of `std/std.zig` is a
+    // bug — a cache left over from an older binary whose `zig_lib.tar` had
+    // a different file set (notably one missing the `libc` tree, which made
+    // every `*-linux-musl` cross-build fail with `crt1.c FileNotFound`)
+    // would be reused forever, so a corrected bundle could never take
+    // effect. Instead store a digest of the embedded archive in a marker
+    // file and re-extract whenever it is absent or does not match.
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(zig_lib_archive.data, &digest, .{});
+    var digest_hex: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+    _ = std.fmt.bufPrint(&digest_hex, "{x}", .{&digest}) catch unreachable;
 
-    if (std.Io.Dir.cwd().access(global_io, marker, .{})) |_| {
-        return lib_dir;
+    const digest_marker = try std.fs.path.join(allocator, &.{ lib_dir, ".zap_bundle_digest" });
+    defer allocator.free(digest_marker);
+    const std_marker = try std.fs.path.join(allocator, &.{ lib_dir, "std", "std.zig" });
+    defer allocator.free(std_marker);
+
+    // Fast path: the std tree is present AND the digest marker matches this
+    // binary's embedded archive — the cache is current, reuse it as-is.
+    if (std.Io.Dir.cwd().access(global_io, std_marker, .{})) |_| {
+        if (std.Io.Dir.cwd().readFileAlloc(global_io, digest_marker, allocator, .limited(256))) |existing| {
+            defer allocator.free(existing);
+            if (std.mem.eql(u8, std.mem.trim(u8, existing, " \n\r\t"), &digest_hex)) {
+                return lib_dir;
+            }
+        } else |_| {}
     } else |_| {}
 
+    // Stale or absent: wipe any prior extraction so files removed from the
+    // archive do not linger, then extract this binary's archive fresh. The
+    // cache is fully regenerable, so deleting it is safe.
+    std.Io.Dir.cwd().deleteTree(global_io, lib_dir) catch {};
     std.Io.Dir.cwd().createDirPath(global_io, lib_dir) catch {};
 
     var dir = std.Io.Dir.cwd().openDir(global_io, lib_dir, .{}) catch return error.FileNotFound;
@@ -12603,6 +12630,11 @@ fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
 
     var reader = std.Io.Reader.fixed(zig_lib_archive.data);
     std.tar.extract(global_io, dir, &reader, .{}) catch return error.FileNotFound;
+
+    // Stamp the digest marker last so a crash mid-extract leaves an
+    // unmarked (therefore stale-on-next-run) tree rather than a marked
+    // partial one.
+    writeFile(digest_marker, &digest_hex) catch {};
 
     return lib_dir;
 }
