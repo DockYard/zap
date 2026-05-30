@@ -292,10 +292,40 @@ pub fn build(b: *std.Build) void {
     // for a foreign target.
     tar_step.addArgs(&.{ "std", "compiler_rt", "compiler_rt.zig", "ubsan_rt.zig", "fuzzer.zig", "c.zig", "c", "libc" });
 
+    // The uncompressed `zig_lib.tar` above is ~244M (the bundled `std` + `c` +
+    // `libc` trees are overwhelmingly header/source TEXT, which compresses
+    // ~9:1). Embedding it verbatim via `@embedFile` pushes the `zap` binary to
+    // ~466M. We therefore XZ-compress the tar at build time and decompress it
+    // on extraction (`extractEmbeddedZigLib` in `src/main.zig`). This changes
+    // ONLY the archive's *encoding* — the full, unmodified file set above is
+    // still present byte-for-byte after decompression, so cross-compiling to
+    // every libc target Zig supports (musl, glibc, MinGW/Windows, WASI, the
+    // BSDs, every arch) keeps working. We do not strip, subset, or reorder any
+    // part of the bundle; we only shrink the stored bytes.
+    //
+    // XZ is chosen over gzip/zstd because (a) it gives the best ratio on this
+    // header-heavy text (~9:1 vs gzip's ~3-4:1), (b) the `xz` toolchain is
+    // already proven in this build env (the `zap-deps-*.tar.xz` archives are
+    // fetched and extracted with `tar xJf` elsewhere in this file), and (c) the
+    // fork's `std.compress.xz.Decompress` round-trips the real archive. The
+    // tar arg list above is kept as a plain `tar -cf` (no `-J`) so the
+    // *contents* of the bundle are independent of the compressor; a dedicated
+    // `xz` Run step performs the compression and its stdout is captured as the
+    // embedded `zig_lib.tar.xz`. `--threads=0` parallelizes compression across
+    // all cores (build-time only); `-9 --extreme` maximizes the ratio since the
+    // archive is compressed exactly once per build but shipped in every binary
+    // (this brings the embedded archive from ~244M down to ~25M). NB: the
+    // multi-threaded encoder emits a multi-block XZ stream, which the fork's
+    // `std.compress.xz.Decompress` decodes block-by-block — verified to
+    // round-trip the real archive byte-for-byte on extraction.
+    const xz_step = b.addSystemCommand(&.{ "xz", "--compress", "--stdout", "--threads=0", "-9", "--extreme" });
+    xz_step.addFileArg(tar_output);
+    const xz_output = xz_step.captureStdOut(.{ .basename = "zig_lib.tar.xz" });
+
     const wf = b.addWriteFiles();
-    _ = wf.addCopyFile(tar_output, "zig_lib.tar");
+    _ = wf.addCopyFile(xz_output, "zig_lib.tar.xz");
     const wrapper_source = wf.add("zig_lib_archive.zig",
-        \\pub const data = @embedFile("zig_lib.tar");
+        \\pub const data = @embedFile("zig_lib.tar.xz");
         \\
     );
 

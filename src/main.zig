@@ -12691,8 +12691,27 @@ fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
     var dir = std.Io.Dir.cwd().openDir(global_io, lib_dir, .{}) catch return error.FileNotFound;
     defer dir.close(global_io);
 
-    var reader = std.Io.Reader.fixed(zig_lib_archive.data);
-    std.tar.extract(global_io, dir, &reader, .{}) catch return error.FileNotFound;
+    // The embedded archive (`zig_lib_archive.data`) is XZ-compressed at build
+    // time (`build.zig`) to keep the `zap` binary small — the bundled std/c/
+    // libc trees are header-heavy text that compresses ~9:1. Decompress it on
+    // the fly and feed the *decompressed* byte stream into `std.tar.extract`,
+    // so the full, unmodified file set lands on disk exactly as before. The
+    // reader chain is:
+    //
+    //   fixed(compressed bytes) -> xz.Decompress -> tar.extract
+    //
+    // `xz.Decompress.init` takes ownership of `decompress_buffer` and grows it
+    // with `allocator` as LZMA2 dictionaries require (XZ blocks declare their
+    // own dictionary size); `decompress.deinit()` frees it. The decompressed
+    // `std.Io.Reader` is exposed as `decompress.reader`. NB: `xz.Decompress`
+    // resolves its parent via `@fieldParentPtr("reader", ...)`, so the
+    // `decompress` value must not be moved after `init` — keep it in this
+    // stable local and pass `&decompress.reader` to the extractor.
+    var compressed_reader = std.Io.Reader.fixed(zig_lib_archive.data);
+    const decompress_buffer = allocator.alloc(u8, 64 * 1024) catch return error.OutOfMemory;
+    var decompress = std.compress.xz.Decompress.init(&compressed_reader, allocator, decompress_buffer) catch return error.FileNotFound;
+    defer decompress.deinit();
+    std.tar.extract(global_io, dir, &decompress.reader, .{}) catch return error.FileNotFound;
 
     // Stamp the digest marker last so a crash mid-extract leaves an
     // unmarked (therefore stale-on-next-run) tree rather than a marked
