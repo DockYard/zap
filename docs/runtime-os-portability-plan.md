@@ -337,6 +337,20 @@ confirm format, and run it where a runner exists (`wasmtime`/`wasm3` for wasi; `
 box for PE — run-if-possible, else link+`file` is the bar).
 
 ### Phase A — seam skeleton + console write + std-portable migration (the "hello world abroad" phase)
+**Status: COMPLETE.** `IO.puts` runs on `wasm32-wasi` under `wasmtime` (prints `hello abroad`) and
+links clean as `x86_64-windows-gnu` (`PE32+`); native stays byte-for-byte green (`zig build test`
+exit 0, `zap test` 942/0 + 1366 assertions, golden corpus 14/14). The seam lives at
+`src/runtime_os/{posix,windows,wasi}.zig` (with the `caps` model) and is assembled into the
+embedded `zap_runtime` by `compiler.zig`'s `rewriteRuntimeSource` Stage 7 (the source-level inline
+seam is the POSIX backend verbatim, so the unrewritten host-test build is the native anchor).
+Three cross-cutting blockers beyond the originally-scoped four surfaced and were fixed: the
+manager-ABI vtable structs were 64-bit-only (made pointer-width relative across `abi.zig` + 6
+managers + the runtime `AbiV1` mirror); the driver validated target sections with host `@sizeOf`
+(made target-pointer-width aware); and the fork forced `link_libc=false` for wasi (now honoured,
+since wasi-libc exists). Deferred per scope: Domain C file I/O (Phase B — the `IO.File`/instrumentation
+`std.c.open`/`write` paths remain native), Domain B crash handler (Phase D), and a Windows-argv
+follow-up (PEB `CommandLine` WTF-16 recovery; argv degrades to empty on Windows for now).
+
 **Goal:** a trivial `IO.puts("hello")` program **links and runs** as `wasm32-wasi` and links (runs
 if a runner is available) as `x86_64-windows-gnu`.
 - Introduce `src/runtime_os/{dispatch,posix,windows,wasi}.zig` + the `caps` struct; wire the
