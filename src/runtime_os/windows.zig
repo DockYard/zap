@@ -152,7 +152,10 @@ pub const Backend = struct {
             ) callconv(.winapi) std.os.windows.BOOL;
         };
         var mode: std.os.windows.DWORD = 0;
-        return k.GetConsoleMode(stderrHandle(), &mode) != 0;
+        // `BOOL` is the typed `Bool(c_int)` enum in std; `.toBool()` is
+        // the correct truthiness test (a raw `!= 0` compares an enum to
+        // an int and a `!= .FALSE`/`== .TRUE` is flagged as a bug).
+        return k.GetConsoleMode(stderrHandle(), &mode).toBool();
     }
 
     /// 100-ns ticks between 1601-01-01 (the Windows FILETIME epoch) and
@@ -211,22 +214,22 @@ pub const Backend = struct {
         return c.atexit(handler);
     }
 
-    /// Process argv via the mingw CRT globals `__argv`/`__argc`, which
-    /// `*-windows-gnu` populates before `main`. These are NUL-terminated
-    /// multibyte (CRT-encoded) strings; for ASCII argv (the common case)
-    /// they are byte-for-byte. A libc-free Windows target would parse
-    /// the PEB `CommandLine` instead, but Zap's Windows builds link
-    /// mingw libc, so the CRT globals are the correct, allocation-free
-    /// source. Degrades to an empty slice if the CRT did not populate
-    /// them.
+    /// Process argv on Windows. The argument vector lives in the PEB as
+    /// a single WTF-16 `CommandLine` UNICODE_STRING; recovering a
+    /// `[*:0]const u8`-style argv requires tokenizing it (quote/backslash
+    /// rules) and transcoding WTF-16 → UTF-8 into stable storage. That
+    /// transcode is the one piece of the argv domain that does not map to
+    /// an allocation-free static-cache lift the way the POSIX
+    /// `/proc/self/cmdline` and macOS `_NSGetArgv` paths do, so under the
+    /// capability model it DEGRADES to an empty argv on Windows for now
+    /// (a program that does not read its arguments — like the Phase-A
+    /// `IO.puts` fixture — is unaffected). The CommandLine tokenizer +
+    /// WTF-16 transcode into a static cache is the tracked Windows-argv
+    /// follow-up; it is deliberately NOT the mingw `__argv`/`__argc` CRT
+    /// globals (those are not defined under Zap's object-based Windows
+    /// link, producing `undefined symbol` link errors).
     pub fn argv() []const [*:0]const u8 {
-        const c = struct {
-            extern "c" var __argc: c_int;
-            extern "c" var __argv: [*]const [*:0]const u8;
-        };
-        if (c.__argc <= 0) return &.{};
-        const argc: usize = @intCast(c.__argc);
-        return c.__argv[0..argc];
+        return &.{};
     }
     // ZAP_RUNTIME_OS_BODY_END windows
 };

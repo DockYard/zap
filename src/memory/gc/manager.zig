@@ -168,8 +168,8 @@ comptime {
     if (@sizeOf(ZapCapabilityDescV1) != std.mem.alignForward(usize, 12, PTR) + PTR) @compileError(
         "gc: ZapCapabilityDescV1 size must be its integer prefix plus one pointer",
     );
-    if (@sizeOf(ZapMemoryManagerCoreV1) != 16 + 5 * PTR) @compileError(
-        "gc: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers",
+    if (@sizeOf(ZapMemoryManagerCoreV1) != std.mem.alignForward(usize, 16 + 5 * PTR, @alignOf(ZapMemoryManagerCoreV1))) @compileError(
+        "gc: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers (aligned)",
     );
     if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16 + 0 * PTR) @compileError(
         "gc: ZapMemoryManagerCoreV1.init must follow the 16-byte prefix",

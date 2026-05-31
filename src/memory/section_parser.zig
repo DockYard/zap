@@ -307,60 +307,177 @@ fn readUleb128(bytes: []const u8, cursor: *usize) ?usize {
     return result;
 }
 
-/// WebAssembly extraction. The `.zapmem` metadata ships as a wasm
-/// *custom section* (the manager-side `SECTION_NAME` `.wasm` arm emits
-/// `linksection(".zapmem")`, which the wasm object writer lowers to a
-/// custom section named `.zapmem`).
+/// Skip a LEB128-encoded integer (signed or unsigned — the
+/// continuation-bit framing is identical) at `cursor.*`, advancing past
+/// it. Returns null on truncation or an over-long (> 10-byte) encoding.
+fn skipLeb(bytes: []const u8, cursor: *usize) ?void {
+    var produced: usize = 0;
+    while (true) {
+        if (cursor.* >= bytes.len) return null;
+        const byte = bytes[cursor.*];
+        cursor.* += 1;
+        produced += 1;
+        if (produced > 10) return null;
+        if (byte & 0x80 == 0) break;
+    }
+    return {};
+}
+
+/// WebAssembly extraction. In a *relocatable* wasm object (what `zig
+/// build-obj -target wasm32-*` emits, and what the manager compile
+/// produces), the `.zapmem` data emitted via `linksection(".zapmem")` is
+/// NOT a top-level custom section — it is a **data segment** in the DATA
+/// section, and `.zapmem` appears only as that segment's NAME in the
+/// `linking` custom section's `WASM_SEGMENT_INFO` subsection. So
+/// extraction is a two-step join:
+///
+///   1. Parse the DATA section (id 11) into its ordered segments,
+///      recording each segment's raw-bytes `[start, len)` in the buffer.
+///   2. Parse the `linking` custom section's `WASM_SEGMENT_INFO`
+///      subsection (id 5) — a parallel-ordered list of `(name, align,
+///      flags)` — to find the index whose name is `.zapmem`.
+///
+/// The DATA-segment at that index is the `.zapmem` payload.
 ///
 /// A wasm binary is an 8-byte header (`\0asm` + u32 version) followed by
-/// a sequence of sections. Each section is:
-///
-///   id        : 1 byte           (0 = custom)
-///   size      : ULEB128          (byte length of the section payload)
-///   <payload> : `size` bytes
-///
-/// For a custom section the payload begins with a name:
-///
-///   name_len  : ULEB128
-///   name      : `name_len` bytes (UTF-8)
-///   <content> : the remainder of the payload
-///
-/// We walk the sections, and for each custom section (id 0) compare its
-/// name to `.zapmem`, returning the content slice on a match.
+/// sections `id:1byte, size:ULEB, payload`. Custom sections (id 0)
+/// additionally begin with `name_len:ULEB, name`.
 fn extractFromWasm(bytes: []const u8) ExtractError![]const u8 {
-    // 8-byte header: magic (4) + version (4). The magic was already
-    // checked by `detectFormat`; require the version word to be present.
     const wasm_header_len: usize = 8;
     if (bytes.len < wasm_header_len) return error.InvalidObject;
+
+    var data_section: ?[]const u8 = null;
+    var linking_content: ?[]const u8 = null;
 
     var cursor: usize = wasm_header_len;
     while (cursor < bytes.len) {
         const section_id = bytes[cursor];
         cursor += 1;
-
         const section_size = readUleb128(bytes, &cursor) orelse return error.InvalidObject;
-        // The payload must lie fully within the buffer (overflow-safe).
         if (section_size > bytes.len or cursor > bytes.len - section_size) {
             return error.InvalidObject;
         }
         const payload_start = cursor;
         const payload_end = cursor + section_size;
-        // Advance the cursor past this section regardless of match.
         cursor = payload_end;
 
-        if (section_id != 0) continue; // not a custom section
+        if (section_id == 11) {
+            // DATA section.
+            data_section = bytes[payload_start..payload_end];
+        } else if (section_id == 0) {
+            var name_cursor = payload_start;
+            const name_len = readUleb128(bytes, &name_cursor) orelse return error.InvalidObject;
+            if (name_len > section_size or name_cursor > payload_end - name_len) {
+                return error.InvalidObject;
+            }
+            const name = bytes[name_cursor .. name_cursor + name_len];
+            if (std.mem.eql(u8, name, "linking")) {
+                linking_content = bytes[name_cursor + name_len .. payload_end];
+            }
+        }
+    }
 
-        // Parse the custom section's name from its payload.
-        var name_cursor = payload_start;
-        const name_len = readUleb128(bytes, &name_cursor) orelse return error.InvalidObject;
-        if (name_len > section_size) return error.InvalidObject;
-        if (name_cursor > payload_end - name_len) return error.InvalidObject;
-        const name = bytes[name_cursor .. name_cursor + name_len];
+    const data = data_section orelse return error.SectionNotFound;
+    const linking = linking_content orelse return error.SectionNotFound;
 
-        if (std.mem.eql(u8, name, ".zapmem")) {
-            const content = bytes[name_cursor + name_len .. payload_end];
-            if (content.len < @sizeOf(ZapMemoryManagerMetaV1)) return error.SectionTooSmall;
-            return content;
+    // Find the `.zapmem` segment index in WASM_SEGMENT_INFO.
+    const zapmem_index = wasmSegmentIndexByName(linking, ".zapmem") orelse
+        return error.SectionNotFound;
+
+    // Walk the DATA section to the segment at `zapmem_index` and return
+    // its bytes.
+    return wasmDataSegmentBytes(data, zapmem_index);
+}
+
+/// Scan the `linking` section content for the `WASM_SEGMENT_INFO`
+/// subsection (id 5) and return the index of the segment named `want`,
+/// or null. The subsection content is `count:ULEB` then `count` entries
+/// of `name_len:ULEB, name, alignment:ULEB, flags:ULEB`.
+fn wasmSegmentIndexByName(linking: []const u8, want: []const u8) ?usize {
+    const WASM_SEGMENT_INFO: u8 = 5;
+    var i: usize = 0;
+    _ = readUleb128(linking, &i) orelse return null; // version
+    while (i < linking.len) {
+        const sub_id = linking[i];
+        i += 1;
+        const sub_size = readUleb128(linking, &i) orelse return null;
+        if (sub_size > linking.len or i > linking.len - sub_size) return null;
+        const sub_end = i + sub_size;
+        if (sub_id == WASM_SEGMENT_INFO) {
+            var p = i;
+            const count = readUleb128(linking, &p) orelse return null;
+            var idx: usize = 0;
+            while (idx < count) : (idx += 1) {
+                const name_len = readUleb128(linking, &p) orelse return null;
+                if (name_len > sub_end or p > sub_end - name_len) return null;
+                const name = linking[p .. p + name_len];
+                p += name_len;
+                _ = readUleb128(linking, &p) orelse return null; // alignment
+                _ = readUleb128(linking, &p) orelse return null; // flags
+                if (std.mem.eql(u8, name, want)) return idx;
+            }
+            return null; // segment-info present but name absent
+        }
+        i = sub_end;
+    }
+    return null;
+}
+
+/// Walk the DATA section content to the segment at ordinal `target_index`
+/// and return its raw byte payload. The DATA section is `count:ULEB`
+/// then `count` segments. Each segment is:
+///   flags:ULEB
+///   (flags==2)            ⇒ memidx:ULEB
+///   (flags==0 or flags==2) ⇒ offset init-expr (instrs ending in 0x0b)
+///   size:ULEB
+///   <size bytes>
+/// Passive segments (flags==1) carry no memidx/offset.
+fn wasmDataSegmentBytes(data: []const u8, target_index: usize) ExtractError![]const u8 {
+    var i: usize = 0;
+    const count = readUleb128(data, &i) orelse return error.InvalidObject;
+    if (target_index >= count) return error.InvalidObject;
+
+    var seg: usize = 0;
+    while (seg < count) : (seg += 1) {
+        const flags = readUleb128(data, &i) orelse return error.InvalidObject;
+        if (flags == 2) {
+            _ = readUleb128(data, &i) orelse return error.InvalidObject; // memidx
+        }
+        if (flags == 0 or flags == 2) {
+            // Offset init-expr. Decode each instruction and skip its
+            // immediate operand precisely, then expect the `end` opcode
+            // (0x0b). Decoding (rather than scanning for a raw 0x0b)
+            // avoids mistaking a LEB immediate byte that happens to
+            // equal 0x0b (e.g. a constant offset of 11) for the
+            // terminator. For relocatable objects the expression is
+            // typically `i32.const <reloc> end`, but `global.get` and
+            // 64-bit constants are handled too.
+            while (true) {
+                if (i >= data.len) return error.InvalidObject;
+                const op = data[i];
+                i += 1;
+                switch (op) {
+                    0x0b => break, // end
+                    0x41, 0x42 => { // i32.const (SLEB32) / i64.const (SLEB64)
+                        skipLeb(data, &i) orelse return error.InvalidObject;
+                    },
+                    0x23 => { // global.get (ULEB global index)
+                        skipLeb(data, &i) orelse return error.InvalidObject;
+                    },
+                    0x43 => i += 4, // f32.const
+                    0x44 => i += 8, // f64.const
+                    else => return error.InvalidObject, // unexpected opcode in a data offset
+                }
+                if (i > data.len) return error.InvalidObject;
+            }
+        }
+        const size = readUleb128(data, &i) orelse return error.InvalidObject;
+        if (size > data.len or i > data.len - size) return error.InvalidObject;
+        const seg_bytes = data[i .. i + size];
+        i += size;
+        if (seg == target_index) {
+            if (seg_bytes.len < @sizeOf(ZapMemoryManagerMetaV1)) return error.SectionTooSmall;
+            return seg_bytes;
         }
     }
     return error.SectionNotFound;

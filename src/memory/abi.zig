@@ -350,8 +350,12 @@ comptime {
     // `PTR` wide. On 64-bit (`PTR == 8`) this is the original 56-byte
     // layout with the pointers at 16/24/32/40/48.
     const core_ptr_base: usize = 16;
-    if (@sizeOf(ZapMemoryManagerCoreV1) != core_ptr_base + 5 * PTR) @compileError(
-        "abi: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers",
+    // The `u64 declared_caps` gives the struct 8-byte alignment, so on
+    // wasm32 (4-byte pointers) the five trailing pointers leave tail
+    // padding to the next 8-byte boundary; account for it via
+    // `alignForward`. On 64-bit this is exactly 56.
+    if (@sizeOf(ZapMemoryManagerCoreV1) != std.mem.alignForward(usize, core_ptr_base + 5 * PTR, @alignOf(ZapMemoryManagerCoreV1))) @compileError(
+        "abi: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers (aligned)",
     );
     if (@offsetOf(ZapMemoryManagerCoreV1, "abi_major") != 0) @compileError(
         "abi: ZapMemoryManagerCoreV1.abi_major must be at offset 0",

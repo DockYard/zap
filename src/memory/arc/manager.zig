@@ -195,8 +195,8 @@ comptime {
     if (@sizeOf(ZapCapabilityDescV1) != std.mem.alignForward(usize, 12, PTR) + PTR) @compileError(
         "arc: ZapCapabilityDescV1 size must be its integer prefix plus one pointer",
     );
-    if (@sizeOf(ZapMemoryManagerCoreV1) != 16 + 5 * PTR) @compileError(
-        "arc: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers",
+    if (@sizeOf(ZapMemoryManagerCoreV1) != std.mem.alignForward(usize, 16 + 5 * PTR, @alignOf(ZapMemoryManagerCoreV1))) @compileError(
+        "arc: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers (aligned)",
     );
     if (@sizeOf(ZapRefcountCapabilityV1) != 6 * PTR) @compileError(
         "arc: ZapRefcountCapabilityV1 (Phase 4.x extended) must be six pointer slots wide",

@@ -133,15 +133,17 @@ pub const Backend = struct {
         std.os.wasi.proc_exit(@as(std.os.wasi.exitcode_t, code));
     }
 
-    /// WASI has no `atexit` in the import ABI. There is no portable
-    /// preview1 process-exit hook, so registration is a no-op that
-    /// reports failure (non-zero). The runtime's only `atexit` use is
-    /// the stdout flush; under WASI the runtime flushes explicitly on
-    /// the normal-exit path instead of relying on this hook (the trivial
-    /// Phase-A fixture flushes before `exitProcess`).
+    /// Register a C-ABI handler to run at normal process exit via libc
+    /// `atexit`. wasi-libc (which a hosted Zap wasm binary links) provides
+    /// `atexit`, and its crt0 calls `exit()` on a normal `main` return,
+    /// which runs registered handlers — so the buffered-stdout flush
+    /// fires before the instance terminates, exactly as on POSIX. Returns
+    /// 0 on success.
     pub fn registerAtExit(handler: *const fn () callconv(.c) void) c_int {
-        _ = handler;
-        return -1;
+        const c = struct {
+            extern "c" fn atexit(handler: *const fn () callconv(.c) void) c_int;
+        };
+        return c.atexit(handler);
     }
 
     /// Process argv via `args_sizes_get` + `args_get`. The pointers and

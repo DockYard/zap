@@ -378,6 +378,7 @@ pub fn resolve(
         allocator,
         source_selection.type_name,
         cache_entry.object_path,
+        targetPointerSize(options),
         diag,
     ) catch |err| switch (err) {
         ResolveError.ObjectReadFailed,
@@ -412,6 +413,7 @@ pub fn resolve(
         allocator,
         source_selection.type_name,
         cache_entry.object_path,
+        targetPointerSize(options),
         diag,
     );
     try writeValidationSidecar(allocator, cache_entry.sidecar_path, cache_entry.record_identity, validated);
@@ -507,6 +509,7 @@ fn validateManagerObjectAtPath(
     allocator: std.mem.Allocator,
     manager_name: []const u8,
     object_path: []const u8,
+    target_ptr_size: usize,
     diag: *DriverDiagnostic,
 ) ResolveError!ValidatedSection {
     // Read the resulting object file and locate the `.zapmem` section.
@@ -543,8 +546,10 @@ fn validateManagerObjectAtPath(
         return ResolveError.SectionInvalid;
     };
 
-    // Static validation per spec section 3.5.
-    const validated = try validateSection(manager_name, section_bytes, diag);
+    // Static validation per spec section 3.5. The section was produced
+    // for the TARGET, so its vtable layout uses the target's pointer
+    // width — pass it through so the bounds checks are correct.
+    const validated = try validateSection(manager_name, section_bytes, target_ptr_size, diag);
 
     // Build-time check: source registration later binds
     // `zap_active_manager.zap_memory_section`; the validation object
@@ -1312,6 +1317,25 @@ fn defaultAbiForTriple(arch_tag: usize, os_tag: usize) ?usize {
         else => return null,
     };
     return @intFromEnum(default_abi);
+}
+
+/// The pointer width in bytes of the build's *target* (not the host the
+/// driver runs on). The driver validates a `.zapmem` section that was
+/// produced FOR the target, whose vtable-descriptor layout is
+/// pointer-width dependent — so the size/offset checks must use the
+/// target's pointer width, never the host's `@sizeOf`. Resolves the
+/// triple's arch: `wasm32` ⇒ 4; the other supported arches (`x86_64`,
+/// `aarch64`) are 64-bit ⇒ 8. A native build (no explicit target) uses
+/// the host pointer width. A malformed/absent triple falls back to the
+/// host width — the compile path surfaces the bad triple separately.
+fn targetPointerSize(options: ResolveOptions) usize {
+    const triple = options.target orelse return @sizeOf(usize);
+    const target = parseTargetTriple(triple) orelse return @sizeOf(usize);
+    const arch = enumFromTag(std.Target.Cpu.Arch, target.arch_tag) orelse return @sizeOf(usize);
+    return switch (arch) {
+        .wasm32, .arm, .armeb, .x86, .mips, .mipsel, .powerpc, .riscv32, .thumb, .thumbeb, .csky, .hexagon, .loongarch32, .m68k, .sparc, .spirv32, .xtensa => 4,
+        else => 8,
+    };
 }
 
 /// Look up an enum's integer tag value by case-insensitive name match.
@@ -2099,9 +2123,37 @@ fn validateDeclaredCaps(
     }
 }
 
+/// Expected `@sizeOf(ZapMemoryManagerCoreV1)` for a section produced for
+/// a target with `ptr` pointer width: 16-byte integer prefix + five
+/// pointers, rounded up to the 8-byte alignment the `u64 declared_caps`
+/// imposes. (64-bit ⇒ 56; wasm32 ⇒ 40.)
+fn targetCoreVtableSize(ptr: usize) usize {
+    return std.mem.alignForward(usize, 16 + 5 * ptr, 8);
+}
+
+/// Expected `@sizeOf(ZapCapabilityDescV1)` for a target with `ptr`
+/// pointer width: 12-byte integer prefix, then one pointer at `ptr`
+/// alignment. (64-bit ⇒ 24; wasm32 ⇒ 16.)
+fn targetCapabilityDescSize(ptr: usize) usize {
+    return std.mem.alignForward(usize, 12, ptr) + ptr;
+}
+
+/// Expected v1.0 `REFCOUNT_V1` vtable length (`retain`+`release`) for a
+/// target with `ptr` pointer width: two pointer slots.
+fn targetRefcountSizeV1_0(ptr: usize) u16 {
+    return @intCast(2 * ptr);
+}
+
+/// Expected v1.1 `REFCOUNT_V1` vtable length (all six slots) for a
+/// target with `ptr` pointer width: six pointer slots.
+fn targetRefcountSizeV1_1(ptr: usize) u16 {
+    return @intCast(6 * ptr);
+}
+
 fn validateSection(
     manager_name: []const u8,
     section_bytes: []const u8,
+    target_ptr_size: usize,
     diag: *DriverDiagnostic,
 ) ResolveError!ValidatedSection {
     if (section_bytes.len < @sizeOf(abi.ZapMemoryManagerMetaV1)) {
@@ -2177,8 +2229,9 @@ fn validateSection(
         return ResolveError.ValidationFailed;
     }
 
+    const target_core_size = targetCoreVtableSize(target_ptr_size);
     if (meta.core_vtable_offset > section_bytes.len or
-        section_bytes.len - meta.core_vtable_offset < @sizeOf(abi.ZapMemoryManagerCoreV1))
+        section_bytes.len - meta.core_vtable_offset < target_core_size)
     {
         diag.write(
             "manager '{s}' core vtable at offset {d} exceeds section bounds ({d} bytes)",
@@ -2194,30 +2247,37 @@ fn validateSection(
     // / undefined Axis-A codes, and inconsistent axis combinations.
     try validateDeclaredCaps(manager_name, meta.declared_caps, diag);
 
-    var core: abi.ZapMemoryManagerCoreV1 = undefined;
-    @memcpy(
-        std.mem.asBytes(&core),
-        section_bytes[meta.core_vtable_offset..][0..@sizeOf(abi.ZapMemoryManagerCoreV1)],
-    );
+    // The core vtable's INTEGER PREFIX (`abi_major`:u16@0,
+    // `abi_minor`:u16@2, `size`:u32@4, `declared_caps`:u64@8) is
+    // pointer-width INDEPENDENT, so it is read directly from the target
+    // bytes at fixed offsets — a host-struct `@memcpy` would assume the
+    // host pointer width and misread a cross-width target section. The
+    // trailing function-pointer slots are runtime vtable entries the
+    // driver never dereferences.
+    const core_base = section_bytes[meta.core_vtable_offset..];
+    const core_abi_major = std.mem.readInt(u16, core_base[0..2], .little);
+    const core_abi_minor = std.mem.readInt(u16, core_base[2..4], .little);
+    const core_size = std.mem.readInt(u32, core_base[4..8], .little);
+    const core_declared_caps = std.mem.readInt(u64, core_base[8..16], .little);
 
-    if (core.abi_major != meta.abi_major or core.abi_minor != meta.abi_minor) {
+    if (core_abi_major != meta.abi_major or core_abi_minor != meta.abi_minor) {
         diag.write(
             "manager '{s}' meta/core ABI mismatch (meta {d}.{d} vs core {d}.{d})",
-            .{ manager_name, meta.abi_major, meta.abi_minor, core.abi_major, core.abi_minor },
+            .{ manager_name, meta.abi_major, meta.abi_minor, core_abi_major, core_abi_minor },
         );
         return ResolveError.ValidationFailed;
     }
-    if (core.declared_caps != meta.declared_caps) {
+    if (core_declared_caps != meta.declared_caps) {
         diag.write(
             "manager '{s}' meta.declared_caps (0x{x}) and core.declared_caps (0x{x}) disagree",
-            .{ manager_name, meta.declared_caps, core.declared_caps },
+            .{ manager_name, meta.declared_caps, core_declared_caps },
         );
         return ResolveError.ValidationFailed;
     }
-    if (core.size < @sizeOf(abi.ZapMemoryManagerCoreV1)) {
+    if (core_size < target_core_size) {
         diag.write(
             "manager '{s}' core size {d} is smaller than the v1.0 base size ({d})",
-            .{ manager_name, core.size, @sizeOf(abi.ZapMemoryManagerCoreV1) },
+            .{ manager_name, core_size, target_core_size },
         );
         return ResolveError.ValidationFailed;
     }
@@ -2226,21 +2286,25 @@ fn validateSection(
     // (see above). The core vtable may grow with additional function
     // pointers in future ABI minors; the cap simply bounds how far the
     // driver is willing to walk before deciding the input is corrupt.
-    const MAX_CORE_SIZE: usize = 8 * @sizeOf(abi.ZapMemoryManagerCoreV1);
-    if (@as(usize, core.size) > MAX_CORE_SIZE) {
+    const MAX_CORE_SIZE: usize = 8 * target_core_size;
+    if (@as(usize, core_size) > MAX_CORE_SIZE) {
         diag.write(
             "manager '{s}' core size {d} exceeds the v1.x upper bound ({d}); the manager was built against a future ABI version",
-            .{ manager_name, core.size, MAX_CORE_SIZE },
+            .{ manager_name, core_size, MAX_CORE_SIZE },
         );
         return ResolveError.ValidationFailed;
     }
 
     // Validate embedded descriptors: each id must map to a declared bit;
-    // id == 0 is reserved; size must fit.
+    // id == 0 is reserved; size must fit. Descriptor records are
+    // pointer-width sized (one trailing `vtable` pointer), so the stride
+    // and the per-descriptor integer-prefix reads use the TARGET pointer
+    // width, not the host's.
+    const target_desc_size = targetCapabilityDescSize(target_ptr_size);
     var refcount_sized_extension = false;
     if (meta.desc_count > 0) {
-        const desc_table_offset = @as(usize, meta.core_vtable_offset) + @as(usize, core.size);
-        const desc_total = @as(usize, meta.desc_count) * @sizeOf(abi.ZapCapabilityDescV1);
+        const desc_table_offset = @as(usize, meta.core_vtable_offset) + @as(usize, core_size);
+        const desc_total = @as(usize, meta.desc_count) * target_desc_size;
         if (desc_table_offset + desc_total > section_bytes.len) {
             diag.write(
                 "manager '{s}' embedded descriptor table ({d} bytes starting at offset {d}) exceeds section ({d} bytes)",
@@ -2250,13 +2314,15 @@ fn validateSection(
         }
         var i: u32 = 0;
         while (i < meta.desc_count) : (i += 1) {
-            const desc_offset = desc_table_offset + @as(usize, i) * @sizeOf(abi.ZapCapabilityDescV1);
-            var desc: abi.ZapCapabilityDescV1 = undefined;
-            @memcpy(
-                std.mem.asBytes(&desc),
-                section_bytes[desc_offset..][0..@sizeOf(abi.ZapCapabilityDescV1)],
-            );
-            if (desc.id == 0) {
+            const desc_offset = desc_table_offset + @as(usize, i) * target_desc_size;
+            // Descriptor integer prefix (`id`:u32@0, `version`:u16@4,
+            // `size`:u16@6, `flags`:u32@8) is pointer-width independent;
+            // read it directly at fixed offsets. The trailing `vtable`
+            // pointer is a runtime field the driver never dereferences.
+            const desc_base = section_bytes[desc_offset..];
+            const desc_id = std.mem.readInt(u32, desc_base[0..4], .little);
+            const desc_size = std.mem.readInt(u16, desc_base[6..8], .little);
+            if (desc_id == 0) {
                 diag.write(
                     "manager '{s}' embeds descriptor with id == 0; descriptor ID 0 is reserved",
                     .{manager_name},
@@ -2264,17 +2330,17 @@ fn validateSection(
                 return ResolveError.ValidationFailed;
             }
             // Translate id -> bit mask and ensure declared_caps covers it.
-            const bit = bitForTag(desc.id) orelse {
+            const bit = bitForTag(desc_id) orelse {
                 diag.write(
                     "manager '{s}' embeds descriptor with unknown id 0x{x:0>8}",
-                    .{ manager_name, desc.id },
+                    .{ manager_name, desc_id },
                 );
                 return ResolveError.ValidationFailed;
             };
             if ((meta.declared_caps & (@as(u64, 1) << bit)) == 0) {
                 diag.write(
                     "manager '{s}' embeds descriptor for capability 0x{x:0>8} but does not declare it in declared_caps",
-                    .{ manager_name, desc.id },
+                    .{ manager_name, desc_id },
                 );
                 return ResolveError.ValidationFailed;
             }
@@ -2282,27 +2348,28 @@ fn validateSection(
             // its own minimum size (the v1.0 base of that capability's
             // vtable) and the same upper bound applies (8× the v1.x
             // vtable size, mirroring the bound applied to `core.size`
-            // and `meta.size`). The runtime tripwire at
-            // `zapMemoryStartup` mirrors these checks as defence-in-
-            // depth; rejecting at the driver gives a clearer build-
-            // time diagnostic instead of a runtime panic.
-            const cap_size_min = capabilityVtableMinSize(desc.id);
-            const cap_size_max = capabilityVtableMaxSize(desc.id);
-            if (desc.size < cap_size_min) {
+            // and `meta.size`). These vtable lengths are pointer-width
+            // dependent, so they are computed for the TARGET. The runtime
+            // tripwire at `zapMemoryStartup` mirrors these checks as
+            // defence-in-depth; rejecting at the driver gives a clearer
+            // build-time diagnostic instead of a runtime panic.
+            const cap_size_min = capabilityVtableMinSize(desc_id, target_ptr_size);
+            const cap_size_max = capabilityVtableMaxSize(desc_id, target_ptr_size);
+            if (desc_size < cap_size_min) {
                 diag.write(
                     "manager '{s}' descriptor for capability 0x{x:0>8} has size {d}, less than the minimum {d} bytes",
-                    .{ manager_name, desc.id, desc.size, cap_size_min },
+                    .{ manager_name, desc_id, desc_size, cap_size_min },
                 );
                 return ResolveError.ValidationFailed;
             }
-            if (desc.size > cap_size_max) {
+            if (desc_size > cap_size_max) {
                 diag.write(
                     "manager '{s}' descriptor for capability 0x{x:0>8} has size {d}, exceeding the v1.x upper bound {d}; the manager was built against a future ABI version",
-                    .{ manager_name, desc.id, desc.size, cap_size_max },
+                    .{ manager_name, desc_id, desc_size, cap_size_max },
                 );
                 return ResolveError.ValidationFailed;
             }
-            if (desc.id == abi.REFC_TAG and desc.size >= abi.REFCOUNT_V1_SIZE_V1_1) {
+            if (desc_id == abi.REFC_TAG and desc_size >= targetRefcountSizeV1_1(target_ptr_size)) {
                 refcount_sized_extension = true;
             }
         }
@@ -2319,8 +2386,10 @@ fn validateSection(
 /// `REFCOUNT_V1` this is the v1.0 vtable size (16 bytes); a manager
 /// that advertises a smaller size cannot satisfy even the v1.0
 /// `retain`/`release` contract.
-fn capabilityVtableMinSize(id: u32) usize {
-    if (id == abi.REFC_TAG) return abi.REFCOUNT_V1_SIZE_V1_0;
+fn capabilityVtableMinSize(id: u32, target_ptr_size: usize) usize {
+    // The REFCOUNT_V1 v1.0 vtable is two pointer slots, sized for the
+    // TARGET (16 bytes on 64-bit, 8 on wasm32).
+    if (id == abi.REFC_TAG) return targetRefcountSizeV1_0(target_ptr_size);
     // Unknown / future capabilities have no defined minimum in v1.0;
     // they are rejected earlier in the loop (`bitForTag` returns
     // null), so this branch is unreachable for v1.0 inputs. Provide
@@ -2331,11 +2400,11 @@ fn capabilityVtableMinSize(id: u32) usize {
 /// Maximum legal byte length for `desc.size`, per capability. Same
 /// rationale as the `core.size` upper bound: an absurdly large
 /// descriptor is treated as corrupt rather than an enormous future
-/// ABI shape. For `REFCOUNT_V1` the bound is 8× the v1.1 vtable size
-/// (8 × 48 = 384 bytes).
-fn capabilityVtableMaxSize(id: u32) usize {
-    if (id == abi.REFC_TAG) return 8 * @as(usize, abi.REFCOUNT_V1_SIZE_V1_1);
-    return 8 * @sizeOf(abi.ZapCapabilityDescV1);
+/// ABI shape. For `REFCOUNT_V1` the bound is 8× the v1.1 vtable size,
+/// computed for the TARGET pointer width.
+fn capabilityVtableMaxSize(id: u32, target_ptr_size: usize) usize {
+    if (id == abi.REFC_TAG) return 8 * @as(usize, targetRefcountSizeV1_1(target_ptr_size));
+    return 8 * targetCapabilityDescSize(target_ptr_size);
 }
 
 /// Translate a FourCC tag (in target endianness) to its bit position in
@@ -2451,7 +2520,7 @@ test "validateSection accepts a minimal NoOp-style section" {
 
     var diag_buf: [256]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-    const v = try validateSection("Test.Manager", &bytes, &diag);
+    const v = try validateSection("Test.Manager", &bytes, @sizeOf(usize), &diag);
     try std.testing.expectEqual(@as(u64, 0), v.declared_caps);
     try std.testing.expectEqual(@as(u16, 0), v.abi_minor);
 }
@@ -2474,7 +2543,7 @@ test "validateSection rejects bad magic" {
 
     var diag_buf: [256]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-    const result = validateSection("Bad", &bytes, &diag);
+    const result = validateSection("Bad", &bytes, @sizeOf(usize), &diag);
     try std.testing.expectError(ResolveError.BadMagic, result);
 }
 
@@ -3493,7 +3562,7 @@ test "validateSection rejects reserved capability bit" {
 
     var diag_buf: [256]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-    const result = validateSection("ReservedBit", &bytes, &diag);
+    const result = validateSection("ReservedBit", &bytes, @sizeOf(usize), &diag);
     try std.testing.expectError(ResolveError.ReservedCapabilityDeclared, result);
 }
 
@@ -3667,7 +3736,7 @@ test "validateSection accepts REFCOUNT_V1 descriptor at v1.0 size (16 bytes)" {
     const len = synthesizeRefcountDescriptorSection(&bytes, abi.REFCOUNT_V1_SIZE_V1_0);
     var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-    const v = try validateSection("V1_0_Refc", bytes[0..len], &diag);
+    const v = try validateSection("V1_0_Refc", bytes[0..len], @sizeOf(usize), &diag);
     try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, v.declared_caps);
 }
 
@@ -3676,7 +3745,7 @@ test "validateSection accepts REFCOUNT_V1 descriptor at v1.1 size (48 bytes)" {
     const len = synthesizeRefcountDescriptorSection(&bytes, abi.REFCOUNT_V1_SIZE_V1_1);
     var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-    const v = try validateSection("V1_1_Refc", bytes[0..len], &diag);
+    const v = try validateSection("V1_1_Refc", bytes[0..len], @sizeOf(usize), &diag);
     try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, v.declared_caps);
 }
 
@@ -3685,7 +3754,7 @@ test "validateSection rejects REFCOUNT_V1 descriptor smaller than 16 bytes" {
     const len = synthesizeRefcountDescriptorSection(&bytes, 8); // half of v1.0
     var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-    const result = validateSection("TooSmall", bytes[0..len], &diag);
+    const result = validateSection("TooSmall", bytes[0..len], @sizeOf(usize), &diag);
     try std.testing.expectError(ResolveError.ValidationFailed, result);
     try std.testing.expect(std.mem.indexOf(u8, diag.text(), "less than the minimum") != null);
 }
@@ -3695,7 +3764,7 @@ test "validateSection rejects REFCOUNT_V1 descriptor larger than 384 bytes" {
     const len = synthesizeRefcountDescriptorSection(&bytes, 385);
     var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-    const result = validateSection("TooLarge", bytes[0..len], &diag);
+    const result = validateSection("TooLarge", bytes[0..len], @sizeOf(usize), &diag);
     try std.testing.expectError(ResolveError.ValidationFailed, result);
     try std.testing.expect(std.mem.indexOf(u8, diag.text(), "exceeding the v1.x upper bound") != null);
 }
@@ -3705,7 +3774,7 @@ test "validateSection accepts REFCOUNT_V1 descriptor at exact upper bound (384 b
     const len = synthesizeRefcountDescriptorSection(&bytes, 384);
     var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
-    const v = try validateSection("AtBound", bytes[0..len], &diag);
+    const v = try validateSection("AtBound", bytes[0..len], @sizeOf(usize), &diag);
     try std.testing.expectEqual(abi.REFCOUNT_V1_BIT, v.declared_caps);
 }
 
@@ -4449,7 +4518,7 @@ fn verifyRealManagerObject(
     var diag_buf: [1024]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
 
-    const validated = validateSection(manager_label, section_bytes, &diag) catch |err| {
+    const validated = validateSection(manager_label, section_bytes, @sizeOf(usize), &diag) catch |err| {
         std.debug.print(
             "validateSection rejected real {s} manager object: {any} - {s}\n",
             .{ manager_label, err, diag.text() },
