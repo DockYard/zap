@@ -22,13 +22,11 @@ const active_manager = @import("zap_active_manager");
 /// binaries as standalone source — it has no sibling files in the
 /// emission cache. Mirrors `src/env.zig`'s helper for the runtime side.
 fn envGetRuntime(name: []const u8) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    if (name.len >= buf.len) return null;
-    @memcpy(buf[0..name.len], name);
-    buf[name.len] = 0;
-    const name_z: [*:0]const u8 = buf[0..name.len :0];
-    const ptr = std.c.getenv(name_z) orelse return null;
-    return std.mem.span(ptr);
+    // Environment reads route through the `runtime_os` seam (`getEnv`):
+    // POSIX `getenv`, Windows `GetEnvironmentVariableA`, WASI preview1
+    // `environ_get`. The POSIX backend is byte-identical to the previous
+    // inline `getenv`-on-NUL-terminated-copy implementation.
+    return RuntimeOs.getEnv(name);
 }
 
 // Well-known atom IDs — must match the registration order in initGlobalAtomTable
@@ -172,6 +170,102 @@ const RuntimeOs = struct {
         const ptr = std.c.getcwd(out_buffer.ptr, out_buffer.len) orelse return null;
         const len = std.mem.sliceTo(ptr, 0).len;
         return out_buffer[0..len];
+    }
+
+    /// Read up to `buf.len` bytes of OS entropy into `buf`; returns the
+    /// number of bytes actually obtained (`0` if the OS has no usable
+    /// entropy source for this target). Entropy has no uniform
+    /// `std`-portable surface in the bundled std (no `std.posix.getrandom`
+    /// / no `std.crypto.random` reachable from the embedded runtime), so it
+    /// is an OS primitive carried by the seam. POSIX is a byte-for-byte
+    /// lift of the prior `Random.osEntropy`: linux uses the `getrandom(2)`
+    /// syscall; every other POSIX target degrades to `0` (the previous
+    /// `else => return 0` arm — the SplitMix64 seed then relies on
+    /// `@returnAddress` ASLR entropy alone, exactly as before).
+    pub fn osEntropy(buf: []u8) usize {
+        switch (comptime builtin.os.tag) {
+            .linux => {
+                const rc = std.os.linux.getrandom(buf.ptr, buf.len, 0);
+                // `getrandom` returns the byte count on success; a value
+                // beyond `buf.len` cannot happen, and the errno-encoded
+                // negative returns wrap to a huge `usize`, so clamp.
+                return if (rc <= buf.len) rc else 0;
+            },
+            else => return 0,
+        }
+    }
+
+    /// Whether stdin has at least one byte ready to read WITHOUT blocking.
+    /// Drives `IO.try_get_char`'s non-blocking probe. POSIX uses a
+    /// zero-timeout `poll(POLLIN)` on the stdin descriptor — a byte-for-byte
+    /// lift of the prior inline probe (`std.posix.poll(pollfd, 0)`). A poll
+    /// error degrades to `false` (treat as "nothing ready"), exactly as the
+    /// previous `catch return ""` did.
+    pub fn pollStdinReady() bool {
+        const POLLIN: i16 = 0x0001;
+        var fds = [_]std.c.pollfd{.{
+            .fd = stdin_handle,
+            .events = POLLIN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, 0) catch return false;
+        return ready != 0;
+    }
+
+    /// Saved pre-raw-mode terminal attributes and a flag tracking whether
+    /// they have been captured. State for `enterRawMode`/`exitRawMode`;
+    /// lives in the seam because the `termios` type is itself POSIX-only.
+    var original_termios: std.posix.termios = undefined;
+    var raw_mode_saved: bool = false;
+
+    /// Put the controlling terminal into raw mode (no canonical line
+    /// buffering, no echo, one byte minimum, no inter-byte timer), saving
+    /// the prior attributes on first entry so `exitRawMode` can restore
+    /// them. Gated by `caps.supports_termios`; a target without termios
+    /// (Windows/WASI) provides a no-op body. POSIX is a byte-for-byte lift
+    /// of the prior `set_terminal_mode("Raw")` arm: `tcgetattr` → clear
+    /// `ICANON`/`ECHO`, set `V.MIN=1`/`V.TIME=0` → `tcsetattr(.FLUSH)`. A
+    /// `tcgetattr`/`tcsetattr` error degrades silently (the prior
+    /// `catch return`).
+    pub fn enterRawMode() void {
+        var termios = std.posix.tcgetattr(stdin_handle) catch return;
+        if (!raw_mode_saved) {
+            original_termios = termios;
+            raw_mode_saved = true;
+        }
+        termios.lflag.ICANON = false;
+        termios.lflag.ECHO = false;
+        termios.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+        termios.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        std.posix.tcsetattr(stdin_handle, .FLUSH, termios) catch return;
+    }
+
+    /// Restore the terminal attributes saved by the first `enterRawMode`.
+    /// A no-op if raw mode was never entered. POSIX is a byte-for-byte lift
+    /// of the prior `set_terminal_mode` restore arm.
+    pub fn exitRawMode() void {
+        if (raw_mode_saved) {
+            std.posix.tcsetattr(stdin_handle, .FLUSH, original_termios) catch return;
+        }
+    }
+
+    /// Look up environment variable `name`, returning its value as a slice
+    /// of process-lifetime storage (the libc environ entry on POSIX), or
+    /// `null` if unset / not representable. The embedded runtime can't
+    /// `@import("env.zig")` (it ships as standalone source), and the
+    /// bundled std exposes no allocation-free portable env reader reachable
+    /// here, so this is an OS primitive carried by the seam. POSIX is a
+    /// byte-for-byte lift of the prior `envGetRuntime` (`getenv` on a
+    /// NUL-terminated copy of `name`); names at or beyond the 256-byte
+    /// scratch are rejected, exactly as before.
+    pub fn getEnv(name: []const u8) ?[]const u8 {
+        var buf: [256]u8 = undefined;
+        if (name.len >= buf.len) return null;
+        @memcpy(buf[0..name.len], name);
+        buf[name.len] = 0;
+        const name_z: [*:0]const u8 = buf[0..name.len :0];
+        const ptr = std.c.getenv(name_z) orelse return null;
+        return std.mem.span(ptr);
     }
 };
 // ZAP_RUNTIME_OS_SEAM_END
@@ -398,29 +492,24 @@ var linux_cmdline_loaded: bool = false;
 
 /// Read and parse `/proc/self/cmdline` into the static argv cache.
 /// Idempotent: only the first call performs I/O. Safe to call from the
-/// runtime startup path (raw syscalls only, no allocator).
+/// runtime startup path (no allocator — the read targets the pre-sized
+/// static `linux_cmdline_buf`).
 fn loadLinuxCmdline() void {
     if (linux_cmdline_loaded) return;
     linux_cmdline_loaded = true;
     linux_cmdline_argc = 0;
 
-    // Use libc-level `open`/`read`/`close` (public POSIX functions
-    // present in BOTH musl and glibc), mirroring `File.read` above.
-    // This deliberately avoids any libc-internal symbol.
-    const fd = std.c.open(
-        "/proc/self/cmdline",
-        .{ .ACCMODE = .RDONLY },
-        @as(std.c.mode_t, 0),
-    );
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
-
-    var total: usize = 0;
-    while (total < linux_cmdline_buf.len) {
-        const n = std.posix.read(fd, linux_cmdline_buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
+    // Read `/proc/self/cmdline` through the portable `std.Io.Dir` API
+    // (the same Phase-B file-I/O path the `.zap-symbols` sidecar reader
+    // uses), eliminating the prior raw `std.c.open`/`close` +
+    // `std.posix.read` loop. `readFile` reads into the caller-provided
+    // buffer via `readSliceShort` (NOT a stat-sized read), so it works on
+    // the zero-stat-size `/proc` pseudo-file and allocates nothing — the
+    // bytes land directly in the static cache. `io` is the process-wide
+    // blocking `Io` already used everywhere else in the runtime.
+    const io = std.Options.debug_io;
+    const bytes = std.Io.Dir.cwd().readFile(io, "/proc/self/cmdline", &linux_cmdline_buf) catch return;
+    const total = bytes.len;
     if (total == 0) return;
 
     // /proc/self/cmdline is NUL-separated. Each argument is itself
@@ -501,9 +590,10 @@ fn stdoutWrite(bytes: []const u8) void {
 
 var runtime_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.c_allocator);
 
-// Terminal mode state for raw/normal switching
-var original_termios: std.posix.termios = undefined;
-var raw_mode_saved: bool = false;
+// Terminal raw/normal-mode state (`original_termios`/`raw_mode_saved`)
+// lives inside the `runtime_os` seam (`enterRawMode`/`exitRawMode`), since
+// the `termios` type and its save/restore are POSIX-only and degrade to a
+// no-op on targets without a controlling terminal.
 
 // ============================================================
 // bumpAlloc instrumentation
@@ -2178,6 +2268,15 @@ fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
 /// layout) so observable behaviour is byte-faithful. Any drift between
 /// them produces an immediate test failure because every Arc(T) test
 /// path runs against this fallback.
+// ZAP_RUNTIME_OS_TESTONLY_BEGIN slab-pool
+//
+// `TestOnlyArcSlabPool` is a `builtin.is_test`-gated struct: it compiles to
+// nothing (`else struct {}`) in shipped Zap user binaries, so its raw
+// `std.posix.mmap`/`munmap` calls never reach a foreign target. It is host
+// scaffolding for the ARC slab-pool unit tests; production ARC allocates
+// through `page_allocator`. The runtime OS-portability grep-gate allowlists
+// raw `std.c`/`std.posix`/`std.os` calls inside this marked region because
+// it is excluded from the user-binary port surface by construction.
 const TestOnlyArcSlabPool = if (builtin.is_test) struct {
     pub const SLAB_SIZE: usize = 64 * 1024;
     pub const SLAB_ALIGN: usize = SLAB_SIZE;
@@ -2535,6 +2634,7 @@ const TestOnlyArcSlabPool = if (builtin.is_test) struct {
         return @ptrCast(@alignCast(byte_ptr - @sizeOf(LargeHeader)));
     }
 } else struct {};
+// ZAP_RUNTIME_OS_TESTONLY_END slab-pool
 
 /// Static context for the test-only ARC manager. Allocated as a fixed
 /// global storage so it lives for the test process's lifetime; the
@@ -8725,6 +8825,26 @@ pub const String = struct {
     }
 };
 
+// ZAP_RUNTIME_OS_CRASH_BEGIN
+//
+// Domain B — the crash-handling / backtrace / symbolization / signal
+// subsystem (the runtime OS-portability campaign's deep, OS-divergent
+// domain; migrated to the `runtime_os` seam in Phase D, not Phase C).
+//
+// Everything between this marker and `ZAP_RUNTIME_OS_CRASH_END` is the
+// diagnostic-abort machinery: stack capture, DWARF symbolization, the
+// `.zap-symbols` sidecar reader, the ASLR-slide query (`mainImageSlide`),
+// the crash-report renderers (text + JSON), the leak-report renderers
+// (which share the same `posixWrite` + source-location plumbing), the
+// double-fault sink, the `ZapPanic` bridge, and the POSIX signal-handler
+// install/entry. The genuinely OS-divergent raw calls in this region —
+// the `_dyld_*`/`dl_iterate_phdr` slide query, the `_exit` async-signal-
+// safe terminations, and the `sigaction`/`SIG`/`siginfo_t` signal layer —
+// have NO uniform `std` abstraction (POSIX signals vs Windows VEH vs WASI
+// no-signal-model) and are the explicit Phase-D port. Until then the CI
+// grep-gate (`build.zig`'s runtime-os portability gate) allowlists raw
+// `std.c`/`std.posix`/`std.os` calls inside this marked region; a Phase-C
+// domain (time/entropy/stdin/env/file) must NOT introduce raw calls here.
 // ============================================================
 // Crash reporter — Phase 2.a of the Zap error system
 //
@@ -11034,6 +11154,7 @@ pub fn installZapCrashHandlers() void {
     zapCrashReporterInit();
     installZapSignalHandlers();
 }
+// ZAP_RUNTIME_OS_CRASH_END
 
 // ============================================================
 // Kernel functions (spec §30.2)
@@ -13503,15 +13624,17 @@ const Wyhash = struct {
     }
 
     fn osEntropy() u64 {
+        // OS entropy routes through the `runtime_os` seam: linux uses
+        // `getrandom(2)`, Windows `RtlGenRandom`, WASI `random_get`, and
+        // other POSIX targets degrade to 0 (the prior `else` arm). The
+        // POSIX backend is byte-identical to the previous inline call — a
+        // full 8-byte fill yields the little-endian u64; any short read
+        // (including the degrade-to-0 targets) yields 0, matching the old
+        // `if (rc == buf.len)` gate exactly.
         var buf: [8]u8 = undefined;
-        switch (builtin.os.tag) {
-            .linux => {
-                const rc = std.os.linux.getrandom(&buf, buf.len, 0);
-                if (rc == buf.len) {
-                    return std.mem.readInt(u64, &buf, .little);
-                }
-            },
-            else => {},
+        const got = RuntimeOs.osEntropy(&buf);
+        if (got == buf.len) {
+            return std.mem.readInt(u64, &buf, .little);
         }
         return 0;
     }
@@ -17941,24 +18064,17 @@ pub const IO = struct {
     /// for "Raw" to enable raw mode (no canonical line buffering, no
     /// echo); any other value restores the saved original termios.
     pub fn set_terminal_mode(mode: u32) void {
-        const posix = std.posix;
-        const stdin_fd = posix.STDIN_FILENO;
+        // Raw-mode toggle routes through the `runtime_os` seam: POSIX uses
+        // `termios` (byte-identical to the prior inline path), while a
+        // target without a controlling terminal (Windows/WASI,
+        // `caps.supports_termios == false`) provides a no-op backend, so
+        // this degrades cleanly. `"Raw"` enters raw mode; any other value
+        // restores the saved attributes.
         const is_raw = std.mem.eql(u8, atomToString(mode), "Raw");
         if (is_raw) {
-            var termios = posix.tcgetattr(stdin_fd) catch return;
-            if (!raw_mode_saved) {
-                original_termios = termios;
-                raw_mode_saved = true;
-            }
-            termios.lflag.ICANON = false;
-            termios.lflag.ECHO = false;
-            termios.cc[@intFromEnum(posix.V.MIN)] = 1;
-            termios.cc[@intFromEnum(posix.V.TIME)] = 0;
-            posix.tcsetattr(stdin_fd, .FLUSH, termios) catch return;
+            RuntimeOs.enterRawMode();
         } else {
-            if (raw_mode_saved) {
-                posix.tcsetattr(stdin_fd, .FLUSH, original_termios) catch return;
-            }
+            RuntimeOs.exitRawMode();
         }
     }
 
@@ -17980,17 +18096,9 @@ pub const IO = struct {
             return result_buf;
         }
 
-        const posix = std.posix;
-        const stdin_fd = posix.STDIN_FILENO;
-        const POLLIN: i16 = 0x0001;
-
-        var fds = [_]std.c.pollfd{.{
-            .fd = stdin_fd,
-            .events = POLLIN,
-            .revents = 0,
-        }};
-        const ready = posix.poll(&fds, 0) catch return "";
-        if (ready == 0) return "";
+        // Non-blocking readiness probe through the seam (POSIX `poll`;
+        // Windows/WASI have their own backend probe). Nothing ready ⇒ "".
+        if (!RuntimeOs.pollStdinReady()) return "";
 
         if (stdinRefill() == 0) return "";
         const b = stdin_buf[stdin_buf_pos];

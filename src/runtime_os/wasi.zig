@@ -208,6 +208,116 @@ pub const Backend = struct {
         _ = out_buffer;
         return null;
     }
+
+    /// Read up to `buf.len` bytes of OS entropy into `buf` via preview1
+    /// `random_get`; returns the number of bytes obtained (`0` on error).
+    /// `random_get` fills the entire buffer on success (it has no partial-
+    /// fill semantics), so a `.SUCCESS` errno means `buf.len` bytes; any
+    /// other errno yields `0` (the seed then degrades to `@returnAddress`
+    /// entropy alone, per the comptime-degrade contract).
+    pub fn osEntropy(buf: []u8) usize {
+        if (buf.len == 0) return 0;
+        const rc = std.os.wasi.random_get(buf.ptr, buf.len);
+        return if (rc == .SUCCESS) buf.len else 0;
+    }
+
+    /// Whether stdin has data ready WITHOUT blocking. WASI has no `poll`;
+    /// `poll_oneoff` blocks until an event, so to probe without blocking we
+    /// submit TWO subscriptions — an `FD_READ` on stdin (fd 0) and a
+    /// zero-duration relative MONOTONIC clock — so the call returns
+    /// immediately (the zero timer always fires). Stdin is "ready" iff the
+    /// returned events include the `FD_READ` subscription (identified by its
+    /// `userdata` tag) with no error. The two subscriptions are tagged via
+    /// `userdata` (0 = stdin read, 1 = the wake clock). Any errno degrades
+    /// to `false`.
+    pub fn pollStdinReady() bool {
+        const STDIN_USERDATA: std.os.wasi.userdata_t = 0;
+        const CLOCK_USERDATA: std.os.wasi.userdata_t = 1;
+        const subs = [_]std.os.wasi.subscription_t{
+            .{
+                .userdata = STDIN_USERDATA,
+                .u = .{ .tag = .FD_READ, .u = .{ .fd_read = .{ .fd = stdin_handle } } },
+            },
+            .{
+                .userdata = CLOCK_USERDATA,
+                .u = .{ .tag = .CLOCK, .u = .{ .clock = .{
+                    .id = .MONOTONIC,
+                    .timeout = 0, // zero relative timeout ⇒ return immediately
+                    .precision = 0,
+                    .flags = 0,
+                } } },
+            },
+        };
+        var events: [2]std.os.wasi.event_t = undefined;
+        var nevents: usize = 0;
+        const rc = std.os.wasi.poll_oneoff(&subs[0], &events[0], subs.len, &nevents);
+        if (rc != .SUCCESS) return false;
+        var i: usize = 0;
+        while (i < nevents) : (i += 1) {
+            const ev = events[i];
+            if (ev.userdata == STDIN_USERDATA and ev.@"error" == .SUCCESS and ev.fd_readwrite.nbytes > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Raw terminal mode. WASI has no controlling terminal
+    /// (`caps.supports_termios == false`), so raw-mode DEGRADES to a no-op
+    /// — the campaign's comptime-degrade contract. Line-mode `gets` still
+    /// works; character-at-a-time input is simply unavailable under WASI.
+    pub fn enterRawMode() void {}
+
+    /// Restore from raw mode — a no-op on WASI (see `enterRawMode`).
+    pub fn exitRawMode() void {}
+
+    /// Fixed environment cache. WASI hands the full environ block to the
+    /// module at startup via `environ_get`; we snapshot it once into static
+    /// storage (no allocator on the startup path) and scan it on each
+    /// lookup. 32 KiB of bytes with up to 256 entries matches the argv
+    /// cache's order of magnitude.
+    const WASI_ENVIRON_BUF_SIZE: usize = 32 * 1024;
+    const WASI_ENVIRON_MAX_VARS: usize = 256;
+
+    var wasi_environ_buf: [WASI_ENVIRON_BUF_SIZE]u8 = undefined;
+    var wasi_environ_ptrs: [WASI_ENVIRON_MAX_VARS][*:0]u8 = undefined;
+    var wasi_environ_count: usize = 0;
+    var wasi_environ_loaded: bool = false;
+
+    /// Populate the environ cache from preview1 `environ_get`. Idempotent.
+    /// Degrades to an empty environ (no vars) if the block does not fit the
+    /// fixed cache, rather than overrunning.
+    fn loadWasiEnviron() void {
+        if (wasi_environ_loaded) return;
+        wasi_environ_loaded = true;
+        wasi_environ_count = 0;
+
+        var count: usize = 0;
+        var buf_size: usize = 0;
+        if (std.os.wasi.environ_sizes_get(&count, &buf_size) != .SUCCESS) return;
+        if (count == 0) return;
+        if (count > WASI_ENVIRON_MAX_VARS or buf_size > WASI_ENVIRON_BUF_SIZE) return;
+        if (std.os.wasi.environ_get(&wasi_environ_ptrs, &wasi_environ_buf) != .SUCCESS) return;
+        wasi_environ_count = count;
+    }
+
+    /// Look up environment variable `name` by scanning the cached WASI
+    /// environ block for a `name=value` entry. Returns the value slice
+    /// (into the process-lifetime cache) or `null` if unset. Each cached
+    /// entry is a `[*:0]u8` `name=value` string.
+    pub fn getEnv(name: []const u8) ?[]const u8 {
+        loadWasiEnviron();
+        var i: usize = 0;
+        while (i < wasi_environ_count) : (i += 1) {
+            const entry = std.mem.span(wasi_environ_ptrs[i]);
+            if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
+                if (std.mem.eql(u8, entry[0..eq], name)) {
+                    return entry[eq + 1 ..];
+                }
+            }
+        }
+        return null;
+    }
     // ZAP_RUNTIME_OS_BODY_END wasi
 };
 

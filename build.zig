@@ -206,6 +206,26 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&runtime_os_windows_tests.step);
 
+    // Runtime OS-portability grep-gate (campaign lock-in). Scans the
+    // embedded `src/runtime.zig` and FAILS the build if a raw `std.c.` /
+    // `std.posix.` / `std.os.` call appears OUTSIDE the allowlisted regions
+    // (the `runtime_os` seam, the Domain-B crash region, `test {}` blocks,
+    // the `builtin.is_test` slab-pool scaffold, and a short enumerated list
+    // of comptime irreducibles). A new raw per-OS call added to the general
+    // runtime body — which would ship into every Zap user binary on every
+    // target — fails here in the normal `zig build test` gate with a precise
+    // `runtime.zig:<line>` message. It is a native test (it reads source
+    // bytes via `@embedFile`; the host target is fine).
+    const runtime_os_portability_gate = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime_os_portability_gate.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_runtime_os_portability_gate = b.addRunArtifact(runtime_os_portability_gate);
+    test_step.dependOn(&run_runtime_os_portability_gate.step);
+
     // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------

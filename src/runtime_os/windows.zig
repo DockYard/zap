@@ -260,6 +260,108 @@ pub const Backend = struct {
         if (written == 0 or written >= out_buffer.len) return null;
         return out_buffer[0..written];
     }
+
+    /// Read up to `buf.len` bytes of OS entropy into `buf`; returns the
+    /// number of bytes obtained (`0` on failure). Windows exposes the
+    /// system CSPRNG as `RtlGenRandom` (advapi32 ordinal `SystemFunction036`,
+    /// the primitive `BCryptGenRandom`/`RtlGenRandom` and Rust's `getrandom`
+    /// crate use on Windows); advapi32 is linkable on `*-windows-gnu`. A
+    /// `TRUE` return means the whole buffer was filled, so the byte count is
+    /// `buf.len`; `FALSE` yields `0` (the seed then degrades to
+    /// `@returnAddress` entropy alone, matching the campaign's
+    /// comptime-degrade contract).
+    pub fn osEntropy(buf: []u8) usize {
+        if (buf.len == 0) return 0;
+        const advapi = struct {
+            extern "advapi32" fn SystemFunction036(
+                RandomBuffer: [*]u8,
+                RandomBufferLength: std.os.windows.ULONG,
+            ) callconv(.winapi) std.os.windows.BOOLEAN;
+        };
+        const len: std.os.windows.ULONG = if (buf.len > std.math.maxInt(std.os.windows.ULONG))
+            std.math.maxInt(std.os.windows.ULONG)
+        else
+            @intCast(buf.len);
+        const ok = advapi.SystemFunction036(buf.ptr, len);
+        // `BOOLEAN` is the typed `Bool(BYTE)` enum in std; `.toBool()` is
+        // the correct truthiness test (a raw `!= 0` would compare an enum
+        // to an int). Success means the requested `len` bytes were written.
+        return if (ok.toBool()) len else 0;
+    }
+
+    /// Whether stdin has input ready WITHOUT blocking. Windows has no
+    /// `poll`; `WaitForSingleObject(hStdInput, 0)` returns `WAIT_OBJECT_0`
+    /// (0) when the handle is signaled — for a console input handle this
+    /// means an input record is queued. Any other return (timeout
+    /// `WAIT_TIMEOUT`/`0x102`, or `WAIT_FAILED`/`0xFFFFFFFF`) means "not
+    /// ready". kernel32 is always linked on Windows. (A console signaled
+    /// state can include non-key events; faithfully filtering those needs
+    /// `PeekConsoleInput`, the same console-input enrichment deferred with
+    /// raw-mode — for the readiness gate the wait is the correct primitive
+    /// and never blocks.)
+    pub fn pollStdinReady() bool {
+        const k = struct {
+            extern "kernel32" fn WaitForSingleObject(
+                hHandle: std.os.windows.HANDLE,
+                dwMilliseconds: std.os.windows.DWORD,
+            ) callconv(.winapi) std.os.windows.DWORD;
+        };
+        const WAIT_OBJECT_0: std.os.windows.DWORD = 0;
+        return k.WaitForSingleObject(stdinHandle(), 0) == WAIT_OBJECT_0;
+    }
+
+    /// Raw terminal mode. Windows uses `SetConsoleMode` (clearing
+    /// `ENABLE_LINE_INPUT`/`ENABLE_ECHO_INPUT`) rather than termios, so
+    /// `caps.supports_termios` is `false` and this DEGRADES to a no-op: the
+    /// console stays in its default line-buffered mode (input still works;
+    /// it is just not character-at-a-time). The `SetConsoleMode` raw-input
+    /// backend is the tracked Windows console-mode follow-up, parallel to
+    /// the Windows-argv work. A no-op here is the campaign's comptime-
+    /// degrade contract, never a compile error.
+    pub fn enterRawMode() void {}
+
+    /// Restore from raw mode — a no-op on Windows (see `enterRawMode`).
+    pub fn exitRawMode() void {}
+
+    /// Static storage for the most-recent `getEnv` value (the byte `A`
+    /// variant writes here). The runtime reads env vars one at a time on
+    /// the startup/diagnostic paths and copies anything it needs to keep,
+    /// so a single process-static value buffer (single-threaded runtime)
+    /// satisfies the "process-lifetime slice" contract without an
+    /// allocator. 32 KiB is the documented Windows environment-variable
+    /// maximum.
+    var env_value_buf: [32 * 1024]u8 = undefined;
+
+    /// Look up environment variable `name` via kernel32
+    /// `GetEnvironmentVariableA` (kernel32 is always linked). The name is
+    /// copied NUL-terminated into a stack scratch; the value is written
+    /// into the process-static `env_value_buf` and returned as a slice of
+    /// it. A `0` return means unset (or error); a return `>= buf.len` means
+    /// the value did not fit and is treated as unset. The byte (`A`)
+    /// variant matches the `[]const u8` contract; a `W`-variant +
+    /// WTF-16→UTF-8 transcode is the same deferred work as Windows-argv and
+    /// is not needed for ASCII env names/values (the runtime's env keys are
+    /// all ASCII, e.g. `ZAP_BACKTRACE`).
+    pub fn getEnv(name: []const u8) ?[]const u8 {
+        var name_buf: [256]u8 = undefined;
+        if (name.len >= name_buf.len) return null;
+        @memcpy(name_buf[0..name.len], name);
+        name_buf[name.len] = 0;
+        const k = struct {
+            extern "kernel32" fn GetEnvironmentVariableA(
+                lpName: [*:0]const u8,
+                lpBuffer: [*]u8,
+                nSize: std.os.windows.DWORD,
+            ) callconv(.winapi) std.os.windows.DWORD;
+        };
+        const name_z: [*:0]const u8 = name_buf[0..name.len :0];
+        const cap: std.os.windows.DWORD = @intCast(env_value_buf.len);
+        const written = k.GetEnvironmentVariableA(name_z, &env_value_buf, cap);
+        // `written` excludes the NUL on success; `0` is unset/error; a
+        // value `>= cap` means truncation (didn't fit) → treat as unset.
+        if (written == 0 or written >= cap) return null;
+        return env_value_buf[0..written];
+    }
     // ZAP_RUNTIME_OS_BODY_END windows
 };
 

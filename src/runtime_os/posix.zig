@@ -197,6 +197,86 @@ pub const Backend = struct {
         const len = std.mem.sliceTo(ptr, 0).len;
         return out_buffer[0..len];
     }
+
+    /// Read up to `buf.len` bytes of OS entropy into `buf`; returns the
+    /// number of bytes obtained (`0` if unavailable). Entropy has no
+    /// uniform `std`-portable surface in the embedded runtime's bundled
+    /// std (no `std.posix.getrandom`/`std.crypto.random` reachable), so it
+    /// is an OS primitive carried by the seam. POSIX is a byte-for-byte
+    /// lift of the runtime's previous `Random.osEntropy`: linux uses the
+    /// `getrandom(2)` syscall; the BSDs/macOS degrade to `0` (the previous
+    /// `else => return 0` arm), so the SplitMix64 seed falls back to
+    /// `@returnAddress` ASLR entropy alone there, exactly as before.
+    pub fn osEntropy(buf: []u8) usize {
+        switch (comptime builtin.os.tag) {
+            .linux => {
+                const rc = std.os.linux.getrandom(buf.ptr, buf.len, 0);
+                return if (rc <= buf.len) rc else 0;
+            },
+            else => return 0,
+        }
+    }
+
+    /// Whether stdin has at least one byte ready WITHOUT blocking, via a
+    /// zero-timeout `poll(POLLIN)` — a byte-for-byte lift of the runtime's
+    /// previous `try_get_char` probe. A poll error degrades to `false`.
+    pub fn pollStdinReady() bool {
+        const POLLIN: i16 = 0x0001;
+        var fds = [_]std.c.pollfd{.{
+            .fd = stdin_handle,
+            .events = POLLIN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&fds, 0) catch return false;
+        return ready != 0;
+    }
+
+    /// Saved pre-raw-mode terminal attributes and a capture flag. POSIX-only
+    /// state for `enterRawMode`/`exitRawMode` (the `termios` type is itself
+    /// POSIX-only), lifted from the runtime's previous module globals.
+    var original_termios: std.posix.termios = undefined;
+    var raw_mode_saved: bool = false;
+
+    /// Put the terminal into raw mode (no canonical buffering, no echo,
+    /// `V.MIN=1`/`V.TIME=0`), saving the prior attributes on first entry.
+    /// A byte-for-byte lift of the runtime's previous
+    /// `set_terminal_mode("Raw")` arm; `tcgetattr`/`tcsetattr` errors
+    /// degrade silently.
+    pub fn enterRawMode() void {
+        var termios = std.posix.tcgetattr(stdin_handle) catch return;
+        if (!raw_mode_saved) {
+            original_termios = termios;
+            raw_mode_saved = true;
+        }
+        termios.lflag.ICANON = false;
+        termios.lflag.ECHO = false;
+        termios.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+        termios.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        std.posix.tcsetattr(stdin_handle, .FLUSH, termios) catch return;
+    }
+
+    /// Restore the attributes saved by the first `enterRawMode` (no-op if
+    /// raw mode was never entered). Byte-for-byte lift of the prior restore.
+    pub fn exitRawMode() void {
+        if (raw_mode_saved) {
+            std.posix.tcsetattr(stdin_handle, .FLUSH, original_termios) catch return;
+        }
+    }
+
+    /// Look up environment variable `name`. POSIX uses libc `getenv` on a
+    /// NUL-terminated copy of `name` (Zap links libc on POSIX) — a
+    /// byte-for-byte lift of the runtime's previous `envGetRuntime`. Names
+    /// at or beyond the 256-byte scratch are rejected. The returned slice
+    /// references the process environ block (process-lifetime).
+    pub fn getEnv(name: []const u8) ?[]const u8 {
+        var buf: [256]u8 = undefined;
+        if (name.len >= buf.len) return null;
+        @memcpy(buf[0..name.len], name);
+        buf[name.len] = 0;
+        const name_z: [*:0]const u8 = buf[0..name.len :0];
+        const ptr = std.c.getenv(name_z) orelse return null;
+        return std.mem.span(ptr);
+    }
     // ZAP_RUNTIME_OS_BODY_END posix
 };
 
