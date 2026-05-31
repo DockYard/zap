@@ -197,6 +197,17 @@ pub const Backend = struct {
         }
         wasi_argv_argc = argc;
     }
+
+    /// WASI preview1 is capability-based: a module reaches the filesystem
+    /// only through host-granted preopened directories, and there is no
+    /// canonical absolute "current working directory" path to report. So
+    /// `cwd` degrades to `null` (the `System.cwd` Zap contract surfaces
+    /// this as `""`), consistent with the campaign's comptime-degrade
+    /// capability model.
+    pub fn cwd(out_buffer: []u8) ?[]const u8 {
+        _ = out_buffer;
+        return null;
+    }
     // ZAP_RUNTIME_OS_BODY_END wasi
 };
 

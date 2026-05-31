@@ -159,6 +159,20 @@ const RuntimeOs = struct {
             return &.{};
         }
     }
+
+    /// Current working directory absolute path, written into `out_buffer`;
+    /// returns the populated sub-slice, or `null` on failure / when the
+    /// buffer is too small. `getcwd` has no portable `std.fs`/`std.Io`
+    /// abstraction (the `Dir.cwd()` handle is the `AT.FDCWD` sentinel, not
+    /// a real fd `realPath` can resolve, and WASI's capability model has no
+    /// canonical cwd at all), so it is an OS primitive carried by the seam.
+    /// POSIX: a byte-for-byte lift of the prior `std.c.getcwd(&buf, len)` —
+    /// returns the NUL-terminated path's slice (native anchor).
+    pub fn cwd(out_buffer: []u8) ?[]const u8 {
+        const ptr = std.c.getcwd(out_buffer.ptr, out_buffer.len) orelse return null;
+        const len = std.mem.sliceTo(ptr, 0).len;
+        return out_buffer[0..len];
+    }
 };
 // ZAP_RUNTIME_OS_SEAM_END
 
@@ -3629,13 +3643,13 @@ const InstrumentationState = struct {
     /// that site.
     callsite_counts: std.AutoHashMap(u64, u64) = undefined,
     atexit_registered: bool = false,
-    /// Posix file descriptor for the optional `map-instrumentation.jsonl`
-    /// detail file, or `-1` when no detail file is open. We use a raw
-    /// fd rather than `std.fs.File` because the embedded user-binary
-    /// runtime context exposes only a restricted std surface (the rest
-    /// of `runtime.zig` follows the same pattern — see `File.write` at
-    /// the bottom of this file).
-    detail_fd: i32 = -1,
+    /// Open handle for the optional `map-instrumentation.jsonl` detail
+    /// file, or `null` when no detail file is open. Routed through the
+    /// portable `std.Io.File`/`std.Io.Dir` API (with `std.Options.debug_io`
+    /// as the `Io`) so the instrumentation file path is OS-portable on
+    /// every Zap target — the same approach the `File` primitives at the
+    /// bottom of this file use.
+    detail_file: ?std.Io.File = null,
     detail_attempted: bool = false,
 };
 
@@ -3673,13 +3687,13 @@ fn ensureInstrumentationInit() void {
         const detail_var = envGetRuntime("ZAP_INSTRUMENT_DETAIL");
         if (detail_var) |v| {
             if (v.len != 0 and v[0] != '0') {
-                const path_z = std.posix.toPosixPath("map-instrumentation.jsonl") catch null;
-                if (path_z) |pz| {
-                    const fd = std.c.open(&pz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-                    if (fd >= 0) {
-                        instrumentation_state.detail_fd = fd;
-                    }
-                }
+                const io = std.Options.debug_io;
+                // Create-truncate the JSONL detail file (the previous
+                // `open(WRONLY|CREAT|TRUNC, 0o644)`); keep the handle open
+                // for streaming per-record appends.
+                if (std.Io.Dir.cwd().createFile(io, "map-instrumentation.jsonl", .{})) |file| {
+                    instrumentation_state.detail_file = file;
+                } else |_| {}
             }
         }
     }
@@ -3836,8 +3850,8 @@ pub fn mapInstrumentationOnRelease(cell_ptr: usize, size_at_release: u32) void {
     }
 
     instrumentation_state.finalised.append(instrumentationAllocator(), record) catch {};
-    if (instrumentation_state.detail_fd >= 0) {
-        writeRecordJsonLine(instrumentation_state.detail_fd, record) catch {};
+    if (instrumentation_state.detail_file) |*file| {
+        writeRecordJsonLine(file, record) catch {};
     }
 }
 
@@ -3929,7 +3943,7 @@ pub fn mapInstrumentationNoteNodeClone(input_cell_ptr: usize) void {
     }
 }
 
-fn writeRecordJsonLine(fd: i32, record: MapInstanceRecord) !void {
+fn writeRecordJsonLine(file: *std.Io.File, record: MapInstanceRecord) !void {
     var buf: [768]u8 = undefined;
     const class_str: []const u8 = switch (record.class) {
         'S' => "S",
@@ -3950,7 +3964,10 @@ fn writeRecordJsonLine(fd: i32, record: MapInstanceRecord) !void {
         record.alloc_time_ns,      record.release_time_ns,
         record.size_at_release,    class_str,
     });
-    _ = std.c.write(fd, formatted.ptr, formatted.len);
+    // Streaming append to the already-open detail file. `writeStreamingAll`
+    // writes all bytes at the file's current position (the handle was opened
+    // WRONLY|CREAT|TRUNC), the same shape as the prior `std.c.write(fd, …)`.
+    file.writeStreamingAll(std.Options.debug_io, formatted) catch {};
 }
 
 fn classifyHistogramSize(s: u32) usize {
@@ -4176,8 +4193,8 @@ fn flushPendingActiveRecords() void {
             instrumentation_state.post_share_mutation_count += 1;
         }
         instrumentation_state.finalised.append(instrumentationAllocator(), record) catch {};
-        if (instrumentation_state.detail_fd >= 0) {
-            writeRecordJsonLine(instrumentation_state.detail_fd, record) catch {};
+        if (instrumentation_state.detail_file) |*file| {
+            writeRecordJsonLine(file, record) catch {};
         }
     }
     instrumentation_state.active.clearRetainingCapacity();
@@ -4197,27 +4214,25 @@ fn mapInstrumentationAtexit() callconv(.c) void {
     if (!instrumentation_state.initialised) return;
     flushStdoutBuf();
     flushPendingActiveRecords();
-    if (instrumentation_state.detail_fd >= 0) {
-        _ = std.c.close(instrumentation_state.detail_fd);
-        instrumentation_state.detail_fd = -1;
+    const io = std.Options.debug_io;
+    if (instrumentation_state.detail_file) |*file| {
+        file.close(io);
+        instrumentation_state.detail_file = null;
     }
     const out_path = envGetRuntime("ZAP_INSTRUMENT_OUT") orelse "map-instrumentation.json";
-    const out_path_z = std.posix.toPosixPath(out_path) catch return;
 
     const alloc = instrumentationAllocator();
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
     renderInstrumentationSummaryJson(&buf, alloc) catch return;
 
-    const fd = std.c.open(&out_path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
-    var written: usize = 0;
-    while (written < buf.items.len) {
-        const n = std.c.write(fd, buf.items[written..].ptr, buf.items[written..].len);
-        if (n <= 0) break;
-        written += @intCast(n);
-    }
+    // One-shot create-truncate-write-close of the summary JSON — the same
+    // shape as `File.write` (the previous `open(WRONLY|CREAT|TRUNC, 0o644)`
+    // + write loop + close).
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = out_path,
+        .data = buf.items,
+    }) catch return;
 }
 
 /// Test-only helper: returns a copy of the finalised record matching
@@ -18116,66 +18131,118 @@ fn inspectWrite(writer: anytype, value: anytype) void {
 }
 
 pub const File = struct {
+    // Domain C file I/O is fully covered by the per-OS backends of the
+    // fork's `std.Io.Dir`/`std.Io.File` (posix `*at` syscalls, Windows
+    // Nt*File, WASI preview1 `path_open`/`fd_*`), so — per the campaign's
+    // Decision 1 (std-portable-first) — these primitives route through
+    // `std.Io.Dir` directly rather than the `runtime_os` seam. Every call
+    // uses `std.Options.debug_io` as its `Io`: that is the process-wide
+    // blocking I/O instance the embedded runtime already uses for the
+    // `.zap-symbols` sidecar reader (`loadZapSymbols`) and the glob walker,
+    // so it is established as resolving and linking on every Zap target
+    // (native, wasm32-wasi, x86_64-windows-gnu). On POSIX the resulting
+    // syscalls are the same `openat`/`read`/`write`/`unlinkat`/`mkdirat`/
+    // `renameat`/`fstatat` the raw `std.c` calls made before, so the
+    // user-observable behavior (empty-string-on-failure for `read`, the
+    // `bool` success returns, the 1 MiB read cap) is byte-for-byte
+    // unchanged — the native regression anchor (`test/zap/file_test.zap`).
+
+    /// Default file-creation permissions for `write`. On POSIX this is the
+    /// exact `0o644` the previous `std.c.open(..., 0o644)` passed, so the
+    /// created file's mode bits are identical to the pre-migration
+    /// behavior. `std.Io.File.Permissions.fromMode` only exists on POSIX
+    /// (where `mode_t` is a real integer); on Windows/WASI — where the mode
+    /// has no POSIX meaning — it degrades to the std-blessed portable
+    /// default (`.default_file`).
+    const write_permissions: std.Io.File.Permissions = if (std.posix.mode_t != u0)
+        .fromMode(0o644)
+    else
+        .default_file;
+
+    /// Default directory-creation permissions for `mkdir`. POSIX-exact
+    /// `0o755` (matching the previous `std.c.mkdirat(..., 0o755)`),
+    /// degrading to `.default_dir` where `mode_t` is not a POSIX integer.
+    const mkdir_permissions: std.Io.File.Permissions = if (std.posix.mode_t != u0)
+        .fromMode(0o755)
+    else
+        .default_dir;
+
     pub fn read(path: []const u8) []const u8 {
-        const path_z = std.posix.toPosixPath(path) catch return "";
-        const fd = std.c.open(&path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return "";
-        defer _ = std.c.close(fd);
-        var stat: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &stat) != 0) return "";
-        const file_size: usize = @intCast(@max(stat.size, 0));
+        const io = std.Options.debug_io;
+        // One open + stat-for-size + read + close, mirroring the previous
+        // open/fstat/read/close exactly. `openFile` follows symlinks and
+        // opens read-only by default, matching `std.c.open(.RDONLY)`.
+        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return "";
+        defer file.close(io);
+        const st = file.stat(io) catch return "";
+        const file_size: usize = @intCast(@min(st.size, std.math.maxInt(usize)));
         if (file_size == 0) return "";
         const read_size = @min(file_size, 1024 * 1024);
         const result = bumpAllocAt(.file_read, read_size);
         if (result.len == 0) return "";
-        var total: usize = 0;
-        while (total < read_size) {
-            const n = std.posix.read(fd, result[total..read_size]) catch break;
-            if (n == 0) break;
-            total += n;
-        }
+        // `readSliceShort` fills the buffer with successive reads until it
+        // is full or EOF/short-read occurs — the same "loop until
+        // `read_size` bytes or a zero-length read" semantics as the prior
+        // `std.posix.read` loop. A read failure degrades to whatever was
+        // read so far (`catch 0` ⇒ the partial slice), matching the prior
+        // `catch break`.
+        var file_reader = file.reader(io, &.{});
+        const total = file_reader.interface.readSliceShort(result[0..read_size]) catch 0;
         return result[0..total];
     }
 
     pub fn write(path: []const u8, content: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        const fd = std.c.open(&path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-        if (fd < 0) return false;
-        defer _ = std.c.close(fd);
-        var written: usize = 0;
-        while (written < content.len) {
-            const rc = std.c.write(fd, content[written..].ptr, content[written..].len);
-            if (rc <= 0) return false;
-            written += @intCast(rc);
-        }
+        const io = std.Options.debug_io;
+        // `writeFile` create-truncates the file (CREAT|TRUNC|WRONLY) and
+        // writes all bytes, the same shape as the prior
+        // `open(WRONLY|CREAT|TRUNC, 0o644)` + write loop. Any open/write
+        // failure surfaces as `false`.
+        std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = path,
+            .data = content,
+            .flags = .{ .permissions = write_permissions },
+        }) catch return false;
         return true;
     }
 
     pub fn exists(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        return std.c.faccessat(std.posix.AT.FDCWD, &path_z, std.posix.F_OK, 0) == 0;
+        const io = std.Options.debug_io;
+        // `access` with no permission bits is an existence check
+        // (`F_OK`), exactly the prior `faccessat(AT.FDCWD, …, F_OK, 0)`.
+        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+        return true;
     }
 
     pub fn rm(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        return std.c.unlinkat(std.posix.AT.FDCWD, &path_z, 0) == 0;
+        const io = std.Options.debug_io;
+        // `deleteFile` is `unlinkat(AT.FDCWD, …, 0)` on POSIX.
+        std.Io.Dir.cwd().deleteFile(io, path) catch return false;
+        return true;
     }
 
     pub fn mkdir(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        return std.c.mkdirat(std.posix.AT.FDCWD, &path_z, 0o755) == 0;
+        const io = std.Options.debug_io;
+        // `createDir` is a single `mkdirat(AT.FDCWD, …, 0o755)` on POSIX
+        // (NOT the recursive `createDirPath`), matching the prior call.
+        std.Io.Dir.cwd().createDir(io, path, mkdir_permissions) catch return false;
+        return true;
     }
 
     pub fn rmdir(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        const AT_REMOVEDIR: u32 = 0x80; // POSIX standard
-        return std.c.unlinkat(std.posix.AT.FDCWD, &path_z, AT_REMOVEDIR) == 0;
+        const io = std.Options.debug_io;
+        // `deleteDir` is `unlinkat(AT.FDCWD, …, AT_REMOVEDIR)` on POSIX —
+        // removes an empty directory only, matching the prior call.
+        std.Io.Dir.cwd().deleteDir(io, path) catch return false;
+        return true;
     }
 
     pub fn rename(old_path: []const u8, new_path: []const u8) bool {
-        const old_z = std.posix.toPosixPath(old_path) catch return false;
-        const new_z = std.posix.toPosixPath(new_path) catch return false;
-        return std.c.renameat(std.posix.AT.FDCWD, &old_z, std.posix.AT.FDCWD, &new_z) == 0;
+        const io = std.Options.debug_io;
+        // `rename` is `renameat(AT.FDCWD, old, AT.FDCWD, new)` on POSIX;
+        // both source and destination are resolved against the cwd.
+        const cwd = std.Io.Dir.cwd();
+        std.Io.Dir.rename(cwd, old_path, cwd, new_path, io) catch return false;
+        return true;
     }
 
     pub fn cp(src: []const u8, dest: []const u8) bool {
@@ -18185,17 +18252,18 @@ pub const File = struct {
     }
 
     pub fn is_dir(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        var stat: std.c.Stat = undefined;
-        if (std.c.fstatat(std.posix.AT.FDCWD, &path_z, &stat, 0) != 0) return false;
-        return stat.mode & std.posix.S.IFMT == std.posix.S.IFDIR;
+        const io = std.Options.debug_io;
+        // `statFile` follows symlinks (the prior `fstatat(…, 0)` did too)
+        // and yields a portable `Stat.kind`, replacing the raw
+        // `mode & S.IFMT == S.IFDIR` bit test with the per-OS-correct kind.
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+        return st.kind == .directory;
     }
 
     pub fn is_regular(path: []const u8) bool {
-        const path_z = std.posix.toPosixPath(path) catch return false;
-        var stat: std.c.Stat = undefined;
-        if (std.c.fstatat(std.posix.AT.FDCWD, &path_z, &stat, 0) != 0) return false;
-        return stat.mode & std.posix.S.IFMT == std.posix.S.IFREG;
+        const io = std.Options.debug_io;
+        const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+        return st.kind == .file;
     }
 };
 
@@ -18507,11 +18575,14 @@ pub const Path = struct {
 pub const System = struct {
     pub fn cwd() []const u8 {
         var buf: [4096]u8 = undefined;
-        const ptr = std.c.getcwd(&buf, buf.len) orelse return "";
-        const len = std.mem.sliceTo(ptr, 0).len;
-        const result = bumpAllocAt(.system_cwd, len);
+        // `getcwd` is an OS primitive with no uniform `std.fs` abstraction,
+        // so it routes through the `runtime_os` seam (POSIX: `getcwd`;
+        // WASI: degrades to `null` ⇒ "" — capability model). The Zap
+        // contract is "empty string on failure", preserved here.
+        const path = RuntimeOs.cwd(&buf) orelse return "";
+        const result = bumpAllocAt(.system_cwd, path.len);
         if (result.len == 0) return "";
-        @memcpy(result, buf[0..len]);
+        @memcpy(result, path);
         return result;
     }
 

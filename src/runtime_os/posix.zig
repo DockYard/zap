@@ -183,6 +183,20 @@ pub const Backend = struct {
             return &.{};
         }
     }
+
+    /// Current working directory absolute path, written into `out_buffer`;
+    /// returns the populated sub-slice, or `null` on failure / when the
+    /// buffer is too small. `getcwd` has no portable `std.fs`/`std.Io`
+    /// abstraction (the `Dir.cwd()` handle is the `AT.FDCWD` sentinel, not
+    /// a real fd `realPath` can resolve, and WASI's capability model has no
+    /// canonical cwd at all), so it is an OS primitive carried by the seam.
+    /// POSIX: a byte-for-byte lift of the prior `std.c.getcwd(&buf, len)` —
+    /// returns the NUL-terminated path's slice (native anchor).
+    pub fn cwd(out_buffer: []u8) ?[]const u8 {
+        const ptr = std.c.getcwd(out_buffer.ptr, out_buffer.len) orelse return null;
+        const len = std.mem.sliceTo(ptr, 0).len;
+        return out_buffer[0..len];
+    }
     // ZAP_RUNTIME_OS_BODY_END posix
 };
 

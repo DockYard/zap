@@ -231,6 +231,35 @@ pub const Backend = struct {
     pub fn argv() []const [*:0]const u8 {
         return &.{};
     }
+
+    /// Current working directory absolute path, written into `out_buffer`;
+    /// returns the populated sub-slice, or `null` on failure / when the
+    /// buffer is too small. `getcwd` has no uniform `std.fs`/`std.Io`
+    /// abstraction, so it is an OS primitive carried by the seam. Windows
+    /// uses kernel32 `GetCurrentDirectoryA` (kernel32 is always linked):
+    /// it writes a NUL-terminated path and returns the length WITHOUT the
+    /// terminator on success, or — when the buffer is too small — the
+    /// required size INCLUDING the terminator (a value `>= out_buffer.len`),
+    /// which we treat as failure (`null`). A `0` return is also failure.
+    /// The byte (`A`) variant matches the `[]const u8` byte-path contract
+    /// of `System.cwd`; a `W`-variant + WTF-16→UTF-8 transcode (for
+    /// non-ANSI paths) is the same deferred work as the Windows-argv
+    /// follow-up and is not required for the ASCII-path common case.
+    pub fn cwd(out_buffer: []u8) ?[]const u8 {
+        const k = struct {
+            extern "kernel32" fn GetCurrentDirectoryA(
+                nBufferLength: std.os.windows.DWORD,
+                lpBuffer: [*]u8,
+            ) callconv(.winapi) std.os.windows.DWORD;
+        };
+        const len_dword: std.os.windows.DWORD = if (out_buffer.len > std.math.maxInt(std.os.windows.DWORD))
+            std.math.maxInt(std.os.windows.DWORD)
+        else
+            @intCast(out_buffer.len);
+        const written = k.GetCurrentDirectoryA(len_dword, out_buffer.ptr);
+        if (written == 0 or written >= out_buffer.len) return null;
+        return out_buffer[0..written];
+    }
     // ZAP_RUNTIME_OS_BODY_END windows
 };
 
