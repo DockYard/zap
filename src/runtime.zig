@@ -18147,22 +18147,32 @@ pub const File = struct {
     // `bool` success returns, the 1 MiB read cap) is byte-for-byte
     // unchanged — the native regression anchor (`test/zap/file_test.zap`).
 
+    /// `std.Io.File.Permissions.fromMode` (and the underlying POSIX
+    /// `mode_t` interpretation of `Permissions`) exists ONLY on the POSIX
+    /// `Permissions` variant, which `std` selects when the target is not
+    /// Windows AND `std.posix.mode_t` is a real integer. On Windows
+    /// `Permissions` is an attribute enum (mingw still defines a non-`u0`
+    /// `mode_t`, so the predicate MUST also exclude Windows), and on WASI
+    /// `mode_t` is `u0`. This comptime flag mirrors `std`'s own selection
+    /// condition so the POSIX-exact mode is used precisely where (and only
+    /// where) `fromMode` is available.
+    const posix_mode_perms: bool = builtin.os.tag != .windows and std.posix.mode_t != u0;
+
     /// Default file-creation permissions for `write`. On POSIX this is the
     /// exact `0o644` the previous `std.c.open(..., 0o644)` passed, so the
-    /// created file's mode bits are identical to the pre-migration
-    /// behavior. `std.Io.File.Permissions.fromMode` only exists on POSIX
-    /// (where `mode_t` is a real integer); on Windows/WASI — where the mode
-    /// has no POSIX meaning — it degrades to the std-blessed portable
-    /// default (`.default_file`).
-    const write_permissions: std.Io.File.Permissions = if (std.posix.mode_t != u0)
+    /// created file's mode bits are byte-for-byte identical to the
+    /// pre-migration behavior. On Windows/WASI — where the POSIX mode has
+    /// no meaning — it degrades to the std-blessed portable default
+    /// (`.default_file`).
+    const write_permissions: std.Io.File.Permissions = if (posix_mode_perms)
         .fromMode(0o644)
     else
         .default_file;
 
     /// Default directory-creation permissions for `mkdir`. POSIX-exact
     /// `0o755` (matching the previous `std.c.mkdirat(..., 0o755)`),
-    /// degrading to `.default_dir` where `mode_t` is not a POSIX integer.
-    const mkdir_permissions: std.Io.File.Permissions = if (std.posix.mode_t != u0)
+    /// degrading to `.default_dir` on Windows/WASI.
+    const mkdir_permissions: std.Io.File.Permissions = if (posix_mode_perms)
         .fromMode(0o755)
     else
         .default_dir;
