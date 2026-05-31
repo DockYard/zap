@@ -395,14 +395,55 @@ are the stdin/terminal domain, distinct from file I/O, and route through the sea
 `wasmtime --dir=.`; links for windows.
 
 ### Phase C — time/entropy/atexit edges + misc (Domain F/H/I close-out)
-**Goal:** every non-crash domain is portable; nothing left calling raw `std.c`/`std.posix` outside
-the seam (except the deliberately host-test-only mmap pool).
-- Finish Domain H (`osEntropy` via seam/`std.crypto.random`), Domain I atexit edge cases
-  (WASI `proc_exit` shape), the `[zap-arc-stats]` and instrumentation write/timestamp paths.
-- Add a CI grep-gate: no raw `std.c.`/`std.posix.` in `runtime.zig` outside `runtime_os` usage and
-  `test{}` blocks.
-- **Done =** native green; the grep-gate passes; the `Zest` timing path works on wasi (timeout
-  fixtures).
+**Status: COMPLETE.** Every non-crash domain is now portable; nothing calls raw `std.c`/`std.posix`/
+`std.os` in `runtime.zig` outside the `runtime_os` seam, the Domain-B crash region (Phase D), the
+`builtin.is_test` slab-pool, `test {}` blocks, and one enumerated comptime irreducible. The
+remaining edges were migrated to the seam (all three backends + the inline POSIX seam, POSIX
+behavior byte-for-byte identical):
+
+- **Domain H entropy** — `Random.osEntropy` now calls `RuntimeOs.osEntropy(buf)`: posix
+  `getrandom(2)` (else degrade-0, the prior behavior), windows `RtlGenRandom` (advapi32
+  `SystemFunction036`), wasi `random_get`.
+- **Domain D stdin poll** — `IO.try_get_char` now calls `RuntimeOs.pollStdinReady()`: posix
+  zero-timeout `poll(POLLIN)`, windows `WaitForSingleObject(hStdInput,0)`, wasi `poll_oneoff`
+  (FD_READ + zero-clock two-subscription non-blocking probe).
+- **Domain D termios raw-mode** — `IO.set_terminal_mode` now calls `RuntimeOs.enterRawMode()`/
+  `exitRawMode()` (the `original_termios`/`raw_mode_saved` state moved into the seam): posix
+  `termios`; windows/wasi degrade to a no-op under `caps.supports_termios == false`.
+- **Domain E env** — `envGetRuntime` now calls `RuntimeOs.getEnv(name)`: posix `getenv`, windows
+  `GetEnvironmentVariableA`, wasi preview1 `environ_get` scan.
+- **Domain E linux cmdline** — `loadLinuxCmdline`'s raw `std.c.open`/`close` + `std.posix.read`
+  replaced by the portable `std.Io.Dir.cwd().readFile` (the Phase-B file-I/O path; `readSliceShort`
+  reads the zero-stat-size `/proc/self/cmdline` pseudo-file with no allocator).
+- **Domain F time/sleep** — was already fully closed through the seam in Phase A
+  (`RuntimeOs.nowNanos`/`sleepNanos` drive `Zest.nowNs`, `get_seed`, instrumentation timestamps,
+  and `Kernel.sleep`); Phase C confirms it (the Phase-A "time reverted on posix" note is resolved
+  — the seam carries it cleanly, posix calling `clock_gettime`/`nanosleep` verbatim).
+- **Domain I atexit/exit** — was already closed through the seam in Phase A
+  (`RuntimeOs.registerAtExit` / `exitProcess`); the only remaining raw `std.c._exit` calls are the
+  three async-signal-safe terminations INSIDE the Domain-B crash region (the double-fault sink and
+  the crash-report sinks), which are deliberately deferred to Phase D and allowlisted by the crash
+  marker.
+
+**The CI grep-gate (the campaign lock-in):** `src/runtime_os_portability_gate.zig` is a Zig test
+(wired into `zig build test`'s `test_step`) that `@embedFile`s `runtime.zig`, strips comments
+(quote-aware), tracks the allowlisted regions, and FAILS with a precise `runtime.zig:<line>` +
+offending-call + "move it into the runtime_os seam" message if a raw `std.c.`/`std.posix.`/`std.os.`
+call appears in the general body. Allowlisted: the `// ZAP_RUNTIME_OS_SEAM_BEGIN/END` seam, the
+`// ZAP_RUNTIME_OS_CRASH_BEGIN/END` Domain-B region (newly marked so Phase D tracks it precisely),
+the `// ZAP_RUNTIME_OS_TESTONLY_BEGIN/END` `builtin.is_test` slab-pool, any top-level `test {}` /
+`test "…" {}` block (brace-tracked), and one enumerated comptime irreducible (`std.posix.mode_t`,
+the Domain-C file-mode capability probe — portable type introspection, not a syscall). The test
+includes self-checks proving it fires on a planted call, ignores comment mentions, and honors every
+allowlist; a sanity assertion requires `seam_hits > 0` and `crash_hits > 0` so a "PASS" is never
+vacuous.
+
+- **Done =** native green (`zig build test` exit 0 incl. the wired gate + V8 verifier; `zap test`
+  942/0 + 1366 assertions; golden 14/14); the grep-gate passes clean on the tree and provably FAILS
+  on a planted `std.c.write` at `runtime.zig:557` (then passes again after removal); the file-roundtrip
+  fixture and a Domain-F-sleep fixture both cross-build and RUN on `wasm32-wasi` under `wasmtime`
+  (the file fixture fails-closed without `--dir`, honoring WASI's preopen capability model), and both
+  link as `x86_64-windows-gnu` `PE32+`.
 
 ### Phase D — crash handler (the deep domain; Domain B)
 **Goal:** Windows gets a real crash report via VEH; WASI degrades cleanly (no compile error, trap
