@@ -363,13 +363,36 @@ if a runner is available) as `x86_64-windows-gnu`.
   prints `hello`; `file` shows `PE32+` for windows (run under wine if present).
 
 ### Phase B — file I/O (Domain C)
-**Goal:** `IO.File.read`/`write`/`exists`/… work on a foreign binary.
-- Replace the `File` struct's raw `std.c`/`toPosixPath`/`AT_*` calls with `std.fs.Dir`/`std.fs.File`
-  (portable) — the cheapest, highest-line-count domain.
-- Migrate Domain D-read stdin reads to std-portable; route `pollStdinReady`/raw-mode through the
-  seam (`caps.supports_termios` → wasi/windows degrade for raw-mode).
-- **Done =** native green (the full `File`/`IO` corpus); a file-roundtrip fixture runs under
-  `wasmtime --dir=.`; links for windows.
+**Status: COMPLETE.** The `IO.File` primitives (`read`/`write`/`exists?`/`rm`/`mkdir`/`rmdir`/
+`rename`/`cp`/`is_dir`/`is_regular`), the map-instrumentation detail/summary file writers, and
+`System.cwd` are migrated off raw `std.c`/`std.posix`/`toPosixPath`/`AT_*` onto the fork's portable
+`std.Io.Dir`/`std.Io.File` API (the classic `std.fs` `Dir`/`File`/`cwd` are deprecated in this
+0.16 fork — `Dir` lives at `std.Io.Dir` and every op takes an `io: Io`). The `Io` is
+`std.Options.debug_io` — the same process-wide blocking instance the runtime already uses for the
+`.zap-symbols` sidecar reader and the glob walker, so it is established as linking on every target.
+On POSIX the underlying syscalls are unchanged (`openat`/`read`/`write`/`unlinkat`/`mkdirat`/
+`renameat`/`fstatat`), so user-observable behavior is byte-for-byte identical (native anchor:
+`zig build test` exit 0, `zap test` 942/0 + 1366 assertions, golden 14/14; `test/zap/file_test.zap`
++ `system_test.zap` exercise every method end-to-end). The file-roundtrip fixture
+(`script_fixtures/phase_b_file_roundtrip.zap`) runs under `wasmtime --dir=.` (printing the read-back
+content; it fails-closed without the dir grant, honoring WASI's preopen capability model) and links
+as `x86_64-windows-gnu` (`PE32+`).
+
+Two non-uniform surfaces handled per the capability model: (1) **file mode bits** — the POSIX-exact
+`0o644`/`0o755` is applied via `Permissions.fromMode` only where std selects its POSIX `Permissions`
+variant (`os.tag != .windows and std.posix.mode_t != u0`), degrading to the portable
+`.default_file`/`.default_dir` on Windows/WASI. (2) **`getcwd`** — it has NO uniform `std.fs`/`std.Io`
+abstraction (the `Dir.cwd()` handle is the `AT.FDCWD` sentinel `realPath` cannot resolve, and WASI's
+capability model has no canonical cwd; `realPath` returns `error.OperationUnsupported` on wasi), so
+it is the one Domain-C op carried by the **`runtime_os` seam** as a `cwd(buf) ?[]const u8` primitive
+(posix: `getcwd` verbatim; windows: `GetCurrentDirectoryA`; wasi: degrade to `null` ⇒ `""`).
+
+Deferred (NOT Domain C): Domain D-read stdin + `pollStdinReady`/termios raw-mode (the
+`try_get_char` `poll`/`pollfd` and the `tcgetattr`/`tcsetattr` raw-mode path) remain native — they
+are the stdin/terminal domain, distinct from file I/O, and route through the seam in a later phase.
+
+**Done =** native green (the full `File`/`IO` corpus); a file-roundtrip fixture runs under
+`wasmtime --dir=.`; links for windows.
 
 ### Phase C — time/entropy/atexit edges + misc (Domain F/H/I close-out)
 **Goal:** every non-crash domain is portable; nothing left calling raw `std.c`/`std.posix` outside
