@@ -290,7 +290,22 @@ pub fn build(b: *std.Build) void {
     // claims to be authoritative/self-contained, so it must carry `libc`
     // exactly as a full Zig lib dir does — there is no system-libc fallback
     // for a foreign target.
-    tar_step.addArgs(&.{ "std", "compiler_rt", "compiler_rt.zig", "ubsan_rt.zig", "fuzzer.zig", "c.zig", "c", "libc" });
+    //
+    // `include` is the compiler-provided C header set (`lib/include/**`:
+    // `float.h`, `stddef.h`, `stdarg.h`, `x86intrin.h`, …). It is REQUIRED
+    // whenever a libc cross-build sub-compiles C *source* that pulls in a
+    // compiler-provided header. MinGW (the `*-windows-gnu` ABI) is the
+    // sharp edge: Zig builds the mingw CRT (`crtexe.c`, `tlssup.c`,
+    // `pesect.c`, …) from `libc/mingw/**`, and those translation units
+    // `#include <float.h>` / `<x86intrin.h>` (via `windows.h` → `winnt.h`),
+    // which resolve to `lib/include/`, NOT `lib/libc/include/`. With
+    // `include` omitted the Windows final link dies with
+    // `'x86intrin.h' file not found` / `'float.h' file not found` while
+    // compiling the CRT. (Linux musl/glibc CRT objects do not reach these
+    // headers, which is why the gap was invisible until the Windows
+    // target.) A self-contained zig-lib must carry `include` exactly as a
+    // full Zig lib dir does.
+    tar_step.addArgs(&.{ "std", "compiler_rt", "compiler_rt.zig", "ubsan_rt.zig", "fuzzer.zig", "c.zig", "c", "libc", "include" });
 
     // The uncompressed `zig_lib.tar` above is ~244M (the bundled `std` + `c` +
     // `libc` trees are overwhelmingly header/source TEXT, which compresses

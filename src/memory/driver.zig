@@ -237,6 +237,17 @@ pub const ResolveError = error{
     ValidationFailed,
     /// A reserved-but-unimplemented capability bit was declared.
     ReservedCapabilityDeclared,
+    /// The selected manager declares a capability that is sound to
+    /// *compile* for the cross-compile target but unsound to *select*
+    /// there because a required runtime backend is missing for that
+    /// target (e.g. a TRACED/conservative-GC manager on a COFF/PE target
+    /// that has no global-segment scanner). This is the forward-compatible
+    /// selection gate: a build-time error today (keyed on `-Dmemory` +
+    /// `-Dtarget`), and the same compatibility predicate becomes the
+    /// runtime spawn-error once per-process spawn-time manager selection
+    /// lands. The manager's source still compiles for the target, so it
+    /// remains linkable for the managers a future binary CAN use there.
+    ManagerTargetUnsupported,
     /// Internal driver error (allocator, filesystem) not described above.
     InternalError,
     OutOfMemory,
@@ -359,6 +370,7 @@ pub fn resolve(
 
     if (try readValidationSidecar(allocator, cache_entry.sidecar_path, cache_entry.record_identity)) |metadata| {
         if (options.progress) |progress| progress.stage("Memory: using cached manager metadata", .{});
+        try enforceManagerTargetSupport(source_selection.type_name, metadata.declared_caps, options, diag);
         return resolvedFromValidation(source_selection, metadata);
     }
 
@@ -379,6 +391,7 @@ pub fn resolve(
     };
     if (validation_from_object) |metadata| {
         try writeValidationSidecar(allocator, cache_entry.sidecar_path, cache_entry.record_identity, metadata);
+        try enforceManagerTargetSupport(source_selection.type_name, metadata.declared_caps, options, diag);
         return resolvedFromValidation(source_selection, metadata);
     }
 
@@ -403,6 +416,7 @@ pub fn resolve(
     );
     try writeValidationSidecar(allocator, cache_entry.sidecar_path, cache_entry.record_identity, validated);
 
+    try enforceManagerTargetSupport(source_selection.type_name, validated.declared_caps, options, diag);
     return resolvedFromValidation(source_selection, validated);
 }
 
@@ -417,6 +431,60 @@ fn resolvedFromValidation(
         .abi_minor = validated.abi_minor,
         .refcount_sized_extension = validated.refcount_sized_extension,
     };
+}
+
+/// Forward-compatible manager × target soundness gate.
+///
+/// Runs after validation (so the manager's declared capabilities are
+/// known) and before `resolve` returns, on BOTH the cache-hit and
+/// freshly-compiled paths. The manager's source has already compiled for
+/// the target at this point — the gate rejects *selecting* it, not
+/// *building* it, so the backend stays linkable for a future binary that
+/// monomorphises a different manager at a spawn site.
+///
+/// The check is **capability-driven**, not keyed on a manager type name:
+/// it reasons about the `declared_caps` the driver already reads from the
+/// validated `.zapmem` section. Today the only unsound combination is a
+/// TRACED (conservative stop-the-world mark-sweep) manager on a Windows
+/// (COFF/PE) target: `src/memory/gc/manager.zig`'s `scanGlobals` has no
+/// COFF/PE global-segment backend (it no-ops, so a global holding the
+/// sole reference to a heap object would be reclaimed — silent
+/// corruption), and Windows additionally needs TIB-based stack bounds
+/// that are not yet wired. Any future tracing manager that declares
+/// TRACED inherits the same correct gate automatically.
+///
+/// `selected_type_name` is used only to make the diagnostic actionable;
+/// the gate *decision* depends solely on the capability and the target.
+fn enforceManagerTargetSupport(
+    selected_type_name: []const u8,
+    declared_caps: u64,
+    options: ResolveOptions,
+    diag: *DriverDiagnostic,
+) ResolveError!void {
+    const target_triple = options.target orelse return; // native host: GC is supported (ELF/Mach-O backends exist)
+    const target = parseTargetTriple(target_triple) orelse return; // malformed triples are surfaced later by the compile path
+    const os_tag = enumFromTag(std.Target.Os.Tag, target.os_tag) orelse return;
+
+    const reclamation_model =
+        (declared_caps >> abi.RECLAMATION_MODEL_SHIFT) & abi.RECLAMATION_MODEL_MASK;
+    const is_traced = reclamation_model == abi.RECLAMATION_TRACED;
+
+    // The only currently-unsound combination: TRACED × Windows (COFF/PE).
+    if (is_traced and os_tag == .windows) {
+        diag.write(
+            "{s} is unsupported on {s}: conservative global/stack scanning has no COFF/PE backend yet; use Memory.ARC, Memory.Arena, Memory.Leak, Memory.NoOp, or Memory.Tracking",
+            .{ selected_type_name, target_triple },
+        );
+        return ResolveError.ManagerTargetUnsupported;
+    }
+}
+
+/// Map a wire-format enum tag (`u16`) back to its `std.Target` enum value.
+/// Returns null for an unrecognised tag.
+fn enumFromTag(comptime E: type, tag: u16) ?E {
+    return inline for (@typeInfo(E).@"enum".fields) |f| {
+        if (f.value == tag) break @field(E, f.name);
+    } else null;
 }
 
 fn validateManagerObjectAtPath(
@@ -1474,13 +1542,13 @@ const SymbolCheckError = error{
 };
 
 /// Walk the object's symbol table and return `true` iff
-/// `zap_memory_section` is present. Supports ELF64 and Mach-O 64-bit
-/// — the same formats `section_parser.extractSection` handles.
+/// `zap_memory_section` is present. Supports ELF64, Mach-O 64-bit, and
+/// COFF — the same formats `section_parser.extractSection` handles.
 fn managerSymbolPresent(bytes: []const u8) SymbolCheckError!bool {
     return switch (section_parser.detectFormat(bytes)) {
         .elf => elfSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
         .macho => machoSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
-        .coff => SymbolCheckError.UnsupportedFormat,
+        .coff => coffSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
         .unknown => SymbolCheckError.InvalidObject,
     };
 }
@@ -1637,6 +1705,81 @@ fn machoSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool
 }
 
 fn machoSymbolName(strtab: []const u8, offset: u32) ?[]const u8 {
+    if (offset >= strtab.len) return null;
+    const start: usize = offset;
+    var end: usize = start;
+    while (end < strtab.len and strtab[end] != 0) : (end += 1) {}
+    return strtab[start..end];
+}
+
+/// COFF symbol-table walk. Zig emits a raw COFF object whose symbol table
+/// sits at `pointer_to_symbol_table` with `number_of_symbols` records of
+/// 18 bytes each, immediately followed by the string table (4-byte size
+/// prefix + NUL-terminated names). The manager symbol `zap_memory_section`
+/// is 18 bytes (> 8), so it is always carried via the string-table form
+/// (`name[0..4] == 0`, `name[4..8]` = offset). We resolve both the inline
+/// and string-table name forms for robustness, and match the bare name as
+/// well as a leading-underscore variant (x86_64 Windows uses bare C names;
+/// i386 prefixes `_`).
+///
+/// Each symbol record may be followed by `number_of_aux_symbols` auxiliary
+/// records (also 18 bytes); those are skipped so a multi-section symbol's
+/// aux data is not misread as a symbol name.
+fn coffSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool {
+    if (bytes.len < @sizeOf(std.coff.Header)) return SymbolCheckError.InvalidObject;
+    var header: std.coff.Header = undefined;
+    @memcpy(std.mem.asBytes(&header), bytes[0..@sizeOf(std.coff.Header)]);
+
+    // No symbol table ⇒ the symbol cannot be present.
+    if (header.pointer_to_symbol_table == 0) return false;
+
+    const symbol_stride: usize = 18; // std.coff.Symbol.sizeOf()
+    const symtab_offset: usize = header.pointer_to_symbol_table;
+    const symbol_count: usize = header.number_of_symbols;
+    const symtab_bytes = std.math.mul(usize, symbol_count, symbol_stride) catch
+        return SymbolCheckError.InvalidObject;
+    if (symtab_bytes > bytes.len or symtab_offset > bytes.len - symtab_bytes) {
+        return SymbolCheckError.InvalidObject;
+    }
+
+    // String table: 4-byte little-endian size prefix (inclusive) directly
+    // after the symbol table.
+    const strtab_offset = symtab_offset + symtab_bytes;
+    const string_table: []const u8 = blk: {
+        if (strtab_offset + 4 > bytes.len) break :blk &.{};
+        const declared = std.mem.readInt(u32, bytes[strtab_offset..][0..4], .little);
+        if (declared < 4 or @as(usize, declared) > bytes.len - strtab_offset) break :blk &.{};
+        break :blk bytes[strtab_offset..][0..@as(usize, declared)];
+    };
+
+    var index: usize = 0;
+    while (index < symbol_count) {
+        const record = bytes[symtab_offset + index * symbol_stride ..][0..symbol_stride];
+        // Auxiliary-record count is the last byte of the 18-byte record.
+        const aux_count: usize = record[17];
+
+        const name: ?[]const u8 = if (std.mem.eql(u8, record[0..4], "\x00\x00\x00\x00")) name_blk: {
+            // String-table form: bytes [4..8] are the offset.
+            const name_offset = std.mem.readInt(u32, record[4..8], .little);
+            break :name_blk coffSymbolName(string_table, name_offset);
+        } else inline_blk: {
+            const field = record[0..8];
+            const len = std.mem.indexOfScalar(u8, field, 0) orelse field.len;
+            break :inline_blk field[0..len];
+        };
+
+        if (name) |n| {
+            if (std.mem.eql(u8, n, want)) return true;
+            if (n.len > 0 and n[0] == '_' and std.mem.eql(u8, n[1..], want)) return true;
+        }
+
+        // Advance past this symbol and its aux records (overflow-safe).
+        index = std.math.add(usize, index, 1 + aux_count) catch return SymbolCheckError.InvalidObject;
+    }
+    return false;
+}
+
+fn coffSymbolName(strtab: []const u8, offset: u32) ?[]const u8 {
     if (offset >= strtab.len) return null;
     const start: usize = offset;
     var end: usize = start;
@@ -2476,6 +2619,69 @@ fn synthesizeMachoWithCaps(buffer: []u8, declared_caps: u64) usize {
     return total;
 }
 
+/// Build a complete raw COFF (no `MZ`) AMD64 object in `buffer` whose
+/// `.zapmem` section carries a NoOp-style metadata payload AND whose
+/// symbol table exports `zap_memory_section` (via the string-table name
+/// form, since the name exceeds 8 bytes). Mirrors the ELF/Mach-O
+/// synthesisers so `coffSymbolPresent` and `extractFromCoff` are exercised
+/// against a realistic object without invoking the cross compiler.
+/// Returns the number of bytes written.
+fn synthesizeNoOpCoff(buffer: []u8) usize {
+    const header_size: usize = @sizeOf(std.coff.Header); // 20
+    const section_header_size: usize = @sizeOf(std.coff.SectionHeader); // 40
+    const symbol_stride: usize = 18; // std.coff.Symbol.sizeOf()
+
+    const payload = synthesizePayloadWithCaps(0);
+
+    const section_table_offset = header_size;
+    const raw_offset = section_table_offset + section_header_size; // 1 section
+    const raw_size = payload.len;
+    const symtab_offset = raw_offset + raw_size;
+    const symbol_count: usize = 1;
+    const strtab_offset = symtab_offset + symbol_count * symbol_stride;
+
+    // String table: 4-byte size prefix, then the manager symbol name.
+    const symbol_name = "zap_memory_section\x00";
+    const string_table_total = 4 + symbol_name.len;
+    const symbol_name_offset: u32 = 4; // first byte after the size prefix
+    const total = strtab_offset + string_table_total;
+
+    @memset(buffer[0..total], 0);
+
+    // ---- COFF file header ----
+    std.mem.writeInt(u16, buffer[0..2], 0x8664, .little); // AMD64
+    std.mem.writeInt(u16, buffer[2..4], 1, .little); // number_of_sections
+    std.mem.writeInt(u32, buffer[8..12], @intCast(symtab_offset), .little); // pointer_to_symbol_table
+    std.mem.writeInt(u32, buffer[12..16], @intCast(symbol_count), .little); // number_of_symbols
+    // size_of_optional_header (offset 16) = 0.
+
+    // ---- section header: `.zapmem` ----
+    const sh_off = section_table_offset;
+    @memcpy(buffer[sh_off..][0..".zapmem".len], ".zapmem");
+    std.mem.writeInt(u32, buffer[sh_off + 16 ..][0..4], @intCast(raw_size), .little); // size_of_raw_data
+    std.mem.writeInt(u32, buffer[sh_off + 20 ..][0..4], @intCast(raw_offset), .little); // pointer_to_raw_data
+
+    // ---- raw section bytes ----
+    @memcpy(buffer[raw_offset..][0..payload.len], &payload);
+
+    // ---- symbol table: one symbol, string-table name form ----
+    const sym = buffer[symtab_offset..][0..symbol_stride];
+    // name[0..4] = 0 (string-table form), name[4..8] = offset.
+    std.mem.writeInt(u32, sym[0..4], 0, .little);
+    std.mem.writeInt(u32, sym[4..8], symbol_name_offset, .little);
+    std.mem.writeInt(u32, sym[8..12], 0, .little); // value
+    std.mem.writeInt(u16, sym[12..14], 1, .little); // section_number = 1 (.zapmem)
+    std.mem.writeInt(u16, sym[14..16], 0, .little); // type
+    sym[16] = 2; // storage_class = EXTERNAL
+    sym[17] = 0; // number_of_aux_symbols
+
+    // ---- string table ----
+    std.mem.writeInt(u32, buffer[strtab_offset..][0..4], @intCast(string_table_total), .little);
+    @memcpy(buffer[strtab_offset + 4 ..][0..symbol_name.len], symbol_name);
+
+    return total;
+}
+
 /// Mock `ForkCompileFn` used by the ELF integration test. Writes a
 /// NoOp-style ELF object to the requested output path and returns `.Ok`.
 var mock_noop_compile_count: usize = 0;
@@ -2925,6 +3131,109 @@ test "assertExportsManagerSymbol passes for synthesized NoOp Mach-O" {
     var diag_buf: [512]u8 = undefined;
     var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
     try assertExportsManagerSymbol("NoOp(Mach-O)", buffer[0..written], &diag);
+}
+
+test "assertExportsManagerSymbol passes for synthesized NoOp COFF" {
+    // The COFF synthesiser emits a symbol table exporting
+    // `zap_memory_section` via the string-table name form; the
+    // symbol-presence check must accept it (the Windows cross-compile
+    // path).
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeNoOpCoff(&buffer);
+    var diag_buf: [512]u8 = undefined;
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    try assertExportsManagerSymbol("NoOp(COFF)", buffer[0..written], &diag);
+}
+
+test "coffSymbolPresent returns false when the manager symbol is absent" {
+    // Rewrite the exported symbol name so the lookup must miss, proving
+    // the walker does not spuriously match.
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeNoOpCoff(&buffer);
+    var i: usize = 0;
+    while (i + "zap_memory_section".len <= written) : (i += 1) {
+        if (std.mem.eql(u8, buffer[i..][0.."zap_memory_section".len], "zap_memory_section")) {
+            buffer[i] = 'X';
+            break;
+        }
+    }
+    try std.testing.expect(!(try coffSymbolPresent(buffer[0..written], MANAGER_SYMBOL_NAME)));
+}
+
+test "coffSymbolPresent extracts the .zapmem section from a synthesized COFF" {
+    // Cross-check that the section reader and symbol walker agree on the
+    // same synthesised object (both must succeed for validation to pass).
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeNoOpCoff(&buffer);
+    const section = try section_parser.extractSection(buffer[0..written]);
+    try std.testing.expect(section.len >= @sizeOf(abi.ZapMemoryManagerMetaV1));
+    try std.testing.expect(try coffSymbolPresent(buffer[0..written], MANAGER_SYMBOL_NAME));
+}
+
+// ---------------------------------------------------------------------------
+// Manager × target soundness gate (forward-compatible spawn-time check).
+// ---------------------------------------------------------------------------
+
+/// `declared_caps` for a fully-declared TRACED manager (`Memory.GC`): the
+/// Axis-A reclamation-model field set to TRACED. Equals `0x4`.
+const TRACED_CAPS: u64 = abi.RECLAMATION_TRACED << abi.RECLAMATION_MODEL_SHIFT;
+
+fn gateDiagBuf() [512]u8 {
+    return [_]u8{0} ** 512;
+}
+
+test "enforceManagerTargetSupport gates TRACED manager on windows-gnu" {
+    var diag_buf = gateDiagBuf();
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const options: ResolveOptions = .{ .adapter = null, .project_root = "/tmp", .zap_source_root = "/tmp", .cache_dir = "/tmp", .target = "x86_64-windows-gnu" };
+    const err = enforceManagerTargetSupport("Memory.GC", TRACED_CAPS, options, &diag);
+    try std.testing.expectError(ResolveError.ManagerTargetUnsupported, err);
+    // The diagnostic must name the selected type, the target, and the
+    // viable alternatives so it is actionable.
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), "Memory.GC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), "x86_64-windows-gnu") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), "COFF/PE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diag.text(), "Memory.ARC") != null);
+}
+
+test "enforceManagerTargetSupport gates TRACED manager on windows-msvc too" {
+    // The gate keys on the OS (windows), not a specific ABI — msvc is
+    // equally unsound for conservative global scanning.
+    var diag_buf = gateDiagBuf();
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const options: ResolveOptions = .{ .adapter = null, .project_root = "/tmp", .zap_source_root = "/tmp", .cache_dir = "/tmp", .target = "x86_64-windows-msvc" };
+    try std.testing.expectError(
+        ResolveError.ManagerTargetUnsupported,
+        enforceManagerTargetSupport("Memory.GC", TRACED_CAPS, options, &diag),
+    );
+}
+
+test "enforceManagerTargetSupport allows TRACED manager on linux (ELF backend exists)" {
+    var diag_buf = gateDiagBuf();
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const options: ResolveOptions = .{ .adapter = null, .project_root = "/tmp", .zap_source_root = "/tmp", .cache_dir = "/tmp", .target = "x86_64-linux-gnu" };
+    try enforceManagerTargetSupport("Memory.GC", TRACED_CAPS, options, &diag);
+}
+
+test "enforceManagerTargetSupport allows TRACED manager natively (no target)" {
+    // Native host build: the Mach-O / ELF global scanners exist, so GC is
+    // supported. A null target must not gate.
+    var diag_buf = gateDiagBuf();
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const options: ResolveOptions = .{ .adapter = null, .project_root = "/tmp", .zap_source_root = "/tmp", .cache_dir = "/tmp", .target = null };
+    try enforceManagerTargetSupport("Memory.GC", TRACED_CAPS, options, &diag);
+}
+
+test "enforceManagerTargetSupport allows non-TRACED managers on windows" {
+    // REFCOUNTED (ARC), BULK_OR_NEVER (Arena/NoOp/Leak), and
+    // INDIVIDUAL_NO_REFCOUNT (Tracking) all run on windows — only the
+    // conservative-scan TRACED model is gated.
+    var diag_buf = gateDiagBuf();
+    var diag: DriverDiagnostic = .{ .buffer = &diag_buf };
+    const options: ResolveOptions = .{ .adapter = null, .project_root = "/tmp", .zap_source_root = "/tmp", .cache_dir = "/tmp", .target = "x86_64-windows-gnu" };
+    try enforceManagerTargetSupport("Memory.ARC", abi.CAPS_REFCOUNTED, options, &diag);
+    try enforceManagerTargetSupport("Memory.Arena", abi.CAPS_BULK_OR_NEVER, options, &diag);
+    try enforceManagerTargetSupport("Memory.Tracking", abi.CAPS_INDIVIDUAL_NO_REFCOUNT, options, &diag);
 }
 
 test "assertExportsManagerSymbol rejects ELF object lacking the symbol" {

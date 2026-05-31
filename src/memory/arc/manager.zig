@@ -563,47 +563,49 @@ inline fn slabPoolInit() SlabPool {
     return pool;
 }
 
-/// Acquire a 64-KiB-aligned mmap region. Over-allocate by one slab's
-/// worth and trim the head/tail to leave exactly a `SLAB_SIZE`-aligned
-/// `SLAB_SIZE` region. Returns the aligned base pointer or null on OOM.
+/// Acquire a 64-KiB-aligned `SLAB_SIZE` region. Delegates to
+/// `page_allocator`, which honours over-page alignment requests on every
+/// supported OS (POSIX over-allocates and trims; Windows reserves a
+/// placeholder, splits it, and commits the aligned sub-range). This is
+/// the same libc-free virtual-memory primitive the large-allocation path
+/// uses (`largeAlloc`) and is the primitive the module header documents
+/// for slab backing — `mmap` on POSIX, `NtAllocateVirtualMemory` on
+/// Windows. Returns the aligned base pointer or null on OOM.
+///
+/// `page_allocator` returns a region whose address is already
+/// `SLAB_ALIGN`-aligned, so no manual head/tail trim is needed (and no
+/// raw `std.posix.mmap`, which does not exist on Windows). The returned
+/// pointer doubles as the allocation base recorded in
+/// `SlabHeader.allocation_base`; `unmapSlab` frees exactly this region.
 fn mmapAlignedSlab() ?[*]align(std.heap.page_size_min) u8 {
     const page_size = std.heap.page_size_min;
-    // SLAB_SIZE must be a multiple of the OS page size for the trim
-    // arithmetic to be valid; verified at comptime in debug builds.
+    // SLAB_SIZE must be a multiple of the OS page size so the
+    // page-granular allocator returns exactly `SLAB_SIZE` usable bytes.
     std.debug.assert(SLAB_SIZE % page_size == 0);
 
-    const overalloc_len: usize = SLAB_SIZE + SLAB_ALIGN - page_size;
-    const raw = std.posix.mmap(
-        null,
-        overalloc_len,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    ) catch return null;
+    // `SLAB_ALIGN` (64 KiB) exceeds every supported page size, so the
+    // alignment is the load-bearing request; clamp to at least the page
+    // size for the degenerate case where a future page size meets or
+    // exceeds `SLAB_ALIGN`.
+    const slab_alignment: std.mem.Alignment =
+        .fromByteUnits(@max(SLAB_ALIGN, @as(usize, page_size)));
+    const base = std.heap.page_allocator.rawAlloc(
+        SLAB_SIZE,
+        slab_alignment,
+        @returnAddress(),
+    ) orelse return null;
 
-    const raw_addr = @intFromPtr(raw.ptr);
-    const aligned_addr = std.mem.alignForward(usize, raw_addr, SLAB_ALIGN);
-    const head_bytes = aligned_addr - raw_addr;
-    const tail_bytes = overalloc_len - head_bytes - SLAB_SIZE;
-
-    if (head_bytes != 0) {
-        std.posix.munmap(@alignCast(raw[0..head_bytes]));
-    }
-    if (tail_bytes != 0) {
-        const tail_start = head_bytes + SLAB_SIZE;
-        std.posix.munmap(@alignCast(raw[tail_start..(tail_start + tail_bytes)]));
-    }
-
-    const aligned_ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(aligned_addr);
-    return aligned_ptr;
+    return @alignCast(base);
 }
 
 /// Counterpart to `mmapAlignedSlab`: release a `SLAB_SIZE`-aligned
-/// `SLAB_SIZE` region.
+/// `SLAB_SIZE` region back to `page_allocator` (POSIX `munmap` /
+/// Windows `NtFreeVirtualMemory`).
 fn unmapSlab(base: [*]align(std.heap.page_size_min) u8) void {
-    const slab_slice = base[0..SLAB_SIZE];
-    std.posix.munmap(@alignCast(slab_slice));
+    const page_size = std.heap.page_size_min;
+    const slab_alignment: std.mem.Alignment =
+        .fromByteUnits(@max(SLAB_ALIGN, @as(usize, page_size)));
+    std.heap.page_allocator.rawFree(base[0..SLAB_SIZE], slab_alignment, @returnAddress());
 }
 
 /// Initialise a freshly-mmapped slab. Sets the header and zero-fills

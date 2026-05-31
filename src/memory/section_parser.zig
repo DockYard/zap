@@ -70,9 +70,45 @@ pub fn detectFormat(bytes: []const u8) ObjectFormat {
     }
     const m0_be = std.mem.readInt(u32, bytes[0..4], .big);
     if (m0_be == 0xCAFEBABE) return .macho; // fat
-    // COFF/PE: MZ header for PE; raw COFF starts with machine bytes
+    // COFF/PE: a PE *image* starts with the `MZ` DOS stub; a raw COFF
+    // *object* (what `zig build-obj -target *-windows-*` emits, and what
+    // the manager-object compile produces) has no `MZ` stub — it begins
+    // directly with the 20-byte COFF file header whose first u16 is the
+    // machine type. We recognise both: `MZ` for images, and a known
+    // COFF machine word for raw objects. The machine match is gated by a
+    // header-plausibility check (`size_of_optional_header == 0`, which is
+    // mandatory for object files per PE/COFF §3.3) so arbitrary data that
+    // merely happens to start with a machine-type word is not misread as
+    // COFF.
     if (bytes[0] == 'M' and bytes[1] == 'Z') return .coff;
+    if (looksLikeRawCoffObject(bytes)) return .coff;
     return .unknown;
+}
+
+/// Known COFF machine-type words (PE/COFF §3.3.1, `IMAGE_FILE_MACHINE_*`)
+/// for the 64- and 32-bit targets Zig can emit Windows objects for.
+const COFF_MACHINE_AMD64: u16 = 0x8664;
+const COFF_MACHINE_ARM64: u16 = 0xaa64;
+const COFF_MACHINE_I386: u16 = 0x14c;
+
+/// Heuristic discriminator for a raw COFF *object* file (no `MZ` stub).
+/// Reads the leading 20-byte COFF file header and requires:
+///   * a recognised machine word, and
+///   * `size_of_optional_header == 0` — objects never carry an optional
+///     header (it is image-only), so a non-zero value here means the
+///     buffer is not a raw COFF object.
+/// This is a detection gate only; full structural validation (section
+/// table bounds, etc.) happens in `extractFromCoff`.
+fn looksLikeRawCoffObject(bytes: []const u8) bool {
+    if (bytes.len < @sizeOf(std.coff.Header)) return false;
+    const machine = std.mem.readInt(u16, bytes[0..2], .little);
+    const is_known_machine = machine == COFF_MACHINE_AMD64 or
+        machine == COFF_MACHINE_ARM64 or
+        machine == COFF_MACHINE_I386;
+    if (!is_known_machine) return false;
+    // `size_of_optional_header` is the u16 at offset 16 of the header.
+    const size_of_optional_header = std.mem.readInt(u16, bytes[16..18], .little);
+    return size_of_optional_header == 0;
 }
 
 /// Extract the `.zapmem` section content from a complete object-file
@@ -93,7 +129,7 @@ pub fn extractSection(bytes: []const u8) ExtractError![]const u8 {
     return switch (detectFormat(bytes)) {
         .elf => extractFromElf(bytes),
         .macho => extractFromMacho(bytes),
-        .coff => error.UnsupportedFormat,
+        .coff => extractFromCoff(bytes),
         .unknown => error.InvalidObject,
     };
 }
@@ -233,6 +269,131 @@ fn trimZeros(name: []const u8) []const u8 {
     var end: usize = name.len;
     while (end > 0 and name[end - 1] == 0) : (end -= 1) {}
     return name[0..end];
+}
+
+/// COFF extraction. The spec's section name on Windows is `.zapmem`
+/// (mirrors the ELF name; see the manager-side `SECTION_NAME` switch in
+/// `src/memory/<backend>/manager.zig`). Zig emits a raw COFF *object*
+/// (no `MZ`/PE image wrapper), so the layout is:
+///
+///   [0]                COFF file header (20 bytes,`std.coff.Header`)
+///   [20]               section table (`number_of_sections` ×
+///                      `std.coff.SectionHeader`, 40 bytes each, because
+///                      `size_of_optional_header` is 0 for objects)
+///   [pointer_to_raw_data]  per-section raw bytes
+///   [pointer_to_symbol_table]            symbol table (18 bytes/entry)
+///   [pointer_to_symbol_table + nsyms*18] string table (4-byte size + names)
+///
+/// Section content is located by `pointer_to_raw_data` + `size_of_raw_data`.
+/// We deliberately do NOT use `virtual_size`: for object files that field
+/// is typically 0 (it is meaningful only in a linked image), so
+/// `std.coff.Coff.getSectionData` — which keys on `virtual_size` — would
+/// return an empty slice. `size_of_raw_data` is the on-disk section length.
+///
+/// Long section names (> 8 bytes) are stored as `/<decimal-offset>` into
+/// the string table; `.zapmem` is 7 bytes so it is always inline, but the
+/// parser resolves the string-table form too for robustness.
+fn extractFromCoff(bytes: []const u8) ExtractError![]const u8 {
+    if (bytes.len < @sizeOf(std.coff.Header)) return error.InvalidObject;
+
+    var header: std.coff.Header = undefined;
+    @memcpy(std.mem.asBytes(&header), bytes[0..@sizeOf(std.coff.Header)]);
+
+    // Object files carry no optional header; reject a non-zero size as
+    // malformed (the detector already gates on this, but `extractSection`
+    // can be reached with the `MZ`-image path too — guard regardless).
+    if (header.size_of_optional_header != 0) return error.UnsupportedFormat;
+
+    const section_table_offset: usize =
+        @as(usize, @sizeOf(std.coff.Header)) + header.size_of_optional_header;
+    const section_header_size: usize = @sizeOf(std.coff.SectionHeader); // 40
+    const section_count: usize = header.number_of_sections;
+
+    // Bounds-check the whole section table up front (overflow-safe).
+    const section_table_bytes = std.math.mul(usize, section_count, section_header_size) catch
+        return error.InvalidObject;
+    if (section_table_bytes > bytes.len or section_table_offset > bytes.len - section_table_bytes) {
+        return error.InvalidObject;
+    }
+
+    // Resolve the string table lazily — only needed for long names.
+    // Layout: `pointer_to_symbol_table + number_of_symbols*18`, first 4
+    // bytes are the total size (inclusive of those 4 bytes).
+    const string_table: ?[]const u8 = coffStringTable(bytes, header);
+
+    var section_index: usize = 0;
+    while (section_index < section_count) : (section_index += 1) {
+        const sh_offset = section_table_offset + section_index * section_header_size;
+        var sh: std.coff.SectionHeader = undefined;
+        @memcpy(std.mem.asBytes(&sh), bytes[sh_offset..][0..section_header_size]);
+
+        const name = coffSectionName(&sh, string_table) orelse continue;
+        if (!std.mem.eql(u8, name, ".zapmem")) continue;
+
+        const raw_offset: usize = sh.pointer_to_raw_data;
+        const raw_size: usize = sh.size_of_raw_data;
+        // A `.zapmem` section with no on-disk bytes cannot carry the
+        // metadata header; treat as too-small rather than not-found so
+        // the caller emits the right diagnostic.
+        if (raw_size == 0) return error.SectionTooSmall;
+        if (raw_size > bytes.len or raw_offset > bytes.len - raw_size) {
+            return error.InvalidObject;
+        }
+        const section = bytes[raw_offset..][0..raw_size];
+        if (section.len < @sizeOf(ZapMemoryManagerMetaV1)) return error.SectionTooSmall;
+        return section;
+    }
+    return error.SectionNotFound;
+}
+
+/// Locate the COFF string table (4-byte little-endian size prefix
+/// followed by NUL-terminated names). Returns null when no symbol table
+/// is present (then there is no string table) or when the declared size
+/// overflows the buffer. The returned slice includes the 4-byte size
+/// prefix, matching the offset convention used by section/symbol names
+/// (offsets are measured from the start of the string table, and offsets
+/// 0..3 alias the size field, which real names never use).
+fn coffStringTable(bytes: []const u8, header: std.coff.Header) ?[]const u8 {
+    if (header.pointer_to_symbol_table == 0) return null;
+    const symbol_stride: usize = 18; // std.coff.Symbol.sizeOf()
+    const symtab_offset: usize = header.pointer_to_symbol_table;
+    const symtab_bytes = std.math.mul(usize, header.number_of_symbols, symbol_stride) catch
+        return null;
+    const strtab_offset = std.math.add(usize, symtab_offset, symtab_bytes) catch return null;
+    if (strtab_offset + 4 > bytes.len) return null;
+    const declared_size = std.mem.readInt(u32, bytes[strtab_offset..][0..4], .little);
+    if (declared_size < 4) return null;
+    if (@as(usize, declared_size) > bytes.len - strtab_offset) return null;
+    return bytes[strtab_offset..][0..@as(usize, declared_size)];
+}
+
+/// Resolve a COFF section name: inline (8-byte field, NUL-padded) or, for
+/// names longer than 8 bytes, `/<decimal-offset>` into the string table.
+fn coffSectionName(
+    section_header: *const std.coff.SectionHeader,
+    string_table: ?[]const u8,
+) ?[]const u8 {
+    if (section_header.name[0] != '/') {
+        const len = std.mem.indexOfScalar(u8, &section_header.name, 0) orelse section_header.name.len;
+        return section_header.name[0..len];
+    }
+    // Long name: `/<decimal>` references an offset into the string table.
+    const strtab = string_table orelse return null;
+    const digits_len = std.mem.indexOfScalar(u8, section_header.name[1..], 0) orelse
+        (section_header.name.len - 1);
+    const offset = std.fmt.parseInt(u32, section_header.name[1 .. 1 + digits_len], 10) catch return null;
+    return coffStringAt(strtab, offset);
+}
+
+/// Read a NUL-terminated name from the COFF string table at `offset`
+/// (offset measured from the start of the table, including its 4-byte
+/// size prefix).
+fn coffStringAt(string_table: []const u8, offset: u32) ?[]const u8 {
+    if (offset >= string_table.len) return null;
+    const start: usize = offset;
+    var end: usize = start;
+    while (end < string_table.len and string_table[end] != 0) : (end += 1) {}
+    return string_table[start..end];
 }
 
 // ---------------------------------------------------------------------------
@@ -558,9 +719,12 @@ test "extractSection: buffer too small to detect format" {
     try std.testing.expectError(error.InvalidObject, extractSection(&bytes));
 }
 
-test "extractSection: COFF MZ returns UnsupportedFormat" {
+test "extractSection: COFF MZ stub too short to be a COFF object" {
+    // A bare `MZ` DOS stub with no following COFF header is detected as
+    // `.coff` but is shorter than the 20-byte file header, so the COFF
+    // reader rejects it as a malformed object.
     const bytes = [_]u8{ 'M', 'Z', 0, 0, 0, 0, 0, 0 };
-    try std.testing.expectError(error.UnsupportedFormat, extractSection(&bytes));
+    try std.testing.expectError(error.InvalidObject, extractSection(&bytes));
 }
 
 test "extractSection: garbage buffer returns InvalidObject" {
@@ -568,14 +732,170 @@ test "extractSection: garbage buffer returns InvalidObject" {
     try std.testing.expectError(error.InvalidObject, extractSection(&bytes));
 }
 
-test "extractSection: COFF without MZ prefix is treated as unknown" {
-    // Raw COFF starts with a 16-bit machine type rather than `MZ`. The
-    // current detector does not pattern-match those values; it returns
-    // `.unknown`, which `extractSection` surfaces as InvalidObject.
-    //
-    // Document this in a test so a future contributor adding COFF
-    // detection updates it deliberately rather than silently changing
-    // the observable behavior.
+test "detectFormat: raw COFF object recognised by machine word" {
+    // A raw COFF object (no `MZ`) begins with the 20-byte file header
+    // whose first u16 is the machine type. With a recognised machine
+    // (AMD64) and `size_of_optional_header == 0`, the detector reports
+    // `.coff`.
+    var header_bytes = [_]u8{0} ** @sizeOf(std.coff.Header);
+    std.mem.writeInt(u16, header_bytes[0..2], COFF_MACHINE_AMD64, .little);
+    // size_of_optional_header (offset 16) already 0.
+    try std.testing.expectEqual(ObjectFormat.coff, detectFormat(&header_bytes));
+}
+
+test "detectFormat: raw COFF rejected when optional header size nonzero" {
+    // A non-zero optional-header size is image-only; a raw object never
+    // sets it, so a machine-word match with a non-zero value is NOT
+    // treated as a COFF object (guards against false positives).
+    var header_bytes = [_]u8{0} ** @sizeOf(std.coff.Header);
+    std.mem.writeInt(u16, header_bytes[0..2], COFF_MACHINE_AMD64, .little);
+    std.mem.writeInt(u16, header_bytes[16..18], 0xE0, .little); // PE32+ optional header
+    try std.testing.expectEqual(ObjectFormat.unknown, detectFormat(&header_bytes));
+}
+
+test "detectFormat: short raw-COFF-looking buffer is unknown" {
+    // Only the machine word, not a full header — cannot be a COFF object.
     const bytes = [_]u8{ 0x64, 0x86, 0x00, 0x00, 0x00, 0x00 }; // IMAGE_FILE_MACHINE_AMD64 LE
-    try std.testing.expectError(error.InvalidObject, extractSection(&bytes));
+    try std.testing.expectEqual(ObjectFormat.unknown, detectFormat(&bytes));
+}
+
+// ---------------------------------------------------------------------------
+// COFF synthesis helpers.
+// ---------------------------------------------------------------------------
+
+const CoffSynthOptions = struct {
+    omit_zapmem: bool = false,
+    /// Emit `.zapmem` with a 0-byte `size_of_raw_data`.
+    zero_raw_size: bool = false,
+    /// Make `pointer_to_raw_data` + `size_of_raw_data` overflow the buffer.
+    raw_offset_overflow: bool = false,
+    /// Store the section name via the `/<offset>` long-name form in the
+    /// string table instead of inline (exercises `coffSectionName`'s
+    /// string-table path even though `.zapmem` fits inline).
+    long_name_form: bool = false,
+};
+
+/// Build a minimal raw COFF (no `MZ` stub) AMD64 object with a single
+/// `.zapmem` section. Layout matches what `zig build-obj -target
+/// x86_64-windows-gnu` emits: 20-byte header, 40-byte section header(s),
+/// raw section bytes, then (for the long-name case) a symbol table +
+/// string table. Returns the number of bytes written.
+fn synthesizeCoff(
+    buf: []u8,
+    payload: []const u8,
+    options: CoffSynthOptions,
+) usize {
+    const header_size: usize = @sizeOf(std.coff.Header); // 20
+    const section_header_size: usize = @sizeOf(std.coff.SectionHeader); // 40
+    const section_count: usize = if (options.omit_zapmem) 0 else 1;
+
+    const section_table_offset = header_size;
+    const raw_offset = section_table_offset + section_header_size * section_count;
+    const raw_size: usize = if (options.zero_raw_size) 0 else payload.len;
+    const after_raw = raw_offset + raw_size;
+
+    // Long-name form needs a symbol table (we emit zero symbols) followed
+    // by a string table that contains the `.zapmem` name.
+    const symtab_offset = after_raw;
+    const string_table_name = ".zapmem\x00";
+    const string_table_total: usize = 4 + string_table_name.len; // size prefix + name
+    const string_name_offset: u32 = 4; // first byte after the 4-byte size
+
+    var total: usize = after_raw;
+
+    // ---- COFF file header ----
+    @memset(buf[0..header_size], 0);
+    std.mem.writeInt(u16, buf[0..2], COFF_MACHINE_AMD64, .little); // machine
+    std.mem.writeInt(u16, buf[2..4], @intCast(section_count), .little); // number_of_sections
+    // size_of_optional_header (offset 16) = 0 already.
+    if (options.long_name_form) {
+        std.mem.writeInt(u32, buf[8..12], @intCast(symtab_offset), .little); // pointer_to_symbol_table
+        std.mem.writeInt(u32, buf[12..16], 0, .little); // number_of_symbols = 0
+        total = symtab_offset + string_table_total;
+    }
+
+    // ---- section header(s) ----
+    if (!options.omit_zapmem) {
+        const sh_off = section_table_offset;
+        @memset(buf[sh_off..][0..section_header_size], 0);
+        if (options.long_name_form) {
+            // `/<decimal offset>` into the string table.
+            const long = std.fmt.bufPrint(buf[sh_off..][0..8], "/{d}", .{string_name_offset}) catch unreachable;
+            // bufPrint wrote the digits; zero-pad the rest of the 8-byte field.
+            for (buf[sh_off + long.len .. sh_off + 8]) |*b| b.* = 0;
+        } else {
+            @memcpy(buf[sh_off..][0..".zapmem".len], ".zapmem");
+        }
+        // virtual_size (offset 8) intentionally 0 — objects leave it 0.
+        std.mem.writeInt(u32, buf[sh_off + 16 ..][0..4], @intCast(raw_size), .little); // size_of_raw_data
+        const stored_raw_offset: u32 = if (options.raw_offset_overflow) 0xFFFFFFFF else @intCast(raw_offset);
+        std.mem.writeInt(u32, buf[sh_off + 20 ..][0..4], stored_raw_offset, .little); // pointer_to_raw_data
+    }
+
+    // ---- raw section bytes ----
+    if (raw_size > 0) {
+        @memcpy(buf[raw_offset..][0..payload.len], payload);
+    }
+
+    // ---- string table (long-name form only) ----
+    if (options.long_name_form) {
+        std.mem.writeInt(u32, buf[symtab_offset..][0..4], @intCast(string_table_total), .little);
+        @memcpy(buf[symtab_offset + 4 ..][0..string_table_name.len], string_table_name);
+    }
+
+    return total;
+}
+
+test "extractFromCoff: round-trips valid section (inline name)" {
+    const payload = validZapmemPayload();
+    var buf: [4096]u8 = undefined;
+    const written = synthesizeCoff(&buf, &payload, .{});
+    const result = try extractSection(buf[0..written]);
+    try std.testing.expectEqual(@as(usize, payload.len), result.len);
+    try std.testing.expectEqualSlices(u8, &payload, result);
+}
+
+test "extractFromCoff: round-trips valid section (long name via string table)" {
+    const payload = validZapmemPayload();
+    var buf: [4096]u8 = undefined;
+    const written = synthesizeCoff(&buf, &payload, .{ .long_name_form = true });
+    const result = try extractSection(buf[0..written]);
+    try std.testing.expectEqual(@as(usize, payload.len), result.len);
+    try std.testing.expectEqualSlices(u8, &payload, result);
+}
+
+test "extractFromCoff: SectionNotFound when .zapmem absent" {
+    var buf: [4096]u8 = undefined;
+    const written = synthesizeCoff(&buf, &.{}, .{ .omit_zapmem = true });
+    try std.testing.expectError(error.SectionNotFound, extractSection(buf[0..written]));
+}
+
+test "extractFromCoff: SectionTooSmall when payload < 32 bytes" {
+    const short_payload = [_]u8{ 1, 2, 3, 4, 5 };
+    var buf: [4096]u8 = undefined;
+    const written = synthesizeCoff(&buf, &short_payload, .{});
+    try std.testing.expectError(error.SectionTooSmall, extractSection(buf[0..written]));
+}
+
+test "extractFromCoff: SectionTooSmall when size_of_raw_data is zero" {
+    const payload = validZapmemPayload();
+    var buf: [4096]u8 = undefined;
+    const written = synthesizeCoff(&buf, &payload, .{ .zero_raw_size = true });
+    try std.testing.expectError(error.SectionTooSmall, extractSection(buf[0..written]));
+}
+
+test "extractFromCoff: InvalidObject when raw offset+size overflows buffer" {
+    const payload = validZapmemPayload();
+    var buf: [4096]u8 = undefined;
+    const written = synthesizeCoff(&buf, &payload, .{ .raw_offset_overflow = true });
+    try std.testing.expectError(error.InvalidObject, extractSection(buf[0..written]));
+}
+
+test "extractFromCoff: InvalidObject when section count overruns buffer" {
+    // A header that claims many sections but a tiny buffer must be
+    // rejected by the up-front section-table bounds check.
+    var buf = [_]u8{0} ** @sizeOf(std.coff.Header);
+    std.mem.writeInt(u16, buf[0..2], COFF_MACHINE_AMD64, .little);
+    std.mem.writeInt(u16, buf[2..4], 100, .little); // 100 sections, no room
+    try std.testing.expectError(error.InvalidObject, extractSection(&buf));
 }
