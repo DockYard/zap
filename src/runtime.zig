@@ -31,27 +31,170 @@ fn envGetRuntime(name: []const u8) ?[]const u8 {
     return std.mem.span(ptr);
 }
 
-const STDOUT_FD = std.posix.STDOUT_FILENO;
-const STDERR_FD = std.posix.STDERR_FILENO;
-const STDIN_FD = std.posix.STDIN_FILENO;
-
 // Well-known atom IDs — must match the registration order in initGlobalAtomTable
 // and AtomTable.init: nil=0, true=1, false=2, ok=3, error=4, cont=5, halt=6, done=7
 pub const ATOM_CONT: u32 = 5;
 pub const ATOM_HALT: u32 = 6;
 pub const ATOM_DONE: u32 = 7;
 
-fn posixWrite(fd: std.posix.fd_t, bytes: []const u8) void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        const rc = std.c.write(fd, bytes[written..].ptr, bytes[written..].len);
-        if (rc <= 0) break;
-        written += @intCast(rc);
+// ============================================================
+// runtime_os seam
+//
+// The OS-primitive layer for the embedded runtime. `runtime.zig` ships
+// as a single standalone `@embedFile`'d source unit (no sibling files in
+// the emission cache), so the seam cannot be a separate `@import`'d
+// module. Instead the compiler's source-rewrite path
+// (`src/compiler.zig`'s `rewriteRuntimeSource`) replaces the region
+// between the `ZAP_RUNTIME_OS_SEAM_BEGIN`/`END` sentinels below with a
+// comptime-selected switch over the three backend bodies that live as
+// real, separately-testable files in `src/runtime_os/{posix,windows,
+// wasi}.zig`.
+//
+// The SOURCE-LEVEL default here is the POSIX backend, verbatim. This is
+// deliberate: the host test build (`zig build test`) loads `runtime.zig`
+// directly WITHOUT the rewrite, and the host is a POSIX target, so the
+// inline POSIX backend keeps the host runtime byte-for-byte identical to
+// the pre-seam behavior (the native regression anchor, Decision 6). For
+// user binaries the rewrite swaps in the full three-OS version so a
+// foreign target gets its own backend.
+//
+// The body below MUST stay textually in sync with
+// `src/runtime_os/posix.zig`'s body (between that file's
+// `ZAP_RUNTIME_OS_BODY_BEGIN/END posix` sentinels). `compiler.zig`'s
+// rewrite asserts the source markers exist; a drift between this inline
+// copy and the file is caught by the per-target runtime_os test in
+// `build.zig` and by the rewrite's marker assertions.
+// ============================================================
+
+// ZAP_RUNTIME_OS_SEAM_BEGIN
+const RuntimeOs = struct {
+    /// Capability model for the POSIX backend. POSIX has signals,
+    /// termios, and small-integer file descriptors, and `std.debug`'s
+    /// `SelfInfo` carries DWARF symbolization for the native targets.
+    pub const caps = struct {
+        pub const supports_signals: bool = true;
+        pub const supports_termios: bool = true;
+        pub const supports_backtrace: bool = std.debug.SelfInfo != void;
+        pub const console_handle: type = std.posix.fd_t;
+    };
+
+    pub const stdout_handle: caps.console_handle = std.posix.STDOUT_FILENO;
+    pub const stderr_handle: caps.console_handle = std.posix.STDERR_FILENO;
+    pub const stdin_handle: caps.console_handle = std.posix.STDIN_FILENO;
+
+    pub fn consoleWrite(handle: caps.console_handle, bytes: []const u8) void {
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const rc = std.c.write(handle, bytes[written..].ptr, bytes[written..].len);
+            if (rc <= 0) break;
+            written += @intCast(rc);
+        }
+    }
+
+    pub fn consoleRead(handle: caps.console_handle, buf: []u8) usize {
+        return std.posix.read(handle, buf) catch 0;
+    }
+
+    pub fn writeStdout(bytes: []const u8) void {
+        consoleWrite(stdout_handle, bytes);
+    }
+
+    pub fn writeStderr(bytes: []const u8) void {
+        consoleWrite(stderr_handle, bytes);
+    }
+
+    pub fn readStdin(buf: []u8) usize {
+        return consoleRead(stdin_handle, buf);
+    }
+
+    pub fn stderrIsTty() bool {
+        return std.c.isatty(stderr_handle) != 0;
+    }
+
+    pub fn nowNanos() u64 {
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+        const total_ns: i128 = @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+        if (total_ns <= 0) return 0;
+        return @intCast(total_ns);
+    }
+
+    pub fn sleepNanos(nanoseconds: u64) void {
+        if (nanoseconds == 0) return;
+        var ts = std.posix.timespec{
+            .sec = @intCast(nanoseconds / 1_000_000_000),
+            .nsec = @intCast(nanoseconds % 1_000_000_000),
+        };
+        while (true) {
+            const rc = std.c.nanosleep(&ts, &ts);
+            if (rc == 0) break;
+            if (std.posix.errno(rc) != .INTR) break;
+        }
+    }
+
+    pub fn exitProcess(code: u8) noreturn {
+        std.process.exit(code);
+    }
+
+    pub fn registerAtExit(handler: *const fn () callconv(.c) void) c_int {
+        const c = struct {
+            extern "c" fn atexit(handler: *const fn () callconv(.c) void) c_int;
+        };
+        return c.atexit(handler);
+    }
+
+    pub fn argv() []const [*:0]const u8 {
+        if (comptime builtin.os.tag == .macos) {
+            const c = struct {
+                extern "c" fn _NSGetArgc() *c_int;
+                extern "c" fn _NSGetArgv() *[*]const [*:0]const u8;
+            };
+            const argc: usize = @intCast(c._NSGetArgc().*);
+            const args = c._NSGetArgv().*;
+            return args[0..argc];
+        } else if (comptime builtin.os.tag == .linux) {
+            loadLinuxCmdline();
+            return linux_cmdline_ptrs[0..linux_cmdline_argc];
+        } else {
+            return &.{};
+        }
+    }
+};
+// ZAP_RUNTIME_OS_SEAM_END
+
+// Console-stream selector. Historically the runtime addressed the
+// console by raw fd int (`STDOUT_FD`/`STDERR_FD`/`STDIN_FD`), but those
+// constants are not portable — Windows has no small-int fds and its
+// `std.posix.fd_t` is a `HANDLE`. These three values are now opaque
+// stream tags routed through the `runtime_os` seam, so call sites stay
+// unchanged (`posixWrite(STDERR_FD, …)`) while the actual write targets
+// the right per-OS console primitive.
+const ConsoleStream = enum { stdout, stderr, stdin };
+const STDOUT_FD: ConsoleStream = .stdout;
+const STDERR_FD: ConsoleStream = .stderr;
+const STDIN_FD: ConsoleStream = .stdin;
+
+/// Write `bytes` to the selected console stream through the seam. The
+/// historical name and `(stream, bytes)` call shape are preserved so the
+/// ~150 crash/leak/diagnostic call sites need no edit; only the stream
+/// argument's type changed from a raw fd to a `ConsoleStream` tag. On
+/// POSIX this is the same `std.c.write` loop as before (byte-identical
+/// native behavior). `.stdin` is not writable and is a no-op.
+fn posixWrite(stream: ConsoleStream, bytes: []const u8) void {
+    switch (stream) {
+        .stdout => RuntimeOs.writeStdout(bytes),
+        .stderr => RuntimeOs.writeStderr(bytes),
+        .stdin => {},
     }
 }
 
-fn posixRead(fd: std.posix.fd_t, buf: []u8) usize {
-    return std.posix.read(fd, buf) catch 0;
+/// Read up to `buf.len` bytes from the selected console stream through
+/// the seam. Only `.stdin` reads; the output streams return 0.
+fn posixRead(stream: ConsoleStream, buf: []u8) usize {
+    return switch (stream) {
+        .stdin => RuntimeOs.readStdin(buf),
+        .stdout, .stderr => 0,
+    };
 }
 
 // ============================================================
@@ -84,13 +227,9 @@ var stdout_atexit_registered: bool = false;
 
 fn flushStdoutBuf() void {
     if (stdout_buf_pos == 0) return;
-    var written: usize = 0;
-    while (written < stdout_buf_pos) {
-        const remaining = stdout_buf_pos - written;
-        const rc = std.c.write(STDOUT_FD, stdout_buf[written..].ptr, remaining);
-        if (rc <= 0) break;
-        written += @intCast(rc);
-    }
+    // Route through the seam's stdout write (the same partial-write
+    // `write(2)` loop on POSIX, the right per-OS primitive elsewhere).
+    RuntimeOs.writeStdout(stdout_buf[0..stdout_buf_pos]);
     stdout_buf_pos = 0;
 }
 
@@ -104,15 +243,14 @@ fn stdoutAtexitFlush() callconv(.c) void {
     flushStdoutBuf();
 }
 
-// `std.c.atexit` isn't part of the public `std.c` surface in Zig
-// 0.16; declare the libc symbol directly. Zap binaries link libc
-// unconditionally (`main.zig` builds with `link_libc = true`).
-extern "c" fn atexit(handler: *const fn () callconv(.c) void) c_int;
-
+// Process-exit handler registration routes through the `runtime_os`
+// seam (`RuntimeOs.registerAtExit`) so a target without libc `atexit`
+// (WASI) degrades cleanly. On POSIX/Windows this is libc `atexit`,
+// byte-identical to the previous bare `extern "c" atexit`.
 fn ensureStdoutAtexit() void {
     if (stdout_atexit_registered) return;
     stdout_atexit_registered = true;
-    _ = atexit(stdoutAtexitFlush);
+    _ = RuntimeOs.registerAtExit(stdoutAtexitFlush);
 }
 
 /// Write a slice of bytes to the buffered stdout, flushing once when
@@ -300,22 +438,13 @@ fn loadLinuxCmdline() void {
 
 /// Platform-portable access to process argv (replacement for removed getArgv() in 0.16).
 pub fn getArgv() []const [*:0]const u8 {
-    if (comptime builtin.os.tag == .macos) {
-        const c = struct {
-            extern "c" fn _NSGetArgc() *c_int;
-            extern "c" fn _NSGetArgv() *[*]const [*:0]const u8;
-        };
-        const argc: usize = @intCast(c._NSGetArgc().*);
-        const argv = c._NSGetArgv().*;
-        return argv[0..argc];
-    } else if (comptime builtin.os.tag == .linux) {
-        // Portable, libc-independent argv recovery. Works for static
-        // and dynamic, musl and glibc — no `__libc_argv` dependency.
-        loadLinuxCmdline();
-        return linux_cmdline_ptrs[0..linux_cmdline_argc];
-    } else {
-        return &.{};
-    }
+    // Argv recovery routes through the `runtime_os` seam: macOS uses the
+    // `_NSGetArgv`/`_NSGetArgc` crt globals, linux parses
+    // `/proc/self/cmdline` (libc-independent), Windows uses the mingw
+    // `__argv`/`__argc` globals, and WASI uses preview1 `args_get`. The
+    // POSIX backend's arms are byte-identical to the previous inline
+    // implementation here.
+    return RuntimeOs.argv();
 }
 
 /// Write formatted output to stdout through the buffered writer.
@@ -3009,7 +3138,16 @@ fn zapMemoryStartup() void {
     // Acceptable trade-off — atexit failure is extreme and never
     // observed in practice on hosted Linux/macOS, where the slot
     // table is bounded only by available memory.
-    std.debug.assert(atexit(zapMemoryShutdownAtexit) == 0);
+    //
+    // The registration routes through the `runtime_os` seam. On a
+    // target with no libc `atexit` (WASI) the seam returns a negative
+    // sentinel — the shutdown hook is unavailable there and the runtime
+    // must shut down on its explicit exit path instead. A `0` return is
+    // the libc success contract on POSIX/Windows; a positive return
+    // would be a real registration failure, which the assert still
+    // catches in debug builds.
+    const atexit_rc = RuntimeOs.registerAtExit(zapMemoryShutdownAtexit);
+    std.debug.assert(atexit_rc <= 0);
     active_manager_state.started = true;
 }
 
@@ -3369,7 +3507,7 @@ fn ensureArcStatsAtexit() void {
     arc_stats_atexit_registered = true;
     const value = envGetRuntime("ZAP_ARC_STATS") orelse return;
     if (value.len == 0 or value[0] == '0') return;
-    _ = atexit(arcStatsAtexit);
+    _ = RuntimeOs.registerAtExit(arcStatsAtexit);
 }
 
 // ============================================================
@@ -3494,11 +3632,9 @@ fn instrumentationAllocator() std.mem.Allocator {
 }
 
 fn instrumentationNowNs() u64 {
-    var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    const total: i128 = @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
-    if (total < 0) return 0;
-    return @intCast(total);
+    // Wall-clock nanoseconds since the Unix epoch through the seam
+    // (`std.time.nanoTimestamp`; `clock_gettime` on POSIX).
+    return RuntimeOs.nowNanos();
 }
 
 fn ensureInstrumentationInit() void {
@@ -3512,7 +3648,7 @@ fn ensureInstrumentationInit() void {
     instrumentation_state.initialised = true;
     if (!instrumentation_state.atexit_registered) {
         instrumentation_state.atexit_registered = true;
-        _ = atexit(mapInstrumentationAtexit);
+        _ = RuntimeOs.registerAtExit(mapInstrumentationAtexit);
     }
     if (!instrumentation_state.detail_attempted) {
         instrumentation_state.detail_attempted = true;
@@ -9052,7 +9188,7 @@ pub fn zapCrashReporterInit() void {
     // the later colored renderer needs no startup change.
     const no_color = envGetRuntime("NO_COLOR");
     const no_color_set = no_color != null and no_color.?.len > 0;
-    crash_reporter_config.use_color = !no_color_set and std.c.isatty(STDERR_FD) != 0;
+    crash_reporter_config.use_color = !no_color_set and RuntimeOs.stderrIsTty();
 
     crash_reporter_config.symbols = loadZapSymbols();
 
@@ -11886,15 +12022,11 @@ pub const Kernel = struct {
     pub fn sleep(milliseconds: i64) i64 {
         if (milliseconds <= 0) return milliseconds;
         const ms: u64 = @intCast(milliseconds);
-        var ts = std.posix.timespec{
-            .sec = @intCast(ms / 1000),
-            .nsec = @intCast((ms % 1000) * 1_000_000),
-        };
-        while (true) {
-            const rc = std.c.nanosleep(&ts, &ts);
-            if (rc == 0) break;
-            if (std.posix.errno(rc) != .INTR) break;
-        }
+        // Route through the seam (`std.time.sleep`), which is the
+        // per-OS-portable replacement for the previous `nanosleep`
+        // retry-on-EINTR loop; on POSIX it lowers to the same
+        // `nanosleep` and already retries on `EINTR`.
+        RuntimeOs.sleepNanos(ms * 1_000_000);
         return milliseconds;
     }
 };
@@ -11954,11 +12086,10 @@ pub const Zest = struct {
     var timeout_count: i64 = 0; // number of tests that timed out
 
     fn nowNs() u64 {
-        var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-        const total_ns: i128 = @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
-        if (total_ns <= 0) return 0;
-        return @intCast(total_ns);
+        // Wall-clock nanoseconds since the Unix epoch through the seam
+        // (`std.time.nanoTimestamp` on every OS; `clock_gettime` on
+        // POSIX, so the value is identical to the previous direct call).
+        return RuntimeOs.nowNanos();
     }
 
     pub fn set_seed(s: i64) void {
@@ -11968,11 +12099,11 @@ pub const Zest = struct {
 
     pub fn get_seed() i64 {
         if (!seed_set) {
-            var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
-            _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-            const abs_nanos: i96 = @as(i96, ts.sec) * 1_000_000_000 + @as(i96, ts.nsec);
-            const positive = if (abs_nanos < 0) -abs_nanos else abs_nanos;
-            seed = @intCast(positive & 0x7FFFFFFFFFFFFFFF);
+            // Default seed from the wall clock through the seam. The
+            // value is masked to a non-negative i64, matching the
+            // previous `clock_gettime`-derived seed.
+            const now_ns: u64 = RuntimeOs.nowNanos();
+            seed = @intCast(now_ns & 0x7FFFFFFFFFFFFFFF);
             seed_set = true;
         }
         return seed;
@@ -20916,15 +21047,19 @@ test "runtime: IO.gets handles partial-line buffer boundaries" {
     try std.testing.expectEqual(@as(isize, @intCast(tail_bytes.len)), written);
     _ = libc.close(write_end);
 
-    // Redirect STDIN_FD to point at the pipe's read end. Save the
-    // original fd so we can restore it.
-    const saved_stdin_fd = libc.dup(STDIN_FD);
+    // Redirect stdin to point at the pipe's read end. Save the original
+    // fd so we can restore it. This is host-test-only POSIX scaffolding
+    // (it never ships in a user binary), so it uses the raw
+    // `STDIN_FILENO` descriptor directly rather than the portable
+    // `ConsoleStream` seam tag.
+    const stdin_raw_fd = std.posix.STDIN_FILENO;
+    const saved_stdin_fd = libc.dup(stdin_raw_fd);
     try std.testing.expect(saved_stdin_fd >= 0);
     defer {
-        _ = libc.dup2(saved_stdin_fd, STDIN_FD);
+        _ = libc.dup2(saved_stdin_fd, stdin_raw_fd);
         _ = libc.close(saved_stdin_fd);
     }
-    try std.testing.expect(libc.dup2(read_end, STDIN_FD) >= 0);
+    try std.testing.expect(libc.dup2(read_end, stdin_raw_fd) >= 0);
 
     // Pre-pack the first chunk into the buffer. It does NOT contain
     // a newline — `gets` will consume it into scratch and then call

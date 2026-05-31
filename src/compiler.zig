@@ -12,6 +12,18 @@ const ast = zap.ast;
 // extractEmbeddedZigLib is called from main.zig which has access to it.
 
 const runtime_source = @embedFile("runtime.zig");
+
+// The three `runtime_os` seam backends. They are real, separately
+// type-checked Zig files (`build.zig` compiles each for its own target),
+// but the embedded runtime ships as a single standalone source unit and
+// cannot `@import` siblings — so their bodies are `@embedFile`'d here and
+// spliced inline into the emitted runtime by `rewriteRuntimeSource`
+// (Stage 7), mirroring how the `declared_caps` / `zap_active_manager`
+// markers are rewritten.
+const runtime_os_posix_source = @embedFile("runtime_os/posix.zig");
+const runtime_os_windows_source = @embedFile("runtime_os/windows.zig");
+const runtime_os_wasi_source = @embedFile("runtime_os/wasi.zig");
+
 const lexer = @import("lexer.zig");
 const progress_mod = @import("progress.zig");
 const frontend_policy = @import("frontend_policy.zig");
@@ -10232,6 +10244,64 @@ fn rewriteCacheKey(req: RuntimeRewrite) u128 {
     return key;
 }
 
+/// Extract a `runtime_os` backend body — the text between
+/// `// ZAP_RUNTIME_OS_BODY_BEGIN <tag>` and `// ZAP_RUNTIME_OS_BODY_END
+/// <tag>` (exclusive of the marker lines) — from a backend file's
+/// embedded source. The body is the set of `pub const`/`pub fn`
+/// declarations spliced into the emitted runtime's `RuntimeOs` switch
+/// arm. Panics with a precise message if either marker is missing so a
+/// backend-file refactor that drops a sentinel fails the compile loudly
+/// rather than emitting a malformed runtime.
+fn extractRuntimeOsBody(source: []const u8, comptime tag: []const u8) []const u8 {
+    const begin_marker = "ZAP_RUNTIME_OS_BODY_BEGIN " ++ tag;
+    const end_marker = "ZAP_RUNTIME_OS_BODY_END " ++ tag;
+    const begin_idx = std.mem.indexOf(u8, source, begin_marker) orelse
+        @panic("runtime_os/" ++ tag ++ ".zig is missing the " ++ begin_marker ++ " sentinel");
+    // Body starts after the end of the begin-marker's line.
+    const after_begin = begin_idx + begin_marker.len;
+    const begin_line_end = std.mem.indexOfScalarPos(u8, source, after_begin, '\n') orelse
+        @panic("runtime_os/" ++ tag ++ ".zig: malformed begin sentinel (no newline)");
+    const body_start = begin_line_end + 1;
+    const end_idx = std.mem.indexOfPos(u8, source, body_start, end_marker) orelse
+        @panic("runtime_os/" ++ tag ++ ".zig is missing the " ++ end_marker ++ " sentinel");
+    // Body ends at the start of the end-marker's line. Walk back from
+    // the marker to the preceding newline so the `// ZAP_…END` comment
+    // line itself is excluded.
+    const body_end = std.mem.lastIndexOfScalar(u8, source[0..end_idx], '\n') orelse
+        @panic("runtime_os/" ++ tag ++ ".zig: malformed end sentinel (no preceding newline)");
+    return source[body_start .. body_end + 1];
+}
+
+/// Assemble the comptime-selected three-backend `RuntimeOs` namespace
+/// that replaces the source-level POSIX-only seam in the emitted user
+/// binary. Each backend body is spliced verbatim into a `struct { … }`
+/// arm of a `switch (builtin.os.tag)`; lazy analysis means only the
+/// selected target's arm is ever semantically analyzed, so the wasm and
+/// Windows bodies impose no cost on a native build (and vice versa).
+///
+/// The caller owns the returned buffer.
+fn buildRuntimeOsSeam(allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
+    const posix_body = extractRuntimeOsBody(runtime_os_posix_source, "posix");
+    const windows_body = extractRuntimeOsBody(runtime_os_windows_source, "windows");
+    const wasi_body = extractRuntimeOsBody(runtime_os_wasi_source, "wasi");
+
+    return std.fmt.allocPrint(allocator,
+        \\// ZAP_RUNTIME_OS_SEAM_BEGIN (assembled by compiler.zig: three-backend dispatch)
+        \\const RuntimeOs = switch (builtin.os.tag) {{
+        \\    .windows => struct {{
+        \\{s}
+        \\    }},
+        \\    .wasi => struct {{
+        \\{s}
+        \\    }},
+        \\    else => struct {{
+        \\{s}
+        \\    }},
+        \\}};
+        \\// ZAP_RUNTIME_OS_SEAM_END
+    , .{ windows_body, wasi_body, posix_body });
+}
+
 fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
     const key = rewriteCacheKey(req);
     if (rewritten_runtime_cache.get(key)) |cached| return cached;
@@ -10368,6 +10438,46 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
         @memcpy(prologue_buf[prologue_idx + prologue_replacement.len ..], final_buf[prologue_idx + prologue_needle.len ..]);
         std.heap.page_allocator.free(final_buf);
         final_buf = prologue_buf;
+    }
+
+    // Stage 7: runtime_os seam splice. The source-level seam in
+    // `runtime.zig` is the POSIX backend inline (so the host test build,
+    // which loads `runtime.zig` unrewritten on a POSIX host, stays the
+    // native regression anchor). For EVERY user binary we replace that
+    // region with the comptime-selected three-backend dispatch assembled
+    // from `src/runtime_os/{posix,windows,wasi}.zig`, so a foreign
+    // target compiles its own backend. A native user binary selects the
+    // POSIX arm — identical behavior, but the rewrite is unconditional
+    // so it is self-validating (a missing marker fails the compile).
+    {
+        const seam_begin_marker = "// ZAP_RUNTIME_OS_SEAM_BEGIN";
+        const seam_end_marker = "// ZAP_RUNTIME_OS_SEAM_END";
+        const seam_begin_idx = std.mem.indexOf(u8, final_buf, seam_begin_marker) orelse {
+            @panic("runtime.zig is missing the // ZAP_RUNTIME_OS_SEAM_BEGIN marker; runtime_os seam splice cannot proceed");
+        };
+        const seam_end_find = std.mem.indexOfPos(u8, final_buf, seam_begin_idx, seam_end_marker) orelse {
+            @panic("runtime.zig is missing the // ZAP_RUNTIME_OS_SEAM_END marker; runtime_os seam splice cannot proceed");
+        };
+        // Replace through the end of the END-marker's line (consume the
+        // trailing newline if present) so the generated block — which
+        // carries its own END comment — slots in cleanly.
+        var seam_end_idx = seam_end_find + seam_end_marker.len;
+        if (seam_end_idx < final_buf.len and final_buf[seam_end_idx] == '\n') {
+            seam_end_idx += 1;
+        }
+
+        const assembled = buildRuntimeOsSeam(std.heap.page_allocator) catch
+            @panic("out of memory assembling the runtime_os seam");
+        defer std.heap.page_allocator.free(assembled);
+
+        const seam_total_len = final_buf.len - (seam_end_idx - seam_begin_idx) + assembled.len;
+        var seam_buf = std.heap.page_allocator.alloc(u8, seam_total_len) catch
+            @panic("out of memory rewriting runtime source for the runtime_os seam");
+        @memcpy(seam_buf[0..seam_begin_idx], final_buf[0..seam_begin_idx]);
+        @memcpy(seam_buf[seam_begin_idx .. seam_begin_idx + assembled.len], assembled);
+        @memcpy(seam_buf[seam_begin_idx + assembled.len ..], final_buf[seam_end_idx..]);
+        std.heap.page_allocator.free(final_buf);
+        final_buf = seam_buf;
     }
 
     rewritten_runtime_cache.put(std.heap.page_allocator, key, final_buf) catch

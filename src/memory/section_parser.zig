@@ -49,6 +49,7 @@ pub const ObjectFormat = enum {
     elf,
     macho,
     coff,
+    wasm,
     unknown,
 };
 
@@ -70,6 +71,13 @@ pub fn detectFormat(bytes: []const u8) ObjectFormat {
     }
     const m0_be = std.mem.readInt(u32, bytes[0..4], .big);
     if (m0_be == 0xCAFEBABE) return .macho; // fat
+    // WebAssembly object/module: the 4-byte magic `\0asm` (0x00 0x61
+    // 0x73 0x6D) followed by a 4-byte version. `zig build-obj -target
+    // wasm32-wasi` emits a wasm object with this header; custom sections
+    // (the `.zapmem` metadata) live inside it.
+    if (bytes[0] == 0x00 and bytes[1] == 0x61 and bytes[2] == 0x73 and bytes[3] == 0x6D) {
+        return .wasm;
+    }
     // COFF/PE: a PE *image* starts with the `MZ` DOS stub; a raw COFF
     // *object* (what `zig build-obj -target *-windows-*` emits, and what
     // the manager-object compile produces) has no `MZ` stub — it begins
@@ -130,6 +138,7 @@ pub fn extractSection(bytes: []const u8) ExtractError![]const u8 {
         .elf => extractFromElf(bytes),
         .macho => extractFromMacho(bytes),
         .coff => extractFromCoff(bytes),
+        .wasm => extractFromWasm(bytes),
         .unknown => error.InvalidObject,
     };
 }
@@ -269,6 +278,92 @@ fn trimZeros(name: []const u8) []const u8 {
     var end: usize = name.len;
     while (end > 0 and name[end - 1] == 0) : (end -= 1) {}
     return name[0..end];
+}
+
+/// Read an unsigned LEB128 integer from `bytes` starting at `cursor.*`,
+/// advancing the cursor past the encoded bytes. Returns null on a
+/// truncated or over-long encoding (a `usize`-bounded value cannot
+/// exceed 10 groups). WebAssembly section sizes and name lengths are
+/// ULEB128-encoded.
+fn readUleb128(bytes: []const u8, cursor: *usize) ?usize {
+    var result: usize = 0;
+    var shift: u6 = 0;
+    var produced: usize = 0;
+    while (true) {
+        if (cursor.* >= bytes.len) return null;
+        const byte = bytes[cursor.*];
+        cursor.* += 1;
+        produced += 1;
+        if (produced > 10) return null; // beyond a 64-bit value
+        const low: usize = byte & 0x7F;
+        // Guard the shift against overflow before applying it.
+        if (shift >= @bitSizeOf(usize) and low != 0) return null;
+        if (shift < @bitSizeOf(usize)) {
+            result |= low << shift;
+        }
+        if (byte & 0x80 == 0) break;
+        shift += 7;
+    }
+    return result;
+}
+
+/// WebAssembly extraction. The `.zapmem` metadata ships as a wasm
+/// *custom section* (the manager-side `SECTION_NAME` `.wasm` arm emits
+/// `linksection(".zapmem")`, which the wasm object writer lowers to a
+/// custom section named `.zapmem`).
+///
+/// A wasm binary is an 8-byte header (`\0asm` + u32 version) followed by
+/// a sequence of sections. Each section is:
+///
+///   id        : 1 byte           (0 = custom)
+///   size      : ULEB128          (byte length of the section payload)
+///   <payload> : `size` bytes
+///
+/// For a custom section the payload begins with a name:
+///
+///   name_len  : ULEB128
+///   name      : `name_len` bytes (UTF-8)
+///   <content> : the remainder of the payload
+///
+/// We walk the sections, and for each custom section (id 0) compare its
+/// name to `.zapmem`, returning the content slice on a match.
+fn extractFromWasm(bytes: []const u8) ExtractError![]const u8 {
+    // 8-byte header: magic (4) + version (4). The magic was already
+    // checked by `detectFormat`; require the version word to be present.
+    const wasm_header_len: usize = 8;
+    if (bytes.len < wasm_header_len) return error.InvalidObject;
+
+    var cursor: usize = wasm_header_len;
+    while (cursor < bytes.len) {
+        const section_id = bytes[cursor];
+        cursor += 1;
+
+        const section_size = readUleb128(bytes, &cursor) orelse return error.InvalidObject;
+        // The payload must lie fully within the buffer (overflow-safe).
+        if (section_size > bytes.len or cursor > bytes.len - section_size) {
+            return error.InvalidObject;
+        }
+        const payload_start = cursor;
+        const payload_end = cursor + section_size;
+        // Advance the cursor past this section regardless of match.
+        cursor = payload_end;
+
+        if (section_id != 0) continue; // not a custom section
+
+        // Parse the custom section's name from its payload.
+        var name_cursor = payload_start;
+        const name_len = readUleb128(bytes, &name_cursor) orelse return error.InvalidObject;
+        if (name_len > section_size) return error.InvalidObject;
+        if (name_cursor > payload_end - name_len) return error.InvalidObject;
+        const name = bytes[name_cursor .. name_cursor + name_len];
+
+        if (std.mem.eql(u8, name, ".zapmem")) {
+            const content = bytes[name_cursor + name_len .. payload_end];
+            if (content.len < @sizeOf(ZapMemoryManagerMetaV1)) return error.SectionTooSmall;
+            return content;
+        }
+    }
+    return error.SectionNotFound;
 }
 
 /// COFF extraction. The spec's section name on Windows is `.zapmem`

@@ -279,9 +279,26 @@ pub const ZapCapabilityDescV1 = extern struct {
     vtable: *const anyopaque,
 };
 
+/// Native pointer width in bytes. The vtable-bearing ABI structs carry
+/// function/data pointers whose size and alignment are pointer-width
+/// dependent, so their layout asserts below are expressed RELATIVE to
+/// `PTR` rather than as 64-bit-only literals. On the 64-bit targets
+/// (`PTR == 8`) every derived offset/size reduces to the original v1.0
+/// constants (24/56/48), so the wire/runtime contract is byte-identical;
+/// on wasm32 (`PTR == 4`) the in-memory vtable descriptors are correctly
+/// smaller. The wire-format section payload (`ZapMemoryManagerMetaV1`,
+/// all fixed-width integers) is pointer-INDEPENDENT and keeps its literal
+/// 32-byte assert.
+pub const PTR: usize = @sizeOf(*const anyopaque);
+
 comptime {
-    if (@sizeOf(ZapCapabilityDescV1) != 24) @compileError(
-        "abi: ZapCapabilityDescV1 v1.0 must be exactly 24 bytes",
+    // id:u32(0) version:u16(4) size:u16(6) flags:u32(8) then the
+    // pointer, aligned to `PTR`. The integer prefix is 12 bytes; the
+    // pointer sits at the next `PTR`-aligned offset and the struct's
+    // size is that offset plus one pointer.
+    const desc_vtable_off = std.mem.alignForward(usize, 12, PTR);
+    if (@sizeOf(ZapCapabilityDescV1) != desc_vtable_off + PTR) @compileError(
+        "abi: ZapCapabilityDescV1 size must be its pointer offset plus one pointer width",
     );
     if (@offsetOf(ZapCapabilityDescV1, "id") != 0) @compileError(
         "abi: ZapCapabilityDescV1.id must be at offset 0",
@@ -295,8 +312,8 @@ comptime {
     if (@offsetOf(ZapCapabilityDescV1, "flags") != 8) @compileError(
         "abi: ZapCapabilityDescV1.flags must be at offset 8",
     );
-    if (@offsetOf(ZapCapabilityDescV1, "vtable") != 16) @compileError(
-        "abi: ZapCapabilityDescV1.vtable must be at offset 16",
+    if (@offsetOf(ZapCapabilityDescV1, "vtable") != desc_vtable_off) @compileError(
+        "abi: ZapCapabilityDescV1.vtable must follow the integer prefix at PTR alignment",
     );
 }
 
@@ -328,8 +345,13 @@ pub const ZapMemoryManagerCoreV1 = extern struct {
 };
 
 comptime {
-    if (@sizeOf(ZapMemoryManagerCoreV1) != 56) @compileError(
-        "abi: ZapMemoryManagerCoreV1 v1.0 must be exactly 56 bytes",
+    // Integer prefix is 16 bytes (abi_major:u16, abi_minor:u16,
+    // size:u32, declared_caps:u64), then five function pointers each
+    // `PTR` wide. On 64-bit (`PTR == 8`) this is the original 56-byte
+    // layout with the pointers at 16/24/32/40/48.
+    const core_ptr_base: usize = 16;
+    if (@sizeOf(ZapMemoryManagerCoreV1) != core_ptr_base + 5 * PTR) @compileError(
+        "abi: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers",
     );
     if (@offsetOf(ZapMemoryManagerCoreV1, "abi_major") != 0) @compileError(
         "abi: ZapMemoryManagerCoreV1.abi_major must be at offset 0",
@@ -343,20 +365,20 @@ comptime {
     if (@offsetOf(ZapMemoryManagerCoreV1, "declared_caps") != 8) @compileError(
         "abi: ZapMemoryManagerCoreV1.declared_caps must be at offset 8",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16) @compileError(
-        "abi: ZapMemoryManagerCoreV1.init must be at offset 16",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "init") != core_ptr_base + 0 * PTR) @compileError(
+        "abi: ZapMemoryManagerCoreV1.init must follow the 16-byte prefix",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "deinit") != 24) @compileError(
-        "abi: ZapMemoryManagerCoreV1.deinit must be at offset 24",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deinit") != core_ptr_base + 1 * PTR) @compileError(
+        "abi: ZapMemoryManagerCoreV1.deinit must be the second pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != 32) @compileError(
-        "abi: ZapMemoryManagerCoreV1.allocate must be at offset 32",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != core_ptr_base + 2 * PTR) @compileError(
+        "abi: ZapMemoryManagerCoreV1.allocate must be the third pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 40) @compileError(
-        "abi: ZapMemoryManagerCoreV1.deallocate must be at offset 40",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != core_ptr_base + 3 * PTR) @compileError(
+        "abi: ZapMemoryManagerCoreV1.deallocate must be the fourth pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 48) @compileError(
-        "abi: ZapMemoryManagerCoreV1.get_capability_desc must be at offset 48",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != core_ptr_base + 4 * PTR) @compileError(
+        "abi: ZapMemoryManagerCoreV1.get_capability_desc must be the fifth pointer slot",
     );
 }
 
@@ -399,39 +421,44 @@ pub const ZapRefcountCapabilityV1 = extern struct {
     refcount_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32,
 };
 
-/// The legacy v1.0 byte length of `ZapRefcountCapabilityV1`. A manager
-/// built against ABI v1.0 advertises `desc.size == REFCOUNT_V1_SIZE_V1_0`
-/// (16 bytes). The runtime accepts any `desc.size >= REFCOUNT_V1_SIZE_V1_0`
-/// per the size-field forward-extension contract in spec §2.3.
-pub const REFCOUNT_V1_SIZE_V1_0: u16 = 16;
+/// The legacy v1.0 byte length of `ZapRefcountCapabilityV1` — the first
+/// two pointer slots (`retain`, `release`). A manager built against ABI
+/// v1.0 advertises `desc.size == REFCOUNT_V1_SIZE_V1_0`; the runtime
+/// accepts any `desc.size >= REFCOUNT_V1_SIZE_V1_0` per the size-field
+/// forward-extension contract in spec §2.3. Pointer-width relative
+/// (`2 * PTR`): 16 bytes on 64-bit targets, 8 on wasm32. The manager and
+/// the runtime that compares this value are always compiled for the SAME
+/// target, so the advertised size is internally consistent.
+pub const REFCOUNT_V1_SIZE_V1_0: u16 = @intCast(2 * PTR);
 
-/// The v1.1 byte length of `ZapRefcountCapabilityV1`, including the
-/// side-table extension slots. A v1.1+ manager advertises
-/// `desc.size >= REFCOUNT_V1_SIZE_V1_1` so the runtime can dispatch
-/// generic `Arc(T)` allocations through the sized API path.
-pub const REFCOUNT_V1_SIZE_V1_1: u16 = 48;
+/// The v1.1 byte length of `ZapRefcountCapabilityV1`, including the four
+/// side-table extension slots (all six pointer slots). A v1.1+ manager
+/// advertises `desc.size >= REFCOUNT_V1_SIZE_V1_1` so the runtime can
+/// dispatch generic `Arc(T)` allocations through the sized API path.
+/// Pointer-width relative (`6 * PTR`): 48 bytes on 64-bit, 24 on wasm32.
+pub const REFCOUNT_V1_SIZE_V1_1: u16 = @intCast(6 * PTR);
 
 comptime {
-    if (@sizeOf(ZapRefcountCapabilityV1) != 48) @compileError(
-        "abi: ZapRefcountCapabilityV1 (ABI v1.1, Phase 4.x extension) must be exactly 48 bytes",
+    if (@sizeOf(ZapRefcountCapabilityV1) != 6 * PTR) @compileError(
+        "abi: ZapRefcountCapabilityV1 (ABI v1.1) must be exactly six pointer slots wide",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0) @compileError(
-        "abi: ZapRefcountCapabilityV1.retain must be at offset 0",
+    if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0 * PTR) @compileError(
+        "abi: ZapRefcountCapabilityV1.retain must be the first pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "release") != 8) @compileError(
-        "abi: ZapRefcountCapabilityV1.release must be at offset 8",
+    if (@offsetOf(ZapRefcountCapabilityV1, "release") != 1 * PTR) @compileError(
+        "abi: ZapRefcountCapabilityV1.release must be the second pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "retain_sized") != 16) @compileError(
-        "abi: ZapRefcountCapabilityV1.retain_sized must be at offset 16",
+    if (@offsetOf(ZapRefcountCapabilityV1, "retain_sized") != 2 * PTR) @compileError(
+        "abi: ZapRefcountCapabilityV1.retain_sized must be the third pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "release_sized") != 24) @compileError(
-        "abi: ZapRefcountCapabilityV1.release_sized must be at offset 24",
+    if (@offsetOf(ZapRefcountCapabilityV1, "release_sized") != 3 * PTR) @compileError(
+        "abi: ZapRefcountCapabilityV1.release_sized must be the fourth pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "allocate_refcounted") != 32) @compileError(
-        "abi: ZapRefcountCapabilityV1.allocate_refcounted must be at offset 32",
+    if (@offsetOf(ZapRefcountCapabilityV1, "allocate_refcounted") != 4 * PTR) @compileError(
+        "abi: ZapRefcountCapabilityV1.allocate_refcounted must be the fifth pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "refcount_sized") != 40) @compileError(
-        "abi: ZapRefcountCapabilityV1.refcount_sized must be at offset 40",
+    if (@offsetOf(ZapRefcountCapabilityV1, "refcount_sized") != 5 * PTR) @compileError(
+        "abi: ZapRefcountCapabilityV1.refcount_sized must be the sixth pointer slot",
     );
     if (REFCOUNT_V1_SIZE_V1_1 != @sizeOf(ZapRefcountCapabilityV1)) @compileError(
         "abi: REFCOUNT_V1_SIZE_V1_1 must match the current ZapRefcountCapabilityV1 size",
@@ -446,6 +473,12 @@ test "ZapInitOptions layout is exactly 8 bytes" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(ZapInitOptions));
 }
 
+// These host tests pin the canonical 64-bit ABI layout (the host is a
+// 64-bit target). The pointer-width-RELATIVE comptime asserts above (in
+// terms of `PTR`) are what hold the layout correct on other widths such
+// as wasm32; here we lock the 64-bit numbers explicitly so a refactor
+// that accidentally changed the 64-bit layout still fails the test
+// suite.
 test "ZapCapabilityDescV1 layout is exactly 24 bytes" {
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(ZapCapabilityDescV1));
 }

@@ -469,10 +469,26 @@ fn enforceManagerTargetSupport(
         (declared_caps >> abi.RECLAMATION_MODEL_SHIFT) & abi.RECLAMATION_MODEL_MASK;
     const is_traced = reclamation_model == abi.RECLAMATION_TRACED;
 
-    // The only currently-unsound combination: TRACED × Windows (COFF/PE).
+    // Unsound combination 1: TRACED × Windows (COFF/PE) — conservative
+    // global/stack scanning has no COFF/PE backend yet.
     if (is_traced and os_tag == .windows) {
         diag.write(
             "{s} is unsupported on {s}: conservative global/stack scanning has no COFF/PE backend yet; use Memory.ARC, Memory.Arena, Memory.Leak, Memory.NoOp, or Memory.Tracking",
+            .{ selected_type_name, target_triple },
+        );
+        return ResolveError.ManagerTargetUnsupported;
+    }
+
+    // Unsound combination 2: TRACED × WebAssembly — conservative
+    // scanning is architecturally IMPOSSIBLE on wasm's linear-memory
+    // model (no raw machine stack to scan, no inline-asm register
+    // flush). A TRACED manager there would miss roots and prematurely
+    // reclaim live objects. The backend stays linkable (its SECTION_NAME
+    // has a wasm arm) so a different manager can be monomorphised for
+    // wasm; only SELECTING the tracing manager is rejected.
+    if (is_traced and os_tag == .wasi) {
+        diag.write(
+            "{s} is unsupported on {s}: conservative global/stack scanning is architecturally impossible on WebAssembly's linear-memory model; use Memory.ARC, Memory.Arena, Memory.Leak, Memory.NoOp, or Memory.Tracking",
             .{ selected_type_name, target_triple },
         );
         return ResolveError.ManagerTargetUnsupported;
@@ -1252,12 +1268,23 @@ fn parseTargetTriple(triple: []const u8) ?ZapForkTarget {
     var iter = std.mem.tokenizeAny(u8, triple, "-");
     const arch_str = iter.next() orelse return null;
     const os_str = iter.next() orelse return null;
-    const abi_str = iter.next() orelse return null;
-    if (iter.next() != null) return null; // exactly 3 segments
+    // The ABI segment is OPTIONAL. A two-component `arch-os` triple
+    // (e.g. `wasm32-wasi`) is the canonical spelling for targets whose
+    // ABI is implied by the OS — Zig itself accepts `wasm32-wasi` and
+    // resolves the ABI to `musl` (wasi-libc). When the ABI is omitted we
+    // synthesize the OS's default ABI via `defaultAbiForTriple` so the
+    // downstream fork compile and the section/object parsers see a fully
+    // resolved triple. A three-component triple is taken verbatim.
+    const abi_str_opt = iter.next();
+    if (iter.next() != null) return null; // at most 3 segments
 
     const arch_tag = enumTag(std.Target.Cpu.Arch, arch_str) orelse return null;
     const os_tag = enumTag(std.Target.Os.Tag, os_str) orelse return null;
-    const abi_tag = enumTag(std.Target.Abi, abi_str) orelse return null;
+
+    const abi_tag: usize = if (abi_str_opt) |abi_str|
+        (enumTag(std.Target.Abi, abi_str) orelse return null)
+    else
+        (defaultAbiForTriple(arch_tag, os_tag) orelse return null);
 
     return .{
         .arch_tag = @intCast(arch_tag),
@@ -1265,6 +1292,26 @@ fn parseTargetTriple(triple: []const u8) ?ZapForkTarget {
         .abi_tag = @intCast(abi_tag),
         ._reserved = 0,
     };
+}
+
+/// The default ABI tag for an `arch-os` triple whose ABI segment was
+/// omitted. Mirrors Zig's own triple-resolution defaults for the targets
+/// Zap cross-compiles to: `wasm32-wasi` → `musl` (wasi-libc), `*-macos`
+/// → `none` (Mach-O native), `*-windows` → `gnu` (mingw, Zap's bundled
+/// Windows toolchain). Returns null for an OS with no unambiguous
+/// default so the caller rejects the under-specified triple rather than
+/// guessing. Tag-validity is enforced by the caller via `enumTag`; this
+/// function only chooses which ABI an absent segment implies.
+fn defaultAbiForTriple(arch_tag: usize, os_tag: usize) ?usize {
+    _ = arch_tag;
+    const os: std.Target.Os.Tag = enumFromTag(std.Target.Os.Tag, @intCast(os_tag)) orelse return null;
+    const default_abi: std.Target.Abi = switch (os) {
+        .wasi => .musl,
+        .macos => .none,
+        .windows => .gnu,
+        else => return null,
+    };
+    return @intFromEnum(default_abi);
 }
 
 /// Look up an enum's integer tag value by case-insensitive name match.
@@ -1461,9 +1508,36 @@ test "parseTargetTriple accepts a well-formed triple" {
 }
 
 test "parseTargetTriple rejects malformed input" {
+    // A two-component triple whose OS has NO unambiguous default ABI is
+    // rejected (linux is gnu-or-musl, so the segment is required).
     try std.testing.expectEqual(@as(?ZapForkTarget, null), parseTargetTriple("aarch64-linux"));
     try std.testing.expectEqual(@as(?ZapForkTarget, null), parseTargetTriple("aarch64-linux-gnu-extra"));
     try std.testing.expectEqual(@as(?ZapForkTarget, null), parseTargetTriple("not-a-real-arch"));
+    // A single component is never enough.
+    try std.testing.expectEqual(@as(?ZapForkTarget, null), parseTargetTriple("wasm32"));
+}
+
+test "parseTargetTriple synthesizes the default ABI for a two-component triple" {
+    // `wasm32-wasi` is the canonical two-component spelling; the absent
+    // ABI segment resolves to `musl` (wasi-libc).
+    const wasi = parseTargetTriple("wasm32-wasi") orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(@as(u16, @intCast(@intFromEnum(std.Target.Cpu.Arch.wasm32))), wasi.arch_tag);
+    try std.testing.expectEqual(@as(u16, @intCast(@intFromEnum(std.Target.Os.Tag.wasi))), wasi.os_tag);
+    try std.testing.expectEqual(@as(u16, @intCast(@intFromEnum(std.Target.Abi.musl))), wasi.abi_tag);
+    try std.testing.expectEqual(@as(u16, 0), wasi._reserved);
+
+    // A three-component triple is still taken verbatim (the explicit ABI
+    // wins over any default).
+    const wasi_explicit = parseTargetTriple("wasm32-wasi-musl") orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(wasi.abi_tag, wasi_explicit.abi_tag);
+
+    // `*-macos` (two-component) resolves to `none` (Mach-O native ABI).
+    const macos = parseTargetTriple("aarch64-macos") orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(@as(u16, @intCast(@intFromEnum(std.Target.Abi.none))), macos.abi_tag);
+
+    // `*-windows` (two-component) resolves to `gnu` (mingw).
+    const windows = parseTargetTriple("x86_64-windows") orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(@as(u16, @intCast(@intFromEnum(std.Target.Abi.gnu))), windows.abi_tag);
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,15 +1616,156 @@ const SymbolCheckError = error{
 };
 
 /// Walk the object's symbol table and return `true` iff
-/// `zap_memory_section` is present. Supports ELF64, Mach-O 64-bit, and
-/// COFF — the same formats `section_parser.extractSection` handles.
+/// `zap_memory_section` is present. Supports ELF64, Mach-O 64-bit, COFF,
+/// and WebAssembly — the same formats `section_parser.extractSection`
+/// handles.
 fn managerSymbolPresent(bytes: []const u8) SymbolCheckError!bool {
     return switch (section_parser.detectFormat(bytes)) {
         .elf => elfSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
         .macho => machoSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
         .coff => coffSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
+        .wasm => wasmSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
         .unknown => SymbolCheckError.InvalidObject,
     };
+}
+
+/// Read an unsigned LEB128 integer from `bytes` at `cursor.*`, advancing
+/// the cursor. Returns null on truncation or an over-long encoding.
+fn wasmReadUleb128(bytes: []const u8, cursor: *usize) ?usize {
+    var result: usize = 0;
+    var shift: u6 = 0;
+    var produced: usize = 0;
+    while (true) {
+        if (cursor.* >= bytes.len) return null;
+        const byte = bytes[cursor.*];
+        cursor.* += 1;
+        produced += 1;
+        if (produced > 10) return null;
+        const low: usize = byte & 0x7F;
+        if (shift >= @bitSizeOf(usize) and low != 0) return null;
+        if (shift < @bitSizeOf(usize)) result |= low << shift;
+        if (byte & 0x80 == 0) break;
+        shift += 7;
+    }
+    return result;
+}
+
+/// WebAssembly symbol-presence check. A relocatable wasm object emitted
+/// by LLVM carries a `"linking"` custom section whose `WASM_SYMBOL_TABLE`
+/// subsection (id 8) lists every symbol with its name. We walk that
+/// table and return true when `want` (the exported section-payload
+/// symbol) appears as a defined DATA symbol.
+///
+/// The `linking` section layout (relocatable object, version 2):
+///   custom-section: id 0, size, name="linking"
+///   content: version:ULEB(=2), then subsections:
+///     subsection: id:1byte, size:ULEB, payload
+///   WASM_SYMBOL_TABLE (id 8) payload:
+///     count:ULEB, then `count` syminfo entries:
+///       kind:1byte, flags:ULEB
+///       DATA (kind 1): if defined (flags bit UNDEFINED=0x10 clear):
+///         name_len:ULEB, name, index:ULEB, offset:ULEB, size:ULEB
+///       (undefined DATA carries only name; FUNCTION/GLOBAL/etc. carry an
+///        index and, when not imported, a name)
+fn wasmSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool {
+    const WASM_HEADER_LEN: usize = 8;
+    const SYMTAB_SUBSECTION_ID: u8 = 8;
+    const SYMTAB_KIND_FUNCTION: u8 = 0;
+    const SYMTAB_KIND_DATA: u8 = 1;
+    const SYMTAB_KIND_GLOBAL: u8 = 2;
+    const SYMTAB_KIND_SECTION: u8 = 3;
+    const SYMTAB_KIND_EVENT: u8 = 4;
+    const SYMTAB_KIND_TABLE: u8 = 5;
+    const WASM_SYM_UNDEFINED: usize = 0x10;
+    const WASM_SYM_EXPLICIT_NAME: usize = 0x40;
+
+    if (bytes.len < WASM_HEADER_LEN) return SymbolCheckError.InvalidObject;
+
+    // Find the "linking" custom section.
+    var cursor: usize = WASM_HEADER_LEN;
+    while (cursor < bytes.len) {
+        const section_id = bytes[cursor];
+        cursor += 1;
+        const section_size = wasmReadUleb128(bytes, &cursor) orelse return SymbolCheckError.InvalidObject;
+        if (section_size > bytes.len or cursor > bytes.len - section_size) {
+            return SymbolCheckError.InvalidObject;
+        }
+        const section_end = cursor + section_size;
+        defer cursor = section_end;
+        if (section_id != 0) continue;
+
+        var name_cursor = cursor;
+        const name_len = wasmReadUleb128(bytes, &name_cursor) orelse return SymbolCheckError.InvalidObject;
+        if (name_len > section_size or name_cursor > section_end - name_len) {
+            return SymbolCheckError.InvalidObject;
+        }
+        const sec_name = bytes[name_cursor .. name_cursor + name_len];
+        if (!std.mem.eql(u8, sec_name, "linking")) continue;
+
+        // Parse the linking section: version, then subsections.
+        var p = name_cursor + name_len;
+        _ = wasmReadUleb128(bytes, &p) orelse return SymbolCheckError.InvalidObject; // version
+        while (p < section_end) {
+            const sub_id = bytes[p];
+            p += 1;
+            const sub_size = wasmReadUleb128(bytes, &p) orelse return SymbolCheckError.InvalidObject;
+            if (sub_size > section_end - p) return SymbolCheckError.InvalidObject;
+            const sub_end = p + sub_size;
+            if (sub_id != SYMTAB_SUBSECTION_ID) {
+                p = sub_end;
+                continue;
+            }
+            // WASM_SYMBOL_TABLE.
+            var sp = p;
+            const count = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject;
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                if (sp >= sub_end) return SymbolCheckError.InvalidObject;
+                const kind = bytes[sp];
+                sp += 1;
+                const flags = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject;
+                const undefined_sym = (flags & WASM_SYM_UNDEFINED) != 0;
+                const explicit_name = (flags & WASM_SYM_EXPLICIT_NAME) != 0;
+                switch (kind) {
+                    SYMTAB_KIND_DATA => {
+                        // DATA: always name_len, name; if defined also
+                        // index, offset, size.
+                        const sym_name_len = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject;
+                        if (sym_name_len > sub_end - sp) return SymbolCheckError.InvalidObject;
+                        const sym_name = bytes[sp .. sp + sym_name_len];
+                        sp += sym_name_len;
+                        if (std.mem.eql(u8, sym_name, want) and !undefined_sym) return true;
+                        if (!undefined_sym) {
+                            _ = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject; // index
+                            _ = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject; // offset
+                            _ = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject; // size
+                        }
+                    },
+                    SYMTAB_KIND_FUNCTION, SYMTAB_KIND_GLOBAL, SYMTAB_KIND_EVENT, SYMTAB_KIND_TABLE => {
+                        // index:ULEB, then name (present if defined or
+                        // EXPLICIT_NAME set for an import).
+                        _ = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject; // index
+                        if (!undefined_sym or explicit_name) {
+                            const sym_name_len = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject;
+                            if (sym_name_len > sub_end - sp) return SymbolCheckError.InvalidObject;
+                            sp += sym_name_len;
+                        }
+                    },
+                    SYMTAB_KIND_SECTION => {
+                        // section symbol: section index only, no name.
+                        _ = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject;
+                    },
+                    else => return SymbolCheckError.InvalidObject,
+                }
+            }
+            // Symbol table parsed; the symbol was not found.
+            return false;
+        }
+        // "linking" section had no symbol table subsection.
+        return false;
+    }
+    // No "linking" section ⇒ not a relocatable object we can inspect.
+    return SymbolCheckError.InvalidObject;
 }
 
 fn elfSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool {

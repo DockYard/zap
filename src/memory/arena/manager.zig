@@ -158,27 +158,32 @@ comptime {
     if (@sizeOf(ZapInitOptions) != 8) @compileError(
         "arena: ZapInitOptions v1.0 must be exactly 8 bytes",
     );
-    if (@sizeOf(ZapCapabilityDescV1) != 24) @compileError(
-        "arena: ZapCapabilityDescV1 v1.0 must be exactly 24 bytes",
+    // Vtable structs carry pointers; their layout checks are RELATIVE
+    // to `PTR` (mirroring `src/memory/abi.zig`). On 64-bit (`PTR == 8`)
+    // these reduce to the original 24/56-byte layout; on wasm32 the
+    // descriptors are correctly smaller.
+    const PTR: usize = @sizeOf(*const anyopaque);
+    if (@sizeOf(ZapCapabilityDescV1) != std.mem.alignForward(usize, 12, PTR) + PTR) @compileError(
+        "arena: ZapCapabilityDescV1 size must be its integer prefix plus one pointer",
     );
-    if (@sizeOf(ZapMemoryManagerCoreV1) != 56) @compileError(
-        "arena: ZapMemoryManagerCoreV1 v1.0 must be exactly 56 bytes",
+    if (@sizeOf(ZapMemoryManagerCoreV1) != 16 + 5 * PTR) @compileError(
+        "arena: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers",
     );
 
-    if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16) @compileError(
-        "arena: ZapMemoryManagerCoreV1.init must be at offset 16",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16 + 0 * PTR) @compileError(
+        "arena: ZapMemoryManagerCoreV1.init must follow the 16-byte prefix",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "deinit") != 24) @compileError(
-        "arena: ZapMemoryManagerCoreV1.deinit must be at offset 24",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deinit") != 16 + 1 * PTR) @compileError(
+        "arena: ZapMemoryManagerCoreV1.deinit must be the second pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != 32) @compileError(
-        "arena: ZapMemoryManagerCoreV1.allocate must be at offset 32",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != 16 + 2 * PTR) @compileError(
+        "arena: ZapMemoryManagerCoreV1.allocate must be the third pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 40) @compileError(
-        "arena: ZapMemoryManagerCoreV1.deallocate must be at offset 40",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 16 + 3 * PTR) @compileError(
+        "arena: ZapMemoryManagerCoreV1.deallocate must be the fourth pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 48) @compileError(
-        "arena: ZapMemoryManagerCoreV1.get_capability_desc must be at offset 48",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 16 + 4 * PTR) @compileError(
+        "arena: ZapMemoryManagerCoreV1.get_capability_desc must be the fifth pointer slot",
     );
 }
 
@@ -211,6 +216,10 @@ const SECTION_NAME = switch (builtin.target.ofmt) {
     .elf => ".zapmem",
     .macho => "__DATA,__zapmem",
     .coff => ".zapmem",
+    // WebAssembly custom sections are named directly (no segment
+    // prefix); `linksection(".zapmem")` emits a `.zapmem` custom section
+    // the driver's wasm object reader locates by name.
+    .wasm => ".zapmem",
     else => @compileError("arena: unsupported object format for .zapmem section"),
 };
 

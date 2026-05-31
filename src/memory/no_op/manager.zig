@@ -72,11 +72,16 @@ comptime {
     if (@sizeOf(ZapInitOptions) != 8) @compileError(
         "no_op: ZapInitOptions v1.0 must be exactly 8 bytes",
     );
-    if (@sizeOf(ZapCapabilityDescV1) != 24) @compileError(
-        "no_op: ZapCapabilityDescV1 v1.0 must be exactly 24 bytes",
+    // Vtable structs carry pointers; their size checks are RELATIVE to
+    // `PTR` (mirroring `src/memory/abi.zig`). On 64-bit (`PTR == 8`)
+    // these reduce to the original 24/56-byte layout; on wasm32 the
+    // descriptors are correctly smaller.
+    const PTR: usize = @sizeOf(*const anyopaque);
+    if (@sizeOf(ZapCapabilityDescV1) != std.mem.alignForward(usize, 12, PTR) + PTR) @compileError(
+        "no_op: ZapCapabilityDescV1 size must be its integer prefix plus one pointer",
     );
-    if (@sizeOf(ZapMemoryManagerCoreV1) != 56) @compileError(
-        "no_op: ZapMemoryManagerCoreV1 v1.0 must be exactly 56 bytes",
+    if (@sizeOf(ZapMemoryManagerCoreV1) != 16 + 5 * PTR) @compileError(
+        "no_op: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers",
     );
 }
 
@@ -111,6 +116,10 @@ const SECTION_NAME = switch (builtin.target.ofmt) {
     .elf => ".zapmem",
     .macho => "__DATA,__zapmem",
     .coff => ".zapmem",
+    // WebAssembly custom sections are named directly (no segment
+    // prefix); `linksection(".zapmem")` emits a `.zapmem` custom section
+    // the driver's wasm object reader locates by name.
+    .wasm => ".zapmem",
     else => @compileError("no_op: unsupported object format for .zapmem section"),
 };
 

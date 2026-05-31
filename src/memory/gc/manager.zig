@@ -158,26 +158,33 @@ comptime {
     if (@sizeOf(ZapInitOptions) != 8) @compileError(
         "gc: ZapInitOptions v1.0 must be exactly 8 bytes",
     );
-    if (@sizeOf(ZapCapabilityDescV1) != 24) @compileError(
-        "gc: ZapCapabilityDescV1 v1.0 must be exactly 24 bytes",
+    // Vtable structs carry pointers; their layout checks are RELATIVE
+    // to `PTR` (mirroring `src/memory/abi.zig`). On 64-bit (`PTR == 8`)
+    // these reduce to the original 24/56-byte layout. The GC backend
+    // stays linkable on wasm32 (so a binary monomorphising a different
+    // manager links), though SELECTING it on wasm is rejected by the
+    // driver's capability gate.
+    const PTR: usize = @sizeOf(*const anyopaque);
+    if (@sizeOf(ZapCapabilityDescV1) != std.mem.alignForward(usize, 12, PTR) + PTR) @compileError(
+        "gc: ZapCapabilityDescV1 size must be its integer prefix plus one pointer",
     );
-    if (@sizeOf(ZapMemoryManagerCoreV1) != 56) @compileError(
-        "gc: ZapMemoryManagerCoreV1 v1.0 must be exactly 56 bytes",
+    if (@sizeOf(ZapMemoryManagerCoreV1) != 16 + 5 * PTR) @compileError(
+        "gc: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16) @compileError(
-        "gc: ZapMemoryManagerCoreV1.init must be at offset 16",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16 + 0 * PTR) @compileError(
+        "gc: ZapMemoryManagerCoreV1.init must follow the 16-byte prefix",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "deinit") != 24) @compileError(
-        "gc: ZapMemoryManagerCoreV1.deinit must be at offset 24",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deinit") != 16 + 1 * PTR) @compileError(
+        "gc: ZapMemoryManagerCoreV1.deinit must be the second pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != 32) @compileError(
-        "gc: ZapMemoryManagerCoreV1.allocate must be at offset 32",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != 16 + 2 * PTR) @compileError(
+        "gc: ZapMemoryManagerCoreV1.allocate must be the third pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 40) @compileError(
-        "gc: ZapMemoryManagerCoreV1.deallocate must be at offset 40",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 16 + 3 * PTR) @compileError(
+        "gc: ZapMemoryManagerCoreV1.deallocate must be the fourth pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 48) @compileError(
-        "gc: ZapMemoryManagerCoreV1.get_capability_desc must be at offset 48",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 16 + 4 * PTR) @compileError(
+        "gc: ZapMemoryManagerCoreV1.get_capability_desc must be the fifth pointer slot",
     );
 }
 
@@ -210,6 +217,15 @@ const SECTION_NAME = switch (builtin.target.ofmt) {
     .elf => ".zapmem",
     .macho => "__DATA,__zapmem",
     .coff => ".zapmem",
+    // WebAssembly custom sections are named directly (no segment
+    // prefix). The GC backend stays LINKABLE on wasm so a future binary
+    // that monomorphises a different manager can still link this object,
+    // but SELECTING the GC on wasm is rejected by the driver's
+    // capability gate (`enforceManagerTargetSupport`): conservative
+    // stack/global scanning is architecturally impossible on wasm's
+    // linear-memory model (no raw stack, no register flush), so a
+    // TRACED manager there would silently mis-collect.
+    .wasm => ".zapmem",
     else => @compileError("gc: unsupported object format for .zapmem section"),
 };
 

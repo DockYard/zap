@@ -178,54 +178,62 @@ const ZapMemoryManagerCoreV1 = extern struct {
 };
 
 comptime {
+    // Native pointer width. The vtable-bearing ABI structs carry
+    // pointers, so their size/offset checks are RELATIVE to `PTR`
+    // (mirroring `src/memory/abi.zig`'s `PTR`). On 64-bit targets
+    // (`PTR == 8`) these reduce to the original 24/56/48-byte layout;
+    // on wasm32 (`PTR == 4`) the descriptors are correctly smaller. The
+    // wire-format `ZapMemoryManagerMetaV1` (all fixed-width ints) keeps
+    // its literal 32-byte assert.
+    const PTR: usize = @sizeOf(*const anyopaque);
     if (@sizeOf(ZapMemoryManagerMetaV1) != 32) @compileError(
         "arc: ZapMemoryManagerMetaV1 v1.0 must be exactly 32 bytes",
     );
     if (@sizeOf(ZapInitOptions) != 8) @compileError(
         "arc: ZapInitOptions v1.0 must be exactly 8 bytes",
     );
-    if (@sizeOf(ZapCapabilityDescV1) != 24) @compileError(
-        "arc: ZapCapabilityDescV1 v1.0 must be exactly 24 bytes",
+    if (@sizeOf(ZapCapabilityDescV1) != std.mem.alignForward(usize, 12, PTR) + PTR) @compileError(
+        "arc: ZapCapabilityDescV1 size must be its integer prefix plus one pointer",
     );
-    if (@sizeOf(ZapMemoryManagerCoreV1) != 56) @compileError(
-        "arc: ZapMemoryManagerCoreV1 v1.0 must be exactly 56 bytes",
+    if (@sizeOf(ZapMemoryManagerCoreV1) != 16 + 5 * PTR) @compileError(
+        "arc: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers",
     );
-    if (@sizeOf(ZapRefcountCapabilityV1) != 48) @compileError(
-        "arc: ZapRefcountCapabilityV1 (Phase 4.x extended) must be exactly 48 bytes",
+    if (@sizeOf(ZapRefcountCapabilityV1) != 6 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1 (Phase 4.x extended) must be six pointer slots wide",
     );
 
-    if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16) @compileError(
-        "arc: ZapMemoryManagerCoreV1.init must be at offset 16",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16 + 0 * PTR) @compileError(
+        "arc: ZapMemoryManagerCoreV1.init must follow the 16-byte prefix",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "deinit") != 24) @compileError(
-        "arc: ZapMemoryManagerCoreV1.deinit must be at offset 24",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deinit") != 16 + 1 * PTR) @compileError(
+        "arc: ZapMemoryManagerCoreV1.deinit must be the second pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != 32) @compileError(
-        "arc: ZapMemoryManagerCoreV1.allocate must be at offset 32",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != 16 + 2 * PTR) @compileError(
+        "arc: ZapMemoryManagerCoreV1.allocate must be the third pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 40) @compileError(
-        "arc: ZapMemoryManagerCoreV1.deallocate must be at offset 40",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 16 + 3 * PTR) @compileError(
+        "arc: ZapMemoryManagerCoreV1.deallocate must be the fourth pointer slot",
     );
-    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 48) @compileError(
-        "arc: ZapMemoryManagerCoreV1.get_capability_desc must be at offset 48",
+    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 16 + 4 * PTR) @compileError(
+        "arc: ZapMemoryManagerCoreV1.get_capability_desc must be the fifth pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0) @compileError(
-        "arc: ZapRefcountCapabilityV1.retain must be at offset 0",
+    if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1.retain must be the first pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "release") != 8) @compileError(
-        "arc: ZapRefcountCapabilityV1.release must be at offset 8",
+    if (@offsetOf(ZapRefcountCapabilityV1, "release") != 1 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1.release must be the second pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "retain_sized") != 16) @compileError(
-        "arc: ZapRefcountCapabilityV1.retain_sized must be at offset 16",
+    if (@offsetOf(ZapRefcountCapabilityV1, "retain_sized") != 2 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1.retain_sized must be the third pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "release_sized") != 24) @compileError(
-        "arc: ZapRefcountCapabilityV1.release_sized must be at offset 24",
+    if (@offsetOf(ZapRefcountCapabilityV1, "release_sized") != 3 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1.release_sized must be the fourth pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "allocate_refcounted") != 32) @compileError(
-        "arc: ZapRefcountCapabilityV1.allocate_refcounted must be at offset 32",
+    if (@offsetOf(ZapRefcountCapabilityV1, "allocate_refcounted") != 4 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1.allocate_refcounted must be the fifth pointer slot",
     );
-    if (@offsetOf(ZapRefcountCapabilityV1, "refcount_sized") != 40) @compileError(
-        "arc: ZapRefcountCapabilityV1.refcount_sized must be at offset 40",
+    if (@offsetOf(ZapRefcountCapabilityV1, "refcount_sized") != 5 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1.refcount_sized must be the sixth pointer slot",
     );
 }
 
@@ -264,6 +272,10 @@ const SECTION_NAME = switch (builtin.target.ofmt) {
     .elf => ".zapmem",
     .macho => "__DATA,__zapmem",
     .coff => ".zapmem",
+    // WebAssembly custom sections are named directly (no segment
+    // prefix); `linksection(".zapmem")` emits a `.zapmem` custom section
+    // the driver's wasm object reader locates by name.
+    .wasm => ".zapmem",
     else => @compileError("arc: unsupported object format for .zapmem section"),
 };
 
@@ -840,8 +852,12 @@ const LargeHeader = extern struct {
 };
 
 comptime {
-    if (@sizeOf(LargeHeader) != 24) @compileError(
-        "arc: LargeHeader must be exactly 24 bytes",
+    // Internal large-allocation header (not a cross-tooling ABI type),
+    // so the assert is pointer-width relative: a `u32` magic + `u32`
+    // pad, then a `usize` size, then `u32` alignment + `u32` refcount —
+    // `16 + @sizeOf(usize)` bytes (24 on 64-bit, 20 on wasm32).
+    if (@sizeOf(LargeHeader) != 16 + @sizeOf(usize)) @compileError(
+        "arc: LargeHeader must be its two u32 prefix + usize + two u32 trailer",
     );
 }
 

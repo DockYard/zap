@@ -157,6 +157,56 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_error_format_drift_tests.step);
 
     // -----------------------------------------------------------------------
+    // runtime_os seam backends. The three `src/runtime_os/*.zig` files are
+    // real, separately-compilable Zig — they are `@embedFile`'d into the
+    // compiler and their bodies spliced into the embedded runtime by
+    // `compiler.zig`'s `rewriteRuntimeSource`, but they must also stand
+    // alone so each backend type-checks against its own target's std.
+    //
+    //   * posix.zig  — type-checked AND its `test {}` blocks run natively
+    //     (the native regression anchor is the host target here).
+    //   * wasi.zig   — compile-only check for `wasm32-wasi` (the host can
+    //     type-check the wasm target but cannot run the artifact).
+    //   * windows.zig — compile-only check for `x86_64-windows-gnu`.
+    //
+    // A drift between a backend body and the splice markers, or a std-API
+    // break for any target, fails `zig build test` here rather than only
+    // surfacing at a cross-compile attempt.
+    const runtime_os_posix_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime_os/posix.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_runtime_os_posix_tests = b.addRunArtifact(runtime_os_posix_tests);
+    test_step.dependOn(&run_runtime_os_posix_tests.step);
+
+    const runtime_os_wasi_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime_os/wasi.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi }),
+            .optimize = optimize,
+        }),
+    });
+    // Cross-target: depend on the compile (type-check) only, never the run.
+    test_step.dependOn(&runtime_os_wasi_tests.step);
+
+    const runtime_os_windows_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime_os/windows.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .x86_64,
+                .os_tag = .windows,
+                .abi = .gnu,
+            }),
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    test_step.dependOn(&runtime_os_windows_tests.step);
+
+    // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------
     const user_lib = b.option([]const u8, "zap-compiler-lib", "Path to libzap_compiler.a");
