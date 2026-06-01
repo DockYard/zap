@@ -575,6 +575,19 @@ pub fn build(b: *std.Build) void {
     abort_json_cmd.step.dependOn(b.getInstallStep());
     abort_json_step.dependOn(&abort_json_cmd.step);
 
+    // Phase D crash-handler portability acceptance: the Domain-B crash handler
+    // now lives in the `runtime_os` seam, per-OS. This harness asserts the
+    // portability matrix — native SIGSEGV + panic reports unchanged, WASI
+    // recoverable-raise reports STILL render under wasmtime while a hardware
+    // fault traps cleanly (the `supports_signals=false` degrade), and the
+    // Windows VEH crash backend links as a PE32+ (running under wine where
+    // available). It is a standalone step (matching the other acceptance
+    // harnesses) so the crash-portability invariant is explicitly verifiable.
+    const crash_portability_step = b.step("crash-portability-acceptance", "Assert the Phase-D crash handler is OS-portable: native reports unchanged, WASI degrades + recoverable reports render, Windows VEH links as PE32+");
+    const crash_portability_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_phase_d_crash_portability.sh" });
+    crash_portability_cmd.step.dependOn(b.getInstallStep());
+    crash_portability_step.dependOn(&crash_portability_cmd.step);
+
     // FCC Phase 5 acceptance: the hardening / breadth / precision corpus for
     // first-class closures (aliased fn-returns, nested/cross-box closures,
     // mixed boxed+direct, the boxed-effect-precision cases). Each fixture runs

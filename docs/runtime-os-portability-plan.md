@@ -1,9 +1,15 @@
 # Runtime OS-Portability — Implementation Plan
 
-Status: **proposed, awaiting approval.** Branch `main`. This is **Phase 0 (design)** of an
-approved campaign to make Zap's embedded runtime OS-portable. No runtime/compiler code changes
-in this phase — this document is the foundation for the multi-phase implementation (tasks
-#336/#337/#338 are the downstream cross-compile/port phases this design feeds).
+Status: **COMPLETE — campaign done.** Branch `main`. This document began as **Phase 0 (design)** of
+an approved campaign to make Zap's embedded runtime OS-portable; Phases **A, B, C, and D** have all
+landed (see the per-phase status banners below). The embedded runtime (`src/runtime.zig`) now routes
+**every** OS-divergent domain — console, file I/O, time, entropy, stdin/termios, env, argv, exit,
+atexit, and (Phase D) the crash handler — through the comptime-selected `runtime_os` seam, with a
+capability model that degrades cleanly on targets that cannot support a domain. The CI grep-gate
+(`src/runtime_os_portability_gate.zig`, wired into `zig build test`) ENFORCES this: a raw
+`std.c.`/`std.posix.`/`std.os.` call anywhere in the runtime body outside the seam fails the build.
+Native (darwin/aarch64 + linux/x86_64) is byte-for-byte unchanged; a trivial program runs on
+`wasm32-wasi` under `wasmtime` and links as `x86_64-windows-gnu` `PE32+`.
 
 ## Principle (non-negotiable)
 
@@ -446,20 +452,58 @@ vacuous.
   link as `x86_64-windows-gnu` `PE32+`.
 
 ### Phase D — crash handler (the deep domain; Domain B)
-**Goal:** Windows gets a real crash report via VEH; WASI degrades cleanly (no compile error, trap
-on fatal fault).
-- **windows:** `AddVectoredExceptionHandler` translating exception codes → Zap kind atoms;
-  `RtlCaptureStackBackTrace` for the address list; lean on std's `SelfInfo` PE/PDB path for
-  symbolization, degrade to raw addresses if `SelfInfo == void`; the `.zap-symbols` sidecar reader
-  is already std-portable (`executablePath` + `Io.Dir`).
-- **wasi:** `caps.supports_signals = false` → `installCrashHandlers` is a comptime no-op; a fatal
-  fault traps. The recoverable-`raise`/`@panic`/explicit-crash-report paths (which don't need
-  signals) still render their report through the now-portable console write.
-- Generalize `mainImageSlide` (already switched) and the `object_format` underscore-strip (already
-  gated) into the seam for completeness.
-- **Done =** native crash reports byte-identical (the error-system corpus); a windows
-  divide-by-zero/segfault fixture produces a Zap-format report (run-if-possible); a wasi fixture
-  with a deliberate fault traps cleanly and an explicit `@panic` still prints a report.
+**Status: COMPLETE.** The genuinely OS-divergent crash-handling primitives moved out of the
+`ZAP_RUNTIME_OS_CRASH` region in `runtime.zig` and into the `runtime_os` seam, per-OS (all three
+backends + the inline POSIX seam; POSIX byte-for-byte identical). The crash REPORT renderers, the
+DWARF symbolizer, the `.zap-symbols` sidecar reader, the `Backtrace` capture primitive, and the
+double-fault guard STAY in `runtime.zig` — they were already portable (`posixWrite` → the console
+seam + `std.debug.SelfInfo`, which degrades to raw addresses). Three seam primitives now carry the
+divergence, gated by `caps.supports_signals` / the seam's `supports_fault_handlers`:
+
+- **`imageSlide()`** — the ASLR slide query (posix: `_dyld_get_image_vmaddr_slide`/`dl_iterate_phdr`
+  verbatim; windows/wasi: `0`, no slide notion). Generalizes the prior `mainImageSlide` switch.
+- **`abortProcess(code)`** — the async-signal-safe immediate termination that runs no `atexit`
+  (posix: `_exit`; windows: `TerminateProcess(GetCurrentProcess(),…)`; wasi: `proc_exit`). Replaces
+  the three `std.c._exit` calls (double-fault sink + the two crash-report sinks).
+- **`installCrashHandlers()`** — the hardware-fault interceptor:
+  - **posix:** `sigaction` ×5 (SEGV/BUS/FPE/ILL/TRAP), `SA_SIGINFO|RESETHAND|ONSTACK` — a verbatim
+    lift of `installZapSignalHandlers`; the handler maps the signal → kind/message, captures from
+    the saved CPU context (`fromPosixSignalContext`), and routes to the runtime sink.
+  - **windows:** `RtlAddVectoredExceptionHandler` (VEH). The handler maps
+    `EXCEPTION_RECORD.ExceptionCode` (`ACCESS_VIOLATION`/`STACK_OVERFLOW` → `segmentation_fault`,
+    `DATATYPE_MISALIGNMENT` → `bus_error`, the INT/FLT divide+overflow codes → `arithmetic_error`,
+    `ILLEGAL`/`PRIV_INSTRUCTION` → `illegal_instruction`, `BREAKPOINT` → `trap`) to the SAME Zap kind
+    atoms the posix path produces; builds the unwinder context from
+    `EXCEPTION_POINTERS.ContextRecord` via the fork's `cpu_context.fromWindowsContext`; symbolizes
+    through std's `SelfInfo` PE/PDB path (degrades to addresses if `SelfInfo == void` / no PDB);
+    returns `EXCEPTION_CONTINUE_SEARCH` for unrecognized codes. No fork change was needed — the
+    fork's `cpu_context.fromWindowsContext`, `RtlAddVectoredExceptionHandler`, `EXCEPTION_RECORD`,
+    `EXCEPTION_POINTERS`, and `RtlCaptureStackBackTrace` already exist (and `cpu_context.Native` is a
+    real type for `x86_64-windows`, so the VEH takes the real backtrace path, not the degrade).
+  - **wasi:** `caps.supports_signals = false` → `installCrashHandlers` is a comptime no-op; a fatal
+    fault traps. The recoverable-`raise`/`@panic`/explicit-crash-report paths still render through
+    the portable console seam.
+
+The seam's OS fault handler calls back into four runtime-side contract symbols
+(`crashReportInProgress` / `captureFaultBacktrace` / `emptyBacktrace` / `crashFromFault`), so the
+seam never learns Zap's error-IR `CrashDomain` vocabulary — it stays a general-purpose OS layer. The
+`ZAP_RUNTIME_OS_CRASH` grep-gate allowlist is now **CLOSED**: the crash region holds zero raw per-OS
+calls, so it is scanned as general body like everything else (the `// ZAP_RUNTIME_OS_CRASH_BEGIN`/
+`END` markers remain only as orienting section comments). The runtime is now **fully OS-portable**,
+every domain confined to the seam and enforced by the gate.
+
+**Done =** native crash reports byte-identical: `zig build test` green (incl. the now-crash-covering
+grep-gate + V8 verifier), `zap test` 942/0 + 1366 assertions, golden corpus 14/14 (the
+`runtime_raise`/`arithmetic_overflow`/`index_error`/`leak_report` txt+json snapshots — the proof the
+report output is unchanged), `abort-json-acceptance` 3/3, and the Phase-2.b acceptance harness's real
+stack-overflow **SIGSEGV** + divide-by-zero reports (verifying the migrated
+`installCrashHandlers`→`faultSignalHandler`→`crashFromFault` path produces the identical symbolized
+backtrace). A wasi recoverable-`raise` fixture (`phase_d_wasi_recoverable_raise.zap`) renders its
+`** (runtime_error) …` report under `wasmtime` (and its stdout proves the WASI console seam), while a
+wasi hardware-fault fixture traps cleanly; the Windows VEH crash backend (a divide-by-zero fixture)
+links as `x86_64-windows-gnu` `PE32+` with its `.zap-symbols` sidecar (wine unavailable on this host
+→ link+`file` is the Windows bar). All four are bundled in the
+`crash-portability-acceptance` build step (`script_fixtures/run_phase_d_crash_portability.sh`).
 
 Phase ordering rationale: A delivers a *runnable* foreign binary fastest (console + exit + time +
 argv are the minimum for "it runs"); B and C broaden the runnable surface with the
