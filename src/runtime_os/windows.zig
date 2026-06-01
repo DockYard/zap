@@ -43,8 +43,13 @@ pub const Backend = struct {
         /// console-mode backend lands.
         pub const supports_termios: bool = false;
 
-        /// Symbolization follows the fork's `SelfInfo` (PE/PDB on
-        /// Windows; degrades to `void` → raw addresses otherwise).
+        /// Symbolization follows the fork's `SelfInfo`. On
+        /// `*-windows-gnu` (mingw) the fork emits DWARF `.debug_*`
+        /// sections into the PE and `SelfInfo`'s Windows reader resolves
+        /// them to `file:line:function` (the same DWARF reader the
+        /// native targets use); on `*-windows-msvc` it reads a sibling
+        /// PDB. It degrades to `void` → raw addresses only when
+        /// `SelfInfo == void` for the target.
         pub const supports_backtrace: bool = std.debug.SelfInfo != void;
 
         /// Windows console primitives address streams by `HANDLE`.
@@ -646,10 +651,17 @@ pub const Backend = struct {
     // `cpu_context.fromWindowsContext` (symmetric to POSIX's
     // `fromPosixSignalContext`), captures the backtrace, and routes to the
     // runtime's shared portable crash sink (`crashFromFault`). Symbolization
-    // flows through std's `SelfInfo` PE/PDB path (degrades to raw addresses
-    // when `SelfInfo == void` or no PDB is present — address-level reporting,
-    // which is the documented Phase-D Windows v1 bar). The crash REPORT
-    // renderers themselves are unchanged and target-agnostic.
+    // flows through std's `SelfInfo` Windows path, which the runtime calls
+    // identically on every OS (`runtime.zig`'s `symbolizeAddress` →
+    // `getSelfDebugInfo().getSymbols`). On `*-windows-gnu` the fork emits
+    // DWARF into the PE (the `debug-info=.full` policy keeps it for Debug /
+    // ReleaseSafe; the Mach-O dSYM/strip post-pass is not run for COFF), so
+    // `SelfInfo` resolves frames to `file:line:function` — the same Zap
+    // source `file:line` the native targets report (Phase 0's `.dbg_stmt`
+    // emission). It degrades to address-level only when `SelfInfo == void`
+    // for the target or DWARF is stripped (`-Ddebug-info=none`, ReleaseFast /
+    // ReleaseSmall). The crash REPORT renderers are unchanged and
+    // target-agnostic.
 
     /// No meaningful ASLR-slide story to thread into the offline-resolution
     /// fallback on Windows: the report's de-slide subtraction is the
