@@ -4538,6 +4538,16 @@ pub const GateDiagnostic = struct {
 /// recomputed, so a re-run for a different target produces the correct marker.
 /// A null-caps `target` disables gating (no entry is ever gated). Unknown /
 /// malformed capability atoms append a `GateDiagnostic` to `diagnostics`.
+//
+// ZAP_TARGET_GATE_DECISION_BEGIN
+// Everything between this sentinel and ZAP_TARGET_GATE_DECISION_END is the
+// `@available_on` gate DECISION path. The capability-not-name audit
+// (`src/target_capability_audit.zig`) scans this region and FAILS the build if
+// an OS-name string literal (`"wasi"`, `"windows"`, …) appears here: the gate
+// must decide availability from the capability BITSET
+// (`TargetCapabilitySet.firstMissingFrom`), never by comparing an OS name.
+// OS-name facts live ONLY in `src/target_caps.zig`'s capability-derivation
+// layer (where reading `std.Target` os/arch to COMPUTE the bitset is correct).
 pub fn gateAvailableOn(
     alloc: std.mem.Allocator,
     graph: *scope.ScopeGraph,
@@ -4668,6 +4678,7 @@ fn appendUnknownCapDiagnostic(
     );
     try diagnostics.append(alloc, .{ .message = msg, .span = span });
 }
+// ZAP_TARGET_GATE_DECISION_END
 
 /// Evaluate computed attributes across all structs.
 ///

@@ -246,6 +246,38 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runtime_os_portability_gate.step);
 
     // -----------------------------------------------------------------------
+    // Capability-not-OS-name audit (Phase 4 lock-in for the target-capability
+    // model — `docs/target-capability-model-plan.md`). A native test
+    // (`src/target_capability_audit.zig`) that scans EVERY stdlib source
+    // (`lib/**/*.zap`) and FAILS the build if any `@available_on(:atom)` names
+    // something that is not a capability (an OS name like `:wasi`, or a typo) —
+    // gates must name CAPABILITIES, not OSes — and also scans the gate-decision
+    // region of `src/ctfe.zig` for smuggled OS-name literals. The stdlib file
+    // set is enumerated from the source tree HERE and embedded via a generated
+    // manifest (`stdlib_sources`), so a NEW lib file is audited automatically
+    // with no hand-maintained list to forget. Mirrors the runtime_os
+    // portability gate above.
+    const stdlib_sources_module = generateStdlibSourcesModule(b);
+    const target_capability_audit = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/target_capability_audit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "stdlib_sources", .module = stdlib_sources_module },
+            },
+        }),
+    });
+    const run_target_capability_audit = b.addRunArtifact(target_capability_audit);
+    test_step.dependOn(&run_target_capability_audit.step);
+
+    // A standalone step so the audit can be run in isolation (fast iteration,
+    // and the consolidated Phase-4 verification matrix invokes it directly):
+    // `zig build target-capability-audit`.
+    const audit_step = b.step("target-capability-audit", "Run the capability-not-OS-name stdlib audit (Phase 4 lock-in)");
+    audit_step.dependOn(&run_target_capability_audit.step);
+
+    // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------
     const user_lib = b.option([]const u8, "zap-compiler-lib", "Path to libzap_compiler.a");
@@ -678,6 +710,96 @@ pub fn build(b: *std.Build) void {
     const zir_test_step = b.step("zir-test", "Run ZIR integration tests");
     zir_test_step.dependOn(&run_zir_tests.step);
     zir_test_step.dependOn(b.getInstallStep());
+}
+
+/// Build a module exporting `files`: every `lib/**/*.zap` stdlib source with
+/// its repo-relative path and full bytes, for the capability-not-OS-name audit
+/// (`src/target_capability_audit.zig`). The lib tree is walked HERE (build.zig
+/// runs on the host with filesystem access), each `.zap` copied into a
+/// generated package and `@embedFile`'d, and a manifest source emitted. This
+/// gives the audit the ACTUAL current stdlib with ZERO hand-maintained file
+/// list — a new `lib/*.zap` is enumerated and audited automatically, so the
+/// audit can never develop a silent hole.
+///
+/// The walk is sorted (deterministic build output) and copies each file under
+/// a collision-free flattened name (`/` → `__`) inside the generated package,
+/// while the manifest preserves the ORIGINAL repo-relative path for the audit's
+/// diagnostics. A missing `lib/` dir is a hard build error: the audit losing
+/// its input must never silently pass.
+fn generateStdlibSourcesModule(b: *std.Build) *std.Build.Module {
+    const wf = b.addWriteFiles();
+
+    var rel_paths: std.ArrayList([]const u8) = .empty;
+    defer rel_paths.deinit(b.allocator);
+
+    // This fork's std uses the `std.Io`-based filesystem API: directory and
+    // walker operations take the build graph's `Io` instance.
+    const io = b.graph.io;
+    const lib_root = b.pathFromRoot("lib");
+    var dir = b.build_root.handle.openDir(io, "lib", .{ .iterate = true }) catch |err| {
+        std.debug.panic("target-capability audit: cannot open stdlib dir '{s}': {s}", .{ lib_root, @errorName(err) });
+    };
+    defer dir.close(io);
+
+    var walker = dir.walk(b.allocator) catch |err| {
+        std.debug.panic("target-capability audit: cannot walk stdlib dir: {s}", .{@errorName(err)});
+    };
+    defer walker.deinit();
+    while (walker.next(io) catch |err| {
+        std.debug.panic("target-capability audit: stdlib walk failed: {s}", .{@errorName(err)});
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zap")) continue;
+        // `entry.path` is relative to `lib/`; the repo-relative path is
+        // `lib/<entry.path>` with forward slashes (walker yields OS-native
+        // separators, normalized below for both the manifest and copy name).
+        const normalized = b.dupe(entry.path);
+        std.mem.replaceScalar(u8, normalized, std.fs.path.sep, '/');
+        rel_paths.append(b.allocator, b.fmt("lib/{s}", .{normalized})) catch @panic("OOM");
+    }
+
+    if (rel_paths.items.len == 0) {
+        std.debug.panic("target-capability audit: found zero lib/**/*.zap files under '{s}'", .{lib_root});
+    }
+
+    // Deterministic ordering so the generated manifest (and thus the test
+    // binary) is reproducible across builds.
+    std.mem.sort([]const u8, rel_paths.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lessThan);
+
+    // Build the manifest source by string concatenation. (This fork's Zig 0.16
+    // `ArrayList` has no `.writer()`, so we assemble with `appendSlice` and
+    // `b.fmt` rather than a formatted writer.)
+    var manifest: std.ArrayList(u8) = .empty;
+    defer manifest.deinit(b.allocator);
+    manifest.appendSlice(b.allocator,
+        \\//! GENERATED by build.zig — the stdlib source manifest for the
+        \\//! capability-not-OS-name audit. Do not edit by hand; it is
+        \\//! regenerated from the `lib/**/*.zap` tree on every build.
+        \\
+        \\pub const StdlibFile = struct { path: []const u8, source: []const u8 };
+        \\
+        \\pub const files = [_]StdlibFile{
+        \\
+    ) catch @panic("OOM");
+    for (rel_paths.items) |rel| {
+        // Flatten the repo-relative path to a collision-free embed name inside
+        // the generated package (e.g. `lib/io/mode.zap` → `lib_io_mode.zap`).
+        const flat = b.dupe(rel);
+        std.mem.replaceScalar(u8, flat, '/', '_');
+        _ = wf.addCopyFile(b.path(rel), flat);
+        manifest.appendSlice(b.allocator, b.fmt(
+            "    .{{ .path = \"{s}\", .source = @embedFile(\"{s}\") }},\n",
+            .{ rel, flat },
+        )) catch @panic("OOM");
+    }
+    manifest.appendSlice(b.allocator, "};\n") catch @panic("OOM");
+
+    const manifest_source = wf.add("stdlib_sources.zig", manifest.items);
+    return b.createModule(.{ .root_source_file = manifest_source });
 }
 
 /// Apply the native compiler-backend linkage (the prebuilt
