@@ -4561,12 +4561,26 @@ pub fn gateAvailableOn(
             }
         }
     }
+    // A macro is compile-time-only: it always runs on the host and has no
+    // runtime reference that could be "unavailable on a target", so a
+    // macro-level `@available_on` is a category error — silently ignoring it
+    // would be a footgun (the author would believe the feature is gated when
+    // it is not). The capability a macro's EXPANSION needs is gated correctly
+    // and automatically: the expanded `:zig.`/def reference flows through name
+    // resolution and trips the gate there (verified). So we REJECT a
+    // macro-level `@available_on` with a precise diagnostic redirecting the
+    // author to gate the runtime API instead. (`@available_on` is still
+    // *accepted* on `def`/`struct` — only the meaningless macro placement is an
+    // error; this is distinct from the retired `@requires`, which the collector
+    // rejects outright on macros.)
     for (graph.macro_families.items) |*macro_family| {
-        macro_family.gated_out = null;
         for (macro_family.attributes.items) |*attr| {
-            if (try gateFromAttrAst(alloc, attr, interner, target, diagnostics)) |g| {
-                macro_family.gated_out = g;
-            }
+            if (!std.mem.eql(u8, interner.get(attr.name), "available_on")) continue;
+            const span = if (attr.value) |v| v.getMeta().span else ast.SourceSpan{ .start = 0, .end = 0 };
+            try diagnostics.append(alloc, .{
+                .message = "`@available_on` cannot gate a macro — a macro runs at compile time and has no per-target runtime form. Gate the runtime API the macro expands to (its `def`/`:zig.` call is gated automatically), or move `@available_on` to a `def`/`struct`.",
+                .span = span,
+            });
         }
     }
 }

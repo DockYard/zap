@@ -336,12 +336,12 @@ pub const MacroFamily = struct {
     /// never cached, since two adjacent calls to the same macro must
     /// produce distinguishable scope-set marks for resolution.
     intro_scope: ?ScopeId = null,
-    /// Set by the target-aware CTFE attribute pass when this macro's
-    /// `@available_on(:cap, …)` requires a capability this build's target
-    /// lacks. Note: this is the *target*-capability gate (`@available_on`),
-    /// orthogonal to `required_caps` (the CTFE-eval capability set inferred
-    /// from the body). Null on native and whenever the target satisfies it.
-    gated_out: ?GatedOut = null,
+    // NOTE: there is deliberately no `gated_out` here. A macro is
+    // compile-time-only (it always runs on the host), so a macro-level
+    // `@available_on` is a category error rejected by `ctfe.gateAvailableOn`
+    // with a precise diagnostic — never silently marked. The capability a
+    // macro's EXPANSION needs is gated through the expanded def/`:zig.`
+    // reference at name resolution, which is the real safety boundary.
 
     pub fn init(id: MacroFamilyId, scope_id: ScopeId, name: ast.StringId, arity: u32) MacroFamily {
         return .{
