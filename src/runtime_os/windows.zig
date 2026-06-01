@@ -362,8 +362,211 @@ pub const Backend = struct {
         if (written == 0 or written >= cap) return null;
         return env_value_buf[0..written];
     }
+
+    // ---- Domain B: crash handling / backtrace / VEH (Phase D) ------------
+    //
+    // Windows has no POSIX signal model — hardware faults arrive through
+    // Vectored Exception Handling. `installCrashHandlers` registers a VEH
+    // with `RtlAddVectoredExceptionHandler`; the handler maps the
+    // `EXCEPTION_RECORD.ExceptionCode` to the SAME Zap crash-kind atom the
+    // POSIX `signalKind` path produces, builds the unwinder context from the
+    // `EXCEPTION_POINTERS.ContextRecord` via the fork's
+    // `cpu_context.fromWindowsContext` (symmetric to POSIX's
+    // `fromPosixSignalContext`), captures the backtrace, and routes to the
+    // runtime's shared portable crash sink (`crashFromFault`). Symbolization
+    // flows through std's `SelfInfo` PE/PDB path (degrades to raw addresses
+    // when `SelfInfo == void` or no PDB is present — address-level reporting,
+    // which is the documented Phase-D Windows v1 bar). The crash REPORT
+    // renderers themselves are unchanged and target-agnostic.
+
+    /// No meaningful ASLR-slide story to thread into the offline-resolution
+    /// fallback on Windows: the report's de-slide subtraction is the
+    /// identity (0), so the no-symbol fallback prints the raw runtime
+    /// address. std's `SelfInfo` keys symbolization against the module's own
+    /// loaded base, so symbolized frames are unaffected. (A
+    /// `GetModuleHandleW(null)`-based PE-base story for the addr2line
+    /// fallback is a tracked Windows-symbolization follow-up.)
+    pub fn imageSlide() usize {
+        return 0;
+    }
+
+    /// Terminate the process IMMEDIATELY with `code`, running NO `atexit` /
+    /// CRT / DLL-detach handlers — the Windows analog of the POSIX `_exit`
+    /// the crash path uses. `TerminateProcess(GetCurrentProcess(), code)` is
+    /// the most direct kill available from a VEH context (unlike
+    /// `ExitProcess`, which runs loader detach + CRT atexit and is therefore
+    /// not safe from a half-destroyed crash context). kernel32 is always
+    /// linked on Windows.
+    pub fn abortProcess(code: u8) noreturn {
+        const k = struct {
+            extern "kernel32" fn GetCurrentProcess() callconv(.winapi) std.os.windows.HANDLE;
+            extern "kernel32" fn TerminateProcess(
+                hProcess: std.os.windows.HANDLE,
+                uExitCode: std.os.windows.UINT,
+            ) callconv(.winapi) std.os.windows.BOOL;
+        };
+        _ = k.TerminateProcess(k.GetCurrentProcess(), code);
+        // `TerminateProcess` on the current process does not return; satisfy
+        // the `noreturn` contract for the verifier.
+        unreachable;
+    }
+
+    /// Windows NTSTATUS exception codes not (yet) re-exported by the fork's
+    /// `std.os.windows`. These are stable, documented Win32 constants
+    /// (`winnt.h`); declaring them here keeps the backend self-contained
+    /// without a fork edit. `EXCEPTION_ACCESS_VIOLATION`,
+    /// `EXCEPTION_ILLEGAL_INSTRUCTION`, `EXCEPTION_STACK_OVERFLOW`, and
+    /// `EXCEPTION_DATATYPE_MISALIGNMENT` ARE in std and are used from there.
+    const EXCEPTION_BREAKPOINT: u32 = 0x80000003;
+    const EXCEPTION_INT_DIVIDE_BY_ZERO: u32 = 0xC0000094;
+    const EXCEPTION_INT_OVERFLOW: u32 = 0xC0000095;
+    const EXCEPTION_FLT_DIVIDE_BY_ZERO: u32 = 0xC000008E;
+    const EXCEPTION_FLT_OVERFLOW: u32 = 0xC0000091;
+    const EXCEPTION_FLT_UNDERFLOW: u32 = 0xC0000093;
+    const EXCEPTION_FLT_INVALID_OPERATION: u32 = 0xC0000090;
+    const EXCEPTION_PRIV_INSTRUCTION: u32 = 0xC0000096;
+
+    /// Map a Windows exception code to its Zap crash-report kind atom — the
+    /// SAME snake_case kinds the POSIX `signalKind` produces, so a Windows
+    /// crash report and a POSIX crash report name the fault identically:
+    ///   * access violation / stack overflow → `segmentation_fault`
+    ///     (a wild/overflowing memory access — the SIGSEGV analog)
+    ///   * datatype misalignment            → `bus_error` (SIGBUS analog)
+    ///   * integer/float divide, overflow, invalid op → `arithmetic_error`
+    ///     (the SIGFPE analog, matching `ZapPanic`'s arithmetic kinds)
+    ///   * illegal / privileged instruction → `illegal_instruction`
+    ///   * breakpoint                       → `trap` (SIGTRAP analog)
+    /// Returns `null` for any other code, so the VEH continues the search
+    /// (the exception was not one this handler claims).
+    fn exceptionKind(code: u32) ?[]const u8 {
+        const windows = std.os.windows;
+        return switch (code) {
+            windows.EXCEPTION_ACCESS_VIOLATION, windows.EXCEPTION_STACK_OVERFLOW => "segmentation_fault",
+            windows.EXCEPTION_DATATYPE_MISALIGNMENT => "bus_error",
+            EXCEPTION_INT_DIVIDE_BY_ZERO,
+            EXCEPTION_INT_OVERFLOW,
+            EXCEPTION_FLT_DIVIDE_BY_ZERO,
+            EXCEPTION_FLT_OVERFLOW,
+            EXCEPTION_FLT_UNDERFLOW,
+            EXCEPTION_FLT_INVALID_OPERATION,
+            => "arithmetic_error",
+            windows.EXCEPTION_ILLEGAL_INSTRUCTION, EXCEPTION_PRIV_INSTRUCTION => "illegal_instruction",
+            EXCEPTION_BREAKPOINT => "trap",
+            else => null,
+        };
+    }
+
+    /// A human-readable description of the fault for the report's message
+    /// slot, mirroring the POSIX `signalMessage` wording where the faults
+    /// correspond so the two surfaces read alike.
+    fn exceptionMessage(code: u32) []const u8 {
+        const windows = std.os.windows;
+        return switch (code) {
+            windows.EXCEPTION_ACCESS_VIOLATION => "segmentation fault (invalid memory access)",
+            windows.EXCEPTION_STACK_OVERFLOW => "stack overflow",
+            windows.EXCEPTION_DATATYPE_MISALIGNMENT => "bus error (misaligned memory access)",
+            EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_FLT_DIVIDE_BY_ZERO => "division by zero",
+            EXCEPTION_INT_OVERFLOW => "integer overflow",
+            EXCEPTION_FLT_OVERFLOW, EXCEPTION_FLT_UNDERFLOW, EXCEPTION_FLT_INVALID_OPERATION => "arithmetic exception",
+            windows.EXCEPTION_ILLEGAL_INSTRUCTION => "illegal instruction",
+            EXCEPTION_PRIV_INSTRUCTION => "privileged instruction",
+            EXCEPTION_BREAKPOINT => "trace/breakpoint trap",
+            else => "fatal signal",
+        };
+    }
+
+    /// Windows backtrace capture from a fault context can use the fork's
+    /// `SelfInfo`-aware unwinder when `cpu_context` resolves to a real type
+    /// for this target; on a target where the fork has no Windows unwinder
+    /// (`cpu_context.Native == noreturn`) the VEH still installs and emits an
+    /// address-less header (the Phase-D degrade). This gate mirrors the
+    /// POSIX `signal_handlers_supported`, minus the segfault-handling term
+    /// (which is POSIX-specific).
+    const context_unwind_supported = std.debug.cpu_context.Native != noreturn;
+
+    /// Windows can always intercept hardware faults via VEH (it has no
+    /// `cpu_context`-dependent install step the way POSIX `sigaction` is
+    /// gated), so fault handlers are supported even when symbolization /
+    /// context unwinding is not — the report then degrades to the
+    /// address-less header. The `runtime.zig` call site reads this.
+    pub const supports_fault_handlers: bool = true;
+
+    var veh_handle: ?std.os.windows.LPVOID = null;
+
+    /// The Vectored Exception Handler. Fires for EVERY exception raised in
+    /// the process, so it claims ONLY the hardware-fault codes
+    /// `exceptionKind` recognizes and returns `EXCEPTION_CONTINUE_SEARCH`
+    /// for everything else (letting the program's own `__try`/SEH or the
+    /// default handler run). For a claimed fault it captures the backtrace
+    /// from the `ContextRecord` and routes to the runtime's portable crash
+    /// sink, which terminates via `abortProcess` — so this path is
+    /// `noreturn` for a claimed fault and never actually returns a
+    /// disposition in that case (the `c_long` return type is the VEH ABI).
+    fn vehHandler(info: *std.os.windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
+        const code = info.ExceptionRecord.ExceptionCode;
+        const kind = exceptionKind(code) orelse return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
+        const message = exceptionMessage(code);
+
+        // A report is already underway (a fault re-entered the printer, or a
+        // sibling fatal exception beat it here): divert to the minimal abort
+        // BEFORE the context read/unwind, which can themselves fault.
+        if (crashReportInProgress()) doubleFaultAbort();
+
+        if (comptime context_unwind_supported) {
+            // `fromWindowsContext` returns a by-value `cpu_context.Native`;
+            // bind it so the unwinder can take its address. The saved PC
+            // seeds the first frame, so the trace begins at the faulting
+            // instruction, not this VEH trampoline (symmetric to the POSIX
+            // `fromPosixSignalContext` path).
+            const ctx_local = std.debug.cpu_context.fromWindowsContext(info.ContextRecord);
+            const bt = captureFaultBacktrace(&ctx_local);
+            crashFromFault(kind, message, bt);
+        }
+
+        // No usable unwinder for this target: still emit the unified header
+        // (address-less) so the fault is reported in the Zap format.
+        crashFromFault(kind, message, emptyBacktrace());
+    }
+
+    /// Install the Vectored Exception Handler for hardware faults.
+    /// Idempotent. `First = 1` (TRUE) registers the handler at the FRONT of
+    /// the VEH chain so the Zap crash report fires before any later-added
+    /// handler. kernel32/ntdll are always linked on Windows.
+    pub fn installCrashHandlers() void {
+        if (veh_handle != null) return;
+        veh_handle = std.os.windows.ntdll.RtlAddVectoredExceptionHandler(1, vehHandler);
+    }
     // ZAP_RUNTIME_OS_BODY_END windows
 };
+
+// Standalone stubs for the crash-handler seam↔runtime contract. The spliced
+// body (between the BODY sentinels) calls back into these `runtime.zig`
+// top-level symbols — the portable crash-report sink, the double-fault guard,
+// and the `Backtrace` capture primitive — which are in scope where the body is
+// spliced. For the standalone compile-check build (`zig build test` building
+// this file via `Backend = struct{}` for `x86_64-windows-gnu`) the same names
+// must exist, so these minimal stubs stand in; the splice never sees them
+// (they live outside the sentinels). The production code is in `runtime.zig`.
+const StubBacktrace = extern struct { addresses: [1]usize, len: usize };
+fn crashReportInProgress() bool {
+    return false;
+}
+fn doubleFaultAbort() noreturn {
+    Backend.abortProcess(137);
+}
+fn captureFaultBacktrace(ctx: std.debug.CpuContextPtr) StubBacktrace {
+    _ = ctx;
+    return .{ .addresses = undefined, .len = 0 };
+}
+fn emptyBacktrace() StubBacktrace {
+    return .{ .addresses = undefined, .len = 0 };
+}
+fn crashFromFault(kind: []const u8, message: []const u8, bt: StubBacktrace) noreturn {
+    _ = kind;
+    _ = message;
+    _ = bt;
+    Backend.abortProcess(1);
+}
 
 test "windows backend caps use HANDLE and degrade termios" {
     try std.testing.expect(!Backend.caps.supports_termios);

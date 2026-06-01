@@ -5,21 +5,16 @@
 //! Zap user binary, so any raw per-OS syscall in it (`std.c.write`,
 //! `std.posix.open`, `std.os.linux.getrandom`, …) is a per-OS assumption in
 //! every Zap program on every target. The campaign's architecture confines
-//! such calls to the comptime-selected `runtime_os` seam (and, until Phase D,
-//! the crash-handler region). This test ENFORCES that confinement: it scans
-//! `runtime.zig` and FAILS the build if a raw `std.c.` / `std.posix.` /
-//! `std.os.` call appears OUTSIDE the allowlisted regions.
+//! such calls to the comptime-selected `runtime_os` seam. This test ENFORCES
+//! that confinement: it scans `runtime.zig` and FAILS the build if a raw
+//! `std.c.` / `std.posix.` / `std.os.` call appears OUTSIDE the allowlisted
+//! regions.
 //!
 //! ## Allowlisted regions (where per-OS calls legitimately live)
 //!
 //!  * The `runtime_os` seam — between `// ZAP_RUNTIME_OS_SEAM_BEGIN` and
 //!    `// ZAP_RUNTIME_OS_SEAM_END`. This is the comptime-selected OS-primitive
 //!    layer; per-OS calls are its whole purpose.
-//!  * The Domain-B crash handler — between `// ZAP_RUNTIME_OS_CRASH_BEGIN` and
-//!    `// ZAP_RUNTIME_OS_CRASH_END`. POSIX signals / `_exit` / the ASLR-slide
-//!    query have no uniform `std` abstraction and are the explicit Phase-D
-//!    port; until then their raw calls are allowlisted by this marker so the
-//!    gate tracks the deep domain precisely.
 //!  * Test-only scaffolding — between `// ZAP_RUNTIME_OS_TESTONLY_BEGIN` and
 //!    `// ZAP_RUNTIME_OS_TESTONLY_END` (the `builtin.is_test`-gated ARC
 //!    slab-pool), and inside any top-level `test { … }` / `test "…" { … }`
@@ -33,6 +28,23 @@
 //! runtime body fails this test with the precise `runtime.zig:<line>` and the
 //! offending call, instructing the author to move it into the `runtime_os`
 //! seam. This makes portability ENFORCED architecture, not a convention.
+//!
+//! ## Phase D — the crash handler is now covered as general body
+//!
+//! Through Phase C, the Domain-B crash handler (`// ZAP_RUNTIME_OS_CRASH_BEGIN`
+//! /`END`) was a SEPARATE allowlisted region: its POSIX `sigaction` / `_exit` /
+//! ASLR-slide calls had no uniform `std` abstraction and were the deferred
+//! deep domain. Phase D migrated every one of those OS-divergent primitives
+//! into the `runtime_os` seam (`installCrashHandlers`, `abortProcess`,
+//! `imageSlide`, plus the per-OS fault→kind mapping), so the crash region no
+//! longer contains a single raw per-OS call — only portable `std.debug`
+//! symbolization. The crash allowlist is therefore CLOSED: the crash handler
+//! is scanned as general body like everything else, and a raw per-OS call
+//! reintroduced there fails the gate. The `// ZAP_RUNTIME_OS_CRASH_BEGIN`/`END`
+//! markers remain in `runtime.zig` purely as orienting section comments; they
+//! no longer drive an allowlist. The runtime is now FULLY OS-portable, with
+//! EVERY domain — including the crash handler — confined to the seam and
+//! enforced here.
 
 const std = @import("std");
 
@@ -97,9 +109,13 @@ const RegionMarker = struct {
     end: []const u8,
 };
 
+// NOTE: the Domain-B crash handler (`// ZAP_RUNTIME_OS_CRASH_BEGIN`/`END`) is
+// deliberately NOT listed here — Phase D moved its OS-divergent primitives into
+// the seam, so the crash handler is now scanned as general body (see the module
+// doc's "Phase D" section). The crash markers remain in `runtime.zig` only as
+// orienting section comments.
 const region_markers = [_]RegionMarker{
     .{ .name = "runtime_os seam", .begin = "// ZAP_RUNTIME_OS_SEAM_BEGIN", .end = "// ZAP_RUNTIME_OS_SEAM_END" },
-    .{ .name = "crash handler (Phase D)", .begin = "// ZAP_RUNTIME_OS_CRASH_BEGIN", .end = "// ZAP_RUNTIME_OS_CRASH_END" },
     .{ .name = "test-only scaffolding", .begin = "// ZAP_RUNTIME_OS_TESTONLY_BEGIN", .end = "// ZAP_RUNTIME_OS_TESTONLY_END" },
 };
 
@@ -189,7 +205,6 @@ const Violation = struct {
 const ScanResult = struct {
     violations: []Violation,
     seam_hits: usize,
-    crash_hits: usize,
     testonly_hits: usize,
     testblock_hits: usize,
     irreducible_hits: usize,
@@ -200,7 +215,6 @@ fn scan(allocator: std.mem.Allocator, source: []const u8) !ScanResult {
     errdefer violations.deinit(allocator);
 
     var seam_hits: usize = 0;
-    var crash_hits: usize = 0;
     var testonly_hits: usize = 0;
     var testblock_hits: usize = 0;
     var irreducible_hits: usize = 0;
@@ -275,8 +289,7 @@ fn scan(allocator: std.mem.Allocator, source: []const u8) !ScanResult {
         if (in_region) |region_idx| {
             switch (region_idx) {
                 0 => seam_hits += 1,
-                1 => crash_hits += 1,
-                2 => testonly_hits += 1,
+                1 => testonly_hits += 1,
                 else => {},
             }
             continue;
@@ -301,14 +314,13 @@ fn scan(allocator: std.mem.Allocator, source: []const u8) !ScanResult {
     return .{
         .violations = try violations.toOwnedSlice(allocator),
         .seam_hits = seam_hits,
-        .crash_hits = crash_hits,
         .testonly_hits = testonly_hits,
         .testblock_hits = testblock_hits,
         .irreducible_hits = irreducible_hits,
     };
 }
 
-test "runtime.zig has no raw std.c/std.posix/std.os calls outside the runtime_os seam, crash region, or test scaffolding" {
+test "runtime.zig has no raw std.c/std.posix/std.os calls outside the runtime_os seam or test scaffolding (crash handler now covered)" {
     const allocator = std.testing.allocator;
     const result = try scan(allocator, runtime_source);
     defer allocator.free(result.violations);
@@ -345,11 +357,16 @@ test "runtime.zig has no raw std.c/std.posix/std.os calls outside the runtime_os
     }
 
     // Sanity: the scanner MUST have seen the known per-OS calls in the
-    // allowlisted regions. If these are zero, region tracking is broken (e.g.
-    // a renamed marker), and a "PASS" would be vacuous. The seam and crash
-    // region both contain many raw calls today.
+    // `runtime_os` seam region. If this is zero, region tracking is broken
+    // (e.g. a renamed marker), and a "PASS" would be vacuous — the seam
+    // contains many raw calls today (console write/read, time, exit, entropy,
+    // poll, termios, env, getcwd, AND, since Phase D, the crash primitives:
+    // `imageSlide`'s `_dyld`/`dl_iterate_phdr`, `abortProcess`'s `_exit`, and
+    // the `sigaction` install). The Domain-B crash handler is deliberately NOT
+    // counted here: Phase D closed its allowlist, so it is scanned as general
+    // body — that the general-body scan above found ZERO violations is itself
+    // the proof the crash handler carries no raw per-OS call.
     try std.testing.expect(result.seam_hits > 0);
-    try std.testing.expect(result.crash_hits > 0);
 }
 
 test "gate detects a planted raw call in the general body" {

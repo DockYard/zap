@@ -318,6 +318,48 @@ pub const Backend = struct {
         }
         return null;
     }
+
+    // ---- Domain B: crash handling (Phase D — degrade) --------------------
+    //
+    // WASM has NO signal/exception model, so there is no way to intercept a
+    // hardware fault: `supports_fault_handlers = false`, `installCrashHandlers`
+    // is a comptime no-op, and a fatal fault traps (`unreachable`/`abort` in
+    // the wasm runtime). This is loss-of-rich-crash, NOT loss-of-correctness:
+    // the RECOVERABLE `raise`/`@panic`/explicit-crash-report paths do not go
+    // through the OS fault interceptor — they call the runtime's portable
+    // crash sink directly — so they STILL render a full report through the
+    // `consoleWrite` (`fd_write`) console seam. Only the hardware-fault
+    // interception is unavailable. (Mirrors `caps.supports_signals = false`.)
+
+    /// No ASLR / dynamic load bias under wasm linear memory: the slide is
+    /// always 0 (static == runtime), so the crash report's de-slide
+    /// subtraction is the identity. The `SelfInfo` symbolizer (when the fork
+    /// carries a wasm unwinder) and the `.zap-symbols` side-table render the
+    /// recoverable-path backtrace; otherwise it degrades to raw addresses.
+    pub fn imageSlide() usize {
+        return 0;
+    }
+
+    /// Terminate the process IMMEDIATELY with `code` via preview1
+    /// `proc_exit`, running no `atexit` handlers — the WASI analog of the
+    /// async-signal-safe abort the crash path uses. `proc_exit` does not
+    /// return, so the trailing `unreachable` is never reached (it satisfies
+    /// the `noreturn` contract for the verifier).
+    pub fn abortProcess(code: u8) noreturn {
+        std.os.wasi.proc_exit(code);
+        unreachable;
+    }
+
+    /// WASM has no hardware-fault interception model, so fault handlers are
+    /// unsupported; the `runtime.zig` call site reads this to make
+    /// `installCrashHandlers` a comptime no-op. A fatal hardware fault traps.
+    pub const supports_fault_handlers: bool = false;
+
+    /// No-op: WASM cannot intercept hardware faults (see the section note).
+    /// The recoverable `raise`/`@panic` crash reports still render — they do
+    /// not depend on this install. Matches the campaign's comptime-degrade
+    /// contract, never a compile error.
+    pub fn installCrashHandlers() void {}
     // ZAP_RUNTIME_OS_BODY_END wasi
 };
 

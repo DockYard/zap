@@ -267,6 +267,105 @@ const RuntimeOs = struct {
         const ptr = std.c.getenv(name_z) orelse return null;
         return std.mem.span(ptr);
     }
+
+    // ---- Domain B: crash handling / backtrace / signals (Phase D) --------
+    // See `src/runtime_os/posix.zig` for the authoritative docs; this inline
+    // copy is the host-test (native) anchor. The crash REPORT renderers, the
+    // symbolizer, and the `Backtrace` capture all stay in `runtime.zig` (they
+    // are already portable). Only the OS-divergent surface is here: the ASLR
+    // slide, the async-signal-safe abort, and the `sigaction`-based fault
+    // interception. The handler calls back into the runtime's portable sink
+    // (`crashFromFault`), guard (`crashReportInProgress`/`doubleFaultAbort`),
+    // and capture (`captureFaultBacktrace`/`emptyBacktrace`).
+
+    pub fn imageSlide() usize {
+        switch (comptime builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos, .visionos => {
+                if (std.c._dyld_image_count() == 0) return 0;
+                return std.c._dyld_get_image_vmaddr_slide(0);
+            },
+            .linux => {
+                if (comptime builtin.object_format != .elf) return 0;
+                const Finder = struct {
+                    fn callback(info: *std.c.dl_phdr_info, size: usize, data: ?*anyopaque) callconv(.c) c_int {
+                        _ = size;
+                        const out: *usize = @ptrCast(@alignCast(data.?));
+                        out.* = @intCast(info.addr);
+                        return 1;
+                    }
+                };
+                var slide: usize = 0;
+                _ = std.c.dl_iterate_phdr(Finder.callback, &slide);
+                return slide;
+            },
+            else => return 0,
+        }
+    }
+
+    pub fn abortProcess(code: u8) noreturn {
+        std.c._exit(code);
+    }
+
+    fn signalKind(sig: std.posix.SIG) []const u8 {
+        return switch (sig) {
+            .SEGV => "segmentation_fault",
+            .BUS => "bus_error",
+            .FPE => "arithmetic_error",
+            .ILL => "illegal_instruction",
+            .TRAP => "trap",
+            else => "fatal_signal",
+        };
+    }
+
+    fn signalMessage(sig: std.posix.SIG) []const u8 {
+        return switch (sig) {
+            .SEGV => "segmentation fault (invalid memory access)",
+            .BUS => "bus error (misaligned or non-existent memory access)",
+            .FPE => "arithmetic exception",
+            .ILL => "illegal instruction",
+            .TRAP => "trace/breakpoint trap",
+            else => "fatal signal",
+        };
+    }
+
+    const signal_handlers_supported =
+        std.debug.have_segfault_handling_support and
+        std.debug.cpu_context.Native != noreturn;
+
+    pub const supports_fault_handlers: bool = signal_handlers_supported;
+
+    var signal_handlers_installed: bool = false;
+
+    fn faultSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
+        _ = info;
+        if (crashReportInProgress()) doubleFaultAbort();
+        const kind = signalKind(sig);
+        const message = signalMessage(sig);
+        if (comptime signal_handlers_supported) {
+            if (std.debug.cpu_context.fromPosixSignalContext(ctx_ptr)) |cpu_ctx| {
+                const ctx_local = cpu_ctx;
+                const bt = captureFaultBacktrace(&ctx_local);
+                crashFromFault(kind, message, bt);
+            }
+        }
+        crashFromFault(kind, message, emptyBacktrace());
+    }
+
+    pub fn installCrashHandlers() void {
+        if (comptime !signal_handlers_supported) return;
+        if (signal_handlers_installed) return;
+        signal_handlers_installed = true;
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .sigaction = faultSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.SIGINFO | std.posix.SA.RESETHAND | std.posix.SA.ONSTACK,
+        };
+        std.posix.sigaction(.SEGV, &act, null);
+        std.posix.sigaction(.BUS, &act, null);
+        std.posix.sigaction(.FPE, &act, null);
+        std.posix.sigaction(.ILL, &act, null);
+        std.posix.sigaction(.TRAP, &act, null);
+    }
 };
 // ZAP_RUNTIME_OS_SEAM_END
 
@@ -9281,42 +9380,12 @@ fn loadZapSymbols() ?ZapSymbolReader {
     return ZapSymbolReader.init(bytes);
 }
 
-/// Compute the main executable's runtime ASLR slide ONCE, at startup — NOT
-/// from a signal context. The dyld / loader queries used here take loader
-/// locks and are not async-signal-safe, which is exactly why this is cached
-/// eagerly by `zapCrashReporterInit` (run before any user code) and the crash
-/// path only ever reads the cached `image_slide`.
-///
-/// macOS: image index 0 is always the main executable, and
-/// `_dyld_get_image_vmaddr_slide(0)` returns its slide (the same value `atos
-/// -s` / crash reporters use). Linux/ELF: the first object `dl_iterate_phdr`
-/// visits is the main program; its `dlpi_addr` is the load bias. Other targets
-/// (or a static no-PIE image): slide is 0, so static == runtime.
-fn mainImageSlide() usize {
-    switch (comptime builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => {
-            if (std.c._dyld_image_count() == 0) return 0;
-            return std.c._dyld_get_image_vmaddr_slide(0);
-        },
-        .linux => {
-            if (comptime builtin.object_format != .elf) return 0;
-            const Finder = struct {
-                /// `dl_iterate_phdr` visits the main program first; capture its
-                /// load bias and stop (returning non-zero ends iteration).
-                fn callback(info: *std.c.dl_phdr_info, size: usize, data: ?*anyopaque) callconv(.c) c_int {
-                    _ = size;
-                    const out: *usize = @ptrCast(@alignCast(data.?));
-                    out.* = @intCast(info.addr);
-                    return 1;
-                }
-            };
-            var slide: usize = 0;
-            _ = std.c.dl_iterate_phdr(Finder.callback, &slide);
-            return slide;
-        },
-        else => return 0,
-    }
-}
+// The main-executable ASLR-slide query (`_dyld_get_image_vmaddr_slide` on
+// Darwin, `dl_iterate_phdr` on Linux/ELF, 0 elsewhere) is OS-divergent and
+// lives in the `runtime_os` seam as `RuntimeOs.imageSlide()`. It is called
+// ONCE at startup (NOT from a signal context — the loader queries take loader
+// locks and are not async-signal-safe), and the crash path only ever reads
+// the cached `crash_reporter_config.image_slide`.
 
 /// Read `ZAP_BACKTRACE`, `NO_COLOR`, and the stderr-TTY state ONCE and cache
 /// them, then load the side-table once. Idempotent. Safe to call eagerly at
@@ -9347,8 +9416,9 @@ pub fn zapCrashReporterInit() void {
 
     // Cache the main-image ASLR slide now (startup, non-signal context) so the
     // crash path can render static addresses without any async-signal-unsafe
-    // dyld/loader query.
-    crash_reporter_config.image_slide = mainImageSlide();
+    // dyld/loader query. The slide query is OS-divergent (`_dyld` on Darwin,
+    // `dl_iterate_phdr` on Linux/ELF, 0 elsewhere), so it lives in the seam.
+    crash_reporter_config.image_slide = RuntimeOs.imageSlide();
 }
 
 /// The diagnostic security tier (brief VI.B #9) — runtime MIRROR of
@@ -10619,7 +10689,10 @@ fn enterCrashReport() bool {
 /// is safe from a signal context. `noinline` + `noreturn`.
 noinline fn doubleFaultAbort() noreturn {
     posixWrite(STDERR_FD, ZAP_DOUBLE_FAULT_MARKER);
-    std.c._exit(ZAP_DOUBLE_FAULT_EXIT_CODE);
+    // `abortProcess` is the seam's async-signal-safe immediate termination
+    // (POSIX `_exit`, Windows `ExitProcess`, WASI `proc_exit`) — it runs no
+    // `atexit` handlers, so it is safe from a signal/VEH context.
+    RuntimeOs.abortProcess(ZAP_DOUBLE_FAULT_EXIT_CODE);
 }
 
 /// Test-only: clear the crash-path re-entrancy flag so a unit test can drive
@@ -10677,7 +10750,7 @@ fn emitCrashReportWithBacktrace(domain: CrashDomain, kind: []const u8, message: 
     // the cached flag here is async-signal-safe.
     if (crash_report_format == .json) {
         emitCrashReportJson(domain, kind, message, bt);
-        std.c._exit(1);
+        RuntimeOs.abortProcess(1);
     }
 
     // Header: ** (<kind>) <message>\n — using the SHARED visual-format
@@ -10722,7 +10795,9 @@ fn emitCrashReportWithBacktrace(domain: CrashDomain, kind: []const u8, message: 
     // frames already unwound). No-op for a direct abort (no ERT captured).
     emitErrorReturnTraceSection();
 
-    std.c._exit(1);
+    // Async-signal-safe immediate termination through the seam (POSIX
+    // `_exit`, Windows `ExitProcess`, WASI `proc_exit`) — runs no `atexit`.
+    RuntimeOs.abortProcess(1);
 }
 
 /// The async-signal-safe crash report for the direct `raise` path. Prints
@@ -10995,152 +11070,77 @@ pub const ZapPanic = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Phase 2.b — hardware-fault signal handlers.
+// Phase 2.b / Phase D — hardware-fault interception (the `runtime_os` seam).
 //
-// The root `panic` namespace (`ZapPanic`) routes Zig-level *software*
-// safety checks to the Zap crash printer. But a raw hardware fault —
-// dereferencing a wild pointer (SIGSEGV), a misaligned/cache fault
-// (SIGBUS), a CPU divide trap that bypassed the software check (SIGFPE),
-// an illegal opcode (SIGILL), or a breakpoint/`@trap` (SIGTRAP) — is
-// delivered as a POSIX signal, not through Zig's panic interface. Without
-// a handler the kernel prints nothing and the process dies with a bare
-// signal, which is exactly the unsymbolized "startup SIGTRAP" defect the
-// error-system plan targets.
+// The root `panic` namespace (`ZapPanic`) routes Zig-level *software* safety
+// checks to the Zap crash printer. But a raw hardware fault — dereferencing a
+// wild pointer (SIGSEGV/`EXCEPTION_ACCESS_VIOLATION`), a misaligned/cache fault
+// (SIGBUS), a CPU divide trap (SIGFPE/`EXCEPTION_INT_DIVIDE_BY_ZERO`), an
+// illegal opcode (SIGILL/`EXCEPTION_ILLEGAL_INSTRUCTION`), or a breakpoint/
+// `@trap` (SIGTRAP/`EXCEPTION_BREAKPOINT`) — is delivered by the OS, not
+// through Zig's panic interface. The interception mechanism is the one
+// genuinely OS-divergent piece of the crash subsystem (POSIX `sigaction`,
+// Windows Vectored Exception Handling, WASI nothing), so in Phase D it moved
+// into `RuntimeOs.installCrashHandlers` — each backend installs its own
+// fault interceptor, maps the OS fault code to the SAME Zap crash-kind atom,
+// captures the backtrace from the OS-saved context, and routes to the shared,
+// PORTABLE crash sink below (`crashFromFault`).
 //
-// `installZapSignalHandlers` registers an `SA_SIGINFO` handler for each of
-// these signals. The handler unwinds from the *interrupted* CPU context
-// (so the report points at the faulting frame, not the handler) and emits
-// the same unified `** (<kind>) <message>` + Zap backtrace as every other
-// crash path. It is async-signal-safe: pure `write`(2) + `_exit`, the
-// page-allocator-backed DWARF arena, and `SA_RESETHAND` so a fault *inside*
-// the handler falls back to the default disposition instead of looping.
-// `SA_RESETHAND` is defense-in-depth; the primary double-fault guard is the
-// explicit `crash_report_in_progress` flag (Phase 2.e) checked at handler
-// entry and at the top of `emitCrashReportWithBacktrace`, which also catches
-// a *different* fatal signal (or an in-printer panic) that RESETHAND misses.
+// Everything downstream of "capture addresses → render report" — the
+// symbolizer, the `.zap-symbols` side-table, the text/JSON renderers, the
+// double-fault guard — is unchanged and target-agnostic (it uses `posixWrite`
+// → the console seam and `std.debug.SelfInfo`, which degrades to raw
+// addresses). The handler in the seam calls back into these four runtime-side
+// contract symbols, which are in scope where the seam body is spliced.
+// `RuntimeOs.caps.supports_signals` (and the seam's
+// `supports_fault_handlers`) gate the install: WASI has no fault model, so
+// `installCrashHandlers` is a comptime no-op there and a hardware fault traps
+// — but the recoverable `raise`/`@panic` reports still render through this
+// same portable sink, since they never went through the OS fault path.
 // ---------------------------------------------------------------------------
 
-/// True on targets where the fork's `captureCurrentStackTrace` can unwind
-/// from a POSIX signal's saved CPU context. `cpu_context.Native` is
-/// `noreturn` on unsupported targets (and `CpuContextPtr` follows), so this
-/// gates the whole signal-handler subsystem at comptime; on an unsupported
-/// target `installZapSignalHandlers` is a no-op and the default signal
-/// disposition stands.
-const zap_signal_handlers_supported =
-    std.debug.have_segfault_handling_support and
-    builtin.os.tag != .windows and
-    std.debug.cpu_context.Native != noreturn;
-
-/// Map a fault signal to its Zap crash-report kind atom. SIGFPE is an
-/// `arithmetic_error` (it is the hardware sibling of the software
-/// divide-by-zero/overflow checks `ZapPanic` already maps there); the
-/// memory/instruction faults each get a dedicated kind so the report names
-/// the fault precisely. Kinds are snake-case to match the `Error.kind`
-/// convention used everywhere else in the crash report.
-fn zapSignalKind(sig: std.posix.SIG) []const u8 {
-    return switch (sig) {
-        .SEGV => "segmentation_fault",
-        .BUS => "bus_error",
-        .FPE => "arithmetic_error",
-        .ILL => "illegal_instruction",
-        .TRAP => "trap",
-        else => "fatal_signal",
-    };
+/// Observe (without claiming) whether the crash path is already underway.
+/// The seam's fault handler calls this BEFORE reading the OS-saved context or
+/// unwinding — both of which can themselves fault — so a second fatal fault
+/// arriving mid-report diverts straight to `doubleFaultAbort` rather than
+/// re-running the work that may have just faulted. `@atomicLoad` (not the
+/// claiming `enterCrashReport` RMW) so the single claim stays in
+/// `emitCrashReportWithBacktrace`; `seq_cst` matches the guard's other
+/// accesses. This is the runtime side of the Phase-D seam↔runtime contract.
+fn crashReportInProgress() bool {
+    return @atomicLoad(bool, &crash_report_in_progress, .seq_cst);
 }
 
-/// A human-readable description of the fault for the report's message
-/// slot. Mirrors the fork's own signal names so a Zap report and a Zig
-/// report describe the same fault identically.
-fn zapSignalMessage(sig: std.posix.SIG) []const u8 {
-    return switch (sig) {
-        .SEGV => "segmentation fault (invalid memory access)",
-        .BUS => "bus error (misaligned or non-existent memory access)",
-        .FPE => "arithmetic exception",
-        .ILL => "illegal instruction",
-        .TRAP => "trace/breakpoint trap",
-        else => "fatal signal",
-    };
+/// Capture the call stack of a fault-interrupted thread from the OS-saved CPU
+/// context (whose program counter seeds the first frame, so the trace begins
+/// at the faulting instruction, not the handler). Allocation-free,
+/// async-signal-safe. The runtime side of the seam↔runtime contract: the
+/// POSIX fault handler passes the `cpu_context.Native` it extracted from the
+/// `siginfo` context; a future Windows VEH passes the one it builds from the
+/// `EXCEPTION_POINTERS.ContextRecord`.
+fn captureFaultBacktrace(ctx: std.debug.CpuContextPtr) Backtrace {
+    return Backtrace.captureFromContext(ctx);
 }
 
-/// The `SA_SIGINFO` handler installed for every hardware-fault signal.
-/// Async-signal-safe: it reads the saved CPU context, captures a backtrace
-/// from the faulting frame, and routes to the shared crash-report sink,
-/// which terminates via `_exit`. `crash_reporter_config` was populated at
-/// startup by `installZapCrashHandlers`, so this path performs no
-/// `getenv`/file IO.
-///
-/// `SA_RESETHAND` was set at install time, so if unwinding or printing
-/// itself faults, the *second* delivery of that signal uses the default
-/// disposition and the process dies immediately instead of recursing.
-///
-/// Double-fault contained (Phase 2.e): `SA_RESETHAND` only catches
-/// re-delivery of the *same* signal. A *different* fatal signal arriving
-/// while the crash printer runs (e.g. a SIGSEGV during the symbolizer, then a
-/// SIGBUS) would re-enter this handler with a fresh disposition. The explicit
-/// `crash_report_in_progress` check below catches that: if a report is
-/// already underway, this is a second fault, so we abort minimally *before*
-/// touching the (possibly corrupt) CPU context — the context extraction and
-/// stack walk are themselves things that can fault, so they must not run a
-/// second time. The non-re-entrant first delivery falls through and claims
-/// the guard inside `emitCrashReportWithBacktrace`.
-fn zapSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
-    _ = info;
-
-    // A report is already in progress: this signal interrupted the crash
-    // printer (or a sibling fatal signal beat it here). Diverting to the
-    // minimal abort BEFORE the context read/unwind avoids re-running the very
-    // work that may have just faulted. `@atomicLoad` (not `enterCrashReport`)
-    // so we observe-without-claiming — the single claim stays in `emit`.
-    if (@atomicLoad(bool, &crash_report_in_progress, .seq_cst)) doubleFaultAbort();
-
-    const kind = zapSignalKind(sig);
-    const message = zapSignalMessage(sig);
-
-    if (comptime zap_signal_handlers_supported) {
-        if (std.debug.cpu_context.fromPosixSignalContext(ctx_ptr)) |cpu_ctx| {
-            // `fromPosixSignalContext` returns a by-value `cpu_context.Native`;
-            // bind it to a local so the unwinder can take its address.
-            const ctx_local = cpu_ctx;
-            const bt = Backtrace.captureFromContext(&ctx_local);
-            // A hardware-fault signal (SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGTRAP) is
-            // a language-level failure: domain `.panic`. The format was
-            // resolved at startup (`zapCrashReporterInit`), so no `getenv` here.
-            emitCrashReportWithBacktrace(.panic, kind, message, bt);
-        }
-    }
-
-    // No usable CPU context (unsupported target or extraction failed):
-    // still emit the unified header so the fault is reported in the Zap
-    // format, just without a symbolized backtrace.
-    emitCrashReportWithBacktrace(.panic, kind, message, .{ .addresses = undefined, .len = 0 });
+/// An empty backtrace, for the fault path when no usable CPU context could be
+/// recovered: the unified header still renders, just without a symbolized
+/// trace. The runtime side of the seam↔runtime contract.
+fn emptyBacktrace() Backtrace {
+    return .{ .addresses = undefined, .len = 0 };
 }
 
-/// Install the `SA_SIGINFO` Zap crash handler for the hardware-fault
-/// signals (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP). Idempotent — guarded
-/// by `zap_signal_handlers_installed` — and a comptime no-op on targets
-/// that cannot unwind a signal context. Uses `SA_ONSTACK` so a
-/// stack-overflow SIGSEGV can still be handled on the alternate signal
-/// stack (configured by the std library when `signal_stack_size` is set),
-/// and `SA_RESETHAND` as defense-in-depth behind the explicit Phase 2.e
-/// `crash_report_in_progress` double-fault guard.
-fn installZapSignalHandlers() void {
-    if (comptime !zap_signal_handlers_supported) return;
-    if (zap_signal_handlers_installed) return;
-    zap_signal_handlers_installed = true;
-
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .sigaction = zapSignalHandler },
-        .mask = std.posix.sigemptyset(),
-        .flags = std.posix.SA.SIGINFO | std.posix.SA.RESETHAND | std.posix.SA.ONSTACK,
-    };
-    std.posix.sigaction(.SEGV, &act, null);
-    std.posix.sigaction(.BUS, &act, null);
-    std.posix.sigaction(.FPE, &act, null);
-    std.posix.sigaction(.ILL, &act, null);
-    std.posix.sigaction(.TRAP, &act, null);
+/// The shared, portable crash sink the seam's OS fault handler routes into.
+/// A hardware fault is always a language-level failure, so the canonical
+/// domain is `.panic`; no error-return trace is captured on this path (a
+/// fault is not a propagated `raise`, so the JSON `error_return_trace` is
+/// `[]`). The crash-reporter config was populated at startup
+/// (`installZapCrashHandlers` → `zapCrashReporterInit`), so this path performs
+/// no `getenv`/file IO — it is async-signal-safe. The runtime side of the
+/// seam↔runtime contract: it hides the `CrashDomain` enum from the seam (which
+/// is a general-purpose OS layer and must not know Zap's error-IR vocabulary).
+fn crashFromFault(kind: []const u8, message: []const u8, bt: Backtrace) noreturn {
+    emitCrashReportWithBacktrace(.panic, kind, message, bt);
 }
-
-var zap_signal_handlers_installed: bool = false;
 
 /// One-time program-startup setup for the entire crash-reporting
 /// subsystem. Called from the entry-point prologue (`memoryStartupForEntry`)
@@ -11148,11 +11148,14 @@ var zap_signal_handlers_installed: bool = false;
 /// operation can run. Does the non-async-signal-safe work up front —
 /// caching `ZAP_BACKTRACE`/`NO_COLOR`/TTY state and loading the
 /// `.zap-symbols` sidecar via `zapCrashReporterInit` — so the per-crash
-/// path (panic handler or signal handler) stays signal-safe, then installs
-/// the hardware-fault signal handlers. Idempotent.
+/// path (panic handler or fault handler) stays signal-safe, then installs
+/// the OS hardware-fault interceptor through the `runtime_os` seam
+/// (`RuntimeOs.installCrashHandlers`): POSIX `sigaction`, Windows VEH, or a
+/// comptime no-op on WASI (no fault model — a hardware fault traps there,
+/// while recoverable `raise`/`@panic` reports still render). Idempotent.
 pub fn installZapCrashHandlers() void {
     zapCrashReporterInit();
-    installZapSignalHandlers();
+    RuntimeOs.installCrashHandlers();
 }
 // ZAP_RUNTIME_OS_CRASH_END
 

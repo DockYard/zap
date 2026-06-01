@@ -277,6 +277,181 @@ pub const Backend = struct {
         const ptr = std.c.getenv(name_z) orelse return null;
         return std.mem.span(ptr);
     }
+
+    // ---- Domain B: crash handling / backtrace / signals (Phase D) --------
+    //
+    // The crash REPORT renderers, the DWARF symbolizer, the `.zap-symbols`
+    // sidecar reader, the double-fault guard, and the `Backtrace` capture
+    // primitive all live in `runtime.zig` and are already portable (they
+    // use `posixWrite` → the console seam and `std.debug.SelfInfo`, which
+    // degrades to raw addresses). Only the genuinely OS-divergent surface
+    // is carried here: the ASLR image slide, the async-signal-safe abort,
+    // and the hardware-fault interception (POSIX `sigaction`; Windows VEH;
+    // WASI none). The handler trampoline calls back into the runtime's
+    // portable sink (`crashFromFault`) and capture primitive
+    // (`Backtrace.captureFromContext`) — both top-level `runtime.zig`
+    // symbols in scope where this body is spliced.
+
+    /// Compute the main executable's runtime ASLR slide ONCE, at startup
+    /// (NOT from a signal context — the loader queries take loader locks
+    /// and are not async-signal-safe). The crash path subtracts this from
+    /// each return address before the `0x<addr>` fallback so the report
+    /// emits STATIC (file-relative) addresses (brief VI.B #9). A
+    /// byte-for-byte lift of the runtime's previous `mainImageSlide`.
+    ///
+    /// macOS: image index 0 is the main executable;
+    /// `_dyld_get_image_vmaddr_slide(0)` returns its slide. Linux/ELF: the
+    /// first object `dl_iterate_phdr` visits is the main program; its
+    /// `dlpi_addr` is the load bias. Other POSIX targets (or a static
+    /// no-PIE image): slide is 0 (static == runtime).
+    pub fn imageSlide() usize {
+        switch (comptime builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos, .visionos => {
+                if (std.c._dyld_image_count() == 0) return 0;
+                return std.c._dyld_get_image_vmaddr_slide(0);
+            },
+            .linux => {
+                if (comptime builtin.object_format != .elf) return 0;
+                const Finder = struct {
+                    /// `dl_iterate_phdr` visits the main program first;
+                    /// capture its load bias and stop (non-zero ends it).
+                    fn callback(info: *std.c.dl_phdr_info, size: usize, data: ?*anyopaque) callconv(.c) c_int {
+                        _ = size;
+                        const out: *usize = @ptrCast(@alignCast(data.?));
+                        out.* = @intCast(info.addr);
+                        return 1;
+                    }
+                };
+                var slide: usize = 0;
+                _ = std.c.dl_iterate_phdr(Finder.callback, &slide);
+                return slide;
+            },
+            else => return 0,
+        }
+    }
+
+    /// Terminate the process IMMEDIATELY with `code`, running NO `atexit`
+    /// handlers and performing no flushing — the async-signal-safe abort
+    /// the crash path uses (a fault handler must not run `atexit`, which is
+    /// not async-signal-safe). A byte-for-byte lift of the runtime's prior
+    /// `std.c._exit(code)`. Distinct from `exitProcess`, which is the
+    /// NORMAL exit and DOES run `atexit`.
+    pub fn abortProcess(code: u8) noreturn {
+        std.c._exit(code);
+    }
+
+    /// Map a fault signal to its Zap crash-report kind atom. SIGFPE is an
+    /// `arithmetic_error` (the hardware sibling of the software
+    /// divide-by-zero/overflow checks); the memory/instruction faults each
+    /// get a dedicated kind. Snake-case to match the `Error.kind`
+    /// convention. A verbatim lift of the runtime's prior `zapSignalKind`.
+    fn signalKind(sig: std.posix.SIG) []const u8 {
+        return switch (sig) {
+            .SEGV => "segmentation_fault",
+            .BUS => "bus_error",
+            .FPE => "arithmetic_error",
+            .ILL => "illegal_instruction",
+            .TRAP => "trap",
+            else => "fatal_signal",
+        };
+    }
+
+    /// A human-readable description of the fault for the report's message
+    /// slot. Mirrors the fork's own signal names. A verbatim lift of the
+    /// runtime's prior `zapSignalMessage`.
+    fn signalMessage(sig: std.posix.SIG) []const u8 {
+        return switch (sig) {
+            .SEGV => "segmentation fault (invalid memory access)",
+            .BUS => "bus error (misaligned or non-existent memory access)",
+            .FPE => "arithmetic exception",
+            .ILL => "illegal instruction",
+            .TRAP => "trace/breakpoint trap",
+            else => "fatal signal",
+        };
+    }
+
+    /// True on targets where the fork's `captureCurrentStackTrace` can
+    /// unwind from a POSIX signal's saved CPU context. `cpu_context.Native`
+    /// is `noreturn` on unsupported targets (and `CpuContextPtr` follows),
+    /// so this gates the whole signal-handler subsystem at comptime; on an
+    /// unsupported target `installCrashHandlers` is a no-op and the default
+    /// signal disposition stands. A verbatim lift of the runtime's prior
+    /// `zap_signal_handlers_supported` (minus the `os.tag != .windows`
+    /// term, which is implicit: this body is the non-Windows arm).
+    const signal_handlers_supported =
+        std.debug.have_segfault_handling_support and
+        std.debug.cpu_context.Native != noreturn;
+
+    /// Whether hardware-fault interception is wired on this target. The
+    /// `runtime.zig` call site reads this to decide whether to install the
+    /// handler at startup; it is the seam-level generalization of the
+    /// prior `zap_signal_handlers_supported` gate.
+    pub const supports_fault_handlers: bool = signal_handlers_supported;
+
+    var signal_handlers_installed: bool = false;
+
+    /// The `SA_SIGINFO` handler installed for every hardware-fault signal.
+    /// Async-signal-safe: reads the saved CPU context, captures a backtrace
+    /// from the faulting frame, and routes to the runtime's shared crash
+    /// sink (`crashFromFault`), which terminates via `abortProcess`. The
+    /// double-fault observe-without-claim happens in `crashFromFault`, but
+    /// a report already in progress is short-circuited HERE (before the
+    /// context read/unwind, which can themselves fault) — a verbatim lift
+    /// of the runtime's prior `zapSignalHandler`.
+    fn faultSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) noreturn {
+        _ = info;
+
+        // A report is already underway: this signal interrupted the crash
+        // printer (or a sibling fatal signal beat it here). Divert to the
+        // minimal abort BEFORE the context read/unwind. `@atomicLoad` (not
+        // a claiming RMW) so we observe-without-claiming; the single claim
+        // stays in `crashFromFault`.
+        if (crashReportInProgress()) doubleFaultAbort();
+
+        const kind = signalKind(sig);
+        const message = signalMessage(sig);
+
+        if (comptime signal_handlers_supported) {
+            if (std.debug.cpu_context.fromPosixSignalContext(ctx_ptr)) |cpu_ctx| {
+                // `fromPosixSignalContext` returns a by-value
+                // `cpu_context.Native`; bind it so the unwinder can take
+                // its address. The PC seeds the first frame, so the trace
+                // begins at the faulting instruction, not this handler.
+                const ctx_local = cpu_ctx;
+                const bt = captureFaultBacktrace(&ctx_local);
+                crashFromFault(kind, message, bt);
+            }
+        }
+
+        // No usable CPU context (extraction failed): still emit the
+        // unified header so the fault is reported in the Zap format, just
+        // without a symbolized backtrace.
+        crashFromFault(kind, message, emptyBacktrace());
+    }
+
+    /// Install the `SA_SIGINFO` Zap crash handler for the hardware-fault
+    /// signals (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP). Idempotent and a
+    /// comptime no-op on targets that cannot unwind a signal context.
+    /// `SA_ONSTACK` so a stack-overflow SIGSEGV is handled on the alternate
+    /// signal stack; `SA_RESETHAND` as defense-in-depth behind the
+    /// runtime's explicit `crash_report_in_progress` double-fault guard. A
+    /// verbatim lift of the runtime's prior `installZapSignalHandlers`.
+    pub fn installCrashHandlers() void {
+        if (comptime !signal_handlers_supported) return;
+        if (signal_handlers_installed) return;
+        signal_handlers_installed = true;
+
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .sigaction = faultSignalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.SIGINFO | std.posix.SA.RESETHAND | std.posix.SA.ONSTACK,
+        };
+        std.posix.sigaction(.SEGV, &act, null);
+        std.posix.sigaction(.BUS, &act, null);
+        std.posix.sigaction(.FPE, &act, null);
+        std.posix.sigaction(.ILL, &act, null);
+        std.posix.sigaction(.TRAP, &act, null);
+    }
     // ZAP_RUNTIME_OS_BODY_END posix
 };
 
@@ -291,6 +466,35 @@ var linux_cmdline_ptrs: [1][*:0]const u8 = undefined;
 var linux_cmdline_argc: usize = 0;
 fn loadLinuxCmdline() void {
     linux_cmdline_argc = 0;
+}
+
+// Standalone stubs for the crash-handler seam↔runtime contract. The spliced
+// body (between the BODY sentinels) calls back into these `runtime.zig`
+// top-level symbols — the portable crash-report sink, the double-fault guard,
+// and the `Backtrace` capture primitive — which are all in scope where the
+// body is spliced. For the standalone type-check build (`zig build test`
+// compiling this file via `Backend = struct{}`) the same names must exist, so
+// these minimal stubs stand in; the splice never sees them (they live outside
+// the sentinels). The production implementations are in `runtime.zig`.
+const StubBacktrace = extern struct { addresses: [1]usize, len: usize };
+fn crashReportInProgress() bool {
+    return false;
+}
+fn doubleFaultAbort() noreturn {
+    std.c._exit(137);
+}
+fn captureFaultBacktrace(ctx: std.debug.CpuContextPtr) StubBacktrace {
+    _ = ctx;
+    return .{ .addresses = undefined, .len = 0 };
+}
+fn emptyBacktrace() StubBacktrace {
+    return .{ .addresses = undefined, .len = 0 };
+}
+fn crashFromFault(kind: []const u8, message: []const u8, bt: StubBacktrace) noreturn {
+    _ = kind;
+    _ = message;
+    _ = bt;
+    std.c._exit(1);
 }
 
 test "posix backend caps describe a POSIX target" {
