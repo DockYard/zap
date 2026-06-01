@@ -73,6 +73,12 @@ pub const Domain = enum {
     io,
     /// Internal compiler error (Phase 4.b populates).
     ice,
+    /// A target-capability gate: a reference to a declaration marked
+    /// `@available_on(:cap, …)` on a compilation target that lacks the
+    /// required capability (`docs/target-capability-model-plan.md`, Phase 2).
+    /// Distinct from `name` (the decl IS defined — it is present-but-gated),
+    /// so it never collapses into the "I cannot find …" / did-you-mean path.
+    target_capability,
 
     /// Stable lowercase wire name used in JSON's `domain` field. Stable
     /// public API: consumers key off these, so they are never renamed.

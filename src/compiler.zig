@@ -3998,6 +3998,7 @@ const Pipeline = struct {
                 .machine_data = type_err.machine_data,
                 .fixits = type_err.fixits,
                 .expansion = type_err.expansion,
+                .domain = type_err.domain,
             }) catch {};
         }
     }
@@ -4218,8 +4219,9 @@ const Pipeline = struct {
     ) void {
         const cache_dir = self.options.cache_dir;
         const opts_hash = ctfeCompileOptionsHash(self.options);
+        const gating_target = self.ctfeGatingTarget();
         if (struct_order) |order| {
-            _ = zap.ctfe.evaluateStructAttributesInOrder(
+            _ = zap.ctfe.evaluateStructAttributesInOrderTargeted(
                 self.alloc,
                 ir_program,
                 &self.ctx.collector.graph,
@@ -4227,17 +4229,48 @@ const Pipeline = struct {
                 order,
                 cache_dir,
                 opts_hash,
+                gating_target,
             ) catch {};
         } else {
-            _ = zap.ctfe.evaluateComputedAttributes(
+            _ = zap.ctfe.evaluateComputedAttributesTargeted(
                 self.alloc,
                 ir_program,
                 &self.ctx.collector.graph,
                 self.ctx.interner,
                 cache_dir,
                 opts_hash,
+                gating_target,
             ) catch {};
         }
+    }
+
+    /// The `@available_on` gating target for this build: the resolved
+    /// compilation target's capability set + a human label for the diagnostic.
+    /// `ctfe_target` is the requested triple (or a native sentinel resolved to
+    /// the host); `target_caps.capabilitiesForTarget` maps it to the capability
+    /// set the gate intersects requirements against. A target whose atoms do
+    /// not resolve yields null caps → gating disabled (no decl gated out).
+    /// On native, every capability is present → no decl is ever gated out
+    /// (the zero-impact regression-anchor guarantee).
+    fn ctfeGatingTarget(self: *Pipeline) zap.ctfe.GatingTarget {
+        const atoms = zap.target_triple.resolve(self.options.ctfe_target);
+        const caps = if (atoms) |a| zap.target_caps.capabilitiesForTarget(a) else null;
+        const label = self.ctfeTargetLabel(atoms);
+        return .{ .caps = caps, .label = label };
+    }
+
+    /// A human-facing target label for the `target_capability` diagnostic
+    /// (`unavailable on \`wasm32-wasi\``). Uses the requested triple verbatim
+    /// when one was given; otherwise synthesizes `arch-os-abi` from the
+    /// resolved host atoms (so the native label is a concrete triple, never
+    /// the opaque `"default"` sentinel).
+    fn ctfeTargetLabel(self: *Pipeline, atoms: ?zap.target_triple.TargetAtoms) []const u8 {
+        const requested = self.options.ctfe_target orelse "";
+        if (!zap.target_triple.isNativeSentinel(requested)) return requested;
+        if (atoms) |a| {
+            return std.fmt.allocPrint(self.alloc, "{s}-{s}-{s}", .{ a.arch, a.os, a.abi }) catch requested;
+        }
+        return requested;
     }
 
     /// Per-struct CTFE used when each struct's IR is built in
@@ -4248,7 +4281,7 @@ const Pipeline = struct {
         mod_name: []const u8,
         mod_ir: *ir.Program,
     ) void {
-        const ctfe_result = zap.ctfe.evaluateComputedAttributesForStruct(
+        const ctfe_result = zap.ctfe.evaluateComputedAttributesForStructTargeted(
             self.alloc,
             mod_ir,
             &self.ctx.collector.graph,
@@ -4256,6 +4289,7 @@ const Pipeline = struct {
             mod_name,
             self.options.cache_dir,
             ctfeCompileOptionsHash(self.options),
+            self.ctfeGatingTarget(),
         ) catch null;
         if (ctfe_result) |cr| {
             if (cr.errors.len > 0) zap.ctfe.emitCtfeErrors(self.alloc, cr.errors);
@@ -5116,6 +5150,7 @@ fn compileStagedStructHir(
             .machine_data = type_err.machine_data,
             .fixits = type_err.fixits,
             .expansion = type_err.expansion,
+            .domain = type_err.domain,
         }) catch {};
     }
     if (diag_engine.errorCount() > error_baseline) return error.TypeCheckFailed;

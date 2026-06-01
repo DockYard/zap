@@ -277,6 +277,12 @@ pub const FunctionFamily = struct {
     visibility: ast.FunctionDecl.Visibility,
     /// Attributes attached to this function (@doc, @deprecated, etc.)
     attributes: std.ArrayListUnmanaged(Attribute) = .empty,
+    /// Set by the target-aware CTFE attribute pass when this function's
+    /// `@available_on(:cap, …)` (or its enclosing struct's) requires a
+    /// capability this build's target lacks. A live reference then resolves
+    /// to the `target_capability` diagnostic rather than executing. Null on
+    /// native and whenever the target satisfies the requirement.
+    gated_out: ?GatedOut = null,
 
     pub fn init(id: FunctionFamilyId, scope_id: ScopeId, name: ast.StringId, arity: u32, visibility: ast.FunctionDecl.Visibility) FunctionFamily {
         return .{
@@ -330,6 +336,12 @@ pub const MacroFamily = struct {
     /// never cached, since two adjacent calls to the same macro must
     /// produce distinguishable scope-set marks for resolution.
     intro_scope: ?ScopeId = null,
+    /// Set by the target-aware CTFE attribute pass when this macro's
+    /// `@available_on(:cap, …)` requires a capability this build's target
+    /// lacks. Note: this is the *target*-capability gate (`@available_on`),
+    /// orthogonal to `required_caps` (the CTFE-eval capability set inferred
+    /// from the body). Null on native and whenever the target satisfies it.
+    gated_out: ?GatedOut = null,
 
     pub fn init(id: MacroFamilyId, scope_id: ScopeId, name: ast.StringId, arity: u32) MacroFamily {
         return .{
@@ -403,6 +415,34 @@ pub const TypeKind = union(enum) {
 // Struct registration
 // ============================================================
 
+/// Records that a declaration is gated OUT for the current compilation
+/// target — present in the scope graph (so name resolution can distinguish
+/// "unavailable on this target" from "misspelled"), but unavailable because
+/// the target lacks a capability the declaration's `@available_on(:cap, …)`
+/// attribute requires. Set by the CTFE attribute pass
+/// (`ctfe.evaluateComputedAttributes`, target-aware) when the decl's required
+/// capability set is NOT a subset of the target's capability set
+/// (`target_caps.capabilitiesForTarget`). Mirrors the `@native` precedent of a
+/// "present-but-resolved-specially" marker on a scope entry.
+///
+/// A `null` `gated_out` (the common case, and ALWAYS on native, where every
+/// capability is present) means the decl is fully available — zero behavior
+/// change. When set, name resolution emits the distinct `target_capability`
+/// diagnostic (naming `missing_cap` and the `@target` guard) instead of the
+/// "I cannot find …" / did-you-mean path.
+pub const GatedOut = struct {
+    /// The first required capability atom (without the leading `:`) that the
+    /// target lacks, in `target_caps.TargetCapability` declaration order. The
+    /// diagnostic prints this (`needs capability :processes`). Borrowed
+    /// static `@tagName` slice — no ownership.
+    missing_cap: []const u8,
+    /// The compilation target this decl is gated out for, as a human label
+    /// (the `-Dtarget=` triple, or a resolved native triple). Borrowed for the
+    /// program lifetime; the diagnostic prints it
+    /// (`unavailable on \`wasm32-wasi\``).
+    target_label: []const u8,
+};
+
 /// A compile-time attribute stored on a struct or function.
 ///
 /// Attributes are append-only at compile time. A single declared
@@ -427,6 +467,12 @@ pub const StructEntry = struct {
     decl: *const ast.StructDecl,
     /// Struct-level attributes (@doc, @author, etc.)
     attributes: std.ArrayListUnmanaged(Attribute) = .empty,
+    /// Set by the target-aware CTFE attribute pass when a struct-level
+    /// `@available_on(:cap, …)` requires a capability this build's target
+    /// lacks. A struct-level gate gates the whole module: every member
+    /// reference resolves to the `target_capability` diagnostic. Null on
+    /// native and whenever the target satisfies the requirement.
+    gated_out: ?GatedOut = null,
 };
 
 pub const SourceFileEntry = struct {

@@ -1737,6 +1737,19 @@ fn joinStructNameWithUnderscore(allocator: std.mem.Allocator, interner: *const a
     return @constCast(joined);
 }
 
+/// Extract the OS atom name from a `arch-os[-abi]` target-triple label for the
+/// `target_capability` diagnostic's guard hint (`if @target.os != :<os>`). The
+/// labels the gate carries are always full triples (the compile pipeline
+/// synthesizes `arch-os-abi` even for native), so the OS is the second
+/// hyphen-segment. Falls back to the whole label if it is not a triple, so the
+/// hint degrades to a still-readable (if imperfect) suggestion rather than
+/// erroring — the gate's correctness does not depend on the hint text.
+fn osAtomFromTargetLabel(label: []const u8) []const u8 {
+    var iter = std.mem.tokenizeScalar(u8, label, '-');
+    _ = iter.next() orelse return label; // arch
+    return iter.next() orelse label; // os
+}
+
 /// Canonical mangled name for any `TypeId`. Public so the IR builder,
 /// ZIR backend, and symbol-table emitter share one identity convention
 /// with the monomorphizer's per-specialization naming
@@ -2030,6 +2043,11 @@ pub const TypeChecker = struct {
         /// to `diagnostics.Diagnostic.expansion`. When set, the renderer prints
         /// the "in expansion of macro X" backtrace. Null for source-level nodes.
         expansion: ?*const ast.ExpansionInfo = null,
+        /// The diagnostic domain, carried to `diagnostics.Diagnostic.domain`.
+        /// Defaults to `.typecheck` (the type checker's usual domain); the
+        /// target-capability gate sets `.target_capability` so the gate error
+        /// is distinguishable in JSON/tools from a name or type error.
+        domain: diagnostics_mod.Domain = .typecheck,
     };
 
     const ResolvedCallSignature = struct {
@@ -4613,6 +4631,77 @@ pub const TypeChecker = struct {
     fn addFormattedError(self: *TypeChecker, span: ast.SourceSpan, comptime fmt: []const u8, args: anytype) !void {
         const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
         try self.addError(msg, span);
+    }
+
+    /// The target-capability gate that applies to a resolved function family:
+    /// the family's own `@available_on` marker, or — if the family is itself
+    /// available — its enclosing struct's `@available_on` marker (a
+    /// struct-level gate gates every member). Returns the first applicable
+    /// `GatedOut`, or null when the family is available on this target.
+    ///
+    /// This is the `present-but-unavailable` discriminator: a gated-out family
+    /// IS defined (so this is not "I cannot find"), but is unavailable because
+    /// the build's target lacks a required capability.
+    fn gatedOutForFamilyId(self: *const TypeChecker, family_id: scope_mod.FunctionFamilyId) ?scope_mod.GatedOut {
+        const family = self.graph.getFamily(family_id);
+        if (family.gated_out) |g| return g;
+        return self.gatedOutForStructScope(family.scope_id);
+    }
+
+    /// The struct-level `@available_on` gate for a scope, if the scope belongs
+    /// to a gated-out struct. A struct-level gate makes every member reference
+    /// resolve to the capability diagnostic.
+    fn gatedOutForStructScope(self: *const TypeChecker, scope_id: scope_mod.ScopeId) ?scope_mod.GatedOut {
+        for (self.graph.structs.items) |mod_entry| {
+            if (mod_entry.scope_id == scope_id) {
+                return mod_entry.gated_out;
+            }
+        }
+        return null;
+    }
+
+    /// Emit the distinct `target_capability` diagnostic for a live reference to
+    /// a declaration gated out on this build's target
+    /// (`docs/target-capability-model-plan.md`, Phase 2). `display_name` is the
+    /// human callee spelling (`System.spawn/2` or `spawn/2`). The diagnostic
+    /// names the target, the missing capability, and the comptime-`@target`
+    /// guard escape hatch — and is `domain = .target_capability`, NOT the
+    /// name-resolution / did-you-mean path (the name DID resolve; it is gated).
+    fn emitTargetCapabilityError(
+        self: *TypeChecker,
+        display_name: []const u8,
+        gated: scope_mod.GatedOut,
+        span: ast.SourceSpan,
+    ) !void {
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "`{s}` is unavailable on `{s}`",
+            .{ display_name, gated.target_label },
+        );
+        const label = try std.fmt.allocPrint(
+            self.allocator,
+            "this target lacks the `:{s}` capability",
+            .{gated.missing_cap},
+        );
+        const help = try std.fmt.allocPrint(
+            self.allocator,
+            "`{s}` needs the `:{s}` capability; guard the call with `if @target.os != :{s} {{ … }}`, or build for a target that has `:{s}`",
+            .{ display_name, gated.missing_cap, osAtomFromTargetLabel(gated.target_label), gated.missing_cap },
+        );
+        // Structured machine-only payload for tools (the missing capability and
+        // the target), so CI/LSP can key off the gate without parsing prose.
+        const machine = try self.allocator.alloc(diagnostics_mod.MachineDatum, 2);
+        machine[0] = .{ .key = "missing_capability", .value = gated.missing_cap };
+        machine[1] = .{ .key = "target", .value = gated.target_label };
+        try self.errors.append(self.allocator, .{
+            .message = message,
+            .span = span,
+            .label = label,
+            .help = help,
+            .severity = .@"error",
+            .domain = .target_capability,
+            .machine_data = machine,
+        });
     }
 
     /// Render a function/closure type in the CURRENT surface syntax
@@ -8606,6 +8695,23 @@ pub const TypeChecker = struct {
                     }
                 }
 
+                // Target-capability gate (BEFORE signature resolution and the
+                // not-found arm): if the family this call resolves to is gated
+                // out on this build's target (its or its struct's
+                // `@available_on` requirement is unmet), a LIVE reference is the
+                // distinct `target_capability` compile error — not a type error
+                // and not "I cannot find". A comptime-`@target`-guarded dead
+                // reference never reaches here (Phase 1's HIR fold elided the
+                // branch before resolution), which is the escape hatch.
+                if (self.graph.resolveFamilyAllowingDefaults(scope_id, vr.name, arity)) |rfd| {
+                    if (self.gatedOutForFamilyId(rfd.family_id)) |gated| {
+                        const display = try std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ self.interner.get(vr.name), arity });
+                        try self.emitTargetCapabilityError(display, gated, call.meta.span);
+                        for (call.args) |arg| _ = try self.inferExpr(arg);
+                        return TypeStore.UNKNOWN;
+                    }
+                }
+
                 // Check function families. Candidate selection is type-aware:
                 // exact typed clauses win first, then same-family numeric
                 // widening is considered as a fallback.
@@ -8903,6 +9009,25 @@ pub const TypeChecker = struct {
                             }
                         }
                         if (match) {
+                            // Target-capability gate for `Struct.method(...)`
+                            // (BEFORE signature resolution / the not-found
+                            // fall-through): a struct-level `@available_on`
+                            // gates every member, and a method-level gate gates
+                            // that method. A LIVE reference is the distinct
+                            // `target_capability` compile error. A comptime-
+                            // `@target`-guarded dead reference was elided in the
+                            // HIR fold and never reaches here (the escape hatch).
+                            const struct_gate = mod_entry.gated_out orelse
+                                if (self.graph.resolveFamilyAllowingDefaults(mod_entry.scope_id, fa.field, arity)) |rfd|
+                                    self.graph.getFamily(rfd.family_id).gated_out
+                                else
+                                    null;
+                            if (struct_gate) |gated| {
+                                const display = try std.fmt.allocPrint(self.allocator, "{s}.{s}/{d}", .{ self.interner.get(mod_name.parts[mod_name.parts.len - 1]), self.interner.get(fa.field), arity });
+                                try self.emitTargetCapabilityError(display, gated, call.meta.span);
+                                for (call.args) |arg| _ = try self.inferExpr(arg);
+                                return TypeStore.UNKNOWN;
+                            }
                             const arg_types = try self.inferCallArgTypes(call.args);
                             if (try self.resolveFamilyCallSignature(mod_entry.scope_id, fa.field, arity, arg_types)) |resolved_call| {
                                 const signature = resolved_call.signature;

@@ -2318,6 +2318,48 @@ pub const Parser = struct {
             });
         }
 
+        // Call-form attribute: `@name(arg, …)`. The ergonomic surface for
+        // capability gating, `@available_on(:processes)` /
+        // `@available_on(:processes, :signals)` (the plan's spelling). The
+        // arguments are stored as a `list_literal` VALUE expression — so the
+        // attribute value is uniformly "an atom-list" regardless of arity (a
+        // single `@available_on(:cap)` yields a one-element list). This reuses
+        // the existing CTFE list-literal evaluation; no new attribute storage
+        // shape is needed. The arguments are ordinary expressions (atoms in
+        // practice), so a non-atom argument surfaces as a precise CTFE/gating
+        // diagnostic at its own span rather than a parse error here.
+        if (self.check(.left_paren)) {
+            _ = self.advance();
+            var args: std.ArrayListUnmanaged(*const ast.Expr) = .empty;
+            if (!self.check(.right_paren)) {
+                while (true) {
+                    const arg = try self.parseExpr();
+                    try args.append(self.allocator, arg);
+                    if (self.check(.comma)) {
+                        _ = self.advance();
+                        // Allow a trailing comma before `)`.
+                        if (self.check(.right_paren)) break;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            _ = try self.expect(.right_paren);
+            const elements = try args.toOwnedSlice(self.allocator);
+            const list_value = try self.create(ast.Expr, .{
+                .list = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                    .elements = elements,
+                },
+            });
+            return self.create(ast.AttributeDecl, .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .name = name,
+                .type_expr = null,
+                .value = list_value,
+            });
+        }
+
         // Bareword attribute value: `@code Z3041`. Required surface for
         // the Phase 1.2 `@code Zxxxx` annotation on `pub error` decls —
         // the research brief specifies the no-`=` form. Scoped to the
