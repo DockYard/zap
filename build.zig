@@ -639,6 +639,18 @@ pub fn build(b: *std.Build) void {
     crash_portability_cmd.step.dependOn(b.getInstallStep());
     crash_portability_step.dependOn(&crash_portability_cmd.step);
 
+    // The consolidated target-capability verification matrix (task #360, Phase 4
+    // lock-in) — the campaign's single standing gate. Orchestrates (without
+    // duplicating) the capability-not-OS-name audit + the target_caps <->
+    // RuntimeOs.caps single-source invariant + the Phase 1/2/3 acceptance
+    // harnesses, each of which spans native / wasm32-wasi / x86_64-windows-gnu.
+    // Depends on the install step so `zig-out/bin/zap` (which the phase
+    // harnesses run) carries the current stdlib gates.
+    const target_capability_matrix_step = b.step("target-capability-matrix", "Run the consolidated target-capability verification matrix (audit + single-source + Phase 1/2/3 across native/wasi/windows)");
+    const target_capability_matrix_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_target_capability_matrix.sh" });
+    target_capability_matrix_cmd.step.dependOn(b.getInstallStep());
+    target_capability_matrix_step.dependOn(&target_capability_matrix_cmd.step);
+
     // Follow-up #342: the ARC and Tracking managers use atomics that are an
     // OPTIONAL target feature on wasm32 — ARC's refcount `@atomicRmw`
     // (`.monotonic`/`.acq_rel`) and Tracking's spinlock `@cmpxchgStrong`

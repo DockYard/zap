@@ -1,9 +1,22 @@
 # Language-Level Target-Capability Model — Implementation Plan
 
-Status: **proposed, awaiting approval.** Branch `main`. This is **Phase 0 (design)** of an approved
-campaign to make **target-conditionality fundamental at the Zap LANGUAGE level**, not just the Zig
-implementation. The plan goes to the user for approval before any implementation. (Read-only research
-produced it; no compiler/runtime/stdlib code changed.)
+Status: **COMPLETE — campaign done, model ENFORCED.** Branch `main`. This document began as
+**Phase 0 (design)** of an approved campaign to make **target-conditionality fundamental at the Zap
+LANGUAGE level**, not just the Zig implementation. All four phases have landed (see the per-phase
+status banners below). Zap now exposes the compilation target to source as comptime atoms (`@target`),
+gates declarations on **capabilities** (`@available_on(:cap)`) with a clean compile-time
+`target_capability` diagnostic and a comptime-`@target` escape hatch, and the target-sensitive stdlib
+surface is swept. The model is **locked in** by two CI tests wired into `zig build test`: the
+capability-not-OS-name audit (`src/target_capability_audit.zig`) FAILS the build if any
+`@available_on` in `lib/**/*.zap` names an OS instead of a capability (or if the compiler's
+gate-decision smuggles an OS-name literal), and the single-source invariant
+(`src/target_caps.zig`) pins every runtime-primitive cap (`:signals`/`:terminal`/`:backtrace`) to the
+`RuntimeOs.caps` truth for every supported target, so the Zig-codegen caps and the Zap-comptime caps
+can never drift. The consolidated verification matrix
+(`script_fixtures/run_target_capability_matrix.sh`, `zig build target-capability-matrix`) orchestrates
+the audit + single-source + the Phase 1/2/3 acceptance harnesses across native / `wasm32-wasi` /
+`x86_64-windows-gnu` as the campaign's standing gate. Native (darwin/aarch64 + linux/x86_64) is the
+regression anchor and stays green throughout.
 
 ## Principle (non-negotiable)
 
@@ -350,6 +363,17 @@ native corpus is the regression anchor at each phase. Verification **never** use
 `wasmtime` where a runner exists (the existing Phase-A..D portability harness pattern).
 
 ### Phase 1 — comptime `@target` introspection
+**Status: COMPLETE.** `@target.os`/`.arch`/`.abi` are comptime atoms surfaced to Zap source
+(`src/target_triple.zig` resolves the requested triple — or the native sentinel → host triple — to
+`{os, arch, abi}` atom names; `src/hir.zig` / `src/target_fold.zig` fold `@target.<field>` over them so
+a `case`/`if` collapses at compile time and the dead branch is elided before ZIR lowering). The
+requested target is threaded into the comptime layer across all build paths, and the latent
+`%Zap.Env` host-vs-target bug (`src/builder.zig`) is fixed (the build-manifest env now reports the
+*requested* target, not the host). Verified by `script_fixtures/run_target_comptime_acceptance.sh`:
+native folds the host branch; `wasm32-wasi` cross-builds + runs under `wasmtime` printing the wasi
+branch (proving the value is the requested target); `x86_64-windows-gnu` links `PE32+`; the dead-branch
+`:zig.` elision and `%Zap.Env` requested-target reporting both hold. Native green throughout.
+
 **Goal:** `@target.os`/`.arch`/`.abi` are comptime atoms usable in `if`, folding per target.
 - Add the `@target` intrinsic: parser/desugar recognition → an IR form the CTFE interpreter resolves
   to a `const_atom` from the threaded target. Thread `CompileOptions.ctfe_target` (parsed via
@@ -363,6 +387,21 @@ native corpus is the regression anchor at each phase. Verification **never** use
   the fixture natively; cross-build + `wasmtime` for wasi.
 
 ### Phase 2 — `@available_on` attribute + compile-error gating + gate ONE real API
+**Status: COMPLETE.** `src/target_caps.zig` is the unified capability vocabulary
+(`ZapForkTarget`/`std.Target` → capability bitset; runtime-primitive caps single-sourced from the
+`runtime_os` backends, language-domain caps derived from `std.Target` facts). The gate is applied
+AST-first, before type-checking (`compiler.zig`'s `applyTargetCapabilityGate` → `ctfe.zig`'s
+`gateAvailableOn`), marking each `@available_on`-gated decl `gated_out` on a target lacking a required
+capability; name resolution then emits the distinct `target_capability` diagnostic (a new
+`error_ir.zig` domain) on a live reference — naming the API, the target, the missing capability, and the
+`@target` guard hint — never the "undefined" path. The comptime-`@target` escape hatch elides a dead
+guarded reference pre-lowering, so it does not error. `@available_on` on a macro is a rejected category
+error. `IO.get_char/0` (and the `IO.mode` cluster) gate on `:terminal`. Verified by
+`script_fixtures/run_target_capability_acceptance.sh` (gated-out compile error on wasi AND windows —
+capability-keyed, not OS-keyed; escape hatch compiles + runs under `wasmtime`; native zero-impact;
+genuine-undefined unaffected; unknown-cap + macro-gate errors; arity broadcast; struct-level gate).
+Native green.
+
 **Goal:** `@available_on(:cap)` on a `def` produces a clean compile error when referenced on a lacking
 target; prove it by gating `System.spawn` (or, until a spawn exists, a purpose-built stdlib API) on
 `:processes`.
@@ -380,6 +419,16 @@ target; prove it by gating `System.spawn` (or, until a spawn exists, a purpose-b
   guarded-compiles fixture.
 
 ### Phase 3 — sweep the target-sensitive stdlib surface
+**Status: COMPLETE.** The target-divergent stdlib surface is swept: the IO raw-mode terminal-input
+cluster (`IO.mode/1`, `IO.mode/2`, `IO.get_char/0`, `IO.try_get_char/0` in `lib/io.zap`) is gated on
+`:terminal`, with the gate broadcast across arities by the collector so a caller cannot bypass via an
+un-annotated arity. The remaining stdlib OS surface (`lib/file.zap` File I/O) is `:filesystem`, which is
+present on every supported target (wasi via preopens), so it is correctly NOT gated — proven by the
+over-gating guard. Verified by `script_fixtures/run_target_capability_phase3_acceptance.sh`: each swept
+API is a compile error on wasi AND windows (capability-keyed); the escape hatch compiles + runs under
+`wasmtime`; a wasi-CAPABLE program (File/String/List/IO.puts) cross-builds + runs under `wasmtime` (no
+over-gating); native zero-impact across the whole cluster. Native green.
+
 **Goal:** every target-divergent stdlib API in `lib/*.zap` is correctly gated or comptime-branched, so
 the stdlib exposes only target-appropriate APIs and no `:zig.` bridge can be reached on a target whose
 runtime would trap.
@@ -392,6 +441,28 @@ runtime would trap.
   foreign-build harness + an expected-error fixture per gated domain.
 
 ### Phase 4 — lock-in: capability-not-name audit + verification matrix
+**Status: COMPLETE.** The model is ENFORCED. (1) The capability-not-OS-name audit
+(`src/target_capability_audit.zig`, wired into `zig build test` + the standalone
+`zig build target-capability-audit`) scans EVERY stdlib source (`lib/**/*.zap` — enumerated from the
+tree by `build.zig` and embedded via a generated manifest, so a new lib file is audited automatically
+with no hand-maintained list) and FAILS the build if any `@available_on(:atom)` names something that is
+not a capability — an OS name (`:wasi`/`:windows`/`:linux`/…) or a typo — judged against the SAME
+`target_caps.capabilityFromAtomName` single source of truth the compiler gate uses; it also scans the
+`@available_on` gate-DECISION region of `src/ctfe.zig` (delimited by `ZAP_TARGET_GATE_DECISION_BEGIN`/
+`END`) and FAILS on a smuggled OS-name string literal, since the gate must decide via the capability
+bitset (`firstMissingFrom`), never an OS-name comparison. *Proven:* planting `@available_on(:wasi)` in
+`lib/io.zap` makes the audit FAIL naming `lib/io.zap:204: names an OS, not a capability`; reverting
+PASSES. (2) The single-source invariant (`src/target_caps.zig`) pins every runtime-primitive cap
+(`:signals`/`:terminal`/`:backtrace`) to the `RuntimeOs.caps` truth for every supported target
+(linux/macos/windows/wasi). `:backtrace` is pinned two ways — to the governing backend's
+`supports_backtrace` const for the host row, and to an independent recomputation of the same
+`std.Target.ObjectFormat.default` → `SelfInfo` selection for every row — so a desync of
+`targetSupportsBacktrace` is a compile-time test failure (proven by a plant→fail→revert). (3) The
+consolidated matrix (`script_fixtures/run_target_capability_matrix.sh`,
+`zig build target-capability-matrix`) orchestrates the audit + single-source + the Phase 1/2/3
+acceptance harnesses across native / `wasm32-wasi` / `x86_64-windows-gnu` and is all-PASS (5/5). The
+campaign is sealed. **No fork C-ABI change was needed.**
+
 **Goal:** prove the gating keys off capabilities, never OS names, and lock the matrix.
 - Audit: no Zap struct/function name and no bare OS-name comparison drives the gate in `src/*.zig` —
   every gate reads `target_caps` bits (mirroring the memory-model `no-name-special-casing` audit).
