@@ -107,12 +107,22 @@ pub struct IO {
   @doc = """
     Switches the terminal input mode.
 
+    Available only on targets with the `:terminal` capability (raw-mode TTY /
+    termios). Switching between raw and line-buffered (canonical) modes is a
+    termios operation; on a target without it — e.g. `wasm32-wasi`, whose
+    runtime has no termios, so a mode switch would be a silent no-op that
+    breaks the documented raw/normal contract — a direct call is a
+    compile-time error. Guard it with `if @target.os != :wasi { … }` to keep
+    portable code compiling. (The gate is broadcast across both `mode`
+    arities.)
+
     ## Examples
 
         IO.mode(IO.Mode.Raw)      # keypress-at-a-time, no echo
         key = IO.get_char()
         IO.mode(IO.Mode.Normal)   # restore line-buffered mode
     """
+  @available_on(:terminal)
 
   pub fn mode(mode_value :: IO.Mode) -> IO.Mode {
     :zig.IO.set_terminal_mode(mode_value)
@@ -122,6 +132,11 @@ pub struct IO {
   @doc = """
     Switches terminal mode, runs the callback, then restores
     normal mode automatically.
+
+    Available only on targets with the `:terminal` capability (raw-mode TTY /
+    termios), like `IO.mode/1` — the gate is broadcast across both `mode`
+    arities, so on a target without termios (e.g. `wasm32-wasi`) a direct call
+    is a compile-time error. Guard it with `if @target.os != :wasi { … }`.
 
     ## Examples
 
@@ -171,6 +186,13 @@ pub struct IO {
     an empty string if no input is waiting. Must be in raw mode
     for meaningful use.
 
+    Available only on targets with the `:terminal` capability (raw-mode TTY /
+    termios). Its contract — "a key available *right now*, without blocking" —
+    is meaningful only with raw-mode terminal control; on a target without it,
+    e.g. `wasm32-wasi` (whose runtime has no termios, so raw mode is a no-op),
+    a direct call is a compile-time error. Guard it with
+    `if @target.os != :wasi { … }` to keep portable code compiling.
+
     ## Examples
 
         IO.mode(IO.Mode.Raw)
@@ -179,6 +201,7 @@ pub struct IO {
           IO.puts("no key pressed")
         }
     """
+  @available_on(:terminal)
 
   pub fn try_get_char() -> String {
     :zig.IO.try_get_char()
