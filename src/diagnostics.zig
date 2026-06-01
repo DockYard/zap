@@ -507,6 +507,22 @@ pub const DiagnosticEngine = struct {
         return false;
     }
 
+    /// True when a reported error would NOT otherwise halt the build at the
+    /// backend, so the merged-IR path must halt on it explicitly. The merged-IR
+    /// build (`compiler.finishMergedIr`) reports per-struct frontend errors and
+    /// CONTINUES — a genuine type/name error still fails end-to-end because it
+    /// trips a backend "undeclared identifier", and tests rely on that
+    /// continue-and-collect behavior. But a `target_capability` gate error does
+    /// NOT trip the backend: the gated symbol exists and lowers fine, so the
+    /// binary would be wrongly produced. This predicate lets `finishMergedIr`
+    /// halt for exactly those build-halting diagnostics and no others.
+    pub fn hasBuildHaltingError(self: *const DiagnosticEngine) bool {
+        for (self.diagnostics.items) |d| {
+            if (d.severity == .@"error" and d.domain == .target_capability) return true;
+        }
+        return false;
+    }
+
     pub fn errorCount(self: *const DiagnosticEngine) usize {
         var count: usize = 0;
         for (self.diagnostics.items) |d| {

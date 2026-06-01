@@ -5799,15 +5799,20 @@ fn finishMergedIr(
     if (ctx.diag_engine.hasErrors()) {
         pipeline.clearProgress();
         emitContextDiagnostics(ctx, alloc);
-        // Per-struct frontend errors (the `compileSingleStructHir(...) catch
-        // continue` loop reports them to `ctx.diag_engine` and continues so the
-        // whole program's errors surface together) MUST fail the build. A
-        // genuine type/name error usually also trips a backend "undeclared
-        // identifier", but a `target_capability` gate error does NOT — the
-        // gated symbol exists and lowers fine — so without this gate the binary
-        // would be produced despite a reported compile error. Mirrors
-        // `compileForCtfe`'s post-typecheck `hasErrors` → `TypeCheckFailed`.
-        return pipeline.failWithExisting(error.TypeCheckFailed);
+        // The merged-IR path reports per-struct frontend errors and CONTINUES
+        // (the `compileSingleStructHir(...) catch continue` loop), so the whole
+        // program's errors surface together; callers gate on `errorCount()`,
+        // and a genuine type/name error still fails end-to-end because it trips
+        // a backend "undeclared identifier" (the
+        // `compileStructByStruct isolates per-struct diagnostics` test pins
+        // this continue-and-collect behavior). We must therefore halt HERE only
+        // for an error the backend would NOT catch: a `target_capability` gate
+        // error lowers a perfectly valid symbol, so without an explicit halt
+        // the binary would be wrongly produced despite a reported compile
+        // error. `hasBuildHaltingError` is exactly that narrow set.
+        if (ctx.diag_engine.hasBuildHaltingError()) {
+            return pipeline.failWithExisting(error.TypeCheckFailed);
+        }
     }
 
     return .{
