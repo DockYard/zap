@@ -588,6 +588,26 @@ pub fn build(b: *std.Build) void {
     crash_portability_cmd.step.dependOn(b.getInstallStep());
     crash_portability_step.dependOn(&crash_portability_cmd.step);
 
+    // Follow-up #342: the ARC and Tracking managers use atomics that are an
+    // OPTIONAL target feature on wasm32 — ARC's refcount `@atomicRmw`
+    // (`.monotonic`/`.acq_rel`) and Tracking's spinlock `@cmpxchgStrong`
+    // (`.acquire`/`.monotonic`) + `@atomicStore` (`.release`). On single-threaded
+    // wasm32-wasi LLVM lowers these ordered atomics to plain non-atomic
+    // loads/stores, so neither a `+atomics` feature nor an ordering relaxation
+    // is required — proven empirically here and gated henceforth: each fixture
+    // genuinely drives the atomic refcount / spinlock path (the canonical
+    // `[{String, i64}]` sort+each shape), runs NATIVELY under its manager, then
+    // cross-builds `-Dtarget=wasm32-wasi`, links as a wasm MVP binary, and runs
+    // under `wasmtime` with byte-identical output + exit 0 + no leak/double-free
+    // (a miscompiled atomic would deadlock, corrupt the tracking table, or
+    // prematurely free a refcounted value). Arena/Leak are spot-confirmed as the
+    // atomics-free baseline. A standalone step (matching the other acceptance
+    // harnesses) so the wasm-atomics invariant is explicitly verifiable.
+    const wasm_atomic_managers_step = b.step("wasm-atomic-managers-acceptance", "Assert ARC (@atomicRmw) + Tracking (@cmpxchgStrong/@atomicStore) lower + run correctly on single-threaded wasm32-wasi under wasmtime");
+    const wasm_atomic_managers_cmd = b.addSystemCommand(&.{ "bash", "script_fixtures/run_wasm_atomic_managers.sh" });
+    wasm_atomic_managers_cmd.step.dependOn(b.getInstallStep());
+    wasm_atomic_managers_step.dependOn(&wasm_atomic_managers_cmd.step);
+
     // FCC Phase 5 acceptance: the hardening / breadth / precision corpus for
     // first-class closures (aliased fn-returns, nested/cross-box closures,
     // mixed boxed+direct, the boxed-effect-precision cases). Each fixture runs
