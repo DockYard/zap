@@ -433,6 +433,12 @@ pub const Collector = struct {
                 }
             }
         }
+
+        // Broadcast each `@available_on` capability gate across every arity of
+        // the gated name (now that the full name→arities family set for this
+        // struct is collected), so the gate cannot be bypassed via a different
+        // arity. A no-op when no member is gated.
+        try self.broadcastAvailableOnAcrossArities(mod_scope);
     }
 
     // ============================================================
@@ -446,19 +452,92 @@ pub const Collector = struct {
         pending_attrs: *std.ArrayListUnmanaged(scope.Attribute),
     ) !void {
         try self.collectFunction(func, parent_scope);
-        // Attach pending attributes to the function family
+        // Attach pending attributes to the family for each clause's arity as
+        // written. A `pub fn` item carries exactly one clause (the parser emits
+        // one `FunctionDecl` per `pub fn`), so this normally attaches to a
+        // single arity; the cross-arity capability broadcast — gating EVERY
+        // arity of a name when ANY clause is `@available_on`-gated, so the gate
+        // cannot be bypassed by calling a different arity — is a separate
+        // struct-scoped post-pass (`broadcastAvailableOnAcrossArities`) that
+        // runs after all of the struct's items are collected and the whole
+        // name→arities family set is known. Dedup so an attribute the same
+        // arity already carries is not appended twice.
         if (pending_attrs.items.len > 0) {
+            const parent = self.graph.getScopeMut(parent_scope);
             for (func.clauses) |clause| {
                 const arity: u32 = @intCast(clause.params.len);
                 const key = scope.FamilyKey{ .name = func.name, .arity = arity };
-                const parent = self.graph.getScopeMut(parent_scope);
                 if (parent.function_families.get(key)) |fid| {
                     const family = self.graph.getFamilyMut(fid);
                     for (pending_attrs.items) |attr| {
+                        if (familyHasAttribute(family, attr.name, self.interner)) continue;
                         try family.attributes.append(self.allocator, attr);
                     }
                 }
-                break; // Only attach to the first clause's family
+            }
+        }
+    }
+
+    /// True when `family` already carries an attribute named `name` — used to
+    /// avoid attaching the same attribute twice (e.g. when a function's clauses
+    /// repeat an arity, or when the cross-arity `@available_on` broadcast
+    /// reaches a family that already declared the gate itself).
+    fn familyHasAttribute(family: *const scope.FunctionFamily, name: ast.StringId, interner: *const ast.StringInterner) bool {
+        const target = interner.get(name);
+        for (family.attributes.items) |existing| {
+            if (std.mem.eql(u8, interner.get(existing.name), target)) return true;
+        }
+        return false;
+    }
+
+    /// Broadcast every `@available_on` capability gate across ALL arities of
+    /// the gated name within `scope_id`. A Zap "multi-clause function" is a set
+    /// of separately-declared `pub fn name(...)` items grouped into per-arity
+    /// families by name+arity, and `@available_on` is written before just ONE
+    /// clause. Gating only that one arity would be unsound: a caller could
+    /// reach the feature through a DIFFERENT arity of the same name that the
+    /// runtime equally cannot provide on this target. So a gate on any arity of
+    /// a name gates every arity of that name in the same struct scope. Copies
+    /// the ATTRIBUTE (not a computed marker) so the target-keyed gate pass
+    /// (`ctfe.gateAvailableOn`) still recomputes `gated_out` per target.
+    ///
+    /// Runs once per struct after its item loop, when the full name→arities set
+    /// is known. Idempotent: a family that already carries the gate is skipped
+    /// (`familyHasAttribute`).
+    fn broadcastAvailableOnAcrossArities(self: *Collector, scope_id: scope.ScopeId) !void {
+        const parent = self.graph.getScopeMut(scope_id);
+        // Collect (name → the `@available_on` attribute to broadcast). The
+        // first gate seen for a name wins; a name is not expected to carry
+        // conflicting gates on different arities (that would be an author
+        // error), and the gate semantics are "all listed caps required" so the
+        // first is representative.
+        var gated_names: std.ArrayListUnmanaged(struct { name: ast.StringId, attr: scope.Attribute }) = .empty;
+        defer gated_names.deinit(self.allocator);
+        var it = parent.function_families.iterator();
+        while (it.next()) |entry| {
+            const fid = entry.value_ptr.*;
+            const family = self.graph.getFamily(fid);
+            for (family.attributes.items) |attr| {
+                if (!std.mem.eql(u8, self.interner.get(attr.name), "available_on")) continue;
+                var already = false;
+                for (gated_names.items) |g| {
+                    if (g.name == entry.key_ptr.name or std.mem.eql(u8, self.interner.get(g.name), self.interner.get(entry.key_ptr.name))) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) try gated_names.append(self.allocator, .{ .name = entry.key_ptr.name, .attr = attr });
+                break;
+            }
+        }
+        // Second pass: copy each gate to every same-name family that lacks it.
+        for (gated_names.items) |g| {
+            var it2 = parent.function_families.iterator();
+            while (it2.next()) |entry| {
+                if (entry.key_ptr.name != g.name and !std.mem.eql(u8, self.interner.get(entry.key_ptr.name), self.interner.get(g.name))) continue;
+                const family = self.graph.getFamilyMut(entry.value_ptr.*);
+                if (familyHasAttribute(family, g.attr.name, self.interner)) continue;
+                try family.attributes.append(self.allocator, g.attr);
             }
         }
     }

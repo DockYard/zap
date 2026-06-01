@@ -79,10 +79,12 @@ pub const memory_driver = @import("memory/driver.zig");
 pub const memory_elision = @import("memory/elision.zig");
 pub const target_triple = @import("target_triple.zig");
 pub const target_caps = @import("target_caps.zig");
+pub const target_fold = @import("target_fold.zig");
 
 test {
     _ = @import("target_triple.zig");
     _ = @import("target_caps.zig");
+    _ = @import("target_fold.zig");
     _ = @import("token.zig");
     _ = @import("lexer.zig");
     _ = @import("ast.zig");

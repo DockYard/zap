@@ -147,12 +147,18 @@ pub struct IO {
 
     Returns a single-character string, or empty string on EOF.
 
+    Available only on targets with the `:terminal` capability (raw-mode TTY /
+    termios). On a target without it — e.g. `wasm32-wasi`, whose runtime has no
+    termios — a direct call is a compile-time error; guard it with
+    `if @target.os != :wasi { … }` to keep portable code compiling.
+
     ## Examples
 
         IO.mode(1)
         key = IO.get_char()
         IO.mode(0)
     """
+  @available_on(:terminal)
 
   pub fn get_char() -> String {
     :zig.IO.get_char()

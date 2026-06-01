@@ -5,6 +5,8 @@ const escape_lattice = @import("escape_lattice.zig");
 const ir = @import("ir.zig");
 const similarity = @import("similarity.zig");
 const diagnostics_mod = @import("diagnostics.zig");
+const target_triple = @import("target_triple.zig");
+const target_fold = @import("target_fold.zig");
 
 // ============================================================
 // Type representation
@@ -1924,6 +1926,16 @@ pub const TypeChecker = struct {
     owns_store: bool = true,
     interner: *const ast.StringInterner,
     graph: *scope_mod.ScopeGraph,
+    /// The resolved compilation target as `{os, arch, abi}` atoms, threaded from
+    /// `CompileOptions.ctfe_target` (native-resolved to the host). Used SOLELY
+    /// to honor comptime-`@target` dead-branch elision during resolution
+    /// (`target_fold`): a reference inside an `if @target.os != :wasi { … }`
+    /// branch that is dead for this target must NOT be type-checked, so a
+    /// capability-gated reference there does not wrongly fire the
+    /// `target_capability` diagnostic (the portability escape hatch). Null on
+    /// bare unit tests / when the target is unknown — then both branches are
+    /// checked, identical to the pre-Phase-2 behavior.
+    target: ?target_triple.TargetAtoms = null,
     errors: std.ArrayList(Error),
 
     // Expression type mapping. Used as a memo cache by `inferExpr` to
@@ -7499,6 +7511,34 @@ pub const TypeChecker = struct {
             // if_expr, cond_expr, pipe are desugared to case_expr
             // before the TypeChecker runs. If we see them, return UNKNOWN.
             .if_expr => |ie| {
+                // Comptime-`@target` dead-branch elision (Phase 2 escape hatch):
+                // when the condition is `@target.<field> ==/!= :atom`, it folds
+                // to a comptime boolean for this build's target — exactly as the
+                // HIR builder folds it before ZIR lowering. Type-check ONLY the
+                // live branch so a capability-gated reference in the DEAD branch
+                // never reaches the gate (which would wrongly fire). This is the
+                // load-bearing portability idiom: `if @target.os != :wasi {
+                // System.spawn(…) }` compiles on wasi because the guarded call is
+                // elided here, the same point the HIR fold elides it.
+                if (self.target) |atoms| {
+                    if (target_fold.evalTargetEqualityCondition(ie.condition, atoms, self.interner)) |cond_value| {
+                        // The condition is still inferred (it is `@target.<f> ==
+                        // :atom`, a well-typed Bool) so binding/usage bookkeeping
+                        // on the condition runs; only the DEAD body is skipped.
+                        _ = try self.inferExpr(ie.condition);
+                        if (cond_value) {
+                            var then_type: TypeId = TypeStore.NIL;
+                            for (ie.then_block) |stmt| then_type = try self.checkStmt(stmt);
+                            return then_type;
+                        } else if (ie.else_block) |else_block| {
+                            var else_type: TypeId = TypeStore.NIL;
+                            for (else_block) |stmt| else_type = try self.checkStmt(stmt);
+                            return else_type;
+                        } else {
+                            return TypeStore.NIL;
+                        }
+                    }
+                }
                 const cond_type = try self.inferExpr(ie.condition);
                 if (cond_type != TypeStore.BOOL and cond_type != TypeStore.UNKNOWN and cond_type != TypeStore.ERROR) {
                     try self.addRichError(
@@ -7524,6 +7564,29 @@ pub const TypeChecker = struct {
             },
 
             .case_expr => |ce| {
+                // Comptime-`@target` dead-clause elision (Phase 2 escape
+                // hatch). The Kernel `if`/`unless` macro expands
+                // `if @target.os != :wasi { … }` into a `case` over the folded
+                // comparison (`case (@target.os != :wasi) { true -> … ; false
+                // -> … }`), so the canonical guard reaches the type-checker as
+                // a `case_expr`, NOT an `if_expr` — `if`/`cond` are gone by the
+                // time we run. A direct `case @target.os { :wasi -> … }` also
+                // lands here. In BOTH shapes the case is comptime-decidable for
+                // this build's target, exactly as the HIR fold decides it
+                // before ZIR lowering (`target_fold` is the shared oracle), so
+                // we type-check ONLY the live clause: a capability-gated
+                // reference in a DEAD `@target` clause must never reach the
+                // gate (which would wrongly fire and defeat the escape hatch).
+                if (self.target) |atoms| {
+                    if (target_fold.selectLiveTargetCaseClause(ce.scrutinee, ce.clauses, atoms, self.interner)) |live_idx| {
+                        // Still infer the scrutinee so its binding/usage
+                        // bookkeeping runs (it is a well-typed `@target` field
+                        // access or Bool comparison); only the DEAD clause
+                        // bodies are skipped.
+                        _ = try self.inferExpr(ce.scrutinee);
+                        return try self.checkCaseClause(ce.clauses[live_idx], TypeStore.UNKNOWN);
+                    }
+                }
                 const scrutinee_type = try self.inferExpr(ce.scrutinee);
                 var result_type: TypeId = TypeStore.UNKNOWN;
                 var has_wildcard = false;

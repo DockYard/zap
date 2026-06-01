@@ -3,6 +3,7 @@ const ast = @import("ast.zig");
 const types_mod = @import("types.zig");
 const scope_mod = @import("scope.zig");
 const target_triple = @import("target_triple.zig");
+const target_fold = @import("target_fold.zig");
 
 // ============================================================
 // Typed HIR (High-level Intermediate Representation)
@@ -5102,15 +5103,8 @@ pub const HirBuilder = struct {
     /// field-access lowering arm, so an `@target.<bad>` in a comparison or
     /// case never double-reports.
     fn peekTargetFieldAtom(self: *HirBuilder, expr: *const ast.Expr) ?[]const u8 {
-        if (expr.* != .field_access) return null;
-        const fa = expr.field_access;
-        if (!self.isTargetAttrRef(fa.object)) return null;
         const target = self.target orelse return null;
-        const field_name = self.interner.get(fa.field);
-        if (std.mem.eql(u8, field_name, "os")) return target.os;
-        if (std.mem.eql(u8, field_name, "arch")) return target.arch;
-        if (std.mem.eql(u8, field_name, "abi")) return target.abi;
-        return null;
+        return target_fold.peekTargetFieldAtom(expr, target, self.interner);
     }
 
     /// Resolve `@target.<field>` to its comptime atom name for the
@@ -5152,10 +5146,10 @@ pub const HirBuilder = struct {
     }
 
     /// True when `expr` is the bare `@target` intrinsic (an `attr_ref`
-    /// whose name is `target`).
+    /// whose name is `target`). Delegates to `target_fold` — the single
+    /// shared recognition the type-checker also uses.
     fn isTargetAttrRef(self: *HirBuilder, expr: *const ast.Expr) bool {
-        if (expr.* != .attr_ref) return false;
-        return std.mem.eql(u8, self.interner.get(expr.attr_ref.name), "target");
+        return target_fold.isTargetAttrRef(expr, self.interner);
     }
 
     /// Build a comptime-resolved `atom_lit` HIR node carrying `name`,
@@ -5187,25 +5181,15 @@ pub const HirBuilder = struct {
     /// null when the expression is not such a comparison (the caller then
     /// lowers it normally). Folding here — before ZIR lowering — is what
     /// lets the enclosing `if`/`case` elide the dead branch at compile time.
-    fn tryFoldTargetComparison(self: *HirBuilder, bo: ast.BinaryOp) !?*const Expr {
-        const is_eq = bo.op == .equal;
-        const is_neq = bo.op == .not_equal;
-        if (!is_eq and !is_neq) return null;
-
-        // Recognize `@target.<field> <op> :atom` in either operand order.
-        // Pure peek — never emits a diagnostic, so a `@target.<bad>` operand
-        // is reported once, by the field-access lowering arm, not here.
-        const target_atom_opt, const literal_expr = blk: {
-            if (self.peekTargetFieldAtom(bo.lhs)) |name| break :blk .{ name, bo.rhs };
-            if (self.peekTargetFieldAtom(bo.rhs)) |name| break :blk .{ name, bo.lhs };
-            break :blk .{ @as(?[]const u8, null), bo.lhs };
-        };
-        const target_atom = target_atom_opt orelse return null;
-        if (literal_expr.* != .atom_literal) return null;
-
-        const literal_name = self.interner.get(literal_expr.atom_literal.value);
-        const equal = std.mem.eql(u8, target_atom, literal_name);
-        const result = if (is_eq) equal else !equal;
+    fn tryFoldTargetComparison(self: *HirBuilder, expr: *const ast.Expr, bo: ast.BinaryOp) !?*const Expr {
+        const target = self.target orelse return null;
+        // The recognition + comptime-boolean decision is the SHARED
+        // `target_fold` oracle (the same one the type-checker's dead-branch
+        // skip consults), so the HIR fold and the type-checker are provably
+        // consistent. This arm only builds the folded `bool_lit` HIR node.
+        // A `@target.<bad>` operand is reported once, by the field-access
+        // lowering arm — `evalTargetEqualityCondition` is a pure peek.
+        const result = target_fold.evalTargetEqualityCondition(expr, target, self.interner) orelse return null;
         return try self.buildBoolLit(result, bo.meta.span);
     }
 
@@ -5225,53 +5209,54 @@ pub const HirBuilder = struct {
     /// lowered as the resolved atom value. The first matching clause wins
     /// (Zap case semantics are first-match).
     fn tryFoldTargetCase(self: *HirBuilder, ce: ast.CaseExpr) !?*const Expr {
-        // Pure peek — a `case @target.<bad>` falls through and is reported
-        // once by the field-access lowering of the scrutinee, not here.
-        const target_atom = self.peekTargetFieldAtom(ce.scrutinee) orelse return null;
+        const target = self.target orelse return null;
 
-        // First pass: every clause must be a guard-free atom-literal or
-        // wildcard pattern for the fold to be sound. Bail (to normal
-        // lowering) on the first clause that is not.
-        for (ce.clauses) |clause| {
-            if (clause.guard != null) return null;
-            switch (clause.pattern.*) {
-                .wildcard => {},
-                .literal => |lit| if (lit != .atom) return null,
-                else => return null,
-            }
+        // Clause selection is the SHARED `target_fold` oracle — the SAME
+        // function the type-checker's dead-clause skip consults — so the HIR
+        // fold lowers exactly the clause the type-checker live-checks (the two
+        // passes can never disagree about which `@target` branch is live).
+        // Covers both the atom-scrutinee `case @target.os { :atom -> … }` and
+        // the bool-scrutinee `case (@target.os != :wasi) { true -> … }` form
+        // the Kernel `if` macro produces. A non-decidable case (guard, binding,
+        // structured pattern, non-`@target` scrutinee) yields null → normal
+        // lowering. A `case @target.<bad>` falls through and is reported once
+        // by the field-access lowering of the scrutinee, not here.
+        if (target_fold.selectLiveTargetCaseClause(ce.scrutinee, ce.clauses, target, self.interner)) |live_idx| {
+            const block = try self.buildBlock(ce.clauses[live_idx].body);
+            return try self.create(Expr, .{
+                .kind = .{ .block = block.* },
+                .type_id = block.result_type,
+                .span = ce.meta.span,
+            });
         }
 
-        // Second pass: first-match wins. An atom-literal clause matches when
-        // its name equals the resolved target atom; a wildcard matches
-        // unconditionally.
-        for (ce.clauses) |clause| {
-            const matches = switch (clause.pattern.*) {
-                .wildcard => true,
-                .literal => |lit| std.mem.eql(u8, self.interner.get(lit.atom.value), target_atom),
-                else => unreachable, // excluded by the first pass
-            };
-            if (matches) {
-                const block = try self.buildBlock(clause.body);
-                return try self.create(Expr, .{
-                    .kind = .{ .block = block.* },
-                    .type_id = block.result_type,
-                    .span = ce.meta.span,
-                });
+        // The oracle returned null. Distinguish the genuine non-exhaustive
+        // `@target` case (an atom-scrutinee `case @target.os { … }` whose
+        // clauses are all guard-free atoms/wildcards but NONE matches this
+        // build's target and there is no `_`) — a clean compile error, since
+        // the runtime would otherwise hit a match failure — from a merely
+        // non-decidable case (a guard, a binding, a non-`@target` scrutinee),
+        // which falls through to normal lowering. The bool-scrutinee form the
+        // `if` macro emits is always exhaustive (`true`/`false`), so this only
+        // fires for a direct `case @target.<field>`.
+        if (self.peekTargetFieldAtom(ce.scrutinee)) |target_atom| {
+            for (ce.clauses) |clause| {
+                if (clause.guard != null) return null;
+                switch (clause.pattern.*) {
+                    .wildcard => return null, // a wildcard makes it exhaustive — not this error
+                    .literal => |lit| if (lit != .atom) return null,
+                    else => return null,
+                }
             }
+            try self.errors.append(self.allocator, .{
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "`case @target.{s}` has no clause matching `:{s}` for this build's target and no `_` fallback",
+                    .{ targetCaseFieldName(self, ce.scrutinee), target_atom },
+                ),
+                .span = ce.meta.span,
+            });
         }
-
-        // No clause matched the resolved target. This is a non-exhaustive
-        // `@target` case for this build's target — a clean compile error
-        // (the runtime would otherwise hit a match failure). Report it and
-        // fall through so the build fails.
-        try self.errors.append(self.allocator, .{
-            .message = try std.fmt.allocPrint(
-                self.allocator,
-                "`case @target.{s}` has no clause matching `:{s}` for this build's target and no `_` fallback",
-                .{ targetCaseFieldName(self, ce.scrutinee), target_atom },
-            ),
-            .span = ce.meta.span,
-        });
         return null;
     }
 
@@ -5381,7 +5366,7 @@ pub const HirBuilder = struct {
                 // building the operands: a `@target.<field>` operand on a
                 // bare HIR run with no resolved target would otherwise emit
                 // a runtime atom_lit and a stray diagnostic.
-                if (try self.tryFoldTargetComparison(bo)) |folded| return folded;
+                if (try self.tryFoldTargetComparison(expr, bo)) |folded| return folded;
 
                 const lhs_expr = try self.buildExpr(bo.lhs);
                 const rhs_expr = try self.buildExpr(bo.rhs);

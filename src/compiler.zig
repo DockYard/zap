@@ -3112,6 +3112,46 @@ pub fn mmapSourceFile(io: std.Io, file_path: []const u8, fallback_allocator: std
 /// Pass 1: Parse all source files and collect declarations into a shared context.
 ///
 /// Takes a merged source string (all files concatenated) and a file path for
+/// Apply the `@available_on` target-capability gate to a freshly-collected
+/// scope graph (`docs/target-capability-model-plan.md`, Phase 2). Resolves the
+/// build's compilation target to its capability set and marks every
+/// `@available_on`-gated declaration whose requirement the target does not
+/// satisfy — BEFORE type-checking, so name resolution can emit the
+/// `target_capability` diagnostic on a live reference. Malformed/unknown
+/// capability atoms are surfaced through `diag_engine` at the attribute span.
+///
+/// Runs once per collected graph (after capability inference, before any
+/// compilation). On native every capability is present, so no declaration is
+/// gated — the zero-impact regression-anchor guarantee.
+fn applyTargetCapabilityGate(
+    alloc: std.mem.Allocator,
+    graph: *zap.scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+    options: CompileOptions,
+    diag_engine: *zap.DiagnosticEngine,
+) void {
+    const atoms = zap.target_triple.resolve(options.ctfe_target);
+    const caps = if (atoms) |a| zap.target_caps.capabilitiesForTarget(a) else null;
+    const label = targetCapabilityLabel(alloc, options.ctfe_target, atoms);
+    var diagnostics: std.ArrayListUnmanaged(zap.ctfe.GateDiagnostic) = .empty;
+    zap.ctfe.gateAvailableOn(alloc, graph, interner, .{ .caps = caps, .label = label }, &diagnostics) catch return;
+    for (diagnostics.items) |d| {
+        diag_engine.err(d.message, d.span) catch {};
+    }
+}
+
+/// A human target label for the gate diagnostic — the requested triple
+/// verbatim, or a synthesized `arch-os-abi` from the resolved host atoms for a
+/// native sentinel (so the label is a concrete triple, never `"default"`).
+fn targetCapabilityLabel(alloc: std.mem.Allocator, ctfe_target: ?[]const u8, atoms: ?zap.target_triple.TargetAtoms) []const u8 {
+    const requested = ctfe_target orelse "";
+    if (!zap.target_triple.isNativeSentinel(requested)) return requested;
+    if (atoms) |a| {
+        return std.fmt.allocPrint(alloc, "{s}-{s}-{s}", .{ a.arch, a.os, a.abi }) catch requested;
+    }
+    return requested;
+}
+
 /// diagnostics. Returns a CompilationContext with the shared scope graph and
 /// type store populated.
 ///
@@ -3473,6 +3513,15 @@ pub fn collectAllFromUnits(
     // capability sets the macro engine used.
     zap.capability_inference.inferAndApply(alloc, &final_collector.graph, interner) catch {};
 
+    // Target-capability gate (Phase 2): mark `@available_on`-gated decls the
+    // build's target cannot satisfy, BEFORE type-checking resolves references.
+    applyTargetCapabilityGate(alloc, &final_collector.graph, interner, options, &diag_engine);
+    if (diag_engine.hasErrors()) {
+        progressClear(options);
+        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return error.CollectFailed;
+    }
+
     const units = try buildCompilationUnits(alloc, struct_programs, all_source_units);
 
     return .{
@@ -3694,6 +3743,15 @@ fn collectAllFromParsedPrograms(
     }
 
     zap.capability_inference.inferAndApply(alloc, &final_collector.graph, interner) catch {};
+
+    // Target-capability gate (Phase 2): mark `@available_on`-gated decls the
+    // build's target cannot satisfy, BEFORE type-checking resolves references.
+    applyTargetCapabilityGate(alloc, &final_collector.graph, interner, options, &diag_engine);
+    if (diag_engine.hasErrors()) {
+        progressClear(options);
+        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return error.CollectFailed;
+    }
 
     const units = try buildCompilationUnits(alloc, struct_programs, all_source_units);
 
@@ -3971,6 +4029,10 @@ const Pipeline = struct {
         } else zap.types.TypeChecker.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph);
         errdefer type_checker.deinit();
         type_checker.allow_external_static_references = self.options.allow_external_static_references;
+        // Thread the resolved compilation target so resolution honors comptime
+        // `@target` dead-branch elision (Phase 2 escape hatch): a gated
+        // reference inside a comptime-dead `@target` branch is not type-checked.
+        type_checker.target = zap.target_triple.resolve(self.options.ctfe_target);
 
         type_checker.checkProgram(desugared) catch {};
         if (check_unused) type_checker.checkUnusedBindings() catch {};
@@ -4219,9 +4281,12 @@ const Pipeline = struct {
     ) void {
         const cache_dir = self.options.cache_dir;
         const opts_hash = ctfeCompileOptionsHash(self.options);
-        const gating_target = self.ctfeGatingTarget();
+        // NOTE: the `@available_on` target gate is applied EARLIER, directly
+        // from the AST in `applyTargetCapabilityGate` (after collection, before
+        // type-checking) — it must precede name resolution. This pass only
+        // computes attribute VALUES (`@doc`, etc.); it does not gate.
         if (struct_order) |order| {
-            _ = zap.ctfe.evaluateStructAttributesInOrderTargeted(
+            _ = zap.ctfe.evaluateStructAttributesInOrder(
                 self.alloc,
                 ir_program,
                 &self.ctx.collector.graph,
@@ -4229,48 +4294,17 @@ const Pipeline = struct {
                 order,
                 cache_dir,
                 opts_hash,
-                gating_target,
             ) catch {};
         } else {
-            _ = zap.ctfe.evaluateComputedAttributesTargeted(
+            _ = zap.ctfe.evaluateComputedAttributes(
                 self.alloc,
                 ir_program,
                 &self.ctx.collector.graph,
                 self.ctx.interner,
                 cache_dir,
                 opts_hash,
-                gating_target,
             ) catch {};
         }
-    }
-
-    /// The `@available_on` gating target for this build: the resolved
-    /// compilation target's capability set + a human label for the diagnostic.
-    /// `ctfe_target` is the requested triple (or a native sentinel resolved to
-    /// the host); `target_caps.capabilitiesForTarget` maps it to the capability
-    /// set the gate intersects requirements against. A target whose atoms do
-    /// not resolve yields null caps → gating disabled (no decl gated out).
-    /// On native, every capability is present → no decl is ever gated out
-    /// (the zero-impact regression-anchor guarantee).
-    fn ctfeGatingTarget(self: *Pipeline) zap.ctfe.GatingTarget {
-        const atoms = zap.target_triple.resolve(self.options.ctfe_target);
-        const caps = if (atoms) |a| zap.target_caps.capabilitiesForTarget(a) else null;
-        const label = self.ctfeTargetLabel(atoms);
-        return .{ .caps = caps, .label = label };
-    }
-
-    /// A human-facing target label for the `target_capability` diagnostic
-    /// (`unavailable on \`wasm32-wasi\``). Uses the requested triple verbatim
-    /// when one was given; otherwise synthesizes `arch-os-abi` from the
-    /// resolved host atoms (so the native label is a concrete triple, never
-    /// the opaque `"default"` sentinel).
-    fn ctfeTargetLabel(self: *Pipeline, atoms: ?zap.target_triple.TargetAtoms) []const u8 {
-        const requested = self.options.ctfe_target orelse "";
-        if (!zap.target_triple.isNativeSentinel(requested)) return requested;
-        if (atoms) |a| {
-            return std.fmt.allocPrint(self.alloc, "{s}-{s}-{s}", .{ a.arch, a.os, a.abi }) catch requested;
-        }
-        return requested;
     }
 
     /// Per-struct CTFE used when each struct's IR is built in
@@ -4281,7 +4315,7 @@ const Pipeline = struct {
         mod_name: []const u8,
         mod_ir: *ir.Program,
     ) void {
-        const ctfe_result = zap.ctfe.evaluateComputedAttributesForStructTargeted(
+        const ctfe_result = zap.ctfe.evaluateComputedAttributesForStruct(
             self.alloc,
             mod_ir,
             &self.ctx.collector.graph,
@@ -4289,7 +4323,6 @@ const Pipeline = struct {
             mod_name,
             self.options.cache_dir,
             ctfeCompileOptionsHash(self.options),
-            self.ctfeGatingTarget(),
         ) catch null;
         if (ctfe_result) |cr| {
             if (cr.errors.len > 0) zap.ctfe.emitCtfeErrors(self.alloc, cr.errors);
@@ -5766,6 +5799,15 @@ fn finishMergedIr(
     if (ctx.diag_engine.hasErrors()) {
         pipeline.clearProgress();
         emitContextDiagnostics(ctx, alloc);
+        // Per-struct frontend errors (the `compileSingleStructHir(...) catch
+        // continue` loop reports them to `ctx.diag_engine` and continues so the
+        // whole program's errors surface together) MUST fail the build. A
+        // genuine type/name error usually also trips a backend "undeclared
+        // identifier", but a `target_capability` gate error does NOT — the
+        // gated symbol exists and lowers fine — so without this gate the binary
+        // would be produced despite a reported compile error. Mirrors
+        // `compileForCtfe`'s post-typecheck `hasErrors` → `TypeCheckFailed`.
+        return pipeline.failWithExisting(error.TypeCheckFailed);
     }
 
     return .{

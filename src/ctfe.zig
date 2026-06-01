@@ -4512,98 +4512,147 @@ pub const GatingTarget = struct {
     label: []const u8,
 };
 
-/// Apply the `@available_on` capability gate to one declaration's attribute,
-/// AFTER its value has been computed into `attr.computed_value`. When the
-/// attribute is not `@available_on` this is a no-op. Otherwise it reads the
-/// computed atom list, resolves each to a `target_caps.TargetCapability`
-/// (emitting a precise CTFE error for an unknown capability atom), and — if
-/// the required set is NOT a subset of the target's capability set — returns
-/// the `GatedOut` marker the caller stores on the scope entry. Returns null
-/// when the decl is available (required ⊆ target, or gating disabled, or the
-/// attribute is malformed/unknown — the malformed case having recorded its
-/// own diagnostic).
+/// A diagnostic produced by the AST-based `@available_on` gate pass (an
+/// unknown capability atom or a malformed attribute value). Surfaced through
+/// the caller's diagnostic engine at the attribute's span.
+pub const GateDiagnostic = struct {
+    message: []const u8,
+    span: ast.SourceSpan,
+};
+
+/// Apply the `@available_on` capability gate across the whole scope graph
+/// DIRECTLY FROM THE AST, BEFORE type-checking and independent of IR-based CTFE
+/// value computation (`docs/target-capability-model-plan.md`, Phase 2).
 ///
-/// `mod_name` is the enclosing struct (for the CTFE error's attribute context);
-/// it is set on `interp.current_attribute_context` for the duration of this
-/// call so an unknown-capability diagnostic carries the right provenance.
-fn evaluateAvailableOnGate(
+/// Why AST-based and pre-typecheck: the gate marker (`gated_out`) must be set
+/// BEFORE name resolution runs, because resolution is where the
+/// `target_capability` diagnostic is emitted. The per-struct compile path
+/// type-checks each struct (resolving references) before the IR-based CTFE
+/// attribute pass runs, so an IR-based gate would mark the family too late. The
+/// `@available_on` value is a literal atom (or a list of atom literals) — no
+/// interpreter, no IR, no `call_named` is needed to read it — so this pass
+/// resolves the required capabilities straight from the attribute's `value`
+/// AST and sets `gated_out` on every struct / function family / macro family.
+///
+/// Idempotent and target-keyed: each entry's `gated_out` is reset then
+/// recomputed, so a re-run for a different target produces the correct marker.
+/// A null-caps `target` disables gating (no entry is ever gated). Unknown /
+/// malformed capability atoms append a `GateDiagnostic` to `diagnostics`.
+pub fn gateAvailableOn(
     alloc: std.mem.Allocator,
-    interp: *Interpreter,
-    attr: *const scope.Attribute,
-    mod_name: ?ast.StructName,
+    graph: *scope.ScopeGraph,
     interner: *const ast.StringInterner,
     target: GatingTarget,
-) ?scope.GatedOut {
+    diagnostics: *std.ArrayListUnmanaged(GateDiagnostic),
+) std.mem.Allocator.Error!void {
+    for (graph.structs.items) |*mod_entry| {
+        mod_entry.gated_out = null;
+        for (mod_entry.attributes.items) |*attr| {
+            if (try gateFromAttrAst(alloc, attr, interner, target, diagnostics)) |g| {
+                mod_entry.gated_out = g;
+            }
+        }
+    }
+    for (graph.families.items) |*family| {
+        family.gated_out = null;
+        for (family.attributes.items) |*attr| {
+            if (try gateFromAttrAst(alloc, attr, interner, target, diagnostics)) |g| {
+                family.gated_out = g;
+            }
+        }
+    }
+    for (graph.macro_families.items) |*macro_family| {
+        macro_family.gated_out = null;
+        for (macro_family.attributes.items) |*attr| {
+            if (try gateFromAttrAst(alloc, attr, interner, target, diagnostics)) |g| {
+                macro_family.gated_out = g;
+            }
+        }
+    }
+}
+
+/// Compute the `@available_on` gate for one attribute straight from its AST
+/// `value` expression. Returns the `GatedOut` marker when the attribute is
+/// `@available_on` and the target lacks a required capability; null otherwise
+/// (not `@available_on`, available, or malformed — the malformed case having
+/// appended its own diagnostic). The value AST is a `list` of `atom_literal`s
+/// (the call-form parser shape) or a bare `atom_literal` (the valued form).
+fn gateFromAttrAst(
+    alloc: std.mem.Allocator,
+    attr: *const scope.Attribute,
+    interner: *const ast.StringInterner,
+    target: GatingTarget,
+    diagnostics: *std.ArrayListUnmanaged(GateDiagnostic),
+) std.mem.Allocator.Error!?scope.GatedOut {
     if (!std.mem.eql(u8, interner.get(attr.name), "available_on")) return null;
-    const computed = attr.computed_value orelse return null;
+    const value_expr = attr.value orelse return null;
+    const span = value_expr.getMeta().span;
 
-    // Establish attribute context so a malformed-value diagnostic names the
-    // attribute and its struct, mirroring `tryEvalAttribute`.
-    const prev_context = interp.current_attribute_context;
-    defer interp.current_attribute_context = prev_context;
-    const struct_name_str = if (mod_name) |mn| (structNameToString(alloc, mn, interner) catch null) else null;
-    interp.current_attribute_context = .{
-        .attr_name = interner.get(attr.name),
-        .struct_name = struct_name_str orelse "<unknown>",
-    };
-
-    // The attribute value is uniformly an atom-list (the call-form parser
-    // wraps even a single `@available_on(:cap)` in a one-element list). Accept
-    // a bare atom too for the desugared `@available_on = :cap` valued form.
     var required = target_caps.TargetCapabilitySet{};
-    switch (computed) {
-        .list => |elems| {
-            if (elems.len == 0) {
-                interp.emitError(.type_error, "`@available_on` requires at least one capability atom, e.g. `@available_on(:processes)`") catch {};
+    switch (value_expr.*) {
+        .list => |l| {
+            if (l.elements.len == 0) {
+                try diagnostics.append(alloc, .{ .message = "`@available_on` requires at least one capability atom, e.g. `@available_on(:processes)`", .span = span });
                 return null;
             }
-            for (elems) |elem| {
-                const cap = capabilityFromConstAtom(alloc, interp, elem) orelse return null;
+            for (l.elements) |elem| {
+                const cap = try capabilityFromAtomExpr(alloc, elem, interner, diagnostics) orelse return null;
                 required = required.with(cap);
             }
         },
-        .atom => {
-            const cap = capabilityFromConstAtom(alloc, interp, computed) orelse return null;
+        .atom_literal => |a| {
+            const cap = target_caps.capabilityFromAtomName(interner.get(a.value)) orelse {
+                try appendUnknownCapDiagnostic(alloc, interner.get(a.value), span, diagnostics);
+                return null;
+            };
             required = required.with(cap);
         },
         else => {
-            interp.emitError(.type_error, "`@available_on` value must be a capability atom or a list of capability atoms") catch {};
+            try diagnostics.append(alloc, .{ .message = "`@available_on` value must be a capability atom or a list of capability atoms", .span = span });
             return null;
         },
     }
 
-    // Gating disabled (no resolved target) → never gate out.
     const tcaps = target.caps orelse return null;
-    // Available when the required set is a subset of the target's caps.
     const missing = required.firstMissingFrom(tcaps) orelse return null;
     return .{ .missing_cap = missing.atomName(), .target_label = target.label };
 }
 
-/// Resolve a single computed `@available_on` element to its capability, or
-/// null after recording a precise CTFE diagnostic (a non-atom element, or an
-/// unknown capability atom). The unknown-atom message lists every valid
-/// capability so the author can correct a typo or an OS-name mistake.
-fn capabilityFromConstAtom(
+/// Resolve a single `@available_on` list element (an `atom_literal`) to its
+/// capability, appending a precise diagnostic for a non-atom element or an
+/// unknown capability atom.
+fn capabilityFromAtomExpr(
     alloc: std.mem.Allocator,
-    interp: *Interpreter,
-    value: ConstValue,
-) ?target_caps.TargetCapability {
-    switch (value) {
-        .atom => |name| {
+    expr: *const ast.Expr,
+    interner: *const ast.StringInterner,
+    diagnostics: *std.ArrayListUnmanaged(GateDiagnostic),
+) std.mem.Allocator.Error!?target_caps.TargetCapability {
+    switch (expr.*) {
+        .atom_literal => |a| {
+            const name = interner.get(a.value);
             if (target_caps.capabilityFromAtomName(name)) |cap| return cap;
-            const msg = std.fmt.allocPrint(
-                alloc,
-                "unknown capability `:{s}` in `@available_on` — valid capabilities are `:filesystem`, `:processes`, `:signals`, `:network`, `:threads`, `:terminal`, `:backtrace`",
-                .{name},
-            ) catch "unknown capability in `@available_on`";
-            interp.emitError(.type_error, msg) catch {};
+            try appendUnknownCapDiagnostic(alloc, name, expr.getMeta().span, diagnostics);
             return null;
         },
         else => {
-            interp.emitError(.type_error, "`@available_on` arguments must be capability atoms, e.g. `@available_on(:processes, :signals)`") catch {};
+            try diagnostics.append(alloc, .{ .message = "`@available_on` arguments must be capability atoms, e.g. `@available_on(:processes, :signals)`", .span = expr.getMeta().span });
             return null;
         },
     }
+}
+
+fn appendUnknownCapDiagnostic(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    span: ast.SourceSpan,
+    diagnostics: *std.ArrayListUnmanaged(GateDiagnostic),
+) std.mem.Allocator.Error!void {
+    const msg = try std.fmt.allocPrint(
+        alloc,
+        "unknown capability `:{s}` in `@available_on` — valid capabilities are `:filesystem`, `:processes`, `:signals`, `:network`, `:threads`, `:terminal`, `:backtrace`",
+        .{name},
+    );
+    try diagnostics.append(alloc, .{ .message = msg, .span = span });
 }
 
 /// Evaluate computed attributes across all structs.
@@ -4621,23 +4670,6 @@ pub fn evaluateComputedAttributes(
     interner: *const ast.StringInterner,
     cache_dir: ?[]const u8,
     compile_options_hash: u64,
-) EvalAttrError!EvalAttrResult {
-    return evaluateComputedAttributesTargeted(alloc, program, graph, interner, cache_dir, compile_options_hash, .{ .caps = null, .label = "" });
-}
-
-/// Target-aware variant of `evaluateComputedAttributes`. Threads the
-/// compilation `target` so each declaration's `@available_on(:cap, …)`
-/// attribute is gated (its scope-graph entry marked `gated_out` when the
-/// target lacks a required capability). A null-caps `target` (bare unit
-/// tests) leaves gating disabled — identical to the legacy behavior.
-pub fn evaluateComputedAttributesTargeted(
-    alloc: std.mem.Allocator,
-    program: *const ir.Program,
-    graph: *scope.ScopeGraph,
-    interner: *const ast.StringInterner,
-    cache_dir: ?[]const u8,
-    compile_options_hash: u64,
-    target: GatingTarget,
 ) EvalAttrError!EvalAttrResult {
     var interp = Interpreter.init(alloc, program);
     defer interp.deinit();
@@ -4678,57 +4710,11 @@ pub fn evaluateComputedAttributesTargeted(
         }
     }
 
-    applyGatingPass(alloc, &interp, graph, interner, target);
-
     return .{
         .evaluated = evaluated,
         .failed = failed,
         .errors = try cloneCtfeErrors(alloc, interp.errors.items),
     };
-}
-
-/// Apply the `@available_on` capability gate across the WHOLE scope graph in
-/// one post-pass, after attribute values have been computed. Runs over every
-/// struct, function family, and macro family, setting `gated_out` on each
-/// entry whose `@available_on` requirement the target does not satisfy (and
-/// clearing it otherwise, so a re-run for a different target — the CTFE cache
-/// key includes the target — produces the correct marker). Centralizing the
-/// gate here keeps it uniform regardless of which value-computation path
-/// (whole-program, dependency-ordered, or per-struct) ran first, and
-/// guarantees every gateable decl kind is covered exactly once.
-fn applyGatingPass(
-    alloc: std.mem.Allocator,
-    interp: *Interpreter,
-    graph: *scope.ScopeGraph,
-    interner: *const ast.StringInterner,
-    target: GatingTarget,
-) void {
-    for (graph.structs.items) |*mod_entry| {
-        mod_entry.gated_out = null;
-        for (mod_entry.attributes.items) |*attr| {
-            if (evaluateAvailableOnGate(alloc, interp, attr, mod_entry.name, interner, target)) |g| {
-                mod_entry.gated_out = g;
-            }
-        }
-    }
-    for (graph.families.items) |*family| {
-        family.gated_out = null;
-        const mod_name = findStructForScope(graph, family.scope_id);
-        for (family.attributes.items) |*attr| {
-            if (evaluateAvailableOnGate(alloc, interp, attr, mod_name, interner, target)) |g| {
-                family.gated_out = g;
-            }
-        }
-    }
-    for (graph.macro_families.items) |*macro_family| {
-        macro_family.gated_out = null;
-        const mod_name = findStructForScope(graph, macro_family.scope_id);
-        for (macro_family.attributes.items) |*attr| {
-            if (evaluateAvailableOnGate(alloc, interp, attr, mod_name, interner, target)) |g| {
-                macro_family.gated_out = g;
-            }
-        }
-    }
 }
 
 pub const EvalAttrResult = struct {
@@ -4755,23 +4741,6 @@ pub fn evaluateStructAttributesInOrder(
     struct_order: []const []const u8,
     cache_dir: ?[]const u8,
     compile_options_hash: u64,
-) EvalAttrError!EvalAttrResult {
-    return evaluateStructAttributesInOrderTargeted(alloc, program, graph, interner, struct_order, cache_dir, compile_options_hash, .{ .caps = null, .label = "" });
-}
-
-/// Target-aware variant of `evaluateStructAttributesInOrder` — the path the
-/// main project build uses (`compiler.zig`'s `runCtfeAttributes`). Threads the
-/// compilation `target` so the post-pass `applyGatingPass` marks each
-/// `@available_on`-gated declaration's scope entry.
-pub fn evaluateStructAttributesInOrderTargeted(
-    alloc: std.mem.Allocator,
-    program: *const ir.Program,
-    graph: *scope.ScopeGraph,
-    interner: *const ast.StringInterner,
-    struct_order: []const []const u8,
-    cache_dir: ?[]const u8,
-    compile_options_hash: u64,
-    target: GatingTarget,
 ) EvalAttrError!EvalAttrResult {
     var interp = Interpreter.init(alloc, program);
     defer interp.deinit();
@@ -4831,8 +4800,6 @@ pub fn evaluateStructAttributesInOrderTargeted(
         }
     }
 
-    applyGatingPass(alloc, &interp, graph, interner, target);
-
     return .{
         .evaluated = evaluated,
         .failed = failed,
@@ -4853,24 +4820,6 @@ pub fn evaluateComputedAttributesForStruct(
     cache_dir: ?[]const u8,
     compile_options_hash: u64,
 ) EvalAttrError!EvalAttrResult {
-    return evaluateComputedAttributesForStructTargeted(alloc, program, graph, interner, struct_name, cache_dir, compile_options_hash, .{ .caps = null, .label = "" });
-}
-
-/// Target-aware variant of `evaluateComputedAttributesForStruct` (the
-/// per-struct isolated-build path). Gates ONLY the named struct and the
-/// families it owns — the only entries this path has finished loading — so a
-/// `@available_on` requirement marks the right `gated_out` even when structs
-/// are evaluated one at a time.
-pub fn evaluateComputedAttributesForStructTargeted(
-    alloc: std.mem.Allocator,
-    program: *const ir.Program,
-    graph: *scope.ScopeGraph,
-    interner: *const ast.StringInterner,
-    struct_name: []const u8,
-    cache_dir: ?[]const u8,
-    compile_options_hash: u64,
-    target: GatingTarget,
-) EvalAttrError!EvalAttrResult {
     var interp = Interpreter.init(alloc, program);
     defer interp.deinit();
     interp.scope_graph = graph;
@@ -4887,33 +4836,23 @@ pub fn evaluateComputedAttributesForStructTargeted(
     for (graph.structs.items) |*mod_entry| {
         if (!structNameMatchesStr(mod_entry.name, struct_name, interner)) continue;
 
-        mod_entry.gated_out = null;
         for (mod_entry.attributes.items) |*attr| {
-            if (attr.computed_value == null) {
-                if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
-                    evaluated += 1;
-                } else |_| {
-                    failed += 1;
-                }
-            }
-            if (evaluateAvailableOnGate(alloc, &interp, attr, mod_entry.name, interner, target)) |g| {
-                mod_entry.gated_out = g;
+            if (attr.computed_value != null) continue;
+            if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
+                evaluated += 1;
+            } else |_| {
+                failed += 1;
             }
         }
 
         for (graph.families.items) |*family| {
             if (family.scope_id != mod_entry.scope_id) continue;
-            family.gated_out = null;
             for (family.attributes.items) |*attr| {
-                if (attr.computed_value == null) {
-                    if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
-                        evaluated += 1;
-                    } else |_| {
-                        failed += 1;
-                    }
-                }
-                if (evaluateAvailableOnGate(alloc, &interp, attr, mod_entry.name, interner, target)) |g| {
-                    family.gated_out = g;
+                if (attr.computed_value != null) continue;
+                if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
+                    evaluated += 1;
+                } else |_| {
+                    failed += 1;
                 }
             }
         }
