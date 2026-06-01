@@ -6371,15 +6371,25 @@ pub const HirBuilder = struct {
             .field_access => |fa| {
                 // `@target.os`/`.arch`/`.abi` used as a plain atom value
                 // (outside a folded comparison/case): lower to the
-                // comptime-resolved atom name. A `@target.<bad_field>` (or a
-                // build with no resolved target) records a diagnostic inside
-                // `resolveTargetFieldAtom` and falls through to the normal
-                // field-access path below (which yields a benign UNKNOWN
-                // node — the recorded error fails the build).
+                // comptime-resolved atom name. When the object is `@target`
+                // we OWN this field access entirely and never fall through:
+                // a good field resolves to its atom; a `@target.<bad_field>`
+                // (or a build with no resolved target) has already recorded
+                // the precise "unknown `@target` field" diagnostic inside
+                // `resolveTargetFieldAtom`, so we return a benign UNKNOWN nil
+                // placeholder (the recorded error fails the build). Falling
+                // through here would re-build the `@target` object on its
+                // own and double-emit the generic bare-`@target` error,
+                // masking the specific field diagnostic.
                 if (self.isTargetAttrRef(fa.object)) {
                     if (try self.resolveTargetFieldAtom(expr)) |atom_name| {
                         return try self.buildResolvedTargetAtom(atom_name, fa.meta.span);
                     }
+                    return try self.create(Expr, .{
+                        .kind = .nil_lit,
+                        .type_id = types_mod.TypeStore.UNKNOWN,
+                        .span = fa.meta.span,
+                    });
                 }
                 // Struct-qualified reference (e.g. Math.square without call parens)
                 if (fa.object.* == .struct_ref) {
@@ -10445,6 +10455,11 @@ test "@target with an unknown field records a clear diagnostic" {
     defer h.deinit(std.testing.allocator);
     try std.testing.expect(h.builder.errors.items.len >= 1);
     try std.testing.expect(std.mem.indexOf(u8, h.builder.errors.items[0].message, "unknown `@target` field") != null);
+    // A bad field must NOT also emit the generic bare-`@target` message
+    // (the field-access arm owns the access and returns a placeholder).
+    for (h.builder.errors.items) |e| {
+        try std.testing.expect(std.mem.indexOf(u8, e.message, "comptime struct of atoms") == null);
+    }
 }
 
 test "bare @target (no field) records a clear diagnostic" {
