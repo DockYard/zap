@@ -95,6 +95,26 @@ pub fn resolve(triple: ?[]const u8) ?TargetAtoms {
     return .{ .os = os_name, .arch = arch_name, .abi = abi_name };
 }
 
+/// Resolve a target label to `{os, arch, abi}` atoms, treating ANY input
+/// that does not parse as a well-formed `arch-os[-abi]` triple as the
+/// native host — never failing. Use this where the input is a target
+/// LABEL that may legitimately be a non-triple sentinel beyond
+/// `"default"`/`""`/`"native"`: the build/test/script invocation labels
+/// (`"test"`, `"script"`, a manifest target name like `"release"`), which
+/// all mean "no explicit cross triple → build for the host". A genuinely
+/// malformed `-Dtarget=` is policed by the stricter compile path (the
+/// memory driver's `parseTargetTriple` + the fork's `isSupportedTriple`),
+/// so this lenient fallback never masks a real cross-target error; it only
+/// keeps `%Zap.Env`'s os/arch host-correct for native invocations whose
+/// label is not a triple.
+pub fn resolveOrHost(label: ?[]const u8) TargetAtoms {
+    return resolve(label) orelse .{
+        .os = @tagName(builtin.target.os.tag),
+        .arch = @tagName(builtin.target.cpu.arch),
+        .abi = @tagName(builtin.target.abi),
+    };
+}
+
 /// The default ABI atom name for an `arch-os` triple whose ABI segment was
 /// omitted. Mirrors `src/memory/driver.zig`'s `defaultAbiForTriple`:
 /// `wasi → musl` (wasi-libc), `macos → none` (Mach-O native),
@@ -182,6 +202,21 @@ test "isNativeSentinel: recognizes all native spellings and rejects real triples
     try std.testing.expect(isNativeSentinel("native"));
     try std.testing.expect(!isNativeSentinel("wasm32-wasi"));
     try std.testing.expect(!isNativeSentinel("aarch64-macos-none"));
+}
+
+test "resolveOrHost: non-triple labels fall back to the host" {
+    const host_os = @tagName(builtin.target.os.tag);
+    const host_arch = @tagName(builtin.target.cpu.arch);
+    // Invocation labels that are NOT triples (zap test/script/default/...).
+    for ([_]?[]const u8{ "test", "script", "release", "default", "", null }) |label| {
+        const r = resolveOrHost(label);
+        try std.testing.expectEqualStrings(host_os, r.os);
+        try std.testing.expectEqualStrings(host_arch, r.arch);
+    }
+    // A real triple still resolves to that target, not the host.
+    const w = resolveOrHost("wasm32-wasi");
+    try std.testing.expectEqualStrings("wasi", w.os);
+    try std.testing.expectEqualStrings("wasm32", w.arch);
 }
 
 test "resolve: malformed or unknown triples return null" {

@@ -311,21 +311,22 @@ pub fn ctfeManifestDetailedWithProgress(
     // Construct the env argument: %Zap.Env{target: :target_name, os: :os, arch: :arch}.
     //
     // os/arch MUST reflect the *requested compilation target*, not the host
-    // the manifest evaluator runs on. `target_name` is the requested triple
-    // (`"aarch64-macos-none"`, the two-component `"wasm32-wasi"`, …) or the
-    // native sentinel (`"default"`/`""`), which `target_triple.resolve`
-    // maps to the host triple's atoms. Surfacing host os/arch here (the old
+    // the manifest evaluator runs on. `target_name` is the effective target
+    // label: a real triple under `-Dtarget=` (`"aarch64-macos-none"`, the
+    // two-component `"wasm32-wasi"`, …), or a non-triple invocation label
+    // (`"default"`, `"test"`, `"script"`, or a manifest target name) which
+    // all mean native → host. `resolveOrHost` maps a triple to its atoms
+    // and any non-triple label to the host triple's atoms, so it never
+    // errors on a label (a genuinely-malformed `-Dtarget=` is policed by
+    // the stricter compile path). `env.target` keeps the raw label (a
+    // `build.zap` may branch on it, e.g. `:bulk`/`:tracking`).
+    //
+    // Surfacing HOST os/arch here unconditionally (the old
     // `builtin.os.tag`/`builtin.cpu.arch`) was a latent cross-compile bug:
     // a `build.zap` branching on `env.os`/`env.arch` saw the host under
     // `-Dtarget=…`. This is the same resolution `@target` surfaces to all
     // Zap CTFE, single-sourced in `target_triple`.
-    const target_atoms = zap.target_triple.resolve(target_name) orelse {
-        zap.diagnostics.emitStderrFmt(
-            "  manifest error: unrecognized target triple `{s}`\n",
-            .{target_name},
-        );
-        return error.CtfeFailed;
-    };
+    const target_atoms = zap.target_triple.resolveOrHost(target_name);
 
     const env_const = ctfe.ConstValue{ .struct_val = .{
         .type_name = "Zap_Env",
