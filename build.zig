@@ -206,6 +206,25 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&runtime_os_windows_tests.step);
 
+    // The Windows command-line splitter (`Backend.splitCommandLineWtf16`) is
+    // PURE — it tokenizes a `[]const u16` WTF-16 command line and transcodes
+    // to UTF-8 without touching the PEB — so it can be unit-tested on the
+    // HOST and RUN, proving the quote/backslash parsing and WTF-16→UTF-8
+    // transcode correct WITHOUT a Windows runtime or wine. (The full windows
+    // backend above is only compile-checked for `x86_64-windows-gnu`; it
+    // cannot run on the host.) This native target imports only the splitter
+    // — lazy analysis leaves the PEB/console/VEH code unanalyzed — and its
+    // `test` blocks actually execute in `zig build test`.
+    const runtime_os_windows_argv_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime_os/windows_argv_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_runtime_os_windows_argv_tests = b.addRunArtifact(runtime_os_windows_argv_tests);
+    test_step.dependOn(&run_runtime_os_windows_argv_tests.step);
+
     // Runtime OS-portability grep-gate (campaign lock-in). Scans the
     // embedded `src/runtime.zig` and FAILS the build if a raw `std.c.` /
     // `std.posix.` / `std.os.` call appears OUTSIDE the allowlisted regions

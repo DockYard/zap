@@ -214,22 +214,294 @@ pub const Backend = struct {
         return c.atexit(handler);
     }
 
-    /// Process argv on Windows. The argument vector lives in the PEB as
-    /// a single WTF-16 `CommandLine` UNICODE_STRING; recovering a
-    /// `[*:0]const u8`-style argv requires tokenizing it (quote/backslash
-    /// rules) and transcoding WTF-16 → UTF-8 into stable storage. That
-    /// transcode is the one piece of the argv domain that does not map to
-    /// an allocation-free static-cache lift the way the POSIX
-    /// `/proc/self/cmdline` and macOS `_NSGetArgv` paths do, so under the
-    /// capability model it DEGRADES to an empty argv on Windows for now
-    /// (a program that does not read its arguments — like the Phase-A
-    /// `IO.puts` fixture — is unaffected). The CommandLine tokenizer +
-    /// WTF-16 transcode into a static cache is the tracked Windows-argv
-    /// follow-up; it is deliberately NOT the mingw `__argv`/`__argc` CRT
-    /// globals (those are not defined under Zap's object-based Windows
-    /// link, producing `undefined symbol` link errors).
+    /// Fixed argv cache sizes for the Windows backend. A Windows command
+    /// line is capped at 32 767 WTF-16 code units (`CreateProcess`'s
+    /// documented `lpCommandLine` limit). Each UTF-8 byte is at most 1.5×
+    /// the WTF-16 size for BMP text and never exceeds 4 bytes per code
+    /// point, but a per-arg NUL terminator is added, so a 128 KiB byte
+    /// buffer is a generous bound that covers the worst-case transcode of
+    /// the longest legal command line without an allocator (the runtime's
+    /// startup path must not allocate). The argument count is likewise
+    /// bounded well above any realistic argv (the same order of magnitude
+    /// as the linux `/proc/self/cmdline` cache's 4096-arg table).
+    const WINDOWS_ARGV_BUF_SIZE: usize = 128 * 1024;
+    const WINDOWS_ARGV_MAX_ARGS: usize = 4096;
+
+    /// Process-static argv cache: the transcoded UTF-8 argument bytes
+    /// (each NUL-terminated), the pointer table into them, the count, and
+    /// the idempotency flag. argv is immutable process-global, so it is
+    /// parsed once on first call and reused thereafter — a process-lifetime
+    /// static buffer (leaked-once, never freed), which is the correct free
+    /// model for argv and matches the seam contract (the POSIX `_NSGetArgv`
+    /// slice and the linux `/proc/self/cmdline` cache are equally
+    /// process-lifetime and unfreed).
+    var windows_argv_buf: [WINDOWS_ARGV_BUF_SIZE]u8 = undefined;
+    var windows_argv_ptrs: [WINDOWS_ARGV_MAX_ARGS][*:0]const u8 = undefined;
+    var windows_argv_argc: usize = 0;
+    var windows_argv_loaded: bool = false;
+
+    /// Process argv on Windows. The argument vector lives in the PEB as a
+    /// single WTF-16 `CommandLine` UNICODE_STRING (the same PEB the
+    /// standard-handle accessors read), so argv is recovered by reading
+    /// `ProcessParameters.CommandLine` — preferred over `GetCommandLineW`
+    /// (no extra kernel32 import; identical bytes) and over
+    /// `CommandLineToArgvW` (no shell32 dependency, and the splitter is
+    /// then unit-testable on the host without Windows). The slice is
+    /// tokenized by `splitCommandLineWtf16` following the documented
+    /// `CommandLineToArgvW` quote/backslash rules and each argument is
+    /// transcoded WTF-16 → UTF-8 (WTF, not strict UTF-16, so an unpaired
+    /// surrogate in a path/arg is preserved rather than rejected) into the
+    /// process-static cache. The result is cached on first call (argv is
+    /// immutable process-global) and reused thereafter — matching the
+    /// linux/wasi backends' idempotent static-cache shape. Deliberately
+    /// NOT the mingw `__argv`/`__argc` CRT globals: those are undefined
+    /// under Zap's object-based Windows link (`undefined symbol` errors).
     pub fn argv() []const [*:0]const u8 {
-        return &.{};
+        if (windows_argv_loaded) return windows_argv_ptrs[0..windows_argv_argc];
+        windows_argv_loaded = true;
+        windows_argv_argc = 0;
+
+        // The PEB `CommandLine` is a WTF-16 UNICODE_STRING; `.slice()`
+        // yields its `[]const u16` code units (empty if the field is
+        // unset). The same `peb()` accessor backs the standard handles.
+        const command_line: []const u16 = std.os.windows.peb().ProcessParameters.CommandLine.slice();
+        windows_argv_argc = splitCommandLineWtf16(
+            command_line,
+            &windows_argv_buf,
+            &windows_argv_ptrs,
+        );
+        return windows_argv_ptrs[0..windows_argv_argc];
+    }
+
+    /// Tokenize a Windows WTF-16 command line into argv, transcoding each
+    /// argument WTF-16 → UTF-8 into `out_bytes` (NUL-terminating each) and
+    /// filling `out_ptrs` with `[*:0]const u8` pointers into `out_bytes`.
+    /// Returns the argument count (`argc`).
+    ///
+    /// Pure (PEB-independent) so it is unit-testable on any host with
+    /// synthetic WTF-16 input. Faithfully implements the documented
+    /// `CommandLineToArgvW` algorithm:
+    ///
+    ///   * **argv[0]** (the program name) parses by SPECIAL rules:
+    ///     backslashes are literal (never escapes), and a `"` simply toggles
+    ///     in/out of a quoted region; the token ends at the first unquoted
+    ///     whitespace (or the closing quote / end of string).
+    ///   * **Subsequent arguments** parse by the backslash/quote rules:
+    ///       - `2n` backslashes followed by `"` → `n` literal backslashes and
+    ///         the `"` toggles the in-quotes state (the `"` is NOT emitted);
+    ///       - `2n+1` backslashes followed by `"` → `n` literal backslashes
+    ///         and a LITERAL `"` (the quote is escaped, state unchanged);
+    ///       - backslashes NOT followed by `"` are all literal;
+    ///       - inside a quoted region, a `""` pair emits ONE literal `"` and
+    ///         stays in-quotes (the post-2005 CRT rule);
+    ///       - unquoted whitespace (space or tab) separates arguments;
+    ///         leading/trailing/repeated separators collapse (no empty args).
+    ///   * An empty command line yields `argc == 0`.
+    ///
+    /// Overflow is bounded, never overrun: if the pointer table or the byte
+    /// buffer would overflow, tokenization stops and the arguments parsed so
+    /// far are returned (the static cache is sized for the longest legal
+    /// Windows command line, so this is a defensive bound, not an expected
+    /// path).
+    ///
+    /// `pub` so the native splitter unit test
+    /// (`src/runtime_os/windows_argv_test.zig`, wired into `zig build test`)
+    /// can exercise the WTF-16 → UTF-8 quote/backslash parsing on the host
+    /// WITHOUT a Windows runtime or wine: the function is pure (PEB-free), so
+    /// the host can run it and assert exact argv output. (Inside the spliced
+    /// embedded runtime, `pub` on a backend-body helper is harmless — the
+    /// body becomes a private `struct` arm of the comptime `RuntimeOs`
+    /// switch, never re-exported.)
+    pub fn splitCommandLineWtf16(
+        command_line: []const u16,
+        out_bytes: []u8,
+        out_ptrs: [][*:0]const u8,
+    ) usize {
+        const space: u16 = ' ';
+        const tab: u16 = '\t';
+        const quote: u16 = '"';
+        const backslash: u16 = '\\';
+
+        var argc: usize = 0;
+        var write_pos: usize = 0; // next free byte in out_bytes
+        var i: usize = 0; // read cursor into command_line
+
+        // Transcode/emit helpers. Content is emitted in maximal RUNS — a
+        // contiguous `[]const u16` sub-slice of `command_line` — so a UTF-16
+        // surrogate PAIR within a run is transcoded together in a single
+        // `wtf16LeToWtf8` call (recombining into a 4-byte sequence). A
+        // run is only ever broken by a STRUCTURAL code unit (`"`, the `\`
+        // that precedes a `"`, or an unquoted separator), all of which are
+        // BMP non-surrogates, so a surrogate pair is never split across runs
+        // and each run is independently valid WTF-16. The only synthesized
+        // bytes (an escaped literal `\` or `"` from the backslash rule, and
+        // the `""`-in-quotes literal `"`) are pure ASCII, emitted directly.
+        const Emit = struct {
+            /// Transcode the WTF-16 span `units` to WTF-8 and append at
+            /// `pos.*`. Returns false on output overflow (the caller then
+            /// stops and leaves room for its own NUL terminator). A
+            /// zero-length span is a no-op. The exact WTF-8 length is
+            /// computed first (`calcWtf8Len`) so the capacity check is
+            /// precise and the infallible `wtf16LeToWtf8` — which asserts
+            /// the destination is large enough — never trips that assert.
+            fn run(bytes: []u8, pos: *usize, units: []const u16) bool {
+                if (units.len == 0) return true;
+                const needed = std.unicode.calcWtf8Len(units);
+                if (pos.* + needed > bytes.len) return false;
+                const n = std.unicode.wtf16LeToWtf8(bytes[pos.*..], units);
+                pos.* += n;
+                return true;
+            }
+
+            /// Append a single ASCII byte at `pos.*`. Returns false on
+            /// overflow.
+            fn byte(bytes: []u8, pos: *usize, b: u8) bool {
+                if (pos.* >= bytes.len) return false;
+                bytes[pos.*] = b;
+                pos.* += 1;
+                return true;
+            }
+        };
+
+        // ---- argv[0]: program name (special quoting; backslash literal) ---
+        // Per CommandLineToArgvW, argv[0] is only parsed when the command
+        // line is non-empty; an all-whitespace or empty line yields no args.
+        // Skip leading whitespace first (CommandLineToArgvW tolerates it).
+        while (i < command_line.len and (command_line[i] == space or command_line[i] == tab)) : (i += 1) {}
+
+        if (i < command_line.len) {
+            if (argc >= out_ptrs.len or write_pos >= out_bytes.len) return argc;
+            const arg0_start = write_pos;
+            var in_quotes = false;
+            var overflowed0 = false;
+            while (i < command_line.len) {
+                const c = command_line[i];
+                if (c == quote) {
+                    in_quotes = !in_quotes;
+                    i += 1;
+                    continue;
+                }
+                if (!in_quotes and (c == space or c == tab)) break;
+                // Maximal content run up to the next structural unit
+                // (quote, or — when unquoted — a separator). Backslash is
+                // literal in argv[0], so it does NOT break a run.
+                const run_start = i;
+                while (i < command_line.len) : (i += 1) {
+                    const r = command_line[i];
+                    if (r == quote) break;
+                    if (!in_quotes and (r == space or r == tab)) break;
+                }
+                if (!Emit.run(out_bytes, &write_pos, command_line[run_start..i])) {
+                    overflowed0 = true;
+                    break;
+                }
+            }
+            if (overflowed0) return argc;
+            // NUL-terminate argv[0].
+            if (write_pos >= out_bytes.len) return argc;
+            out_bytes[write_pos] = 0;
+            out_ptrs[argc] = out_bytes[arg0_start..write_pos :0];
+            argc += 1;
+            write_pos += 1;
+        }
+
+        // ---- argv[1..]: backslash/quote rules ----------------------------
+        while (true) {
+            // Skip separators between arguments.
+            while (i < command_line.len and (command_line[i] == space or command_line[i] == tab)) : (i += 1) {}
+            if (i >= command_line.len) break;
+
+            if (argc >= out_ptrs.len or write_pos >= out_bytes.len) break;
+            const arg_start = write_pos;
+            var in_quotes = false;
+            var overflowed = false;
+
+            scan_arg: while (i < command_line.len) {
+                const c = command_line[i];
+
+                if (c == backslash) {
+                    // Count the run of backslashes.
+                    const bs_start = i;
+                    while (i < command_line.len and command_line[i] == backslash) : (i += 1) {}
+                    const nbackslash = i - bs_start;
+                    if (i < command_line.len and command_line[i] == quote) {
+                        // `2n` backslashes → n literal `\`, quote toggles;
+                        // `2n+1` → n literal `\`, then a literal `"`. The
+                        // backslashes are ASCII, emitted directly.
+                        var k: usize = 0;
+                        while (k < nbackslash / 2) : (k += 1) {
+                            if (!Emit.byte(out_bytes, &write_pos, '\\')) {
+                                overflowed = true;
+                                break :scan_arg;
+                            }
+                        }
+                        if (nbackslash % 2 == 1) {
+                            // Escaped quote: emit a literal `"`, consume it.
+                            if (!Emit.byte(out_bytes, &write_pos, '"')) {
+                                overflowed = true;
+                                break :scan_arg;
+                            }
+                            i += 1; // consume the `"`
+                        } else {
+                            // Even backslashes: the quote is structural.
+                            in_quotes = !in_quotes;
+                            i += 1; // consume the `"`
+                        }
+                    } else {
+                        // Backslashes not followed by a quote are all literal.
+                        var k: usize = 0;
+                        while (k < nbackslash) : (k += 1) {
+                            if (!Emit.byte(out_bytes, &write_pos, '\\')) {
+                                overflowed = true;
+                                break :scan_arg;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if (c == quote) {
+                    if (in_quotes and i + 1 < command_line.len and command_line[i + 1] == quote) {
+                        // `""` inside quotes → one literal `"`, stay in-quotes.
+                        if (!Emit.byte(out_bytes, &write_pos, '"')) {
+                            overflowed = true;
+                            break :scan_arg;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    in_quotes = !in_quotes;
+                    i += 1;
+                    continue;
+                }
+
+                if (!in_quotes and (c == space or c == tab)) break :scan_arg;
+
+                // Maximal content run up to the next structural unit
+                // (backslash, quote, or — when unquoted — a separator).
+                const run_start = i;
+                while (i < command_line.len) : (i += 1) {
+                    const r = command_line[i];
+                    if (r == backslash or r == quote) break;
+                    if (!in_quotes and (r == space or r == tab)) break;
+                }
+                if (!Emit.run(out_bytes, &write_pos, command_line[run_start..i])) {
+                    overflowed = true;
+                    break :scan_arg;
+                }
+            }
+
+            if (overflowed) break;
+
+            // NUL-terminate this argument.
+            if (write_pos >= out_bytes.len) break;
+            out_bytes[write_pos] = 0;
+            out_ptrs[argc] = out_bytes[arg_start..write_pos :0];
+            argc += 1;
+            write_pos += 1;
+        }
+
+        return argc;
     }
 
     /// Current working directory absolute path, written into `out_buffer`;
