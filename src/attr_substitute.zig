@@ -160,6 +160,17 @@ fn substituteInExpr(
         .attr_ref => |ref| {
             const attr_name = interner.get(ref.name);
 
+            // `@target` is the reserved comptime intrinsic surfacing the
+            // compilation target as `{os, arch, abi}` atoms — NOT a
+            // user-declared struct attribute. Leave it untouched here; the
+            // HIR builder resolves `@target.<field>` to a comptime atom and
+            // folds comparisons/`case` over it. (Without this guard the
+            // attribute-substitution pass would reject `@target` as an
+            // undefined attribute before HIR build ever runs.)
+            if (std.mem.eql(u8, attr_name, "target")) {
+                return expr;
+            }
+
             // Look up in function-level attributes first, then struct-level
             const attr = findAttribute(ref.name, func_attrs) orelse
                 findAttribute(ref.name, mod_attrs);
