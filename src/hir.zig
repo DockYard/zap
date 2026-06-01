@@ -5090,10 +5090,6 @@ pub const HirBuilder = struct {
     // dead arm is elided. Used as a plain value (not in a comparison/case),
     // `@target.<field>` still lowers to a normal runtime `atom_lit`.
 
-    /// The three fields `@target` exposes, in the canonical order the
-    /// diagnostic lists them.
-    const target_fields = [_][]const u8{ "os", "arch", "abi" };
-
     /// PURE recognition: when `expr` is `@target.<field>` for a recognized
     /// field on a build with a resolved target, return that field's
     /// comptime atom name (`"macos"`, `"wasm32"`, `"none"`, …). Returns
