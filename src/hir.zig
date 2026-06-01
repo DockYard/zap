@@ -5094,20 +5094,43 @@ pub const HirBuilder = struct {
     /// diagnostic lists them.
     const target_fields = [_][]const u8{ "os", "arch", "abi" };
 
-    /// When `expr` is `@target.<field>` for a recognized field, return the
-    /// resolved comptime atom name (`"macos"`, `"wasm32"`, `"none"`, …) for
-    /// the build's target. Returns null when `expr` is not a `@target`
-    /// field access at all (the caller falls through to normal lowering).
-    /// An unknown field (`@target.bogus`) or a `@target` access on a build
-    /// with no resolved target records a diagnostic and returns null so the
-    /// fold is skipped and the build fails cleanly.
-    fn resolveTargetFieldAtom(self: *HirBuilder, expr: *const ast.Expr) !?[]const u8 {
+    /// PURE recognition: when `expr` is `@target.<field>` for a recognized
+    /// field on a build with a resolved target, return that field's
+    /// comptime atom name (`"macos"`, `"wasm32"`, `"none"`, …). Returns
+    /// null for anything else — `expr` is not a `@target` field access, the
+    /// field is unknown, or the target is unresolved — WITHOUT emitting a
+    /// diagnostic. The fold probes (`tryFoldTargetComparison`,
+    /// `tryFoldTargetCase`) use this to test operands/scrutinees
+    /// speculatively; the single authoritative diagnostic for a bad
+    /// `@target` access is emitted only by `resolveTargetFieldAtom` from the
+    /// field-access lowering arm, so an `@target.<bad>` in a comparison or
+    /// case never double-reports.
+    fn peekTargetFieldAtom(self: *HirBuilder, expr: *const ast.Expr) ?[]const u8 {
         if (expr.* != .field_access) return null;
         const fa = expr.field_access;
         if (!self.isTargetAttrRef(fa.object)) return null;
+        const target = self.target orelse return null;
+        const field_name = self.interner.get(fa.field);
+        if (std.mem.eql(u8, field_name, "os")) return target.os;
+        if (std.mem.eql(u8, field_name, "arch")) return target.arch;
+        if (std.mem.eql(u8, field_name, "abi")) return target.abi;
+        return null;
+    }
+
+    /// Resolve `@target.<field>` to its comptime atom name for the
+    /// field-access LOWERING arm, emitting the authoritative diagnostic on
+    /// failure: an unknown field (`@target.bogus`) or a `@target` access on
+    /// a build with no resolved target each record a precise error and
+    /// return null. Precondition: `expr` is a `@target` field access (the
+    /// caller has already checked `isTargetAttrRef(expr.field_access.object)`),
+    /// so this is the one site that owns the access and may report.
+    fn resolveTargetFieldAtom(self: *HirBuilder, expr: *const ast.Expr) !?[]const u8 {
+        std.debug.assert(expr.* == .field_access);
+        const fa = expr.field_access;
+        std.debug.assert(self.isTargetAttrRef(fa.object));
 
         const field_name = self.interner.get(fa.field);
-        const target = self.target orelse {
+        if (self.target == null) {
             try self.errors.append(self.allocator, .{
                 .message = try std.fmt.allocPrint(
                     self.allocator,
@@ -5117,11 +5140,9 @@ pub const HirBuilder = struct {
                 .span = fa.meta.span,
             });
             return null;
-        };
+        }
 
-        if (std.mem.eql(u8, field_name, "os")) return target.os;
-        if (std.mem.eql(u8, field_name, "arch")) return target.arch;
-        if (std.mem.eql(u8, field_name, "abi")) return target.abi;
+        if (self.peekTargetFieldAtom(expr)) |atom_name| return atom_name;
 
         try self.errors.append(self.allocator, .{
             .message = try std.fmt.allocPrint(
@@ -5176,9 +5197,11 @@ pub const HirBuilder = struct {
         if (!is_eq and !is_neq) return null;
 
         // Recognize `@target.<field> <op> :atom` in either operand order.
+        // Pure peek — never emits a diagnostic, so a `@target.<bad>` operand
+        // is reported once, by the field-access lowering arm, not here.
         const target_atom_opt, const literal_expr = blk: {
-            if (try self.resolveTargetFieldAtom(bo.lhs)) |name| break :blk .{ name, bo.rhs };
-            if (try self.resolveTargetFieldAtom(bo.rhs)) |name| break :blk .{ name, bo.lhs };
+            if (self.peekTargetFieldAtom(bo.lhs)) |name| break :blk .{ name, bo.rhs };
+            if (self.peekTargetFieldAtom(bo.rhs)) |name| break :blk .{ name, bo.lhs };
             break :blk .{ @as(?[]const u8, null), bo.lhs };
         };
         const target_atom = target_atom_opt orelse return null;
@@ -5206,7 +5229,9 @@ pub const HirBuilder = struct {
     /// lowered as the resolved atom value. The first matching clause wins
     /// (Zap case semantics are first-match).
     fn tryFoldTargetCase(self: *HirBuilder, ce: ast.CaseExpr) !?*const Expr {
-        const target_atom = (try self.resolveTargetFieldAtom(ce.scrutinee)) orelse return null;
+        // Pure peek — a `case @target.<bad>` falls through and is reported
+        // once by the field-access lowering of the scrutinee, not here.
+        const target_atom = self.peekTargetFieldAtom(ce.scrutinee) orelse return null;
 
         // First pass: every clause must be a guard-free atom-literal or
         // wildcard pattern for the fold to be sound. Bail (to normal
@@ -10460,6 +10485,25 @@ test "@target with an unknown field records a clear diagnostic" {
     for (h.builder.errors.items) |e| {
         try std.testing.expect(std.mem.indexOf(u8, e.message, "comptime struct of atoms") == null);
     }
+}
+
+test "@target.<bad_field> in a comparison reports the field error EXACTLY once" {
+    const source =
+        \\pub struct T {
+        \\  pub fn check() -> Bool {
+        \\    @target.bogus == :macos
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+    // The comparison-fold probe is a PURE peek (no diagnostic); only the
+    // field-access lowering of the bad operand reports — exactly once.
+    var unknown_field_count: usize = 0;
+    for (h.builder.errors.items) |e| {
+        if (std.mem.indexOf(u8, e.message, "unknown `@target` field") != null) unknown_field_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), unknown_field_count);
 }
 
 test "bare @target (no field) records a clear diagnostic" {
