@@ -77,8 +77,10 @@ pub const memory_section_parser = @import("memory/section_parser.zig");
 pub const memory_abi = @import("memory/abi.zig");
 pub const memory_driver = @import("memory/driver.zig");
 pub const memory_elision = @import("memory/elision.zig");
+pub const target_triple = @import("target_triple.zig");
 
 test {
+    _ = @import("target_triple.zig");
     _ = @import("token.zig");
     _ = @import("lexer.zig");
     _ = @import("ast.zig");

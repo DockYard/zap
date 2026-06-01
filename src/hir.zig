@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const types_mod = @import("types.zig");
 const scope_mod = @import("scope.zig");
+const target_triple = @import("target_triple.zig");
 
 // ============================================================
 // Typed HIR (High-level Intermediate Representation)
@@ -2586,6 +2587,14 @@ pub const HirBuilder = struct {
     /// (which never emits user diagnostics from `resolveTypeExpr`) just
     /// yields `UNKNOWN` on detection. Empty outside alias resolution.
     alias_resolution_stack: std.ArrayListUnmanaged(scope_mod.TypeId) = .empty,
+    /// The resolved compilation target as comptime atom names, surfaced to
+    /// Zap source through the `@target` intrinsic. Populated by the
+    /// compile pipeline from `CompileOptions.ctfe_target` (native-resolved
+    /// to the host triple). Null only on bare HIR-builder unit tests that
+    /// never exercise `@target`; the `@target` fold treats null as
+    /// "target unknown" and leaves the access unresolved (a clean error
+    /// path), so production builds always set it.
+    target: ?target_triple.TargetAtoms = null,
     errors: std.ArrayList(Error),
 
     pub const Error = struct {
@@ -5059,6 +5068,201 @@ pub const HirBuilder = struct {
     }
 
     // ============================================================
+    // `@target` comptime intrinsic
+    // ============================================================
+    //
+    // `@target` is the language analog of Zig's `builtin.os.tag`: a
+    // comptime value `{os, arch, abi}` of atoms describing the compilation
+    // target, usable in `if`/`case` so the stdlib (and user code) adapt at
+    // COMPILE time. It parses (no parser change needed) as the existing
+    // `@name` attribute-reference surface: bare `@target` is an `attr_ref`,
+    // and `@target.os` is a `field_access` of that `attr_ref`.
+    //
+    // It cannot ride the generic runtime-atom path: a Zap atom lowers to a
+    // runtime `atomIntern` call (an allocation against a global table), so
+    // `atom == atom` is a runtime comparison that does not fold at Sema.
+    // Instead `@target.<field>` is resolved to a comptime-known atom NAME
+    // at HIR build (`self.target`, threaded from `CompileOptions.ctfe_target`),
+    // and a comparison/`case` over it is constant-folded HERE — before ZIR
+    // lowering — so the dead branch is never lowered. That is the
+    // escape-hatch the capability model relies on: a `:zig.` call guarded by
+    // `if @target.os != :wasi { … }` compiles on every target because the
+    // dead arm is elided. Used as a plain value (not in a comparison/case),
+    // `@target.<field>` still lowers to a normal runtime `atom_lit`.
+
+    /// The three fields `@target` exposes, in the canonical order the
+    /// diagnostic lists them.
+    const target_fields = [_][]const u8{ "os", "arch", "abi" };
+
+    /// When `expr` is `@target.<field>` for a recognized field, return the
+    /// resolved comptime atom name (`"macos"`, `"wasm32"`, `"none"`, …) for
+    /// the build's target. Returns null when `expr` is not a `@target`
+    /// field access at all (the caller falls through to normal lowering).
+    /// An unknown field (`@target.bogus`) or a `@target` access on a build
+    /// with no resolved target records a diagnostic and returns null so the
+    /// fold is skipped and the build fails cleanly.
+    fn resolveTargetFieldAtom(self: *HirBuilder, expr: *const ast.Expr) !?[]const u8 {
+        if (expr.* != .field_access) return null;
+        const fa = expr.field_access;
+        if (!self.isTargetAttrRef(fa.object)) return null;
+
+        const field_name = self.interner.get(fa.field);
+        const target = self.target orelse {
+            try self.errors.append(self.allocator, .{
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "`@target.{s}` cannot be resolved: the compilation target is unknown in this build context",
+                    .{field_name},
+                ),
+                .span = fa.meta.span,
+            });
+            return null;
+        };
+
+        if (std.mem.eql(u8, field_name, "os")) return target.os;
+        if (std.mem.eql(u8, field_name, "arch")) return target.arch;
+        if (std.mem.eql(u8, field_name, "abi")) return target.abi;
+
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "unknown `@target` field `{s}` — `@target` exposes only `.os`, `.arch`, and `.abi`",
+                .{field_name},
+            ),
+            .span = fa.meta.span,
+        });
+        return null;
+    }
+
+    /// True when `expr` is the bare `@target` intrinsic (an `attr_ref`
+    /// whose name is `target`).
+    fn isTargetAttrRef(self: *HirBuilder, expr: *const ast.Expr) bool {
+        if (expr.* != .attr_ref) return false;
+        return std.mem.eql(u8, self.interner.get(expr.attr_ref.name), "target");
+    }
+
+    /// Build a comptime-resolved `atom_lit` HIR node carrying `name`,
+    /// interning the name into the shared interner. Used to lower
+    /// `@target.<field>` when it is used as a plain atom value.
+    fn buildResolvedTargetAtom(self: *HirBuilder, name: []const u8, span: ast.SourceSpan) !*const Expr {
+        const interner_mut = @constCast(self.interner);
+        const atom_id = try interner_mut.intern(name);
+        return try self.create(Expr, .{
+            .kind = .{ .atom_lit = atom_id },
+            .type_id = types_mod.TypeStore.ATOM,
+            .span = span,
+        });
+    }
+
+    /// Build a `bool_lit` HIR node. Used when a `@target.<field>`
+    /// comparison is constant-folded at HIR build.
+    fn buildBoolLit(self: *HirBuilder, value: bool, span: ast.SourceSpan) !*const Expr {
+        return try self.create(Expr, .{
+            .kind = .{ .bool_lit = value },
+            .type_id = types_mod.TypeStore.BOOL,
+            .span = span,
+        });
+    }
+
+    /// Attempt to constant-fold a binary `==`/`!=` whose operands are a
+    /// `@target.<field>` access and an atom literal (in either order),
+    /// e.g. `@target.os == :wasi`. Returns a folded `bool_lit` HIR node, or
+    /// null when the expression is not such a comparison (the caller then
+    /// lowers it normally). Folding here — before ZIR lowering — is what
+    /// lets the enclosing `if`/`case` elide the dead branch at compile time.
+    fn tryFoldTargetComparison(self: *HirBuilder, bo: ast.BinaryOp) !?*const Expr {
+        const is_eq = bo.op == .equal;
+        const is_neq = bo.op == .not_equal;
+        if (!is_eq and !is_neq) return null;
+
+        // Recognize `@target.<field> <op> :atom` in either operand order.
+        const target_atom_opt, const literal_expr = blk: {
+            if (try self.resolveTargetFieldAtom(bo.lhs)) |name| break :blk .{ name, bo.rhs };
+            if (try self.resolveTargetFieldAtom(bo.rhs)) |name| break :blk .{ name, bo.lhs };
+            break :blk .{ @as(?[]const u8, null), bo.lhs };
+        };
+        const target_atom = target_atom_opt orelse return null;
+        if (literal_expr.* != .atom_literal) return null;
+
+        const literal_name = self.interner.get(literal_expr.atom_literal.value);
+        const equal = std.mem.eql(u8, target_atom, literal_name);
+        const result = if (is_eq) equal else !equal;
+        return try self.buildBoolLit(result, bo.meta.span);
+    }
+
+    /// Attempt to constant-fold a `case @target.<field> { … }` over a
+    /// comptime-known target atom by selecting the matching clause at HIR
+    /// build and lowering ONLY its body — so the other clauses' bodies are
+    /// never lowered (the same dead-branch elision the `if`/comparison fold
+    /// gives). Returns the folded body expression, or null when the case is
+    /// not a foldable `@target` case (the caller lowers it normally).
+    ///
+    /// Conservative + sound: folds only when the scrutinee is `@target.<field>`
+    /// and EVERY clause is a guard-free bare atom-literal or wildcard
+    /// pattern — the decidable subset. A clause with a guard, a binding, or
+    /// a structured pattern makes the match outcome not statically decidable
+    /// from the atom alone, so the whole case falls through to normal
+    /// (runtime-dispatched, still correct) lowering with the scrutinee
+    /// lowered as the resolved atom value. The first matching clause wins
+    /// (Zap case semantics are first-match).
+    fn tryFoldTargetCase(self: *HirBuilder, ce: ast.CaseExpr) !?*const Expr {
+        const target_atom = (try self.resolveTargetFieldAtom(ce.scrutinee)) orelse return null;
+
+        // First pass: every clause must be a guard-free atom-literal or
+        // wildcard pattern for the fold to be sound. Bail (to normal
+        // lowering) on the first clause that is not.
+        for (ce.clauses) |clause| {
+            if (clause.guard != null) return null;
+            switch (clause.pattern.*) {
+                .wildcard => {},
+                .literal => |lit| if (lit != .atom) return null,
+                else => return null,
+            }
+        }
+
+        // Second pass: first-match wins. An atom-literal clause matches when
+        // its name equals the resolved target atom; a wildcard matches
+        // unconditionally.
+        for (ce.clauses) |clause| {
+            const matches = switch (clause.pattern.*) {
+                .wildcard => true,
+                .literal => |lit| std.mem.eql(u8, self.interner.get(lit.atom.value), target_atom),
+                else => unreachable, // excluded by the first pass
+            };
+            if (matches) {
+                const block = try self.buildBlock(clause.body);
+                return try self.create(Expr, .{
+                    .kind = .{ .block = block.* },
+                    .type_id = block.result_type,
+                    .span = ce.meta.span,
+                });
+            }
+        }
+
+        // No clause matched the resolved target. This is a non-exhaustive
+        // `@target` case for this build's target — a clean compile error
+        // (the runtime would otherwise hit a match failure). Report it and
+        // fall through so the build fails.
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "`case @target.{s}` has no clause matching `:{s}` for this build's target and no `_` fallback",
+                .{ targetCaseFieldName(self, ce.scrutinee), target_atom },
+            ),
+            .span = ce.meta.span,
+        });
+        return null;
+    }
+
+    /// Best-effort field name (`os`/`arch`/`abi`) of a `@target.<field>`
+    /// case scrutinee, for diagnostics. Returns `"<field>"` if the shape is
+    /// unexpected (it never is when reached from `tryFoldTargetCase`).
+    fn targetCaseFieldName(self: *HirBuilder, scrutinee: *const ast.Expr) []const u8 {
+        if (scrutinee.* == .field_access) return self.interner.get(scrutinee.field_access.field);
+        return "<field>";
+    }
+
+    // ============================================================
     // Expression building
     // ============================================================
 
@@ -5150,6 +5354,14 @@ pub const HirBuilder = struct {
                 });
             },
             .binary_op => |bo| {
+                // `@target.<field> ==/!= :atom` folds to a comptime
+                // `bool_lit` so the enclosing `if`/`case` elides the dead
+                // branch (the comptime-guard escape hatch). Must run before
+                // building the operands: a `@target.<field>` operand on a
+                // bare HIR run with no resolved target would otherwise emit
+                // a runtime atom_lit and a stray diagnostic.
+                if (try self.tryFoldTargetComparison(bo)) |folded| return folded;
+
                 const lhs_expr = try self.buildExpr(bo.lhs);
                 const rhs_expr = try self.buildExpr(bo.rhs);
 
@@ -5724,6 +5936,12 @@ pub const HirBuilder = struct {
                 unreachable;
             },
             .case_expr => |ce| {
+                // `case @target.<field> { :atom -> … ; _ -> … }` folds at
+                // HIR build to the matching clause's body (the others are
+                // never lowered). Falls through to normal lowering when not
+                // a foldable `@target` case.
+                if (try self.tryFoldTargetCase(ce)) |folded| return folded;
+
                 const scrutinee = try self.buildExpr(ce.scrutinee);
                 var arms: std.ArrayList(CaseArm) = .empty;
 
@@ -6151,6 +6369,18 @@ pub const HirBuilder = struct {
                 });
             },
             .field_access => |fa| {
+                // `@target.os`/`.arch`/`.abi` used as a plain atom value
+                // (outside a folded comparison/case): lower to the
+                // comptime-resolved atom name. A `@target.<bad_field>` (or a
+                // build with no resolved target) records a diagnostic inside
+                // `resolveTargetFieldAtom` and falls through to the normal
+                // field-access path below (which yields a benign UNKNOWN
+                // node — the recorded error fails the build).
+                if (self.isTargetAttrRef(fa.object)) {
+                    if (try self.resolveTargetFieldAtom(expr)) |atom_name| {
+                        return try self.buildResolvedTargetAtom(atom_name, fa.meta.span);
+                    }
+                }
                 // Struct-qualified reference (e.g. Math.square without call parens)
                 if (fa.object.* == .struct_ref) {
                     const func_name = self.interner.get(fa.field);
@@ -6440,6 +6670,29 @@ pub const HirBuilder = struct {
                     .kind = .nil_lit,
                     .type_id = types_mod.TypeStore.UNKNOWN,
                     .span = mr.meta.span,
+                });
+            },
+            .attr_ref => |ar| {
+                // Bare `@target` (no field) used in a runtime body is a
+                // misuse: `@target` is a struct of atoms — code must read
+                // a field (`@target.os`/`.arch`/`.abi`). Emit a clear
+                // diagnostic. Any other `@attr` reference in a body keeps
+                // the pre-existing nil fallthrough (these never resolved to
+                // a value in body position; the attribute-value CTFE path
+                // handles `@attr` references separately).
+                if (std.mem.eql(u8, self.interner.get(ar.name), "target")) {
+                    try self.errors.append(self.allocator, .{
+                        .message = try self.allocator.dupe(
+                            u8,
+                            "`@target` is a comptime struct of atoms — access a field: `@target.os`, `@target.arch`, or `@target.abi`",
+                        ),
+                        .span = ar.meta.span,
+                    });
+                }
+                return try self.create(Expr, .{
+                    .kind = .nil_lit,
+                    .type_id = types_mod.TypeStore.UNKNOWN,
+                    .span = ar.meta.span,
                 });
             },
             else => {
@@ -10004,6 +10257,224 @@ test "HIR keeps declaration TypeId for concrete (non-parametric) struct literals
     try std.testing.expect(origin_expr.kind == .struct_init);
     const typ = checker.store.getType(origin_expr.type_id);
     try std.testing.expect(typ == .struct_type);
+}
+
+// ------------------------------------------------------------------
+// `@target` comptime-fold tests
+// ------------------------------------------------------------------
+
+/// Build a single-function struct's first-clause body's first expression
+/// with `@target` resolved to `triple`. Shared by the `@target` fold tests.
+/// Returns the arena (caller defers deinit), the built program, and the
+/// extracted body expression.
+const TargetFoldHarness = struct {
+    arena: *std.heap.ArenaAllocator,
+    builder: *HirBuilder,
+    body_expr: *const Expr,
+
+    fn build(gpa: std.mem.Allocator, source: []const u8, triple: []const u8) !TargetFoldHarness {
+        const arena = try gpa.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(gpa);
+        const alloc = arena.allocator();
+
+        const parser = try alloc.create(Parser);
+        parser.* = Parser.init(alloc, source);
+        const program = try parser.parseProgram();
+
+        const collector = try alloc.create(Collector);
+        collector.* = Collector.init(alloc, parser.interner, null);
+        try collector.collectProgram(&program);
+
+        const type_store = try alloc.create(types_mod.TypeStore);
+        type_store.* = types_mod.TypeStore.init(alloc, parser.interner);
+
+        const builder = try alloc.create(HirBuilder);
+        builder.* = HirBuilder.init(alloc, parser.interner, &collector.graph, type_store);
+        builder.target = target_triple.resolve(triple);
+
+        const hir_program = try builder.buildProgram(&program);
+        const body_expr = hir_program.structs[0].functions[0].clauses[0].body.stmts[0].expr;
+        return .{ .arena = arena, .builder = builder, .body_expr = body_expr };
+    }
+
+    fn deinit(self: *TargetFoldHarness, gpa: std.mem.Allocator) void {
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+    }
+};
+
+test "@target.<field> resolves to the requested target's atom (cross-compile)" {
+    const source =
+        \\pub struct T {
+        \\  pub fn os() -> Atom {
+        \\    @target.os
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), h.builder.errors.items.len);
+    try std.testing.expect(h.body_expr.kind == .atom_lit);
+    try std.testing.expectEqualStrings("wasi", h.builder.interner.get(h.body_expr.kind.atom_lit));
+}
+
+test "@target.<field> resolves arch and abi for a three-component triple" {
+    const source =
+        \\pub struct T {
+        \\  pub fn arch() -> Atom {
+        \\    @target.arch
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "x86_64-windows-gnu");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), h.builder.errors.items.len);
+    try std.testing.expect(h.body_expr.kind == .atom_lit);
+    try std.testing.expectEqualStrings("x86_64", h.builder.interner.get(h.body_expr.kind.atom_lit));
+}
+
+test "@target.os == :atom folds to bool_lit true when it matches the target" {
+    const source =
+        \\pub struct T {
+        \\  pub fn check() -> Bool {
+        \\    @target.os == :wasi
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), h.builder.errors.items.len);
+    try std.testing.expect(h.body_expr.kind == .bool_lit);
+    try std.testing.expectEqual(true, h.body_expr.kind.bool_lit);
+}
+
+test "@target.os == :atom folds to bool_lit false when it does not match" {
+    const source =
+        \\pub struct T {
+        \\  pub fn check() -> Bool {
+        \\    @target.os == :macos
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), h.builder.errors.items.len);
+    try std.testing.expect(h.body_expr.kind == .bool_lit);
+    try std.testing.expectEqual(false, h.body_expr.kind.bool_lit);
+}
+
+test "@target.os != :atom folds to the negated bool_lit" {
+    const source =
+        \\pub struct T {
+        \\  pub fn check() -> Bool {
+        \\    @target.os != :wasi
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expect(h.body_expr.kind == .bool_lit);
+    try std.testing.expectEqual(false, h.body_expr.kind.bool_lit); // wasi != wasi is false
+}
+
+test "@target.os == :atom folds with the literal on the left operand too" {
+    const source =
+        \\pub struct T {
+        \\  pub fn check() -> Bool {
+        \\    :wasi == @target.os
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expect(h.body_expr.kind == .bool_lit);
+    try std.testing.expectEqual(true, h.body_expr.kind.bool_lit);
+}
+
+test "case @target.<field> folds to the matching clause body" {
+    const source =
+        \\pub struct T {
+        \\  pub fn pick() -> i64 {
+        \\    case @target.os {
+        \\      :macos -> 1
+        \\      :wasi -> 2
+        \\      _ -> 3
+        \\    }
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), h.builder.errors.items.len);
+    // Folded to the :wasi clause's body block — NOT a `case` node.
+    try std.testing.expect(h.body_expr.kind == .block);
+    const inner = h.body_expr.kind.block.stmts[0].expr;
+    try std.testing.expect(inner.kind == .int_lit);
+    try std.testing.expectEqual(@as(i64, 2), inner.kind.int_lit);
+}
+
+test "case @target.<field> falls to the wildcard clause when no atom matches" {
+    const source =
+        \\pub struct T {
+        \\  pub fn pick() -> i64 {
+        \\    case @target.os {
+        \\      :macos -> 1
+        \\      _ -> 9
+        \\    }
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), h.builder.errors.items.len);
+    try std.testing.expect(h.body_expr.kind == .block);
+    const inner = h.body_expr.kind.block.stmts[0].expr;
+    try std.testing.expectEqual(@as(i64, 9), inner.kind.int_lit);
+}
+
+test "@target with an unknown field records a clear diagnostic" {
+    const source =
+        \\pub struct T {
+        \\  pub fn bad() -> Atom {
+        \\    @target.bogus
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expect(h.builder.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, h.builder.errors.items[0].message, "unknown `@target` field") != null);
+}
+
+test "bare @target (no field) records a clear diagnostic" {
+    const source =
+        \\pub struct T {
+        \\  pub fn bad() -> Atom {
+        \\    @target
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "wasm32-wasi");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expect(h.builder.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, h.builder.errors.items[0].message, "comptime struct of atoms") != null);
+}
+
+test "@target.os resolves to the host on a native build" {
+    const source =
+        \\pub struct T {
+        \\  pub fn os() -> Atom {
+        \\    @target.os
+        \\  }
+        \\}
+    ;
+    var h = try TargetFoldHarness.build(std.testing.allocator, source, "default");
+    defer h.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), h.builder.errors.items.len);
+    try std.testing.expect(h.body_expr.kind == .atom_lit);
+    const host_os = @tagName(@import("builtin").target.os.tag);
+    try std.testing.expectEqualStrings(host_os, h.builder.interner.get(h.body_expr.kind.atom_lit));
 }
 
 /// Map a TypeId to a human-readable name string for synthesized type naming.

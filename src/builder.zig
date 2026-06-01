@@ -308,16 +308,31 @@ pub fn ctfeManifestDetailedWithProgress(
     const manifest_id = findManifestFunction(&result.ir_program) orelse
         return error.ManifestNotFound;
 
-    // Construct the env argument: %Zap.Env{target: :target_name, os: :os, arch: :arch}
-    const os_name = @tagName(@import("builtin").os.tag);
-    const arch_name = @tagName(@import("builtin").cpu.arch);
+    // Construct the env argument: %Zap.Env{target: :target_name, os: :os, arch: :arch}.
+    //
+    // os/arch MUST reflect the *requested compilation target*, not the host
+    // the manifest evaluator runs on. `target_name` is the requested triple
+    // (`"aarch64-macos-none"`, the two-component `"wasm32-wasi"`, …) or the
+    // native sentinel (`"default"`/`""`), which `target_triple.resolve`
+    // maps to the host triple's atoms. Surfacing host os/arch here (the old
+    // `builtin.os.tag`/`builtin.cpu.arch`) was a latent cross-compile bug:
+    // a `build.zap` branching on `env.os`/`env.arch` saw the host under
+    // `-Dtarget=…`. This is the same resolution `@target` surfaces to all
+    // Zap CTFE, single-sourced in `target_triple`.
+    const target_atoms = zap.target_triple.resolve(target_name) orelse {
+        zap.diagnostics.emitStderrFmt(
+            "  manifest error: unrecognized target triple `{s}`\n",
+            .{target_name},
+        );
+        return error.CtfeFailed;
+    };
 
     const env_const = ctfe.ConstValue{ .struct_val = .{
         .type_name = "Zap_Env",
         .fields = &.{
             .{ .name = "target", .value = .{ .atom = target_name } },
-            .{ .name = "os", .value = .{ .atom = os_name } },
-            .{ .name = "arch", .value = .{ .atom = arch_name } },
+            .{ .name = "os", .value = .{ .atom = target_atoms.os } },
+            .{ .name = "arch", .value = .{ .atom = target_atoms.arch } },
         },
     } };
 

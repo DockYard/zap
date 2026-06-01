@@ -4015,6 +4015,10 @@ const Pipeline = struct {
         var hir_builder = zap.hir.HirBuilder.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph, type_store);
         hir_builder.next_group_id = group_id_offset;
         hir_builder.allow_external_static_references = self.options.allow_external_static_references;
+        // Surface the compilation target to `@target` (native-resolved to
+        // the host triple). An unrecognized triple here leaves `target` null;
+        // a `@target` access then reports its own diagnostic.
+        hir_builder.target = zap.target_triple.resolve(self.options.ctfe_target);
         const hir_program = hir_builder.buildProgram(desugared) catch {
             for (hir_builder.errors.items) |hir_err| {
                 self.ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
@@ -4438,6 +4442,7 @@ fn stagedMacroExpandAndDesugar(
             shared_store,
             group_id_offset,
             options.allow_external_static_references,
+            options.ctfe_target,
         );
         const hir_ms = staged_timer.lapMs();
         group_id_offset = hir_result.next_group_id;
@@ -4617,6 +4622,7 @@ fn stagedMacroExpandAndDesugarCached(
             shared_store,
             group_id_offset,
             options.allow_external_static_references,
+            options.ctfe_target,
         );
         const hir_ms = staged_timer.lapMs();
         group_id_offset = hir_result.next_group_id;
@@ -5076,6 +5082,7 @@ fn compileStagedStructHir(
     shared_store: *zap.types.TypeStore,
     group_id_offset: u32,
     allow_external_static_references: bool,
+    ctfe_target: ?[]const u8,
 ) CompileError!StructHirResult {
     const error_baseline = diag_engine.errorCount();
     if (findUndesugaredMacroForm(desugared) orelse findUndesugaredMacroFormInGraphImpls(&collector.graph, desugared)) |form| {
@@ -5116,6 +5123,7 @@ fn compileStagedStructHir(
     var hir_builder = zap.hir.HirBuilder.init(alloc, interner, &collector.graph, shared_store);
     hir_builder.next_group_id = group_id_offset;
     hir_builder.allow_external_static_references = allow_external_static_references;
+    hir_builder.target = zap.target_triple.resolve(ctfe_target);
     sub_timer.reset();
     const hir_program = hir_builder.buildProgram(desugared) catch {
         for (hir_builder.errors.items) |hir_err| {
