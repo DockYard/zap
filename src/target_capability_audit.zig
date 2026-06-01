@@ -124,17 +124,34 @@ pub const Violation = struct {
 // Heredoc/comment-aware `@available_on` extraction
 // ---------------------------------------------------------------------------
 //
-// A real `@available_on(:cap, …)` attribute occurs in CODE position: a line
-// whose trimmed start is `@available_on(`. The string `@available_on` also
+// A real `@available_on` attribute occurs in CODE position: a line whose
+// trimmed start is the token `@available_on`, in any of the THREE legal
+// attribute forms the parser accepts (`src/parser.zig` `parseAttributeDecl`)
+// and the gate honors (`src/ctfe.zig` `gateFromAttrAst`, which reads both a
+// `.list` value from the call form and a bare `.atom_literal` value from the
+// valued/typed form):
+//
+//   * call form    `@available_on(:cap, …)`         — the ergonomic spelling
+//   * valued form  `@available_on = :cap`            — bare atom value
+//   * typed form   `@available_on :: Type = :cap`    — typed atom value
+//
+// All three must be audited: an OS name smuggled via the valued/typed form is
+// just as much a gate as via the call form. The string `@available_on` also
 // appears in `@doc` heredocs (prose: "Available only on targets…", "like
 // `@available_on`…") and could appear in comments; those are NOT attributes
 // and must be ignored. The scanner therefore tracks `"""` heredoc state and
-// strips `#` line comments, matching the attribute ONLY in code, only when it
-// opens the (trimmed) line.
+// strips `#` line comments, matching the attribute ONLY in code, only when the
+// `@available_on` TOKEN opens the (trimmed) line (a following identifier char
+// — e.g. `@available_onx` — is not a match).
 
-/// The attribute spelling, including the opening paren, as it appears at the
-/// start of a trimmed code line for a real attribute declaration.
-const attribute_open = "@available_on(";
+/// The attribute name token (without any following form punctuation).
+const attribute_token = "@available_on";
+
+/// True iff `c` is an identifier continuation char. Used to ensure
+/// `@available_on` is matched as a whole token, not a prefix of a longer name.
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+}
 
 /// Scan one stdlib source for `@available_on` attributes whose atom arguments
 /// are not known capabilities. Appends each to `violations`. Heredoc- and
@@ -167,10 +184,18 @@ fn scanStdlibSource(
         // then look for the attribute at code-position (trimmed line start).
         const code = stripLineComment(raw_line);
         const trimmed = std.mem.trimStart(u8, code, " \t");
-        if (!std.mem.startsWith(u8, trimmed, attribute_open)) continue;
+        if (!std.mem.startsWith(u8, trimmed, attribute_token)) continue;
+        // Match the whole TOKEN: the char after `@available_on` must not be an
+        // identifier char (so `@available_only` is not a false match).
+        const after_token = trimmed[attribute_token.len..];
+        if (after_token.len > 0 and isIdentChar(after_token[0])) continue;
 
-        // Real `@available_on(...)` attribute — extract its atom arguments.
-        try extractAtomViolations(allocator, file_path, line_number, trimmed, violations);
+        // Real `@available_on` attribute in some form — extract every `:atom`
+        // from the remainder (the call-form `(...)`, or the valued/typed-form
+        // `= :cap` / `:: Type = :cap`). Judging each atom against the
+        // capability vocabulary is form-agnostic, so a single extractor over
+        // the post-token remainder covers all three forms.
+        try extractAtomViolations(allocator, file_path, line_number, after_token, violations);
     }
 }
 
@@ -201,32 +226,42 @@ fn stripLineComment(line: []const u8) []const u8 {
     return line;
 }
 
-/// Extract every `:atom` argument inside the `@available_on(...)` call on
-/// `trimmed` (a trimmed code line that starts with `@available_on(`) and
-/// append a `Violation` for each atom that is not a known capability.
+/// Extract every `:atom` literal in `remainder` (everything on the attribute
+/// line AFTER the `@available_on` token) and append a `Violation` for each atom
+/// that is not a known capability. Form-agnostic: it scans for atom literals
+/// (`:name`) directly, so it covers the call form `(:cap, …)`, the valued form
+/// `= :cap`, and the typed form `:: Type = :cap` uniformly. A `::` (the typed
+/// form's type separator) is skipped — only a single `:` immediately followed
+/// by an identifier char starts an atom literal.
 fn extractAtomViolations(
     allocator: std.mem.Allocator,
     file_path: []const u8,
     line_number: usize,
-    trimmed: []const u8,
+    remainder: []const u8,
     violations: *std.ArrayList(Violation),
 ) !void {
-    // The argument list is between the first '(' and its matching ')'.
-    const open_paren = std.mem.indexOfScalar(u8, trimmed, '(') orelse return;
-    const close_paren = std.mem.lastIndexOfScalar(u8, trimmed, ')') orelse trimmed.len;
-    if (close_paren <= open_paren) return;
-    const args = trimmed[open_paren + 1 .. close_paren];
+    var i: usize = 0;
+    while (i < remainder.len) {
+        if (remainder[i] != ':') {
+            i += 1;
+            continue;
+        }
+        // A `::` is the typed-form separator, not an atom. Skip both colons.
+        if (i + 1 < remainder.len and remainder[i + 1] == ':') {
+            i += 2;
+            continue;
+        }
+        // `:` followed by an identifier-start is an atom literal `:name`.
+        const name_start = i + 1;
+        if (name_start >= remainder.len or !isIdentChar(remainder[name_start])) {
+            i += 1;
+            continue;
+        }
+        var name_end = name_start;
+        while (name_end < remainder.len and isIdentChar(remainder[name_end])) name_end += 1;
+        const atom = remainder[name_start..name_end];
+        i = name_end;
 
-    // Each argument is a `:name` atom; split on ',' and parse each.
-    var arg_it = std.mem.splitScalar(u8, args, ',');
-    while (arg_it.next()) |raw_arg| {
-        const arg = std.mem.trim(u8, raw_arg, " \t");
-        if (arg.len == 0) continue;
-        if (arg[0] != ':') continue; // not an atom literal; the compiler's
-        // own `@available_on` parser reports non-atom forms — the audit only
-        // judges atom NAMES against the capability vocabulary.
-        const atom = arg[1..];
-        if (atom.len == 0) continue;
         // The single source of truth: a known capability passes; anything else
         // (OS name or typo) is a violation.
         if (target_caps.capabilityFromAtomName(atom) != null) continue;
@@ -493,6 +528,62 @@ test "scanner IGNORES @available_on mentioned in a doc heredoc or comment" {
         \\}
     ;
     try scanStdlibSource(allocator, "lib/io.zap", source, &violations);
+    try std.testing.expectEqual(@as(usize, 0), violations.items.len);
+}
+
+test "scanner catches the VALUED form @available_on = :os (no parens)" {
+    const allocator = std.testing.allocator;
+    // The parser accepts `@available_on = :cap` (valued form) and the gate
+    // honors it (gateFromAttrAst's `.atom_literal` arm), so an OS name smuggled
+    // this way is a real gate the audit MUST catch — not only the call form.
+    {
+        var violations: std.ArrayList(Violation) = .empty;
+        defer violations.deinit(allocator);
+        const bad =
+            \\  @available_on = :windows
+        ;
+        try scanStdlibSource(allocator, "lib/fake.zap", bad, &violations);
+        try std.testing.expectEqual(@as(usize, 1), violations.items.len);
+        try std.testing.expectEqualStrings("windows", violations.items[0].atom);
+        try std.testing.expect(violations.items[0].is_os_name);
+    }
+    // The valued form with a real capability passes clean.
+    {
+        var violations: std.ArrayList(Violation) = .empty;
+        defer violations.deinit(allocator);
+        const ok =
+            \\  @available_on = :terminal
+        ;
+        try scanStdlibSource(allocator, "lib/fake.zap", ok, &violations);
+        try std.testing.expectEqual(@as(usize, 0), violations.items.len);
+    }
+}
+
+test "scanner catches the TYPED form @available_on :: Type = :os" {
+    const allocator = std.testing.allocator;
+    // The typed form `@available_on :: Atom = :linux`: the `::` separator must
+    // be skipped (not parsed as an atom), and the `:linux` value still caught.
+    var violations: std.ArrayList(Violation) = .empty;
+    defer violations.deinit(allocator);
+    const bad =
+        \\  @available_on :: Atom = :linux
+    ;
+    try scanStdlibSource(allocator, "lib/fake.zap", bad, &violations);
+    try std.testing.expectEqual(@as(usize, 1), violations.items.len);
+    try std.testing.expectEqualStrings("linux", violations.items[0].atom);
+    try std.testing.expect(violations.items[0].is_os_name);
+}
+
+test "scanner does not false-match @available_only or other longer names" {
+    const allocator = std.testing.allocator;
+    var violations: std.ArrayList(Violation) = .empty;
+    defer violations.deinit(allocator);
+    // A hypothetical different attribute whose name merely starts with the same
+    // letters must NOT be treated as `@available_on`.
+    const source =
+        \\  @available_only(:wasi)
+    ;
+    try scanStdlibSource(allocator, "lib/fake.zap", source, &violations);
     try std.testing.expectEqual(@as(usize, 0), violations.items.len);
 }
 
