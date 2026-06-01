@@ -383,31 +383,110 @@ test "capabilitiesForTarget: x86_64-windows-gnu has :signals(VEH) but not :termi
     try std.testing.expect(caps.has(.backtrace)); // COFF/Windows SelfInfo
 }
 
-test "single-source: runtime-primitive caps equal the runtime_os backend caps for each target" {
+test "single-source: EVERY runtime-primitive cap equals its runtime_os backend truth for every supported target" {
     // The DEEP invariant of the unified vocabulary (the plan's Phase-4 lock-in,
-    // asserted here at the source): the Zap-level :signals/:terminal atoms are
-    // DEFINED AS the runtime_os backend `caps` booleans for the resolved
-    // target — there is no second source of truth. This test pins
-    // `capabilitiesForTarget`'s runtime-primitive bits to the exact backend
-    // constants, so any drift between the language gate and the codegen seam
-    // is a compile-time test failure.
+    // asserted here at the source): the Zap-level runtime-primitive atoms
+    // (:signals, :terminal, :backtrace) are DEFINED AS the runtime_os backend
+    // `caps` truth for the resolved target — there is no second source of
+    // truth. This test pins `capabilitiesForTarget`'s runtime-primitive bits to
+    // the exact backend constants for EVERY supported target, so any drift
+    // between the language gate and the codegen seam is a compile-time test
+    // failure.
+    //
+    // :signals / :terminal are absolute backend constants (`supports_signals`,
+    // `supports_termios`) that do NOT depend on the compiler host, so they are
+    // pinned directly for every target.
+    //
+    // :backtrace needs care. Each backend defines
+    // `supports_backtrace = std.debug.SelfInfo != void`, which std resolves for
+    // the COMPILER HOST — so the backend const is target-correct ONLY for the
+    // host row; for a cross target it reflects the host, not the target. The
+    // single source of truth for the requested target is therefore the
+    // `std.debug.SelfInfo` selection itself, i.e. whether the target's default
+    // object format carries an unwinder. We pin :backtrace two ways:
+    //   (a) for the HOST row, equal to the governing backend's
+    //       `supports_backtrace` const (proving no drift from the codegen seam
+    //       on the host); and
+    //   (b) for EVERY row, equal to an INDEPENDENT recomputation of the same
+    //       object-format → SelfInfo condition the backend const encodes
+    //       (`expectedBacktraceForObjectFormat` below), proving
+    //       `targetSupportsBacktrace` reproduces std's `SelfInfo` selection
+    //       exactly for the requested target — the actual single source.
+    const Backend = enum { posix, windows, wasi };
     const Case = struct {
         triple: []const u8,
-        backend_signals: bool,
-        backend_termios: bool,
+        backend: Backend,
     };
     const cases = [_]Case{
-        .{ .triple = "x86_64-linux-gnu", .backend_signals = runtime_os_posix.Backend.caps.supports_signals, .backend_termios = runtime_os_posix.Backend.caps.supports_termios },
-        .{ .triple = "aarch64-macos-none", .backend_signals = runtime_os_posix.Backend.caps.supports_signals, .backend_termios = runtime_os_posix.Backend.caps.supports_termios },
-        .{ .triple = "x86_64-windows-gnu", .backend_signals = runtime_os_windows.Backend.caps.supports_signals, .backend_termios = runtime_os_windows.Backend.caps.supports_termios },
-        .{ .triple = "wasm32-wasi", .backend_signals = runtime_os_wasi.Backend.caps.supports_signals, .backend_termios = runtime_os_wasi.Backend.caps.supports_termios },
+        .{ .triple = "x86_64-linux-gnu", .backend = .posix },
+        .{ .triple = "aarch64-macos-none", .backend = .posix },
+        .{ .triple = "x86_64-windows-gnu", .backend = .windows },
+        .{ .triple = "wasm32-wasi", .backend = .wasi },
     };
+
+    const host_os = builtin.target.os.tag;
+    const host_arch = builtin.target.cpu.arch;
+
     for (cases) |c| {
         const atoms = target_triple.resolve(c.triple).?;
         const caps = capabilitiesForTarget(atoms).?;
-        try std.testing.expectEqual(c.backend_signals, caps.has(.signals));
-        try std.testing.expectEqual(c.backend_termios, caps.has(.terminal));
+
+        // :signals / :terminal — pinned directly to the governing backend's
+        // absolute constants (host-independent).
+        const backend_signals = switch (c.backend) {
+            .posix => runtime_os_posix.Backend.caps.supports_signals,
+            .windows => runtime_os_windows.Backend.caps.supports_signals,
+            .wasi => runtime_os_wasi.Backend.caps.supports_signals,
+        };
+        const backend_termios = switch (c.backend) {
+            .posix => runtime_os_posix.Backend.caps.supports_termios,
+            .windows => runtime_os_windows.Backend.caps.supports_termios,
+            .wasi => runtime_os_wasi.Backend.caps.supports_termios,
+        };
+        try std.testing.expectEqual(backend_signals, caps.has(.signals));
+        try std.testing.expectEqual(backend_termios, caps.has(.terminal));
+
+        // :backtrace (b) — pinned for EVERY target to the independent
+        // object-format → SelfInfo condition the backend const encodes.
+        const case_os = osTagFromName(atoms.os).?;
+        const case_arch = archFromName(atoms.arch).?;
+        try std.testing.expectEqual(
+            expectedBacktraceForObjectFormat(case_os, case_arch),
+            caps.has(.backtrace),
+        );
+
+        // :backtrace (a) — for the HOST row, additionally pin to the governing
+        // backend's `supports_backtrace` const (the only row where the
+        // host-relative const is target-correct), proving no drift from the
+        // codegen seam on the host.
+        if (case_os == host_os and case_arch == host_arch) {
+            const backend_backtrace = switch (c.backend) {
+                .posix => runtime_os_posix.Backend.caps.supports_backtrace,
+                .windows => runtime_os_windows.Backend.caps.supports_backtrace,
+                .wasi => runtime_os_wasi.Backend.caps.supports_backtrace,
+            };
+            try std.testing.expectEqual(backend_backtrace, caps.has(.backtrace));
+        }
     }
+}
+
+/// Independent recomputation, FOR THE TEST, of the `std.debug.SelfInfo != void`
+/// condition each runtime_os backend's `supports_backtrace` const encodes:
+/// whether the target's default object format carries a stack unwinder. Kept
+/// deliberately separate from `targetSupportsBacktrace` so the single-source
+/// test pins one against the other (a drift in either is a test failure). This
+/// is the same `std.Target.ObjectFormat.default`-driven selection std uses.
+fn expectedBacktraceForObjectFormat(os_tag: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) bool {
+    return switch (std.Target.ObjectFormat.default(os_tag, arch)) {
+        .coff => os_tag == .windows,
+        .elf => switch (os_tag) {
+            .freestanding, .other => false,
+            else => true,
+        },
+        .macho => true,
+        .plan9, .spirv, .wasm => false,
+        .c, .hex, .raw => false,
+    };
 }
 
 test "capabilitiesForTarget: unknown target atoms return null" {
