@@ -2025,7 +2025,7 @@ fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.debug.print("Error: could not resolve Zap stdlib directory\n", .{});
         std.process.exit(1);
     };
-    const config = zap.builder.ctfeManifest(allocator, build_source, "default", .empty, zap_lib_dir) catch {
+    const config = zap.builder.ctfeManifest(allocator, build_source, "default", null, .empty, zap_lib_dir) catch {
         std.debug.print("Error: could not evaluate build.zap manifest via CTFE\n", .{});
         std.process.exit(1);
     };
@@ -3297,22 +3297,6 @@ fn buildOverrideIdentity(overrides: BuildOverrides) build_cache.OverrideIdentity
         .target = overrides.target,
         .cpu = overrides.cpu,
     };
-}
-
-/// The effective compilation target the build-manifest env (`%Zap.Env`)
-/// must report — and the manifest CTFE cache must key on. `target_name` is
-/// the invocation positional (a manifest TARGET NAME, e.g. `"default"`);
-/// `-Dtarget=<triple>` arrives as a build OVERRIDE (`overrides.target`),
-/// which `applyBuildOverrides` later stamps onto `config.target`. Because
-/// the override wins for the actual compilation, the env must surface it
-/// too: a `-Dtarget=wasm32-wasi` build's `env.target`/`env.os`/`env.arch`
-/// must report wasi, not the host. When no `-Dtarget` is given, the
-/// positional `target_name` (default `"default"`, which `target_triple`
-/// resolves to the host) is the effective target. The manifest invocation
-/// identity already folds `overrides.target` in (`buildOverrideIdentity`),
-/// so a native↔cross switch is already a distinct cache key.
-fn effectiveManifestTarget(target_name: []const u8, overrides: BuildOverrides) []const u8 {
-    return overrides.target orelse target_name;
 }
 
 fn buildOptIdentityEntries(
@@ -5135,7 +5119,7 @@ fn buildTarget(
     // Compiles build.zap to IR and evaluates manifest/1 at compile time.
     var manifest_eval_node = ScopedProgressNode.start(progress_reporter, progress_root, "Evaluate manifest");
     defer manifest_eval_node.deinit();
-    const manifest_eval = builder.ctfeManifestDetailedWithProgress(alloc, build_source, effectiveManifestTarget(target_name, build_overrides), build_opts, zap_lib_dir, progress_reporter) catch |err| {
+    const manifest_eval = builder.ctfeManifestDetailedWithProgress(alloc, build_source, target_name, build_overrides.target, build_opts, zap_lib_dir, progress_reporter) catch |err| {
         std.debug.print("Error: failed to evaluate build.zap manifest via CTFE: {}\n", .{err});
         std.process.exit(1);
     };
@@ -6573,7 +6557,7 @@ fn collectWatchPaths(
     const build_zap_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
     const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_zap_path, alloc, .limited(10 * 1024 * 1024)) catch return error.ReadError;
     const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch return error.ManifestError;
-    const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, effectiveManifestTarget(target_name, build_overrides), build_opts, zap_lib_dir) catch return error.ManifestError;
+    const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, target_name, build_overrides.target, build_opts, zap_lib_dir) catch return error.ManifestError;
     var config = manifest_eval.config;
     applyBuildOverrides(&config, build_overrides);
     const source_roots = try resolveManifestSourceRoots(alloc, project_root, config, zap_lib_dir, .{
@@ -7032,7 +7016,7 @@ const IncrementalWatchState = struct {
         const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch return null;
         if (progress) |reporter| reporter.stage("Toolchain: resolving Zap stdlib", .{});
         const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch return null;
-        const manifest_eval = zap.builder.ctfeManifestDetailedWithProgress(alloc, build_source, effectiveManifestTarget(target_name, build_overrides), build_opts, zap_lib_dir, progress) catch return null;
+        const manifest_eval = zap.builder.ctfeManifestDetailedWithProgress(alloc, build_source, target_name, build_overrides.target, build_opts, zap_lib_dir, progress) catch return null;
         var config = manifest_eval.config;
         applyBuildOverrides(&config, build_overrides);
         const compile_target: ?[]const u8 = config.target;

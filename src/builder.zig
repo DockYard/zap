@@ -222,26 +222,36 @@ pub fn ctfeManifest(
     alloc: std.mem.Allocator,
     build_source: []const u8,
     target_name: []const u8,
+    cross_target: ?[]const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     zap_lib_dir: ?[]const u8,
 ) !BuildConfig {
-    return (try ctfeManifestDetailed(alloc, build_source, target_name, build_opts, zap_lib_dir)).config;
+    return (try ctfeManifestDetailed(alloc, build_source, target_name, cross_target, build_opts, zap_lib_dir)).config;
 }
 
 pub fn ctfeManifestDetailed(
     alloc: std.mem.Allocator,
     build_source: []const u8,
     target_name: []const u8,
+    cross_target: ?[]const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     zap_lib_dir: ?[]const u8,
 ) !ManifestEval {
-    return ctfeManifestDetailedWithProgress(alloc, build_source, target_name, build_opts, zap_lib_dir, null);
+    return ctfeManifestDetailedWithProgress(alloc, build_source, target_name, cross_target, build_opts, zap_lib_dir, null);
 }
 
+/// `target_name` is the manifest TARGET LABEL the `build.zap` dispatches on
+/// (`case env.target { :release -> … }`) — the build-config selector, NOT a
+/// cross triple. `cross_target` is the `-Dtarget=<triple>` cross-compile
+/// target (or `null` for native), which feeds `env.os`/`env.arch` only.
+/// Keeping these distinct is essential: a `-Dtarget=aarch64-linux-musl`
+/// cross-build must still match the manifest's `:test_prog`/`:release`
+/// label while reporting the cross os/arch.
 pub fn ctfeManifestDetailedWithProgress(
     alloc: std.mem.Allocator,
     build_source: []const u8,
     target_name: []const u8,
+    cross_target: ?[]const u8,
     build_opts: std.StringHashMapUnmanaged([]const u8),
     zap_lib_dir: ?[]const u8,
     progress: ?*zap.progress.Reporter,
@@ -310,23 +320,24 @@ pub fn ctfeManifestDetailedWithProgress(
 
     // Construct the env argument: %Zap.Env{target: :target_name, os: :os, arch: :arch}.
     //
-    // os/arch MUST reflect the *requested compilation target*, not the host
-    // the manifest evaluator runs on. `target_name` is the effective target
-    // label: a real triple under `-Dtarget=` (`"aarch64-macos-none"`, the
-    // two-component `"wasm32-wasi"`, …), or a non-triple invocation label
-    // (`"default"`, `"test"`, `"script"`, or a manifest target name) which
-    // all mean native → host. `resolveOrHost` maps a triple to its atoms
-    // and any non-triple label to the host triple's atoms, so it never
-    // errors on a label (a genuinely-malformed `-Dtarget=` is policed by
-    // the stricter compile path). `env.target` keeps the raw label (a
-    // `build.zap` may branch on it, e.g. `:bulk`/`:tracking`).
+    // `env.target` is the manifest TARGET LABEL the `build.zap` dispatches
+    // on (`case env.target { :test_prog -> … }`) — the build-config
+    // selector. It is ALWAYS `target_name` (the invocation label:
+    // `"default"`/`"test"`/`"script"` or a manifest target name), and is
+    // NEVER overwritten by a `-Dtarget=` cross triple — conflating the two
+    // breaks the manifest's label match under cross-compilation.
     //
-    // Surfacing HOST os/arch here unconditionally (the old
-    // `builtin.os.tag`/`builtin.cpu.arch`) was a latent cross-compile bug:
-    // a `build.zap` branching on `env.os`/`env.arch` saw the host under
-    // `-Dtarget=…`. This is the same resolution `@target` surfaces to all
-    // Zap CTFE, single-sourced in `target_triple`.
-    const target_atoms = zap.target_triple.resolveOrHost(target_name);
+    // `env.os`/`env.arch` MUST reflect the *requested compilation target*,
+    // not the host the manifest evaluator runs on. They derive from
+    // `cross_target` (the `-Dtarget=<triple>` override) when present, else
+    // fall back to the label (a non-triple → host). `resolveOrHost` maps a
+    // triple to its atoms and any non-triple to the host's, never erroring
+    // (a genuinely-malformed `-Dtarget=` is policed by the stricter compile
+    // path). Surfacing HOST os/arch unconditionally (the old
+    // `builtin.os.tag`/`builtin.cpu.arch`) was a latent cross-compile bug.
+    // This is the same resolution `@target` surfaces to all Zap CTFE,
+    // single-sourced in `target_triple`.
+    const target_atoms = zap.target_triple.resolveOrHost(cross_target orelse target_name);
 
     const env_const = ctfe.ConstValue{ .struct_val = .{
         .type_name = "Zap_Env",
