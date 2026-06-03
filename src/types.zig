@@ -2824,8 +2824,11 @@ pub const TypeChecker = struct {
     ///     against the expected list's element type — adopts when at least one
     ///     element adopts and none overflow (so `[5, 9, 200]` into `[u8]`
     ///     adopts, `[5, 9999]` into `[u8]` overflows);
-    ///   * a `map` literal whose every value classifies likewise against the
-    ///     expected map's value type (keys are not numerically adopted here).
+    ///   * a `tuple` literal of equal arity, classified position-wise against
+    ///     the expected tuple's element types (`{5, 200}` into `{u8, u8}`);
+    ///   * a `map` literal whose every key AND value classifies likewise
+    ///     against the expected map's key/value types (`%{5 => 9}` into
+    ///     `Map(u8, u16)`).
     ///
     /// Anything else — a `var_ref`, a `field_access`, a call result, a typed
     /// value — is `not_a_literal`, so typed values never adopt.
@@ -2847,14 +2850,39 @@ pub const TypeChecker = struct {
                 const element_expected = expected_type.list.element;
                 return self.classifyElementLiteralAdoption(list_expr.elements, element_expected);
             },
+            .tuple => |tuple_expr| {
+                if (expected_type != .tuple) return .not_a_literal;
+                // A tuple literal adopts position-wise: each component literal
+                // is classified against the expected tuple's element type at
+                // the same index. Mismatched arity is not an adoption (the
+                // tuple types simply differ).
+                if (tuple_expr.elements.len != expected_type.tuple.elements.len) return .not_a_literal;
+                var any_adopts = false;
+                for (tuple_expr.elements, expected_type.tuple.elements) |element, element_expected| {
+                    switch (self.classifyArgLiteralAdoption(element, element_expected)) {
+                        .adopts => any_adopts = true,
+                        .overflow => |o| return .{ .overflow = o },
+                        .not_a_literal => {},
+                    }
+                }
+                return if (any_adopts) .adopts else .not_a_literal;
+            },
             .map => |map_expr| {
                 if (expected_type != .map) return .not_a_literal;
                 // Only adopt over a map LITERAL, never a `%{...}` update form
                 // whose base source carries an already-typed map value.
                 if (map_expr.update_source != null) return .not_a_literal;
+                const key_expected = expected_type.map.key;
                 const value_expected = expected_type.map.value;
                 var any_adopts = false;
                 for (map_expr.fields) |field| {
+                    // Both key and value literals adopt their respective
+                    // expected types (`%{5 => 9}` into `Map(u8, u16)`).
+                    switch (self.classifyArgLiteralAdoption(field.key, key_expected)) {
+                        .adopts => any_adopts = true,
+                        .overflow => |o| return .{ .overflow = o },
+                        .not_a_literal => {},
+                    }
                     switch (self.classifyArgLiteralAdoption(field.value, value_expected)) {
                         .adopts => any_adopts = true,
                         .overflow => |o| return .{ .overflow = o },

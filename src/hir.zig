@@ -8597,8 +8597,11 @@ pub const HirBuilder = struct {
     ///   * `list_init` into a `.list` type: restamp the list's own `type_id`
     ///     to the expected list type and recurse into every element against
     ///     the expected element type.
+    ///   * `tuple_init` into a `.tuple` type of equal arity: recurse
+    ///     position-wise into each component against the expected element type.
     ///   * `map_init` into a `.map` type: restamp the map's own `type_id` and
-    ///     recurse into every entry value against the expected value type.
+    ///     recurse into every entry key AND value against the expected key/value
+    ///     types.
     fn adoptNumericLiteralType(self: *const HirBuilder, expr: *Expr, expected_type: types_mod.TypeId) bool {
         if (expected_type == types_mod.TypeStore.UNKNOWN) return false;
         if (expected_type >= self.type_store.types.items.len) return false;
@@ -8632,11 +8635,23 @@ pub const HirBuilder = struct {
                 }
                 return adopted_any;
             },
+            .tuple_init => |elements| {
+                if (expected_kind != .tuple) return false;
+                if (elements.len != expected_kind.tuple.elements.len) return false;
+                var adopted_any = false;
+                for (elements, expected_kind.tuple.elements) |element, element_expected| {
+                    if (self.adoptNumericLiteralType(@constCast(element), element_expected)) adopted_any = true;
+                }
+                if (adopted_any) expr.type_id = expected_type;
+                return adopted_any;
+            },
             .map_init => |entries| {
                 if (expected_kind != .map) return false;
+                const key_expected = expected_kind.map.key;
                 const value_expected = expected_kind.map.value;
                 var adopted_any = false;
                 for (entries) |entry| {
+                    if (self.adoptNumericLiteralType(@constCast(entry.key), key_expected)) adopted_any = true;
                     if (self.adoptNumericLiteralType(@constCast(entry.value), value_expected)) adopted_any = true;
                 }
                 if (adopted_any) expr.type_id = expected_type;

@@ -67,6 +67,27 @@ check "exit 0"        "$code" "0"
 check "size 1"        "$out"  "1"
 
 echo
+echo "== 5b) tuple element: literals adopt position-wise from {u8,u8} parameter =="
+run_fixture literal_adopt_tuple_element.zap
+echo "$out"
+check "exit 0"        "$code" "0"
+check "prints ok"     "$out"  "ok"
+
+echo
+echo "== 5c) map KEY: literal adopts u8 from Map(u8,Atom) key position =="
+run_fixture literal_adopt_map_key.zap
+echo "$out"
+check "exit 0"        "$code" "0"
+check "size 1"        "$out"  "1"
+
+echo
+echo "== 5d) nested list: literals adopt through [[u8]] =="
+run_fixture literal_adopt_nested_list.zap
+echo "$out"
+check "exit 0"        "$code" "0"
+check "length 2"      "$out"  "2"
+
+echo
 echo "== 6) return / if / case: literals adopt declared non-i64 return =="
 run_fixture literal_adopt_return_ifcase.zap
 echo "$out"
