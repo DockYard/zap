@@ -95,6 +95,15 @@ check "exit 0"        "$code" "0"
 check "three 5s"      "$out"  $'5\n5\n5'
 
 echo
+echo "== 6a2) FLOAT return / if / case: float literals adopt declared f32 return =="
+run_fixture literal_adopt_return_float.zap
+echo "$out"
+check "exit 0"        "$code" "0"
+check "plain 2.5"     "$out"  "2.5"
+check "if 1.5"        "$out"  "1.5"
+check "case 3.5"      "$out"  "3.5"
+
+echo
 echo "== 6b) if-expr in ARGUMENT position: both arms adopt u8 =="
 run_fixture literal_adopt_if_arg.zap
 echo "$out"

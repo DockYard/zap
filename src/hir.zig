@@ -4969,6 +4969,21 @@ pub const HirBuilder = struct {
                         _ = self.expected_type_stack.pop();
                     };
                     const hir_expr = try self.buildExpr(expr);
+                    // task #361: a bare untyped numeric literal (int, float,
+                    // negated, or an if/case/block of such) in the block's TAIL
+                    // position adopts the expected tail type — the return-
+                    // position analog of the call-argument restamp. Restamping
+                    // the literal's HIR `type_id` (recursing through control-flow
+                    // arms) makes the IR builder lower each arm at the adopted
+                    // width, so a float tail like `if c { 1.5 } else { 2.5 }`
+                    // into a `-> f32` return lowers as `f32` instead of escaping
+                    // a runtime branch as a bare `comptime_float`.
+                    if (apply_expected) {
+                        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                        if (!store_ptr.containsTypeVars(expected_tail_type)) {
+                            _ = self.adoptNumericLiteralType(@constCast(hir_expr), expected_tail_type);
+                        }
+                    }
                     try hir_stmts.append(self.allocator, .{ .expr = hir_expr });
                 },
                 .assignment => |assign| {

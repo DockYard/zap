@@ -2778,21 +2778,22 @@ pub const TypeChecker = struct {
         return null;
     }
 
-    /// Integer literals are contextually typed: a bare literal adopts any
-    /// declared integer type whose range it fits, with narrowing handled by
-    /// the downstream typed position. This matches existing Zap behavior for
-    /// struct fields such as `Function.arity :: u8`. The fit check is the same
-    /// `intLiteralFitsInType` the binary-op peer adoption and the range
-    /// diagnostics use, so an out-of-range literal (`9999` into `u8`,
-    /// `-5` into an unsigned type) is rejected here and falls through to the
-    /// caller's mismatch/overflow reporting rather than being silently
-    /// accepted and rejected far downstream by Zig Sema.
+    /// Numeric literals are contextually typed: a bare literal adopts a
+    /// concrete numeric type whose range it fits, with narrowing handled by the
+    /// downstream typed position. This matches existing Zap behavior for struct
+    /// fields such as `Function.arity :: u8` and now extends uniformly to float
+    /// literals (`ratio :: f32 = 1.5`), negated literals, and container/control-
+    /// flow literals via the shared `classifyArgLiteralAdoption` (task #361).
+    /// Range-checked: an out-of-range literal (`9999` into `u8`, `-5` into an
+    /// unsigned type) is NOT accepted here and falls through to the caller's
+    /// mismatch/overflow reporting rather than being silently accepted and
+    /// rejected far downstream by Zig Sema. Used for struct-field defaults,
+    /// variant-field defaults, and struct-init field values.
     fn acceptsIntegerLiteralForExpectedType(self: *const TypeChecker, expr: *const ast.Expr, expected: TypeId) bool {
-        if (expr.* != .int_literal) return false;
-        if (expected >= self.store.types.items.len) return false;
-        const expected_type = self.store.getType(expected);
-        if (expected_type != .int) return false;
-        return self.store.intLiteralFitsInType(expr.int_literal.value, expected);
+        return switch (self.classifyArgLiteralAdoption(expr, expected)) {
+            .adopts => true,
+            .overflow, .not_a_literal => false,
+        };
     }
 
     /// The outcome of classifying a call argument as an untyped numeric
@@ -2994,32 +2995,6 @@ pub const TypeChecker = struct {
             .label = "integer literal out of range",
             .expansion = arg.getMeta().expansion,
         });
-    }
-
-    fn blockTailIntegerLiteralCanSatisfyExpectedType(self: *const TypeChecker, stmts: []const ast.Stmt, expected: TypeId) bool {
-        if (stmts.len == 0) return false;
-        const last = stmts[stmts.len - 1];
-        if (last != .expr) return false;
-        return self.exprTailIntegerLiteralCanSatisfyExpectedType(last.expr, expected);
-    }
-
-    fn exprTailIntegerLiteralCanSatisfyExpectedType(self: *const TypeChecker, expr: *const ast.Expr, expected: TypeId) bool {
-        if (self.acceptsIntegerLiteralForExpectedType(expr, expected)) return true;
-        return switch (expr.*) {
-            .if_expr => |if_expr| blk: {
-                if (!self.blockTailIntegerLiteralCanSatisfyExpectedType(if_expr.then_block, expected)) break :blk false;
-                const else_block = if_expr.else_block orelse break :blk false;
-                break :blk self.blockTailIntegerLiteralCanSatisfyExpectedType(else_block, expected);
-            },
-            .case_expr => |case_expr| blk: {
-                if (case_expr.clauses.len == 0) break :blk false;
-                for (case_expr.clauses) |case_clause| {
-                    if (!self.blockTailIntegerLiteralCanSatisfyExpectedType(case_clause.body, expected)) break :blk false;
-                }
-                break :blk true;
-            },
-            else => false,
-        };
     }
 
     fn structExprFieldValue(self: *const TypeChecker, struct_expr: ast.StructExpr, field_name_text: []const u8) ?*const ast.Expr {
@@ -7468,8 +7443,15 @@ pub const TypeChecker = struct {
             declared_return != TypeStore.ERROR and
             self.store.getType(declared_return) != .type_var;
         if (declared_is_checkable and body_type != TypeStore.UNKNOWN and body_type != TypeStore.ERROR) {
+            // task #361: a bare untyped numeric literal (int, float, negated, or
+            // an if/case/block whose every arm tail is one) in return position
+            // adopts the declared non-default return type, range-checked. The
+            // shared `acceptsIntegerLiteralForExpectedType` now delegates to
+            // `classifyArgLiteralAdoption`, which recurses through control flow,
+            // so this single call covers the plain, if-result, and case-result
+            // return positions for both int and float literals.
             const return_matches_declared = self.store.typeEqualsModuloCallable(body_type, declared_return) or
-                if (last_expr) |expr| self.exprTailIntegerLiteralCanSatisfyExpectedType(expr, declared_return) else false;
+                if (last_expr) |expr| self.acceptsIntegerLiteralForExpectedType(expr, declared_return) else false;
             if (!return_matches_declared) {
                 const expected = self.typeToString(declared_return);
                 const got = self.typeToString(body_type);

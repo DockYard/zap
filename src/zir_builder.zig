@@ -6071,11 +6071,23 @@ pub const ZirDriver = struct {
                 try self.setLocal(ci.dest, ref);
             },
             .const_float => |cf| {
+                // Float-literal typing priority mirrors `const_int`:
+                //  1. Explicit IR hint (the literal's concretized/adopted
+                //     float width) — coerce the bare float to it.
+                //  2. Inside a case/branch result block: typed `f64` so a
+                //     literal that becomes the control-flow result does not
+                //     flow out as a bare `comptime_float` (Zig rejects a
+                //     comptime-only value depending on runtime control flow —
+                //     the float analog of the `comptime_int` case-result fix).
+                //  3. Else a bare float (Zig infers `comptime_float`),
+                //     unchanged for every straight-line use.
                 const raw_ref = zir_builder_emit_float(self.handle, cf.value);
                 if (raw_ref == error_ref) return error.EmitFailed;
                 const type_hint_ref: u32 = if (cf.type_hint) |type_hint| mapReturnType(type_hint) else 0;
                 const ref = if (type_hint_ref != 0)
                     zir_builder_emit_as(self.handle, type_hint_ref, raw_ref)
+                else if (self.current_case_dest != null)
+                    zir_builder_emit_as(self.handle, @intFromEnum(Zir.Inst.Ref.f64_type), raw_ref)
                 else
                     raw_ref;
                 if (ref == error_ref) return error.EmitFailed;

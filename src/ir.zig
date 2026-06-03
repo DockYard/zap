@@ -4065,6 +4065,24 @@ pub const IrBuilder = struct {
         };
     }
 
+    /// The float analog of `expectedConcreteIntegerType`: when
+    /// `current_expected_type` names a concrete float type, return its
+    /// `ZigType`. Used by the `float_lit` lowering so a default-`F64`-stamped
+    /// float literal adopts the surrounding expected float type (a callee's
+    /// parameter type, or the enclosing function's return type for a
+    /// tail/return-position literal, including through `if`/`case` arms) —
+    /// without it an arm float literal stays a bare `comptime_float` and Zig
+    /// rejects a comptime-only value depending on runtime control flow.
+    fn expectedConcreteFloatType(self: *const IrBuilder) ?ZigType {
+        const context = self.current_expected_type orelse return null;
+        if (self.usableContextType(context) == null) return null;
+        const context_zig_type = typeIdToZigTypeWithStore(context, self.type_store);
+        return switch (context_zig_type) {
+            .f16, .f32, .f64, .f80, .f128 => context_zig_type,
+            else => null,
+        };
+    }
+
     fn shouldPreferContextType(self: *const IrBuilder, fallback: types_mod.TypeId, context: types_mod.TypeId) bool {
         _ = self.usableContextType(context) orelse return false;
         if (fallback == types_mod.TypeStore.UNKNOWN or fallback == types_mod.TypeStore.ERROR) return true;
@@ -12830,8 +12848,29 @@ pub const IrBuilder = struct {
                 try self.known_local_types.put(dest, resolved);
             },
             .float_lit => |v| {
-                const float_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
-                const resolved = if (float_type == .any) .f64 else float_type;
+                // Float-literal typing precedence mirrors `int_lit`:
+                //   1. A non-default float type concretized onto this node
+                //      (`expr.type_id`) wins.
+                //   2. Otherwise the literal still carries HIR's default `F64`
+                //      stamp; the surrounding *expected type*
+                //      (`current_expected_type` — a callee's parameter type, or
+                //      the enclosing function's return type for a tail/return-
+                //      position literal, propagated through `if`/`case` arms)
+                //      drives the concrete float type. Reading it here lets an
+                //      arm float literal adopt e.g. `f32` instead of escaping a
+                //      runtime branch as a bare `comptime_float`.
+                //   3. Else a bare `f64`-stamped literal, emitted untyped.
+                const declared_float_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const context_float_type: ?ZigType = if (declared_float_type == .any or declared_float_type == .f64)
+                    self.expectedConcreteFloatType()
+                else
+                    null;
+                const resolved = if (context_float_type) |ctx|
+                    ctx
+                else if (declared_float_type == .any)
+                    .f64
+                else
+                    declared_float_type;
                 const hint: ?ZigType = if (resolved != .f64) resolved else null;
                 try self.current_instrs.append(self.allocator, .{
                     .const_float = .{ .dest = dest, .value = v, .type_hint = hint },
