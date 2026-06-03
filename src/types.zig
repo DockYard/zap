@@ -2817,6 +2817,10 @@ pub const TypeChecker = struct {
     ///
     ///   * an `int_literal` against a concrete `.int` parameter — adopts when
     ///     the value fits (`intLiteralFitsInType`), else `overflow`;
+    ///   * a negated integer literal `unary_op(.negate, int_literal)` (`-5`)
+    ///     against a concrete `.int` parameter — adopts when the negated value
+    ///     fits (so it adopts a signed type and is rejected for an unsigned
+    ///     one);
     ///   * a `float_literal` against a concrete `.float` parameter — always
     ///     adopts (a float literal carries no width, so it fits any float
     ///     type; there is no out-of-range float literal at this granularity);
@@ -2840,6 +2844,21 @@ pub const TypeChecker = struct {
                 if (expected_type != .int) return .not_a_literal;
                 if (self.store.intLiteralFitsInType(lit.value, expected)) return .adopts;
                 return .{ .overflow = .{ .value = lit.value, .expected = expected } };
+            },
+            .unary_op => |unary| {
+                // A negated untyped integer literal (`-5`, parsed as
+                // `unary_op(.negate, int_literal 5)`) is itself an untyped
+                // integer literal with value `-N`. It adopts a concrete signed
+                // integer type when `-N` fits, and is correctly REJECTED for an
+                // unsigned target (`intLiteralFitsInType` returns false for a
+                // negative value into an unsigned type — e173303-consistent).
+                // `not_op` and any non-int-literal operand are not adoptions.
+                if (unary.op != .negate) return .not_a_literal;
+                if (unary.operand.* != .int_literal) return .not_a_literal;
+                if (expected_type != .int) return .not_a_literal;
+                const negated: i64 = -unary.operand.int_literal.value;
+                if (self.store.intLiteralFitsInType(negated, expected)) return .adopts;
+                return .{ .overflow = .{ .value = negated, .expected = expected } };
             },
             .float_literal => {
                 if (expected_type != .float) return .not_a_literal;

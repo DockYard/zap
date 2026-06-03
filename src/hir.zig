@@ -8624,6 +8624,29 @@ pub const HirBuilder = struct {
                 expr.type_id = expected_type;
                 return true;
             },
+            .unary => |unary| {
+                // A negated untyped integer literal (`-5`, lowered as
+                // `unary(.negate, int_lit 5)`) adopts a concrete SIGNED integer
+                // type when the negated value fits. Restamp ONLY the outer
+                // `unary` expression to the adopted width — the inner positive
+                // literal is deliberately LEFT at the default `I64` so the IR
+                // builder lowers it as an untyped `comptime_int` (no narrow
+                // `type_hint`); narrowing the inner literal would emit e.g.
+                // `128 : i8` which Sema rejects BEFORE the negation, whereas
+                // `-(128 : comptime_int)` correctly fits `i8` as `-128`. The
+                // inner literal must be an untyped (default-`I64`) `int_lit`;
+                // an unsigned target is rejected via the range check
+                // (`intLiteralFitsInType` of a negative value).
+                if (unary.op != .negate) return false;
+                if (expected_kind != .int) return false;
+                const operand: *const Expr = unary.operand;
+                if (operand.kind != .int_lit) return false;
+                if (operand.type_id != types_mod.TypeStore.I64) return false;
+                const negated: i64 = -operand.kind.int_lit;
+                if (!self.type_store.intLiteralFitsInType(negated, expected_type)) return false;
+                expr.type_id = expected_type;
+                return true;
+            },
             .list_init => |elements| {
                 if (expected_kind != .list) return false;
                 const element_expected = expected_kind.list.element;

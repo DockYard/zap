@@ -109,6 +109,13 @@ check "exit 0"        "$code" "0"
 check "prints 200"    "$out"  "200"
 
 echo
+echo "== 6d) negated literal adopts a SIGNED type (-5, -128 into i8) =="
+run_fixture literal_adopt_negative_signed.zap
+echo "$out"
+check "exit 0"        "$code" "0"
+check "length 3"      "$out"  "3"
+
+echo
 echo "== 7) NEGATIVE: arg literal that does not fit u8 is an overflow error =="
 run_fixture literal_adopt_arg_overflow.zap
 echo "$out"
