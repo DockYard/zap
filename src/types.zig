@@ -2891,8 +2891,55 @@ pub const TypeChecker = struct {
                 }
                 return if (any_adopts) .adopts else .not_a_literal;
             },
+            .if_expr => |if_expr| {
+                // An `if`/`else` whose BOTH arms are adopting untyped literals
+                // adopts the expected type in argument/element position, the
+                // same way a tail `if` adopts a declared return type
+                // (`exprTailIntegerLiteralCanSatisfyExpectedType`). A one-armed
+                // `if` (no `else`) cannot adopt — it is not total. Any arm that
+                // is not itself an adopting literal makes the whole expression
+                // `not_a_literal` (we cannot retype a non-literal arm).
+                const else_stmts = if_expr.else_block orelse return .not_a_literal;
+                switch (self.classifyBlockTailAdoption(if_expr.then_block, expected)) {
+                    .not_a_literal => return .not_a_literal,
+                    .overflow => |o| return .{ .overflow = o },
+                    .adopts => {},
+                }
+                switch (self.classifyBlockTailAdoption(else_stmts, expected)) {
+                    .not_a_literal => return .not_a_literal,
+                    .overflow => |o| return .{ .overflow = o },
+                    .adopts => {},
+                }
+                return .adopts;
+            },
+            .case_expr => |case_expr| {
+                // A `case` whose EVERY arm tail is an adopting untyped literal
+                // adopts the expected type (mirrors the return-position rule).
+                if (case_expr.clauses.len == 0) return .not_a_literal;
+                for (case_expr.clauses) |case_clause| {
+                    switch (self.classifyBlockTailAdoption(case_clause.body, expected)) {
+                        .not_a_literal => return .not_a_literal,
+                        .overflow => |o| return .{ .overflow = o },
+                        .adopts => {},
+                    }
+                }
+                return .adopts;
+            },
+            .block => |block_expr| {
+                return self.classifyBlockTailAdoption(block_expr.stmts, expected);
+            },
             else => return .not_a_literal,
         }
+    }
+
+    /// Classify the tail expression of a block (the value the block produces)
+    /// for untyped-literal adoption against `expected`. An empty block, or a
+    /// block whose last statement is not an expression, cannot adopt.
+    fn classifyBlockTailAdoption(self: *const TypeChecker, stmts: []const ast.Stmt, expected: TypeId) LiteralAdoption {
+        if (stmts.len == 0) return .not_a_literal;
+        const last = stmts[stmts.len - 1];
+        if (last != .expr) return .not_a_literal;
+        return self.classifyArgLiteralAdoption(last.expr, expected);
     }
 
     /// Shared element-sequence classifier for list literals (and reused for

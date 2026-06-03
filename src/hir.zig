@@ -8602,6 +8602,10 @@ pub const HirBuilder = struct {
     ///   * `map_init` into a `.map` type: restamp the map's own `type_id` and
     ///     recurse into every entry key AND value against the expected key/value
     ///     types.
+    ///   * `branch` (an `if`/`else`), `case`, and `block`: recurse into the
+    ///     value-producing tail of each arm/block so an `if c {5} else {9}` or
+    ///     `case` of untyped literals in argument/element position adopts the
+    ///     expected type, the same way it does in return position.
     fn adoptNumericLiteralType(self: *const HirBuilder, expr: *Expr, expected_type: types_mod.TypeId) bool {
         if (expected_type == types_mod.TypeStore.UNKNOWN) return false;
         if (expected_type >= self.type_store.types.items.len) return false;
@@ -8657,8 +8661,56 @@ pub const HirBuilder = struct {
                 if (adopted_any) expr.type_id = expected_type;
                 return adopted_any;
             },
+            .branch => |branch| {
+                // An `if`/`else` whose arm tails are untyped literals adopts the
+                // expected type through both arms — the value-producing context
+                // analog of the return-position lowering. (Layer 1's
+                // `classifyArgLiteralAdoption` only suppressed the type-check
+                // mismatch when BOTH arms adopt, so by the time we reach here a
+                // one-armed `if` never qualifies.)
+                var adopted_any = false;
+                if (self.adoptNumericLiteralInBlockTail(branch.then_block, expected_type)) adopted_any = true;
+                if (branch.else_block) |else_block| {
+                    if (self.adoptNumericLiteralInBlockTail(else_block, expected_type)) adopted_any = true;
+                }
+                if (adopted_any) expr.type_id = expected_type;
+                return adopted_any;
+            },
+            .case => |case_data| {
+                var adopted_any = false;
+                for (case_data.arms) |arm| {
+                    if (self.adoptNumericLiteralInBlockTail(arm.body, expected_type)) adopted_any = true;
+                }
+                if (adopted_any) expr.type_id = expected_type;
+                return adopted_any;
+            },
+            .block => {
+                if (self.adoptNumericLiteralInBlockTail(&expr.kind.block, expected_type)) {
+                    expr.type_id = expected_type;
+                    return true;
+                }
+                return false;
+            },
             else => return false,
         }
+    }
+
+    /// Recurse `adoptNumericLiteralType` into the tail (value-producing)
+    /// expression of a block, used by the control-flow arms of
+    /// `adoptNumericLiteralType` (`branch`, `case`, `block`). Returns true when
+    /// the tail adopted, in which case the block's `result_type` is updated to
+    /// match so the IR builder lowers the block at the adopted width. The tail
+    /// is the last `.expr` statement; a block with no tail expression cannot
+    /// adopt.
+    fn adoptNumericLiteralInBlockTail(self: *const HirBuilder, block: *const Block, expected_type: types_mod.TypeId) bool {
+        if (block.stmts.len == 0) return false;
+        const last = block.stmts[block.stmts.len - 1];
+        if (last != .expr) return false;
+        if (self.adoptNumericLiteralType(@constCast(last.expr), expected_type)) {
+            @constCast(block).result_type = expected_type;
+            return true;
+        }
+        return false;
     }
 
     /// Describes a binary-operator operand that is (directly or by way of a

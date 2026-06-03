@@ -95,6 +95,20 @@ check "exit 0"        "$code" "0"
 check "three 5s"      "$out"  $'5\n5\n5'
 
 echo
+echo "== 6b) if-expr in ARGUMENT position: both arms adopt u8 =="
+run_fixture literal_adopt_if_arg.zap
+echo "$out"
+check "exit 0"        "$code" "0"
+check "prints 5"      "$out"  "5"
+
+echo
+echo "== 6c) case in ARGUMENT position: every arm adopts u8 =="
+run_fixture literal_adopt_case_arg.zap
+echo "$out"
+check "exit 0"        "$code" "0"
+check "prints 200"    "$out"  "200"
+
+echo
 echo "== 7) NEGATIVE: arg literal that does not fit u8 is an overflow error =="
 run_fixture literal_adopt_arg_overflow.zap
 echo "$out"
