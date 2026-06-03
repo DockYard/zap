@@ -2778,15 +2778,128 @@ pub const TypeChecker = struct {
         return null;
     }
 
-    /// Integer literals are contextually typed: a bare literal can
-    /// satisfy any declared integer type, with narrowing handled by
-    /// the downstream typed position. This matches existing Zap
-    /// behavior for struct fields such as `Function.arity :: u8`.
+    /// Integer literals are contextually typed: a bare literal adopts any
+    /// declared integer type whose range it fits, with narrowing handled by
+    /// the downstream typed position. This matches existing Zap behavior for
+    /// struct fields such as `Function.arity :: u8`. The fit check is the same
+    /// `intLiteralFitsInType` the binary-op peer adoption and the range
+    /// diagnostics use, so an out-of-range literal (`9999` into `u8`,
+    /// `-5` into an unsigned type) is rejected here and falls through to the
+    /// caller's mismatch/overflow reporting rather than being silently
+    /// accepted and rejected far downstream by Zig Sema.
     fn acceptsIntegerLiteralForExpectedType(self: *const TypeChecker, expr: *const ast.Expr, expected: TypeId) bool {
         if (expr.* != .int_literal) return false;
         if (expected >= self.store.types.items.len) return false;
         const expected_type = self.store.getType(expected);
-        return expected_type == .int;
+        if (expected_type != .int) return false;
+        return self.store.intLiteralFitsInType(expr.int_literal.value, expected);
+    }
+
+    /// The outcome of classifying a call argument as an untyped numeric
+    /// literal flowing into a concrete numeric parameter type (task #361).
+    /// `adopts` means the literal (or every literal element of a list/map
+    /// literal) fits the expected type and should adopt it — the caller
+    /// suppresses the argument-type-mismatch diagnostic. `overflow` means the
+    /// argument IS such a literal but its value does not fit — the caller emits
+    /// the range/overflow diagnostic instead of the generic mismatch.
+    /// `not_a_literal` means the argument is not an untyped numeric literal in
+    /// an adopting position, so the caller proceeds with its normal mismatch
+    /// handling (this is the path a typed value or typed binding always takes,
+    /// preserving "only literals adopt").
+    const LiteralAdoption = union(enum) {
+        adopts,
+        overflow: struct { value: i64, expected: TypeId },
+        not_a_literal,
+    };
+
+    /// Classify a call argument against an expected parameter type for untyped
+    /// numeric literal adoption (task #361). Only a literal AST node adopts:
+    ///
+    ///   * an `int_literal` against a concrete `.int` parameter — adopts when
+    ///     the value fits (`intLiteralFitsInType`), else `overflow`;
+    ///   * a `float_literal` against a concrete `.float` parameter — always
+    ///     adopts (a float literal carries no width, so it fits any float
+    ///     type; there is no out-of-range float literal at this granularity);
+    ///   * a `list` literal whose every element classifies as `adopts`/`not`
+    ///     against the expected list's element type — adopts when at least one
+    ///     element adopts and none overflow (so `[5, 9, 200]` into `[u8]`
+    ///     adopts, `[5, 9999]` into `[u8]` overflows);
+    ///   * a `map` literal whose every value classifies likewise against the
+    ///     expected map's value type (keys are not numerically adopted here).
+    ///
+    /// Anything else — a `var_ref`, a `field_access`, a call result, a typed
+    /// value — is `not_a_literal`, so typed values never adopt.
+    fn classifyArgLiteralAdoption(self: *const TypeChecker, arg: *const ast.Expr, expected: TypeId) LiteralAdoption {
+        if (expected == TypeStore.UNKNOWN or expected >= self.store.types.items.len) return .not_a_literal;
+        const expected_type = self.store.getType(expected);
+        switch (arg.*) {
+            .int_literal => |lit| {
+                if (expected_type != .int) return .not_a_literal;
+                if (self.store.intLiteralFitsInType(lit.value, expected)) return .adopts;
+                return .{ .overflow = .{ .value = lit.value, .expected = expected } };
+            },
+            .float_literal => {
+                if (expected_type != .float) return .not_a_literal;
+                return .adopts;
+            },
+            .list => |list_expr| {
+                if (expected_type != .list) return .not_a_literal;
+                const element_expected = expected_type.list.element;
+                return self.classifyElementLiteralAdoption(list_expr.elements, element_expected);
+            },
+            .map => |map_expr| {
+                if (expected_type != .map) return .not_a_literal;
+                // Only adopt over a map LITERAL, never a `%{...}` update form
+                // whose base source carries an already-typed map value.
+                if (map_expr.update_source != null) return .not_a_literal;
+                const value_expected = expected_type.map.value;
+                var any_adopts = false;
+                for (map_expr.fields) |field| {
+                    switch (self.classifyArgLiteralAdoption(field.value, value_expected)) {
+                        .adopts => any_adopts = true,
+                        .overflow => |o| return .{ .overflow = o },
+                        .not_a_literal => {},
+                    }
+                }
+                return if (any_adopts) .adopts else .not_a_literal;
+            },
+            else => return .not_a_literal,
+        }
+    }
+
+    /// Shared element-sequence classifier for list literals (and reused for
+    /// the list arm above): adopts when at least one element is an adopting
+    /// untyped numeric literal and no element overflows the element type.
+    fn classifyElementLiteralAdoption(self: *const TypeChecker, elements: []const *const ast.Expr, element_expected: TypeId) LiteralAdoption {
+        var any_adopts = false;
+        for (elements) |element| {
+            switch (self.classifyArgLiteralAdoption(element, element_expected)) {
+                .adopts => any_adopts = true,
+                .overflow => |o| return .{ .overflow = o },
+                .not_a_literal => {},
+            }
+        }
+        return if (any_adopts) .adopts else .not_a_literal;
+    }
+
+    /// Emit the task #361 overflow diagnostic for an untyped numeric literal
+    /// argument whose value does not fit the parameter's declared numeric
+    /// type. Reported against the argument span, naming both the value and the
+    /// target type — the in-band analog of `unifyIntLiteralOperandType`'s
+    /// peer-adoption range error, so an out-of-range literal is a clear
+    /// compile error rather than a silent default.
+    fn reportLiteralArgumentOverflow(self: *TypeChecker, arg: *const ast.Expr, arg_index: usize, value: i64, expected: TypeId) !void {
+        const expected_str = self.typeToString(expected);
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "argument {d} integer literal {d} is out of range for type `{s}` — an untyped literal adopts the parameter type only when its value fits",
+                .{ arg_index + 1, value, expected_str },
+            ),
+            .span = arg.getMeta().span,
+            .label = "integer literal out of range",
+            .expansion = arg.getMeta().expansion,
+        });
     }
 
     fn blockTailIntegerLiteralCanSatisfyExpectedType(self: *const TypeChecker, stmts: []const ast.Stmt, expected: TypeId) bool {
@@ -8405,6 +8518,26 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// Decide whether an argument that failed `callMatchCost` is genuinely a
+    /// mismatch, after applying task #361 untyped-literal adoption. Returns
+    /// false (no further diagnostic) when the argument is an untyped numeric
+    /// literal that fits the expected type — it adopts the parameter type. When
+    /// the argument is such a literal but out of range, this emits the overflow
+    /// diagnostic and returns false (the overflow IS the diagnostic). Returns
+    /// true only when the argument is not an adopting literal, in which case
+    /// the caller emits its normal argument-type-mismatch (preserving "only
+    /// literals adopt" — a typed value/binding always returns true here).
+    fn argMismatchSurvivesLiteralAdoption(self: *TypeChecker, arg: *const ast.Expr, arg_index: usize, expected: TypeId) !bool {
+        switch (self.classifyArgLiteralAdoption(arg, expected)) {
+            .adopts => return false,
+            .overflow => |o| {
+                try self.reportLiteralArgumentOverflow(arg, arg_index, o.value, o.expected);
+                return false;
+            },
+            .not_a_literal => return true,
+        }
+    }
+
     fn reportArgumentTypeMismatch(self: *TypeChecker, arg: *const ast.Expr, arg_index: usize, expected: TypeId, got: TypeId) !void {
         return self.reportArgumentTypeMismatchProvenance(arg, arg_index, expected, got, null);
     }
@@ -8552,17 +8685,22 @@ pub const TypeChecker = struct {
             if (idx < signature.params.len) {
                 const expected = signature.params[idx];
                 if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
-                    // Phase 4.b two-sided: hand the resolved clause's parameter
-                    // annotation span so the diagnostic points at where the
-                    // expected type came from. The clause ref resolves to its
-                    // owning FunctionDecl's clause; guard the clause_index in
-                    // case the family shape ever drifts.
-                    const clause_ref = family.clauses.items[0];
-                    const origin_span = if (clause_ref.clause_index < clause_ref.decl.clauses.len)
-                        clauseParamOriginSpan(&clause_ref.decl.clauses[clause_ref.clause_index], idx)
-                    else
-                        null;
-                    try self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin_span);
+                    // task #361: an untyped numeric literal argument adopts the
+                    // parameter's concrete numeric type (range-checked); only a
+                    // genuine non-literal mismatch is reported.
+                    if (try self.argMismatchSurvivesLiteralAdoption(arg, idx, expected)) {
+                        // Phase 4.b two-sided: hand the resolved clause's parameter
+                        // annotation span so the diagnostic points at where the
+                        // expected type came from. The clause ref resolves to its
+                        // owning FunctionDecl's clause; guard the clause_index in
+                        // case the family shape ever drifts.
+                        const clause_ref = family.clauses.items[0];
+                        const origin_span = if (clause_ref.clause_index < clause_ref.decl.clauses.len)
+                            clauseParamOriginSpan(&clause_ref.decl.clauses[clause_ref.clause_index], idx)
+                        else
+                            null;
+                        try self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin_span);
+                    }
                 }
             }
         }
@@ -8931,8 +9069,16 @@ pub const TypeChecker = struct {
                                 const expected = signature.params[idx];
                                 if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
                                     if (self.callMatchCost(arg_type, expected) == null) {
-                                        try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
-                                        unification_failed = true;
+                                        // task #361: an untyped numeric literal
+                                        // adopts a concrete numeric parameter
+                                        // type (range-checked). On adoption the
+                                        // arg already satisfies the concrete
+                                        // `expected`, so no unify binding is
+                                        // needed — fall through past the unify.
+                                        if (try self.argMismatchSurvivesLiteralAdoption(arg, idx, expected)) {
+                                            try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                                            unification_failed = true;
+                                        }
                                         continue;
                                     }
                                     const unified = self.store.unify(expected, arg_type, &subs) catch false;
@@ -8969,7 +9115,11 @@ pub const TypeChecker = struct {
                         if (idx < signature.params.len) {
                             const expected = signature.params[idx];
                             if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
-                                try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                                // task #361: untyped numeric literal adopts the
+                                // parameter's concrete numeric type (range-checked).
+                                if (try self.argMismatchSurvivesLiteralAdoption(arg, idx, expected)) {
+                                    try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
+                                }
                             }
                         }
                     }
@@ -9137,8 +9287,15 @@ pub const TypeChecker = struct {
                                             if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
                                                 const origin = self.familyParamOriginSpan(resolved_call.family_id, resolved_call.clause_index, idx);
                                                 if (self.callMatchCost(arg_type, expected) == null) {
-                                                    self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
-                                                    mod_unification_failed = true;
+                                                    // task #361: untyped numeric literal
+                                                    // adopts the concrete numeric param
+                                                    // type (range-checked); on adoption it
+                                                    // already satisfies `expected`, so skip
+                                                    // the unify binding.
+                                                    if (self.argMismatchSurvivesLiteralAdoption(arg, idx, expected) catch true) {
+                                                        self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
+                                                        mod_unification_failed = true;
+                                                    }
                                                     continue;
                                                 }
                                                 const unified = self.store.unify(expected, arg_type, &mod_subs) catch false;
@@ -9172,11 +9329,15 @@ pub const TypeChecker = struct {
                                     if (idx < signature.params.len) {
                                         const expected = signature.params[idx];
                                         if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
-                                            // Phase 4.b two-sided: point at the
-                                            // resolved callee parameter's declared
-                                            // type as the expected-type origin.
-                                            const origin = self.familyParamOriginSpan(resolved_call.family_id, resolved_call.clause_index, idx);
-                                            self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
+                                            // task #361: untyped numeric literal adopts the
+                                            // parameter's concrete numeric type (range-checked).
+                                            if (self.argMismatchSurvivesLiteralAdoption(arg, idx, expected) catch true) {
+                                                // Phase 4.b two-sided: point at the
+                                                // resolved callee parameter's declared
+                                                // type as the expected-type origin.
+                                                const origin = self.familyParamOriginSpan(resolved_call.family_id, resolved_call.clause_index, idx);
+                                                self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
+                                            }
                                         }
                                     }
                                 }
@@ -11485,6 +11646,52 @@ test "function reference arity narrows to u8 before validation" {
 }
 
 test "static manual Function struct validates target and accepts narrowed arity field" {
+    // An untyped integer literal in a `u8` field position adopts `u8` when it
+    // fits (task #361 range-checked adoption). `arity: 1` both fits u8 and
+    // matches the resolved `Test.main/1` reference the static-Function-struct
+    // validation checks (the arity field IS the looked-up arity).
+    const source =
+        \\pub struct Type {
+        \\  name :: Atom
+        \\}
+        \\
+        \\pub struct Function {
+        \\  struct :: Type
+        \\  name :: Atom
+        \\  arity :: u8
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn main(args :: Nil) -> Function {
+        \\    %Function{struct: Test, name: :main, arity: 1}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "static manual Function struct rejects an out-of-range arity field literal" {
+    // task #361: untyped-literal adoption is range-checked. `257` does NOT fit
+    // the `u8` arity field, so this is a type error rather than a silent
+    // narrowing (previously the un-range-checked acceptance let `257` through,
+    // only for Zig Sema to reject it far from the source).
     const source =
         \\pub struct Type {
         \\  name :: Atom
@@ -11519,7 +11726,19 @@ test "static manual Function struct validates target and accepts narrowed arity 
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+    // `257` (which `@truncate`s to a valid `main/1` for the static-ref check,
+    // so the only remaining error is the range rejection) does not fit the
+    // `u8` arity field — a genuine type error, not a silent narrowing.
+    var found_range_error = false;
+    for (checker.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "arity") != null and
+            std.mem.find(u8, err.message, "u8") != null)
+        {
+            found_range_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_range_error);
 }
 
 test "calling Function stored in a variable is rejected as dynamic dispatch" {

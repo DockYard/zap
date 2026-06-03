@@ -5798,6 +5798,25 @@ pub const HirBuilder = struct {
                     }
                 }
 
+                // task #361: an untyped numeric literal argument adopts the
+                // parameter's concrete numeric type. The TypeChecker already
+                // accepted the adoption (suppressing the argument-type
+                // mismatch and range-checking the value); here we restamp the
+                // literal's HIR `type_id` so the IR builder lowers the value at
+                // the adopted width — the call-argument analog of the
+                // struct-field default restamp `propagateExpectedTypeToDefault`
+                // performs at construction sites. Recurses into list/map
+                // element literals so `[5, 9, 200]` into `[u8]` lowers as
+                // `List(u8)`. Only genuinely untyped literals (an `int_lit`
+                // stamped the default `I64`, a `float_lit` stamped `F64`, or a
+                // container literal of such) adopt; a typed value is untouched.
+                for (args.items) |*arg| {
+                    if (arg.expected_type == types_mod.TypeStore.UNKNOWN) continue;
+                    const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                    if (store_ptr.containsTypeVars(arg.expected_type)) continue;
+                    _ = self.adoptNumericLiteralType(@constCast(arg.expr), arg.expected_type);
+                }
+
                 if (target == .direct) {
                     const group_id = target.direct.function_group_id;
                     const group_captures = self.group_captures.get(group_id) orelse &.{};
@@ -8533,23 +8552,18 @@ pub const HirBuilder = struct {
         // exact UNKNOWN-to-expected stamping the codegen needs.
         self.patchEmptyContainerTypesExpr(expr, expected_type);
 
-        // Integer-literal narrowing: a bare `8080` lowers as a
+        // Numeric-literal narrowing: a bare `8080` lowers as a
         // default-typed `int_lit` (HIR's `buildExpr` stamps `I64`
-        // unconditionally). When the receiving field declares a
-        // different integer width — `port :: u16 = 8080`,
-        // `flags :: u8 = 0`, etc. — we restamp the literal here so
-        // the codegen path that previously failed on
-        // `expected u8, got value 8080` gets the right slot from
-        // the start. This is the construction-site analog of the
-        // `arg.expected_type` propagation loop that buildExpr runs
-        // for user-supplied call arguments (search for
-        // "Propagate expected_type to argument expressions").
-        const expected_kind = self.type_store.getType(expected_type);
+        // unconditionally; a `float_lit` stamps `F64`). When the
+        // receiving field declares a different numeric width —
+        // `port :: u16 = 8080`, `flags :: u8 = 0`, `ratio :: f32 = 1.5`
+        // — we restamp the literal so the codegen path that previously
+        // failed on `expected u8, got value 8080` gets the right slot
+        // from the start. Shared with the call-argument adoption
+        // (task #361) via `adoptNumericLiteralType`, which range-checks
+        // and recurses into container literals.
         const mut: *Expr = @constCast(expr);
-        if (mut.kind == .int_lit and expected_kind == .int) {
-            mut.type_id = expected_type;
-            return;
-        }
+        if (self.adoptNumericLiteralType(mut, expected_type)) return;
 
         // String literal whose type slot stayed UNKNOWN: same
         // stamping. (String literals normally get STRING from
@@ -8559,6 +8573,76 @@ pub const HirBuilder = struct {
         if (mut.kind == .string_lit and mut.type_id == types_mod.TypeStore.UNKNOWN and expected_type == types_mod.TypeStore.STRING) {
             mut.type_id = expected_type;
             return;
+        }
+    }
+
+    /// Restamp an untyped numeric literal HIR expression to adopt a concrete
+    /// numeric `expected_type`, range-checked (task #361). Returns true when an
+    /// adoption was performed (so callers can stop), false otherwise.
+    ///
+    /// An untyped literal is one `buildExpr` stamped with the placeholder
+    /// default: an `int_lit` typed `I64`, a `float_lit` typed `F64`. Only such
+    /// genuinely-untyped literals adopt — a literal that already carries a
+    /// concrete non-default type (e.g. one written `5 :: u8`) is left as-is,
+    /// and a non-literal (a `local_get` of a typed binding, a call result) is
+    /// never touched, preserving "only untyped literals adopt".
+    ///
+    ///   * `int_lit` (typed `I64`) into a concrete `.int` type: restamp when
+    ///     the value fits (`intLiteralFitsInType`); when it does not fit the
+    ///     literal is left at `I64` (the TypeChecker has already reported the
+    ///     out-of-range error — restamping a narrower type onto an overflowing
+    ///     value would corrupt the lowered slot).
+    ///   * `float_lit` (typed `F64`) into a concrete `.float` type: restamp
+    ///     (a float literal carries no width, so it fits any float type).
+    ///   * `list_init` into a `.list` type: restamp the list's own `type_id`
+    ///     to the expected list type and recurse into every element against
+    ///     the expected element type.
+    ///   * `map_init` into a `.map` type: restamp the map's own `type_id` and
+    ///     recurse into every entry value against the expected value type.
+    fn adoptNumericLiteralType(self: *const HirBuilder, expr: *Expr, expected_type: types_mod.TypeId) bool {
+        if (expected_type == types_mod.TypeStore.UNKNOWN) return false;
+        if (expected_type >= self.type_store.types.items.len) return false;
+        const expected_kind = self.type_store.getType(expected_type);
+        switch (expr.kind) {
+            .int_lit => |value| {
+                if (expr.type_id != types_mod.TypeStore.I64) return false;
+                if (expected_kind != .int) return false;
+                if (!self.type_store.intLiteralFitsInType(value, expected_type)) return false;
+                expr.type_id = expected_type;
+                return true;
+            },
+            .float_lit => {
+                if (expr.type_id != types_mod.TypeStore.F64) return false;
+                if (expected_kind != .float) return false;
+                expr.type_id = expected_type;
+                return true;
+            },
+            .list_init => |elements| {
+                if (expected_kind != .list) return false;
+                const element_expected = expected_kind.list.element;
+                var adopted_any = false;
+                for (elements) |element| {
+                    if (self.adoptNumericLiteralType(@constCast(element), element_expected)) adopted_any = true;
+                }
+                if (adopted_any) {
+                    // The element widths changed — adopt the expected list
+                    // type so the IR builder lowers `List(u8)` rather than
+                    // re-deriving `List(i64)` from the (now restamped) elements.
+                    expr.type_id = expected_type;
+                }
+                return adopted_any;
+            },
+            .map_init => |entries| {
+                if (expected_kind != .map) return false;
+                const value_expected = expected_kind.map.value;
+                var adopted_any = false;
+                for (entries) |entry| {
+                    if (self.adoptNumericLiteralType(@constCast(entry.value), value_expected)) adopted_any = true;
+                }
+                if (adopted_any) expr.type_id = expected_type;
+                return adopted_any;
+            },
+            else => return false,
         }
     }
 
