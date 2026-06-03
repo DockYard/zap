@@ -155,6 +155,42 @@ negative-into-unsigned, e173303-consistent). Float literal fits any float type
 (value-domain). Overflow → a clear in-band Zap diagnostic at the literal's span,
 naming the value and the target type.
 
+## Final implemented position set (post gap-analysis)
+
+All verified via `script_fixtures/run_literal_adoption_acceptance.sh` (19
+positive + 3 negative checks) and runtime probes:
+
+| Position | Example | Layer(s) touched |
+|---|---|---|
+| Function argument (int) | `P.takes_u8(5)` | type-check + HIR |
+| Function argument (float) | `P.takes_f32(3.5)` | type-check + HIR + IR float context |
+| Nested-call argument | `P.takes_u8(P.id_u8(5))` | type-check + HIR |
+| List element (incl. nested) | `L.count([5, 9, 200])`, `[[5],[200]]` | type-check + HIR (recursive) |
+| Tuple element | `take({5, 200})` | type-check + HIR |
+| Map value AND key | `M.take(%{5 => 9})` | type-check + HIR |
+| `if`/`case`/`block` in arg | `take(if c {5} else {9})` | type-check + HIR (arm recursion) |
+| Return (int + float) | `fn f() -> u8 {5}`, `-> f32 {2.5}` | type-check + HIR tail + IR/ZIR float |
+| `if`/`case` return (int + float) | `-> f32 { if c {1.5} else {2.5} }` | type-check + HIR tail + IR/ZIR float |
+| Negated literal → signed | `takes_i8(-5)`, `[-5,100,-128]` | type-check + HIR (outer-only restamp) |
+| Struct field default / init | `port :: u16 = 8080`, `%Box{v:5}` | type-check + HIR (range-checked) |
+
+Negative anchors (still error, verified): out-of-range literal (overflow
+diagnostic), typed binding into narrower param (`n = 5; takes_u8(n)`),
+negative literal into unsigned (`takes_u8(-5)`), float literal into int param
+(`takes_u8(3.5)`), int literal into String. Overload selection is byte-
+identical for all existing code (`callMatchCost`/`wideningCost` untouched).
+
+### Two unification refactors landed during gap analysis
+* The int-only `acceptsIntegerLiteralForExpectedType` /
+  `exprTailIntegerLiteralCanSatisfyExpectedType` now delegate to the single
+  float-aware, range-checked, control-flow-recursive `classifyArgLiteralAdoption`
+  (the redundant tail-recursion helpers were removed). One predicate now governs
+  every type-check position.
+* The IR `float_lit` lowering gained `expectedConcreteFloatType` (the analog of
+  `expectedConcreteIntegerType`) and the ZIR `const_float` handler gained the
+  case-result `f64` fallback the `const_int` handler already had — closing the
+  `comptime_float` control-flow gap symmetrically with int.
+
 ## Risk + checkpoint
 
 The delicate surface is the shared overload-cost path. The design keeps
