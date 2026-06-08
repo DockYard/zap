@@ -576,7 +576,7 @@ fn(input_value :: i64) {
 
 ### Closure Capture And Ownership
 
-The compiler infers ownership (`shared`, `unique`, `borrowed`) automatically based on types and escape analysis. You do not annotate ownership in Zap source code.
+The compiler infers ownership (`shared`, `unique`, `borrowed`) automatically based on types and escape analysis. Idiomatic Zap does not annotate ownership — the entire stdlib and test corpus omit it. (The qualifiers *do* exist as an optional, enforced override on parameter and function-type slots, e.g. `fn f(x :: borrowed String)`; this is just not how you normally write Zap. See [`ownership-model.md`](ownership-model.md) for the full, verified picture.)
 
 If a closure captures a value that the compiler determines is borrowed, it cannot escape the enclosing scope. The compiler enforces this — you do not need to think about it when writing Zap code.
 
