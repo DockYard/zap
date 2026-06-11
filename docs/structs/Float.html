@@ -48,6 +48,8 @@
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
 <ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
 <li><a href="../structs/Atom.html">Atom</a></li>
 <li><a href="../structs/Bool.html">Bool</a></li>
 <li><a href="../structs/Enum.html">Enum</a></li>
@@ -55,25 +57,43 @@
 <li class="active"><a href="../structs/Float.html">Float</a></li>
 <li><a href="../structs/Function.html">Function</a></li>
 <li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
 <li><a href="../structs/Integer.html">Integer</a></li>
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
 <li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
 <li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
@@ -82,10 +102,13 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
 <ul>
 <li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
 <li><a href="../structs/Comparator.html">Comparator</a></li>
 <li><a href="../structs/Concatenable.html">Concatenable</a></li>
 <li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
 <li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
 <li><a href="../structs/Stringable.html">Stringable</a></li>
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
@@ -94,6 +117,8 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
 <ul>
 <li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
 </ul>
 </div>
 <div class="sidebar-group" data-group="Guides">
@@ -178,7 +203,7 @@ C's `printf(&quot;%.&lt;n&gt;f&quot;, value)` rounding semantics.</td></tr>
 <div class="function-doc">
 <p>Converts a floating-point number to its string representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L33">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L35">Source</a>
 </div>
 <div class="function-detail" id="to_string-2">
 <div class="function-header">
@@ -194,7 +219,7 @@ C's <code>printf(&quot;%.&lt;n&gt;f&quot;, value)</code> rounding semantics. Use
 numeric output that needs to be byte-identical against
 reference implementations in other languages.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L46">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L48">Source</a>
 </div>
 <div class="function-detail" id="abs-1">
 <div class="function-header">
@@ -211,7 +236,7 @@ reference implementations in other languages.</p>
 <div class="function-doc">
 <p>Returns the absolute value of a float.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L52">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L56">Source</a>
 </div>
 <div class="function-detail" id="max-2">
 <div class="function-header">
@@ -228,7 +253,7 @@ reference implementations in other languages.</p>
 <div class="function-doc">
 <p>Returns the larger of two floats.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L60">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L66">Source</a>
 </div>
 <div class="function-detail" id="min-2">
 <div class="function-header">
@@ -245,7 +270,7 @@ reference implementations in other languages.</p>
 <div class="function-doc">
 <p>Returns the smaller of two floats.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L68">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L76">Source</a>
 </div>
 <div class="function-detail" id="parse-1">
 <div class="function-header">
@@ -259,7 +284,7 @@ reference implementations in other languages.</p>
 <p>Parses a string into a float. Returns 0.0 if the string is not
 a valid float representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L79">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L87">Source</a>
 </div>
 <div class="function-detail" id="round-1">
 <div class="function-header">
@@ -276,7 +301,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Rounds a float to the nearest integer value, returned as a float.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L85">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L95">Source</a>
 </div>
 <div class="function-detail" id="floor-1">
 <div class="function-header">
@@ -293,7 +318,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Returns the largest integer value less than or equal to the given float.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L93">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L105">Source</a>
 </div>
 <div class="function-detail" id="ceil-1">
 <div class="function-header">
@@ -310,7 +335,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Returns the smallest integer value greater than or equal to the given float.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L101">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L115">Source</a>
 </div>
 <div class="function-detail" id="truncate-1">
 <div class="function-header">
@@ -327,7 +352,7 @@ a valid float representation.</p>
 <div class="function-doc">
 <p>Truncates a float toward zero, removing the fractional part.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L109">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L125">Source</a>
 </div>
 <div class="function-detail" id="to_integer-1">
 <div class="function-header">
@@ -352,7 +377,7 @@ rounding mode:</p>
 Float.ceil(<span class="hl-number">0.2</span>)  <span class="hl-op">|&gt;</span> Float.to_integer()    <span class="hl-comment"># =&gt; 1</span>
 Float.round(<span class="hl-number">0.5</span>) <span class="hl-op">|&gt;</span> Float.to_integer()    <span class="hl-comment"># =&gt; 1</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L128">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L144">Source</a>
 </div>
 <div class="function-detail" id="clamp-3">
 <div class="function-header">
@@ -369,7 +394,7 @@ Float.round(<span class="hl-number">0.5</span>) <span class="hl-op">|&gt;</span>
 <div class="function-doc">
 <p>Clamps a float to be within the given range.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L136">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/float.zap#L154">Source</a>
 </div>
 </main>
 <aside class="toc">

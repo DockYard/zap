@@ -2734,6 +2734,20 @@ pub const Parser = struct {
     fn parseCompareExpr(self: *Parser) !*const ast.Expr {
         var left = try self.parsePipeExpr();
 
+        if (self.check(.keyword_not) and self.peekNext() == .keyword_in) {
+            _ = self.advance();
+            _ = self.advance();
+            const right = try self.parsePipeExpr();
+            return self.create(ast.Expr, .{
+                .binary_op = .{
+                    .meta = .{ .span = ast.SourceSpan.merge(left.getMeta().span, right.getMeta().span) },
+                    .op = .not_in_op,
+                    .lhs = left,
+                    .rhs = right,
+                },
+            });
+        }
+
         const op: ?ast.BinaryOp.Op = switch (self.peek()) {
             .equal_equal => .equal,
             .not_equal => .not_equal,
@@ -9139,7 +9153,6 @@ test "parse union variant Some() with no payload rejects with a clear error" {
     };
     return error.TestExpectedParseError;
 }
-
 
 // ============================================================
 // Phase 1.2 — `pub error` declaration form

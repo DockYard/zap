@@ -48,6 +48,8 @@
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
 <ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
 <li><a href="../structs/Atom.html">Atom</a></li>
 <li><a href="../structs/Bool.html">Bool</a></li>
 <li><a href="../structs/Enum.html">Enum</a></li>
@@ -55,25 +57,43 @@
 <li><a href="../structs/Float.html">Float</a></li>
 <li><a href="../structs/Function.html">Function</a></li>
 <li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
 <li><a href="../structs/Integer.html">Integer</a></li>
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
 <li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
 <li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li class="active"><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
@@ -82,10 +102,13 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
 <ul>
 <li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
 <li><a href="../structs/Comparator.html">Comparator</a></li>
 <li><a href="../structs/Concatenable.html">Concatenable</a></li>
 <li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
 <li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
 <li><a href="../structs/Stringable.html">Stringable</a></li>
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
@@ -94,6 +117,8 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
 <ul>
 <li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
 </ul>
 </div>
 <div class="sidebar-group" data-group="Guides">
@@ -119,16 +144,17 @@
 <p>Discovers and runs Zest test structs.</p>
 <p><code>use Zest.Runner</code> expands into a test runner <code>main/1</code> that discovers
 Zap source files from configured glob patterns, reflects their structs,
-invokes each discovered struct's <code>run/0</code>, and then prints the summary.</p>
+runs the discovered Zest cases in seeded order, and then prints the
+summary.</p>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
-<tr><td class="summary-name"><a href="#configure-0">configure/0</a></td><td class="summary-doc">Parses `--seed` and `--timeout` from CLI arguments and applies
-them to the test tracker.</td></tr>
+<tr><td class="summary-name"><a href="#configure-0">configure/0</a></td><td class="summary-doc">Parses Zest runtime options from CLI arguments and applies them
+to the test tracker.</td></tr>
 <tr><td class="summary-name"><a href="#run-0">run/0</a></td><td class="summary-doc">Prints the test summary with counts and exits with a
 failure code if any tests failed.</td></tr>
-<tr><td class="summary-name"><a href="#parse_cli_args-2">parse_cli_args/2</a></td><td class="summary-doc">Recursively scans CLI arguments for `--seed &lt;value&gt;` and
-`--timeout &lt;milliseconds&gt;`, applying each to the test tracker.</td></tr>
+<tr><td class="summary-name"><a href="#parse_cli_args-2">parse_cli_args/2</a></td><td class="summary-doc">Recursively scans CLI arguments for Zest runtime options and applies
+each to the test tracker.</td></tr>
 </table>
 <h2 id="macros">Macros</h2>
 <table class="summary">
@@ -144,17 +170,20 @@ failure code if any tests failed.</td></tr>
 </div>
 <div class="signature"><code><span class="sig-name">configure</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Atom</span></code></div>
 <div class="function-doc">
-<p>Parses <code>--seed</code> and <code>--timeout</code> from CLI arguments and applies
-them to the test tracker. If <code>--seed &lt;integer&gt;</code> is present,
-sets the seed explicitly for reproducible ordering. Otherwise
-the tracker generates a seed from the system clock.</p>
+<p>Parses Zest runtime options from CLI arguments and applies them
+to the test tracker. If <code>--seed &lt;integer&gt;</code> is present, sets the
+seed explicitly for reproducible ordering. Otherwise the tracker
+generates a seed from the system clock.</p>
 <p>If <code>--timeout &lt;milliseconds&gt;</code> is present, sets a per-test
 timeout. Tests exceeding the timeout are marked as failed
 with a yellow &quot;T&quot; indicator.</p>
+<p>If <code>--timings</code> is present, the summary prints every test case
+duration in execution order. If <code>--slowest &lt;count&gt;</code> is present,
+the summary prints the slowest <code>count</code> test cases.</p>
 <p>Call this before running any tests to ensure the seed and
-timeout are set.</p>
+reporting options are set.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/runner.zap#L87">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/runner.zap#L125">Source</a>
 </div>
 <div class="function-detail" id="run-0">
 <div class="function-header">
@@ -179,7 +208,7 @@ code <code>1</code>.</p>
   Zest.Runner.run()
 }</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/runner.zap#L109">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/runner.zap#L148">Source</a>
 </div>
 <div class="function-detail" id="parse_cli_args-2">
 <div class="function-header">
@@ -190,10 +219,10 @@ code <code>1</code>.</p>
 </div>
 <div class="signature"><code><span class="sig-name">parse_cli_args</span><span class="sig-paren">(</span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Atom</span></code></div>
 <div class="function-doc">
-<p>Recursively scans CLI arguments for <code>--seed &lt;value&gt;</code> and
-<code>--timeout &lt;milliseconds&gt;</code>, applying each to the test tracker.</p>
+<p>Recursively scans CLI arguments for Zest runtime options and applies
+each to the test tracker.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/runner.zap#L119">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/runner.zap#L162">Source</a>
 </div>
 <h2>Macro Details</h2>
 <div class="function-detail" id="options-1">
@@ -209,7 +238,7 @@ code <code>1</code>.</p>
 <p><code>nil</code> and <code>[]</code> become an empty list, an existing option list is returned
 as-is, and a single non-list option is wrapped in a one-element list.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/runner.zap#L57">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/runner.zap#L91">Source</a>
 </div>
 </main>
 <aside class="toc">

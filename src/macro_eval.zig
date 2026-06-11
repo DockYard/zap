@@ -553,6 +553,55 @@ pub fn eval(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 return CtValue{ .tuple = .{ .alloc_id = id, .elems = elems } };
             }
 
+            // type_tuple(type_expr, arity) — construct a tuple TypeExpr CtValue
+            // containing `arity` copies of `type_expr`.
+            if (std.mem.eql(u8, form_name, "type_tuple")) {
+                if (arg_elems.len != 2) return .nil;
+                const lane_type = try eval(env, arg_elems[0]);
+                const lane_count_raw = unwrapAstLiteral(try eval(env, arg_elems[1]));
+                if (lane_count_raw != .int or lane_count_raw.int < 0) return .nil;
+                const lane_count: usize = @intCast(lane_count_raw.int);
+
+                const elems = try env.alloc.alloc(CtValue, lane_count);
+                for (elems) |*elem| {
+                    elem.* = lane_type;
+                }
+
+                const empty = ast_data.emptyList(env.alloc, env.store) catch return .nil;
+                const args_list = ast_data.makeListFromSlice(env.alloc, env.store, elems) catch return .nil;
+                return ast_data.makeTuple3(env.alloc, env.store, .{ .atom = "tuple" }, empty, args_list) catch return .nil;
+            }
+
+            // type_name(type_expr) — return the dotted textual name for a
+            // simple type expression. Used by macros that need to dispatch to
+            // a typed runtime bridge while still accepting Type-shaped input.
+            if (std.mem.eql(u8, form_name, "type_name")) {
+                if (arg_elems.len != 1) return CtValue{ .string = "" };
+                const type_expr = try eval(env, arg_elems[0]);
+                if (extractStructRefName(env.alloc, type_expr) catch null) |name| {
+                    return CtValue{ .string = name };
+                }
+                if (env.struct_ctx) |ctx| {
+                    const ast_type_expr = ast_data.ctValueToTypeExpr(env.alloc, ctx.interner, type_expr) catch return CtValue{ .string = "" };
+                    var buffer = signature.Buffer.init(env.alloc);
+                    appendReflectionTypeExpr(&buffer, ast_type_expr, ctx.interner, ctx.graph);
+                    return CtValue{ .string = buffer.toSlice() };
+                }
+                return CtValue{ .string = "" };
+            }
+
+            // type_annotate(expr, type_expr) — construct `expr :: type_expr`
+            // as AST data for macros that need to carry a computed TypeExpr
+            // through quote/unquote.
+            if (std.mem.eql(u8, form_name, "type_annotate")) {
+                if (arg_elems.len != 2) return .nil;
+                const value_expr = try eval(env, arg_elems[0]);
+                const type_expr = try eval(env, arg_elems[1]);
+                const empty = ast_data.emptyList(env.alloc, env.store) catch return .nil;
+                const args_list = ast_data.makeList(env.alloc, env.store, &.{ value_expr, type_expr }) catch return .nil;
+                return ast_data.makeTuple3(env.alloc, env.store, .{ .atom = "::" }, empty, args_list) catch return .nil;
+            }
+
             // %{key => value, ...} — construct a map at compile time.
             // The parser encodes a map literal as `{:%{}, meta, [pair, ...]}`
             // where each pair is `{key_form, value_form}`. Evaluating each
@@ -882,6 +931,28 @@ fn evalBinop(env: *Env, op: []const u8, lhs_raw: CtValue, rhs_raw: CtValue) Macr
         if (std.mem.eql(u8, op, "||")) return CtValue{ .bool_val = lhs.bool_val or rhs.bool_val };
     }
 
+    // Membership over compile-time list literals. Runtime `in`
+    // desugars through the Membership protocol; macro bodies need the
+    // same operator to fold when both operands are already compile-time
+    // values, e.g. `if lanes in [2, 3, 4, 8, 16] { ... }`.
+    if (std.mem.eql(u8, op, "in") and rhs_raw == .list) {
+        for (rhs_raw.list.elems) |candidate_raw| {
+            if (lhs.eql(unwrapAstLiteral(candidate_raw))) {
+                return CtValue{ .bool_val = true };
+            }
+        }
+        return CtValue{ .bool_val = false };
+    }
+
+    if (std.mem.eql(u8, op, "not in") and rhs_raw == .list) {
+        for (rhs_raw.list.elems) |candidate_raw| {
+            if (lhs.eql(unwrapAstLiteral(candidate_raw))) {
+                return CtValue{ .bool_val = false };
+            }
+        }
+        return CtValue{ .bool_val = true };
+    }
+
     // String concat
     if (lhs == .string and rhs == .string) {
         if (std.mem.eql(u8, op, "<>")) {
@@ -1090,6 +1161,30 @@ test "eval: quote with multi-stmt body wraps result in __block__" {
     try std.testing.expectEqualStrings("__block__", result.tuple.elems[0].atom);
     try std.testing.expect(result.tuple.elems[2] == .list);
     try std.testing.expectEqual(@as(usize, 2), result.tuple.elems[2].list.elems.len);
+}
+
+test "eval: in operator checks compile-time list membership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var store = AllocationStore{};
+    var env = Env.init(alloc, &store);
+    defer env.deinit();
+
+    const empty = try ast_data.emptyList(alloc, &store);
+    const two = try ast_data.makeTuple3(alloc, &store, .{ .int = 2 }, empty, .nil);
+    const three = try ast_data.makeTuple3(alloc, &store, .{ .int = 3 }, empty, .nil);
+    const four = try ast_data.makeTuple3(alloc, &store, .{ .int = 4 }, empty, .nil);
+    const five = try ast_data.makeTuple3(alloc, &store, .{ .int = 5 }, empty, .nil);
+    const members = try ast_data.makeList(alloc, &store, &.{ two, three, four });
+
+    const hit = try evalBinop(&env, "in", four, members);
+    const miss = try evalBinop(&env, "in", five, members);
+
+    try std.testing.expect(hit == .bool_val);
+    try std.testing.expect(hit.bool_val);
+    try std.testing.expect(miss == .bool_val);
+    try std.testing.expect(!miss.bool_val);
 }
 
 // ============================================================

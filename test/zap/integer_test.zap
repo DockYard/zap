@@ -297,5 +297,65 @@ pub struct Zap.IntegerTest {
     test("lcm same") {
       assert(Integer.lcm(7, 7) == 7)
     }
+
+    test("helper overloads preserve exact signed and unsigned widths") {
+      assert(accept_i32(Integer.abs(-7 :: i32)) == "i32")
+      assert(accept_u32(Integer.abs(7 :: u32)) == "u32")
+      assert(accept_i128((1 :: i128) + (2 :: i128)) == "i128")
+      assert(accept_u128((2 :: u128) * (3 :: u128)) == "u128")
+      assert(accept_u128(Integer.max(3 :: u128, 2 :: u128)) == "u128")
+      assert(accept_i128(Integer.byte_swap(1 :: i128)) == "i128")
+      assert(accept_u128(Integer.bit_reverse(1 :: u128)) == "u128")
+    }
+
+    test("i128 and u128 helpers return correct values") {
+      assert(Integer.to_string((9 :: i128) / (2 :: i128)) == "4")
+      assert(Integer.to_string((9 :: u128) rem (4 :: u128)) == "1")
+      assert(Integer.to_string(Integer.abs(-7 :: i128)) == "7")
+      assert(Integer.to_string(Integer.min(3 :: i128, 2 :: i128)) == "2")
+      assert(Integer.to_string(Integer.clamp(9 :: u128, 2 :: u128, 7 :: u128)) == "7")
+      assert(Integer.to_string(Integer.pow(2 :: u128, 4 :: u128)) == "16")
+      assert(Integer.digits(-12345 :: i128) == 5)
+      assert(Integer.digits(12345 :: u128) == 5)
+      assert(accept_f64(Integer.to_float(42 :: u128)) == "f64")
+      assert(Integer.count_leading_zeros(1 :: u128) == 127)
+      assert(Integer.count_trailing_zeros(8 :: i128) == 3)
+      assert(Integer.popcount(7 :: u128) == 3)
+      assert(Integer.add_sat(1 :: i128, 2 :: i128) == (3 :: i128))
+      assert(Integer.sub_sat(0 :: u128, 1 :: u128) == (0 :: u128))
+      assert(Integer.mul_sat(2 :: i128, 3 :: i128) == (6 :: i128))
+      assert(Integer.band(6 :: u128, 3 :: u128) == (2 :: u128))
+      assert(Integer.bor(6 :: i128, 3 :: i128) == (7 :: i128))
+      assert(Integer.bxor(6 :: u128, 3 :: u128) == (5 :: u128))
+      assert(Integer.bsl(1 :: u128, 3 :: u128) == (8 :: u128))
+      assert(Integer.to_string(Integer.bsl(1 :: u128, 100 :: u128)) == "1267650600228229401496703205376")
+      assert(Integer.bsr(8 :: i128, 3 :: i128) == (1 :: i128))
+      assert(Integer.sign(-7 :: i128) == -1)
+      assert(Integer.sign(7 :: u128) == 1)
+      assert(Integer.even?(8 :: u128))
+      assert(Integer.odd?(7 :: i128))
+      assert(Integer.gcd(48 :: i128, 18 :: i128) == (6 :: i128))
+      assert(Integer.lcm(4 :: u128, 6 :: u128) == (12 :: u128))
+    }
+  }
+
+  fn accept_i32(value :: i32) -> String {
+    "i32"
+  }
+
+  fn accept_u32(value :: u32) -> String {
+    "u32"
+  }
+
+  fn accept_i128(value :: i128) -> String {
+    "i128"
+  }
+
+  fn accept_u128(value :: u128) -> String {
+    "u128"
+  }
+
+  fn accept_f64(value :: f64) -> String {
+    "f64"
   }
 }

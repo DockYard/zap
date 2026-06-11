@@ -11233,6 +11233,337 @@ pub const Tuple = struct {
     }
 };
 
+pub const Simd = struct {
+    fn tupleLen(comptime TupleType: type) comptime_int {
+        return switch (@typeInfo(TupleType)) {
+            .@"struct" => |info| blk: {
+                if (!info.is_tuple) @compileError("Simd expects a tuple value");
+                if (info.fields.len == 0) @compileError("Simd expects at least one lane");
+                break :blk info.fields.len;
+            },
+            else => @compileError("Simd expects a tuple value"),
+        };
+    }
+
+    fn tupleElem(comptime TupleType: type) type {
+        const info = switch (@typeInfo(TupleType)) {
+            .@"struct" => |struct_info| struct_info,
+            else => @compileError("Simd expects a tuple value"),
+        };
+        if (!info.is_tuple) @compileError("Simd expects a tuple value");
+        if (info.fields.len == 0) @compileError("Simd expects at least one lane");
+
+        const Elem = info.fields[0].type;
+        inline for (info.fields[1..]) |field| {
+            if (field.type != Elem) @compileError("Simd expects homogeneous tuple lanes");
+        }
+        return Elem;
+    }
+
+    fn requireNumericLane(comptime Elem: type) void {
+        switch (@typeInfo(Elem)) {
+            .int, .float => {},
+            else => @compileError("Simd numeric operations require integer or float lanes"),
+        }
+    }
+
+    fn requireBoolLane(comptime Elem: type) void {
+        if (Elem != bool) @compileError("Simd masks require Bool lanes");
+    }
+
+    fn TupleOf(comptime len: comptime_int, comptime Elem: type) type {
+        var field_types: [len]type = undefined;
+        inline for (&field_types) |*field_type| {
+            field_type.* = Elem;
+        }
+        return std.meta.Tuple(&field_types);
+    }
+
+    fn vectorLen(comptime VectorType: type) comptime_int {
+        return switch (@typeInfo(VectorType)) {
+            .vector => |info| info.len,
+            else => @compileError("Simd expected a Zig vector"),
+        };
+    }
+
+    fn vectorElem(comptime VectorType: type) type {
+        return switch (@typeInfo(VectorType)) {
+            .vector => |info| info.child,
+            else => @compileError("Simd expected a Zig vector"),
+        };
+    }
+
+    fn tupleToVector(value: anytype) @Vector(tupleLen(@TypeOf(value)), tupleElem(@TypeOf(value))) {
+        const TupleType = @TypeOf(value);
+        const len = comptime tupleLen(TupleType);
+        const Elem = tupleElem(TupleType);
+        requireNumericLane(Elem);
+
+        var array: [len]Elem = undefined;
+        inline for (0..len) |index| {
+            array[index] = value[index];
+        }
+        return array;
+    }
+
+    fn tupleToBoolVector(value: anytype) @Vector(tupleLen(@TypeOf(value)), bool) {
+        const TupleType = @TypeOf(value);
+        const len = comptime tupleLen(TupleType);
+        const Elem = tupleElem(TupleType);
+        requireBoolLane(Elem);
+
+        var array: [len]bool = undefined;
+        inline for (0..len) |index| {
+            array[index] = value[index];
+        }
+        return array;
+    }
+
+    fn tupleToShuffleMask(comptime mask: anytype) @Vector(tupleLen(@TypeOf(mask)), i32) {
+        const MaskType = @TypeOf(mask);
+        const len = comptime tupleLen(MaskType);
+        const Elem = tupleElem(MaskType);
+        if (Elem != i32) @compileError("Simd.shuffle expects an i32 mask tuple");
+
+        var array: [len]i32 = undefined;
+        inline for (0..len) |index| {
+            array[index] = mask[index];
+        }
+        return array;
+    }
+
+    fn vectorToTuple(vector_value: anytype) TupleOf(vectorLen(@TypeOf(vector_value)), vectorElem(@TypeOf(vector_value))) {
+        const VectorType = @TypeOf(vector_value);
+        const vector_info = switch (@typeInfo(VectorType)) {
+            .vector => |info| info,
+            else => @compileError("Simd expected a Zig vector"),
+        };
+        const len = vector_info.len;
+        const Elem = vector_info.child;
+        const array: [len]Elem = vector_value;
+
+        var result: TupleOf(len, Elem) = undefined;
+        inline for (0..len) |index| {
+            result[index] = array[index];
+        }
+        return result;
+    }
+
+    pub fn vector(value: anytype) TupleOf(tupleLen(@TypeOf(value)), tupleElem(@TypeOf(value))) {
+        const vector_value = tupleToVector(value);
+        return vectorToTuple(vector_value);
+    }
+
+    pub fn splat(comptime len: comptime_int, scalar: anytype) TupleOf(len, @TypeOf(scalar)) {
+        const Elem = @TypeOf(scalar);
+        requireNumericLane(Elem);
+        const vector_value: @Vector(len, Elem) = @splat(scalar);
+        return vectorToTuple(vector_value);
+    }
+
+    fn splatTyped(comptime len: comptime_int, comptime Elem: type, scalar: Elem) TupleOf(len, Elem) {
+        requireNumericLane(Elem);
+        const vector_value: @Vector(len, Elem) = @splat(scalar);
+        return vectorToTuple(vector_value);
+    }
+
+    pub fn splat_i8(comptime len: comptime_int, scalar: i8) TupleOf(len, i8) {
+        return splatTyped(len, i8, scalar);
+    }
+
+    pub fn splat_i16(comptime len: comptime_int, scalar: i16) TupleOf(len, i16) {
+        return splatTyped(len, i16, scalar);
+    }
+
+    pub fn splat_i32(comptime len: comptime_int, scalar: i32) TupleOf(len, i32) {
+        return splatTyped(len, i32, scalar);
+    }
+
+    pub fn splat_i64(comptime len: comptime_int, scalar: i64) TupleOf(len, i64) {
+        return splatTyped(len, i64, scalar);
+    }
+
+    pub fn splat_i128(comptime len: comptime_int, scalar: i128) TupleOf(len, i128) {
+        return splatTyped(len, i128, scalar);
+    }
+
+    pub fn splat_u8(comptime len: comptime_int, scalar: u8) TupleOf(len, u8) {
+        return splatTyped(len, u8, scalar);
+    }
+
+    pub fn splat_u16(comptime len: comptime_int, scalar: u16) TupleOf(len, u16) {
+        return splatTyped(len, u16, scalar);
+    }
+
+    pub fn splat_u32(comptime len: comptime_int, scalar: u32) TupleOf(len, u32) {
+        return splatTyped(len, u32, scalar);
+    }
+
+    pub fn splat_u64(comptime len: comptime_int, scalar: u64) TupleOf(len, u64) {
+        return splatTyped(len, u64, scalar);
+    }
+
+    pub fn splat_u128(comptime len: comptime_int, scalar: u128) TupleOf(len, u128) {
+        return splatTyped(len, u128, scalar);
+    }
+
+    pub fn splat_usize(comptime len: comptime_int, scalar: usize) TupleOf(len, usize) {
+        return splatTyped(len, usize, scalar);
+    }
+
+    pub fn splat_isize(comptime len: comptime_int, scalar: isize) TupleOf(len, isize) {
+        return splatTyped(len, isize, scalar);
+    }
+
+    pub fn splat_f16(comptime len: comptime_int, scalar: f16) TupleOf(len, f16) {
+        return splatTyped(len, f16, scalar);
+    }
+
+    pub fn splat_f32(comptime len: comptime_int, scalar: f32) TupleOf(len, f32) {
+        return splatTyped(len, f32, scalar);
+    }
+
+    pub fn splat_f64(comptime len: comptime_int, scalar: f64) TupleOf(len, f64) {
+        return splatTyped(len, f64, scalar);
+    }
+
+    pub fn splat2(scalar: anytype) TupleOf(2, @TypeOf(scalar)) {
+        return splat(2, scalar);
+    }
+
+    pub fn splat3(scalar: anytype) TupleOf(3, @TypeOf(scalar)) {
+        return splat(3, scalar);
+    }
+
+    pub fn splat4(scalar: anytype) TupleOf(4, @TypeOf(scalar)) {
+        return splat(4, scalar);
+    }
+
+    pub fn splat8(scalar: anytype) TupleOf(8, @TypeOf(scalar)) {
+        return splat(8, scalar);
+    }
+
+    pub fn splat16(scalar: anytype) TupleOf(16, @TypeOf(scalar)) {
+        return splat(16, scalar);
+    }
+
+    pub fn add(left: anytype, right: @TypeOf(left)) @TypeOf(left) {
+        const result = tupleToVector(left) + tupleToVector(right);
+        return vectorToTuple(result);
+    }
+
+    pub fn sub(left: anytype, right: @TypeOf(left)) @TypeOf(left) {
+        const result = tupleToVector(left) - tupleToVector(right);
+        return vectorToTuple(result);
+    }
+
+    pub fn mul(left: anytype, right: @TypeOf(left)) @TypeOf(left) {
+        const result = tupleToVector(left) * tupleToVector(right);
+        return vectorToTuple(result);
+    }
+
+    pub fn eq(left: anytype, right: @TypeOf(left)) TupleOf(tupleLen(@TypeOf(left)), bool) {
+        const result = tupleToVector(left) == tupleToVector(right);
+        return vectorToTuple(result);
+    }
+
+    pub fn ne(left: anytype, right: @TypeOf(left)) TupleOf(tupleLen(@TypeOf(left)), bool) {
+        const result = tupleToVector(left) != tupleToVector(right);
+        return vectorToTuple(result);
+    }
+
+    pub fn lt(left: anytype, right: @TypeOf(left)) TupleOf(tupleLen(@TypeOf(left)), bool) {
+        const result = tupleToVector(left) < tupleToVector(right);
+        return vectorToTuple(result);
+    }
+
+    pub fn lte(left: anytype, right: @TypeOf(left)) TupleOf(tupleLen(@TypeOf(left)), bool) {
+        const result = tupleToVector(left) <= tupleToVector(right);
+        return vectorToTuple(result);
+    }
+
+    pub fn gt(left: anytype, right: @TypeOf(left)) TupleOf(tupleLen(@TypeOf(left)), bool) {
+        const result = tupleToVector(left) > tupleToVector(right);
+        return vectorToTuple(result);
+    }
+
+    pub fn gte(left: anytype, right: @TypeOf(left)) TupleOf(tupleLen(@TypeOf(left)), bool) {
+        const result = tupleToVector(left) >= tupleToVector(right);
+        return vectorToTuple(result);
+    }
+
+    pub fn select(mask: anytype, when_true: anytype, when_false: @TypeOf(when_true)) @TypeOf(when_true) {
+        const ValueType = @TypeOf(when_true);
+        const value_len = comptime tupleLen(ValueType);
+        if (tupleLen(@TypeOf(mask)) != value_len) @compileError("Simd.select mask and value tuples must have the same lane count");
+
+        const Elem = tupleElem(ValueType);
+        const mask_vector = tupleToBoolVector(mask);
+        const true_vector = tupleToVector(when_true);
+        const false_vector = tupleToVector(when_false);
+        const result = @select(Elem, mask_vector, true_vector, false_vector);
+        return vectorToTuple(result);
+    }
+
+    pub fn reduce_add(value: anytype) tupleElem(@TypeOf(value)) {
+        return @reduce(.Add, tupleToVector(value));
+    }
+
+    pub fn reduce_min(value: anytype) tupleElem(@TypeOf(value)) {
+        return @reduce(.Min, tupleToVector(value));
+    }
+
+    pub fn reduce_max(value: anytype) tupleElem(@TypeOf(value)) {
+        return @reduce(.Max, tupleToVector(value));
+    }
+
+    pub fn shuffle(left: anytype, right: @TypeOf(left), comptime mask: anytype) TupleOf(tupleLen(@TypeOf(mask)), tupleElem(@TypeOf(left))) {
+        const Elem = tupleElem(@TypeOf(left));
+        const result = @shuffle(Elem, tupleToVector(left), tupleToVector(right), tupleToShuffleMask(mask));
+        return vectorToTuple(result);
+    }
+
+    pub fn unsupported_shape() noreturn {
+        @compileError("unsupported Simd lane count; supported lane counts are 2, 3, 4, 8, and 16");
+    }
+};
+
+test "Simd runtime helpers operate on tuple-backed Zig vectors" {
+    const I32x4 = std.meta.Tuple(&.{ i32, i32, i32, i32 });
+    const left: I32x4 = .{ 1, 2, 3, 4 };
+    const right: I32x4 = .{ 10, 20, 30, 40 };
+
+    const sum = Simd.add(left, right);
+    try std.testing.expectEqual(@as(i32, 11), sum[0]);
+    try std.testing.expectEqual(@as(i32, 22), sum[1]);
+    try std.testing.expectEqual(@as(i32, 33), sum[2]);
+    try std.testing.expectEqual(@as(i32, 44), sum[3]);
+
+    const threshold: I32x4 = .{ 20, 20, 20, 20 };
+    const mask = Simd.gt(sum, threshold);
+    const selected = Simd.select(mask, sum, Simd.splat(4, @as(i32, 0)));
+    try std.testing.expectEqual(@as(i32, 0), selected[0]);
+    try std.testing.expectEqual(@as(i32, 22), selected[1]);
+    try std.testing.expectEqual(@as(i32, 33), selected[2]);
+    try std.testing.expectEqual(@as(i32, 44), selected[3]);
+    try std.testing.expectEqual(@as(i32, 99), Simd.reduce_add(selected));
+}
+
+test "Simd runtime shuffle delegates to Zig @shuffle" {
+    const F32x4 = std.meta.Tuple(&.{ f32, f32, f32, f32 });
+    const I32x4 = std.meta.Tuple(&.{ i32, i32, i32, i32 });
+    const values: F32x4 = .{ 1.0, 2.0, 3.0, 4.0 };
+    const zeros = Simd.splat(4, @as(f32, 0.0));
+    const reversed = Simd.shuffle(values, zeros, @as(I32x4, .{ 3, 2, 1, 0 }));
+
+    try std.testing.expectEqual(@as(f32, 4.0), reversed[0]);
+    try std.testing.expectEqual(@as(f32, 3.0), reversed[1]);
+    try std.testing.expectEqual(@as(f32, 2.0), reversed[2]);
+    try std.testing.expectEqual(@as(f32, 1.0), reversed[3]);
+    try std.testing.expectEqual(@as(f32, 1.0), Simd.reduce_min(reversed));
+    try std.testing.expectEqual(@as(f32, 4.0), Simd.reduce_max(reversed));
+}
+
 pub const Kernel = struct {
     /// Generic string conversion used by string interpolation. Strings
     /// pass through untouched; numbers/bools/enums are formatted via the

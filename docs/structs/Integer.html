@@ -53,6 +53,8 @@
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
 <ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
 <li><a href="../structs/Atom.html">Atom</a></li>
 <li><a href="../structs/Bool.html">Bool</a></li>
 <li><a href="../structs/Enum.html">Enum</a></li>
@@ -60,25 +62,43 @@
 <li><a href="../structs/Float.html">Float</a></li>
 <li><a href="../structs/Function.html">Function</a></li>
 <li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
 <li class="active"><a href="../structs/Integer.html">Integer</a></li>
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
 <li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
 <li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
@@ -87,10 +107,13 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
 <ul>
 <li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
 <li><a href="../structs/Comparator.html">Comparator</a></li>
 <li><a href="../structs/Concatenable.html">Concatenable</a></li>
 <li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
 <li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
 <li><a href="../structs/Stringable.html">Stringable</a></li>
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
@@ -99,6 +122,8 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
 <ul>
 <li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
 </ul>
 </div>
 <div class="sidebar-group" data-group="Guides">
@@ -256,7 +281,7 @@ value is the original value.</p>
 <div class="function-doc">
 <p>Returns the larger of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L72">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L74">Source</a>
 </div>
 <div class="function-detail" id="min-2">
 <div class="function-header">
@@ -278,7 +303,7 @@ value is the original value.</p>
 <div class="function-doc">
 <p>Returns the smaller of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L85">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L89">Source</a>
 </div>
 <div class="function-detail" id="parse-1">
 <div class="function-header">
@@ -292,7 +317,7 @@ value is the original value.</p>
 <p>Parses a string into an integer. Returns 0 if the string is not
 a valid integer representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L101">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L105">Source</a>
 </div>
 <div class="function-detail" id="remainder-2">
 <div class="function-header">
@@ -314,7 +339,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Computes the remainder of integer division.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L107">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L113">Source</a>
 </div>
 <div class="function-detail" id="pow-2">
 <div class="function-header">
@@ -336,7 +361,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Raises <code>base</code> to the power of <code>exponent</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L120">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L128">Source</a>
 </div>
 <div class="function-detail" id="clamp-3">
 <div class="function-header">
@@ -358,7 +383,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Clamps a value to be within the given range.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L133">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L143">Source</a>
 </div>
 <div class="function-detail" id="digits-1">
 <div class="function-header">
@@ -380,7 +405,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of decimal digits in an integer.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L146">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L158">Source</a>
 </div>
 <div class="function-detail" id="to_float-1">
 <div class="function-header">
@@ -402,7 +427,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Converts an integer to a 64-bit floating-point number.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L159">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L173">Source</a>
 </div>
 <div class="function-detail" id="count_leading_zeros-1">
 <div class="function-header">
@@ -424,7 +449,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of leading zeros in the binary representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L172">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L188">Source</a>
 </div>
 <div class="function-detail" id="count_trailing_zeros-1">
 <div class="function-header">
@@ -446,7 +471,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of trailing zeros in the binary representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L185">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L203">Source</a>
 </div>
 <div class="function-detail" id="popcount-1">
 <div class="function-header">
@@ -468,7 +493,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the number of set bits in the binary representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L198">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L218">Source</a>
 </div>
 <div class="function-detail" id="byte_swap-1">
 <div class="function-header">
@@ -490,7 +515,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Reverses the byte order of an integer.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L211">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L233">Source</a>
 </div>
 <div class="function-detail" id="bit_reverse-1">
 <div class="function-header">
@@ -512,7 +537,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Reverses all bits in the binary representation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L224">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L248">Source</a>
 </div>
 <div class="function-detail" id="add_sat-2">
 <div class="function-header">
@@ -534,7 +559,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Adds two integers with saturation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L237">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L263">Source</a>
 </div>
 <div class="function-detail" id="sub_sat-2">
 <div class="function-header">
@@ -556,7 +581,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Subtracts two integers with saturation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L250">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L278">Source</a>
 </div>
 <div class="function-detail" id="mul_sat-2">
 <div class="function-header">
@@ -578,7 +603,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Multiplies two integers with saturation.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L263">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L293">Source</a>
 </div>
 <div class="function-detail" id="band-2">
 <div class="function-header">
@@ -600,7 +625,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise AND of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L276">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L308">Source</a>
 </div>
 <div class="function-detail" id="bor-2">
 <div class="function-header">
@@ -622,7 +647,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise OR of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L289">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L323">Source</a>
 </div>
 <div class="function-detail" id="bxor-2">
 <div class="function-header">
@@ -644,7 +669,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise XOR of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L302">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L338">Source</a>
 </div>
 <div class="function-detail" id="bnot-1">
 <div class="function-header">
@@ -666,7 +691,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise NOT of an integer.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L315">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L353">Source</a>
 </div>
 <div class="function-detail" id="bsl-2">
 <div class="function-header">
@@ -688,7 +713,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise shift left.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L328">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L368">Source</a>
 </div>
 <div class="function-detail" id="bsr-2">
 <div class="function-header">
@@ -710,7 +735,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Bitwise shift right.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L341">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L383">Source</a>
 </div>
 <div class="function-detail" id="sign-1">
 <div class="function-header">
@@ -732,7 +757,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns the sign of an integer.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L354">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L398">Source</a>
 </div>
 <div class="function-detail" id="even?-1">
 <div class="function-header">
@@ -754,7 +779,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns true if the integer is even.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L367">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L413">Source</a>
 </div>
 <div class="function-detail" id="odd?-1">
 <div class="function-header">
@@ -776,7 +801,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Returns true if the integer is odd.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L380">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L428">Source</a>
 </div>
 <div class="function-detail" id="gcd-2">
 <div class="function-header">
@@ -798,7 +823,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Computes the greatest common divisor of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L393">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L443">Source</a>
 </div>
 <div class="function-detail" id="lcm-2">
 <div class="function-header">
@@ -820,7 +845,7 @@ a valid integer representation.</p>
 <div class="function-doc">
 <p>Computes the least common multiple of two integers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L406">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/integer.zap#L458">Source</a>
 </div>
 </main>
 <aside class="toc">

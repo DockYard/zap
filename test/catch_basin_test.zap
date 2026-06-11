@@ -17,13 +17,28 @@ pub struct CatchBasinTest {
     test("another unmatched value goes to handler") {
       assert(try_parse("xyz") == "unmatched: xyz")
     }
+
+    test("handler pattern matches on unmatched value") {
+      assert(try_with_patterns("one") == "1")
+      assert(try_with_patterns("bad") == "got bad")
+      assert(try_with_patterns("xyz") == "unknown: xyz")
+    }
+
+    test("short-circuits multi-step pipes") {
+      assert(try_pipeline("good") == "formatted: valid")
+      assert(try_pipeline("bad") == "rejected: bad")
+    }
+
+    test("function handler receives unmatched value") {
+      assert(try_fn_handler("one") == "1")
+      assert(try_fn_handler("bad") == "error: bad")
+    }
+
+    test("function handler with extra args receives unmatched value") {
+      assert(try_fn_handler_extra("one") == "1")
+      assert(try_fn_handler_extra("nope") == "fallback: nope")
+    }
   }
-
-  # TODO: Additional catch basin patterns have multi-file compilation issues
-
-  # TODO: Function handler with extra args has a multi-file issue
-  # assert(try_fn_handler_extra("one") == "1")
-  # assert(try_fn_handler_extra("nope") == "fallback: nope")
 
   # Multi-clause function — only matches specific strings
   fn parse("one" :: String) -> String {

@@ -1,3 +1,19 @@
+pub union ResultTestPair(t, e) {
+  Ok :: t
+  Error :: e
+}
+
+pub union ResultTestTri(a, b, c) {
+  First :: a
+  Second :: b
+  Third :: c
+}
+
+pub union ResultTestTE(t, e) {
+  Ok :: t
+  Err :: e
+}
+
 pub struct ResultTest {
   use Zest.Case
 
@@ -55,6 +71,20 @@ pub struct ResultTest {
     test("Result.Error(reason) -> reason extracts the error payload") {
       assert(ResultHelper.error_reason(ResultHelper.err("boom")) == "boom")
     }
+
+    test("comptime-known dual-payload match extracts each active arm") {
+      assert(pair_from_ok() == 42)
+      assert(pair_from_error() == 7)
+    }
+
+    test("three payload arms dispatch to the active arm") {
+      assert(tri_second() == 99)
+    }
+
+    test("multi-arg parametric result destructures through runtime scrutinee") {
+      assert(unwrap_result_te(ResultTestTE(i64, String).Ok(42)) == 42)
+      assert(unwrap_result_te(ResultTestTE(i64, String).Err("bad")) == -1)
+    }
   }
 
   describe("Result — map/2") {
@@ -85,4 +115,35 @@ pub struct ResultTest {
     }
   }
 
+  fn pair_from_ok() -> i64 {
+    result = ResultTestPair(i64, i64).Ok(42)
+    case result {
+      ResultTestPair.Ok(value) -> value
+      ResultTestPair.Error(reason) -> reason
+    }
+  }
+
+  fn pair_from_error() -> i64 {
+    result = ResultTestPair(i64, i64).Error(7)
+    case result {
+      ResultTestPair.Ok(value) -> value
+      ResultTestPair.Error(reason) -> reason
+    }
+  }
+
+  fn tri_second() -> i64 {
+    result = ResultTestTri(i64, i64, i64).Second(99)
+    case result {
+      ResultTestTri.First(value) -> value
+      ResultTestTri.Second(value) -> value
+      ResultTestTri.Third(value) -> value
+    }
+  }
+
+  fn unwrap_result_te(result :: ResultTestTE(i64, String)) -> i64 {
+    case result {
+      ResultTestTE.Ok(value) -> value
+      ResultTestTE.Err(_) -> -1
+    }
+  }
 }

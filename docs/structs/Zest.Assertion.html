@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zest.Assertion — Zap</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search structs, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group" data-group="Structs">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
+<ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
+<li><a href="../structs/Atom.html">Atom</a></li>
+<li><a href="../structs/Bool.html">Bool</a></li>
+<li><a href="../structs/Enum.html">Enum</a></li>
+<li><a href="../structs/File.html">File</a></li>
+<li><a href="../structs/Float.html">Float</a></li>
+<li><a href="../structs/Function.html">Function</a></li>
+<li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
+<li><a href="../structs/Integer.html">Integer</a></li>
+<li><a href="../structs/Kernel.html">Kernel</a></li>
+<li><a href="../structs/List.html">List</a></li>
+<li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
+<li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
+<li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
+<li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
+<li><a href="../structs/Zest.html">Zest</a></li>
+<li class="active"><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Protocols">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
+<ul>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Unions">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Guides">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Guides</h4></button>
+<ul>
+<li><a href="../guides/enum.html">Enum</a></li>
+<li><a href="../guides/integer.html">Integer</a></li>
+<li><a href="../guides/io.html">Io</a></li>
+<li><a href="../guides/list.html">List</a></li>
+<li><a href="../guides/string.html">String</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<nav class="breadcrumb" aria-label="Breadcrumb">
+<span>Structs</span>
+<span>/</span>
+<span class="breadcrumb-current">Zest.Assertion</span>
+</nav>
+<h1 class="page-title">Zest.Assertion</h1>
+<p class="tagline">Assertion result helpers for Zest.</p>
+<div class="structdoc">
+<p>Assertion result helpers for Zest.</p>
+<p>The public functions receive structured assertion data from
+macro-expanded <code>assert</code> and <code>reject</code> calls, decide whether the
+assertion passed, and record either a pass or a rich rendered
+failure message with the runtime test tracker.</p>
+</div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#truthy_result-5">truthy_result/5</a></td><td class="summary-doc">Records the result of a truthy assertion or rejection.</td></tr>
+<tr><td class="summary-name"><a href="#truthy_result-6">truthy_result/6</a></td><td class="summary-doc">Records the result of a truthy assertion or rejection with a source location.</td></tr>
+<tr><td class="summary-name"><a href="#comparison_result-9">comparison_result/9</a></td><td class="summary-doc">Records the result of a comparison assertion or rejection.</td></tr>
+<tr><td class="summary-name"><a href="#comparison_result-10">comparison_result/10</a></td><td class="summary-doc">Records the result of a comparison assertion or rejection with a source location.</td></tr>
+<tr><td class="summary-name"><a href="#no_leaks_result-7">no_leaks_result/7</a></td><td class="summary-doc">Records the result of an `assert_no_leaks { &lt;block&gt; }` assertion.</td></tr>
+<tr><td class="summary-name"><a href="#would_report_leak?-1">would_report_leak?/1</a></td><td class="summary-doc">Pure decision: would an `assert_no_leaks` block with the given net live-
+allocation delta be reported as a leak? `true` for a positive delta (the
+block left allocations live), `false` otherwise.</td></tr>
+<tr><td class="summary-name"><a href="#expect_leak_result-7">expect_leak_result/7</a></td><td class="summary-doc">Records the result of an `@expect_leak`-inverted leak assertion.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="truthy_result-5">
+<div class="function-header">
+<h3>truthy_result<span class="arity">/5</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#truthy_result-5" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">truthy_result</span><span class="sig-paren">(</span>kind<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>code<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>result<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>custom_message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Records the result of a truthy assertion or rejection.</p>
+<p><code>kind</code> is <code>&quot;assert&quot;</code> or <code>&quot;reject&quot;</code>. <code>code</code> is the source text for
+the asserted expression when available. <code>value</code> is the already
+rendered value of the expression, and <code>result</code> is the boolean value
+used to decide pass/fail.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/assertion.zap#L20">Source</a>
+</div>
+<div class="function-detail" id="truthy_result-6">
+<div class="function-header">
+<h3>truthy_result<span class="arity">/6</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#truthy_result-6" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">truthy_result</span><span class="sig-paren">(</span>kind<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>code<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>result<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>custom_message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>location<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Records the result of a truthy assertion or rejection with a source location.</p>
+<p><code>location</code> is a <code>file:line</code> string captured at macro expansion time.
+It is included in the rendered failure report when available.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/assertion.zap#L31">Source</a>
+</div>
+<div class="function-detail" id="comparison_result-9">
+<div class="function-header">
+<h3>comparison_result<span class="arity">/9</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#comparison_result-9" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">comparison_result</span><span class="sig-paren">(</span>kind<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>operator<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>code<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>left_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>left_value<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>right_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>right_value<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>comparison_result<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>custom_message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Records the result of a comparison assertion or rejection.</p>
+<p><code>kind</code> is <code>&quot;assert&quot;</code> or <code>&quot;reject&quot;</code>. <code>operator</code>, <code>code</code>,
+<code>left_label</code>, <code>left_value</code>, <code>right_label</code>, and <code>right_value</code>
+describe the comparison. <code>comparison_result</code> is the boolean result
+of evaluating the comparison exactly once.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/assertion.zap#L56">Source</a>
+</div>
+<div class="function-detail" id="comparison_result-10">
+<div class="function-header">
+<h3>comparison_result<span class="arity">/10</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#comparison_result-10" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">comparison_result</span><span class="sig-paren">(</span>kind<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>operator<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>code<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>left_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>left_value<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>right_label<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>right_value<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>comparison_result<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>custom_message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>location<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Records the result of a comparison assertion or rejection with a source location.</p>
+<p><code>location</code> is a <code>file:line</code> string captured at macro expansion time.
+It is included in the rendered failure report when available.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/assertion.zap#L67">Source</a>
+</div>
+<div class="function-detail" id="no_leaks_result-7">
+<div class="function-header">
+<h3>no_leaks_result<span class="arity">/7</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#no_leaks_result-7" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">no_leaks_result</span><span class="sig-paren">(</span>tracking_active<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>before_count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>after_count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>before_bytes<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>after_bytes<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>code<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>location<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Records the result of an <code>assert_no_leaks { &lt;block&gt; }</code> assertion.</p>
+<p><code>before_count</code>/<code>after_count</code> are the live-allocation counts sampled by the
+macro immediately before and after the block; <code>before_bytes</code>/<code>after_bytes</code>
+are the matching byte totals. <code>tracking_active</code> is whether the active
+memory manager could answer the query at all.</p>
+<p>When <code>tracking_active</code> is <code>false</code> (the test target does not select
+<code>Memory.Tracking</code>), the assertion PASSES as a documented no-op — there is
+no live-set to checkpoint, so a leak is not observable here. Otherwise the
+net rise in live allocations (<code>after_count - before_count</code>) is the set of
+allocations the block made and abandoned: zero passes; a positive delta
+fails with the leaked count + bytes rendered as the failure detail.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/assertion.zap#L99">Source</a>
+</div>
+<div class="function-detail" id="would_report_leak?-1">
+<div class="function-header">
+<h3>would_report_leak?<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#would_report_leak?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">would_report_leak?</span><span class="sig-paren">(</span>leaked_count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Pure decision: would an <code>assert_no_leaks</code> block with the given net live-
+allocation delta be reported as a leak? <code>true</code> for a positive delta (the
+block left allocations live), <code>false</code> otherwise. Side-effect-free — the
+recording in <code>no_leaks_result</code> delegates to this so the polarity is unit-
+testable without touching the live test tracker.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/assertion.zap#L125">Source</a>
+</div>
+<div class="function-detail" id="expect_leak_result-7">
+<div class="function-header">
+<h3>expect_leak_result<span class="arity">/7</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#expect_leak_result-7" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">expect_leak_result</span><span class="sig-paren">(</span>tracking_active<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>before_count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>after_count<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>_before_bytes<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>_after_bytes<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>code<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>location<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
+<div class="function-doc">
+<p>Records the result of an <code>@expect_leak</code>-inverted leak assertion.</p>
+<p>Used for a test marked <code>@expect_leak</code>: the test is EXPECTED to leak, so the
+polarity of <code>no_leaks_result</code> is inverted. A positive net live-allocation
+delta (the expected leak occurred) PASSES; a zero delta FAILS, because a
+test that claims it leaks but does not is a stale expectation that should be
+removed. When the manager cannot answer (<code>tracking_active == false</code>), the
+assertion passes as a no-op (the expectation cannot be checked here).</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/assertion.zap#L140">Source</a>
+</div>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#truthy_result-5">truthy_result/5</a></li>
+<li><a href="#truthy_result-6">truthy_result/6</a></li>
+<li><a href="#comparison_result-9">comparison_result/9</a></li>
+<li><a href="#comparison_result-10">comparison_result/10</a></li>
+<li><a href="#no_leaks_result-7">no_leaks_result/7</a></li>
+<li><a href="#would_report_leak?-1">would_report_leak?/1</a></li>
+<li><a href="#expect_leak_result-7">expect_leak_result/7</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<div class="search-header">
+<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+<circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<input type="text" id="search-modal-input" placeholder="Search Zap docs…" aria-label="Search">
+<kbd>ESC</kbd>
+</div>
+<ul id="search-results" class="search-results"></ul>
+<div class="search-footer">
+<span class="search-footer-item"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+<span class="search-footer-item"><kbd>↵</kbd> open</span>
+<span class="spacer"></span>
+<span class="search-footer-item"><kbd>ESC</kbd> close</span>
+</div>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

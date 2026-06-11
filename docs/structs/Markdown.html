@@ -48,6 +48,8 @@
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
 <ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
 <li><a href="../structs/Atom.html">Atom</a></li>
 <li><a href="../structs/Bool.html">Bool</a></li>
 <li><a href="../structs/Enum.html">Enum</a></li>
@@ -55,25 +57,43 @@
 <li><a href="../structs/Float.html">Float</a></li>
 <li><a href="../structs/Function.html">Function</a></li>
 <li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
 <li><a href="../structs/Integer.html">Integer</a></li>
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li class="active"><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
 <li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
 <li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
@@ -82,10 +102,13 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
 <ul>
 <li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
 <li><a href="../structs/Comparator.html">Comparator</a></li>
 <li><a href="../structs/Concatenable.html">Concatenable</a></li>
 <li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
 <li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
 <li><a href="../structs/Stringable.html">Stringable</a></li>
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
@@ -94,6 +117,8 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
 <ul>
 <li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
 </ul>
 </div>
 <div class="sidebar-group" data-group="Guides">
@@ -268,7 +293,7 @@ when the surrounding fenced block is tagged <code>language-zap</code>,
 Other languages emit only HTML-escaped text so the surrounding
 <code>&lt;pre&gt;&lt;code&gt;</code> reflects the source verbatim.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L70">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L71">Source</a>
 </div>
 <div class="function-detail" id="zap_lang?-1">
 <div class="function-header">
@@ -278,7 +303,7 @@ Other languages emit only HTML-escaped text so the surrounding
 <a href="#zap_lang?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">zap_lang?</span><span class="sig-paren">(</span>code_lang<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L78">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L79">Source</a>
 </div>
 <div class="function-detail" id="classify_line-4">
 <div class="function-header">
@@ -293,7 +318,7 @@ Other languages emit only HTML-escaped text so the surrounding
 Order matters: code-fence opens before headings, headings before
 list items, list items before paragraphs.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L88">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L89">Source</a>
 </div>
 <div class="function-detail" id="classify_after_close-4">
 <div class="function-header">
@@ -309,7 +334,7 @@ inner heading/list/table/paragraph cascade in <code>classify_line</code> but wit
 the <code>is_indented_code_line?</code> re-check, since the caller has already
 decided this line ended the indented code run.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L118">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L120">Source</a>
 </div>
 <div class="function-detail" id="is_indented_code_line?-1">
 <div class="function-header">
@@ -324,7 +349,7 @@ decided this line ended the indented code run.</p>
 four characters are spaces (or a tab). Mirrors the CommonMark
 rule used to render <code>@doc</code> Example blocks as <code>&lt;pre&gt;&lt;code&gt;</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L159">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L162">Source</a>
 </div>
 <div class="function-detail" id="strip_indent4-1">
 <div class="function-header">
@@ -334,7 +359,7 @@ rule used to render <code>@doc</code> Example blocks as <code>&lt;pre&gt;&lt;cod
 <a href="#strip_indent4-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">strip_indent4</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L167">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L170">Source</a>
 </div>
 <div class="function-detail" id="is_table_header?-2">
 <div class="function-header">
@@ -349,7 +374,7 @@ rule used to render <code>@doc</code> Example blocks as <code>&lt;pre&gt;&lt;cod
 row (<code>| --- | --- |</code>). Matching the GFM-flavored shape the doc
 generator emits.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L185">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L188">Source</a>
 </div>
 <div class="function-detail" id="is_pipe_row?-1">
 <div class="function-header">
@@ -359,7 +384,7 @@ generator emits.</p>
 <a href="#is_pipe_row?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_pipe_row?</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L196">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L199">Source</a>
 </div>
 <div class="function-detail" id="is_table_separator?-1">
 <div class="function-header">
@@ -369,7 +394,7 @@ generator emits.</p>
 <a href="#is_table_separator?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_table_separator?</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L200">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L203">Source</a>
 </div>
 <div class="function-detail" id="open_table-4">
 <div class="function-header">
@@ -379,7 +404,7 @@ generator emits.</p>
 <a href="#open_table-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">open_table</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>rest<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>mode<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L205">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L208">Source</a>
 </div>
 <div class="function-detail" id="render_table_row-2">
 <div class="function-header">
@@ -389,7 +414,7 @@ generator emits.</p>
 <a href="#render_table_row-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_table_row</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>cell_tag<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L214">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L217">Source</a>
 </div>
 <div class="function-detail" id="render_table_cells-3">
 <div class="function-header">
@@ -399,7 +424,7 @@ generator emits.</p>
 <a href="#render_table_cells-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_table_cells</span><span class="sig-paren">(</span>cells<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>cell_tag<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L219">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L222">Source</a>
 </div>
 <div class="function-detail" id="parse_pipe_cells-1">
 <div class="function-header">
@@ -414,7 +439,7 @@ generator emits.</p>
 pipe characters. Whitespace inside each cell is trimmed so
 <code>| Field | Description |</code> produces <code>[&quot;Field&quot;, &quot;Description&quot;]</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L232">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L235">Source</a>
 </div>
 <div class="function-detail" id="strip_pipes-1">
 <div class="function-header">
@@ -424,7 +449,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#strip_pipes-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">strip_pipes</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L239">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L242">Source</a>
 </div>
 <div class="function-detail" id="trim_each-2">
 <div class="function-header">
@@ -434,7 +459,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#trim_each-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">trim_each</span><span class="sig-paren">(</span>parts<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">[String]</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L252">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L255">Source</a>
 </div>
 <div class="function-detail" id="open_code_block-4">
 <div class="function-header">
@@ -444,7 +469,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#open_code_block-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">open_code_block</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>rest<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>mode<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L259">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L262">Source</a>
 </div>
 <div class="function-detail" id="render_list_item-4">
 <div class="function-header">
@@ -454,7 +479,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#render_list_item-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_list_item</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>rest<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>mode<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L270">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L273">Source</a>
 </div>
 <div class="function-detail" id="render_paragraph_line-4">
 <div class="function-header">
@@ -464,7 +489,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#render_paragraph_line-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_paragraph_line</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>rest<span class="sig-separator">::</span><span class="sig-type-pill">[String]</span><span class="sig-paren">, </span>mode<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L279">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L282">Source</a>
 </div>
 <div class="function-detail" id="close_block-2">
 <div class="function-header">
@@ -474,7 +499,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#close_block-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">close_block</span><span class="sig-paren">(</span>mode<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L287">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L290">Source</a>
 </div>
 <div class="function-detail" id="render_heading-2">
 <div class="function-header">
@@ -484,7 +509,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#render_heading-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">render_heading</span><span class="sig-paren">(</span>tag<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L307">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L310">Source</a>
 </div>
 <div class="function-detail" id="is_blank_line?-1">
 <div class="function-header">
@@ -494,7 +519,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#is_blank_line?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_blank_line?</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L311">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L314">Source</a>
 </div>
 <div class="function-detail" id="is_list_item?-1">
 <div class="function-header">
@@ -504,7 +529,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#is_list_item?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_list_item?</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L315">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L318">Source</a>
 </div>
 <div class="function-detail" id="list_item_text-1">
 <div class="function-header">
@@ -514,7 +539,7 @@ pipe characters. Whitespace inside each cell is trimmed so
 <a href="#list_item_text-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">list_item_text</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L319">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L322">Source</a>
 </div>
 <div class="function-detail" id="render_inline-1">
 <div class="function-header">
@@ -530,7 +555,7 @@ backtick-delimited code spans and wrap them as <code>&lt;code&gt;</code>. Backti
 nest one level — content between matching pairs is escaped but
 not further parsed for inline syntax.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L330">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L333">Source</a>
 </div>
 <div class="function-detail" id="inline_walk-5">
 <div class="function-header">
@@ -540,7 +565,7 @@ not further parsed for inline syntax.</p>
 <a href="#inline_walk-5" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">inline_walk</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>in_code<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L334">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L337">Source</a>
 </div>
 <div class="function-detail" id="inline_try_link-5">
 <div class="function-header">
@@ -557,7 +582,7 @@ Anything else (including a stray <code>[</code> with no matching close) falls
 back to the normal escape-and-advance path so partial bracket
 syntax in prose doesn't get mangled.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L362">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L366">Source</a>
 </div>
 <div class="function-detail" id="inline_try_link_paren-5">
 <div class="function-header">
@@ -567,7 +592,7 @@ syntax in prose doesn't get mangled.</p>
 <a href="#inline_try_link_paren-5" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">inline_try_link_paren</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>close_idx<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L375">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L379">Source</a>
 </div>
 <div class="function-detail" id="find_link_text_close-3">
 <div class="function-header">
@@ -577,7 +602,7 @@ syntax in prose doesn't get mangled.</p>
 <a href="#find_link_text_close-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">find_link_text_close</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L391">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L395">Source</a>
 </div>
 <div class="function-detail" id="find_link_url_close-3">
 <div class="function-header">
@@ -587,7 +612,7 @@ syntax in prose doesn't get mangled.</p>
 <a href="#find_link_url_close-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">find_link_url_close</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L408">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L412">Source</a>
 </div>
 <div class="function-detail" id="escape_inline-1">
 <div class="function-header">
@@ -597,7 +622,7 @@ syntax in prose doesn't get mangled.</p>
 <a href="#escape_inline-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_inline</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L425">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L429">Source</a>
 </div>
 <div class="function-detail" id="escape_html-1">
 <div class="function-header">
@@ -607,7 +632,7 @@ syntax in prose doesn't get mangled.</p>
 <a href="#escape_html-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_html</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L429">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L433">Source</a>
 </div>
 <div class="function-detail" id="escape_chars-4">
 <div class="function-header">
@@ -617,7 +642,7 @@ syntax in prose doesn't get mangled.</p>
 <a href="#escape_chars-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_chars</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L433">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L437">Source</a>
 </div>
 <div class="function-detail" id="escape_one-1">
 <div class="function-header">
@@ -627,7 +652,7 @@ syntax in prose doesn't get mangled.</p>
 <a href="#escape_one-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_one</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L442">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L446">Source</a>
 </div>
 <div class="function-detail" id="highlight_zap_line-1">
 <div class="function-header">
@@ -648,7 +673,7 @@ set the legacy generator highlighted (<code>-&gt;</code>, <code>::</code>, <code
 <code>&gt;</code>, <code>&lt;</code>, <code>|</code>). Unrecognised text passes through HTML-escaped
 so non-Zap fragments still render correctly.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L473">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L478">Source</a>
 </div>
 <div class="function-detail" id="highlight_walk-4">
 <div class="function-header">
@@ -658,7 +683,7 @@ so non-Zap fragments still render correctly.</p>
 <a href="#highlight_walk-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">highlight_walk</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L477">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L482">Source</a>
 </div>
 <div class="function-detail" id="highlight_after_atom_check-5">
 <div class="function-header">
@@ -668,7 +693,7 @@ so non-Zap fragments still render correctly.</p>
 <a href="#highlight_after_atom_check-5" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">highlight_after_atom_check</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L499">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L504">Source</a>
 </div>
 <div class="function-detail" id="highlight_op_or_passthrough-4">
 <div class="function-header">
@@ -678,7 +703,7 @@ so non-Zap fragments still render correctly.</p>
 <a href="#highlight_op_or_passthrough-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">highlight_op_or_passthrough</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L511">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L516">Source</a>
 </div>
 <div class="function-detail" id="highlight_string-4">
 <div class="function-header">
@@ -688,7 +713,7 @@ so non-Zap fragments still render correctly.</p>
 <a href="#highlight_string-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">highlight_string</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L525">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L530">Source</a>
 </div>
 <div class="function-detail" id="escape_html_no_quotes-1">
 <div class="function-header">
@@ -707,7 +732,7 @@ selectors target the literal character. Used by the string and
 keyword highlighters where <code>&quot;</code> appearing as content is part of
 the source rather than an attribute delimiter.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L540">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L546">Source</a>
 </div>
 <div class="function-detail" id="escape_no_quotes_walk-4">
 <div class="function-header">
@@ -717,7 +742,7 @@ the source rather than an attribute delimiter.</p>
 <a href="#escape_no_quotes_walk-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_no_quotes_walk</span><span class="sig-paren">(</span>text<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L544">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L550">Source</a>
 </div>
 <div class="function-detail" id="escape_one_no_quote-1">
 <div class="function-header">
@@ -727,7 +752,7 @@ the source rather than an attribute delimiter.</p>
 <a href="#escape_one_no_quote-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">escape_one_no_quote</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L553">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L559">Source</a>
 </div>
 <div class="function-detail" id="find_string_end-3">
 <div class="function-header">
@@ -737,7 +762,7 @@ the source rather than an attribute delimiter.</p>
 <a href="#find_string_end-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">find_string_end</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L569">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L575">Source</a>
 </div>
 <div class="function-detail" id="highlight_atom-4">
 <div class="function-header">
@@ -747,7 +772,7 @@ the source rather than an attribute delimiter.</p>
 <a href="#highlight_atom-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">highlight_atom</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L586">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L592">Source</a>
 </div>
 <div class="function-detail" id="scan_atom_end-3">
 <div class="function-header">
@@ -757,7 +782,7 @@ the source rather than an attribute delimiter.</p>
 <a href="#scan_atom_end-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">scan_atom_end</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L592">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L598">Source</a>
 </div>
 <div class="function-detail" id="highlight_number-4">
 <div class="function-header">
@@ -767,7 +792,7 @@ the source rather than an attribute delimiter.</p>
 <a href="#highlight_number-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">highlight_number</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L605">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L611">Source</a>
 </div>
 <div class="function-detail" id="scan_number_end-3">
 <div class="function-header">
@@ -777,7 +802,7 @@ the source rather than an attribute delimiter.</p>
 <a href="#scan_number_end-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">scan_number_end</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L611">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L617">Source</a>
 </div>
 <div class="function-detail" id="highlight_word-4">
 <div class="function-header">
@@ -787,7 +812,7 @@ the source rather than an attribute delimiter.</p>
 <a href="#highlight_word-4" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">highlight_word</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>acc<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L624">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L630">Source</a>
 </div>
 <div class="function-detail" id="is_zap_builtin?-1">
 <div class="function-header">
@@ -797,7 +822,7 @@ the source rather than an attribute delimiter.</p>
 <a href="#is_zap_builtin?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_zap_builtin?</span><span class="sig-paren">(</span>word<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L642">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L648">Source</a>
 </div>
 <div class="function-detail" id="is_zap_primitive_type?-1">
 <div class="function-header">
@@ -814,7 +839,7 @@ classified as primitive types — the integer / float widths plus
 <code>&lt;span class=&quot;hl-type&quot;&gt;</code> so the bundled stylesheet can paint
 them with the type colour rather than as bare identifiers.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L653">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L660">Source</a>
 </div>
 <div class="function-detail" id="is_zap_int_type?-1">
 <div class="function-header">
@@ -824,7 +849,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_zap_int_type?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_zap_int_type?</span><span class="sig-paren">(</span>word<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L661">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L668">Source</a>
 </div>
 <div class="function-detail" id="is_zap_float_type?-1">
 <div class="function-header">
@@ -834,7 +859,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_zap_float_type?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_zap_float_type?</span><span class="sig-paren">(</span>word<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L665">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L672">Source</a>
 </div>
 <div class="function-detail" id="scan_word_end-3">
 <div class="function-header">
@@ -844,7 +869,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#scan_word_end-3" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">scan_word_end</span><span class="sig-paren">(</span>line<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">, </span>end_index<span class="sig-separator">::</span><span class="sig-type-pill">i64</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">i64</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L669">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L676">Source</a>
 </div>
 <div class="function-detail" id="is_digit_byte?-1">
 <div class="function-header">
@@ -854,7 +879,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_digit_byte?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_digit_byte?</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L682">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L689">Source</a>
 </div>
 <div class="function-detail" id="is_atom_start_byte?-1">
 <div class="function-header">
@@ -864,7 +889,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_atom_start_byte?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_atom_start_byte?</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L686">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L693">Source</a>
 </div>
 <div class="function-detail" id="is_lower_byte?-1">
 <div class="function-header">
@@ -874,7 +899,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_lower_byte?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_lower_byte?</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L690">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L697">Source</a>
 </div>
 <div class="function-detail" id="is_upper_byte?-1">
 <div class="function-header">
@@ -884,7 +909,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_upper_byte?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_upper_byte?</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L694">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L701">Source</a>
 </div>
 <div class="function-detail" id="is_alpha_byte?-1">
 <div class="function-header">
@@ -894,7 +919,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_alpha_byte?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_alpha_byte?</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L698">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L705">Source</a>
 </div>
 <div class="function-detail" id="is_ident_continue?-1">
 <div class="function-header">
@@ -904,7 +929,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_ident_continue?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_ident_continue?</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L702">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L709">Source</a>
 </div>
 <div class="function-detail" id="two_char_op?-2">
 <div class="function-header">
@@ -914,7 +939,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#two_char_op?-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">two_char_op?</span><span class="sig-paren">(</span>c1<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>c2<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L706">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L713">Source</a>
 </div>
 <div class="function-detail" id="two_char_op_more?-2">
 <div class="function-header">
@@ -924,7 +949,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#two_char_op_more?-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">two_char_op_more?</span><span class="sig-paren">(</span>c1<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>c2<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L722">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L729">Source</a>
 </div>
 <div class="function-detail" id="two_char_op_compare?-2">
 <div class="function-header">
@@ -934,7 +959,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#two_char_op_compare?-2" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">two_char_op_compare?</span><span class="sig-paren">(</span>c1<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">, </span>c2<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L738">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L745">Source</a>
 </div>
 <div class="function-detail" id="single_char_op?-1">
 <div class="function-header">
@@ -944,7 +969,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#single_char_op?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">single_char_op?</span><span class="sig-paren">(</span>ch<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L758">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L765">Source</a>
 </div>
 <div class="function-detail" id="is_zap_keyword?-1">
 <div class="function-header">
@@ -954,7 +979,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_zap_keyword?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_zap_keyword?</span><span class="sig-paren">(</span>word<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L762">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L769">Source</a>
 </div>
 <div class="function-detail" id="is_zap_keyword_more?-1">
 <div class="function-header">
@@ -964,7 +989,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_zap_keyword_more?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_zap_keyword_more?</span><span class="sig-paren">(</span>word<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L774">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L781">Source</a>
 </div>
 <div class="function-detail" id="is_zap_keyword_misc?-1">
 <div class="function-header">
@@ -974,7 +999,7 @@ them with the type colour rather than as bare identifiers.</p>
 <a href="#is_zap_keyword_misc?-1" class="anchor-link">#</a>
 </div>
 <div class="signature"><code><span class="sig-name">is_zap_keyword_misc?</span><span class="sig-paren">(</span>word<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L786">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/markdown.zap#L793">Source</a>
 </div>
 </main>
 <aside class="toc">

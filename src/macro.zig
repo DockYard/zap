@@ -4,6 +4,7 @@ const scope = @import("scope.zig");
 const ast_data = @import("ast_data.zig");
 const ctfe = @import("ctfe.zig");
 const ir = @import("ir.zig");
+const macro_eval_mod = @import("macro_eval.zig");
 
 // ============================================================
 // Macro engine
@@ -19,15 +20,20 @@ const ir = @import("ir.zig");
 // ============================================================
 
 pub const CompiledMacroExecutor = struct {
+    const MacroFunctionKey = struct {
+        family_id: scope.MacroFamilyId,
+        clause_index: u32,
+    };
+
     allocator: std.mem.Allocator,
     program: *const ir.Program,
-    family_functions: std.AutoHashMap(scope.MacroFamilyId, ir.FunctionId),
+    family_functions: std.AutoHashMap(MacroFunctionKey, ir.FunctionId),
 
     pub fn init(allocator: std.mem.Allocator, program: *const ir.Program) CompiledMacroExecutor {
         return .{
             .allocator = allocator,
             .program = program,
-            .family_functions = std.AutoHashMap(scope.MacroFamilyId, ir.FunctionId).init(allocator),
+            .family_functions = std.AutoHashMap(MacroFunctionKey, ir.FunctionId).init(allocator),
         };
     }
 
@@ -40,15 +46,33 @@ pub const CompiledMacroExecutor = struct {
         family_id: scope.MacroFamilyId,
         function_id: ir.FunctionId,
     ) !void {
-        try self.family_functions.put(family_id, function_id);
+        try self.registerMacroClauseFunction(family_id, 0, function_id);
     }
 
-    pub fn hasMacro(self: *const CompiledMacroExecutor, family_id: scope.MacroFamilyId) bool {
-        return self.family_functions.contains(family_id);
+    pub fn registerMacroClauseFunction(
+        self: *CompiledMacroExecutor,
+        family_id: scope.MacroFamilyId,
+        clause_index: u32,
+        function_id: ir.FunctionId,
+    ) !void {
+        try self.family_functions.put(.{
+            .family_id = family_id,
+            .clause_index = clause_index,
+        }, function_id);
     }
 
-    pub fn functionIdFor(self: *const CompiledMacroExecutor, family_id: scope.MacroFamilyId) ?ir.FunctionId {
-        return self.family_functions.get(family_id);
+    pub fn hasMacro(self: *const CompiledMacroExecutor, family_id: scope.MacroFamilyId, clause_index: u32) bool {
+        return self.family_functions.contains(.{
+            .family_id = family_id,
+            .clause_index = clause_index,
+        });
+    }
+
+    pub fn functionIdFor(self: *const CompiledMacroExecutor, family_id: scope.MacroFamilyId, clause_index: u32) ?ir.FunctionId {
+        return self.family_functions.get(.{
+            .family_id = family_id,
+            .clause_index = clause_index,
+        });
     }
 };
 
@@ -1672,6 +1696,283 @@ pub const MacroEngine = struct {
         });
     }
 
+    const MacroClauseSelection = struct {
+        ref: scope.FunctionClauseRef,
+        clause: *const ast.FunctionClause,
+    };
+
+    fn selectMacroClause(
+        self: *MacroEngine,
+        family: *const scope.MacroFamily,
+        args: []const *const ast.Expr,
+        call_span: ast.SourceSpan,
+    ) !?MacroClauseSelection {
+        var selection_store = ctfe.AllocationStore{};
+        defer selection_store.deinit(self.allocator);
+
+        const arg_cts = try self.allocator.alloc(ctfe.CtValue, args.len);
+        defer self.allocator.free(arg_cts);
+        for (args, 0..) |arg, index| {
+            arg_cts[index] = try ast_data.exprToCtValue(self.allocator, self.interner, &selection_store, arg);
+        }
+
+        for (family.clauses.items) |clause_ref| {
+            const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+            if (try self.macroClauseMatches(clause, args, arg_cts, call_span)) {
+                return .{ .ref = clause_ref, .clause = clause };
+            }
+        }
+
+        if (family.clauses.items.len == 1) {
+            const clause_ref = family.clauses.items[0];
+            const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+            if (!try self.validateMacroArgs(clause.params, args, arg_cts, call_span, true)) return null;
+        }
+
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "no macro clause of `{s}/{d}` matches the arguments",
+                .{ self.interner.get(family.name), family.arity },
+            ),
+            .span = call_span,
+        });
+        return null;
+    }
+
+    fn macroClauseMatches(
+        self: *MacroEngine,
+        clause: *const ast.FunctionClause,
+        args: []const *const ast.Expr,
+        arg_cts: []const ctfe.CtValue,
+        call_span: ast.SourceSpan,
+    ) !bool {
+        if (clause.params.len != arg_cts.len) return false;
+        if (!try self.validateMacroArgs(clause.params, args, arg_cts, call_span, false)) return false;
+
+        var match_store = ctfe.AllocationStore{};
+        defer match_store.deinit(self.allocator);
+
+        for (clause.params, 0..) |param, index| {
+            if (!try self.macroParamPatternMatches(param, arg_cts[index], &match_store)) return false;
+        }
+        if (clause.refinement) |refinement| {
+            if (!try self.macroClauseRefinementMatches(clause, refinement, arg_cts, call_span)) return false;
+        }
+        return true;
+    }
+
+    fn macroClauseRefinementMatches(
+        self: *MacroEngine,
+        clause: *const ast.FunctionClause,
+        refinement: *const ast.Expr,
+        arg_cts: []const ctfe.CtValue,
+        call_span: ast.SourceSpan,
+    ) !bool {
+        var guard_store = ctfe.AllocationStore{};
+        defer guard_store.deinit(self.allocator);
+
+        var env = macro_eval_mod.Env.init(self.allocator, &guard_store);
+        defer env.deinit();
+        env.compiled_program = self.compiledProgram();
+        env.struct_ctx = .{
+            .graph = self.graph,
+            .interner = self.interner,
+            .current_struct_scope = self.current_struct_scope,
+        };
+
+        for (clause.params, 0..) |param, index| {
+            if (index >= arg_cts.len) break;
+            if (param.pattern.* != .bind) continue;
+            const name_id = param.pattern.bind.name;
+            if (self.isConcreteTypePatternName(name_id)) continue;
+            try env.bind(self.interner.get(name_id), arg_cts[index]);
+        }
+
+        const refinement_ct = try ast_data.exprToCtValue(self.allocator, self.interner, &guard_store, refinement);
+        const result = macro_eval_mod.eval(&env, refinement_ct) catch |err| {
+            if (env.last_capability_error) |message| {
+                try self.errors.append(self.allocator, .{ .message = message, .span = call_span });
+            }
+            return err;
+        };
+        const value = unwrapAstLeaf(result);
+        if (value == .bool_val) return value.bool_val;
+
+        try self.errors.append(self.allocator, .{
+            .message = "macro clause guard must evaluate to Bool during expansion",
+            .span = call_span,
+        });
+        return false;
+    }
+
+    fn macroParamPatternMatches(
+        self: *MacroEngine,
+        param: ast.Param,
+        arg_ct: ctfe.CtValue,
+        store: *ctfe.AllocationStore,
+    ) !bool {
+        return self.macroPatternMatches(param.pattern, arg_ct, self.paramSpliceKind(param), store);
+    }
+
+    fn macroPatternMatches(
+        self: *MacroEngine,
+        pattern: *const ast.Pattern,
+        arg_ct: ctfe.CtValue,
+        splice_kind: ?ast.MacroSpliceKind,
+        store: *ctfe.AllocationStore,
+    ) !bool {
+        return switch (pattern.*) {
+            .wildcard => true,
+            .bind => |bind| blk: {
+                if (self.isConcreteTypePatternName(bind.name)) {
+                    break :blk self.typePatternNameMatches(bind.name, arg_ct);
+                }
+                break :blk true;
+            },
+            .literal => |literal| self.literalPatternMatches(literal, arg_ct),
+            .tuple => |tuple_pattern| blk: {
+                const elems = astNodeArgs(arg_ct, "{}") orelse break :blk false;
+                if (elems.len != tuple_pattern.elements.len) break :blk false;
+                for (tuple_pattern.elements, elems) |element_pattern, element_value| {
+                    if (!try self.macroPatternMatches(element_pattern, element_value, null, store)) break :blk false;
+                }
+                break :blk true;
+            },
+            .list => |list_pattern| blk: {
+                if (arg_ct != .list) break :blk false;
+                if (arg_ct.list.elems.len != list_pattern.elements.len) break :blk false;
+                for (list_pattern.elements, arg_ct.list.elems) |element_pattern, element_value| {
+                    if (!try self.macroPatternMatches(element_pattern, element_value, null, store)) break :blk false;
+                }
+                break :blk true;
+            },
+            .list_cons => |cons_pattern| blk: {
+                if (arg_ct != .list) break :blk false;
+                if (arg_ct.list.elems.len < cons_pattern.heads.len) break :blk false;
+                for (cons_pattern.heads, arg_ct.list.elems[0..cons_pattern.heads.len]) |head_pattern, head_value| {
+                    if (!try self.macroPatternMatches(head_pattern, head_value, null, store)) break :blk false;
+                }
+                const tail = try ast_data.makeListFromSlice(self.allocator, store, arg_ct.list.elems[cons_pattern.heads.len..]);
+                break :blk try self.macroPatternMatches(cons_pattern.tail, tail, null, store);
+            },
+            .map, .struct_pattern, .pin, .binary, .tagged_union_variant => blk: {
+                const pattern_ct = try ast_data.patternToCtValue(self.allocator, self.interner, store, pattern);
+                break :blk self.macroCtPatternMatches(pattern_ct, arg_ct);
+            },
+            .paren => |paren_pattern| self.macroPatternMatches(paren_pattern.inner, arg_ct, splice_kind, store),
+        };
+    }
+
+    fn literalPatternMatches(self: *const MacroEngine, literal: ast.LiteralPattern, arg_ct: ctfe.CtValue) bool {
+        const value = unwrapAstLeaf(arg_ct);
+        return switch (literal) {
+            .int => |lit| value == .int and value.int == lit.value,
+            .float => |lit| value == .float and value.float == lit.value,
+            .string => |lit| value == .string and std.mem.eql(u8, value.string, self.interner.get(lit.value)),
+            .atom => |lit| blk: {
+                if (value != .atom) break :blk false;
+                const expected = self.interner.get(lit.value);
+                const actual = value.atom;
+                break :blk actual.len == expected.len + 1 and actual[0] == ':' and std.mem.eql(u8, actual[1..], expected);
+            },
+            .bool_lit => |lit| value == .bool_val and value.bool_val == lit.value,
+            .nil => value == .nil,
+        };
+    }
+
+    fn macroCtPatternMatches(self: *MacroEngine, pattern: ctfe.CtValue, subject: ctfe.CtValue) bool {
+        if (pattern == .tuple and pattern.tuple.elems.len == 3) {
+            const form = pattern.tuple.elems[0];
+            const args = pattern.tuple.elems[2];
+
+            if (form == .atom and args == .nil) {
+                const name = form.atom;
+                if (std.mem.eql(u8, name, "_")) return true;
+                if (name.len > 0 and (name[0] == '_' or std.ascii.isLower(name[0]))) return true;
+                return literalFormMatchesSubject(form, subject);
+            }
+
+            if (form == .atom and std.mem.eql(u8, form.atom, "{}")) {
+                const subject_args = astNodeArgs(subject, "{}") orelse return false;
+                if (args != .list or args.list.elems.len != subject_args.len) return false;
+                for (args.list.elems, subject_args) |pattern_elem, subject_elem| {
+                    if (!self.macroCtPatternMatches(pattern_elem, subject_elem)) return false;
+                }
+                return true;
+            }
+
+            if (form == .atom and args == .list) {
+                const subject_args = astNodeArgs(subject, form.atom) orelse return false;
+                if (args.list.elems.len != subject_args.len) return false;
+                for (args.list.elems, subject_args) |pattern_elem, subject_elem| {
+                    if (!self.macroCtPatternMatches(pattern_elem, subject_elem)) return false;
+                }
+                return true;
+            }
+        }
+
+        if (pattern == .list and subject == .list) {
+            if (pattern.list.elems.len != subject.list.elems.len) return false;
+            for (pattern.list.elems, subject.list.elems) |pattern_elem, subject_elem| {
+                if (!self.macroCtPatternMatches(pattern_elem, subject_elem)) return false;
+            }
+            return true;
+        }
+
+        return pattern.eql(subject);
+    }
+
+    fn isConcreteTypePatternName(self: *const MacroEngine, name_id: ast.StringId) bool {
+        const name = self.interner.get(name_id);
+        const builtins = [_][]const u8{
+            "Term", "Bool",  "String", "Atom", "Nil", "Void", "Never",
+            "i128", "i64",   "i32",    "i16",  "i8",  "u128", "u64",
+            "u32",  "u16",   "u8",     "f128", "f80", "f64",  "f32",
+            "f16",  "usize", "isize",
+        };
+        for (&builtins) |builtin| {
+            if (std.mem.eql(u8, name, builtin)) return true;
+        }
+        return self.graph.resolveTypeByName(name_id) != null;
+    }
+
+    fn typePatternNameMatches(self: *const MacroEngine, name_id: ast.StringId, arg_ct: ctfe.CtValue) bool {
+        const actual = simpleTypeNameFromCt(arg_ct) orelse return false;
+        return std.mem.eql(u8, actual, self.interner.get(name_id));
+    }
+
+    fn simpleTypeNameFromCt(value: ctfe.CtValue) ?[]const u8 {
+        const leaf = unwrapAstLeaf(value);
+        if (leaf == .atom) {
+            const name = leaf.atom;
+            if (name.len == 0) return null;
+            if (name[0] == ':') return null;
+            return name;
+        }
+        return null;
+    }
+
+    fn literalFormMatchesSubject(form: ctfe.CtValue, subject: ctfe.CtValue) bool {
+        return form.eql(unwrapAstLeaf(subject));
+    }
+
+    fn unwrapAstLeaf(value: ctfe.CtValue) ctfe.CtValue {
+        if (value == .tuple and value.tuple.elems.len == 3 and value.tuple.elems[2] == .nil) {
+            return value.tuple.elems[0];
+        }
+        return value;
+    }
+
+    fn astNodeArgs(value: ctfe.CtValue, form_name: []const u8) ?[]const ctfe.CtValue {
+        if (value != .tuple or value.tuple.elems.len != 3) return null;
+        const form = value.tuple.elems[0];
+        const args = value.tuple.elems[2];
+        if (form != .atom or !std.mem.eql(u8, form.atom, form_name)) return null;
+        if (args != .list) return null;
+        return args.list.elems;
+    }
+
     fn expandMacroCall(
         self: *MacroEngine,
         expr: *const ast.Expr,
@@ -1709,30 +2010,9 @@ pub const MacroEngine = struct {
             .parent = expr.getMeta().expansion,
         };
 
-        // Use the first clause for now (pattern matching on macro args is Phase 4+)
-        const clause_ref = family.clauses.items[0];
-        const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
-
-        // Validate typed splice categories (`:: Pat`, `:: Decl`, ...)
-        // before either expansion path runs. The conversion to CtValue
-        // is repeated by each path; the cost is negligible (expansion
-        // happens once per macro call) and the alternative (passing
-        // pre-converted CtValues into expandQuote and the evaluator
-        // path) couples both paths to the same conversion store
-        // lifecycle. Validate-first, expand-second is simpler.
-        {
-            const limit = @min(clause.params.len, call.args.len);
-            if (limit > 0) {
-                var validation_store = ctfe.AllocationStore{};
-                var arg_cts = try self.allocator.alloc(ctfe.CtValue, limit);
-                defer self.allocator.free(arg_cts);
-                for (call.args[0..limit], 0..) |arg, i| {
-                    arg_cts[i] = try ast_data.exprToCtValue(self.allocator, self.interner, &validation_store, arg);
-                }
-                const ok = try self.validateMacroArgs(clause.params, call.args, arg_cts, call.meta.span);
-                if (!ok) return expr;
-            }
-        }
+        const selection = (try self.selectMacroClause(family, call.args, call.meta.span)) orelse return expr;
+        const clause_ref = selection.ref;
+        const clause = selection.clause;
 
         // Allocate the Flatt-2016 hygiene scopes for this expansion:
         //   use_scope:   fresh per call site, added to the user's arg
@@ -1761,10 +2041,11 @@ pub const MacroEngine = struct {
         // Phase 3: evaluate macro body as a function using the macro evaluator.
         // Convert the body and args to CtValue, run the evaluator, convert back.
         if (self.compiled_executor) |executor| {
-            if (executor.hasMacro(macro_family_id)) {
+            if (executor.hasMacro(macro_family_id, clause_ref.clause_index)) {
                 return try self.expandCompiledMacroCall(
                     expr,
                     macro_family_id,
+                    clause_ref.clause_index,
                     use_scope,
                     intro_scope,
                     expansion_info,
@@ -1891,12 +2172,13 @@ pub const MacroEngine = struct {
         self: *MacroEngine,
         expr: *const ast.Expr,
         macro_family_id: scope.MacroFamilyId,
+        clause_index: u32,
         use_scope: scope.ScopeId,
         intro_scope: scope.ScopeId,
         expansion_info: *ast.ExpansionInfo,
     ) !*const ast.Expr {
         const executor = self.compiled_executor orelse return expr;
-        const function_id = executor.functionIdFor(macro_family_id) orelse return expr;
+        const function_id = executor.functionIdFor(macro_family_id, clause_index) orelse return expr;
         const call = expr.call;
         const family = &self.graph.macro_families.items[macro_family_id];
 
@@ -2166,11 +2448,12 @@ pub const MacroEngine = struct {
     // ============================================================
     // Typed splice validation
     //
-    // When a macro parameter is annotated with a meta-type
-    // (`Expr`, `Pat`, `Decl`, `Type`, `Ident`, `Block`, etc.), the
-    // bound CtValue's shape is checked against the expected category
-    // so authors find out at the macro call site, not at the splice
-    // site, when they pass the wrong kind of AST.
+    // When a macro parameter is annotated with a syntax category
+    // (`Expr`, `Pat`, `Decl`, `Type`, `Ident`, `Block`) or literal Zap
+    // type (`Atom`, `Integer`, `String`, `List`), the bound CtValue's
+    // shape is checked against that expected category so authors find
+    // out at the macro call site, not at the splice site, when they pass
+    // the wrong kind of syntax value.
     //
     // The default `Expr` accepts anything; narrower kinds like `Decl`
     // require a 3-tuple whose form atom is `:fn`, `:macro`, or
@@ -2196,10 +2479,10 @@ pub const MacroEngine = struct {
             .decl => isDeclShape(value),
             .ident => isIdentShape(value),
             .block => isBlockShape(value),
-            .atom_lit => isAtomShape(value),
-            .integer_lit => value == .int,
-            .string_lit => isStringShape(value),
-            .list_lit => value == .list,
+            .atom => isAtomShape(value),
+            .integer => isIntegerShape(value),
+            .string => isStringShape(value),
+            .list => value == .list,
         };
     }
 
@@ -2253,6 +2536,14 @@ pub const MacroEngine = struct {
         return false;
     }
 
+    fn isIntegerShape(value: ctfe.CtValue) bool {
+        if (value == .int) return true;
+        if (value == .tuple and value.tuple.elems.len == 3) {
+            return value.tuple.elems[0] == .int and value.tuple.elems[2] == .nil;
+        }
+        return false;
+    }
+
     fn isPatternShape(value: ctfe.CtValue) bool {
         // Patterns and exprs share the tuple shape. Most expression
         // CtValues are also valid patterns. The compiler verifies
@@ -2266,11 +2557,14 @@ pub const MacroEngine = struct {
 
     fn isTypeShape(value: ctfe.CtValue) bool {
         // Type expressions show up in CtValue as `__aliases__` lists
-        // for struct references, or as plain identifier atoms for
-        // built-in types. Accept either shape.
+        // for struct references, as `tuple`/`list`/`map` nodes for
+        // structural types, or as plain identifier atoms for built-in
+        // types and type variables. Accept those source-level shapes;
+        // ordinary type resolution still decides whether the name is
+        // meaningful for the expanded code.
         if (value == .atom) {
             const name = value.atom;
-            return name.len > 0 and (std.ascii.isUpper(name[0]) or name[0] == ':');
+            return name.len > 0 and (std.ascii.isAlphabetic(name[0]) or name[0] == ':');
         }
         if (value == .tuple and value.tuple.elems.len == 3) {
             const form = value.tuple.elems[0];
@@ -2278,7 +2572,12 @@ pub const MacroEngine = struct {
                 const f = form.atom;
                 if (std.mem.eql(u8, f, "__aliases__")) return true;
                 if (std.mem.eql(u8, f, ".")) return true;
-                if (f.len > 0 and std.ascii.isUpper(f[0])) return true;
+                if (std.mem.eql(u8, f, "tuple")) return true;
+                if (std.mem.eql(u8, f, "list")) return true;
+                if (std.mem.eql(u8, f, "map")) return true;
+                if (std.mem.eql(u8, f, "fn_type")) return true;
+                if (std.mem.eql(u8, f, "union_type")) return true;
+                if (f.len > 0 and std.ascii.isAlphabetic(f[0])) return true;
             }
         }
         return false;
@@ -2293,6 +2592,7 @@ pub const MacroEngine = struct {
         args: []const *const ast.Expr,
         arg_cts: []const ctfe.CtValue,
         call_span: ast.SourceSpan,
+        report_errors: bool,
     ) !bool {
         var ok = true;
         const limit = @min(params.len, arg_cts.len);
@@ -2301,6 +2601,7 @@ pub const MacroEngine = struct {
             if (matchesSpliceKind(arg_cts[i], kind)) continue;
 
             ok = false;
+            if (!report_errors) continue;
             const param_name = if (param.pattern.* == .bind)
                 self.interner.get(param.pattern.bind.name)
             else
@@ -2341,6 +2642,7 @@ pub const MacroEngine = struct {
             .or_op => "or",
             .concat => "<>",
             .in_op => "in",
+            .not_in_op => "not in",
         };
     }
 
@@ -4255,10 +4557,10 @@ test "macro substitution into case_expr and block" {
     try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
 }
 
-test "typed splice: AtomLit param accepts atom literals" {
+test "typed splice: Atom param accepts atom literals" {
     const source =
         \\pub struct Test {
-        \\  pub macro tag_with(label :: AtomLit, value :: Expr) -> Nil {
+        \\  pub macro tag_with(label :: Atom, value :: Expr) -> Nil {
         \\    quote {
         \\      {unquote(label), unquote(value)}
         \\    }
@@ -4294,10 +4596,10 @@ test "typed splice: AtomLit param accepts atom literals" {
     try std.testing.expectEqual(@as(usize, 0), splice_errs);
 }
 
-test "typed splice: AtomLit param rejects integer literal" {
+test "typed splice: Atom param rejects integer literal" {
     const source =
         \\pub struct Test {
-        \\  pub macro tag_with(label :: AtomLit, value :: Expr) -> Nil {
+        \\  pub macro tag_with(label :: Atom, value :: Expr) -> Nil {
         \\    quote {
         \\      {unquote(label), unquote(value)}
         \\    }
@@ -4325,16 +4627,133 @@ test "typed splice: AtomLit param rejects integer literal" {
     defer engine.deinit();
     _ = try engine.expandProgram(&program);
 
-    // The `42` literal does not match `AtomLit`. Validation must
+    // The `42` literal does not match `Atom`. Validation must
     // record an error mentioning the splice kind.
     var has_kind_error = false;
     for (engine.errors.items) |err| {
-        if (std.mem.find(u8, err.message, "AtomLit") != null) {
+        if (std.mem.find(u8, err.message, "Atom") != null) {
             has_kind_error = true;
             break;
         }
     }
     try std.testing.expect(has_kind_error);
+}
+
+test "typed splice: Integer param accepts integer literals" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro duplicate(value :: Integer) -> Expr {
+        \\    quote {
+        \\      unquote(value) + unquote(value)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn check() -> i64 {
+        \\    duplicate(21)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    var splice_errs: usize = 0;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "splice kind") != null) splice_errs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), splice_errs);
+}
+
+test "typed splice: List param accepts list literals" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro first(values :: List) -> Expr {
+        \\    quote {
+        \\      unquote(values)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn check() -> [i64] {
+        \\    first([1, 2, 3])
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    var splice_errs: usize = 0;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "splice kind") != null) splice_errs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), splice_errs);
+}
+
+test "typed splice: Type param accepts primitive numeric type names" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro typed_pair(value :: Expr, lane_type :: Type) -> Expr {
+        \\    pair_type = type_tuple(lane_type, 2)
+        \\    typed_value = type_annotate(value, pair_type)
+        \\
+        \\    quote {
+        \\      unquote(typed_value)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn check() -> {f32, f32} {
+        \\    typed_pair({1.0, 2.0}, f32)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    var splice_errs: usize = 0;
+    for (engine.errors.items) |err| {
+        if (std.mem.find(u8, err.message, "splice kind") != null) splice_errs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), splice_errs);
 }
 
 test "struct attribute intrinsics: put writes to current StructEntry" {
@@ -5251,7 +5670,7 @@ test "comptime intrinsics: slugify produces snake_case from string" {
     // intrinsic from the more complex name-splicing path.
     const source =
         \\pub struct Test {
-        \\  pub macro slug_of(label :: StringLit) -> Expr {
+        \\  pub macro slug_of(label :: String) -> Expr {
         \\    s = slugify(label)
         \\    quote { unquote(s) }
         \\  }
@@ -5430,7 +5849,7 @@ test "comptime intrinsics: slugify + intern produces dynamic fn name" {
     // detection logic that's exercised in other tests.
     const source =
         \\pub struct Test {
-        \\  pub macro emit_named(label :: StringLit) -> Expr {
+        \\  pub macro emit_named(label :: String) -> Expr {
         \\    fn_name_str = "test_" <> slugify(label)
         \\    quote { unquote(fn_name_str) }
         \\  }
@@ -5491,7 +5910,7 @@ test "dynamic fn name: unquote in fn-name position resolves at expansion" {
     // Zest migration.
     const source =
         \\pub struct Test {
-        \\  pub macro define_const(name :: AtomLit) -> Decl {
+        \\  pub macro define_const(name :: Atom) -> Decl {
         \\    quote {
         \\      pub fn unquote(name)() -> i64 {
         \\        42
@@ -5564,7 +5983,7 @@ test "@before_compile: hook reads caller's accumulated attributes" {
         \\}
         \\
         \\pub struct Target {
-        \\  pub macro track(name :: AtomLit) -> Nil {
+        \\  pub macro track(name :: Atom) -> Nil {
         \\    struct_register_attribute(:tests)
         \\    struct_put_attribute(:tests, name)
         \\    quote { nil }

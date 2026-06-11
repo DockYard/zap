@@ -48,6 +48,8 @@
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
 <ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
 <li><a href="../structs/Atom.html">Atom</a></li>
 <li><a href="../structs/Bool.html">Bool</a></li>
 <li><a href="../structs/Enum.html">Enum</a></li>
@@ -55,25 +57,43 @@
 <li><a href="../structs/Float.html">Float</a></li>
 <li><a href="../structs/Function.html">Function</a></li>
 <li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
 <li><a href="../structs/Integer.html">Integer</a></li>
 <li class="active"><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
 <li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
 <li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
@@ -82,10 +102,13 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
 <ul>
 <li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
 <li><a href="../structs/Comparator.html">Comparator</a></li>
 <li><a href="../structs/Concatenable.html">Concatenable</a></li>
 <li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
 <li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
 <li><a href="../structs/Stringable.html">Stringable</a></li>
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
@@ -94,6 +117,8 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
 <ul>
 <li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
 </ul>
 </div>
 <div class="sidebar-group" data-group="Guides">
@@ -121,6 +146,24 @@
 as macros: control flow (<code>if</code>, <code>unless</code>), boolean operators
 (<code>and</code>, <code>or</code>), the pipe operator (<code>|&gt;</code>), sigils (<code>~s</code>, <code>~S</code>,
 <code>~w</code>, <code>~W</code>), and declaration macros (<code>fn</code>, <code>struct</code>, <code>union</code>).</p>
+<p>Kernel also provides the multi-step pattern-match composition
+<code>with</code> (Elixir-style):</p>
+<pre><code class="language-zap">with Result.Ok(a) <span class="hl-op">&lt;-</span> step1(),
+     Result.Ok(b) <span class="hl-op">&lt;-</span> step2(a) {
+  Result.Ok(<span class="hl-keyword">use</span>(a, b))
+} <span class="hl-keyword">else</span> {
+  Result.Error(e) <span class="hl-op">-&gt;</span> Result.Error(wrap(e))
+}</code></pre>
+<p>Each <code>pattern &lt;- expr</code> step evaluates <code>expr</code> and matches it; on the
+first non-matching step the whole <code>with</code> short-circuits to the
+<code>else</code> clauses (or, with no <code>else</code>, to the non-matching value). The
+<code>do</code> body runs only when every step matched. Like the
+<code>cond</code>/<code>for</code>/<code>try</code> block forms, <code>with</code> is a variadic construct, so —
+unlike the fixed-arity <code>if</code> macro — it is not expressible as a
+single Kernel macro; it is a contextual keyword desugared to nested
+<code>case</code> expressions in the same bootstrap layer that lowers
+<code>if</code>/<code>cond</code>. It introduces no new runtime mechanism — pure sugar
+over <code>case</code>.</p>
 <p>You don't need to <code>import Kernel</code> — its macros are available
 everywhere automatically.</p>
 </div>
@@ -138,6 +181,15 @@ everywhere automatically.</p>
 <tr><td class="summary-name"><a href="#is_map?-1">is_map?/1</a></td><td class="summary-doc">Returns true if the value is a map.</td></tr>
 <tr><td class="summary-name"><a href="#is_struct?-1">is_struct?/1</a></td><td class="summary-doc">Returns true if the value is a struct.</td></tr>
 <tr><td class="summary-name"><a href="#raise-1">raise/1</a></td><td class="summary-doc">Raises a runtime error with the provided message.</td></tr>
+<tr><td class="summary-name"><a href="#do_raise-1">do_raise/1</a></td><td class="summary-doc">Error-aware abort backing the surface `raise` keyword (Phase 1.4).</td></tr>
+<tr><td class="summary-name"><a href="#abort_recoverable_raise-0">abort_recoverable_raise/0</a></td><td class="summary-doc">Unhandled-`raise` terminus (Phase 3.b cross-function propagation).</td></tr>
+<tr><td class="summary-name"><a href="#recoverable_raise-1">recoverable_raise/1</a></td><td class="summary-doc">Recoverable raise sink backing a `raise` lexically inside a
+`try { … } rescue { … }` body (Phase 3.a).</td></tr>
+<tr><td class="summary-name"><a href="#raise_occurred-0">raise_occurred/0</a></td><td class="summary-doc">True when a `recoverable_raise` has fired in the current `try` body and
+has not yet been consumed by a handler (Phase 3.a).</td></tr>
+<tr><td class="summary-name"><a href="#take_recoverable_raise-0">take_recoverable_raise/0</a></td><td class="summary-doc">Read and clear the pending recoverable-raise `Error` value (Phase 3.a).</td></tr>
+<tr><td class="summary-name"><a href="#peek_recoverable_raise-0">peek_recoverable_raise/0</a></td><td class="summary-doc">Read the pending recoverable-raise `Error` value WITHOUT clearing the
+side-channel or the captured error-return trace (Phase 4.a, ERT display).</td></tr>
 <tr><td class="summary-name"><a href="#sleep-1">sleep/1</a></td><td class="summary-doc">Suspends the current process for the given number of milliseconds.</td></tr>
 <tr><td class="summary-name"><a href="#to_string-1">to_string/1</a></td><td class="summary-doc">Converts any value to its string representation.</td></tr>
 <tr><td class="summary-name"><a href="#inspect-1">inspect/1</a></td><td class="summary-doc">Print a value's string representation to stdout, followed by a newline.</td></tr>
@@ -171,7 +223,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is an integer type (i8, i16, i32, i64, i128, u8, u16, u32, u64, u128).</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L269">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L290">Source</a>
 </div>
 <div class="function-detail" id="is_float?-1">
 <div class="function-header">
@@ -184,7 +236,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a float type (f16, f32, f64, f80, f128).</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L277">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L298">Source</a>
 </div>
 <div class="function-detail" id="is_number?-1">
 <div class="function-header">
@@ -197,7 +249,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a number (integer or float).</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L285">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L306">Source</a>
 </div>
 <div class="function-detail" id="is_boolean?-1">
 <div class="function-header">
@@ -210,7 +262,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a boolean.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L293">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L314">Source</a>
 </div>
 <div class="function-detail" id="is_string?-1">
 <div class="function-header">
@@ -223,7 +275,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a string.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L301">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L322">Source</a>
 </div>
 <div class="function-detail" id="is_atom?-1">
 <div class="function-header">
@@ -236,7 +288,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is an atom.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L309">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L330">Source</a>
 </div>
 <div class="function-detail" id="is_nil?-1">
 <div class="function-header">
@@ -249,7 +301,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is nil.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L317">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L338">Source</a>
 </div>
 <div class="function-detail" id="is_list?-1">
 <div class="function-header">
@@ -262,7 +314,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a list.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L325">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L346">Source</a>
 </div>
 <div class="function-detail" id="is_tuple?-1">
 <div class="function-header">
@@ -275,7 +327,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a tuple.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L333">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L354">Source</a>
 </div>
 <div class="function-detail" id="is_map?-1">
 <div class="function-header">
@@ -288,7 +340,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a map.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L341">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L362">Source</a>
 </div>
 <div class="function-detail" id="is_struct?-1">
 <div class="function-header">
@@ -301,7 +353,7 @@ everywhere automatically.</p>
 <div class="function-doc">
 <p>Returns true if the value is a struct.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L349">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L370">Source</a>
 </div>
 <div class="function-detail" id="raise-1">
 <div class="function-header">
@@ -313,8 +365,142 @@ everywhere automatically.</p>
 <div class="signature"><code><span class="sig-name">raise</span><span class="sig-paren">(</span>message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Never</span></code></div>
 <div class="function-doc">
 <p>Raises a runtime error with the provided message.</p>
+<p>This is the low-level string form. The surface <code>raise</code> keyword is
+Error-aware (Phase 1.4): <code>raise &quot;boom&quot;</code> desugars to
+<code>Kernel.do_raise(%RuntimeError{message: &quot;boom&quot;})</code> and <code>raise %E{...}</code>
+desugars to <code>Kernel.do_raise(%E{...})</code>, routing through <code>do_raise/1</code>
+so the abort carries the value's programmatic <code>Error.kind</code> tag.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L357">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L384">Source</a>
+</div>
+<div class="function-detail" id="do_raise-1">
+<div class="function-header">
+<h3>do_raise<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#do_raise-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">do_raise</span><span class="sig-paren">(</span>error_value<span class="sig-separator">::</span><span class="sig-type-pill">Error</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Never</span></code></div>
+<div class="function-doc">
+<p>Error-aware abort backing the surface <code>raise</code> keyword (Phase 1.4).</p>
+<p>Accepts any value whose type implements the <code>Error</code> protocol,
+extracts its presentable <code>Error.message/1</code> and programmatic
+<code>Error.kind/1</code> (rendered as a string), and aborts the process
+non-zero, printing <code>** (&lt;kind&gt;) &lt;message&gt;</code> to stderr.</p>
+<p>The compiler's <code>raise</code> desugar (<code>src/desugar.zig</code>) lowers both the
+<code>raise &quot;string&quot;</code> shorthand (after wrapping the string in a
+<code>%RuntimeError{...}</code>) and the <code>raise %CustomError{...}</code> form to a
+call of this function. Returns <code>Never</code> — it does not return.</p>
+<p>Phase 2 extends the abort with backtrace capture and a structured
+crash report; Phase 1.4 is intentionally message-only.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L405">Source</a>
+</div>
+<div class="function-detail" id="abort_recoverable_raise-0">
+<div class="function-header">
+<h3>abort_recoverable_raise<span class="arity">/0</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#abort_recoverable_raise-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">abort_recoverable_raise</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Never</span></code></div>
+<div class="function-doc">
+<p>Unhandled-<code>raise</code> terminus (Phase 3.b cross-function propagation).</p>
+<p>When a <code>raise</code> propagates across function boundaries — as the
+<code>error.ZapRaise</code> tag the compiler returns from a <code>raises</code>-row function,
+with the boxed <code>Error</code> riding the thread-local side-channel — and
+reaches a frame that neither rescues nor further propagates it (the
+top-level <code>main</code>, which cannot return an error union), the compiler
+routes the call-site <code>catch</code> here. It recovers the stashed <code>Error</code> from
+the side-channel and aborts through <code>do_raise/1</code>, producing the same
+Phase 2 crash report (<code>** (kind) message</code> + backtrace) an unrecovered
+<code>raise</code> would. Diverges (<code>Never</code>).</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L425">Source</a>
+</div>
+<div class="function-detail" id="recoverable_raise-1">
+<div class="function-header">
+<h3>recoverable_raise<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#recoverable_raise-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">recoverable_raise</span><span class="sig-paren">(</span>error_value<span class="sig-separator">::</span><span class="sig-type-pill">Error</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Nil</span></code></div>
+<div class="function-doc">
+<p>Recoverable raise sink backing a <code>raise</code> lexically inside a
+<code>try { … } rescue { … }</code> body (Phase 3.a).</p>
+<p>Unlike <code>do_raise/1</code> — which renders the error and aborts via the
+crash printer — this stashes the full <code>Error</code> value into the
+runtime's raise side-channel and sets the pending flag. Control then
+returns to the <code>try</code> body, which immediately hits the handler landing
+pad the compiler emits after the body (<code>Kernel.raise_occurred()</code>):
+seeing the flag set, it recovers the value and dispatches it through
+the <code>rescue</code> arms. The compiler's HIR <code>raise</code> lowering
+(<code>src/hir.zig</code>) selects this sink over <code>do_raise/1</code> whenever a <code>try</code>
+scope is active; outside any handler the abort path is kept so an
+unhandled <code>raise</code> still produces the Phase 2 crash report.</p>
+<p>Returns <code>Nil</code> (not <code>Never</code>): the recoverable path's non-local exit is
+realized by the compiler-emitted landing-pad branch, not by this
+function diverging — so it must be allowed to return after stashing.
+The compiler-emitted handler landing pad (<code>Kernel.raise_occurred()</code> test
+after the body) is what actually diverts control to the <code>rescue</code> arms.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L451">Source</a>
+</div>
+<div class="function-detail" id="raise_occurred-0">
+<div class="function-header">
+<h3>raise_occurred<span class="arity">/0</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#raise_occurred-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">raise_occurred</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>True when a <code>recoverable_raise</code> has fired in the current <code>try</code> body and
+has not yet been consumed by a handler (Phase 3.a). The compiler emits
+a test of this immediately after a <code>try</code> body to decide whether to run
+the <code>rescue</code> arms or yield the body's normal value. Internal compiler
+support for <code>try</code>/<code>rescue</code>; not intended for direct use.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L464">Source</a>
+</div>
+<div class="function-detail" id="take_recoverable_raise-0">
+<div class="function-header">
+<h3>take_recoverable_raise<span class="arity">/0</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#take_recoverable_raise-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">take_recoverable_raise</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Error</span></code></div>
+<div class="function-doc">
+<p>Read and clear the pending recoverable-raise <code>Error</code> value (Phase 3.a).
+The compiler's <code>try</code>/<code>rescue</code> lowering calls this in the handler landing
+pad to recover the raised value and pattern-match it against the <code>rescue</code>
+arms. Internal compiler support for <code>try</code>/<code>rescue</code>; not intended for
+direct use.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L476">Source</a>
+</div>
+<div class="function-detail" id="peek_recoverable_raise-0">
+<div class="function-header">
+<h3>peek_recoverable_raise<span class="arity">/0</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#peek_recoverable_raise-0" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">peek_recoverable_raise</span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Error</span></code></div>
+<div class="function-doc">
+<p>Read the pending recoverable-raise <code>Error</code> value WITHOUT clearing the
+side-channel or the captured error-return trace (Phase 4.a, ERT display).</p>
+<p>Used only by <code>abort_recoverable_raise/0</code>: the unhandled-<code>raise</code> terminus
+needs the boxed value to render the <code>** (kind) message</code> crash header, but
+must leave the error-return trace — captured at the raise origin in
+<code>recoverable_raise/1</code> — intact so the crash printer can render the c→b→a
+propagation chain. The process aborts immediately after, so not clearing
+is safe (the rescue path uses <code>take_recoverable_raise/0</code>, which clears).
+Internal compiler support; not intended for direct use.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L493">Source</a>
 </div>
 <div class="function-detail" id="sleep-1">
 <div class="function-header">
@@ -332,7 +518,7 @@ rate limiting, and timed delays.</p>
 <pre><code class="language-zap">sleep(<span class="hl-number">100</span>)    <span class="hl-comment"># pause for 100ms</span>
 sleep(<span class="hl-number">1000</span>)   <span class="hl-comment"># pause for 1 second</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L373">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L509">Source</a>
 </div>
 <div class="function-detail" id="to_string-1">
 <div class="function-header">
@@ -352,7 +538,7 @@ atoms, strings, and structs.</p>
 to_string(<span class="hl-builtin">true</span>)     <span class="hl-comment"># =&gt; &quot;true&quot;</span>
 to_string(<span class="hl-atom">:hello</span>)   <span class="hl-comment"># =&gt; &quot;hello&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L391">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L527">Source</a>
 </div>
 <div class="function-detail" id="inspect-1">
 <div class="function-header">
@@ -371,7 +557,7 @@ debugging or examples that need a value rendered.</p>
 Kernel.inspect(<span class="hl-builtin">true</span>)     <span class="hl-comment"># prints &quot;true\n&quot;</span>
 Kernel.inspect(<span class="hl-atom">:hello</span>)   <span class="hl-comment"># prints &quot;hello\n&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L408">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L544">Source</a>
 </div>
 <h2>Macro Details</h2>
 <div class="function-detail" id="if-2">
@@ -391,7 +577,7 @@ Returns <code>nil</code> if the condition is false.</p>
   <span class="hl-string">"positive"</span>
 }</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L27">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L48">Source</a>
 </div>
 <div class="function-detail" id="if-3">
 <div class="function-header">
@@ -412,7 +598,7 @@ Returns <code>nil</code> if the condition is false.</p>
   <span class="hl-string">"non-positive"</span>
 }</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L51">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L72">Source</a>
 </div>
 <div class="function-detail" id="unless-2">
 <div class="function-header">
@@ -429,7 +615,7 @@ Returns <code>nil</code> if the condition is false.</p>
   IO.puts(<span class="hl-string">"still working..."</span>)
 }</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L70">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L91">Source</a>
 </div>
 <div class="function-detail" id="and-2">
 <div class="function-header">
@@ -448,7 +634,7 @@ Otherwise evaluates and returns the right operand.</p>
 <span class="hl-builtin">true</span> <span class="hl-keyword">and</span> <span class="hl-builtin">false</span>   <span class="hl-comment"># =&gt; false</span>
 <span class="hl-builtin">false</span> <span class="hl-keyword">and</span> expr   <span class="hl-comment"># =&gt; false (expr not evaluated)</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L91">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L112">Source</a>
 </div>
 <div class="function-detail" id="or-2">
 <div class="function-header">
@@ -467,7 +653,7 @@ Otherwise evaluates and returns the right operand.</p>
 <span class="hl-builtin">false</span> <span class="hl-keyword">or</span> <span class="hl-builtin">false</span>  <span class="hl-comment"># =&gt; false</span>
 <span class="hl-builtin">true</span> <span class="hl-keyword">or</span> expr    <span class="hl-comment"># =&gt; true (expr not evaluated)</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L113">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L134">Source</a>
 </div>
 <div class="function-detail" id="fn-1">
 <div class="function-header">
@@ -484,7 +670,7 @@ Identity transform — provides a hook point for future
 customization such as validation, instrumentation, or
 compile-time checks.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L131">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L152">Source</a>
 </div>
 <div class="function-detail" id="struct-1">
 <div class="function-header">
@@ -499,7 +685,7 @@ compile-time checks.</p>
 <p>Receives the full struct declaration AST and returns it.
 Identity transform — hook point for future customization.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L142">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L163">Source</a>
 </div>
 <div class="function-detail" id="union-1">
 <div class="function-header">
@@ -514,7 +700,7 @@ Identity transform — hook point for future customization.</p>
 <p>Receives the full union declaration AST and returns it.
 Identity transform — hook point for future customization.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L153">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L174">Source</a>
 </div>
 <div class="function-detail" id="sigil_s-2">
 <div class="function-header">
@@ -532,7 +718,7 @@ Lowercase sigils allow <code>\#{}</code> interpolation.</p>
 <pre><code class="language-zap">~s<span class="hl-string">"hello"</span>         <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
 ~s<span class="hl-string">"count: \#{42}"</span> <span class="hl-comment"># =&gt; &quot;count: 42&quot;</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L171">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L192">Source</a>
 </div>
 <div class="function-detail" id="sigil_S-2">
 <div class="function-header">
@@ -550,7 +736,7 @@ Uppercase sigils suppress interpolation.</p>
 <pre><code class="language-zap">~S<span class="hl-string">"hello"</span>          <span class="hl-comment"># =&gt; &quot;hello&quot;</span>
 ~S<span class="hl-string">"no \#{interp}"</span>   <span class="hl-comment"># =&gt; &quot;no \#{interp}&quot; (literal)</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L187">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L208">Source</a>
 </div>
 <div class="function-detail" id="sigil_w-2">
 <div class="function-header">
@@ -568,7 +754,7 @@ Lowercase allows <code>\#{}</code> interpolation before splitting.</p>
 <pre><code class="language-zap">~w<span class="hl-string">"foo bar baz"</span>  <span class="hl-comment"># =&gt; [&quot;foo&quot;, &quot;bar&quot;, &quot;baz&quot;]</span>
 ~w<span class="hl-string">"hello world"</span>  <span class="hl-comment"># =&gt; [&quot;hello&quot;, &quot;world&quot;]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L203">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L224">Source</a>
 </div>
 <div class="function-detail" id="sigil_W-2">
 <div class="function-header">
@@ -585,7 +771,7 @@ Uppercase suppresses <code>\#{}</code> interpolation.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap">~W<span class="hl-string">"foo bar baz"</span>  <span class="hl-comment"># =&gt; [&quot;foo&quot;, &quot;bar&quot;, &quot;baz&quot;]</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L220">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L241">Source</a>
 </div>
 <div class="function-detail" id="|>-2">
 <div class="function-header">
@@ -604,7 +790,7 @@ to the function call on the right.</p>
 <span class="hl-string">"hello"</span> <span class="hl-op">|&gt;</span> <span class="hl-type">String</span>.length()  <span class="hl-comment"># =&gt; String.length(&quot;hello&quot;)</span>
 x <span class="hl-op">|&gt;</span> f() <span class="hl-op">|&gt;</span> g()            <span class="hl-comment"># =&gt; g(f(x))</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L239">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L260">Source</a>
 </div>
 <div class="function-detail" id="<>-2">
 <div class="function-header">
@@ -625,7 +811,7 @@ so users can override <code>&lt;&gt;</code> for their own types directly.</p>
 [<span class="hl-number">1</span>, <span class="hl-number">2</span>] <span class="hl-op">&lt;&gt;</span> [<span class="hl-number">3</span>, <span class="hl-number">4</span>]       <span class="hl-comment"># List</span>
 %{a: <span class="hl-number">1</span>} <span class="hl-op">&lt;&gt;</span> %{b: <span class="hl-number">2</span>}     <span class="hl-comment"># Map</span></code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L261">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/kernel.zap#L282">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -644,6 +830,12 @@ so users can override <code>&lt;&gt;</code> for their own types directly.</p>
 <li><a href="#is_map?-1">is_map?/1</a></li>
 <li><a href="#is_struct?-1">is_struct?/1</a></li>
 <li><a href="#raise-1">raise/1</a></li>
+<li><a href="#do_raise-1">do_raise/1</a></li>
+<li><a href="#abort_recoverable_raise-0">abort_recoverable_raise/0</a></li>
+<li><a href="#recoverable_raise-1">recoverable_raise/1</a></li>
+<li><a href="#raise_occurred-0">raise_occurred/0</a></li>
+<li><a href="#take_recoverable_raise-0">take_recoverable_raise/0</a></li>
+<li><a href="#peek_recoverable_raise-0">peek_recoverable_raise/0</a></li>
 <li><a href="#sleep-1">sleep/1</a></li>
 <li><a href="#to_string-1">to_string/1</a></li>
 <li><a href="#inspect-1">inspect/1</a></li>

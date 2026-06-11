@@ -48,6 +48,8 @@
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
 <ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
 <li><a href="../structs/Atom.html">Atom</a></li>
 <li><a href="../structs/Bool.html">Bool</a></li>
 <li><a href="../structs/Enum.html">Enum</a></li>
@@ -55,25 +57,43 @@
 <li><a href="../structs/Float.html">Float</a></li>
 <li><a href="../structs/Function.html">Function</a></li>
 <li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
 <li><a href="../structs/Integer.html">Integer</a></li>
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
 <li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
 <li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li class="active"><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
 <li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
@@ -82,10 +102,13 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
 <ul>
 <li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
 <li><a href="../structs/Comparator.html">Comparator</a></li>
 <li><a href="../structs/Concatenable.html">Concatenable</a></li>
 <li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
 <li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
 <li><a href="../structs/Stringable.html">Stringable</a></li>
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
@@ -94,6 +117,8 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
 <ul>
 <li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
 </ul>
 </div>
 <div class="sidebar-group" data-group="Guides">
@@ -117,12 +142,13 @@
 <p class="tagline">Zest test framework.</p>
 <div class="structdoc">
 <p>Zest test framework.</p>
-<p>For test cases: <code>use Zest.Case</code> (provides assert/reject + describe/test DSL).
-For test runner: <code>use Zest.Runner</code> (provides summary).</p>
-<p>This struct provides standalone assert and reject functions
-with non-fatal test tracking via <code>:zig.TestTracker</code>. Failed
-assertions mark the current test as failed and return &quot;F&quot;
-but do not stop execution.</p>
+<p>For test cases: <code>use Zest.Case</code> provides the <code>test/case</code> DSL plus
+macro-backed <code>assert</code> and <code>reject</code>.</p>
+<p>For test runners: <code>use Zest.Runner</code> provides test discovery and
+summary reporting.</p>
+<p>This struct keeps standalone <code>Zest.assert</code> and <code>Zest.reject</code>
+compatibility for callers that use the assertion tracker directly.
+The richer source-aware assertion diagnostics live in <code>Zest.Case</code>.</p>
 </div>
 <h2 id="functions">Functions</h2>
 <table class="summary">
@@ -142,11 +168,11 @@ but do not stop execution.</p>
 <div class="signature"><code><span class="sig-name">assert</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Asserts that a boolean value is <code>true</code>.</p>
-<p>On success, increments the assertion pass counter and
-returns &quot;.&quot;. On failure, increments the assertion fail
-counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
+<p>On success, increments the assertion pass counter and returns &quot;.&quot;.
+On failure, increments the assertion fail counter, records a
+message, and returns &quot;F&quot;.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest.zap#L22">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest.zap#L24">Source</a>
 </div>
 <div class="function-detail" id="assert-2">
 <div class="function-header">
@@ -158,11 +184,11 @@ counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
 <div class="signature"><code><span class="sig-name">assert</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Asserts that a boolean value is <code>true</code> with a custom message.</p>
-<p>On success, increments the assertion pass counter and
-returns &quot;.&quot;. On failure, increments the assertion fail
-counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
+<p>On success, increments the assertion pass counter and returns &quot;.&quot;.
+On failure, increments the assertion fail counter, records the
+message, and returns &quot;F&quot;.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest.zap#L34">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest.zap#L36">Source</a>
 </div>
 <div class="function-detail" id="reject-1">
 <div class="function-header">
@@ -174,11 +200,11 @@ counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
 <div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Asserts that a boolean value is <code>false</code>.</p>
-<p>On success, increments the assertion pass counter and
-returns &quot;.&quot;. On failure, increments the assertion fail
-counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
+<p>On success, increments the assertion pass counter and returns &quot;.&quot;.
+On failure, increments the assertion fail counter, records a
+message, and returns &quot;F&quot;.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest.zap#L46">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest.zap#L48">Source</a>
 </div>
 <div class="function-detail" id="reject-2">
 <div class="function-header">
@@ -190,11 +216,11 @@ counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
 <div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">, </span>message<span class="sig-separator">::</span><span class="sig-type-pill">String</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
 <div class="function-doc">
 <p>Asserts that a boolean value is <code>false</code> with a custom message.</p>
-<p>On success, increments the assertion pass counter and
-returns &quot;.&quot;. On failure, increments the assertion fail
-counter and returns &quot;F&quot;. Execution continues (non-fatal).</p>
+<p>On success, increments the assertion pass counter and returns &quot;.&quot;.
+On failure, increments the assertion fail counter, records the
+message, and returns &quot;F&quot;.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest.zap#L58">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest.zap#L60">Source</a>
 </div>
 </main>
 <aside class="toc">

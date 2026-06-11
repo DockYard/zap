@@ -37,6 +37,10 @@ pub struct RecursionTest {
     test("sum of 5") {
       assert(sum(5) == 15)
     }
+
+    test("tail recursive countdown reaches zero") {
+      assert(countdown(10) == 0)
+    }
   }
 
   pub struct LoopState {
@@ -95,5 +99,13 @@ pub struct RecursionTest {
 
   fn sum(n :: i64) -> i64 {
     n + sum(n - 1)
+  }
+
+  fn countdown(0 :: i64) -> i64 {
+    0
+  }
+
+  fn countdown(n :: i64) -> i64 {
+    countdown(n - 1)
   }
 }

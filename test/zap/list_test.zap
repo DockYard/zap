@@ -19,6 +19,9 @@ pub struct Zap.ListTest {
     test("take") { assert(List.length(List.take([1, 2, 3, 4, 5], 3)) == 3) }
     test("drop") { assert(List.head(List.drop([1, 2, 3, 4, 5], 2)) == 3) }
     test("uniq") { assert(List.length(List.uniq([1, 2, 2, 3, 1])) == 3) }
+    test("fixed-length pattern sums list") { assert(sum_three([10, 20, 12]) == 42) }
+    test("recursive sum with cons pattern") { assert(sum_all([10, 20, 12]) == 42) }
+    test("recursive length with cons pattern") { assert(length_recursive([1, 2, 3, 4, 5]) == 5) }
   }
 
   describe("String lists") {
@@ -83,6 +86,66 @@ pub struct Zap.ListTest {
 
   fn score_three_head_rest(_ :: [i64]) -> i64 {
     -1
+  }
+
+  fn sum_three(values :: [i64]) -> i64 {
+    case values {
+      [a, b, c] -> a + b + c
+      _ -> 0
+    }
+  }
+
+  fn sum_all([] :: [i64]) -> i64 {
+    0
+  }
+
+  fn sum_all([head | tail] :: [i64]) -> i64 {
+    head + sum_all(tail)
+  }
+
+  fn length_recursive([] :: [i64]) -> i64 {
+    0
+  }
+
+  fn length_recursive([_ | tail] :: [i64]) -> i64 {
+    1 + length_recursive(tail)
+  }
+
+  describe("Keyword list sugar") {
+    test("single keyword pattern extracts value") {
+      assert(get_name([name: "Brian"]) == "Brian")
+    }
+
+    test("multiple keyword pattern extracts later key") {
+      assert(get_age([name: "Brian", age: 42]) == 42)
+    }
+
+    test("assigned keyword list matches in case") {
+      options = [greeting: "Hello", name: "World"]
+
+      assert(greeting(options) == "Hello, World!")
+    }
+  }
+
+  fn get_name(options :: [{Atom, String}]) -> String {
+    case options {
+      [name: name] -> name
+      _ -> "unknown"
+    }
+  }
+
+  fn get_age(options :: [{Atom, i64}]) -> i64 {
+    case options {
+      [name: _, age: age] -> age
+      _ -> 0
+    }
+  }
+
+  fn greeting(options :: [{Atom, String}]) -> String {
+    case options {
+      [greeting: greeting, name: name] -> greeting <> ", " <> name <> "!"
+      _ -> "no match"
+    }
   }
 
   describe("Bang variants") {

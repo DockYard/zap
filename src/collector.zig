@@ -464,18 +464,37 @@ pub const Collector = struct {
         // arity already carries is not appended twice.
         if (pending_attrs.items.len > 0) {
             const parent = self.graph.getScopeMut(parent_scope);
+            var visited_families: std.ArrayListUnmanaged(scope.FunctionFamilyId) = .empty;
+            defer visited_families.deinit(self.allocator);
+
             for (func.clauses) |clause| {
                 const arity: u32 = @intCast(clause.params.len);
                 const key = scope.FamilyKey{ .name = func.name, .arity = arity };
                 if (parent.function_families.get(key)) |fid| {
+                    if (functionFamilyIdSeen(visited_families.items, fid)) continue;
+                    try visited_families.append(self.allocator, fid);
+
                     const family = self.graph.getFamilyMut(fid);
                     for (pending_attrs.items) |attr| {
-                        if (familyHasAttribute(family, attr.name, self.interner)) continue;
-                        try family.attributes.append(self.allocator, attr);
+                        try self.appendFunctionFamilyAttribute(family, attr, clause.meta.span);
                     }
                 }
             }
         }
+    }
+
+    fn functionFamilyIdSeen(ids: []const scope.FunctionFamilyId, target: scope.FunctionFamilyId) bool {
+        for (ids) |id| {
+            if (id == target) return true;
+        }
+        return false;
+    }
+
+    fn macroFamilyIdSeen(ids: []const scope.MacroFamilyId, target: scope.MacroFamilyId) bool {
+        for (ids) |id| {
+            if (id == target) return true;
+        }
+        return false;
     }
 
     /// True when `family` already carries an attribute named `name` — used to
@@ -483,11 +502,73 @@ pub const Collector = struct {
     /// repeat an arity, or when the cross-arity `@available_on` broadcast
     /// reaches a family that already declared the gate itself).
     fn familyHasAttribute(family: *const scope.FunctionFamily, name: ast.StringId, interner: *const ast.StringInterner) bool {
+        return attributeListHasName(family.attributes.items, name, interner);
+    }
+
+    fn macroFamilyHasAttribute(family: *const scope.MacroFamily, name: ast.StringId, interner: *const ast.StringInterner) bool {
+        return attributeListHasName(family.attributes.items, name, interner);
+    }
+
+    fn attributeListHasName(attributes: []const scope.Attribute, name: ast.StringId, interner: *const ast.StringInterner) bool {
         const target = interner.get(name);
-        for (family.attributes.items) |existing| {
+        for (attributes) |existing| {
             if (std.mem.eql(u8, interner.get(existing.name), target)) return true;
         }
         return false;
+    }
+
+    fn isDocAttribute(self: *const Collector, name: ast.StringId) bool {
+        return std.mem.eql(u8, self.interner.get(name), "doc");
+    }
+
+    fn attributeDiagnosticSpan(attr: scope.Attribute, fallback: ast.SourceSpan) ast.SourceSpan {
+        return if (attr.value) |value| value.getMeta().span else fallback;
+    }
+
+    fn addDuplicateDocError(
+        self: *Collector,
+        kind: []const u8,
+        name: ast.StringId,
+        arity: u32,
+        attr: scope.Attribute,
+        fallback_span: ast.SourceSpan,
+    ) !void {
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "duplicate @doc for {s} `{s}/{d}` — document the {s} family once; pattern-matching clauses share that documentation",
+            .{ kind, self.interner.get(name), arity, kind },
+        );
+        try self.addError(msg, attributeDiagnosticSpan(attr, fallback_span));
+    }
+
+    fn appendFunctionFamilyAttribute(
+        self: *Collector,
+        family: *scope.FunctionFamily,
+        attr: scope.Attribute,
+        fallback_span: ast.SourceSpan,
+    ) !void {
+        if (!familyHasAttribute(family, attr.name, self.interner)) {
+            try family.attributes.append(self.allocator, attr);
+            return;
+        }
+        if (self.isDocAttribute(attr.name)) {
+            try self.addDuplicateDocError("function", family.name, family.arity, attr, fallback_span);
+        }
+    }
+
+    fn appendMacroFamilyAttribute(
+        self: *Collector,
+        family: *scope.MacroFamily,
+        attr: scope.Attribute,
+        fallback_span: ast.SourceSpan,
+    ) !void {
+        if (!macroFamilyHasAttribute(family, attr.name, self.interner)) {
+            try family.attributes.append(self.allocator, attr);
+            return;
+        }
+        if (self.isDocAttribute(attr.name)) {
+            try self.addDuplicateDocError("macro", family.name, family.arity, attr, fallback_span);
+        }
     }
 
     /// Broadcast every `@available_on` capability gate across ALL arities of
@@ -553,12 +634,19 @@ pub const Collector = struct {
         // Macro families are stored on the ScopeGraph, indexed via the Scope's macro_families map
         if (pending_attrs.items.len > 0) {
             if (mac.clauses.len > 0) {
-                const arity: u32 = @intCast(mac.clauses[0].params.len);
-                const key = scope.FamilyKey{ .name = mac.name, .arity = arity };
                 const parent = self.graph.getScopeMut(parent_scope);
-                if (parent.macros.get(key)) |mid| {
+                var visited_families: std.ArrayListUnmanaged(scope.MacroFamilyId) = .empty;
+                defer visited_families.deinit(self.allocator);
+
+                for (mac.clauses) |clause| {
+                    const arity: u32 = @intCast(clause.params.len);
+                    const key = scope.FamilyKey{ .name = mac.name, .arity = arity };
+                    const mid = parent.macros.get(key) orelse continue;
+                    if (macroFamilyIdSeen(visited_families.items, mid)) continue;
+                    try visited_families.append(self.allocator, mid);
+
                     for (pending_attrs.items) |attr| {
-                        try self.graph.macro_families.items[mid].attributes.append(self.allocator, attr);
+                        try self.appendMacroFamilyAttribute(&self.graph.macro_families.items[mid], attr, clause.meta.span);
                         // `@requires` was historically a hand-written
                         // capability declaration. The compiler now infers
                         // each macro's capability set from its call graph
@@ -1439,6 +1527,84 @@ test "collect function family grouping" {
     try std.testing.expectEqual(@as(usize, 1), collector.graph.families.items.len);
     // Family should have 2 clauses
     try std.testing.expectEqual(@as(usize, 2), collector.graph.families.items[0].clauses.items.len);
+}
+
+test "duplicate @doc on same function family produces error" {
+    const source =
+        \\pub struct Test {
+        \\  @doc = """
+        \\    Computes factorial.
+        \\    """
+        \\
+        \\  pub fn factorial(0 :: i64) -> i64 {
+        \\    1
+        \\  }
+        \\
+        \\  @doc = """
+        \\    Computes factorial differently.
+        \\    """
+        \\
+        \\  pub fn factorial(n :: i64) -> i64 {
+        \\    n * factorial(n - 1)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    try std.testing.expect(collector.errors.items.len > 0);
+    const err_msg = collector.errors.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "duplicate @doc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "factorial/1") != null);
+}
+
+test "duplicate @doc on same macro family produces error" {
+    const source =
+        \\pub struct Test {
+        \\  @doc = """
+        \\    Picks an expression.
+        \\    """
+        \\
+        \\  pub macro pick(:ok :: Atom) -> Expr {
+        \\    quote { "ok" }
+        \\  }
+        \\
+        \\  @doc = """
+        \\    Picks a fallback expression.
+        \\    """
+        \\
+        \\  pub macro pick(_value :: Expr) -> Expr {
+        \\    quote { "other" }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    try std.testing.expect(collector.errors.items.len > 0);
+    const err_msg = collector.errors.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "duplicate @doc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "pick/1") != null);
 }
 
 test "collect case expression creates scopes" {

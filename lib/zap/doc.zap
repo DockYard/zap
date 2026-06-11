@@ -72,21 +72,6 @@ pub struct Zap.Doc {
   }
 
   @doc = """
-    Render the "Implements" row when a type satisfies one or more
-    protocols. Each protocol becomes an accent-bordered link pill
-    pointing at its reference page. Returns the empty string for an
-    empty list so the caller can splice unconditionally.
-    """
-
-  @doc = """
-    Render one accent-bordered "Implements" link pill for a single
-    protocol. The eventual `implements_row/1` builder will fold over
-    a list of protocol names, splicing each link into the row body —
-    parked while a list-element type-inference snag in the recursive
-    fold path is sorted out in a follow-up commit.
-    """
-
-  @doc = """
     Build the anchor id for a function or macro entry. The convention is
     `<name>-<arity>`; the renderer uses this both for the `id="..."`
     attribute on a function detail block and for the `href="#..."` of
@@ -96,14 +81,6 @@ pub struct Zap.Doc {
   pub fn anchor_id(name :: String, arity :: i64) -> String {
     name <> "-" <> Integer.to_string(arity)
   }
-
-  @doc = """
-    Render the header row at the top of a function or macro detail
-    block: an `<h3>` with the qualified name and a muted `/arity`
-    span, a small kind badge (`fn` for functions, `macro` for
-    macros), a flex-spacer, and a `#`-prefixed anchor link that
-    deep-links back to this entry.
-    """
 
   @doc = """
     Render a single row in the per-struct summary table — name+arity
@@ -132,18 +109,6 @@ pub struct Zap.Doc {
   pub fn signature_block(signature :: String) -> String {
     "<div class=\"signature\"><code>" <> escape_html(signature) <> "</code></div>\n"
   }
-
-  @doc = """
-    Render a complete per-function detail block — the section that
-    appears under "Function Details" on each module page. Composes
-    the header, all clause signatures, and the doc body (already
-    rendered to HTML by `Markdown.to_html/1`).
-
-    `signatures` is a list of pre-rendered Zap-syntax signature
-    strings, one per clause (multi-clause functions get multiple
-    panels stacked). `doc_html` is the markdown-rendered prose;
-    callers pass `Markdown.to_html(func.doc)`.
-    """
 
   @doc = """
     Render one `<li>` row in a sidebar group's struct list. The active
@@ -367,24 +332,6 @@ pub struct Zap.Doc {
   }
 
   @doc = """
-    Render the entire left sidebar — three potential groups
-    (`Structs`, `Protocols`, `Unions`), each only emitted when its
-    members list is non-empty. `current` is the active module's name
-    (`""` from non-module pages); `base` is the path prefix to the
-    docs root.
-    """
-
-  @doc = """
-    Wrap the page chrome around a fully-composed main column. The
-    layout is a CSS grid with `<nav class="sidebar">` on the left,
-    `<main class="content">` in the middle, and an optional
-    `<aside class="toc">` (the right rail) on the right. When the
-    page has no anchorable entries, pass `""` for the rail and the
-    `layout-no-toc` modifier collapses the grid to two columns so
-    the content fills the freed space.
-    """
-
-  @doc = """
     Compose the main column of a module's reference page from its
     pre-rendered child strings:
 
@@ -410,18 +357,6 @@ pub struct Zap.Doc {
     details = function_details_section("Function Details", functions_details) <> function_details_section("Macro Details", macros_details)
     head <> structdoc <> summaries <> details
   }
-
-  @doc = """
-    Compose a complete struct/protocol/union reference page from its
-    parts. Wraps the chrome (`page_open`, `topbar`, `layout`,
-    `page_close`) around a pre-rendered sidebar HTML, main content,
-    and optional right-rail HTML.
-
-    `title` populates the `<title>` element; pass the module's name.
-    `base` is the path prefix from this page to the docs root
-    (`"../"` from a struct page, `""` from the index).
-    `source_url` is the GitHub repo URL (`""` to omit the GH icon).
-    """
 
   @doc = """
     Render summary table rows from a list of `{name, arity, summary}`
@@ -479,6 +414,12 @@ pub struct Zap.Doc {
     }
   }
 
+  @doc = """
+    Compose a complete struct/protocol/union reference page from its
+    parts. Wraps the chrome around pre-rendered sidebar, main content,
+    and optional right-rail HTML.
+    """
+
   pub fn struct_page(project_name :: String, project_version :: String, title :: String, base :: String, source_url :: String, sidebar_html :: String, content_html :: String, rail_html :: String) -> String {
     struct_page_with_tabs(project_name, project_version, title, base, source_url, sidebar_html, content_html, rail_html, :none, "", "")
   }
@@ -499,6 +440,11 @@ pub struct Zap.Doc {
     head <> bar <> body <> tail
   }
 
+  @doc = """
+    Wrap the page chrome around a fully-composed main column. Pass an
+    empty right rail to collapse the grid to the no-TOC layout.
+    """
+
   pub fn layout(sidebar_html :: String, content_html :: String, rail_html :: String) -> String {
     has_rail = String.length(rail_html) > 0
     open_div = if has_rail {
@@ -509,6 +455,11 @@ pub struct Zap.Doc {
     main_html = "<main class=\"content\">\n" <> content_html <> "</main>\n"
     open_div <> sidebar_html <> main_html <> rail_html <> "</div>\n"
   }
+
+  @doc = """
+    Render the entire left sidebar. Struct, protocol, union, and guide
+    groups are emitted only when their member lists are non-empty.
+    """
 
   pub fn sidebar(structs :: [String], protocols :: [String], unions :: [String], guides :: [String], current :: String, base :: String, project_name :: String, project_version :: String) -> String {
     structs_group = if List.empty?(structs) {
@@ -625,6 +576,11 @@ pub struct Zap.Doc {
     open <> header <> results <> footer_top <> "</div>\n</div>\n"
   }
 
+  @doc = """
+    Render a complete per-function detail block. Composes the header,
+    all clause signatures, and the already-rendered doc body.
+    """
+
   pub fn function_detail(name :: String, arity :: i64, is_macro :: Bool, signatures :: [String], doc_html :: String) -> String {
     sig_blocks = for sig <- signatures {
       signature_block(sig)
@@ -640,6 +596,11 @@ pub struct Zap.Doc {
     open_div <> header <> sigs <> body <> "</div>\n"
   }
 
+  @doc = """
+    Render the header row at the top of a function or macro detail
+    block: qualified name, muted `/arity`, kind badge, and anchor link.
+    """
+
   pub fn function_header(name :: String, arity :: i64, is_macro :: Bool) -> String {
     badge = if is_macro { "macro" } else { "fn" }
     anchor = anchor_id(name, arity)
@@ -650,6 +611,10 @@ pub struct Zap.Doc {
     anchor_link = "<a href=\"#" <> anchor <> "\" class=\"anchor-link\">#</a>\n"
     open_div <> h3 <> badge_span <> spacer <> anchor_link <> "</div>\n"
   }
+
+  @doc = """
+    Render one accent-bordered "Implements" link pill for a protocol.
+    """
 
   pub fn implements_link(name :: String) -> String {
     safe = escape_html(name)
@@ -1900,13 +1865,6 @@ pub struct Zap.Doc {
   }
 
   @doc = """
-    Recursively pull `:name` from each summary, accumulating into a
-    list of strings. Used to build the sidebar name lists from a
-    single-pass walk so callers don't have to maintain three parallel
-    arrays of names alongside their summaries.
-    """
-
-  @doc = """
     Insertion-sort a list of qualified-name strings into ascending
     alphabetical order. Used so the sidebar groups (`Structs`,
     `Protocols`, `Unions`) and the index page list members in a
@@ -1948,6 +1906,11 @@ pub struct Zap.Doc {
       list_concat_strings(List.push(left, List.head(right)), List.tail(right))
     }
   }
+
+  @doc = """
+    Recursively pull `:name` from each summary, accumulating into a
+    list of strings used for sorted sidebar and index navigation.
+    """
 
   pub fn manifest_names(summaries :: [%{Atom => Term}], acc :: [String]) -> [String] {
     if List.empty?(summaries) {

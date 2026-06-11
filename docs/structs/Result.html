@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Result — Zap</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search structs, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group" data-group="Structs">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
+<ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
+<li><a href="../structs/Atom.html">Atom</a></li>
+<li><a href="../structs/Bool.html">Bool</a></li>
+<li><a href="../structs/Enum.html">Enum</a></li>
+<li><a href="../structs/File.html">File</a></li>
+<li><a href="../structs/Float.html">Float</a></li>
+<li><a href="../structs/Function.html">Function</a></li>
+<li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
+<li><a href="../structs/Integer.html">Integer</a></li>
+<li><a href="../structs/Kernel.html">Kernel</a></li>
+<li><a href="../structs/List.html">List</a></li>
+<li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
+<li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li class="active"><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
+<li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
+<li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
+<li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Protocols">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
+<ul>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Unions">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li class="active"><a href="../structs/Result.html">Result</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Guides">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Guides</h4></button>
+<ul>
+<li><a href="../guides/enum.html">Enum</a></li>
+<li><a href="../guides/integer.html">Integer</a></li>
+<li><a href="../guides/io.html">Io</a></li>
+<li><a href="../guides/list.html">List</a></li>
+<li><a href="../guides/string.html">String</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<nav class="breadcrumb" aria-label="Breadcrumb">
+<span>Unions</span>
+<span>/</span>
+<span class="breadcrumb-current">Result</span>
+</nav>
+<h1 class="page-title">Result</h1>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#tuple_to_result-1">tuple_to_result/1</a></td><td class="summary-doc">Migration shim (Phase 1.4): convert a legacy `{:ok, v}` / `{:error, e}`
+tuple into the canonical `Result` variants.</td></tr>
+<tr><td class="summary-name"><a href="#is_ok?-1">is_ok?/1</a></td><td class="summary-doc">Returns `true` when `r` is `Ok(...)`, `false` when it is
+`Error(...)`.</td></tr>
+<tr><td class="summary-name"><a href="#is_error?-1">is_error?/1</a></td><td class="summary-doc">Returns `true` when `r` is `Error(...)`, `false` when it is
+`Ok(...)`.</td></tr>
+<tr><td class="summary-name"><a href="#unwrap_or-2">unwrap_or/2</a></td><td class="summary-doc">Returns the payload of `Ok(...)`, or `default` when `r` is
+`Error(...)`.</td></tr>
+<tr><td class="summary-name"><a href="#map-2">map/2</a></td><td class="summary-doc">Applies `f` to the payload of an `Ok(...)` value, wrapping the
+result back in `Ok`.</td></tr>
+<tr><td class="summary-name"><a href="#map_error-2">map_error/2</a></td><td class="summary-doc">Applies `f` to the payload of an `Error(...)` value, wrapping
+the result back in `Error`.</td></tr>
+<tr><td class="summary-name"><a href="#and_then-2">and_then/2</a></td><td class="summary-doc">Monadic flatMap on `Ok(...)`: applies `f` to the success
+payload, returning whichever `Result` the function produces.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="tuple_to_result-1">
+<div class="function-header">
+<h3>tuple_to_result<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#tuple_to_result-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">tuple_to_result</span><span class="sig-paren">(</span>tuple<span class="sig-separator">::</span><span class="sig-type-pill">{Atom, payload}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Result(payload, payload)</span></code></div>
+<div class="function-doc">
+<p>Migration shim (Phase 1.4): convert a legacy <code>{:ok, v}</code> / <code>{:error, e}</code>
+tuple into the canonical <code>Result</code> variants.</p>
+<pre><code class="language-zap">tuple_to_result({<span class="hl-atom">:ok</span>, v})    <span class="hl-comment"># =&gt; Result.Ok(v)</span>
+tuple_to_result({<span class="hl-atom">:error</span>, e}) <span class="hl-comment"># =&gt; Result.Error(e)</span></code></pre>
+<p>Bare <code>{:ok, _}</code> / <code>{:error, _}</code> tuples are the pre-<code>Result</code> idiom for
+fallible outcomes. This shim bridges code that still produces them to
+the <code>Result(t, e)</code> type so it can flow through <code>?</code>, <code>~&gt;</code>, and the
+<code>Result.*</code> combinators. The compiler emits a warn-only deprecation
+lint on bare-tuple <code>{:ok, _}</code> / <code>{:error, _}</code> patterns pointing here.</p>
+<p>The success and failure payloads share one type parameter, so this
+shim applies to tuples whose <code>:ok</code> and <code>:error</code> payloads are the same
+type; heterogeneous tuples should construct <code>Result</code> variants directly.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Result.tuple_to_result({<span class="hl-atom">:ok</span>, <span class="hl-number">42</span>})
+<span class="hl-comment"># =&gt; Result(i64, i64).Ok(42)</span></code></pre>
+<pre><code class="language-zap">Result.tuple_to_result({<span class="hl-atom">:error</span>, <span class="hl-number">7</span>})
+<span class="hl-comment"># =&gt; Result(i64, i64).Error(7)</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/result.zap#L63">Source</a>
+</div>
+<div class="function-detail" id="is_ok?-1">
+<div class="function-header">
+<h3>is_ok?<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#is_ok?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_ok?</span><span class="sig-paren">(</span>r<span class="sig-separator">::</span><span class="sig-type-pill">Result(value, err)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns <code>true</code> when <code>r</code> is <code>Ok(...)</code>, <code>false</code> when it is
+<code>Error(...)</code>.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Result.is_ok?(Result(<span class="hl-type">i64</span>, ParseError).Ok(<span class="hl-number">42</span>))   <span class="hl-comment"># =&gt; true</span>
+Result.is_ok?(Result(<span class="hl-type">i64</span>, ParseError).Error(err)) <span class="hl-comment"># =&gt; false</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/result.zap#L80">Source</a>
+</div>
+<div class="function-detail" id="is_error?-1">
+<div class="function-header">
+<h3>is_error?<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#is_error?-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">is_error?</span><span class="sig-paren">(</span>r<span class="sig-separator">::</span><span class="sig-type-pill">Result(value, err)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Bool</span></code></div>
+<div class="function-doc">
+<p>Returns <code>true</code> when <code>r</code> is <code>Error(...)</code>, <code>false</code> when it is
+<code>Ok(...)</code>. Logical complement of <code>is_ok?/1</code>.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Result.is_error?(Result(<span class="hl-type">i64</span>, ParseError).Error(err)) <span class="hl-comment"># =&gt; true</span>
+Result.is_error?(Result(<span class="hl-type">i64</span>, ParseError).Ok(<span class="hl-number">42</span>))     <span class="hl-comment"># =&gt; false</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/result.zap#L97">Source</a>
+</div>
+<div class="function-detail" id="unwrap_or-2">
+<div class="function-header">
+<h3>unwrap_or<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#unwrap_or-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">unwrap_or</span><span class="sig-paren">(</span>r<span class="sig-separator">::</span><span class="sig-type-pill">Result(value, err)</span><span class="sig-paren">, </span>default<span class="sig-separator">::</span><span class="sig-type-pill">value</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">value</span></code></div>
+<div class="function-doc">
+<p>Returns the payload of <code>Ok(...)</code>, or <code>default</code> when <code>r</code> is
+<code>Error(...)</code>. The default must have the same type as the
+success payload; there is no implicit conversion.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Result.unwrap_or(Result(<span class="hl-type">i64</span>, ParseError).Ok(<span class="hl-number">42</span>), <span class="hl-number">0</span>)        <span class="hl-comment"># =&gt; 42</span>
+Result.unwrap_or(Result(<span class="hl-type">i64</span>, ParseError).Error(err), <span class="hl-number">0</span>)    <span class="hl-comment"># =&gt; 0</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/result.zap#L115">Source</a>
+</div>
+<div class="function-detail" id="map-2">
+<div class="function-header">
+<h3>map<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#map-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">map</span><span class="sig-paren">(</span>r<span class="sig-separator">::</span><span class="sig-type-pill">Result(value, err)</span><span class="sig-paren">, </span>f<span class="sig-separator">::</span><span class="sig-type-pill">fn(value) -&gt; mapped</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Result(mapped, err)</span></code></div>
+<div class="function-doc">
+<p>Applies <code>f</code> to the payload of an <code>Ok(...)</code> value, wrapping the
+result back in <code>Ok</code>. Passes <code>Error(...)</code> through unchanged.
+Lets callers transform the success value without leaving the
+<code>Result</code> container or touching the error variant.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">r <span class="hl-op">=</span> Result(<span class="hl-type">i64</span>, ParseError).Ok(<span class="hl-number">2</span>)
+Result.map(r, <span class="hl-keyword">fn</span>(payload <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { payload <span class="hl-op">*</span> payload })
+<span class="hl-comment"># =&gt; Result(i64, ParseError).Ok(4)</span></code></pre>
+<pre><code class="language-zap">Result.map(Result(<span class="hl-type">i64</span>, ParseError).Error(err), <span class="hl-keyword">fn</span>(payload <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> { payload <span class="hl-op">+</span> <span class="hl-number">1</span> })
+<span class="hl-comment"># =&gt; Result(i64, ParseError).Error(err)</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/result.zap#L138">Source</a>
+</div>
+<div class="function-detail" id="map_error-2">
+<div class="function-header">
+<h3>map_error<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#map_error-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">map_error</span><span class="sig-paren">(</span>r<span class="sig-separator">::</span><span class="sig-type-pill">Result(value, err)</span><span class="sig-paren">, </span>f<span class="sig-separator">::</span><span class="sig-type-pill">fn(err) -&gt; mapped_err</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Result(value, mapped_err)</span></code></div>
+<div class="function-doc">
+<p>Applies <code>f</code> to the payload of an <code>Error(...)</code> value, wrapping
+the result back in <code>Error</code>. Passes <code>Ok(...)</code> through unchanged.
+Lets callers transform the failure value — for example, to
+enrich an inner error with context or to convert between error
+types — without touching the success variant.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">r <span class="hl-op">=</span> Result(<span class="hl-type">i64</span>, ParseError).Error(parse_err)
+Result.map_error(r, <span class="hl-keyword">fn</span>(e <span class="hl-op">::</span> ParseError) <span class="hl-op">-&gt;</span> WrappedError { WrappedError.wrap(e) })
+<span class="hl-comment"># =&gt; Result(i64, WrappedError).Error(WrappedError.wrap(parse_err))</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/result.zap#L159">Source</a>
+</div>
+<div class="function-detail" id="and_then-2">
+<div class="function-header">
+<h3>and_then<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#and_then-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">and_then</span><span class="sig-paren">(</span>r<span class="sig-separator">::</span><span class="sig-type-pill">Result(value, err)</span><span class="sig-paren">, </span>f<span class="sig-separator">::</span><span class="sig-type-pill">fn(value) -&gt; Result(mapped, err)</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Result(mapped, err)</span></code></div>
+<div class="function-doc">
+<p>Monadic flatMap on <code>Ok(...)</code>: applies <code>f</code> to the success
+payload, returning whichever <code>Result</code> the function produces.
+<code>Error(...)</code> passes through unchanged. The key combinator for
+chaining <code>Result</code>-returning operations without nesting <code>case</code>
+expressions — the same role <code>and_then/2</code> plays for <code>Option</code>.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap">Result.and_then(Result(<span class="hl-type">i64</span>, ParseError).Ok(<span class="hl-number">4</span>),
+                <span class="hl-keyword">fn</span>(payload <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> Result(<span class="hl-type">i64</span>, ParseError) {
+                  Result(<span class="hl-type">i64</span>, ParseError).Ok(payload <span class="hl-op">+</span> <span class="hl-number">1</span>)
+                })
+<span class="hl-comment"># =&gt; Result(i64, ParseError).Ok(5)</span></code></pre>
+<pre><code class="language-zap">Result.and_then(Result(<span class="hl-type">i64</span>, ParseError).Error(err),
+                <span class="hl-keyword">fn</span>(payload <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> Result(<span class="hl-type">i64</span>, ParseError) {
+                  Result(<span class="hl-type">i64</span>, ParseError).Ok(payload <span class="hl-op">+</span> <span class="hl-number">1</span>)
+                })
+<span class="hl-comment"># =&gt; Result(i64, ParseError).Error(err)</span></code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/result.zap#L188">Source</a>
+</div>
+<h2 id="variants">Variants</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#Ok-0">Ok/0</a></td><td class="summary-doc">Ok :: t</td></tr>
+<tr><td class="summary-name"><a href="#Error-0">Error/0</a></td><td class="summary-doc">Error :: e</td></tr>
+</table>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#tuple_to_result-1">tuple_to_result/1</a></li>
+<li><a href="#is_ok?-1">is_ok?/1</a></li>
+<li><a href="#is_error?-1">is_error?/1</a></li>
+<li><a href="#unwrap_or-2">unwrap_or/2</a></li>
+<li><a href="#map-2">map/2</a></li>
+<li><a href="#map_error-2">map_error/2</a></li>
+<li><a href="#and_then-2">and_then/2</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<div class="search-header">
+<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+<circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<input type="text" id="search-modal-input" placeholder="Search Zap docs…" aria-label="Search">
+<kbd>ESC</kbd>
+</div>
+<ul id="search-results" class="search-results"></ul>
+<div class="search-footer">
+<span class="search-footer-item"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+<span class="search-footer-item"><kbd>↵</kbd> open</span>
+<span class="spacer"></span>
+<span class="search-footer-item"><kbd>ESC</kbd> close</span>
+</div>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

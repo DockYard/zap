@@ -6,6 +6,26 @@ pub struct Zap.StringTest {
       assert(("Hello" <> ", " <> "world!") == "Hello, world!")
     }
 
+    test("string literal escape sequences") {
+      assert("line1\nline2\n" == "line1\nline2\n")
+    }
+
+    test("interpolates string variables") {
+      name = "world"
+      assert("Hello, #{name}!" == "Hello, world!")
+    }
+
+    test("interpolates integers through to_string") {
+      answer = 42
+      assert("The answer is #{answer}" == "The answer is 42")
+    }
+
+    test("interpolates multiple expressions") {
+      left = "foo"
+      right = "bar"
+      assert("#{left} and #{right}" == "foo and bar")
+    }
+
     test("length returns byte count") {
       assert(String.length("hello") == 5)
     }

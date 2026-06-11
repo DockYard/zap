@@ -5478,7 +5478,7 @@ pub const HirBuilder = struct {
                         break :blk types_mod.TypeStore.UNKNOWN;
                     },
                     // Comparison/logical/membership: Bool
-                    .equal, .not_equal, .less, .greater, .less_equal, .greater_equal, .and_op, .or_op, .in_op => types_mod.TypeStore.BOOL,
+                    .equal, .not_equal, .less, .greater, .less_equal, .greater_equal, .and_op, .or_op, .in_op, .not_in_op => types_mod.TypeStore.BOOL,
                     // String concat
                     .concat => types_mod.TypeStore.STRING,
                 };
@@ -6548,6 +6548,10 @@ pub const HirBuilder = struct {
                 // expr :: Type — lower the inner expression with the annotated type
                 const inner = try self.buildExpr(ta.expr);
                 const annotated_type = self.resolveTypeExpr(ta.type_expr);
+                const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+                if (!store_ptr.containsTypeVars(annotated_type)) {
+                    _ = self.adoptNumericLiteralType(@constCast(inner), annotated_type);
+                }
                 return try self.create(Expr, .{
                     .kind = inner.kind,
                     .type_id = annotated_type,
@@ -9461,6 +9465,49 @@ test "HIR lowers numeric tuple field access to tuple_index_get" {
     try std.testing.expect(result_expr.kind == .tuple_index_get);
     try std.testing.expectEqual(@as(u32, 1), result_expr.kind.tuple_index_get.index);
     try std.testing.expectEqual(types_mod.TypeStore.STRING, result_expr.type_id);
+}
+
+test "HIR tuple type annotation narrows numeric literal elements" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn lanes() -> {i32, i32, i32, i32} {
+        \\    {1, 2, 3, 4} :: {i32, i32, i32, i32}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&program);
+
+    const clause = hir_program.structs[0].functions[0].clauses[0];
+    const result_expr = clause.body.stmts[0].expr;
+    try std.testing.expect(result_expr.kind == .tuple_init);
+    for (result_expr.kind.tuple_init) |element| {
+        try std.testing.expectEqual(types_mod.TypeStore.I32, element.type_id);
+    }
+
+    const result_type = checker.store.getType(result_expr.type_id);
+    try std.testing.expect(result_type == .tuple);
+    for (result_type.tuple.elements) |element_type| {
+        try std.testing.expectEqual(types_mod.TypeStore.I32, element_type);
+    }
 }
 
 test "HIR pattern compilation" {

@@ -571,18 +571,17 @@ pub const MacroSpliceKind = enum {
     ident,
     /// A `__block__` of statements.
     block,
-    /// An atom literal (`:foo`).
-    atom_lit,
-    /// An integer literal.
-    integer_lit,
-    /// A string literal.
-    string_lit,
-    /// A bare list of CtValues (used by `unquote_splicing`).
-    list_lit,
+    /// An atom literal value (`:foo`) as seen by a macro.
+    atom,
+    /// An integer literal value as seen by a macro.
+    integer,
+    /// A string literal value as seen by a macro.
+    string,
+    /// A list literal value as seen by a macro.
+    list,
 
-    /// Map an annotation name (e.g., `Expr`, `Pat`, `Decl`) to the
-    /// corresponding kind. Returns `null` for non-meta-type names so
-    /// the caller can fall through to ordinary type resolution.
+    /// Map a macro parameter annotation name to the corresponding
+    /// compile-time argument shape.
     pub fn fromName(name: []const u8) ?MacroSpliceKind {
         if (std.mem.eql(u8, name, "Expr")) return .expr;
         if (std.mem.eql(u8, name, "Pat")) return .pattern;
@@ -590,10 +589,24 @@ pub const MacroSpliceKind = enum {
         if (std.mem.eql(u8, name, "Decl")) return .decl;
         if (std.mem.eql(u8, name, "Ident")) return .ident;
         if (std.mem.eql(u8, name, "Block")) return .block;
-        if (std.mem.eql(u8, name, "AtomLit")) return .atom_lit;
-        if (std.mem.eql(u8, name, "IntLit")) return .integer_lit;
-        if (std.mem.eql(u8, name, "StringLit")) return .string_lit;
-        if (std.mem.eql(u8, name, "ListLit")) return .list_lit;
+        if (std.mem.eql(u8, name, "Atom")) return .atom;
+        if (std.mem.eql(u8, name, "Integer")) return .integer;
+        if (std.mem.eql(u8, name, "String")) return .string;
+        if (std.mem.eql(u8, name, "List")) return .list;
+        return null;
+    }
+
+    /// Only syntax categories are macro-only type names. Literal
+    /// annotations (`Atom`, `Integer`, `String`, `List`) are ordinary Zap
+    /// type names whose literal-value validation happens in the macro
+    /// engine.
+    pub fn fromSyntaxName(name: []const u8) ?MacroSpliceKind {
+        if (std.mem.eql(u8, name, "Expr")) return .expr;
+        if (std.mem.eql(u8, name, "Pat")) return .pattern;
+        if (std.mem.eql(u8, name, "Type")) return .type_expr;
+        if (std.mem.eql(u8, name, "Decl")) return .decl;
+        if (std.mem.eql(u8, name, "Ident")) return .ident;
+        if (std.mem.eql(u8, name, "Block")) return .block;
         return null;
     }
 
@@ -605,10 +618,10 @@ pub const MacroSpliceKind = enum {
             .decl => "Decl",
             .ident => "Ident",
             .block => "Block",
-            .atom_lit => "AtomLit",
-            .integer_lit => "IntLit",
-            .string_lit => "StringLit",
-            .list_lit => "ListLit",
+            .atom => "Atom",
+            .integer => "Integer",
+            .string => "String",
+            .list => "List",
         };
     }
 };
@@ -970,6 +983,7 @@ pub const BinaryOp = struct {
         or_op,
         concat, // <>
         in_op, // in
+        not_in_op, // not in
     };
 };
 

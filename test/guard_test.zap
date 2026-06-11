@@ -145,6 +145,14 @@ pub struct GuardTest {
     test("in operator guard fallthrough") {
       assert(classify_day(7) == "other")
     }
+
+    test("not in operator in guard") {
+      assert(classify_non_primary(4) == "other")
+    }
+
+    test("not in operator guard fallthrough") {
+      assert(classify_non_primary(2) == "primary")
+    }
   }
 
   fn is_primary(n :: i64) -> Bool {
@@ -157,6 +165,14 @@ pub struct GuardTest {
 
   fn classify_day(_ :: i64) -> String {
     "other"
+  }
+
+  fn classify_non_primary(n :: i64) -> String if n not in [1, 2, 3] {
+    "other"
+  }
+
+  fn classify_non_primary(_ :: i64) -> String {
+    "primary"
   }
 
   describe("type check functions") {

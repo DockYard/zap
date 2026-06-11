@@ -5228,6 +5228,15 @@ fn evaluateConstBinaryOp(
             },
             else => error.NotComputable,
         },
+        .not_in_op => switch (rhs) {
+            .list => |list| blk: {
+                for (list.elems) |elem| {
+                    if (lhs.eql(elem)) break :blk .{ .bool_val = false };
+                }
+                break :blk .{ .bool_val = true };
+            },
+            else => error.NotComputable,
+        },
     };
 }
 

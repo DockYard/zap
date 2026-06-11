@@ -34,6 +34,15 @@ pub struct Zap.MapTest {
       assert(Map.get(%{a: 1}, :z, 99) == 99)
     }
 
+    test("map update syntax preserves unchanged keys") {
+      assert(updated_name() == "Bob")
+      assert(updated_city() == "Paris")
+    }
+
+    test("map pattern matching in function parameters") {
+      assert(greet(%{name: "World", greeting: "Hello"}) == "Hello, World!")
+    }
+
     test("put adds new key") {
       result = Map.put(%{a: 1}, :b, 2)
       assert(Map.size(result) == 2)
@@ -66,6 +75,22 @@ pub struct Zap.MapTest {
       result = Map.merge(%{a: 1, b: 2}, %{b: 99})
       assert(Map.get(result, :b, 0) == 99)
     }
+  }
+
+  fn greet(%{name: name, greeting: greeting} :: %{Atom -> String}) -> String {
+    greeting <> ", " <> name <> "!"
+  }
+
+  fn updated_name() -> String {
+    original = %{name: "Alice", city: "Paris"}
+    updated = %{original | name: "Bob"}
+    Map.get(updated, :name, "unknown")
+  }
+
+  fn updated_city() -> String {
+    original = %{name: "Alice", city: "Paris"}
+    updated = %{original | name: "Bob"}
+    Map.get(updated, :city, "unknown")
   }
 
   describe("String value maps") {

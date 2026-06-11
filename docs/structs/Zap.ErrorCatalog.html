@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zap.ErrorCatalog — Zap</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search structs, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout layout-no-toc">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group" data-group="Structs">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
+<ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
+<li><a href="../structs/Atom.html">Atom</a></li>
+<li><a href="../structs/Bool.html">Bool</a></li>
+<li><a href="../structs/Enum.html">Enum</a></li>
+<li><a href="../structs/File.html">File</a></li>
+<li><a href="../structs/Float.html">Float</a></li>
+<li><a href="../structs/Function.html">Function</a></li>
+<li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
+<li><a href="../structs/Integer.html">Integer</a></li>
+<li><a href="../structs/Kernel.html">Kernel</a></li>
+<li><a href="../structs/List.html">List</a></li>
+<li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
+<li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
+<li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
+<li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li class="active"><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
+<li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Protocols">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
+<ul>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Unions">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Guides">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Guides</h4></button>
+<ul>
+<li><a href="../guides/enum.html">Enum</a></li>
+<li><a href="../guides/integer.html">Integer</a></li>
+<li><a href="../guides/io.html">Io</a></li>
+<li><a href="../guides/list.html">List</a></li>
+<li><a href="../guides/string.html">String</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<nav class="breadcrumb" aria-label="Breadcrumb">
+<span>Structs</span>
+<span>/</span>
+<span class="breadcrumb-current">Zap.ErrorCatalog</span>
+</nav>
+<h1 class="page-title">Zap.ErrorCatalog</h1>
+<p class="tagline">The Zap diagnostic-code catalog — the long-form source backing
+`zap explain Zxxxx`.</p>
+<div class="structdoc">
+<p>The Zap diagnostic-code catalog — the long-form source backing
+<code>zap explain Zxxxx</code>.</p>
+<p>Each <code>pub error</code> that carries a stable <code>@code Zxxxx</code> may register a
+catalog entry here describing what the code means, why it fires, a
+minimal reproduction, and how to fix it. <code>zap explain Z1003</code> reads this
+file, finds the matching <code>[Z1003]</code> record, and prints the rendered
+explanation. Codes without an entry print a short &quot;no explanation
+registered yet&quot; message — the catalog grows over time, the scaffold is
+what matters.</p>
+<h2>Numbering scheme</h2>
+<p>Codes are written <code>Z&lt;digits&gt;</code> and partitioned into reserved bands so
+stdlib codes never collide with user codes:</p>
+<ul>
+<li><code>Z1xxx</code> — runtime / general failures (this band is the stdlib's).</li>
+<li><code>Z2xxx</code> — type-system / contract failures (reserved for the stdlib).</li>
+<li><code>Z3xxx</code>..<code>Z8xxx</code> — available for user-defined <code>pub error</code> types.</li>
+<li><code>Z9xxx</code> — internal compiler errors (ICE). Reserved for the compiler:</li>
+</ul>
+<p>  a <code>Z9xxx</code> code always means a compiler bug, never a fault in the
+  user's program. See <code>src/diagnostics.zig</code> <code>ICE_CODE_PREFIX</code>.</p>
+<p>Codes are append-only public API: once assigned, a code keeps its
+meaning forever and is never reused for a different error. The compiler
+enforces global uniqueness at build time (see <code>src/error_codes.zig</code>).</p>
+<h2>Record format</h2>
+<p>The catalog body below is a machine-readable record stream consumed by
+the <code>zap explain</code> reader in <code>src/main.zig</code>. Each record opens with a
+<code>[Zxxxx]</code> line in column zero and is followed by <code>key: value</code> lines.
+Recognized keys are <code>title</code>, <code>explanation</code>, <code>repro</code>, and <code>fix</code>. A value
+continues onto subsequent indented (two-space) lines until the next key
+or the next <code>[Zxxxx]</code> header. Lines outside any record (such as this
+documentation heredoc) are ignored by the reader, so this file stays a
+valid Zap source unit.</p>
+<p>[Z1001]
+title: RuntimeError — ad-hoc unstructured failure
+explanation: The default error type raised by the <code>raise &quot;string&quot;</code>
+  shorthand. It carries only a message and is intended for scripts and
+  test code. Production code that crosses a public API boundary should
+  prefer a named <code>pub error</code> with its own <code>@code</code> so callers can match
+  on the error type instead of parsing the message string.
+repro: raise &quot;something went wrong&quot;
+fix: Define a named error — <code>pub error DiskFullError {}</code> — and <code>raise
+  %DiskFullError{}<code> so the failure is matchable and self-describing.</p>
+<p>[Z1002]
+title: ArgumentError — invalid argument passed to a function
+explanation: Raised when a function receives an argument that is the
+  wrong shape, out of the accepted domain, or otherwise invalid in a
+  way the type system did not catch. Distinct from ArithmeticError /
+  IndexError, which are raised by the runtime's arithmetic and bounds
+  checks rather than by explicit validation.
+repro: raise %ArgumentError{message: &quot;expected a positive integer&quot;}
+fix: Validate inputs at the boundary and raise ArgumentError with a
+  message naming the offending parameter and the expected domain.</p>
+<p>[Z1003]
+title: ArithmeticError — integer overflow trap
+explanation: In Debug and ReleaseSafe builds, integer arithmetic that
+  overflows the result type traps and aborts with <code>** (arithmetic_error)
+  ...<code>. This is the per-optimize-mode overflow policy: safe modes trap
+  so overflow never silently corrupts a value, while ReleaseFast and
+  ReleaseSmall builds wrap (two's-complement) for speed, matching Zig's
+  optimize-mode model.
+repro: # ReleaseSafe: traps. ReleaseFast: wraps.
+  x = 9223372036854775807   # i64 max
+  y = x + 1
+fix: Use a wider integer type, check the operands before the operation,
+  or build with <code>-Doptimize=ReleaseFast</code> if wrapping is the intended
+  semantics for a hot path.</p>
+<p>[Z1004]
+title: IndexError — array / list index out of bounds
+explanation: In Debug and ReleaseSafe builds, indexing a list or array
+  outside its valid <code>0..length</code> range traps and aborts with
+  <code>** (index_error) ...</code>. In ReleaseFast / ReleaseSmall the compiler
+  elides the bounds check where it can prove safety, matching Zig's
+  model — it never introduces undefined behavior beyond what Zig itself
+  permits.
+repro: # ReleaseSafe: traps with index_error.
+  items = [1, 2, 3]
+  items[5]
+fix: Check the index against the collection length first, or use a
+  safe accessor that returns <code>Option(t)</code> instead of trapping.</p>
+<p>[Z2001]
+title: Type mismatch — two-sided expected/got
+explanation: A value's type does not match the type required at its use
+  site. Zap renders BOTH sides: the primary caret marks the offending
+  expression (the &quot;got&quot; type), and a <code>= note:</code> line points at where the
+  EXPECTED type came from — a return-type annotation or a parameter
+  declaration. The structured <code>expected_type</code> / <code>got_type</code> ride in the
+  JSON <code>machine_data</code> for tooling. This is the two-sided type error from
+  the error-system design (TypeProvenance): you see not just what was
+  wrong but why the compiler expected what it did.
+repro: pub struct Demo {
+    pub fn takes_int(x :: i64) -&gt; i64 { x }
+    pub fn caller() -&gt; i64 { Demo.takes_int(&quot;hello&quot;) }
+  }
+fix: Convert the value to the expected type, or change the annotation
+  that establishes the expectation (the one the <code>= note:</code> line points
+  at) if the call site is the intended contract.</p>
+<p>[Z9100]
+title: Internal compiler error — script code-generation / link failed
+explanation: An INTERNAL failure (not a fault in your program) occurred
+  while generating code or linking the binary for a <code>zap run</code> script.
+  Nothing internal escapes as a bare string: the compiler reports this
+  structured ICE with the failing pass and a stable code. A <code>Z9xxx</code>
+  code always means a compiler bug — your source is not at fault.
+repro: # Not user-reproducible by design — this fires only on an
+  # internal failure such as an out-of-memory condition or an
+  # unexpected backend state during a <code>zap run &lt;script&gt;</code> compile.
+fix: This is a compiler bug. Please file a report with the smallest
+  <code>.zap</code> script that triggers it and the full diagnostic (including the
+  <code>Z9100</code> code) so the failing pass can be reproduced and fixed.</p>
+<p>[Z9101]
+title: Internal compiler error — project code-generation / link failed
+explanation: As <code>Z9100</code>, but for a manifest/project build (<code>zap build</code>)
+  rather than a single-file script. An internal failure occurred while
+  generating code or linking the project's binary. The user's program
+  is not at fault; the structured ICE names the failing pass.
+repro: # Not user-reproducible by design — fires on an internal failure
+  # during a <code>zap build</code> code-generation / link step.
+fix: This is a compiler bug. File a report with a minimal project that
+  reproduces it and the full diagnostic (including the <code>Z9101</code> code).</p>
+</div>
+</main>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<div class="search-header">
+<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+<circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<input type="text" id="search-modal-input" placeholder="Search Zap docs…" aria-label="Search">
+<kbd>ESC</kbd>
+</div>
+<ul id="search-results" class="search-results"></ul>
+<div class="search-footer">
+<span class="search-footer-item"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+<span class="search-footer-item"><kbd>↵</kbd> open</span>
+<span class="spacer"></span>
+<span class="search-footer-item"><kbd>ESC</kbd> close</span>
+</div>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

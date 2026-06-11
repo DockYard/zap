@@ -68,5 +68,39 @@ pub struct OptionTest {
       }
       assert(result == 0)
     }
+
+    test("multiple construction sites stay per-instantiation typed") {
+      assert(unwrap(Option(i64).Some(42)) == 42)
+      assert(unwrap(Option(i64).None) == 0)
+      assert(unwrap(from_some()) == 7)
+      assert(unwrap(from_none()) == 0)
+    }
+
+    test("comptime-known None matches nullary arm with sibling payload arm") {
+      assert(unwrap_comptime_none() == 0)
+    }
+  }
+
+  fn unwrap(option :: Option(i64)) -> i64 {
+    case option {
+      Option.Some(v) -> v
+      Option.None -> 0
+    }
+  }
+
+  fn from_some() -> Option(i64) {
+    Option(i64).Some(7)
+  }
+
+  fn from_none() -> Option(i64) {
+    Option(i64).None
+  }
+
+  fn unwrap_comptime_none() -> i64 {
+    option = Option(i64).None
+    case option {
+      Option.Some(v) -> v
+      Option.None -> 0
+    }
   }
 }

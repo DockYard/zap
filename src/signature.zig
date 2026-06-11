@@ -332,6 +332,7 @@ fn binaryOpString(op: ast.BinaryOp.Op) []const u8 {
         .or_op => "or",
         .concat => "<>",
         .in_op => "in",
+        .not_in_op => "not in",
     };
 }
 

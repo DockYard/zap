@@ -45,6 +45,20 @@ pub struct ForComprehensionTest {
       assert(List.length(result) == 3)
       assert(List.head(result) == 5)
     }
+
+    test("maps over strings through Enumerable") {
+      result = for character <- "abc" {
+        character <> "!"
+      }
+
+      assert(join_strings(result) == "a!b!c!")
+    }
+
+    test("filters before mapping") {
+      result = for x <- [1, 2, 3, 4, 5, 6], x rem 2 == 0 { x }
+
+      assert(sum(result) == 12)
+    }
   }
 
   describe("for comprehension destructuring") {
@@ -68,5 +82,21 @@ pub struct ForComprehensionTest {
       result = for _kv <- m { 1 }
       assert(List.length(result) == 3)
     }
+  }
+
+  fn join_strings([] :: [String]) -> String {
+    ""
+  }
+
+  fn join_strings([head | tail] :: [String]) -> String {
+    head <> join_strings(tail)
+  }
+
+  fn sum([] :: [i64]) -> i64 {
+    0
+  }
+
+  fn sum([head | tail] :: [i64]) -> i64 {
+    head + sum(tail)
   }
 }

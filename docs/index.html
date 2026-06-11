@@ -48,6 +48,8 @@
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
 <ul>
+<li><a href="structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="structs/ArithmeticError.html">ArithmeticError</a></li>
 <li><a href="structs/Atom.html">Atom</a></li>
 <li><a href="structs/Bool.html">Bool</a></li>
 <li><a href="structs/Enum.html">Enum</a></li>
@@ -55,25 +57,43 @@
 <li><a href="structs/Float.html">Float</a></li>
 <li><a href="structs/Function.html">Function</a></li>
 <li><a href="structs/IO.html">IO</a></li>
+<li><a href="structs/IndexError.html">IndexError</a></li>
 <li><a href="structs/Integer.html">Integer</a></li>
 <li><a href="structs/Kernel.html">Kernel</a></li>
 <li><a href="structs/List.html">List</a></li>
 <li><a href="structs/Map.html">Map</a></li>
 <li><a href="structs/Markdown.html">Markdown</a></li>
 <li><a href="structs/Math.html">Math</a></li>
+<li><a href="structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="structs/Option.html">Option</a></li>
 <li><a href="structs/Path.html">Path</a></li>
 <li><a href="structs/Range.html">Range</a></li>
+<li><a href="structs/Result.html">Result</a></li>
+<li><a href="structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="structs/Simd.html">Simd</a></li>
 <li><a href="structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="structs/String.html">String</a></li>
 <li><a href="structs/Struct.html">Struct</a></li>
 <li><a href="structs/System.html">System</a></li>
 <li><a href="structs/Tuple.html">Tuple</a></li>
+<li><a href="structs/Type.html">Type</a></li>
+<li><a href="structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
 <li><a href="structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
 <li><a href="structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="structs/Zest.html">Zest</a></li>
+<li><a href="structs/Zest.Assertion.html">Zest.Assertion</a></li>
 <li><a href="structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
@@ -82,10 +102,13 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
 <ul>
 <li><a href="structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="structs/Callable.html">Callable</a></li>
 <li><a href="structs/Comparator.html">Comparator</a></li>
 <li><a href="structs/Concatenable.html">Concatenable</a></li>
 <li><a href="structs/Enumerable.html">Enumerable</a></li>
+<li><a href="structs/Error.html">Error</a></li>
 <li><a href="structs/Membership.html">Membership</a></li>
+<li><a href="structs/Memory.Manager.html">Memory.Manager</a></li>
 <li><a href="structs/Stringable.html">Stringable</a></li>
 <li><a href="structs/Updatable.html">Updatable</a></li>
 </ul>
@@ -94,6 +117,8 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
 <ul>
 <li><a href="structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="structs/Option.html">Option</a></li>
+<li><a href="structs/Result.html">Result</a></li>
 </ul>
 </div>
 <div class="sidebar-group" data-group="Guides">
@@ -197,7 +222,7 @@ zap deps update &lt;name&gt;         Re-resolve one dependency</code></pre>
       name: <span class="hl-string">"my_app"</span>,
       version: <span class="hl-string">"0.1.0"</span>,
       kind: <span class="hl-atom">:bin</span>,
-      root: &amp;MyApp.main/1,
+      root: &amp;MyApp.main<span class="hl-op">/</span><span class="hl-number">1</span>,
       paths: [<span class="hl-string">"lib/**/*.zap"</span>],
       optimize: <span class="hl-atom">:release_safe</span>
     }
@@ -208,7 +233,7 @@ zap deps update &lt;name&gt;         Re-resolve one dependency</code></pre>
       name: <span class="hl-string">"my_app_test"</span>,
       version: <span class="hl-string">"0.1.0"</span>,
       kind: <span class="hl-atom">:bin</span>,
-      root: &amp;TestRunner.main/1,
+      root: &amp;TestRunner.main<span class="hl-op">/</span><span class="hl-number">1</span>,
       paths: [<span class="hl-string">"lib/**/*.zap"</span>, <span class="hl-string">"test/**/*.zap"</span>],
       optimize: <span class="hl-atom">:debug</span>
     }
@@ -254,10 +279,10 @@ point and struct references.</p>
   name: <span class="hl-string">"my_app"</span>,
   version: <span class="hl-string">"0.1.0"</span>,
   kind: <span class="hl-atom">:bin</span>,
-  root: &amp;MyApp.main/1,
+  root: &amp;MyApp.main<span class="hl-op">/</span><span class="hl-number">1</span>,
   deps: [
-    {<span class="hl-atom">:shared_utils</span>, {<span class="hl-atom">:path</span>, <span class="hl-string">"../shared_utils"</span>}},
-    {<span class="hl-atom">:parser</span>, {<span class="hl-atom">:git</span>, <span class="hl-string">"https://github.com/example/parser.git"</span>, tag: <span class="hl-string">"v1.0.0"</span>}}
+    %Zap.Dep{name: <span class="hl-string">"shared_utils"</span>, path: <span class="hl-string">"../shared_utils"</span>},
+    %Zap.Dep{name: <span class="hl-string">"parser"</span>, git_url: <span class="hl-string">"https://github.com/example/parser.git"</span>, git_tag: <span class="hl-string">"v1.0.0"</span>}
   ]
 }</code></pre>
 <p>Zap writes <code>zap.lock</code> to record resolved dependency state. Use:</p>
@@ -266,13 +291,19 @@ zap deps update parser</code></pre>
 <h2>Language</h2>
 <h3>Structs, Protocols, Unions, and Files</h3>
 <p>Zap code is organized around top-level declarations:</p>
-<pre><code class="language-zap">@doc <span class="hl-op">=</span> <span class="hl-string">"A two-dimensional point."</span>
+<pre><code class="language-zap">@doc <span class="hl-op">=</span> <span class="hl-string">""</span><span class="hl-string">"</span>
+A two-dimensional point.
+<span class="hl-string">""</span><span class="hl-string">"</span>
+
 <span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Point {
   x <span class="hl-op">::</span> <span class="hl-type">i64</span>
   y <span class="hl-op">::</span> <span class="hl-type">i64</span>
 }
 
-@doc <span class="hl-op">=</span> <span class="hl-string">"Possible directions."</span>
+@doc <span class="hl-op">=</span> <span class="hl-string">""</span><span class="hl-string">"</span>
+Possible directions.
+<span class="hl-string">""</span><span class="hl-string">"</span>
+
 <span class="hl-keyword">pub</span> <span class="hl-keyword">union</span> Direction {
   North,
   South,
@@ -280,7 +311,10 @@ zap deps update parser</code></pre>
   West
 }
 
-@doc <span class="hl-op">=</span> <span class="hl-string">"Values that can be converted to a string."</span>
+@doc <span class="hl-op">=</span> <span class="hl-string">""</span><span class="hl-string">"</span>
+Values that can be converted to a string.
+<span class="hl-string">""</span><span class="hl-string">"</span>
+
 <span class="hl-keyword">pub</span> protocol Stringable {
   <span class="hl-keyword">fn</span> to_string(value) <span class="hl-op">-&gt;</span> <span class="hl-type">String</span>
 }</code></pre>
@@ -396,9 +430,10 @@ functions may capture local variables:</p>
 Enum.map([<span class="hl-number">1</span>, <span class="hl-number">2</span>, <span class="hl-number">3</span>], <span class="hl-keyword">fn</span>(value <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span> {
   value <span class="hl-op">*</span> multiplier
 })</code></pre>
-<p>Function type annotations use arrow syntax:</p>
-<pre><code class="language-zap">callback <span class="hl-op">::</span> (<span class="hl-type">i64</span> <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span>)
-reducer <span class="hl-op">::</span> (<span class="hl-type">i64</span>, <span class="hl-type">i64</span> <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span>)</code></pre>
+<p>Function type annotations mirror the closure literal with parameter names
+and body erased — <code>fn(param-types) -&gt; return-type</code>:</p>
+<pre><code class="language-zap">callback <span class="hl-op">::</span> <span class="hl-keyword">fn</span>(<span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span>
+reducer <span class="hl-op">::</span> <span class="hl-keyword">fn</span>(<span class="hl-type">i64</span>, <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> <span class="hl-type">i64</span></code></pre>
 <h3>Pipes and Catch Basin</h3>
 <p>The pipe operator passes the left side as the first argument to the next call:</p>
 <pre><code class="language-zap"><span class="hl-number">5</span>
@@ -464,12 +499,12 @@ special-casing standard-library struct names.</p>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> MathTest {
   <span class="hl-keyword">use</span> Zest.Case
 
-  <span class="hl-keyword">describe</span>(<span class="hl-string">"addition"</span>) {
-    <span class="hl-keyword">test</span>(<span class="hl-string">"adds two integers"</span>) {
+  <span class="hl-keyword">test</span>(<span class="hl-string">"addition"</span>) {
+    <span class="hl-keyword">case</span>(<span class="hl-string">"adds two integers"</span>) {
       <span class="hl-keyword">assert</span>(<span class="hl-number">1</span> <span class="hl-op">+</span> <span class="hl-number">1</span> <span class="hl-op">==</span> <span class="hl-number">2</span>)
     }
 
-    <span class="hl-keyword">test</span>(<span class="hl-string">"rejects false conditions"</span>) {
+    <span class="hl-keyword">case</span>(<span class="hl-string">"rejects false conditions"</span>) {
       <span class="hl-keyword">reject</span>(<span class="hl-number">1</span> <span class="hl-op">+</span> <span class="hl-number">1</span> <span class="hl-op">==</span> <span class="hl-number">3</span>)
     }
   }
@@ -489,9 +524,15 @@ zap test -- --timeout 5000</code></pre>
 <h2>Documentation</h2>
 <p>Documentation comes from <code>@doc</code> attributes placed immediately before the thing
 being documented:</p>
-<pre><code class="language-zap">@doc <span class="hl-op">=</span> <span class="hl-string">"Functions for working with points."</span>
+<pre><code class="language-zap">@doc <span class="hl-op">=</span> <span class="hl-string">""</span><span class="hl-string">"</span>
+Functions <span class="hl-keyword">for</span> working with points.
+<span class="hl-string">""</span><span class="hl-string">"</span>
+
 <span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Point {
-  @doc <span class="hl-op">=</span> <span class="hl-string">"Builds a point from x and y coordinates."</span>
+  @doc <span class="hl-op">=</span> <span class="hl-string">""</span><span class="hl-string">"</span>
+  Builds a point from x <span class="hl-keyword">and</span> y coordinates.
+  <span class="hl-string">""</span><span class="hl-string">"</span>
+
   <span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> new(x <span class="hl-op">::</span> <span class="hl-type">i64</span>, y <span class="hl-op">::</span> <span class="hl-type">i64</span>) <span class="hl-op">-&gt;</span> Point {
     %Point{x: x, y: y}
   }

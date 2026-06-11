@@ -50,6 +50,21 @@ pub struct FunctionTest {
       ## with the parameter (`x`) by the most-recent-wins resolution.
       assert(add100(5) == 105)
     }
+
+    test("assignment chain reuses previous bindings") {
+      assert(assignment_chain() == 60)
+    }
+
+    test("multi-clause string patterns dispatch by literal") {
+      assert(parse_word("one") == "1")
+      assert(parse_word("two") == "2")
+      assert(parse_word("three") == "?")
+    }
+
+    test("atom literal patterns dispatch in function heads") {
+      assert(status(:ok) == "success")
+      assert(status(:error) == "failure")
+    }
   }
 
   fn rebind_param(x :: i64) -> i64 {
@@ -68,6 +83,12 @@ pub struct FunctionTest {
     y
   }
 
+  fn assignment_chain() -> i64 {
+    a = 10
+    b = a + 20
+    b * 2
+  }
+
   fn classify(0 :: i64) -> String {
     "zero"
   }
@@ -82,6 +103,26 @@ pub struct FunctionTest {
 
   fn greet(name :: String) -> String {
     "Hello, " <> name <> "!"
+  }
+
+  fn parse_word("one" :: String) -> String {
+    "1"
+  }
+
+  fn parse_word("two" :: String) -> String {
+    "2"
+  }
+
+  fn parse_word(_ :: String) -> String {
+    "?"
+  }
+
+  fn status(:ok :: Atom) -> String {
+    "success"
+  }
+
+  fn status(:error :: Atom) -> String {
+    "failure"
   }
 
   fn identity(x :: element) -> element {

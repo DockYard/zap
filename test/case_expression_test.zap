@@ -33,6 +33,13 @@ pub struct CaseExpressionTest {
     test("matches zero literal") {
       assert(add_or_zero(0) == 0)
     }
+
+    test("nested cases classify coordinate axes") {
+      assert(classify_point(0, 0) == "origin")
+      assert(classify_point(0, 5) == "y-axis")
+      assert(classify_point(3, 0) == "x-axis")
+      assert(classify_point(3, 5) == "plane")
+    }
   }
 
   fn label_number(x :: i64) -> String {
@@ -55,6 +62,19 @@ pub struct CaseExpressionTest {
     case x {
       0 -> 0
       n -> n + n
+    }
+  }
+
+  fn classify_point(x :: i64, y :: i64) -> String {
+    case x {
+      0 -> case y {
+        0 -> "origin"
+        _ -> "y-axis"
+      }
+      _ -> case y {
+        0 -> "x-axis"
+        _ -> "plane"
+      }
     }
   }
 }

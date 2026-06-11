@@ -38,6 +38,20 @@ pub struct CycleB {
   back :: CycleA | nil
 }
 
+pub struct GenericBox(t) {
+  value :: t
+}
+
+pub struct GenericPair(left_type, right_type) {
+  left :: left_type
+  right :: right_type
+}
+
+pub struct GenericCounter(t) {
+  value :: t
+  step :: i64 = 1
+}
+
 
 pub struct StructTest {
   use Zest.Case
@@ -205,6 +219,70 @@ pub struct StructTest {
   fn get_x_from_inline() -> i64 {
     point = %Point{x: 42, y: 99}
     point.x
+  }
+
+  describe("Parametric structs") {
+    test("distinct instantiations preserve field types") {
+      int_box = make_explicit_int_box()
+      string_box = make_explicit_string_box()
+
+      assert(read_int_box(int_box) == 42)
+      assert(read_string_box(string_box) == "ok")
+    }
+
+    test("multiple type parameters preserve both fields") {
+      pair = make_pair_box()
+
+      assert(pair.left == 7)
+      assert(pair.right == "hi")
+    }
+
+    test("return type drives omitted type-argument literal instantiation") {
+      assert(make_int_box().value == 99)
+      assert(make_string_box().value == "yep")
+    }
+
+    test("concrete defaults survive parametric instantiation") {
+      counter = %GenericCounter(i64){value: 0}
+
+      assert(counter.value == 0)
+      assert(counter.step == 1)
+    }
+
+    test("nested parametric structs round-trip") {
+      inner = %GenericBox(i64){value: 7}
+      outer = %GenericBox(GenericBox(i64)){value: inner}
+
+      assert(outer.value.value == 7)
+    }
+  }
+
+  fn read_int_box(box :: GenericBox(i64)) -> i64 {
+    box.value
+  }
+
+  fn read_string_box(box :: GenericBox(String)) -> String {
+    box.value
+  }
+
+  fn make_explicit_int_box() -> GenericBox(i64) {
+    %GenericBox(i64){value: 42}
+  }
+
+  fn make_explicit_string_box() -> GenericBox(String) {
+    %GenericBox(String){value: "ok"}
+  }
+
+  fn make_pair_box() -> GenericPair(i64, String) {
+    %GenericPair(i64, String){left: 7, right: "hi"}
+  }
+
+  fn make_int_box() -> GenericBox(i64) {
+    %GenericBox{value: 99}
+  }
+
+  fn make_string_box() -> GenericBox(String) {
+    %GenericBox{value: "yep"}
   }
 
   describe("Lists of structs") {

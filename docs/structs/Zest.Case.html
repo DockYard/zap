@@ -48,6 +48,8 @@
 <div class="sidebar-group" data-group="Structs">
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
 <ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
 <li><a href="../structs/Atom.html">Atom</a></li>
 <li><a href="../structs/Bool.html">Bool</a></li>
 <li><a href="../structs/Enum.html">Enum</a></li>
@@ -55,25 +57,43 @@
 <li><a href="../structs/Float.html">Float</a></li>
 <li><a href="../structs/Function.html">Function</a></li>
 <li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
 <li><a href="../structs/Integer.html">Integer</a></li>
 <li><a href="../structs/Kernel.html">Kernel</a></li>
 <li><a href="../structs/List.html">List</a></li>
 <li><a href="../structs/Map.html">Map</a></li>
 <li><a href="../structs/Markdown.html">Markdown</a></li>
 <li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
 <li><a href="../structs/Path.html">Path</a></li>
 <li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li><a href="../structs/Simd.html">Simd</a></li>
 <li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
 <li><a href="../structs/String.html">String</a></li>
 <li><a href="../structs/Struct.html">Struct</a></li>
 <li><a href="../structs/System.html">System</a></li>
 <li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
 <li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
 <li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
 <li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
 <li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
 <li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
 <li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
 <li class="active"><a href="../structs/Zest.Case.html">Zest.Case</a></li>
 <li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
 </ul>
@@ -82,10 +102,13 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
 <ul>
 <li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
 <li><a href="../structs/Comparator.html">Comparator</a></li>
 <li><a href="../structs/Concatenable.html">Concatenable</a></li>
 <li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
 <li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
 <li><a href="../structs/Stringable.html">Stringable</a></li>
 <li><a href="../structs/Updatable.html">Updatable</a></li>
 </ul>
@@ -94,6 +117,8 @@
 <button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
 <ul>
 <li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
 </ul>
 </div>
 <div class="sidebar-group" data-group="Guides">
@@ -117,25 +142,25 @@
 <p class="tagline">Test case DSL for the Zest test framework.</p>
 <div class="structdoc">
 <p>Test case DSL for the Zest test framework.</p>
-<p>Provides <code>describe</code>, <code>test</code>, <code>assert</code>, <code>reject</code>, <code>setup</code>, and
-<code>teardown</code> for writing structured test cases with test tracking.</p>
-<p>Setup runs fresh before EACH test that requests context.
-Teardown runs after each test. Assertions are non-fatal.</p>
-<p>The <code>describe</code> and <code>test</code> macros expand into function declarations
-so that each test becomes a named pub function (test_*). <code>use Zest.Case</code>
-installs a compile-time hook that generates <code>run/0</code> for the enclosing
-struct after all tests have been registered.</p>
+<p>Provides <code>test</code>, <code>case</code>, <code>assert</code>, <code>reject</code>, <code>setup</code>, and <code>teardown</code>
+for writing structured test cases with test tracking.</p>
+<p><code>test(&quot;subject&quot;) { ... }</code> is a grouping macro. Each nested
+<code>case(&quot;behavior&quot;) { ... }</code> is an executable leaf. Setup and teardown
+blocks inside a <code>test</code> group run once per case.</p>
+<p><code>describe(&quot;subject&quot;) { test(&quot;behavior&quot;) { ... } }</code> remains supported
+as a compatibility alias during the DSL migration. It lowers to the
+same internal case records as <code>test/case</code>.</p>
 <h2>Examples</h2>
 <pre><code class="language-zap"><span class="hl-keyword">pub</span> <span class="hl-keyword">struct</span> Test.MyTest {
   <span class="hl-keyword">use</span> Zest.Case</code></pre>
-<pre><code class="language-zap">  <span class="hl-keyword">describe</span>(<span class="hl-string">"my feature"</span>) {
+<pre><code class="language-zap">  <span class="hl-keyword">test</span>(<span class="hl-string">"my feature"</span>) {
     <span class="hl-builtin">setup</span>() {
       <span class="hl-number">42</span>
     }</code></pre>
-<pre><code class="language-zap">    <span class="hl-keyword">test</span>(<span class="hl-string">"uses context"</span>, ctx) {
+<pre><code class="language-zap">    <span class="hl-keyword">case</span>(<span class="hl-string">"uses context"</span>, ctx) {
       <span class="hl-keyword">assert</span>(ctx <span class="hl-op">==</span> <span class="hl-number">42</span>)
     }</code></pre>
-<pre><code class="language-zap">    <span class="hl-keyword">test</span>(<span class="hl-string">"no context needed"</span>) {
+<pre><code class="language-zap">    <span class="hl-keyword">case</span>(<span class="hl-string">"no context needed"</span>) {
       <span class="hl-keyword">assert</span>(<span class="hl-builtin">true</span>)
     }</code></pre>
 <pre><code class="language-zap">    <span class="hl-builtin">teardown</span>() {
@@ -149,15 +174,20 @@ struct after all tests have been registered.</p>
 <tr><td class="summary-name"><a href="#begin_test-0">begin_test/0</a></td><td class="summary-doc">Wraps `begin_test` for explicit use.</td></tr>
 <tr><td class="summary-name"><a href="#end_test-0">end_test/0</a></td><td class="summary-doc">Wraps `end_test` for explicit use.</td></tr>
 <tr><td class="summary-name"><a href="#print_result-0">print_result/0</a></td><td class="summary-doc">Wraps `print_result` for explicit use.</td></tr>
-<tr><td class="summary-name"><a href="#assert-1">assert/1</a></td><td class="summary-doc">Asserts that a boolean value is `true`.</td></tr>
-<tr><td class="summary-name"><a href="#reject-1">reject/1</a></td><td class="summary-doc">Asserts that a boolean value is `false`.</td></tr>
 </table>
 <h2 id="macros">Macros</h2>
 <table class="summary">
-<tr><td class="summary-name"><a href="#describe-2">describe/2</a></td><td class="summary-doc">Groups related tests under a descriptive label.</td></tr>
-<tr><td class="summary-name"><a href="#test-2">test/2</a></td><td class="summary-doc">Defines a test case without context.</td></tr>
-<tr><td class="summary-name"><a href="#setup-1">setup/1</a></td><td class="summary-doc">Declares setup code that runs before each test with context.</td></tr>
-<tr><td class="summary-name"><a href="#teardown-1">teardown/1</a></td><td class="summary-doc">Declares teardown code that runs after each test.</td></tr>
+<tr><td class="summary-name"><a href="#test-2">test/2</a></td><td class="summary-doc">Defines a test group.</td></tr>
+<tr><td class="summary-name"><a href="#case-2">case/2</a></td><td class="summary-doc">Declares an executable case inside a `test` group.</td></tr>
+<tr><td class="summary-name"><a href="#case-3">case/3</a></td><td class="summary-doc">Declares an executable case with setup context inside a `test` group.</td></tr>
+<tr><td class="summary-name"><a href="#describe-2">describe/2</a></td><td class="summary-doc">Compatibility alias for the pre-migration Zest DSL.</td></tr>
+<tr><td class="summary-name"><a href="#assert-1">assert/1</a></td><td class="summary-doc">Asserts that an expression evaluates to `true`.</td></tr>
+<tr><td class="summary-name"><a href="#assert-2">assert/2</a></td><td class="summary-doc">Asserts that an expression evaluates to `true` with a custom message.</td></tr>
+<tr><td class="summary-name"><a href="#reject-1">reject/1</a></td><td class="summary-doc">Asserts that an expression evaluates to `false`.</td></tr>
+<tr><td class="summary-name"><a href="#reject-2">reject/2</a></td><td class="summary-doc">Asserts that an expression evaluates to `false` with a custom message.</td></tr>
+<tr><td class="summary-name"><a href="#assert_no_leaks-1">assert_no_leaks/1</a></td><td class="summary-doc">Asserts that a block leaks no memory.</td></tr>
+<tr><td class="summary-name"><a href="#setup-1">setup/1</a></td><td class="summary-doc">Declares setup code that runs before each case in a `test` group.</td></tr>
+<tr><td class="summary-name"><a href="#teardown-1">teardown/1</a></td><td class="summary-doc">Declares teardown code that runs after each case in a `test` group.</td></tr>
 </table>
 <h2>Function Details</h2>
 <div class="function-detail" id="begin_test-0">
@@ -171,7 +201,7 @@ struct after all tests have been registered.</p>
 <div class="function-doc">
 <p>Wraps <code>begin_test</code> for explicit use.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L174">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L350">Source</a>
 </div>
 <div class="function-detail" id="end_test-0">
 <div class="function-header">
@@ -184,7 +214,7 @@ struct after all tests have been registered.</p>
 <div class="function-doc">
 <p>Wraps <code>end_test</code> for explicit use.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L183">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L359">Source</a>
 </div>
 <div class="function-detail" id="print_result-0">
 <div class="function-header">
@@ -197,60 +227,9 @@ struct after all tests have been registered.</p>
 <div class="function-doc">
 <p>Wraps <code>print_result</code> for explicit use.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L192">Source</a>
-</div>
-<div class="function-detail" id="assert-1">
-<div class="function-header">
-<h3>assert<span class="arity">/1</span></h3>
-<span class="badge">fn</span>
-<div style="flex:1"></div>
-<a href="#assert-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">assert</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<div class="function-doc">
-<p>Asserts that a boolean value is <code>true</code>.</p>
-<p>Non-fatal: returns :fail on failure, does not stop execution.</p>
-</div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L203">Source</a>
-</div>
-<div class="function-detail" id="reject-1">
-<div class="function-header">
-<h3>reject<span class="arity">/1</span></h3>
-<span class="badge">fn</span>
-<div style="flex:1"></div>
-<a href="#reject-1" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">Bool</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">String</span></code></div>
-<div class="function-doc">
-<p>Asserts that a boolean value is <code>false</code>.</p>
-<p>Non-fatal: returns &quot;F&quot; on failure, does not stop execution.</p>
-</div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L219">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L368">Source</a>
 </div>
 <h2>Macro Details</h2>
-<div class="function-detail" id="describe-2">
-<div class="function-header">
-<h3>describe<span class="arity">/2</span></h3>
-<span class="badge">macro</span>
-<div style="flex:1"></div>
-<a href="#describe-2" class="anchor-link">#</a>
-</div>
-<div class="signature"><code><span class="sig-name">describe</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
-<div class="function-doc">
-<p>Groups related tests under a descriptive label.</p>
-<p>Scans the body for <code>setup</code> and <code>teardown</code> blocks, then
-transforms each <code>test</code> call into a pub function declaration
-and registers the generated function for <code>run/0</code>.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-keyword">describe</span>(<span class="hl-string">"math"</span>) {
-  <span class="hl-builtin">setup</span>() { <span class="hl-number">42</span> }</code></pre>
-<pre><code class="language-zap">  <span class="hl-keyword">test</span>(<span class="hl-string">"addition"</span>, ctx) {
-    <span class="hl-keyword">assert</span>(ctx <span class="hl-op">==</span> <span class="hl-number">42</span>)
-  }
-}</code></pre>
-</div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L124">Source</a>
-</div>
 <div class="function-detail" id="test-2">
 <div class="function-header">
 <h3>test<span class="arity">/2</span></h3>
@@ -260,15 +239,156 @@ and registers the generated function for <code>run/0</code>.</p>
 </div>
 <div class="signature"><code><span class="sig-name">test</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 <div class="function-doc">
-<p>Defines a test case without context.</p>
-<p>Expands into a pub function declaration named test_&lt;slugified_name&gt;
-with begin_test/end_test/print_result tracking calls wrapping the body.</p>
+<p>Defines a test group.</p>
+<p>Nested <code>case/2</code> or <code>case/3</code> calls become executable test cases.
+Setup and teardown blocks in the group run once per case.</p>
+<p>If no nested case is present, <code>test/2</code> falls back to the legacy
+leaf-test behavior for migration compatibility.</p>
 <h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-keyword">test</span>(<span class="hl-string">"true is true"</span>) {
-  <span class="hl-keyword">assert</span>(<span class="hl-builtin">true</span> <span class="hl-op">==</span> <span class="hl-builtin">true</span>)
+<pre><code class="language-zap"><span class="hl-keyword">test</span>(<span class="hl-string">"math"</span>) {
+  <span class="hl-builtin">setup</span>() { <span class="hl-number">40</span> }</code></pre>
+<pre><code class="language-zap">  <span class="hl-keyword">case</span>(<span class="hl-string">"addition"</span>, ctx) {
+    <span class="hl-keyword">assert</span>(ctx <span class="hl-op">+</span> <span class="hl-number">2</span> <span class="hl-op">==</span> <span class="hl-number">42</span>)
+  }
 }</code></pre>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L156">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L261">Source</a>
+</div>
+<div class="function-detail" id="case-2">
+<div class="function-header">
+<h3>case<span class="arity">/2</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#case-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">case</span><span class="sig-paren">(</span>_name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Declares an executable case inside a <code>test</code> group.</p>
+<p><code>case(&quot;label&quot;) { ... }</code> runs without setup context. Use
+<code>case(&quot;label&quot;, ctx) { ... }</code> to bind the value returned by the
+group's setup block to a context variable.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L305">Source</a>
+</div>
+<div class="function-detail" id="case-3">
+<div class="function-header">
+<h3>case<span class="arity">/3</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#case-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">case</span><span class="sig-paren">(</span>_name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>_context<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Declares an executable case with setup context inside a <code>test</code> group.</p>
+<p>This macro exists so <code>case(&quot;label&quot;, ctx) { ... }</code> is a first-class
+Zest form even before the enclosing <code>test</code> group consumes it.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L316">Source</a>
+</div>
+<div class="function-detail" id="describe-2">
+<div class="function-header">
+<h3>describe<span class="arity">/2</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#describe-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">describe</span><span class="sig-paren">(</span>name<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Compatibility alias for the pre-migration Zest DSL.</p>
+<p><code>describe(&quot;subject&quot;) { test(&quot;behavior&quot;) { ... } }</code> is still
+accepted and lowers to the same case records as the primary
+<code>test(&quot;subject&quot;) { case(&quot;behavior&quot;) { ... } }</code> DSL.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L328">Source</a>
+</div>
+<div class="function-detail" id="assert-1">
+<div class="function-header">
+<h3>assert<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#assert-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">assert</span><span class="sig-paren">(</span>expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Asserts that an expression evaluates to <code>true</code>.</p>
+<p>The expression is received as AST so Zest can report source code,
+source locations, evaluated values, and comparison operands
+without evaluating operands more than once.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L381">Source</a>
+</div>
+<div class="function-detail" id="assert-2">
+<div class="function-header">
+<h3>assert<span class="arity">/2</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#assert-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">assert</span><span class="sig-paren">(</span>expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>message<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Asserts that an expression evaluates to <code>true</code> with a custom message.</p>
+<p>Custom messages supplement the structural assertion diagnostics.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L455">Source</a>
+</div>
+<div class="function-detail" id="reject-1">
+<div class="function-header">
+<h3>reject<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#reject-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Asserts that an expression evaluates to <code>false</code>.</p>
+<p>The expression is received as AST so Zest can report source code,
+source locations, evaluated values, and comparison operands
+without evaluating operands more than once.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L531">Source</a>
+</div>
+<div class="function-detail" id="reject-2">
+<div class="function-header">
+<h3>reject<span class="arity">/2</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#reject-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reject</span><span class="sig-paren">(</span>expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">, </span>message<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Asserts that an expression evaluates to <code>false</code> with a custom message.</p>
+<p>Custom messages supplement the structural rejection diagnostics.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L605">Source</a>
+</div>
+<div class="function-detail" id="assert_no_leaks-1">
+<div class="function-header">
+<h3>assert_no_leaks<span class="arity">/1</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#assert_no_leaks-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">assert_no_leaks</span><span class="sig-paren">(</span>block<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Asserts that a block leaks no memory.</p>
+<p><code>assert_no_leaks { &lt;block&gt; }</code> runs <code>&lt;block&gt;</code> and asserts the net number of
+live (un-freed) heap allocations attributable to it is zero. It samples the
+active memory manager's live-allocation count immediately before and after
+the block; a positive delta means the block allocated and abandoned memory,
+which fails the assertion with the leaked allocation count + bytes as the
+failure detail (alongside the deinit-time attributed report).</p>
+<p>Requires the test target to select <code>Memory.Tracking</code> (the manager that
+exposes the live-allocation checkpoint). Under any other manager the live
+set is not observable, so the assertion is a documented no-op that passes.</p>
+<h2>Examples</h2>
+<pre><code class="language-zap"><span class="hl-keyword">case</span>(<span class="hl-string">"builder frees its scratch buffer"</span>) {
+  assert_no_leaks {
+    result <span class="hl-op">=</span> Builder.run(input)
+    <span class="hl-keyword">assert</span>(result <span class="hl-op">==</span> expected)
+  }
+}</code></pre>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L697">Source</a>
 </div>
 <div class="function-detail" id="setup-1">
 <div class="function-header">
@@ -279,15 +399,11 @@ with begin_test/end_test/print_result tracking calls wrapping the body.</p>
 </div>
 <div class="signature"><code><span class="sig-name">setup</span><span class="sig-paren">(</span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 <div class="function-doc">
-<p>Declares setup code that runs before each test with context.</p>
-<p>Place inside a <code>describe</code> block. The return value is bound
-to <code>ctx</code> in each <code>test/3</code> call. Runs fresh for every test.</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-builtin">setup</span>() {
-  connect_db()
-}</code></pre>
+<p>Declares setup code that runs before each case in a <code>test</code> group.</p>
+<p>The return value can be bound by cases that declare a context
+variable with <code>case(&quot;label&quot;, ctx) { ... }</code>.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L242">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L743">Source</a>
 </div>
 <div class="function-detail" id="teardown-1">
 <div class="function-header">
@@ -298,15 +414,11 @@ to <code>ctx</code> in each <code>test/3</code> call. Runs fresh for every test.
 </div>
 <div class="signature"><code><span class="sig-name">teardown</span><span class="sig-paren">(</span>body<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
 <div class="function-doc">
-<p>Declares teardown code that runs after each test.</p>
-<p>Place inside a <code>describe</code> block. Runs after every test body,
-even if assertions fail (non-fatal assertions).</p>
-<h2>Examples</h2>
-<pre><code class="language-zap"><span class="hl-builtin">teardown</span>() {
-  disconnect_db()
-}</code></pre>
+<p>Declares teardown code that runs after each case in a <code>test</code> group.</p>
+<p>Assertions are non-fatal, so teardown still runs after assertion
+failures in the case body.</p>
 </div>
-<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L259">Source</a>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/zest/case.zap#L754">Source</a>
 </div>
 </main>
 <aside class="toc">
@@ -316,11 +428,16 @@ even if assertions fail (non-fatal assertions).</p>
 <li><a href="#begin_test-0">begin_test/0</a></li>
 <li><a href="#end_test-0">end_test/0</a></li>
 <li><a href="#print_result-0">print_result/0</a></li>
-<li><a href="#assert-1">assert/1</a></li>
-<li><a href="#reject-1">reject/1</a></li>
 <li class="toc-section">Macros</li>
-<li><a href="#describe-2">describe/2</a></li>
 <li><a href="#test-2">test/2</a></li>
+<li><a href="#case-2">case/2</a></li>
+<li><a href="#case-3">case/3</a></li>
+<li><a href="#describe-2">describe/2</a></li>
+<li><a href="#assert-1">assert/1</a></li>
+<li><a href="#assert-2">assert/2</a></li>
+<li><a href="#reject-1">reject/1</a></li>
+<li><a href="#reject-2">reject/2</a></li>
+<li><a href="#assert_no_leaks-1">assert_no_leaks/1</a></li>
 <li><a href="#setup-1">setup/1</a></li>
 <li><a href="#teardown-1">teardown/1</a></li>
 </ul>

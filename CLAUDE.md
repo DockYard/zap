@@ -61,6 +61,10 @@ Zap is a general-purpose programming language. Features, behaviors, library func
 
 **No fallbacks.** When refactoring, fully commit to the new approach. Remove old code entirely. If the new approach fails, that's a bug to surface, not hide.
 
+## Test Placement
+
+Before adding to `src/zir_integration_tests.zig`, first ask whether the behavior can be expressed as a Zap/Zest test under `test/`. User-visible language semantics, standard-library APIs, macro behavior, and ordinary runtime behavior belong in the Zap test suite. Keep `zir-test` only for compiler-harness concerns: CLI/env/flag behavior, cache/artifact layout, cross-target outputs, compile-fail diagnostics until Zest supports compile-fail tests, backend instrumentation, memory-manager integration, and process/file-system assertions that cannot be expressed from Zap.
+
 ## Code Generation
 
 **Zap ALWAYS lowers to ZIR.** The only code generation path is `src/zir_builder.zig` → C-ABI calls to the Zig fork. *NEVER* generate Zig source text files. `src/codegen.zig` is legacy dead code — do not use it, do not write tests against it, do not treat it as a working backend. If a feature cannot be expressed through the ZIR builder, the correct fix is to add the necessary C-ABI function to the Zig fork (`~/projects/zig`), not to fall back to text codegen. Integration tests must validate through the ZIR path, not by checking generated Zig source strings.

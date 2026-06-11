@@ -1191,8 +1191,10 @@ pub const Desugarer = struct {
                 // so the in operator dispatches through the protocol like every
                 // other type-polymorphic operation. The HIR builder rewrites
                 // the protocol call to the matching impl based on `collection`'s
-                // inferred type. Note arg order: collection first, then value.
-                if (bo.op == .in_op) {
+                // inferred type. `value not in collection` is the same
+                // membership call wrapped in `not`. Note arg order:
+                // collection first, then value.
+                if (bo.op == .in_op or bo.op == .not_in_op) {
                     const interner_mut: *ast.StringInterner = @constCast(self.interner);
                     const proto_name = try interner_mut.intern("Membership");
                     const fn_name = try interner_mut.intern("member?");
@@ -1204,11 +1206,19 @@ pub const Desugarer = struct {
                     const callee = try self.create(ast.Expr, .{
                         .field_access = .{ .meta = bo.meta, .object = mod_ref, .field = fn_name },
                     });
-                    return try self.create(ast.Expr, .{
+                    const membership_call = try self.create(ast.Expr, .{
                         .call = .{
                             .meta = bo.meta,
                             .callee = callee,
                             .args = try self.allocSlice(*const ast.Expr, &.{ new_rhs, new_lhs }),
+                        },
+                    });
+                    if (bo.op == .in_op) return membership_call;
+                    return try self.create(ast.Expr, .{
+                        .unary_op = .{
+                            .meta = bo.meta,
+                            .op = .not_op,
+                            .operand = membership_call,
                         },
                     });
                 }

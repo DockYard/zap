@@ -1044,6 +1044,14 @@ const MonomorphContext = struct {
         return null;
     }
 
+    fn callTargetClauseIndex(target: hir.CallTarget) usize {
+        return switch (target) {
+            .direct => |direct| if (direct.clause_index) |index| @intCast(index) else 0,
+            .named => |named| if (named.clause_index) |index| @intCast(index) else 0,
+            else => 0,
+        };
+    }
+
     fn callTargetParamType(
         self: *const MonomorphContext,
         target: hir.CallTarget,
@@ -1058,8 +1066,10 @@ const MonomorphContext = struct {
         };
         const group = self.findFunctionGroupById(group_id) orelse return null;
         if (group.clauses.len == 0) return null;
-        if (arg_index >= group.clauses[0].params.len) return null;
-        return group.clauses[0].params[arg_index].type_id;
+        const clause_index = callTargetClauseIndex(target);
+        if (clause_index >= group.clauses.len) return null;
+        if (arg_index >= group.clauses[clause_index].params.len) return null;
+        return group.clauses[clause_index].params[arg_index].type_id;
     }
 
     fn scanBlock(self: *MonomorphContext, block: *const hir.Block) error{OutOfMemory}!void {
@@ -1180,13 +1190,15 @@ const MonomorphContext = struct {
 
                 // Unify arg types with param types to find type variable bindings
                 if (generic_group.clauses.len == 0) return;
-                const first_clause = &generic_group.clauses[0];
-                if (first_clause.params.len != call.args.len) return;
+                const selected_clause_index = callTargetClauseIndex(call.target);
+                if (selected_clause_index >= generic_group.clauses.len) return;
+                const selected_clause = &generic_group.clauses[selected_clause_index];
+                if (selected_clause.params.len != call.args.len) return;
 
                 var subs = SubstitutionMap.init(self.allocator);
                 defer subs.deinit();
 
-                const protocol_param_types = try self.allocator.alloc(TypeId, first_clause.params.len);
+                const protocol_param_types = try self.allocator.alloc(TypeId, selected_clause.params.len);
                 defer self.allocator.free(protocol_param_types);
                 @memset(protocol_param_types, types_mod.TypeStore.UNKNOWN);
 
@@ -1197,7 +1209,7 @@ const MonomorphContext = struct {
                 // callback arg is an unresolved function reference).
                 for (0..2) |pass| {
                     const allow_default_empty_protocol_list = pass == 1;
-                    for (first_clause.params, call.args, 0..) |param, arg, param_index| {
+                    for (selected_clause.params, call.args, 0..) |param, arg, param_index| {
                         const arg_type = self.resolveCallArgumentType(
                             arg,
                             param.type_id,
@@ -1217,7 +1229,7 @@ const MonomorphContext = struct {
                 // higher-order parameter to the boxed `Callable` representation
                 // when this combinator iterates a `[fn(..) -> ..]` (boxed
                 // `Callable`) collection. See the helper for the full rationale.
-                try self.restampClosureArgParamsForBoxedCallable(first_clause.params, call.args, &subs);
+                try self.restampClosureArgParamsForBoxedCallable(selected_clause.params, call.args, &subs);
 
                 // Type variables can appear only in the return type for
                 // constructor-shaped generic functions such as
@@ -1230,7 +1242,7 @@ const MonomorphContext = struct {
                 {
                     const contextual_return = self.effectiveExprType(expr);
                     if (self.isConcreteRuntimeType(contextual_return)) {
-                        _ = self.store.unify(first_clause.return_type, contextual_return, &subs) catch {};
+                        _ = self.store.unify(selected_clause.return_type, contextual_return, &subs) catch {};
                     }
                 }
 
@@ -1269,10 +1281,10 @@ const MonomorphContext = struct {
                 // (Map.get-style) is the only configuration left
                 // untouched, preserving its narrow-binding behaviour.
                 {
-                    const return_uses_var_as_scalar = scalarTypeVarSet(self.store, first_clause.return_type, self.allocator) catch null;
+                    const return_uses_var_as_scalar = scalarTypeVarSet(self.store, selected_clause.return_type, self.allocator) catch null;
                     var return_scalar_set = return_uses_var_as_scalar orelse std.AutoHashMap(types_mod.TypeVarId, void).init(self.allocator);
                     defer return_scalar_set.deinit();
-                    for (first_clause.params, call.args) |param, arg| {
+                    for (selected_clause.params, call.args) |param, arg| {
                         const arg_type = self.resolveCallArgumentType(arg, param.type_id, &subs, true);
                         if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
                         promoteContainerVarsExceptScalarReturn(self.store, param.type_id, arg_type, &return_scalar_set, &subs);
@@ -1299,7 +1311,7 @@ const MonomorphContext = struct {
                         try type_args.append(self.allocator, protocol_type);
                     }
                 }
-                if (self.hasUnboundProtocolParams(first_clause.params, protocol_param_types)) return;
+                if (self.hasUnboundProtocolParams(selected_clause.params, protocol_param_types)) return;
 
                 if (type_args.items.len == 0) return;
 
@@ -1336,7 +1348,7 @@ const MonomorphContext = struct {
                     // same type var IDs as the subs), NOT expr.type_id (which uses
                     // different type var IDs from the HIR builder's scope).
                     if (!self.isConcreteRuntimeType(expr.type_id)) {
-                        const concrete_return = subs.applyToType(self.store, first_clause.return_type);
+                        const concrete_return = subs.applyToType(self.store, selected_clause.return_type);
                         if (self.isConcreteRuntimeType(concrete_return)) {
                             @constCast(expr).type_id = concrete_return;
                         }
@@ -1348,7 +1360,7 @@ const MonomorphContext = struct {
                 const new_id = self.next_group_id.*;
                 self.next_group_id.* += 1;
 
-                const specialized = try self.cloneGroupWithSubs(generic_group, &subs, protocol_param_types, type_args.items, new_id);
+                const specialized = try self.cloneGroupWithSubs(generic_group, &subs, protocol_param_types, type_args.items, new_id, selected_clause_index);
                 try self.new_groups.append(self.allocator, .{
                     .group = specialized,
                     .source_group_id = target_id,
@@ -1364,7 +1376,7 @@ const MonomorphContext = struct {
                 // expr.type_id because the HIR builder resolves type vars in a separate
                 // scope, producing different type var IDs that aren't in the subs.
                 if (!self.isConcreteRuntimeType(expr.type_id)) {
-                    const concrete_return = subs.applyToType(self.store, first_clause.return_type);
+                    const concrete_return = subs.applyToType(self.store, selected_clause.return_type);
                     if (self.isConcreteRuntimeType(concrete_return)) {
                         @constCast(expr).type_id = concrete_return;
                     }
@@ -1719,13 +1731,14 @@ const MonomorphContext = struct {
         protocol_param_types: []const TypeId,
         type_args: []const TypeId,
         new_id: u32,
+        source_clause_index: usize,
     ) !hir.FunctionGroup {
         const saved_subs = self.current_subs;
         const saved_protocol_param_types = self.current_protocol_param_types;
         const saved_protocol_source_param_types = self.current_protocol_source_param_types;
         self.current_subs = subs;
         self.current_protocol_param_types = protocol_param_types;
-        self.current_protocol_source_param_types = if (group.clauses.len > 0) group.clauses[0].params else &.{};
+        self.current_protocol_source_param_types = if (source_clause_index < group.clauses.len) group.clauses[source_clause_index].params else &.{};
         defer self.current_subs = saved_subs;
         defer self.current_protocol_param_types = saved_protocol_param_types;
         defer self.current_protocol_source_param_types = saved_protocol_source_param_types;
@@ -2211,11 +2224,11 @@ const MonomorphContext = struct {
                             switch (c.target) {
                                 .direct => |*dc| dc.function_group_id = new_id,
                                 .dispatch => |*dp| dp.function_group_id = new_id,
-                                .named => {
+                                .named => |nc| {
                                     // Rewrite named cross-struct call to direct call
                                     c.target = .{ .direct = .{
                                         .function_group_id = new_id,
-                                        .clause_index = 0,
+                                        .clause_index = nc.clause_index,
                                     } };
                                 },
                                 else => {},

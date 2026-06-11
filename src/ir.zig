@@ -5725,7 +5725,7 @@ pub const IrBuilder = struct {
                 .local_ownership = try_local_ownership,
                 .result_convention = try_result_convention,
                 .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
-            .deep_release_owned_locals = try self.cloneLocalIdSet(self.deep_release_owned_locals),
+                .deep_release_owned_locals = try self.cloneLocalIdSet(self.deep_release_owned_locals),
             });
         }
     }
@@ -9966,7 +9966,7 @@ pub const IrBuilder = struct {
                     .and_op => .bool_and,
                     .or_op => .bool_or,
                     .concat => .concat,
-                    .in_op => blk: {
+                    .in_op, .not_in_op => blk: {
                         if (bin.rhs.kind == .struct_init) {
                             if (self.type_store) |ts| {
                                 if (bin.rhs.type_id < ts.types.items.len) {
@@ -9980,15 +9980,26 @@ pub const IrBuilder = struct {
                         break :blk .in_list;
                     },
                 };
+                const binary_dest = if (bin.op == .not_in_op) blk: {
+                    const membership_dest = self.next_local;
+                    self.next_local += 1;
+                    try self.local_hir_types.put(membership_dest, types_mod.TypeStore.BOOL);
+                    break :blk membership_dest;
+                } else dest;
                 try self.current_instrs.append(self.allocator, .{
                     .binary_op = .{
-                        .dest = dest,
+                        .dest = binary_dest,
                         .op = ir_op,
                         .lhs = lhs,
                         .rhs = rhs,
                         .result_type = self.binaryResultZigType(expr.type_id, lhs, rhs),
                     },
                 });
+                if (bin.op == .not_in_op) {
+                    try self.current_instrs.append(self.allocator, .{
+                        .unary_op = .{ .dest = dest, .op = .bool_not, .operand = binary_dest },
+                    });
+                }
                 return dest;
             },
             .call => {
@@ -12972,7 +12983,7 @@ pub const IrBuilder = struct {
                     .and_op => .bool_and,
                     .or_op => .bool_or,
                     .concat => .concat,
-                    .in_op => blk: {
+                    .in_op, .not_in_op => blk: {
                         // Detect if RHS is the native Range struct
                         if (bin.rhs.kind == .struct_init) {
                             if (self.type_store) |ts| {
@@ -12987,15 +12998,26 @@ pub const IrBuilder = struct {
                         break :blk .in_list;
                     },
                 };
+                const binary_dest = if (bin.op == .not_in_op) blk: {
+                    const membership_dest = self.next_local;
+                    self.next_local += 1;
+                    try self.local_hir_types.put(membership_dest, types_mod.TypeStore.BOOL);
+                    break :blk membership_dest;
+                } else dest;
                 try self.current_instrs.append(self.allocator, .{
                     .binary_op = .{
-                        .dest = dest,
+                        .dest = binary_dest,
                         .op = ir_op,
                         .lhs = lhs,
                         .rhs = rhs,
                         .result_type = self.binaryResultZigType(expr.type_id, lhs, rhs),
                     },
                 });
+                if (bin.op == .not_in_op) {
+                    try self.current_instrs.append(self.allocator, .{
+                        .unary_op = .{ .dest = dest, .op = .bool_not, .operand = binary_dest },
+                    });
+                }
             },
             .unary => |un| {
                 const operand = try self.lowerExpr(un.operand);
@@ -13003,9 +13025,27 @@ pub const IrBuilder = struct {
                     .negate => .negate,
                     .not_op => .bool_not,
                 };
+                const result_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const needs_numeric_coercion = isConcreteIntegerZigType(result_zig_type) or isFloatZigType(result_zig_type);
+                const unary_dest = if (needs_numeric_coercion) blk: {
+                    const raw_dest = self.next_local;
+                    self.next_local += 1;
+                    try self.local_hir_types.put(raw_dest, tracked_hir_type);
+                    break :blk raw_dest;
+                } else dest;
+
                 try self.current_instrs.append(self.allocator, .{
-                    .unary_op = .{ .dest = dest, .op = ir_op, .operand = operand },
+                    .unary_op = .{ .dest = unary_dest, .op = ir_op, .operand = operand },
                 });
+                if (needs_numeric_coercion) {
+                    try self.current_instrs.append(self.allocator, if (isConcreteIntegerZigType(result_zig_type))
+                        .{ .int_widen = .{ .dest = dest, .source = unary_dest, .dest_type = result_zig_type } }
+                    else
+                        .{ .float_widen = .{ .dest = dest, .source = unary_dest, .dest_type = result_zig_type } });
+                }
+                if (result_zig_type != .any) {
+                    try self.known_local_types.put(dest, result_zig_type);
+                }
             },
             .call => |call| {
                 var args: std.ArrayList(LocalId) = .empty;

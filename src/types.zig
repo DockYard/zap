@@ -622,14 +622,11 @@ pub const TypeStore = struct {
         if (std.mem.eql(u8, name, "f16")) return F16;
         if (std.mem.eql(u8, name, "usize")) return USIZE;
         if (std.mem.eql(u8, name, "isize")) return ISIZE;
-        // Macro meta-types — see `ast.MacroSpliceKind`. The type
-        // checker treats all splice categories as UNKNOWN (no
-        // constraint) because the actual validation lives in the
-        // macro engine, where the bound CtValue's shape can be
-        // checked at expansion time. Adding a name here without a
-        // corresponding entry in `MacroSpliceKind.fromName` would
-        // silently widen the meta-type set; keep the two in sync.
-        if (ast.MacroSpliceKind.fromName(name) != null) return UNKNOWN;
+        // Macro syntax categories — see `ast.MacroSpliceKind`.
+        // Literal macro annotations use ordinary Zap type names
+        // (`Atom`, `Integer`, `String`, `List`), so only syntax-only
+        // categories are erased to UNKNOWN here.
+        if (ast.MacroSpliceKind.fromSyntaxName(name) != null) return UNKNOWN;
         if (std.mem.eql(u8, name, "any")) return UNKNOWN;
         return null;
     }
@@ -989,6 +986,12 @@ pub const TypeStore = struct {
         // existential are the same type in two representations. Accept the
         // argument when the function/`Callable` shapes are equivalent.
         if (self.functionCallableEquiv(actual, expected)) return 0;
+        if (self.containsTypeVars(expected) or self.containsTypeVars(actual)) {
+            var subs = SubstitutionMap.init(self.allocator);
+            defer subs.deinit();
+            if (self.unify(expected, actual, &subs) catch false) return 0;
+            return null;
+        }
         if (self.wideningCost(actual, expected)) |cost| return cost + 1;
         return null;
     }
@@ -1465,18 +1468,20 @@ pub const SubstitutionMap = struct {
                     store.allocator.free(new_params);
                     return type_id;
                 }
-                return store.addType(.{ .function = .{
-                    .params = new_params,
-                    .return_type = new_return,
-                    .param_ownerships = function_type.param_ownerships,
-                    .return_ownership = function_type.return_ownership,
-                    .raises = new_raises,
-                    .effect_var = new_effect_var,
-                    // Phase 4 — the returned-closure error row is concrete
-                    // Error TypeIds (no type vars), so it is preserved verbatim
-                    // across substitution.
-                    .raises_row = function_type.raises_row,
-                } }) catch type_id;
+                return store.addType(.{
+                    .function = .{
+                        .params = new_params,
+                        .return_type = new_return,
+                        .param_ownerships = function_type.param_ownerships,
+                        .return_ownership = function_type.return_ownership,
+                        .raises = new_raises,
+                        .effect_var = new_effect_var,
+                        // Phase 4 — the returned-closure error row is concrete
+                        // Error TypeIds (no type vars), so it is preserved verbatim
+                        // across substitution.
+                        .raises_row = function_type.raises_row,
+                    },
+                }) catch type_id;
             },
             .map => |map_type| {
                 const new_key = self.applyToType(store, map_type.key);
@@ -3593,9 +3598,6 @@ pub const TypeChecker = struct {
             if (self.store.functionCallableEquiv(actual, expected)) return 0;
             return null;
         }
-
-        if (self.store.containsTypeVars(expected) or self.store.containsTypeVars(actual)) return 0;
-        if (expected_type == .type_var or actual_type == .type_var) return 0;
 
         return self.store.callMatchCost(actual, expected);
     }
@@ -8573,6 +8575,16 @@ pub const TypeChecker = struct {
                     );
                     return TypeStore.ERROR;
                 }
+                if (!self.isNumericScalarType(lhs)) {
+                    const lhs_name = self.typeToString(lhs);
+                    try self.addRichError(
+                        try std.fmt.allocPrint(self.allocator, "cannot perform arithmetic on `{s}`", .{lhs_name}),
+                        bo.meta.span,
+                        "arithmetic operands must be numeric scalar values",
+                        "use Simd.* for element-wise operations on homogeneous tuples",
+                    );
+                    return TypeStore.ERROR;
+                }
                 return lhs;
             },
             // Comparison: returns Bool
@@ -8582,7 +8594,15 @@ pub const TypeChecker = struct {
             // String concat
             .concat => TypeStore.STRING,
             // Membership test: returns Bool
-            .in_op => TypeStore.BOOL,
+            .in_op, .not_in_op => TypeStore.BOOL,
+        };
+    }
+
+    fn isNumericScalarType(self: *const TypeChecker, type_id: TypeId) bool {
+        if (type_id >= self.store.types.items.len) return false;
+        return switch (self.store.getType(type_id)) {
+            .int, .float => true,
+            else => false,
         };
     }
 
@@ -14372,6 +14392,38 @@ test "numeric call matching prefers exact type over widening" {
     try std.testing.expectEqual(@as(?u32, 65), store.callMatchCost(TypeStore.U64, TypeStore.U128));
     try std.testing.expectEqual(@as(?u32, 17), store.callMatchCost(TypeStore.F64, TypeStore.F80));
     try std.testing.expectEqual(@as(?u32, 49), store.callMatchCost(TypeStore.F80, TypeStore.F128));
+}
+
+test "generic tuple call matching requires structural arity and repeated lane consistency" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const two_lane_var = try store.freshVar();
+    const two_lane_expected = try store.addType(.{ .tuple = .{
+        .elements = try alloc.dupe(TypeId, &[_]TypeId{ two_lane_var, two_lane_var }),
+    } });
+
+    const four_lane_var = try store.freshVar();
+    const four_lane_expected = try store.addType(.{ .tuple = .{
+        .elements = try alloc.dupe(TypeId, &[_]TypeId{ four_lane_var, four_lane_var, four_lane_var, four_lane_var }),
+    } });
+
+    const four_i32_actual = try store.addType(.{ .tuple = .{
+        .elements = try alloc.dupe(TypeId, &[_]TypeId{ TypeStore.I32, TypeStore.I32, TypeStore.I32, TypeStore.I32 }),
+    } });
+    const mixed_four_lane_actual = try store.addType(.{ .tuple = .{
+        .elements = try alloc.dupe(TypeId, &[_]TypeId{ TypeStore.I32, TypeStore.I64, TypeStore.I32, TypeStore.I32 }),
+    } });
+
+    try std.testing.expectEqual(@as(?u32, null), store.callMatchCost(four_i32_actual, two_lane_expected));
+    try std.testing.expectEqual(@as(?u32, 0), store.callMatchCost(four_i32_actual, four_lane_expected));
+    try std.testing.expectEqual(@as(?u32, null), store.callMatchCost(mixed_four_lane_actual, four_lane_expected));
 }
 
 test "numeric widening is value-preserving across the integer and float families" {

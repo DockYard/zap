@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Simd — Zap</title>
+<link rel="stylesheet" href="../style.css">
+<meta name="zap-docs-base" content="../">
+</head>
+<body>
+<header class="topbar">
+<div class="topbar-left">
+<svg class="zap-mark" width="22" height="22" viewBox="0 0 22 22" fill="none">
+<rect x="0.5" y="0.5" width="21" height="21" rx="3" stroke="var(--border-strong)"/>
+<path d="M6 6 L15 6 L8 13 L16 13 L16 16 L6 16 L13 9 L6 9 Z" fill="var(--accent)"/>
+</svg>
+<a href="../index.html" class="topbar-title">Zap</a>
+<span class="topbar-version">v0.0.0</span>
+<span class="docs-label">docs</span>
+</div>
+<div class="topbar-center">
+<button class="topbar-search-trigger" id="search-trigger">
+<svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+<circle cx="7" cy="7" r="5" stroke="var(--fg-muted)" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="var(--fg-muted)" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<span>Search structs, functions, guides...</span>
+<kbd>⌘</kbd><kbd>K</kbd>
+</button>
+</div>
+<div class="topbar-right">
+<button id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+<span class="theme-icon-light">☀</span>
+<span class="theme-icon-dark">☾</span>
+</button>
+<div class="topbar-divider"></div>
+<a href="https://github.com/DockYard/zap" class="topbar-github" aria-label="GitHub repository" title="GitHub">
+<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor">
+<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+</svg>
+</a>
+</div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+<div class="sidebar-header"><a href="../index.html" class="sidebar-title">Zap</a> <span class="sidebar-version">v0.0.0</span></div>
+<div class="sidebar-search"><input type="text" id="search-input" placeholder="Search (Cmd+K)" aria-label="Search documentation"></div>
+<div class="sidebar-group" data-group="Structs">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Structs</h4></button>
+<ul>
+<li><a href="../structs/ArgumentError.html">ArgumentError</a></li>
+<li><a href="../structs/ArithmeticError.html">ArithmeticError</a></li>
+<li><a href="../structs/Atom.html">Atom</a></li>
+<li><a href="../structs/Bool.html">Bool</a></li>
+<li><a href="../structs/Enum.html">Enum</a></li>
+<li><a href="../structs/File.html">File</a></li>
+<li><a href="../structs/Float.html">Float</a></li>
+<li><a href="../structs/Function.html">Function</a></li>
+<li><a href="../structs/IO.html">IO</a></li>
+<li><a href="../structs/IndexError.html">IndexError</a></li>
+<li><a href="../structs/Integer.html">Integer</a></li>
+<li><a href="../structs/Kernel.html">Kernel</a></li>
+<li><a href="../structs/List.html">List</a></li>
+<li><a href="../structs/Map.html">Map</a></li>
+<li><a href="../structs/Markdown.html">Markdown</a></li>
+<li><a href="../structs/Math.html">Math</a></li>
+<li><a href="../structs/Memory.ARC.html">Memory.ARC</a></li>
+<li><a href="../structs/Memory.Arena.html">Memory.Arena</a></li>
+<li><a href="../structs/Memory.GC.html">Memory.GC</a></li>
+<li><a href="../structs/Memory.Leak.html">Memory.Leak</a></li>
+<li><a href="../structs/Memory.NoOp.html">Memory.NoOp</a></li>
+<li><a href="../structs/Memory.Tracking.html">Memory.Tracking</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Path.html">Path</a></li>
+<li><a href="../structs/Range.html">Range</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+<li><a href="../structs/RuntimeError.html">RuntimeError</a></li>
+<li class="active"><a href="../structs/Simd.html">Simd</a></li>
+<li><a href="../structs/SourceGraph.html">SourceGraph</a></li>
+<li><a href="../structs/String.html">String</a></li>
+<li><a href="../structs/Struct.html">Struct</a></li>
+<li><a href="../structs/System.html">System</a></li>
+<li><a href="../structs/Tuple.html">Tuple</a></li>
+<li><a href="../structs/Type.html">Type</a></li>
+<li><a href="../structs/Zap.Build.Compile.html">Zap.Build.Compile</a></li>
+<li><a href="../structs/Zap.Build.Pipeline.html">Zap.Build.Pipeline</a></li>
+<li><a href="../structs/Zap.Build.Run.html">Zap.Build.Run</a></li>
+<li><a href="../structs/Zap.Build.Step.html">Zap.Build.Step</a></li>
+<li><a href="../structs/Zap.Dep.html">Zap.Dep</a></li>
+<li><a href="../structs/Zap.Doc.html">Zap.Doc</a></li>
+<li><a href="../structs/Zap.Doc.Builder.html">Zap.Doc.Builder</a></li>
+<li><a href="../structs/Zap.Env.html">Zap.Env</a></li>
+<li><a href="../structs/Zap.ErrorCatalog.html">Zap.ErrorCatalog</a></li>
+<li><a href="../structs/Zap.Manifest.html">Zap.Manifest</a></li>
+<li><a href="../structs/Zest.html">Zest</a></li>
+<li><a href="../structs/Zest.Assertion.html">Zest.Assertion</a></li>
+<li><a href="../structs/Zest.Case.html">Zest.Case</a></li>
+<li><a href="../structs/Zest.Runner.html">Zest.Runner</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Protocols">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Protocols</h4></button>
+<ul>
+<li><a href="../structs/Arithmetic.html">Arithmetic</a></li>
+<li><a href="../structs/Callable.html">Callable</a></li>
+<li><a href="../structs/Comparator.html">Comparator</a></li>
+<li><a href="../structs/Concatenable.html">Concatenable</a></li>
+<li><a href="../structs/Enumerable.html">Enumerable</a></li>
+<li><a href="../structs/Error.html">Error</a></li>
+<li><a href="../structs/Membership.html">Membership</a></li>
+<li><a href="../structs/Memory.Manager.html">Memory.Manager</a></li>
+<li><a href="../structs/Stringable.html">Stringable</a></li>
+<li><a href="../structs/Updatable.html">Updatable</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Unions">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Unions</h4></button>
+<ul>
+<li><a href="../structs/IO.Mode.html">IO.Mode</a></li>
+<li><a href="../structs/Option.html">Option</a></li>
+<li><a href="../structs/Result.html">Result</a></li>
+</ul>
+</div>
+<div class="sidebar-group" data-group="Guides">
+<button class="sidebar-group-header" type="button" aria-label="Toggle group"><span class="chevron" aria-hidden="true">▸</span><h4>Guides</h4></button>
+<ul>
+<li><a href="../guides/enum.html">Enum</a></li>
+<li><a href="../guides/integer.html">Integer</a></li>
+<li><a href="../guides/io.html">Io</a></li>
+<li><a href="../guides/list.html">List</a></li>
+<li><a href="../guides/string.html">String</a></li>
+</ul>
+</div>
+</nav>
+<main class="content">
+<nav class="breadcrumb" aria-label="Breadcrumb">
+<span>Structs</span>
+<span>/</span>
+<span class="breadcrumb-current">Simd</span>
+</nav>
+<h1 class="page-title">Simd</h1>
+<p class="tagline">Tuple-backed SIMD operations.</p>
+<div class="structdoc">
+<p>Tuple-backed SIMD operations.</p>
+<p>Simd exposes Zap tuples as the public SIMD value shape and delegates the
+actual lane operations to Zig's <code>@Vector</code> builtins through <code>:zig.Simd</code>.
+No Zap vector type is introduced: <code>{f32, f32, f32, f32}</code> remains an
+ordinary tuple, and SIMD behavior is only available through this module.</p>
+</div>
+<h2 id="functions">Functions</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#add-2">add/2</a></td><td class="summary-doc">Adds two 2-lane SIMD tuples element-wise.</td></tr>
+<tr><td class="summary-name"><a href="#sub-2">sub/2</a></td><td class="summary-doc">Subtracts two 2-lane SIMD tuples element-wise.</td></tr>
+<tr><td class="summary-name"><a href="#mul-2">mul/2</a></td><td class="summary-doc">Multiplies two 2-lane SIMD tuples element-wise.</td></tr>
+<tr><td class="summary-name"><a href="#eq-2">eq/2</a></td><td class="summary-doc">Compares two 2-lane SIMD tuples for lane-wise equality.</td></tr>
+<tr><td class="summary-name"><a href="#ne-2">ne/2</a></td><td class="summary-doc">Compares two 2-lane SIMD tuples for lane-wise inequality.</td></tr>
+<tr><td class="summary-name"><a href="#lt-2">lt/2</a></td><td class="summary-doc">Compares whether each lane in the left 2-lane tuple is less than the right lane.</td></tr>
+<tr><td class="summary-name"><a href="#lte-2">lte/2</a></td><td class="summary-doc">Compares whether each lane in the left 2-lane tuple is less than or equal to the right lane.</td></tr>
+<tr><td class="summary-name"><a href="#gt-2">gt/2</a></td><td class="summary-doc">Compares whether each lane in the left 2-lane tuple is greater than the right lane.</td></tr>
+<tr><td class="summary-name"><a href="#gte-2">gte/2</a></td><td class="summary-doc">Compares whether each lane in the left 2-lane tuple is greater than or equal to the right lane.</td></tr>
+<tr><td class="summary-name"><a href="#select-3">select/3</a></td><td class="summary-doc">Selects between two 2-lane tuples with a Bool mask tuple.</td></tr>
+<tr><td class="summary-name"><a href="#reduce_add-1">reduce_add/1</a></td><td class="summary-doc">Adds all lanes in a 2-lane SIMD tuple.</td></tr>
+<tr><td class="summary-name"><a href="#reduce_min-1">reduce_min/1</a></td><td class="summary-doc">Returns the minimum lane in a 2-lane SIMD tuple.</td></tr>
+<tr><td class="summary-name"><a href="#reduce_max-1">reduce_max/1</a></td><td class="summary-doc">Returns the maximum lane in a 2-lane SIMD tuple.</td></tr>
+</table>
+<h2 id="macros">Macros</h2>
+<table class="summary">
+<tr><td class="summary-name"><a href="#vector-3">vector/3</a></td><td class="summary-doc">Type-checks a homogeneous tuple as an SIMD lane tuple.</td></tr>
+<tr><td class="summary-name"><a href="#splat-3">splat/3</a></td><td class="summary-doc">Builds a homogeneous tuple by splatting one signed 8-bit lane value.</td></tr>
+<tr><td class="summary-name"><a href="#reduce-2">reduce/2</a></td><td class="summary-doc">Reduces a lane tuple with `:add`, `:min`, or `:max`.</td></tr>
+</table>
+<h2>Function Details</h2>
+<div class="function-detail" id="add-2">
+<div class="function-header">
+<h3>add<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#add-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">add</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">add</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">add</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">add</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">add</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span></code></div>
+<div class="function-doc">
+<p>Adds two 2-lane SIMD tuples element-wise.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L340">Source</a>
+</div>
+<div class="function-detail" id="sub-2">
+<div class="function-header">
+<h3>sub<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#sub-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">sub</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">sub</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">sub</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">sub</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">sub</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span></code></div>
+<div class="function-doc">
+<p>Subtracts two 2-lane SIMD tuples element-wise.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L380">Source</a>
+</div>
+<div class="function-detail" id="mul-2">
+<div class="function-header">
+<h3>mul<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#mul-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">mul</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">mul</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">mul</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">mul</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">mul</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span></code></div>
+<div class="function-doc">
+<p>Multiplies two 2-lane SIMD tuples element-wise.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L420">Source</a>
+</div>
+<div class="function-detail" id="eq-2">
+<div class="function-header">
+<h3>eq<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#eq-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">eq</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">eq</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">eq</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">eq</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">eq</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="function-doc">
+<p>Compares two 2-lane SIMD tuples for lane-wise equality.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L460">Source</a>
+</div>
+<div class="function-detail" id="ne-2">
+<div class="function-header">
+<h3>ne<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#ne-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">ne</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">ne</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">ne</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">ne</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">ne</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="function-doc">
+<p>Compares two 2-lane SIMD tuples for lane-wise inequality.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L500">Source</a>
+</div>
+<div class="function-detail" id="lt-2">
+<div class="function-header">
+<h3>lt<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#lt-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">lt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">lt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">lt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">lt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">lt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="function-doc">
+<p>Compares whether each lane in the left 2-lane tuple is less than the right lane.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L540">Source</a>
+</div>
+<div class="function-detail" id="lte-2">
+<div class="function-header">
+<h3>lte<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#lte-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">lte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">lte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">lte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">lte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">lte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="function-doc">
+<p>Compares whether each lane in the left 2-lane tuple is less than or equal to the right lane.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L580">Source</a>
+</div>
+<div class="function-detail" id="gt-2">
+<div class="function-header">
+<h3>gt<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#gt-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">gt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">gt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">gt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">gt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">gt</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="function-doc">
+<p>Compares whether each lane in the left 2-lane tuple is greater than the right lane.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L620">Source</a>
+</div>
+<div class="function-detail" id="gte-2">
+<div class="function-header">
+<h3>gte<span class="arity">/2</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#gte-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">gte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">gte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">gte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">gte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="signature"><code><span class="sig-name">gte</span><span class="sig-paren">(</span>left<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>right<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span></code></div>
+<div class="function-doc">
+<p>Compares whether each lane in the left 2-lane tuple is greater than or equal to the right lane.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L660">Source</a>
+</div>
+<div class="function-detail" id="select-3">
+<div class="function-header">
+<h3>select<span class="arity">/3</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#select-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">select</span><span class="sig-paren">(</span>mask<span class="sig-separator">::</span><span class="sig-type-pill">{Bool, Bool}</span><span class="sig-paren">, </span>when_true<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">, </span>when_false<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">select</span><span class="sig-paren">(</span>mask<span class="sig-separator">::</span><span class="sig-type-pill">{Bool, Bool, Bool}</span><span class="sig-paren">, </span>when_true<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">, </span>when_false<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">select</span><span class="sig-paren">(</span>mask<span class="sig-separator">::</span><span class="sig-type-pill">{Bool, Bool, Bool, Bool}</span><span class="sig-paren">, </span>when_true<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">, </span>when_false<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">select</span><span class="sig-paren">(</span>mask<span class="sig-separator">::</span><span class="sig-type-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span><span class="sig-paren">, </span>when_true<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>when_false<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span></code></div>
+<div class="signature"><code><span class="sig-name">select</span><span class="sig-paren">(</span>mask<span class="sig-separator">::</span><span class="sig-type-pill">{Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool}</span><span class="sig-paren">, </span>when_true<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">, </span>when_false<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span></code></div>
+<div class="function-doc">
+<p>Selects between two 2-lane tuples with a Bool mask tuple.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L700">Source</a>
+</div>
+<div class="function-detail" id="reduce_add-1">
+<div class="function-header">
+<h3>reduce_add<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#reduce_add-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reduce_add</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_add</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_add</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_add</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_add</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="function-doc">
+<p>Adds all lanes in a 2-lane SIMD tuple.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L740">Source</a>
+</div>
+<div class="function-detail" id="reduce_min-1">
+<div class="function-header">
+<h3>reduce_min<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#reduce_min-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reduce_min</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_min</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_min</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_min</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_min</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="function-doc">
+<p>Returns the minimum lane in a 2-lane SIMD tuple.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L780">Source</a>
+</div>
+<div class="function-detail" id="reduce_max-1">
+<div class="function-header">
+<h3>reduce_max<span class="arity">/1</span></h3>
+<span class="badge">fn</span>
+<div style="flex:1"></div>
+<a href="#reduce_max-1" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reduce_max</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_max</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_max</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_max</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="signature"><code><span class="sig-name">reduce_max</span><span class="sig-paren">(</span>value<span class="sig-separator">::</span><span class="sig-type-pill">{lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane, lane}</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">lane</span></code></div>
+<div class="function-doc">
+<p>Returns the maximum lane in a 2-lane SIMD tuple.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L820">Source</a>
+</div>
+<h2>Macro Details</h2>
+<div class="function-detail" id="vector-3">
+<div class="function-header">
+<h3>vector<span class="arity">/3</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#vector-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">vector</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>lane_type<span class="sig-separator">::</span><span class="sig-type-pill">Type</span><span class="sig-paren">, </span>tuple_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Type-checks a homogeneous tuple as an SIMD lane tuple.</p>
+<p><code>Simd.vector(4, f32, {1.0, 2.0, 3.0, 4.0})</code> returns a
+<code>{f32, f32, f32, f32}</code> tuple after validating the shape through
+Zig's SIMD runtime bridge.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L19">Source</a>
+</div>
+<div class="function-detail" id="splat-3">
+<div class="function-header">
+<h3>splat<span class="arity">/3</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#splat-3" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>i8<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>i16<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>i32<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>i64<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>i128<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>u8<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>u16<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>u32<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>u64<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>u128<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>usize<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>isize<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>f16<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>f32<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>f64<span class="sig-paren">, </span>scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="signature"><code><span class="sig-name">splat</span><span class="sig-paren">(</span>_lanes<span class="sig-separator">::</span><span class="sig-type-pill">Integer</span><span class="sig-paren">, </span>_lane_type<span class="sig-separator">::</span><span class="sig-type-pill">Type</span><span class="sig-paren">, </span>_scalar_expression<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Builds a homogeneous tuple by splatting one signed 8-bit lane value.</p>
+<p><code>Simd.splat(4, i8, 7)</code> returns <code>{7, 7, 7, 7}</code> as an
+<code>{i8, i8, i8, i8}</code> tuple.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L57">Source</a>
+</div>
+<div class="function-detail" id="reduce-2">
+<div class="function-header">
+<h3>reduce<span class="arity">/2</span></h3>
+<span class="badge">macro</span>
+<div style="flex:1"></div>
+<a href="#reduce-2" class="anchor-link">#</a>
+</div>
+<div class="signature"><code><span class="sig-name">reduce</span><span class="sig-paren">(</span>operation<span class="sig-separator">::</span><span class="sig-type-pill">Atom</span><span class="sig-paren">, </span>value<span class="sig-separator">::</span><span class="sig-type-pill">Expr</span><span class="sig-paren">)</span><span class="sig-arrow">→</span><span class="sig-ret-pill">Expr</span></code></div>
+<div class="function-doc">
+<p>Reduces a lane tuple with <code>:add</code>, <code>:min</code>, or <code>:max</code>.</p>
+</div>
+<a class="source-link" href="https://github.com/DockYard/zap/blob/v0.0.0/lib/simd.zap#L320">Source</a>
+</div>
+</main>
+<aside class="toc">
+<h3>On This Page</h3>
+<ul>
+<li class="toc-section">Functions</li>
+<li><a href="#add-2">add/2</a></li>
+<li><a href="#sub-2">sub/2</a></li>
+<li><a href="#mul-2">mul/2</a></li>
+<li><a href="#eq-2">eq/2</a></li>
+<li><a href="#ne-2">ne/2</a></li>
+<li><a href="#lt-2">lt/2</a></li>
+<li><a href="#lte-2">lte/2</a></li>
+<li><a href="#gt-2">gt/2</a></li>
+<li><a href="#gte-2">gte/2</a></li>
+<li><a href="#select-3">select/3</a></li>
+<li><a href="#reduce_add-1">reduce_add/1</a></li>
+<li><a href="#reduce_min-1">reduce_min/1</a></li>
+<li><a href="#reduce_max-1">reduce_max/1</a></li>
+<li class="toc-section">Macros</li>
+<li><a href="#vector-3">vector/3</a></li>
+<li><a href="#splat-3">splat/3</a></li>
+<li><a href="#reduce-2">reduce/2</a></li>
+</ul>
+</aside>
+</div>
+<div id="search-modal" class="search-modal" hidden>
+<div class="search-backdrop"></div>
+<div class="search-dialog">
+<div class="search-header">
+<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+<circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.3"/>
+<line x1="10.6" y1="10.6" x2="14" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+</svg>
+<input type="text" id="search-modal-input" placeholder="Search Zap docs…" aria-label="Search">
+<kbd>ESC</kbd>
+</div>
+<ul id="search-results" class="search-results"></ul>
+<div class="search-footer">
+<span class="search-footer-item"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+<span class="search-footer-item"><kbd>↵</kbd> open</span>
+<span class="spacer"></span>
+<span class="search-footer-item"><kbd>ESC</kbd> close</span>
+</div>
+</div>
+</div>
+<script src="../app.js"></script>
+</body>
+</html>

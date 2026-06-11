@@ -62,6 +62,10 @@ error InternalIce {
   message :: String = "internal"
 }
 
+pub struct PubErrorHolder {
+  cause :: Option(Error) = Option.None
+}
+
 pub struct PubErrorTest {
   use Zest.Case
 
@@ -115,6 +119,20 @@ pub struct PubErrorTest {
     test("Error.kind on a private error type still snake_cases the name") {
       e = %InternalIce{}
       assert(Error.kind(e) == :internal_ice)
+    }
+  }
+
+  describe("Option(Error) fields") {
+    test("default cause accepts Option.None") {
+      holder = %PubErrorHolder{}
+
+      assert(Option.is_none?(holder.cause))
+    }
+
+    test("cause accepts Some boxed error") {
+      holder = %PubErrorHolder{cause: Option.Some(%NotConnected{})}
+
+      assert(Option.is_some?(holder.cause))
     }
   }
 }

@@ -840,6 +840,7 @@ fn binopToString(op: ast.BinaryOp.Op) []const u8 {
         .or_op => "||",
         .concat => "<>",
         .in_op => "in",
+        .not_in_op => "not in",
     };
 }
 
@@ -2331,6 +2332,8 @@ fn stringToBinop(name: []const u8) ?ast.BinaryOp.Op {
     if (std.mem.eql(u8, name, "&&")) return .and_op;
     if (std.mem.eql(u8, name, "||")) return .or_op;
     if (std.mem.eql(u8, name, "<>")) return .concat;
+    if (std.mem.eql(u8, name, "in")) return .in_op;
+    if (std.mem.eql(u8, name, "not in")) return .not_in_op;
     return null;
 }
 
