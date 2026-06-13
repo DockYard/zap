@@ -295,10 +295,23 @@ pub const PerceusAnalyzer = struct {
 
                 stats.construction_sites += @intCast(constructions.len);
 
-                // Phase 3: Generate reuse pairs
-                for (constructions) |con| {
+                // Phase 3: Generate reuse pairs.
+                //
+                // A single deconstruction (one match site) can pair with a
+                // construction in EACH arm of the match — every arm reuses the
+                // same scrutinee cell, and they all share one reset token
+                // (`10000 + match_site_id`). Emit the `.reset` arc_op (which
+                // materializes the `resetAny` call that claims the cell) EXACTLY
+                // ONCE per match site, on the first pair: it is the
+                // deconstruction's single claim, placed before the case, and
+                // each arm's `.reuse_alloc` consumes the token on its own
+                // control-flow path. Emitting one `.reset` per construction
+                // (the prior behavior) made a two-arm match run `resetAny`
+                // twice on the same scrutinee — a double-claim/double-release
+                // and a wrong-cell reuse (audit arc-param--04).
+                for (constructions, 0..) |con, con_index| {
                     const kind = self.determineReuseKind(&decon);
-                    try self.generateReusePair(func, &decon, &con, kind);
+                    try self.generateReusePair(func, &decon, &con, kind, con_index == 0);
                     stats.total_reuse_pairs += 1;
                     switch (kind) {
                         .static_reuse => stats.static_reuses += 1,
@@ -831,6 +844,7 @@ pub const PerceusAnalyzer = struct {
         decon: *const DeconstructionSite,
         con: *const ConstructionSite,
         kind: lattice.ReuseKind,
+        emit_reset_arc_op: bool,
     ) !void {
         const function_id = func.id;
         // Fingerprint the anchor instructions NOW, against the current IR
@@ -883,19 +897,27 @@ pub const PerceusAnalyzer = struct {
         // materialization pass can navigate to the correct nested
         // stream without reconstructing position from synthetic
         // arithmetic.
-        try self.arc_ops.append(self.allocator, .{
-            .kind = .reset,
-            .value = decon.scrutinee,
-            .insertion_point = .{
-                .function = function_id,
-                .block = decon.block,
-                .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
-                .instr_index = decon.instr_index,
-                .position = .before,
-                .expected_identity = decon_identity,
-            },
-            .reason = .perceus_reuse,
-        });
+        //
+        // The `.reset` arc_op materializes the single `resetAny` that claims
+        // the deconstructed cell. It is emitted ONCE per match site (only on
+        // the first construction pair) — every arm of the match shares this
+        // one reset and its one token; emitting it per construction would run
+        // `resetAny` once per arm on the same scrutinee (audit arc-param--04).
+        if (emit_reset_arc_op) {
+            try self.arc_ops.append(self.allocator, .{
+                .kind = .reset,
+                .value = decon.scrutinee,
+                .insertion_point = .{
+                    .function = function_id,
+                    .block = decon.block,
+                    .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
+                    .instr_index = decon.instr_index,
+                    .position = .before,
+                    .expected_identity = decon_identity,
+                },
+                .reason = .perceus_reuse,
+            });
+        }
 
         try self.arc_ops.append(self.allocator, .{
             .kind = .reuse_alloc,
@@ -2985,6 +3007,78 @@ test "reuse pair generates reset and reuse_alloc ARC operations" {
             try testing.expectEqual(.before, op.insertion_point.position);
             try testing.expectEqual(lattice.ArcReason.perceus_reuse, op.reason);
         }
+    }
+}
+
+test "two arms reusing one scrutinee emit exactly one reset (no double resetAny)" {
+    // arc-param--04: a single deconstruction (one match site) that pairs with
+    // a construction in EACH arm shares ONE reset token across the arms. The
+    // `.reset` arc_op (which materializes `resetAny`, claiming the cell) must
+    // be emitted exactly ONCE per match site — not once per construction.
+    // Pre-fix, generateReusePair appended one `.reset` per pair, so a two-arm
+    // match produced two `.reset` ops over the same scrutinee and `resetAny`
+    // ran twice (double-claim / double-release / wrong-cell reuse).
+    const allocator = testing.allocator;
+
+    // Both arms construct a `Shape` (2-field struct) from the same scrutinee
+    // (local 1), so both pair with the single deconstruction.
+    const cond0 = [_]ir.Instruction{
+        .{ .match_type = .{ .dest = 10, .scrutinee = 1, .expected_type = .{ .struct_ref = "Shape" }, .expected_arity = 2 } },
+    };
+    const body0 = [_]ir.Instruction{
+        .{ .struct_init = .{ .dest = 20, .type_name = "Shape", .fields = &.{
+            .{ .name = "w", .value = 11 },
+            .{ .name = "h", .value = 12 },
+        } } },
+    };
+    const cond1 = [_]ir.Instruction{
+        .{ .match_type = .{ .dest = 15, .scrutinee = 1, .expected_type = .{ .struct_ref = "Shape" }, .expected_arity = 2 } },
+    };
+    const body1 = [_]ir.Instruction{
+        .{ .struct_init = .{ .dest = 25, .type_name = "Shape", .fields = &.{
+            .{ .name = "w", .value = 12 },
+            .{ .name = "h", .value = 11 },
+        } } },
+    };
+    const arms = [_]ir.IrCaseArm{
+        .{ .cond_instrs = &cond0, .condition = 10, .body_instrs = &body0, .result = 20 },
+        .{ .cond_instrs = &cond1, .condition = 15, .body_instrs = &body1, .result = 25 },
+    };
+    const block_instrs = [_]ir.Instruction{
+        .{ .case_block = .{ .dest = 30, .pre_instrs = &.{}, .arms = &arms, .default_instrs = &.{}, .default_result = null } },
+    };
+    const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
+    const functions = [_]ir.Function{makeFunction(0, "two_arm_reuse", &blocks)};
+    var program = try makeTestProgram(&functions);
+    _ = &program;
+
+    var analyzer = PerceusAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    const result = try analyzer.analyze();
+    defer result.deinit(allocator);
+
+    var reset_count: usize = 0;
+    var reuse_count: usize = 0;
+    for (result.arc_ops) |op| {
+        switch (op.kind) {
+            .reset => reset_count += 1,
+            .reuse_alloc => reuse_count += 1,
+            else => {},
+        }
+    }
+
+    // Both arms pair, so two reuse pairs and two `.reuse_alloc` ops...
+    try testing.expectEqual(@as(usize, 2), result.reuse_pairs.len);
+    try testing.expectEqual(@as(usize, 2), reuse_count);
+    // ...but the shared scrutinee is reset EXACTLY ONCE.
+    try testing.expectEqual(@as(usize, 1), reset_count);
+
+    // The two pairs share one reset token (same match site), and the single
+    // reset's source is the shared scrutinee.
+    try testing.expectEqual(result.reuse_pairs[0].reset.dest, result.reuse_pairs[1].reset.dest);
+    for (result.arc_ops) |op| {
+        if (op.kind == .reset) try testing.expectEqual(@as(ir.LocalId, 1), op.value);
     }
 }
 

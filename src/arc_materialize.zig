@@ -201,8 +201,19 @@ pub fn materializeAnalysisArcOps(
     // struct_init / union_init handlers dispatch on this field,
     // routing through `emitReuseAllocCall` when set — the single
     // canonical `reuseAllocByType` emission site.
+    //
+    // `rewritten_tokens` records the tokens whose construction rewrite
+    // actually applied. The `.reset` materialization below consults it so a
+    // ReusePair is atomic: a `.reset` (which claims the scrutinee cell via
+    // `resetAny`) is emitted ONLY when a construction was rewritten to
+    // consume its token. Without this, a construction rewrite that silently
+    // fails (stale coordinate) would still leave the `.reset` in place,
+    // claiming a cell nothing reuses — a leak invisible to the V10 audit
+    // (audit arc-param--04).
+    var rewritten_tokens: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+    defer rewritten_tokens.deinit(allocator);
     if (emit_refcount_ops) {
-        try rewriteReuseConstructions(allocator, function, analysis_context);
+        try rewriteReuseConstructions(allocator, function, analysis_context, &rewritten_tokens);
     }
 
     var pending = PendingTree.init(allocator);
@@ -239,7 +250,17 @@ pub fn materializeAnalysisArcOps(
                 // `analysis_context.reuse_pairs` keyed on this arc_op's
                 // source local).
                 .reset => blk: {
-                    const token_dest = findResetTokenForSource(analysis_context, function.id, op.value) orelse continue;
+                    // Atomicity: `findResetTokenForSource` only returns a
+                    // token whose construction was actually rewritten to
+                    // consume it. A reset with no consuming construction
+                    // (stale-coordinate rewrite failure, or no reuse pair)
+                    // is NOT materialized — otherwise it would claim the
+                    // scrutinee cell with nothing to reuse it (leak). The
+                    // arc_op's path slice stays owned by the analysis context
+                    // (freed at its deinit); leaving the record un-consumed
+                    // routes it to the V10 leftover audit rather than
+                    // silently dropping it.
+                    const token_dest = findResetTokenForSource(analysis_context, function.id, op.value, &rewritten_tokens) orelse continue;
                     break :blk ir.Instruction{ .reset = .{ .dest = token_dest, .source = op.value } };
                 },
                 // `.reuse_alloc` is consumed by `rewriteReuseConstructions`
@@ -410,15 +431,27 @@ fn rewriteReuseTokensToRealLocals(
 /// `reset.source` matches `source_local` in `function_id`. Returns
 /// `null` if no matching pair exists (no reuse opportunity for
 /// this deconstruction).
+///
+/// When several pairs share one `source_local` (every arm of a single
+/// match site reuses the same scrutinee, sharing one token after
+/// `rewriteReuseTokensToRealLocals`), they all resolve to the same token,
+/// so first-match is correct. The `rewritten_tokens` guard disambiguates
+/// the residual case the audit (arc-param--04) flagged: if two DISTINCT
+/// match sites in one function ever deconstruct the same scrutinee local
+/// (distinct tokens), binding the reset to a token whose construction was
+/// actually rewritten avoids mis-pairing the reset to an unrelated, never-
+/// reused token. A rewritten token is preferred; absent any, the function
+/// returns null so no orphan reset is materialized.
 fn findResetTokenForSource(
     analysis_context: *const escape_lattice.AnalysisContext,
     function_id: ir.FunctionId,
     source_local: ir.LocalId,
+    rewritten_tokens: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
 ) ?ir.LocalId {
     for (analysis_context.reuse_pairs.items) |pair| {
         if (pair.reuse.insertion_point.function != function_id) continue;
         if (pair.reset.source != source_local) continue;
-        return pair.reset.dest;
+        if (rewritten_tokens.contains(pair.reset.dest)) return pair.reset.dest;
     }
     return null;
 }
@@ -435,6 +468,7 @@ fn rewriteReuseConstructions(
     allocator: std.mem.Allocator,
     function: *ir.Function,
     analysis_context: *const escape_lattice.AnalysisContext,
+    rewritten_tokens: *std.AutoHashMapUnmanaged(ir.LocalId, void),
 ) !void {
     for (analysis_context.reuse_pairs.items) |pair| {
         if (pair.reuse.insertion_point.function != function.id) continue;
@@ -449,7 +483,15 @@ fn rewriteReuseConstructions(
             pair.reuse.dest,
             token,
         );
-        if (new_stream) |s| block_ptr.instructions = s;
+        if (new_stream) |s| {
+            block_ptr.instructions = s;
+            // The construction now carries this token. Record it so the
+            // paired `.reset` materialization knows the token is actually
+            // consumed (atomicity — see materializeAnalysisArcOps). A token
+            // shared by several arms of one match is recorded once; any arm
+            // whose construction was rewritten keeps the shared reset live.
+            try rewritten_tokens.put(allocator, token, {});
+        }
     }
 }
 
