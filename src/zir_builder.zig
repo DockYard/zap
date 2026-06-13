@@ -7510,12 +7510,13 @@ pub const ZirDriver = struct {
                     if (type_ref == error_ref) return error.EmitFailed;
                     const token_ref = try self.refForLocal(token_local);
                     const ptr_ref = try self.emitReuseAllocCall(type_ref, token_ref);
-                    for (0..ti.elements.len) |i| {
-                        const name = indexFieldName(i);
-                        const ptr = zir_builder_emit_field_ptr(self.handle, ptr_ref, name.ptr, name.len);
-                        if (ptr == error_ref) return error.EmitFailed;
-                        if (zir_builder_emit_store(self.handle, ptr, values.items[i]) != 0) return error.EmitFailed;
-                    }
+                    // Store the COMPLETE seed tuple into the reused cell in one
+                    // aggregate store rather than element-by-element (IR-ZIRB-2--01,
+                    // kept coherent with the struct/union reuse paths). The seed
+                    // already carries every element (with `Term`-wrapping
+                    // applied above), so this writes them all; it cannot leave
+                    // any element holding stale bytes from the dropped value.
+                    if (zir_builder_emit_store(self.handle, ptr_ref, seed_ref) != 0) return error.EmitFailed;
                     try self.markReuseBackedTupleLocal(ti.dest, ti.elements.len);
                     try self.setLocal(ti.dest, ptr_ref);
                 } else {
@@ -7775,12 +7776,23 @@ pub const ZirDriver = struct {
                     if (type_ref == error_ref) return error.EmitFailed;
                     const token_ref = try self.refForLocal(token_local);
                     const ptr_ref = try self.emitReuseAllocCall(type_ref, token_ref);
-                    for (si.fields) |field| {
-                        const value_ref = self.refForValueLocal(field.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        const ptr = zir_builder_emit_field_ptr(self.handle, ptr_ref, field.name.ptr, @intCast(field.name.len));
-                        if (ptr == error_ref) return error.EmitFailed;
-                        if (zir_builder_emit_store(self.handle, ptr, value_ref) != 0) return error.EmitFailed;
-                    }
+                    // Store the COMPLETE seed value into the reused cell, not a
+                    // hand-picked subset of fields (IR-ZIRB-2--01). The seed
+                    // already carries every field — explicit values with
+                    // indirect-storage heap promotion applied, plus
+                    // default-filled omitted fields — so a single aggregate
+                    // store writes them all correctly. The previous per-field
+                    // loop iterated `si.fields` (the raw, un-promoted,
+                    // possibly-incomplete instruction field list), which left
+                    // defaulted fields holding stale bytes from the dropped
+                    // object and stored un-promoted values into
+                    // indirect-storage (`?*const T`) recursive-field slots.
+                    // The whole-value store is also self-contained: it cannot
+                    // reintroduce stale memory even if a future IR pass
+                    // synthesizes an incomplete `struct_init` paired with a
+                    // reuse token. Finding 1 guarantees the reused cell is
+                    // large enough for the type, so this store never overflows.
+                    if (zir_builder_emit_store(self.handle, ptr_ref, seed_ref) != 0) return error.EmitFailed;
                     try self.markReuseBackedStructLocal(si.dest, si.type_name);
                     try self.setLocal(si.dest, ptr_ref);
                 } else if (self.shouldSkipArc(si.dest) and !self.isRecursiveStruct(si.type_name)) {
@@ -8166,9 +8178,17 @@ pub const ZirDriver = struct {
                     if (type_ref == error_ref) return error.EmitFailed;
                     const token_ref = try self.refForLocal(token_local);
                     const ptr_ref = try self.emitReuseAllocCall(type_ref, token_ref);
-                    const ptr = zir_builder_emit_field_ptr(self.handle, ptr_ref, ui.variant_name.ptr, @intCast(ui.variant_name.len));
-                    if (ptr == error_ref) return error.EmitFailed;
-                    if (zir_builder_emit_store(self.handle, ptr, val_ref) != 0) return error.EmitFailed;
+                    // Store the COMPLETE seed union value (discriminant tag AND
+                    // payload) into the reused cell (IR-ZIRB-2--01). The
+                    // previous code stored ONLY the variant payload field via
+                    // `field_ptr` + `store`, never the tag — so reconstructing
+                    // a DIFFERENT variant from a reset cell (Perceus pairs any
+                    // two variants of the same union) left the stale
+                    // discriminant of the input variant, yielding a value that
+                    // reads back as the wrong variant. The seed `union_init`
+                    // already encodes the correct tag+payload, so one aggregate
+                    // store fixes both. Finding 1 guarantees the cell fits.
+                    if (zir_builder_emit_store(self.handle, ptr_ref, seed_ref) != 0) return error.EmitFailed;
                     try self.markReuseBackedUnionLocal(ui);
                     try self.setLocal(ui.dest, ptr_ref);
                 } else {

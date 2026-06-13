@@ -320,4 +320,73 @@ pub struct UnionTest {
     after = List.length(items)
     after + inner
   }
+
+  # ----------------------------------------------------------------------
+  # Regression guard for IR-ZIRB-2--01 (the union construction path must
+  # write the WHOLE reconstructed value — discriminant tag AND payload).
+  #
+  # A tagged union is deconstructed in a `case` and a DIFFERENT variant is
+  # reconstructed in the matched arm. If the construction (or, when Perceus
+  # pairs this deconstruction+reconstruction into an in-place reuse, the
+  # reuse lowering) ever wrote only the variant payload and not the
+  # discriminant tag, the reconstructed value would read back as the wrong
+  # variant (e.g. `rebuild_as_circle(Square(n))` still tagged Square). The
+  # zir_builder reuse-construction path stores the complete seed value, so
+  # the tag is always written; these tests pin that down by reading the
+  # reconstructed variant back through a tag-dispatching name function. They
+  # guard variant-reconstruction correctness regardless of whether the
+  # optimizer chooses in-place reuse or a fresh allocation.
+  describe("union variant reconstruction preserves the reconstructed tag (IR-ZIRB-2--01)") {
+    test("reconstructing Circle from a Square cell yields a Circle") {
+      assert(UnionTest.variant_name(UnionTest.rebuild_as_circle(CatchallShape(i64).Square(5))) == "circle")
+    }
+
+    test("reconstructing Circle from a Triangle cell yields a Circle") {
+      assert(UnionTest.variant_name(UnionTest.rebuild_as_circle(CatchallShape(i64).Triangle(9))) == "circle")
+    }
+
+    test("reconstructing Square from a Circle cell yields a Square") {
+      assert(UnionTest.variant_name(UnionTest.rebuild_as_square(CatchallShape(i64).Circle(3))) == "square")
+    }
+
+    test("reused construction preserves the payload too") {
+      assert(UnionTest.payload_of(UnionTest.rebuild_as_circle(CatchallShape(i64).Square(42))) == 42)
+    }
+  }
+
+  # Deconstruct an owned `CatchallShape` and rebuild a Circle carrying the
+  # same payload. The deconstruction + same-union reconstruction is a
+  # Perceus reuse pair, so the input variant's cell is reused to build the
+  # Circle.
+  fn rebuild_as_circle(shape :: CatchallShape(i64)) -> CatchallShape(i64) {
+    case shape {
+      CatchallShape.Circle(n) -> CatchallShape(i64).Circle(n)
+      CatchallShape.Square(n) -> CatchallShape(i64).Circle(n)
+      CatchallShape.Triangle(n) -> CatchallShape(i64).Circle(n)
+    }
+  }
+
+  fn rebuild_as_square(shape :: CatchallShape(i64)) -> CatchallShape(i64) {
+    case shape {
+      CatchallShape.Circle(n) -> CatchallShape(i64).Square(n)
+      CatchallShape.Square(n) -> CatchallShape(i64).Square(n)
+      CatchallShape.Triangle(n) -> CatchallShape(i64).Square(n)
+    }
+  }
+
+  fn variant_name(shape :: CatchallShape(i64)) -> String {
+    case shape {
+      CatchallShape.Circle(_) -> "circle"
+      CatchallShape.Square(_) -> "square"
+      CatchallShape.Triangle(_) -> "triangle"
+    }
+  }
+
+  fn payload_of(shape :: CatchallShape(i64)) -> i64 {
+    case shape {
+      CatchallShape.Circle(n) -> n
+      CatchallShape.Square(n) -> n
+      CatchallShape.Triangle(n) -> n
+    }
+  }
 }
