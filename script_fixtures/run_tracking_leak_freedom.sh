@@ -64,8 +64,8 @@ out=$("$ZAP" test -Dmemory=Memory.Tracking 2>&1)
 
 echo
 echo "== corpus assertions pass under Memory.Tracking =="
-check "corpus tests pass (942/0)"        "$out" "942 tests, 0 failures"
-check "corpus assertions pass (1366/0)"  "$out" "1366 assertions, 0 failures"
+check "corpus tests pass (1053/0)"        "$out" "1053 tests, 0 failures"
+check "corpus assertions pass (1679/0)"  "$out" "1679 assertions, 0 failures"
 
 echo
 echo "== whole-corpus leak FREEDOM (zero deinit survivors) =="
