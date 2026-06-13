@@ -49,23 +49,46 @@
 //
 //   * `actx.arc_ops` with kind `.retain` or `.release`, at any
 //     insertion-point depth.
+//   * `actx.arc_ops` with kind `.reset`: lowered to an IR
+//     `.reset { dest, source }`. `rewriteReuseTokensToRealLocals`
+//     first replaces perceus's synthetic reset-token LocalId
+//     (`10000 + match_site_id`) with a real local allocated against
+//     the function's slot space, so the `.reset` and its paired
+//     construction-site `reuse_token` share a real, dense LocalId.
+//   * `actx.arc_ops` with kind `.reuse_alloc` / each reuse_pair's
+//     construction instruction: rewritten in place to carry the
+//     `reuse_token` field (`rewriteReuseConstructions`); no separate
+//     insertion.
 //   * `actx.drop_specializations` field-drops whose `local` is
 //     explicitly set, at any depth.
 //
-// Out of scope (Phase 3 follow-up — Task 10.4):
-//   * `.reset` / `.reuse_alloc` arc-op kinds. Perceus currently
-//     allocates synthetic LocalIds (`10000 + match_site_id`) for
-//     reset tokens; lowering them to IR requires a real-local
-//     allocator. Tracked separately.
-//   * `.move_transfer` / `.share` — these are dataflow markers
-//     that do not correspond to standalone IR instructions.
+// Not materialized as standalone IR:
+//   * `.move_transfer` / `.share` — dataflow markers that do not
+//     correspond to standalone IR instructions; left in the context.
+//
+// Coordinate stability (audit arc-param--01)
+// ------------------------------------------
+//
+// Insertion coordinates (`block` + `path` + `instr_index`) are
+// recorded by the analysis pipeline and consumed HERE, after
+// `runArcOwnershipAndVerify` / `insertScopeExitDrops` /
+// contification have reshaped the instruction streams. Stream
+// positions are NOT stable across those passes (they insert and
+// delete instructions and split blocks), so each insertion record
+// carries `InsertionPoint.expected_identity`: a tag+dest fingerprint
+// of the anchor instruction it was recorded against.
+// `rebuildStream` re-resolves each coordinate against the final IR
+// shape and refuses to insert when the live instruction's
+// fingerprint differs — a stale coordinate yields a left-behind
+// record (surfaced by the V10 audit), never a misplaced operation.
 //
 // Invariant: a record is removed from its analysis-context list
 // only after the corresponding IR has been inserted successfully.
 // If a record's insertion point cannot be resolved (path doesn't
-// match the IR shape, or `instr_index` is out of bounds), the
-// record is left in the analysis context so the V10 audit can
-// surface the mismatch — there is no silent fallback path.
+// match the IR shape, `instr_index` is out of bounds, or the anchor
+// identity no longer matches), the record is left in the analysis
+// context so the V10 audit can surface the mismatch — there is no
+// silent fallback path.
 // ============================================================
 
 const std = @import("std");
@@ -234,6 +257,7 @@ pub fn materializeAnalysisArcOps(
                 .position = if (op.insertion_point.position == .before) .before else .after,
                 .new_instr = new_instr,
                 .origin = .{ .kind = .arc_op, .src_index = src_idx },
+                .expected_identity = op.insertion_point.expected_identity,
             });
         }
 
@@ -264,6 +288,7 @@ pub fn materializeAnalysisArcOps(
                     .position = if (spec.insertion_point.position == .before) .before else .after,
                     .new_instr = .{ .release = .{ .value = target_local, .kind = release_kind } },
                     .origin = .{ .kind = .drop_spec, .src_index = src_idx },
+                    .expected_identity = spec.insertion_point.expected_identity,
                 });
             }
         }
@@ -428,6 +453,39 @@ fn rewriteReuseConstructions(
     }
 }
 
+/// Find the index of the construction instruction (`tuple_init` /
+/// `struct_init` / `union_init`) defining `expected_dest` within
+/// `stream`. Checks the recorded `recorded_index` first (fast path
+/// when the stream hasn't shifted), then falls back to a scan keyed on
+/// the construction's `dest` (its SSA-unique identity). Returns `null`
+/// if no matching construction is present (the anchor was deleted or
+/// moved out of this stream).
+fn locateConstructionByDest(
+    stream: []const ir.Instruction,
+    recorded_index: u32,
+    expected_dest: ir.LocalId,
+) ?u32 {
+    if (recorded_index < stream.len and constructionDest(stream[recorded_index]) == expected_dest) {
+        return recorded_index;
+    }
+    for (stream, 0..) |instr, idx| {
+        if (constructionDest(instr) == expected_dest) return @intCast(idx);
+    }
+    return null;
+}
+
+/// The `dest` of a reuse-eligible construction instruction
+/// (`tuple_init` / `struct_init` / `union_init`), or `null` for any
+/// other instruction.
+fn constructionDest(instr: ir.Instruction) ?ir.LocalId {
+    return switch (instr) {
+        .tuple_init => |ti| ti.dest,
+        .struct_init => |si| si.dest,
+        .union_init => |ui| ui.dest,
+        else => null,
+    };
+}
+
 /// Walk `stream` along `path` until we reach the innermost stream
 /// containing the construction at `instr_index`. Rewrite that
 /// instruction's `reuse_token` field. Returns a rebuilt slice
@@ -441,13 +499,20 @@ fn rewriteOneConstructionInStream(
     token: ir.LocalId,
 ) error{OutOfMemory}!?[]const ir.Instruction {
     if (path.len == 0) {
-        // Leaf stream: mutate the target instruction at `instr_index`.
-        if (instr_index >= stream.len) return null;
-        const target = stream[instr_index];
-        const rewritten = rewriteConstructionInstruction(target, expected_dest, token) orelse return null;
+        // Leaf stream: mutate the target construction. The construction's
+        // `dest` is its SSA-unique identity, so re-locate it by `dest`
+        // when the recorded `instr_index` no longer points at it — the
+        // ownership-rewrite / drop-insertion / contification passes that
+        // run between perceus analysis and here shift stream positions
+        // (audit arc-param--01). This keeps the `.reset` and its paired
+        // construction-token rewrite in lock-step: both re-resolve to the
+        // same live instructions, so a reuse pair is never half-applied
+        // due to a stale coordinate.
+        const target_index = locateConstructionByDest(stream, instr_index, expected_dest) orelse return null;
+        const rewritten = rewriteConstructionInstruction(stream[target_index], expected_dest, token) orelse return null;
         const new_slice = try allocator.alloc(ir.Instruction, stream.len);
         @memcpy(new_slice, stream);
-        new_slice[instr_index] = rewritten;
+        new_slice[target_index] = rewritten;
         return new_slice;
     }
 
@@ -581,6 +646,15 @@ fn rewriteParentChild(
             copy.cases = new_cases;
             break :blk ir.Instruction{ .union_switch = copy };
         },
+        .union_switch_else => blk: {
+            if (parent != .union_switch) break :blk null;
+            if (!parent.union_switch.has_else) break :blk null;
+            const new_stream = try rewriteOneConstructionInStream(allocator, parent.union_switch.else_instrs, rest_path, instr_index, expected_dest, token);
+            if (new_stream == null) break :blk null;
+            var copy = parent.union_switch;
+            copy.else_instrs = new_stream.?;
+            break :blk ir.Instruction{ .union_switch = copy };
+        },
         .union_switch_return_case => |case_idx| blk: {
             if (parent != .union_switch_return) break :blk null;
             const cases = parent.union_switch_return.cases;
@@ -685,6 +759,12 @@ const PendingInsertion = struct {
     position: InsertPosition,
     new_instr: ir.Instruction,
     origin: Origin,
+    /// Fingerprint of the anchor instruction the source record was
+    /// recorded against (`InsertionPoint.expected_identity`). When set,
+    /// `rebuildStream` verifies the live instruction at `instr_index`
+    /// still matches before inserting; on mismatch the insertion is
+    /// skipped and its record left un-consumed (audit arc-param--01).
+    expected_identity: ?ir.InstructionIdentity,
 };
 
 const StreamNode = struct {
@@ -748,6 +828,7 @@ const PendingTree = struct {
         position: InsertPosition,
         new_instr: ir.Instruction,
         origin: Origin,
+        expected_identity: ?ir.InstructionIdentity,
     };
 
     fn add(self: *PendingTree, req: Request) !void {
@@ -762,6 +843,7 @@ const PendingTree = struct {
             .position = req.position,
             .new_instr = req.new_instr,
             .origin = req.origin,
+            .expected_identity = req.expected_identity,
         });
     }
 };
@@ -783,6 +865,50 @@ fn streamStepEql(a: escape_lattice.StreamStep, b: escape_lattice.StreamStep) boo
 // ============================================================
 // Stream rebuilding (mirrors arc_drop_insertion.StreamRebuilder)
 // ============================================================
+
+/// Resolve the index within `stream` at which an insertion recorded at
+/// `recorded_index` (with anchor `expected_identity`) should land,
+/// accounting for stream mutation between coordinate capture and now
+/// (audit arc-param--01).
+///
+///   * No `expected_identity` (legacy/append-at-end record): the
+///     recorded index is used verbatim; only `recorded_index <=
+///     stream.len` is accepted ("append at end" is `== stream.len`).
+///   * Anchor still at `recorded_index` (no shift, or shift cancelled
+///     out): fast path, returns `recorded_index`.
+///   * Anchor moved: scan the stream for the unique instruction whose
+///     fingerprint equals `expected_identity` and return its index.
+///     The anchor's primary dest is SSA-unique, so the match (when the
+///     identity carries a non-null `anchor_local`) is unambiguous.
+///   * Anchor absent (deleted, or an identity with no `anchor_local`
+///     that no longer sits at its recorded slot): returns `null`, and
+///     the caller leaves the record un-consumed.
+fn resolveAnchorIndex(
+    stream: []const ir.Instruction,
+    recorded_index: u32,
+    expected_identity: ?ir.InstructionIdentity,
+) ?u32 {
+    const expected = expected_identity orelse {
+        // No anchor to verify — accept the recorded index if in range
+        // (including the append-at-end position `== stream.len`).
+        return if (recorded_index <= stream.len) recorded_index else null;
+    };
+
+    // Fast path: the anchor is still where it was recorded.
+    if (recorded_index < stream.len and expected.eql(ir.fingerprintInstruction(&stream[recorded_index]))) {
+        return recorded_index;
+    }
+
+    // The anchor shifted. Re-locate it by fingerprint. A null
+    // `anchor_local` cannot be re-located unambiguously (many
+    // instructions share a tag with no dest), so only re-locate when
+    // the identity carries a dest.
+    if (expected.anchor_local == null) return null;
+    for (stream, 0..) |*instr, idx| {
+        if (expected.eql(ir.fingerprintInstruction(instr))) return @intCast(idx);
+    }
+    return null;
+}
 
 /// Rebuild a stream by:
 ///   1) recursively rebuilding any nested sub-stream that has
@@ -814,12 +940,35 @@ fn rebuildStream(
         }
     }
 
-    // Pass 2: schedule direct insertions, bounds-checking each.
+    // Pass 2: schedule direct insertions, resolving each against the
+    // CURRENT stream shape. An insertion's recorded coordinate was
+    // computed against the IR shape the analysis observed; intervening
+    // count-mutating passes (ownership rewrite, drop insertion) and
+    // contification insert/delete instructions and split blocks, so the
+    // recorded `instr_index` is generally stale by the time this pass
+    // runs (audit arc-param--01). Each record therefore carries
+    // `expected_identity`, a tag+dest fingerprint of its anchor
+    // instruction. `resolveAnchorIndex` re-locates the anchor in the
+    // current stream by that fingerprint when its recorded index no
+    // longer matches, so the op lands at the intended program point
+    // rather than a shifted one. The anchor's dest LocalId is
+    // SSA-unique, so at most one instruction in the stream matches —
+    // the re-location is unambiguous. When no instruction matches (the
+    // anchor was deleted, or a stale pre-identity record points out of
+    // range) the insertion is skipped: its record is never marked
+    // consumed, so it survives for the V10 audit (no silent
+    // misplacement), and a debug assertion fires so genuine drift
+    // surfaces loudly in development.
     var scheduled: std.ArrayListUnmanaged(PendingInsertion) = .empty;
     defer scheduled.deinit(allocator);
     for (node.direct.items) |ins| {
-        if (ins.instr_index > stream.len) continue;
-        try scheduled.append(allocator, ins);
+        const resolved_index = resolveAnchorIndex(stream, ins.instr_index, ins.expected_identity) orelse {
+            std.debug.assert(false); // stale insertion coordinate (arc-param--01)
+            continue;
+        };
+        var placed = ins;
+        placed.instr_index = resolved_index;
+        try scheduled.append(allocator, placed);
     }
 
     if (rebuilt_at.count() == 0 and scheduled.items.len == 0) return null;
@@ -980,6 +1129,15 @@ fn rebuildOneChild(
             const new_cases = try cloneUnionCasesWithReplacedBody(allocator, cases, case_idx, new_stream.?);
             var copy = parent.union_switch;
             copy.cases = new_cases;
+            break :blk ir.Instruction{ .union_switch = copy };
+        },
+        .union_switch_else => blk: {
+            if (parent != .union_switch) break :blk null;
+            if (!parent.union_switch.has_else) break :blk null;
+            const new_stream = try rebuildStream(allocator, parent.union_switch.else_instrs, child_node, consumed_arc_ops, consumed_specs);
+            if (new_stream == null) break :blk null;
+            var copy = parent.union_switch;
+            copy.else_instrs = new_stream.?;
             break :blk ir.Instruction{ .union_switch = copy };
         },
         .union_switch_return_case => |case_idx| blk: {
@@ -1321,4 +1479,127 @@ test "materializeAnalysisArcOps emits refcount ops under REFCOUNT_V1" {
     const counts = countRefcountInstrs(&function);
     try std.testing.expect(counts.retains >= 1);
     try std.testing.expect(counts.releases >= 1);
+}
+
+test "resolveAnchorIndex re-locates a shifted anchor by fingerprint" {
+    // Anchor: a tuple_init defining local 42, recorded at index 1.
+    const recorded = [_]ir.Instruction{
+        .{ .const_nil = 1 },
+        .{ .tuple_init = .{ .dest = 42, .elements = &.{} } },
+        .{ .ret = .{ .value = 42 } },
+    };
+    const anchor_identity = ir.fingerprintInstruction(&recorded[1]);
+
+    // Unchanged stream: fast path returns the recorded index.
+    try std.testing.expectEqual(@as(?u32, 1), resolveAnchorIndex(&recorded, 1, anchor_identity));
+
+    // Mutated stream: two instructions inserted before the anchor push
+    // it from index 1 to index 3. The bare recorded index (1) now points
+    // at a `release` — re-resolution must find the tuple_init at index 3.
+    const mutated = [_]ir.Instruction{
+        .{ .release = .{ .value = 7 } },
+        .{ .release = .{ .value = 8 } },
+        .{ .const_nil = 1 },
+        .{ .tuple_init = .{ .dest = 42, .elements = &.{} } },
+        .{ .ret = .{ .value = 42 } },
+    };
+    try std.testing.expectEqual(@as(?u32, 3), resolveAnchorIndex(&mutated, 1, anchor_identity));
+
+    // Anchor deleted entirely: no instruction matches → null (skip).
+    const deleted = [_]ir.Instruction{
+        .{ .const_nil = 1 },
+        .{ .ret = .{ .value = 1 } },
+    };
+    try std.testing.expectEqual(@as(?u32, null), resolveAnchorIndex(&deleted, 1, anchor_identity));
+
+    // No identity → recorded index used verbatim, bounds-checked
+    // (append-at-end == len is allowed).
+    try std.testing.expectEqual(@as(?u32, 2), resolveAnchorIndex(&deleted, 2, null));
+    try std.testing.expectEqual(@as(?u32, null), resolveAnchorIndex(&deleted, 3, null));
+}
+
+test "materializeAnalysisArcOps places a release at the identity-anchored position after the stream shifts" {
+    // Deterministic guard for audit arc-param--01: a record's coordinate
+    // is captured against one stream shape, the stream is then reshaped
+    // (instructions inserted before the anchor), and materialization must
+    // still place the release adjacent to its anchor instruction — not at
+    // the now-stale bare index. Pre-fix (bare-index application) this
+    // mis-resolves: the release lands against the wrong instruction.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "a", .type_expr = .string };
+
+    // Final (post-mutation) stream shape the materializer sees: two
+    // leading param_gets were inserted ahead of the anchor, so the
+    // anchor `call_named` (dest 9) now sits at index 3, not the index 1
+    // a pre-mutation analysis would have recorded.
+    const stream = try arena.alloc(ir.Instruction, 5);
+    stream[0] = .{ .param_get = .{ .dest = 0, .index = 0 } };
+    stream[1] = .{ .param_get = .{ .dest = 7, .index = 0 } }; // inserted
+    stream[2] = .{ .param_get = .{ .dest = 8, .index = 0 } }; // inserted
+    stream[3] = .{ .call_named = .{ .dest = 9, .name = "f", .args = &.{}, .arg_modes = &.{} } }; // anchor (was index 1)
+    stream[4] = .{ .ret = .{ .value = 9 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 10);
+    for (local_ownership) |*o| o.* = .owned;
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "materialize_shift_fixture",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .string,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 10,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var actx = escape_lattice.AnalysisContext.init(std.testing.allocator);
+    defer actx.deinit();
+
+    // Record a release anchored AFTER the call_named (dest 9), but with
+    // the STALE pre-mutation `instr_index = 1`, plus the anchor's
+    // identity fingerprint. Re-resolution must move it to index 3.
+    try actx.arc_ops.append(std.testing.allocator, .{
+        .kind = .release,
+        .value = 9,
+        .insertion_point = .{
+            .function = 0,
+            .block = 0,
+            .instr_index = 1, // stale (anchor is really at index 3)
+            .position = .after,
+            .expected_identity = ir.fingerprintInstruction(&stream[3]),
+        },
+        .reason = .scope_exit,
+    });
+
+    const abi = @import("memory/abi.zig");
+    try materializeAnalysisArcOps(arena, &function, &actx, abi.REFCOUNT_V1_BIT);
+
+    // The release must sit immediately AFTER the call_named (dest 9),
+    // i.e. the instruction preceding the release defines local 9.
+    const out = function.body[0].instructions;
+    var release_pos: ?usize = null;
+    for (out, 0..) |instr, idx| {
+        if (instr == .release and instr.release.value == 9) release_pos = idx;
+    }
+    const pos = release_pos orelse return error.ReleaseNotMaterialized;
+    try std.testing.expect(pos > 0);
+    const before = out[pos - 1];
+    try std.testing.expect(before == .call_named);
+    try std.testing.expectEqual(@as(ir.LocalId, 9), before.call_named.dest);
+
+    // And the record was consumed (placed), so nothing is left behind.
+    try std.testing.expectEqual(@as(usize, 0), actx.arc_ops.items.len);
 }

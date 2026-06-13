@@ -122,6 +122,42 @@ pub struct StructTest {
       result = add_fields(point)
       assert(result == 17)
     }
+
+    ## Perceus reuse / reset opportunity exercised INSIDE a `case` arm
+    ## (regression for audit findings perceus-region--02 and
+    ## arc-param--01). `reflect_in_branch` takes an OWNED `Point`, matches
+    ## a discriminator with a `case`, and in the matched arm deconstructs
+    ## the owned point and reconstructs a same-shape `Point` via update
+    ## syntax — a textbook Perceus reuse pair whose deconstruction and
+    ## construction both live in a NESTED case-arm stream.
+    ##
+    ## perceus-region--02: Phase-2 construction discovery and drop-spec
+    ## generation must resolve the deconstruction by walking the
+    ## coordinate `path` into the arm body, not by indexing the top-level
+    ## block with a nested-stream `instr_index`. The mirror reconstruction
+    ## must pair correctly so the reset token is consumed on the path the
+    ## reset ran.
+    ##
+    ## arc-param--01: in release tiers the recorded insertion coordinates
+    ## are consumed AFTER ownership-rewrite / drop-insertion / contification
+    ## reshape the stream; the materializer must place `.reset` at the
+    ## intended program point (identity-verified), not a shifted one.
+    ## Correct results here (and corpus leak-freedom under
+    ## `Memory.Tracking`, gated by run_tracking_leak_freedom.sh) prove the
+    ## reuse pair is materialized soundly.
+    test("reuse pair inside a case arm reflects point coordinates") {
+      assert(reflect_in_branch(%Point{x: 3, y: 7}, 1) == 7)
+      assert(reflect_in_branch(%Point{x: 3, y: 7}, 0) == 3)
+    }
+
+    test("reuse pair inside a nested case arm shifts point coordinates") {
+      ## Two levels of nesting: the reconstruction lives in an arm of an
+      ## inner `case`, so the recorded coordinate path has depth >= 2.
+      shifted = shift_in_nested_branch(%Point{x: 10, y: 20}, true, 5)
+      assert(shifted == 15)
+      same = shift_in_nested_branch(%Point{x: 10, y: 20}, false, 5)
+      assert(same == 10)
+    }
   }
 
   fn extract_x(%{x: x_val} :: Point) -> i64 {
@@ -130,6 +166,40 @@ pub struct StructTest {
 
   fn add_fields(%{x: x_val, y: y_val} :: Point) -> i64 {
     x_val + y_val
+  }
+
+  ## Owned `point` is consumed by the `case`; the matched arm rebuilds a
+  ## `Point` (deconstruct + reconstruct => Perceus reuse pair) and reads a
+  ## field off the reused cell. The reconstruction is in a nested arm body.
+  fn reflect_in_branch(point :: Point, pick :: i64) -> i64 {
+    case pick {
+      0 -> {
+        reflected = %Point{point | x: point.x, y: point.y}
+        reflected.x
+      }
+      _ -> {
+        swapped = %Point{point | x: point.y, y: point.x}
+        swapped.x
+      }
+    }
+  }
+
+  ## Reconstruction nested two `case` levels deep, so the Perceus
+  ## insertion coordinate carries a multi-step `path`.
+  fn shift_in_nested_branch(point :: Point, go_deep :: Bool, delta :: i64) -> i64 {
+    case go_deep {
+      true -> case delta {
+        0 -> point.x
+        d -> {
+          shifted = %Point{point | x: point.x + d}
+          shifted.x
+        }
+      }
+      false -> {
+        unchanged = %Point{point | x: point.x}
+        unchanged.x
+      }
+    }
   }
 
   describe("Struct field defaults") {
