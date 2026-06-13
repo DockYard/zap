@@ -176,6 +176,25 @@ pub const CallGraph = struct {
                     for (us.cases) |c| {
                         try self.scanInstructions(caller, c.body_instrs);
                     }
+                    // The catch-all `_` prong can itself contain calls; a
+                    // callee invoked only from the else arm must still
+                    // register a call-graph edge.
+                    if (us.has_else) {
+                        try self.scanInstructions(caller, us.else_instrs);
+                    }
+                },
+                .try_call_named => |tcn| {
+                    // Register the edge to the try call's own target (the
+                    // `__try` callee), then descend into the handler and
+                    // success continuation bodies so calls nested inside
+                    // them are not missed. Previously this variant fell into
+                    // `else => {}`, so neither the target edge nor edges
+                    // from the bodies were recorded.
+                    if (self.name_to_id.get(tcn.name)) |callee_id| {
+                        try self.addEdge(caller, callee_id);
+                    }
+                    try self.scanInstructions(caller, tcn.handler_instrs);
+                    try self.scanInstructions(caller, tcn.success_instrs);
                 },
                 .optional_dispatch => |od| {
                     try self.scanInstructions(caller, od.nil_instrs);
@@ -831,6 +850,29 @@ pub const InterproceduralAnalyzer = struct {
                         markArgsPassedToUnknown(tcn.args, param_summaries, aliases);
                         try fresh_locals.put(tcn.dest, {});
                     }
+                    // `try_call_named` lowers to an if-else whose value is
+                    // `dest`: the success branch runs `success_instrs` and
+                    // yields `success_result`; the handler branch runs
+                    // `handler_instrs` and yields `handler_result`. Analyze
+                    // both bodies (so nested calls/returns/escapes inside
+                    // them contribute to the summary) and merge the two
+                    // branch results into `dest`, exactly like `if_expr`.
+                    try self.analyzeInstructions(tcn.handler_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(tcn.success_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    {
+                        var merged = ParamSet.empty();
+                        var any_fresh = false;
+                        if (tcn.handler_result) |hr| {
+                            if (aliases.get(hr)) |ps| merged = merged.merge(ps);
+                            if (fresh_locals.get(hr) != null) any_fresh = true;
+                        }
+                        if (tcn.success_result) |sr| {
+                            if (aliases.get(sr)) |ps| merged = merged.merge(ps);
+                            if (fresh_locals.get(sr) != null) any_fresh = true;
+                        }
+                        if (!merged.isEmpty()) try aliases.put(tcn.dest, merged);
+                        if (any_fresh) try fresh_locals.put(tcn.dest, {});
+                    }
                 },
 
                 .call_closure => |cc| {
@@ -1055,6 +1097,16 @@ pub const InterproceduralAnalyzer = struct {
                         try self.analyzeInstructions(c.body_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
                         if (c.return_value) |rv| {
                             try self.recordReturnValue(rv, param_summaries, aliases, fresh_locals, return_sources);
+                        }
+                    }
+                    // Catch-all `_` prong: analyze its body and treat its
+                    // result identically to an explicit case's
+                    // `return_value`, so nested calls/returns inside the
+                    // else arm contribute to the summary.
+                    if (us.has_else) {
+                        try self.analyzeInstructions(us.else_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                        if (us.else_result) |er| {
+                            try self.recordReturnValue(er, param_summaries, aliases, fresh_locals, return_sources);
                         }
                     }
                 },
