@@ -205,6 +205,76 @@ fn expectCompileFails(source: []const u8) !void {
     try std.testing.expectError(error.CompilationFailed, compileOnlyWithDiagnostics(source, .silent));
 }
 
+fn expectCompileFailsWithDiagnostic(source: []const u8, expected_diagnostic: []const u8) !void {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+
+    const build_source =
+        \\pub struct TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :test_prog ->
+        \\        %Zap.Manifest{
+        \\          name: "test_prog",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: &TestProg.main/0,
+        \\          paths: ["lib/**/*.zap"]
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/test_prog.zap", .data = source }) catch return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    const compile_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ zap_binary, "build", "test_prog" },
+        .cwd = .{ .path = tmp_dir_path },
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.CompilationFailed;
+    defer allocator.free(compile_result.stdout);
+    defer allocator.free(compile_result.stderr);
+
+    const compile_exit = switch (compile_result.term) {
+        .exited => |code| code,
+        else => {
+            printUnexpectedCompileFailure(255, compile_result.stdout, compile_result.stderr);
+            return error.CompilationFailed;
+        },
+    };
+
+    if (compile_exit == 0) {
+        std.debug.print(
+            "\n=== EXPECTED COMPILE FAILURE BUT IT SUCCEEDED ===\n=== stdout ===\n{s}\n=== stderr ===\n{s}\n",
+            .{ compile_result.stdout, compile_result.stderr },
+        );
+        return error.Unexpected;
+    }
+
+    if (std.mem.indexOf(u8, compile_result.stderr, expected_diagnostic) == null) {
+        std.debug.print(
+            "\n=== MISSING EXPECTED DIAGNOSTIC ===\nexpected substring: {s}\n=== stdout ===\n{s}\n=== stderr ===\n{s}\n",
+            .{ expected_diagnostic, compile_result.stdout, compile_result.stderr },
+        );
+        return error.Unexpected;
+    }
+}
+
 /// Compile a Zap source string and run the resulting binary, returning stdout.
 fn compileAndRun(source: []const u8) TestError!TestResult {
     const allocator = std.testing.allocator;
@@ -1137,6 +1207,52 @@ test "ZIR: raw tuple arithmetic is rejected outside Simd" {
         \\    0
         \\  }
         \\}
+    );
+}
+
+test "ZIR: unsupported Simd.reduce operation reports no matching macro clause" {
+    try expectCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    values = Simd.vector(4, i32, {4, -2, 9, 1})
+        \\    Simd.reduce(:median, values)
+        \\    0
+        \\  }
+        \\}
+    ,
+        "no macro clause of `reduce/2` matches the arguments",
+    );
+}
+
+test "ZIR: non-numeric tuple field access reports Zap source diagnostic" {
+    try expectCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    values = Simd.vector(4, i32, {4, -2, 9, 1})
+        \\    _wrong = values.reduce_max
+        \\    0
+        \\  }
+        \\}
+    ,
+        "tuple field access requires a numeric index, got `reduce_max`",
+    );
+}
+
+test "ZIR: macro-expanded non-numeric tuple field call reports Zap source diagnostic" {
+    try expectCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub macro broken_reduce(value :: Expr) -> Expr {
+        \\    quote { simd.reduce_max(unquote(value)) }
+        \\  }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    values = Simd.vector(4, i32, {4, -2, 9, 1})
+        \\    TestProg.broken_reduce(values)
+        \\    0
+        \\  }
+        \\}
+    ,
+        "I cannot find a variable named `simd`",
     );
 }
 

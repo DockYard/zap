@@ -77,13 +77,34 @@ pub const CompiledMacroExecutor = struct {
 };
 
 pub const MacroEngine = struct {
+    pub const MacroExpansionConsumer = union(enum) {
+        function: FunctionConsumer,
+        struct_scope: scope.ScopeId,
+        package,
+    };
+
+    pub const FunctionConsumer = struct {
+        owner_scope: ?scope.ScopeId,
+        decl: *const ast.FunctionDecl,
+    };
+
+    pub const MacroExpansionDependency = struct {
+        consumer: MacroExpansionConsumer,
+        macro_family_id: scope.MacroFamilyId,
+    };
+
     allocator: std.mem.Allocator,
     interner: *ast.StringInterner,
     graph: *scope.ScopeGraph,
     /// The struct scope currently being expanded, for registering generated declarations.
     current_struct_scope: ?scope.ScopeId = null,
+    /// The function currently being expanded. Nested anonymous functions are
+    /// attributed to the outer source function so a dependency can always map
+    /// back to a stable frontend function-body node.
+    current_function_decl: ?*const ast.FunctionDecl = null,
     max_expansions: u32,
     errors: std.ArrayList(Error),
+    macro_expansion_dependencies: std.ArrayList(MacroExpansionDependency),
     /// Optional CTFE-backed executor for macro families whose provider
     /// structs have already been compiled to IR. When a family is
     /// registered here, expansion must use compiled CTFE and must not
@@ -120,6 +141,7 @@ pub const MacroEngine = struct {
             .graph = graph,
             .max_expansions = 100,
             .errors = .empty,
+            .macro_expansion_dependencies = .empty,
             .compiled_executor = null,
             .before_compile_fired = std.AutoHashMap(BeforeCompileKey, void).init(allocator),
             .with_residual_counter = 0,
@@ -128,6 +150,51 @@ pub const MacroEngine = struct {
 
     pub fn setCompiledExecutor(self: *MacroEngine, executor: *CompiledMacroExecutor) void {
         self.compiled_executor = executor;
+    }
+
+    pub fn expansionDependencies(self: *const MacroEngine) []const MacroExpansionDependency {
+        return self.macro_expansion_dependencies.items;
+    }
+
+    fn currentExpansionConsumer(self: *const MacroEngine) MacroExpansionConsumer {
+        if (self.current_function_decl) |decl| {
+            return .{ .function = .{
+                .owner_scope = self.current_struct_scope,
+                .decl = decl,
+            } };
+        }
+        if (self.current_struct_scope) |struct_scope| {
+            return .{ .struct_scope = struct_scope };
+        }
+        return .package;
+    }
+
+    fn macroExpansionConsumerEql(left: MacroExpansionConsumer, right: MacroExpansionConsumer) bool {
+        if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+        return switch (left) {
+            .function => |left_function| blk: {
+                const right_function = right.function;
+                break :blk left_function.owner_scope == right_function.owner_scope and
+                    left_function.decl == right_function.decl;
+            },
+            .struct_scope => |left_scope| left_scope == right.struct_scope,
+            .package => true,
+        };
+    }
+
+    fn recordMacroExpansion(self: *MacroEngine, macro_family_id: scope.MacroFamilyId) !void {
+        const consumer = self.currentExpansionConsumer();
+        for (self.macro_expansion_dependencies.items) |dependency| {
+            if (dependency.macro_family_id == macro_family_id and
+                macroExpansionConsumerEql(dependency.consumer, consumer))
+            {
+                return;
+            }
+        }
+        try self.macro_expansion_dependencies.append(self.allocator, .{
+            .consumer = consumer,
+            .macro_family_id = macro_family_id,
+        });
     }
 
     fn compiledProgram(self: *const MacroEngine) ?*const ir.Program {
@@ -161,6 +228,7 @@ pub const MacroEngine = struct {
     }
 
     pub fn deinit(self: *MacroEngine) void {
+        self.macro_expansion_dependencies.deinit(self.allocator);
         self.errors.deinit(self.allocator);
         self.before_compile_fired.deinit();
     }
@@ -651,6 +719,7 @@ pub const MacroEngine = struct {
         if (family.clauses.items.len == 0) return &.{};
         const clause_ref = family.clauses.items[0];
         const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+        try self.recordMacroExpansion(family_id);
 
         // Build the env-arg CtValue: an atom of the caller's struct
         // name. A richer __ENV__ struct can come later; the atom is
@@ -781,6 +850,12 @@ pub const MacroEngine = struct {
     };
 
     fn expandFunctionDecl(self: *MacroEngine, func: *const ast.FunctionDecl) !ExpandedDecl {
+        const previous_function_decl = self.current_function_decl;
+        if (self.current_function_decl == null) {
+            self.current_function_decl = func;
+        }
+        defer self.current_function_decl = previous_function_decl;
+
         var changed = false;
         var new_clauses: std.ArrayList(ast.FunctionClause) = .empty;
 
@@ -2013,6 +2088,7 @@ pub const MacroEngine = struct {
         const selection = (try self.selectMacroClause(family, call.args, call.meta.span)) orelse return expr;
         const clause_ref = selection.ref;
         const clause = selection.clause;
+        try self.recordMacroExpansion(macro_family_id);
 
         // Allocate the Flatt-2016 hygiene scopes for this expansion:
         //   use_scope:   fresh per call site, added to the user's arg
@@ -2698,6 +2774,7 @@ pub const MacroEngine = struct {
 
         const family = &self.graph.macro_families.items[macro_id];
         if (family.clauses.items.len == 0) return null;
+        self.recordMacroExpansion(macro_id) catch return null;
 
         const clause_ref = family.clauses.items[0];
         const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
@@ -2857,6 +2934,7 @@ pub const MacroEngine = struct {
                 if (family.clauses.items.len > 0) {
                     const clause_ref = family.clauses.items[0];
                     const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
+                    try self.recordMacroExpansion(macro_family_id);
 
                     // Allocate Flatt-2016 hygiene scopes for this
                     // expansion. See `expandMacroCall` for the full
@@ -3150,6 +3228,8 @@ pub const MacroEngine = struct {
             }
         }
 
+        self.recordMacroExpansion(macro_id) catch return null;
+
         // Non-identity macro — convert declaration to CtValue and evaluate
         var store = ctfe.AllocationStore{};
         const item_ct = ast_data.structItemToCtValue(self.allocator, self.interner, &store, item) catch return null;
@@ -3222,6 +3302,7 @@ pub const MacroEngine = struct {
 
         const family = &self.graph.macro_families.items[macro_id];
         if (family.clauses.items.len == 0) return null;
+        self.recordMacroExpansion(macro_id) catch return null;
 
         const clause_ref = family.clauses.items[0];
         const clause = &clause_ref.decl.clauses[clause_ref.clause_index];

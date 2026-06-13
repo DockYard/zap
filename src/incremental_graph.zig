@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const SCHEMA_VERSION: u16 = 3;
+pub const SCHEMA_VERSION: u16 = 4;
 
 const HASH_DOMAIN = "zap.incremental_graph";
 
@@ -950,8 +950,9 @@ pub const DeclarationFingerprintKind = enum(u8) {
     struct_surface = 20,
     function_signature = 30,
     function_body = 40,
-    ctfe_glob = 50,
-    ctfe_reflection = 60,
+    macro_provider = 50,
+    ctfe_glob = 60,
+    ctfe_reflection = 70,
 };
 
 pub const DeclarationFingerprint = struct {
@@ -1261,6 +1262,7 @@ fn declarationFingerprintKindMatchesKey(kind: DeclarationFingerprintKind, key: N
         .struct_surface => key.kind() == .struct_surface,
         .function_signature => key.kind() == .function_signature,
         .function_body => key.kind() == .function_body,
+        .macro_provider => key.kind() == .macro_provider,
         .ctfe_glob => key.kind() == .ctfe_glob,
         .ctfe_reflection => key.kind() == .ctfe_reflection,
     };
@@ -1312,9 +1314,10 @@ pub const StableHashTag = enum(u16) {
     struct_surface_fingerprint = 270,
     function_signature_fingerprint = 280,
     function_body_fingerprint = 290,
-    root_glue_fingerprint = 300,
-    ctfe_glob_fingerprint = 310,
-    ctfe_reflection_fingerprint = 320,
+    macro_provider_fingerprint = 300,
+    root_glue_fingerprint = 310,
+    ctfe_glob_fingerprint = 320,
+    ctfe_reflection_fingerprint = 330,
 };
 
 pub const StableHasher = struct {

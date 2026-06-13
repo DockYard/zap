@@ -17,11 +17,13 @@
 ##   F. Bare `error` desugars to non-`pub` struct + impl; construction
 ##      and protocol dispatch still work from within the declaring file.
 ##
-## Tests C (`@code Zxxxx`) and E (cause chain) — status after the
+## Test C (`@code Zxxxx`) and E (cause chain) — status after the
 ## Phase 1.2.5 Gap-Analysis round:
 ##
-## - The `@code Zxxxx` attribute mechanism lands here (parser + desugar
-##   capture the value and synthesize the `code/1` body).
+## - This file assigns codes to its public error fixtures so the public API
+##   lint stays clean and `Error.code/1` is covered alongside message/kind.
+##   The original focused `@code Zxxxx` acceptance fixture remains as a
+##   `zap run`-exercised script fixture.
 ## - The auto-injected `cause :: Option(Error) = Option.None` field
 ##   IS now functional thanks to Phase 1.2.5 protocol existentials
 ##   + Gap 1 (synthetic-source `zap_runtime` import for parametric
@@ -37,15 +39,18 @@
 ##   payload positions, not yet on regular call arguments.
 
 ## Test A: minimal `pub error TimeoutError {}`.
+@code Z7401
 pub error TimeoutError {}
 
 ## Test B: custom default `message` field.
+@code Z7402
 pub error NotConnected {
   message :: String = "no active connection"
 }
 
 ## Test D: inline `pub fn message/1` overrides the auto-generated body
 ## while `kind/1` still produces the snake-cased atom.
+@code Z7403
 pub error KeyError {
   key :: Atom
   pub fn message(self :: KeyError) -> String {
@@ -79,6 +84,11 @@ pub struct PubErrorTest {
       e = %TimeoutError{}
       assert(Error.kind(e) == :timeout_error)
     }
+
+    test("Error.code returns the declared stable code") {
+      e = %TimeoutError{}
+      assert(Option.unwrap_or(Error.code(e), :Z0000) == :Z7401)
+    }
   }
 
   describe("Test B — custom default `message` field") {
@@ -96,6 +106,11 @@ pub struct PubErrorTest {
       e = %NotConnected{}
       assert(Error.kind(e) == :not_connected)
     }
+
+    test("Error.code returns the declared stable code") {
+      e = %NotConnected{}
+      assert(Option.unwrap_or(Error.code(e), :Z0000) == :Z7402)
+    }
   }
 
   describe("Test D — inline pub fn message/1 override") {
@@ -107,6 +122,11 @@ pub struct PubErrorTest {
     test("Error.kind stays auto-generated from the type name") {
       e = %KeyError{key: :missing}
       assert(Error.kind(e) == :key_error)
+    }
+
+    test("Error.code returns the declared stable code") {
+      e = %KeyError{key: :missing}
+      assert(Option.unwrap_or(Error.code(e), :Z0000) == :Z7403)
     }
   }
 

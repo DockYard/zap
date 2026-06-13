@@ -52,6 +52,18 @@ fn incrementalTrace(comptime format: []const u8, args: anytype) void {
     std.debug.print("\n[incremental trace] " ++ format ++ "\n", args);
 }
 
+fn applyIncrementalTraceFlag(enabled: bool) void {
+    if (!enabled) return;
+    setIncrementalTraceEnabledOverride(true);
+    compiler.setIncrementalTraceEnabledOverride(true);
+}
+
+fn clearIncrementalTraceFlag(enabled: bool) void {
+    if (!enabled) return;
+    compiler.setIncrementalTraceEnabledOverride(null);
+    setIncrementalTraceEnabledOverride(null);
+}
+
 const ProfileTimer = struct {
     last_ns: i128,
 
@@ -222,6 +234,8 @@ fn printUsage() void {
         \\  --build-file <path>  Use a specific build file (default: build.zap)
         \\  --zap-lib-dir <dir>  Use a specific Zap stdlib directory (overrides ZAP_LIB_DIR)
         \\  --watch, -w       Watch source files and rebuild on changes
+        \\  --trace-incremental
+        \\                    Print incremental invalidation and backend selection trace
         \\  --collect-arc-stats Compile ARC counter increments into the generated runtime
         \\  --seed <integer>  Set the test seed for deterministic ordering
         \\  --timings         Print every Zest test case duration
@@ -240,6 +254,7 @@ fn printUsage() void {
         \\  zap build --watch
         \\  zap run -w
         \\  zap test --seed 12345
+        \\  zap test --watch --trace-incremental
         \\  zap test --watch
         \\  zap test -- --list
         \\  zap doc
@@ -259,6 +274,8 @@ fn printUsage() void {
 fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
+    applyIncrementalTraceFlag(parsed.trace_incremental);
+    defer clearIncrementalTraceFlag(parsed.trace_incremental);
 
     const target = parsed.target orelse "default";
 
@@ -316,10 +333,11 @@ const RunPositionalKind = union(enum) {
 /// the following token (the actual script path), mis-dispatching
 /// `zap run --target ./s.zap` to the manifest path with a confusing
 /// "unexpected argument" instead of running the script. Per the
-/// locked position contract only `-D…`, `--zap-lib-dir`, and the
-/// dedicated test-runner options are recognized leading flags; any
-/// other dash-token is just a normal flag/positional and must not
-/// consume the next token.
+/// locked position contract only `-D…`, `--zap-lib-dir`, boolean build
+/// flags such as `--watch`/`--trace-incremental`, and the dedicated
+/// test-runner options are recognized leading flags; any other
+/// dash-token is just a normal flag/positional and must not consume
+/// the next token.
 fn firstPositionalIndex(args: []const []const u8) ?usize {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -335,6 +353,7 @@ fn firstPositionalIndex(args: []const []const u8) ?usize {
         }
         if (std.mem.eql(u8, arg, "--watch") or
             std.mem.eql(u8, arg, "-w") or
+            std.mem.eql(u8, arg, "--trace-incremental") or
             std.mem.eql(u8, arg, "--collect-arc-stats") or
             std.mem.eql(u8, arg, "--no-deps") or
             std.mem.eql(u8, arg, "--timings") or
@@ -401,6 +420,8 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // path uses — one pipeline, no script-mode special case.
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
+    applyIncrementalTraceFlag(parsed.trace_incremental);
+    defer clearIncrementalTraceFlag(parsed.trace_incremental);
 
     // Phase 4.c: thread the leak-report knobs to the runtime of the program
     // we will run (same seam as the script path) — the spawned binary
@@ -1260,6 +1281,15 @@ fn parseScriptLibDirFlag(
     return .{ .ok = null };
 }
 
+fn leadingFlagPresent(args: []const []const u8, leading_end: usize, flag: []const u8) bool {
+    const end = @min(leading_end, args.len);
+    var i: usize = 0;
+    while (i < end) : (i += 1) {
+        if (std.mem.eql(u8, args[i], flag)) return true;
+    }
+    return false;
+}
+
 /// Single-file script mode: compile and run a bare `.zap` file with a
 /// top-level `main/1`. No `build.zap`, no manifest CTFE, no project
 /// paths, no dependencies — the script is one synthetic module
@@ -1269,12 +1299,13 @@ fn parseScriptLibDirFlag(
 /// Flag-position contract (production-locked, mirrors `zig run` /
 /// `cargo run`): ALL leading flags — the Zig-style `-D<key>=<value>`
 /// build flags (`-Doptimize`, `-Dmemory`, `-Dtarget`, `-Dcpu`) and
-/// the `--zap-lib-dir <dir>` stdlib locator — MUST precede the script
-/// path and are CONSUMED there (never forwarded). EVERYTHING after the
-/// script path is forwarded VERBATIM to `main/1`'s `[String]` — there
-/// are NO reserved post-path tokens: a `-D`-looking token, any leading
-/// dashes, and a literal `--` are all passed through unchanged. The
-/// post-path region is opaque passthrough.
+/// the `--zap-lib-dir <dir>` stdlib locator, plus boolean build flags
+/// such as `--trace-incremental` — MUST precede the script path and
+/// are CONSUMED there (never forwarded). EVERYTHING after the script
+/// path is forwarded VERBATIM to `main/1`'s `[String]` — there are NO
+/// reserved post-path tokens: a `-D`-looking token, any leading dashes,
+/// and a literal `--` are all passed through unchanged. The post-path
+/// region is opaque passthrough.
 fn cmdRunScript(
     allocator: std.mem.Allocator,
     args: []const []const u8,
@@ -1290,9 +1321,10 @@ fn cmdRunScript(
     // are CONSUMED here (never forwarded to `main/1`): the
     // `--zap-lib-dir <dir>` stdlib locator and the Zig-style
     // `-D<key>=<value>` build flags (`-Doptimize`, `-Dmemory`,
-    // `-Dtarget`, `-Dcpu`). They are parsed by the SAME shared
-    // parsers every entrypoint uses (`parseScriptLibDirFlag` +
-    // `parseBuildOverrides`). Everything AFTER the script path is
+    // `-Dtarget`, `-Dcpu`), plus `--trace-incremental`. They are
+    // parsed by the SAME shared parsers every entrypoint uses
+    // (`parseScriptLibDirFlag` + `parseBuildOverrides`). Everything
+    // AFTER the script path is
     // forwarded to `main/1` verbatim (including `-D`-looking tokens
     // and a literal `--`). Build defaults come from the synthetic
     // `scriptManifest`; `applyBuildOverrides` overlays any `-D`.
@@ -1318,6 +1350,9 @@ fn cmdRunScript(
         },
         .ok => |ov| ov,
     };
+    const trace_incremental = leadingFlagPresent(args, script_arg_index, "--trace-incremental");
+    applyIncrementalTraceFlag(trace_incremental);
+    defer clearIncrementalTraceFlag(trace_incremental);
 
     // Phase 4.b: install the diagnostic output policy EARLY — before the
     // script contract-parse below — so a `-Derror-format=json` on a script
@@ -1864,6 +1899,8 @@ fn executePipelineAfterInitialCompile(
 fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
+    applyIncrementalTraceFlag(parsed.trace_incremental);
+    defer clearIncrementalTraceFlag(parsed.trace_incremental);
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
@@ -1930,6 +1967,8 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn cmdDoc(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
+    applyIncrementalTraceFlag(parsed.trace_incremental);
+    defer clearIncrementalTraceFlag(parsed.trace_incremental);
 
     const target = parsed.target orelse "doc";
 
@@ -3505,6 +3544,471 @@ fn tryManifestSnapshotHit(
     };
 }
 
+const MANIFEST_EVAL_CACHE_MAGIC: u32 = 0x5a_4d_45_31; // "ZME1"
+const MANIFEST_EVAL_CACHE_VERSION: u16 = 1;
+const MAX_MANIFEST_EVAL_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
+const CachedManifestEval = struct {
+    arena: std.heap.ArenaAllocator,
+    eval: zap.builder.ManifestEval,
+
+    fn deinit(self: *CachedManifestEval) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+fn manifestEvalCachePath(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    target_name: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}.manifest-eval", .{ cache_dir, target_name });
+}
+
+fn tryReadManifestEvalCache(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    path: []const u8,
+    invocation_identity: build_cache.InvocationIdentity,
+) ?CachedManifestEval {
+    return readManifestEvalCache(allocator, scratch_allocator, path, invocation_identity) catch |err| {
+        incrementalTrace(
+            "manifest-eval-cache result=miss reason={s} path={s}",
+            .{ @errorName(err), path },
+        );
+        return null;
+    };
+}
+
+fn readManifestEvalCache(
+    allocator: std.mem.Allocator,
+    scratch_allocator: std.mem.Allocator,
+    path: []const u8,
+    invocation_identity: build_cache.InvocationIdentity,
+) !CachedManifestEval {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(global_io, path, scratch_allocator, .limited(MAX_MANIFEST_EVAL_CACHE_BYTES));
+    defer scratch_allocator.free(bytes);
+
+    var reader: std.Io.Reader = .fixed(bytes);
+    if (try reader.takeInt(u32, .little) != MANIFEST_EVAL_CACHE_MAGIC) return error.InvalidManifestEvalCache;
+    if (try reader.takeInt(u16, .little) != MANIFEST_EVAL_CACHE_VERSION) return error.InvalidManifestEvalCache;
+
+    var stored_identity: build_cache.InvocationIdentity = undefined;
+    try reader.readSliceAll(&stored_identity);
+    if (!std.mem.eql(u8, stored_identity[0..], invocation_identity[0..])) return error.StaleManifestEvalCache;
+
+    var cache_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer cache_arena.deinit();
+    const cache_allocator = cache_arena.allocator();
+
+    const config = try readManifestEvalBuildConfig(cache_allocator, &reader);
+    const dependencies = try readManifestEvalCtDependencies(cache_allocator, &reader);
+    const result_hash = try reader.takeInt(u64, .little);
+
+    if (!zap.ctfe.PersistentCache.validateDependencies(scratch_allocator, dependencies, null, null)) {
+        return error.StaleManifestEvalCache;
+    }
+
+    incrementalTrace("manifest-eval-cache result=hit path={s}", .{path});
+    return .{
+        .arena = cache_arena,
+        .eval = .{
+            .config = config,
+            .dependencies = dependencies,
+            .result_hash = result_hash,
+        },
+    };
+}
+
+fn writeManifestEvalCache(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    invocation_identity: build_cache.InvocationIdentity,
+    manifest_eval: zap.builder.ManifestEval,
+) !void {
+    var serialized: std.Io.Writer.Allocating = .init(allocator);
+    defer serialized.deinit();
+
+    try serialized.writer.writeInt(u32, MANIFEST_EVAL_CACHE_MAGIC, .little);
+    try serialized.writer.writeInt(u16, MANIFEST_EVAL_CACHE_VERSION, .little);
+    try serialized.writer.writeAll(&invocation_identity);
+    try writeManifestEvalBuildConfig(&serialized.writer, manifest_eval.config);
+    try writeManifestEvalCtDependencies(&serialized.writer, manifest_eval.dependencies);
+    try serialized.writer.writeInt(u64, manifest_eval.result_hash, .little);
+
+    try build_cache.writeFileAtomic(allocator, path, serialized.written());
+    incrementalTrace("manifest-eval-cache result=write path={s}", .{path});
+}
+
+fn writeManifestEvalString(writer: *std.Io.Writer, value: []const u8) !void {
+    const len = std.math.cast(u32, value.len) orelse return error.ManifestEvalCacheTooLarge;
+    try writer.writeInt(u32, len, .little);
+    try writer.writeAll(value);
+}
+
+fn readManifestEvalString(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]const u8 {
+    const len = try reader.takeInt(u32, .little);
+    const out = try allocator.alloc(u8, len);
+    errdefer allocator.free(out);
+    try reader.readSliceAll(out);
+    return out;
+}
+
+fn writeManifestEvalOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+    try writer.writeByte(if (value != null) 1 else 0);
+    if (value) |some| try writeManifestEvalString(writer, some);
+}
+
+fn readManifestEvalOptionalString(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?[]const u8 {
+    return switch (try reader.takeInt(u8, .little)) {
+        0 => null,
+        1 => try readManifestEvalString(allocator, reader),
+        else => error.InvalidManifestEvalCache,
+    };
+}
+
+fn writeManifestEvalBool(writer: *std.Io.Writer, value: bool) !void {
+    try writer.writeByte(if (value) 1 else 0);
+}
+
+fn readManifestEvalBool(reader: *std.Io.Reader) !bool {
+    return switch (try reader.takeInt(u8, .little)) {
+        0 => false,
+        1 => true,
+        else => error.InvalidManifestEvalCache,
+    };
+}
+
+fn writeManifestEvalStringSlice(writer: *std.Io.Writer, values: []const []const u8) !void {
+    const count = std.math.cast(u32, values.len) orelse return error.ManifestEvalCacheTooLarge;
+    try writer.writeInt(u32, count, .little);
+    for (values) |value| try writeManifestEvalString(writer, value);
+}
+
+fn readManifestEvalStringSlice(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]const []const u8 {
+    const count = try reader.takeInt(u32, .little);
+    const values = try allocator.alloc([]const u8, count);
+    for (values) |*value| {
+        value.* = try readManifestEvalString(allocator, reader);
+    }
+    return values;
+}
+
+fn readManifestEvalBuildKind(reader: *std.Io.Reader) !zap.builder.BuildConfig.Kind {
+    return switch (try reader.takeInt(u8, .little)) {
+        @intFromEnum(zap.builder.BuildConfig.Kind.bin) => .bin,
+        @intFromEnum(zap.builder.BuildConfig.Kind.lib) => .lib,
+        @intFromEnum(zap.builder.BuildConfig.Kind.obj) => .obj,
+        else => error.InvalidManifestEvalCache,
+    };
+}
+
+fn readManifestEvalOptimize(reader: *std.Io.Reader) !zap.builder.BuildConfig.Optimize {
+    return switch (try reader.takeInt(u8, .little)) {
+        @intFromEnum(zap.builder.BuildConfig.Optimize.debug) => .debug,
+        @intFromEnum(zap.builder.BuildConfig.Optimize.release_safe) => .release_safe,
+        @intFromEnum(zap.builder.BuildConfig.Optimize.release_fast) => .release_fast,
+        @intFromEnum(zap.builder.BuildConfig.Optimize.release_small) => .release_small,
+        else => error.InvalidManifestEvalCache,
+    };
+}
+
+fn writeManifestEvalOptionalDebugInfo(
+    writer: *std.Io.Writer,
+    value: ?zap.builder.BuildConfig.DebugInfo,
+) !void {
+    try writer.writeByte(if (value != null) 1 else 0);
+    if (value) |some| try writer.writeByte(@intFromEnum(some));
+}
+
+fn readManifestEvalOptionalDebugInfo(reader: *std.Io.Reader) !?zap.builder.BuildConfig.DebugInfo {
+    return switch (try reader.takeInt(u8, .little)) {
+        0 => null,
+        1 => switch (try reader.takeInt(u8, .little)) {
+            @intFromEnum(zap.builder.BuildConfig.DebugInfo.full) => .full,
+            @intFromEnum(zap.builder.BuildConfig.DebugInfo.split) => .split,
+            @intFromEnum(zap.builder.BuildConfig.DebugInfo.none) => .none,
+            else => error.InvalidManifestEvalCache,
+        },
+        else => error.InvalidManifestEvalCache,
+    };
+}
+
+fn writeManifestEvalOptionalBool(writer: *std.Io.Writer, value: ?bool) !void {
+    try writer.writeByte(if (value != null) 1 else 0);
+    if (value) |some| try writeManifestEvalBool(writer, some);
+}
+
+fn readManifestEvalOptionalBool(reader: *std.Io.Reader) !?bool {
+    return switch (try reader.takeInt(u8, .little)) {
+        0 => null,
+        1 => try readManifestEvalBool(reader),
+        else => error.InvalidManifestEvalCache,
+    };
+}
+
+fn writeManifestEvalBuildConfigDeps(
+    writer: *std.Io.Writer,
+    deps: []const zap.builder.BuildConfig.Dep,
+) !void {
+    const count = std.math.cast(u32, deps.len) orelse return error.ManifestEvalCacheTooLarge;
+    try writer.writeInt(u32, count, .little);
+    for (deps) |dep| {
+        try writeManifestEvalString(writer, dep.name);
+        switch (dep.source) {
+            .path => |path| {
+                try writer.writeByte(1);
+                try writeManifestEvalString(writer, path);
+            },
+            .git => |git| {
+                try writer.writeByte(2);
+                try writeManifestEvalString(writer, git.url);
+                try writeManifestEvalOptionalString(writer, git.tag);
+                try writeManifestEvalOptionalString(writer, git.branch);
+                try writeManifestEvalOptionalString(writer, git.rev);
+            },
+        }
+        try writeManifestEvalOptionalString(writer, dep.local_override);
+    }
+}
+
+fn readManifestEvalBuildConfigDeps(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+) ![]const zap.builder.BuildConfig.Dep {
+    const count = try reader.takeInt(u32, .little);
+    const deps = try allocator.alloc(zap.builder.BuildConfig.Dep, count);
+    for (deps) |*dep| {
+        const name = try readManifestEvalString(allocator, reader);
+        const source: zap.builder.BuildConfig.DepSource = switch (try reader.takeInt(u8, .little)) {
+            1 => .{ .path = try readManifestEvalString(allocator, reader) },
+            2 => .{ .git = .{
+                .url = try readManifestEvalString(allocator, reader),
+                .tag = try readManifestEvalOptionalString(allocator, reader),
+                .branch = try readManifestEvalOptionalString(allocator, reader),
+                .rev = try readManifestEvalOptionalString(allocator, reader),
+            } },
+            else => return error.InvalidManifestEvalCache,
+        };
+        dep.* = .{
+            .name = name,
+            .source = source,
+            .local_override = try readManifestEvalOptionalString(allocator, reader),
+        };
+    }
+    return deps;
+}
+
+fn writeManifestEvalBuildOpts(
+    writer: *std.Io.Writer,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+) !void {
+    const count = std.math.cast(u32, build_opts.count()) orelse return error.ManifestEvalCacheTooLarge;
+    try writer.writeInt(u32, count, .little);
+    var iterator = build_opts.iterator();
+    while (iterator.next()) |entry| {
+        try writeManifestEvalString(writer, entry.key_ptr.*);
+        try writeManifestEvalString(writer, entry.value_ptr.*);
+    }
+}
+
+fn readManifestEvalBuildOpts(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+) !std.StringHashMapUnmanaged([]const u8) {
+    var build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    const count = try reader.takeInt(u32, .little);
+    try build_opts.ensureUnusedCapacity(allocator, count);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const key = try readManifestEvalString(allocator, reader);
+        const value = try readManifestEvalString(allocator, reader);
+        build_opts.putAssumeCapacity(key, value);
+    }
+    return build_opts;
+}
+
+fn writeManifestEvalMemoryManager(
+    writer: *std.Io.Writer,
+    memory_manager: ?zap.builder.BuildConfig.MemoryManager,
+) !void {
+    try writer.writeByte(if (memory_manager != null) 1 else 0);
+    const manager = memory_manager orelse return;
+    try writeManifestEvalString(writer, manager.type_name);
+    try writeManifestEvalOptionalString(writer, manager.adapter_source_path);
+}
+
+fn readManifestEvalMemoryManager(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+) !?zap.builder.BuildConfig.MemoryManager {
+    return switch (try reader.takeInt(u8, .little)) {
+        0 => null,
+        1 => .{
+            .type_name = try readManifestEvalString(allocator, reader),
+            .adapter_source_path = try readManifestEvalOptionalString(allocator, reader),
+        },
+        else => error.InvalidManifestEvalCache,
+    };
+}
+
+fn writeManifestEvalDocGroups(
+    writer: *std.Io.Writer,
+    doc_groups: []const zap.builder.BuildConfig.DocGroup,
+) !void {
+    const count = std.math.cast(u32, doc_groups.len) orelse return error.ManifestEvalCacheTooLarge;
+    try writer.writeInt(u32, count, .little);
+    for (doc_groups) |group| {
+        try writeManifestEvalString(writer, group.name);
+        try writeManifestEvalStringSlice(writer, group.pages);
+    }
+}
+
+fn readManifestEvalDocGroups(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+) ![]const zap.builder.BuildConfig.DocGroup {
+    const count = try reader.takeInt(u32, .little);
+    const groups = try allocator.alloc(zap.builder.BuildConfig.DocGroup, count);
+    for (groups) |*group| {
+        group.* = .{
+            .name = try readManifestEvalString(allocator, reader),
+            .pages = try readManifestEvalStringSlice(allocator, reader),
+        };
+    }
+    return groups;
+}
+
+fn writeManifestEvalBuildConfig(
+    writer: *std.Io.Writer,
+    config: zap.builder.BuildConfig,
+) !void {
+    try writeManifestEvalString(writer, config.name);
+    try writeManifestEvalString(writer, config.version);
+    try writer.writeByte(@intFromEnum(config.kind));
+    try writeManifestEvalOptionalString(writer, config.root);
+    try writeManifestEvalOptionalString(writer, config.asset_name);
+    try writer.writeByte(@intFromEnum(config.optimize));
+    try writeManifestEvalOptionalDebugInfo(writer, config.debug_info);
+    try writeManifestEvalOptionalBool(writer, config.frame_pointers);
+    try writeManifestEvalOptionalString(writer, config.target);
+    try writeManifestEvalOptionalString(writer, config.cpu);
+    try writeManifestEvalStringSlice(writer, config.paths);
+    try writeManifestEvalBuildConfigDeps(writer, config.deps);
+    try writeManifestEvalBuildOpts(writer, config.build_opts);
+    try writeManifestEvalMemoryManager(writer, config.memory_manager);
+    try writer.writeInt(i64, config.test_timeout, .little);
+    try writeManifestEvalOptionalString(writer, config.error_style);
+    try writeManifestEvalBool(writer, config.multiline_errors);
+    try writeManifestEvalOptionalString(writer, config.source_url);
+    try writeManifestEvalOptionalString(writer, config.landing_page);
+    try writeManifestEvalDocGroups(writer, config.doc_groups);
+    try writeDaemonPipeline(writer, config.pipeline);
+}
+
+fn readManifestEvalBuildConfig(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+) !zap.builder.BuildConfig {
+    return .{
+        .name = try readManifestEvalString(allocator, reader),
+        .version = try readManifestEvalString(allocator, reader),
+        .kind = try readManifestEvalBuildKind(reader),
+        .root = try readManifestEvalOptionalString(allocator, reader),
+        .asset_name = try readManifestEvalOptionalString(allocator, reader),
+        .optimize = try readManifestEvalOptimize(reader),
+        .debug_info = try readManifestEvalOptionalDebugInfo(reader),
+        .frame_pointers = try readManifestEvalOptionalBool(reader),
+        .target = try readManifestEvalOptionalString(allocator, reader),
+        .cpu = try readManifestEvalOptionalString(allocator, reader),
+        .paths = try readManifestEvalStringSlice(allocator, reader),
+        .deps = try readManifestEvalBuildConfigDeps(allocator, reader),
+        .build_opts = try readManifestEvalBuildOpts(allocator, reader),
+        .memory_manager = try readManifestEvalMemoryManager(allocator, reader),
+        .test_timeout = try reader.takeInt(i64, .little),
+        .error_style = try readManifestEvalOptionalString(allocator, reader),
+        .multiline_errors = try readManifestEvalBool(reader),
+        .source_url = try readManifestEvalOptionalString(allocator, reader),
+        .landing_page = try readManifestEvalOptionalString(allocator, reader),
+        .doc_groups = try readManifestEvalDocGroups(allocator, reader),
+        .pipeline = try readDaemonPipeline(allocator, reader),
+    };
+}
+
+fn writeManifestEvalCtDependencies(
+    writer: *std.Io.Writer,
+    dependencies: []const zap.ctfe.CtDependency,
+) !void {
+    const count = std.math.cast(u32, dependencies.len) orelse return error.ManifestEvalCacheTooLarge;
+    try writer.writeInt(u32, count, .little);
+    for (dependencies) |dependency| {
+        switch (dependency) {
+            .file => |file| {
+                try writer.writeByte(1);
+                try writeManifestEvalString(writer, file.path);
+                try writer.writeInt(u64, file.content_hash, .little);
+            },
+            .env_var => |env_var| {
+                try writer.writeByte(2);
+                try writeManifestEvalString(writer, env_var.name);
+                try writer.writeInt(u64, env_var.value_hash, .little);
+                try writeManifestEvalBool(writer, env_var.present);
+            },
+            .glob => |glob_dep| {
+                try writer.writeByte(3);
+                try writeManifestEvalString(writer, glob_dep.pattern);
+                try writer.writeInt(u64, glob_dep.result_hash, .little);
+            },
+            .reflected_struct => |reflected_struct| {
+                try writer.writeByte(4);
+                try writeManifestEvalString(writer, reflected_struct.struct_name);
+                try writer.writeInt(u64, reflected_struct.interface_hash, .little);
+            },
+            .reflected_source => |reflected_source| {
+                try writer.writeByte(5);
+                try writeManifestEvalStringSlice(writer, reflected_source.paths);
+                try writer.writeInt(u64, reflected_source.graph_hash, .little);
+            },
+        }
+    }
+}
+
+fn readManifestEvalCtDependencies(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+) ![]const zap.ctfe.CtDependency {
+    const count = try reader.takeInt(u32, .little);
+    const dependencies = try allocator.alloc(zap.ctfe.CtDependency, count);
+    for (dependencies) |*dependency| {
+        dependency.* = switch (try reader.takeInt(u8, .little)) {
+            1 => .{ .file = .{
+                .path = try readManifestEvalString(allocator, reader),
+                .content_hash = try reader.takeInt(u64, .little),
+            } },
+            2 => .{ .env_var = .{
+                .name = try readManifestEvalString(allocator, reader),
+                .value_hash = try reader.takeInt(u64, .little),
+                .present = try readManifestEvalBool(reader),
+            } },
+            3 => .{ .glob = .{
+                .pattern = try readManifestEvalString(allocator, reader),
+                .result_hash = try reader.takeInt(u64, .little),
+            } },
+            4 => .{ .reflected_struct = .{
+                .struct_name = try readManifestEvalString(allocator, reader),
+                .interface_hash = try reader.takeInt(u64, .little),
+            } },
+            5 => .{ .reflected_source = .{
+                .paths = try readManifestEvalStringSlice(allocator, reader),
+                .graph_hash = try reader.takeInt(u64, .little),
+            } },
+            else => return error.InvalidManifestEvalCache,
+        };
+    }
+    return dependencies;
+}
+
 /// The on-disk artifact filename for `config` — `<name>` for a binary,
 /// `<name>.a` for a static lib, `<name>.o` for an object, where
 /// `<name>` is the manifest `asset_name` (when non-empty) else the
@@ -5066,6 +5570,7 @@ fn buildTarget(
 
     const backend_cache_dir = ".zap-cache";
     const manifest_snapshot_path = build_cache.snapshotPath(alloc, backend_cache_dir, target_name) catch return error.OutOfMemory;
+    const manifest_eval_cache_path = manifestEvalCachePath(alloc, backend_cache_dir, target_name) catch return error.OutOfMemory;
     var manifest_cache_node = ScopedProgressNode.start(progress_reporter, progress_root, "Check manifest cache");
     defer manifest_cache_node.deinit();
     manifest_cache_node.updateCurrentItem(manifest_snapshot_path, "Manifest: checking cache", .{});
@@ -5119,9 +5624,31 @@ fn buildTarget(
     // Compiles build.zap to IR and evaluates manifest/1 at compile time.
     var manifest_eval_node = ScopedProgressNode.start(progress_reporter, progress_root, "Evaluate manifest");
     defer manifest_eval_node.deinit();
-    const manifest_eval = builder.ctfeManifestDetailedWithProgress(alloc, build_source, target_name, build_overrides.target, build_opts, zap_lib_dir, progress_reporter) catch |err| {
-        std.debug.print("Error: failed to evaluate build.zap manifest via CTFE: {}\n", .{err});
-        std.process.exit(1);
+    var cached_manifest_eval: ?CachedManifestEval = null;
+    defer if (cached_manifest_eval) |*cached| cached.deinit();
+    manifest_eval_node.updateCurrentItem(manifest_eval_cache_path, "Manifest: checking eval cache", .{});
+    const manifest_eval = if (tryReadManifestEvalCache(
+        allocator,
+        alloc,
+        manifest_eval_cache_path,
+        manifest_invocation_identity,
+    )) |cached_eval| blk: {
+        cached_manifest_eval = cached_eval;
+        manifest_eval_node.updateCurrentItem(manifest_eval_cache_path, "Manifest: using cached evaluation", .{});
+        break :blk cached_manifest_eval.?.eval;
+    } else blk: {
+        manifest_eval_node.updateCurrentItem(build_file_path, "Manifest: evaluating build.zap", .{});
+        const evaluated = builder.ctfeManifestDetailedWithProgress(alloc, build_source, target_name, build_overrides.target, build_opts, zap_lib_dir, progress_reporter) catch |err| {
+            std.debug.print("Error: failed to evaluate build.zap manifest via CTFE: {}\n", .{err});
+            std.process.exit(1);
+        };
+        writeManifestEvalCache(alloc, manifest_eval_cache_path, manifest_invocation_identity, evaluated) catch |err| {
+            incrementalTrace(
+                "manifest-eval-cache result=write_failed reason={s} path={s}",
+                .{ @errorName(err), manifest_eval_cache_path },
+            );
+        };
+        break :blk evaluated;
     };
     manifest_eval_node.succeed();
     // The CLI is the ultimate per-field source of truth: overlay the
@@ -6785,6 +7312,8 @@ fn cloneBuildConfig(
         .root = try cloneOptionalString(allocator, config.root),
         .asset_name = try cloneOptionalString(allocator, config.asset_name),
         .optimize = config.optimize,
+        .debug_info = config.debug_info,
+        .frame_pointers = config.frame_pointers,
         .target = try cloneOptionalString(allocator, config.target),
         .cpu = try cloneOptionalString(allocator, config.cpu),
         .paths = try cloneStringSlice(allocator, config.paths),
@@ -7371,6 +7900,9 @@ const IncrementalWatchState = struct {
         var build_arena = std.heap.ArenaAllocator.init(allocator);
         defer build_arena.deinit();
         const alloc = build_arena.allocator();
+        for (changed_paths) |changed_path| {
+            incrementalTrace("watch-changed-path path={s}", .{changed_path});
+        }
 
         // Re-read build config and sources (same as buildTarget),
         // INCLUDING the single shared `applyBuildOverrides` step so an
@@ -7500,6 +8032,9 @@ const IncrementalWatchState = struct {
         const backend_selection = backend_plan.selection;
         const backend_module_selection = normalizeIncrementalSelectionForBackend(alloc, backend_selection) catch return error.ContextInvalidated;
         defer backend_module_selection.deinit(alloc);
+        const needs_backend_update = !prepared_update or
+            backend_module_selection.include_root or
+            backend_module_selection.struct_names.len > 0;
         if (incrementalTraceEnabled()) {
             incrementalTrace(
                 "backend-selection prepared={} force_full={} invalidation={s} affected_functions={d}",
@@ -7512,6 +8047,21 @@ const IncrementalWatchState = struct {
             );
             traceIncrementalModuleSelection("final-filtered", backend_selection);
             traceOwnedIncrementalModuleSelection("normalized-backend", backend_module_selection);
+            incrementalTrace(
+                "rebuild-summary changed_paths={d} frontend_changed_structs={d} frontend_invalidated_structs={d} changed_roots={d} affected_functions={d} force_full={} selected_modules={d} include_root={} invalidation={s} backend_update={}",
+                .{
+                    changed_paths.len,
+                    frontend_prepared.changed_struct_names.len,
+                    frontend_prepared.invalidated_struct_names.len,
+                    frontend_prepared.changed_graph_roots.len,
+                    result.incremental_backend_affected_function_ids.len,
+                    result.incremental_backend_force_full,
+                    backend_module_selection.struct_names.len,
+                    backend_module_selection.include_root,
+                    @tagName(backend_plan.invalidation),
+                    needs_backend_update,
+                },
+            );
         }
         if (profileEnabled()) {
             std.debug.print(
@@ -7529,9 +8079,6 @@ const IncrementalWatchState = struct {
                 std.debug.print("[incremental backend] selected {s}\n", .{struct_name});
             }
         }
-        const needs_backend_update = !prepared_update or
-            backend_module_selection.include_root or
-            backend_module_selection.struct_names.len > 0;
 
         // Source edits must publish artifacts from the current affected ZIR
         // modules. Zap keeps the persistent Zig compilation context and prepares
@@ -8822,6 +9369,197 @@ test "manifest daemon request header parser identifies warm build and shutdown m
         bytes[6] = case[0];
         try std.testing.expectEqual(case[1], try readManifestDaemonRequestModeHeader(&bytes));
     }
+}
+
+test "manifest eval cache round trips full manifest config" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cache_path = try std.fs.path.join(allocator, &.{ tmp_path, "default.manifest-eval" });
+    defer allocator.free(cache_path);
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0x42);
+
+    var build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer build_opts.deinit(allocator);
+    try build_opts.put(allocator, "feature", "enabled");
+    try build_opts.put(allocator, "profile", "ci");
+
+    const paths = [_][]const u8{ "lib/**/*.zap", "test/**/*.zap" };
+    const deps = [_]zap.builder.BuildConfig.Dep{
+        .{
+            .name = "local_dep",
+            .source = .{ .path = "../dep" },
+            .local_override = "../dep-dev",
+        },
+        .{
+            .name = "git_dep",
+            .source = .{ .git = .{
+                .url = "https://example.invalid/zap.git",
+                .tag = "v1.2.3",
+                .branch = null,
+                .rev = "abcdef",
+            } },
+            .local_override = null,
+        },
+    };
+    const doc_pages = [_][]const u8{ "README.md", "docs/guide.md" };
+    const doc_groups = [_]zap.builder.BuildConfig.DocGroup{
+        .{ .name = "Guide", .pages = &doc_pages },
+    };
+    const run_args = [_][]const u8{ "--list", "--color" };
+    const steps = [_]zap.builder.BuildConfig.Step{
+        .{ .compile = .{} },
+        .{ .run = .{ .args = &run_args, .forward_args = false } },
+    };
+
+    const config: zap.builder.BuildConfig = .{
+        .name = "zap_test",
+        .version = "1.2.3",
+        .kind = .bin,
+        .root = "Main.main/0",
+        .asset_name = "zap-custom-test",
+        .optimize = .release_safe,
+        .debug_info = .split,
+        .frame_pointers = false,
+        .target = "aarch64-macos",
+        .cpu = "apple_m1",
+        .paths = &paths,
+        .deps = &deps,
+        .build_opts = build_opts,
+        .memory_manager = .{
+            .type_name = "Memory.ARC",
+            .adapter_source_path = "lib/memory/arc.zap",
+        },
+        .test_timeout = 1234,
+        .error_style = "long",
+        .multiline_errors = true,
+        .source_url = "https://example.invalid/repo",
+        .landing_page = "README.md",
+        .doc_groups = &doc_groups,
+        .pipeline = .{ .steps = &steps },
+    };
+    try writeManifestEvalCache(allocator, cache_path, identity, .{
+        .config = config,
+        .dependencies = &.{},
+        .result_hash = 0xfeed_beef,
+    });
+
+    var cached = try readManifestEvalCache(allocator, allocator, cache_path, identity);
+    defer cached.deinit();
+
+    try std.testing.expectEqualStrings("zap_test", cached.eval.config.name);
+    try std.testing.expectEqualStrings("1.2.3", cached.eval.config.version);
+    try std.testing.expectEqual(zap.builder.BuildConfig.Kind.bin, cached.eval.config.kind);
+    try std.testing.expectEqualStrings("Main.main/0", cached.eval.config.root.?);
+    try std.testing.expectEqualStrings("zap-custom-test", cached.eval.config.asset_name.?);
+    try std.testing.expectEqual(zap.builder.BuildConfig.Optimize.release_safe, cached.eval.config.optimize);
+    try std.testing.expectEqual(zap.builder.BuildConfig.DebugInfo.split, cached.eval.config.debug_info.?);
+    try std.testing.expectEqual(false, cached.eval.config.frame_pointers.?);
+    try std.testing.expectEqualStrings("aarch64-macos", cached.eval.config.target.?);
+    try std.testing.expectEqualStrings("apple_m1", cached.eval.config.cpu.?);
+    try std.testing.expectEqualStrings("lib/**/*.zap", cached.eval.config.paths[0]);
+    try std.testing.expectEqualStrings("test/**/*.zap", cached.eval.config.paths[1]);
+    try std.testing.expectEqualStrings("local_dep", cached.eval.config.deps[0].name);
+    try std.testing.expectEqualStrings("../dep", cached.eval.config.deps[0].source.path);
+    try std.testing.expectEqualStrings("../dep-dev", cached.eval.config.deps[0].local_override.?);
+    try std.testing.expectEqualStrings("git_dep", cached.eval.config.deps[1].name);
+    try std.testing.expectEqualStrings("https://example.invalid/zap.git", cached.eval.config.deps[1].source.git.url);
+    try std.testing.expectEqualStrings("v1.2.3", cached.eval.config.deps[1].source.git.tag.?);
+    try std.testing.expectEqualStrings("abcdef", cached.eval.config.deps[1].source.git.rev.?);
+    try std.testing.expectEqualStrings("enabled", cached.eval.config.build_opts.get("feature").?);
+    try std.testing.expectEqualStrings("ci", cached.eval.config.build_opts.get("profile").?);
+    try std.testing.expectEqualStrings("Memory.ARC", cached.eval.config.memory_manager.?.type_name);
+    try std.testing.expectEqualStrings("lib/memory/arc.zap", cached.eval.config.memory_manager.?.adapter_source_path.?);
+    try std.testing.expectEqual(@as(i64, 1234), cached.eval.config.test_timeout);
+    try std.testing.expectEqualStrings("long", cached.eval.config.error_style.?);
+    try std.testing.expect(cached.eval.config.multiline_errors);
+    try std.testing.expectEqualStrings("https://example.invalid/repo", cached.eval.config.source_url.?);
+    try std.testing.expectEqualStrings("README.md", cached.eval.config.landing_page.?);
+    try std.testing.expectEqualStrings("Guide", cached.eval.config.doc_groups[0].name);
+    try std.testing.expectEqualStrings("docs/guide.md", cached.eval.config.doc_groups[0].pages[1]);
+    try std.testing.expectEqual(@as(usize, 2), cached.eval.config.pipeline.?.steps.len);
+    try std.testing.expectEqualStrings("--list", cached.eval.config.pipeline.?.steps[1].run.args[0]);
+    try std.testing.expect(!cached.eval.config.pipeline.?.steps[1].run.forward_args);
+    try std.testing.expectEqual(@as(u64, 0xfeed_beef), cached.eval.result_hash);
+}
+
+test "manifest eval cache rejects mismatched invocation identity" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cache_path = try std.fs.path.join(allocator, &.{ tmp_path, "default.manifest-eval" });
+    defer allocator.free(cache_path);
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0x42);
+    var other_identity = identity;
+    other_identity[0] = 0x43;
+
+    try writeManifestEvalCache(allocator, cache_path, identity, .{
+        .config = .{
+            .name = "zap_test",
+            .version = "1.2.3",
+            .kind = .bin,
+        },
+        .dependencies = &.{},
+        .result_hash = 0,
+    });
+
+    try std.testing.expectError(
+        error.StaleManifestEvalCache,
+        readManifestEvalCache(allocator, allocator, cache_path, other_identity),
+    );
+}
+
+test "manifest eval cache invalidates when CTFE file dependency changes" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "manifest-input.txt", .data = "one" });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cache_path = try std.fs.path.join(allocator, &.{ tmp_path, "default.manifest-eval" });
+    defer allocator.free(cache_path);
+    const dep_path = try std.fs.path.join(allocator, &.{ tmp_path, "manifest-input.txt" });
+    defer allocator.free(dep_path);
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0x42);
+    const dependencies = [_]zap.ctfe.CtDependency{
+        .{ .file = .{
+            .path = dep_path,
+            .content_hash = std.hash.Wyhash.hash(0, "one"),
+        } },
+    };
+
+    try writeManifestEvalCache(allocator, cache_path, identity, .{
+        .config = .{
+            .name = "zap_test",
+            .version = "1.2.3",
+            .kind = .bin,
+        },
+        .dependencies = &dependencies,
+        .result_hash = 0,
+    });
+
+    var cached = try readManifestEvalCache(allocator, allocator, cache_path, identity);
+    cached.deinit();
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "manifest-input.txt", .data = "two" });
+    try std.testing.expectError(
+        error.StaleManifestEvalCache,
+        readManifestEvalCache(allocator, allocator, cache_path, identity),
+    );
 }
 
 fn manifestDaemonNowMs() i64 {
@@ -10352,6 +11090,7 @@ const ParsedArgs = struct {
     timings: bool = false,
     slowest: ?[]const u8 = null,
     watch: bool = false,
+    trace_incremental: bool = false,
     collect_arc_stats: bool = false,
     no_deps: bool = false,
     /// Explicit `--zap-lib-dir <dir>` override for the Zap stdlib root.
@@ -10401,6 +11140,8 @@ fn parseTargetArgs(allocator: std.mem.Allocator, args: []const []const u8) !Pars
             }
         } else if (std.mem.eql(u8, arg, "--watch") or std.mem.eql(u8, arg, "-w")) {
             result.watch = true;
+        } else if (std.mem.eql(u8, arg, "--trace-incremental")) {
+            result.trace_incremental = true;
         } else if (std.mem.eql(u8, arg, "--collect-arc-stats")) {
             result.collect_arc_stats = true;
         } else if (std.mem.eql(u8, arg, "--no-deps")) {
@@ -11192,6 +11933,14 @@ test "parseTargetArgs captures Zest timing flags" {
     try testing.expect(parsed.timings);
     try testing.expectEqualStrings("12", parsed.slowest.?);
     try testing.expect(parsed.target == null);
+}
+
+test "parseTargetArgs captures incremental trace flag" {
+    var parsed = try parseTargetArgs(testing.allocator, &.{ "--trace-incremental", "app" });
+    defer parsed.deinit(testing.allocator);
+
+    try testing.expect(parsed.trace_incremental);
+    try testing.expectEqualStrings("app", parsed.target.?);
 }
 
 test "buildPipelineRunArgs appends forwarded runtime args when requested" {
@@ -12178,8 +12927,9 @@ test "project source file honors manifest paths globs for the supplementary prot
 // a regression
 // that re-adds a removed two-token flag (`-O`/`--memory`/`--target`)
 // would swallow the script path and mis-dispatch (the locked position
-// contract: only `-D…`, `--zap-lib-dir`, and explicit test-runner
-// options are recognized leading flags). `targetIsHostRunnable`
+// contract: only `-D…`, `--zap-lib-dir`, boolean build flags, and
+// explicit test-runner options are recognized leading flags).
+// `targetIsHostRunnable`
 // decides the run-vs-report split for a cross-built artifact. Both are
 // filesystem-free and exercised by `zig build test` without spawning a
 // process.
@@ -12200,6 +12950,10 @@ test "firstPositionalIndex: -D and boolean flags do not consume the next token" 
     try testing.expectEqual(
         @as(?usize, 1),
         firstPositionalIndex(&.{ "--collect-arc-stats", "s.zap" }),
+    );
+    try testing.expectEqual(
+        @as(?usize, 1),
+        firstPositionalIndex(&.{ "--trace-incremental", "s.zap" }),
     );
 }
 
@@ -12246,6 +13000,13 @@ test "firstPositionalIndex: post-positional tokens never re-trigger flag skippin
         @as(?usize, 0),
         firstPositionalIndex(&.{ "s.zap", "--zap-lib-dir", "ignored", "--", "-Dx=1" }),
     );
+}
+
+test "leadingFlagPresent scans only the pre-script region" {
+    const args = &.{ "--trace-incremental", "s.zap", "--trace-incremental" };
+
+    try testing.expect(leadingFlagPresent(args, 1, "--trace-incremental"));
+    try testing.expect(!leadingFlagPresent(args, 0, "--trace-incremental"));
 }
 
 test "targetIsHostRunnable: null target (native, incl. bare -Dcpu) is always runnable" {

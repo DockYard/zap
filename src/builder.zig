@@ -362,9 +362,16 @@ pub fn ctfeManifestDetailedWithProgress(
     var config = try constValueToBuildConfig(alloc, manifest_result.value);
     config.memory_manager = try memoryManagerSelectionFromManifest(alloc, manifest_result.value);
 
+    const dependencies = try manifestEvalDependencies(
+        alloc,
+        if (struct_order_data) |order| order.source_files else null,
+        source_units.items,
+        manifest_result.dependencies,
+    );
+
     return .{
         .config = config,
-        .dependencies = manifest_result.dependencies,
+        .dependencies = dependencies,
         .result_hash = manifest_result.result_hash,
     };
 }
@@ -372,6 +379,7 @@ pub fn ctfeManifestDetailedWithProgress(
 const StructOrderData = struct {
     struct_order: [][]const u8,
     level_boundaries: []u32,
+    source_files: [][]const u8,
 };
 
 /// Run import-driven discovery over `build.zap` + the supplied stdlib
@@ -414,7 +422,9 @@ fn computeStructOrder(
     defer graph.deinit();
 
     var order: std.ArrayListUnmanaged([]const u8) = .empty;
+    var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
     for (graph.topo_order.items) |file_path| {
+        try source_files.append(alloc, try alloc.dupe(u8, file_path));
         if (graph.file_to_struct.get(file_path)) |struct_name| {
             try order.append(alloc, try alloc.dupe(u8, struct_name));
         }
@@ -428,7 +438,99 @@ fn computeStructOrder(
     return .{
         .struct_order = try order.toOwnedSlice(alloc),
         .level_boundaries = try levels.toOwnedSlice(alloc),
+        .source_files = try source_files.toOwnedSlice(alloc),
     };
+}
+
+fn manifestEvalDependencies(
+    alloc: std.mem.Allocator,
+    maybe_reachable_source_files: ?[]const []const u8,
+    source_units: []const compiler.SourceUnit,
+    runtime_dependencies: []const zap.ctfe.CtDependency,
+) ![]const zap.ctfe.CtDependency {
+    var dependencies: std.ArrayListUnmanaged(zap.ctfe.CtDependency) = .empty;
+
+    if (maybe_reachable_source_files) |reachable_source_files| {
+        for (reachable_source_files) |source_file| {
+            const source = sourceForManifestDependency(source_units, source_file) orelse
+                try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, source_file, alloc, .limited(10 * 1024 * 1024));
+            try appendManifestFileDependency(alloc, &dependencies, source_file, source);
+        }
+    } else {
+        // Discovery failure falls back to the legacy manifest compile path.
+        // In that mode we cannot prove reachability, so cache validation
+        // must conservatively cover every source unit that entered CTFE.
+        for (source_units) |source_unit| {
+            try appendManifestFileDependency(alloc, &dependencies, source_unit.file_path, source_unit.source);
+        }
+    }
+
+    for (runtime_dependencies) |dependency| {
+        try dependencies.append(alloc, dependency);
+    }
+
+    return dependencies.toOwnedSlice(alloc);
+}
+
+fn sourceForManifestDependency(
+    source_units: []const compiler.SourceUnit,
+    source_file: []const u8,
+) ?[]const u8 {
+    for (source_units) |source_unit| {
+        if (std.mem.eql(u8, source_unit.file_path, source_file)) return source_unit.source;
+    }
+    return null;
+}
+
+fn appendManifestFileDependency(
+    alloc: std.mem.Allocator,
+    dependencies: *std.ArrayListUnmanaged(zap.ctfe.CtDependency),
+    path: []const u8,
+    source: []const u8,
+) !void {
+    for (dependencies.items) |existing| {
+        if (existing == .file and std.mem.eql(u8, existing.file.path, path)) return;
+    }
+    try dependencies.append(alloc, .{ .file = .{
+        .path = try alloc.dupe(u8, path),
+        .content_hash = std.hash.Wyhash.hash(0, source),
+    } });
+}
+
+test "manifestEvalDependencies uses reachable compile inputs when discovery succeeds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = "manifest" },
+        .{ .file_path = "lib/zap/manifest.zap", .source = "pub struct Zap.Manifest {}" },
+        .{ .file_path = "lib/simd.zap", .source = "pub struct Simd {}" },
+    };
+    const reachable_source_files = [_][]const u8{
+        "build.zap",
+        "lib/zap/manifest.zap",
+    };
+    const runtime_dependencies = [_]zap.ctfe.CtDependency{
+        .{ .env_var = .{ .name = "ZAP_ENV", .value_hash = 123, .present = true } },
+    };
+
+    const dependencies = try manifestEvalDependencies(
+        alloc,
+        &reachable_source_files,
+        &source_units,
+        &runtime_dependencies,
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), dependencies.len);
+    try std.testing.expectEqualStrings("build.zap", dependencies[0].file.path);
+    try std.testing.expectEqualStrings("lib/zap/manifest.zap", dependencies[1].file.path);
+    try std.testing.expectEqualStrings("ZAP_ENV", dependencies[2].env_var.name);
+    for (dependencies) |dependency| {
+        if (dependency == .file) {
+            try std.testing.expect(!std.mem.eql(u8, dependency.file.path, "lib/simd.zap"));
+        }
+    }
 }
 
 /// Read all .zap files from a directory and its subdirectories recursively,

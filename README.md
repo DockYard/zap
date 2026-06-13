@@ -84,6 +84,7 @@ Targets default to `:default` for `build` and `run`, and to `:test` for
 zap build my_app
 zap run my_app -- arg1 arg2
 zap test --seed 12345
+zap test --watch --trace-incremental
 zap doc --no-deps
 ```
 
@@ -105,6 +106,7 @@ Common options:
 -Dkey=value                    Pass a build option to build.zap
 --build-file <path>            Use a build file other than build.zap
 --watch, -w                    Rebuild on changes
+--trace-incremental            Print incremental invalidation and backend selection trace
 --target <triple>              Cross-compile for a Zig target triple
 --seed <integer>               Use deterministic test ordering
 -- <args...>                   Pass runtime args to zap run

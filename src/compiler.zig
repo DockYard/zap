@@ -79,6 +79,19 @@ fn profilingEnabled() bool {
     return Cache.enabled;
 }
 
+fn reportHirBuilderError(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    hir_error: zap.hir.HirBuilder.Error,
+) void {
+    diag_engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .message = hir_error.message,
+        .span = hir_error.span,
+        .label = hir_error.label,
+        .help = hir_error.help,
+    }) catch {};
+}
+
 /// True when verbose incremental-cache tracing is enabled. This is separate
 /// from `ZAP_PROFILE`: profiling answers "how long?", while this trace answers
 /// "why was this node rebuilt?" The alternate spelling keeps older local
@@ -522,6 +535,7 @@ pub const FrontendIncrementalState = struct {
         arena: std.heap.ArenaAllocator,
         name: []const u8,
         declares_macro_provider: bool,
+        macro_expansion_dependencies: []const MacroExpansionGraphDependency,
         program: ast.Program,
 
         fn destroy(self: *CachedExpandedStruct, allocator: std.mem.Allocator) void {
@@ -533,6 +547,7 @@ pub const FrontendIncrementalState = struct {
     const CachedExpandedTopLevel = struct {
         arena: std.heap.ArenaAllocator,
         signature: u64,
+        macro_expansion_dependencies: []const MacroExpansionGraphDependency,
         program: ast.Program,
 
         fn destroy(self: *CachedExpandedTopLevel, allocator: std.mem.Allocator) void {
@@ -696,6 +711,11 @@ pub const FrontendIncrementalState = struct {
         errdefer new_dependency_graph.deinit();
         try augmentFrontendGraphWithDeclarationFingerprints(&new_dependency_graph, parsed_fingerprint_sets);
         try augmentFrontendGraphWithDeclarationFingerprints(&new_dependency_graph, reflection_fingerprint_sets);
+        try augmentFrontendGraphWithCachedMacroExpansionDependencies(
+            &new_dependency_graph,
+            &self.expanded_structs,
+            self.expanded_top_level,
+        );
 
         var new_inventory_arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer new_inventory_arena.deinit();
@@ -757,6 +777,8 @@ pub const FrontendIncrementalState = struct {
         errdefer destroyCachedExpandedStructs(self.allocator, new_expanded_structs.items);
         var new_expanded_top_level: ?*CachedExpandedTopLevel = null;
         errdefer if (new_expanded_top_level) |artifact| artifact.destroy(self.allocator);
+        var macro_expansion_dependencies: std.ArrayListUnmanaged(MacroExpansionGraphDependency) = .empty;
+        defer macro_expansion_dependencies.deinit(alloc);
 
         var expansion_cache = ExpansionCacheWork{
             .state = self,
@@ -764,6 +786,7 @@ pub const FrontendIncrementalState = struct {
             .changed_declaration_structs = &changed_declaration_structs,
             .new_expanded_structs = &new_expanded_structs,
             .new_expanded_top_level = &new_expanded_top_level,
+            .macro_expansion_dependencies = &macro_expansion_dependencies,
         };
 
         var ctx = try collectAllFromParsedPrograms(
@@ -774,6 +797,10 @@ pub const FrontendIncrementalState = struct {
             options,
             diag_engine,
             &expansion_cache,
+        );
+        try augmentFrontendGraphWithMacroExpansionDependencies(
+            &new_dependency_graph,
+            macro_expansion_dependencies.items,
         );
 
         var names: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -1088,6 +1115,13 @@ pub const FrontendIncrementalState = struct {
                                     .{struct_key.qualified_name},
                                 );
                             },
+                            .function_body => |function_key| {
+                                try addStructForDeclarationOwner(function_key.owner, invalidated_structs);
+                                incrementalTrace(
+                                    "invalidated-struct source=function-body owner={s}",
+                                    .{function_key.owner.qualified_name},
+                                );
+                            },
                             else => {},
                         }
                     }
@@ -1250,7 +1284,13 @@ const ExpansionCacheWork = struct {
     changed_declaration_structs: *const std.StringHashMap(void),
     new_expanded_structs: *std.ArrayListUnmanaged(*FrontendIncrementalState.CachedExpandedStruct),
     new_expanded_top_level: *?*FrontendIncrementalState.CachedExpandedTopLevel,
+    macro_expansion_dependencies: *std.ArrayListUnmanaged(MacroExpansionGraphDependency),
     has_unassigned_top_level_items: bool = false,
+};
+
+const MacroExpansionGraphDependency = struct {
+    consumer: zap.incremental_graph.NodeKey,
+    provider: zap.incremental_graph.NodeKey,
 };
 
 const StagedExpansionResult = struct {
@@ -1314,6 +1354,8 @@ fn computeFrontendDeclarationFingerprints(
 
     var top_function_groups: FunctionFingerprintGroups = .{};
     defer top_function_groups.deinit(alloc);
+    var top_macro_groups: MacroProviderFingerprintGroups = .{};
+    defer top_macro_groups.deinit(alloc);
 
     for (program.top_items) |item| {
         switch (item) {
@@ -1331,6 +1373,22 @@ fn computeFrontendDeclarationFingerprints(
                 function_decl,
                 frontendPackageOwnerKey(),
                 .free,
+                source,
+                source_id,
+                interner,
+            ),
+            .macro => |macro_decl| try top_macro_groups.append(
+                alloc,
+                macro_decl,
+                frontendPackageOwnerKey(),
+                source,
+                source_id,
+                interner,
+            ),
+            .priv_macro => |macro_decl| try top_macro_groups.append(
+                alloc,
+                macro_decl,
+                frontendPackageOwnerKey(),
                 source,
                 source_id,
                 interner,
@@ -1355,6 +1413,7 @@ fn computeFrontendDeclarationFingerprints(
         }
     }
     try top_function_groups.appendRecords(alloc, &records);
+    try top_macro_groups.appendRecords(alloc, &records);
 
     return .{
         .root_glue = null,
@@ -1399,6 +1458,8 @@ fn appendStructFunctionDeclarationFingerprints(
 ) FrontendFingerprintBuildError!void {
     var groups: FunctionFingerprintGroups = .{};
     defer groups.deinit(alloc);
+    var macro_groups: MacroProviderFingerprintGroups = .{};
+    defer macro_groups.deinit(alloc);
 
     for (struct_decl.items) |item| {
         switch (item) {
@@ -1420,11 +1481,28 @@ fn appendStructFunctionDeclarationFingerprints(
                 source_id,
                 interner,
             ),
+            .macro => |macro_decl| try macro_groups.append(
+                alloc,
+                macro_decl,
+                owner,
+                source,
+                source_id,
+                interner,
+            ),
+            .priv_macro => |macro_decl| try macro_groups.append(
+                alloc,
+                macro_decl,
+                owner,
+                source,
+                source_id,
+                interner,
+            ),
             else => {},
         }
     }
 
     try groups.appendRecords(alloc, records);
+    try macro_groups.appendRecords(alloc, records);
 }
 
 fn appendImplFunctionDeclarationFingerprints(
@@ -1586,6 +1664,110 @@ const FunctionFingerprintGroups = struct {
     }
 };
 
+const MacroProviderFingerprintGroup = struct {
+    key: zap.incremental_graph.MacroKey,
+    body_hasher: zap.incremental_graph.StableHasher,
+    declaration_count: u64 = 0,
+    clause_count: u64 = 0,
+
+    fn init(key: zap.incremental_graph.MacroKey) MacroProviderFingerprintGroup {
+        var body_hasher = zap.incremental_graph.StableHasher.init(.macro_provider_fingerprint);
+        key.appendStableHash(&body_hasher);
+        return .{
+            .key = key,
+            .body_hasher = body_hasher,
+        };
+    }
+
+    fn appendDeclaration(
+        self: *MacroProviderFingerprintGroup,
+        macro_decl: *const ast.FunctionDecl,
+        source: []const u8,
+        source_id: u32,
+    ) FrontendFingerprintBuildError!void {
+        self.declaration_count += 1;
+        self.body_hasher.appendEnum(macro_decl.visibility);
+        self.body_hasher.appendInt(u64, macro_decl.clauses.len);
+        for (macro_decl.clauses) |clause| {
+            self.clause_count += 1;
+            self.body_hasher.appendInt(u64, clause.params.len);
+            for (clause.params) |param| {
+                self.body_hasher.appendEnum(param.ownership);
+                self.body_hasher.appendBool(param.ownership_explicit);
+                try appendPatternSpan(&self.body_hasher, param.pattern, source, source_id);
+                try appendOptionalTypeExprSpan(&self.body_hasher, param.type_annotation, source, source_id);
+                try appendOptionalExprSpan(&self.body_hasher, param.default, source, source_id);
+            }
+            try appendOptionalTypeExprSpan(&self.body_hasher, clause.return_type, source, source_id);
+            try appendOptionalExprSpan(&self.body_hasher, clause.refinement, source, source_id);
+            if (clause.body) |statements| {
+                self.body_hasher.appendBool(true);
+                self.body_hasher.appendInt(u64, statements.len);
+                for (statements) |statement| {
+                    self.body_hasher.appendEnum(std.meta.activeTag(statement));
+                    try appendSourceSpan(&self.body_hasher, stmtSourceSpan(statement), source, source_id);
+                }
+            } else {
+                self.body_hasher.appendBool(false);
+            }
+        }
+    }
+
+    fn digest(self: *MacroProviderFingerprintGroup) zap.incremental_graph.StableDigest {
+        self.body_hasher.appendInt(u64, self.declaration_count);
+        self.body_hasher.appendInt(u64, self.clause_count);
+        return self.body_hasher.final();
+    }
+};
+
+const MacroProviderFingerprintGroups = struct {
+    items: std.ArrayListUnmanaged(MacroProviderFingerprintGroup) = .empty,
+
+    fn deinit(self: *MacroProviderFingerprintGroups, alloc: std.mem.Allocator) void {
+        self.items.deinit(alloc);
+    }
+
+    fn append(
+        self: *MacroProviderFingerprintGroups,
+        alloc: std.mem.Allocator,
+        macro_decl: *const ast.FunctionDecl,
+        owner: zap.incremental_graph.DeclarationOwnerKey,
+        source: []const u8,
+        source_id: u32,
+        interner: *const ast.StringInterner,
+    ) FrontendFingerprintBuildError!void {
+        const macro_key = try frontendAstMacroKey(alloc, macro_decl, owner, interner);
+        const group = try self.getOrAppend(alloc, macro_key);
+        try group.appendDeclaration(macro_decl, source, source_id);
+    }
+
+    fn appendRecords(
+        self: *MacroProviderFingerprintGroups,
+        alloc: std.mem.Allocator,
+        records: *std.ArrayListUnmanaged(zap.incremental_graph.DeclarationFingerprint),
+    ) !void {
+        for (self.items.items) |*group| {
+            try records.append(alloc, .{
+                .key = .{ .macro_provider = group.key },
+                .kind = .macro_provider,
+                .digest = group.digest(),
+            });
+        }
+    }
+
+    fn getOrAppend(
+        self: *MacroProviderFingerprintGroups,
+        alloc: std.mem.Allocator,
+        macro_key: zap.incremental_graph.MacroKey,
+    ) !*MacroProviderFingerprintGroup {
+        for (self.items.items) |*group| {
+            if (zap.incremental_graph.MacroKey.eql(group.key, macro_key)) return group;
+        }
+        try self.items.append(alloc, MacroProviderFingerprintGroup.init(macro_key));
+        return &self.items.items[self.items.items.len - 1];
+    }
+};
+
 fn appendFunctionFingerprintGroupKey(
     hasher: *zap.incremental_graph.StableHasher,
     key: zap.incremental_graph.FunctionKey,
@@ -1599,6 +1781,25 @@ fn frontendPackageOwnerKey() zap.incremental_graph.DeclarationOwnerKey {
         .kind = .package,
         .qualified_name = "",
     };
+}
+
+fn frontendOwnerKeyForScope(
+    alloc: std.mem.Allocator,
+    graph: *const zap.scope.ScopeGraph,
+    scope_id: ?zap.scope.ScopeId,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!zap.incremental_graph.DeclarationOwnerKey {
+    if (scope_id) |some_scope_id| {
+        for (graph.structs.items) |entry| {
+            if (entry.scope_id != some_scope_id) continue;
+            return .{
+                .package = frontendPackageKey(),
+                .kind = .@"struct",
+                .qualified_name = try structNameToOwnedString(alloc, entry.name, interner),
+            };
+        }
+    }
+    return frontendPackageOwnerKey();
 }
 
 fn frontendAstFunctionKey(
@@ -1627,6 +1828,37 @@ fn functionDeclArity(function_decl: *const ast.FunctionDecl) error{UnsupportedDe
     return std.math.cast(u16, function_decl.clauses[0].params.len) orelse error.UnsupportedDeclarationFingerprint;
 }
 
+fn frontendAstMacroKey(
+    alloc: std.mem.Allocator,
+    macro_decl: *const ast.FunctionDecl,
+    owner: zap.incremental_graph.DeclarationOwnerKey,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!zap.incremental_graph.MacroKey {
+    const arity = try functionDeclArity(macro_decl);
+    return .{
+        .owner = owner,
+        .local_name = try alloc.dupe(u8, interner.get(macro_decl.name)),
+        .arity = arity,
+    };
+}
+
+fn frontendMacroProviderNodeKey(
+    alloc: std.mem.Allocator,
+    graph: *const zap.scope.ScopeGraph,
+    macro_family_id: zap.scope.MacroFamilyId,
+    interner: *const ast.StringInterner,
+) FrontendFingerprintBuildError!zap.incremental_graph.NodeKey {
+    if (macro_family_id >= graph.macro_families.items.len) return error.UnsupportedDeclarationFingerprint;
+    const family = graph.macro_families.items[macro_family_id];
+    const owner = try frontendOwnerKeyForScope(alloc, graph, family.scope_id, interner);
+    const arity = std.math.cast(u16, family.arity) orelse return error.UnsupportedDeclarationFingerprint;
+    return .{ .macro_provider = .{
+        .owner = owner,
+        .local_name = try alloc.dupe(u8, interner.get(family.name)),
+        .arity = arity,
+    } };
+}
+
 fn fingerprintStructSurface(
     struct_decl: *const ast.StructDecl,
     source: []const u8,
@@ -1650,7 +1882,7 @@ fn fingerprintStructSurface(
     for (struct_decl.items) |item| {
         hasher.appendEnum(std.meta.activeTag(item));
         switch (item) {
-            .function, .priv_function => |function_decl| try appendFunctionSurface(&hasher, function_decl, interner),
+            .function, .priv_function, .macro, .priv_macro => |function_decl| try appendFunctionSurface(&hasher, function_decl, interner),
             else => try appendSourceSpan(&hasher, structItemSourceSpan(item), source, source_id),
         }
     }
@@ -2615,6 +2847,17 @@ fn copyStringSet(source: *const std.StringHashMap(void), dest: *std.StringHashMa
     }
 }
 
+fn addStructForDeclarationOwner(
+    owner: zap.incremental_graph.DeclarationOwnerKey,
+    structs: *std.StringHashMap(void),
+) CompileError!void {
+    if (owner.kind == .@"struct") {
+        try structs.put(owner.qualified_name, {});
+    } else if (owner.kind == .package) {
+        try structs.put("", {});
+    }
+}
+
 fn addChangedDeclarationStructForNode(
     alloc: std.mem.Allocator,
     node_key: zap.incremental_graph.NodeKey,
@@ -2623,13 +2866,8 @@ fn addChangedDeclarationStructForNode(
     _ = alloc;
     switch (node_key) {
         .struct_surface => |struct_key| try changed_declaration_structs.put(struct_key.qualified_name, {}),
-        .function_signature, .function_body => |function_key| {
-            if (function_key.owner.kind == .@"struct") {
-                try changed_declaration_structs.put(function_key.owner.qualified_name, {});
-            } else if (function_key.owner.kind == .package) {
-                try changed_declaration_structs.put("", {});
-            }
-        },
+        .function_signature, .function_body => |function_key| try addStructForDeclarationOwner(function_key.owner, changed_declaration_structs),
+        .macro_provider => |macro_key| try addStructForDeclarationOwner(macro_key.owner, changed_declaration_structs),
         .package_surface => try changed_declaration_structs.put("", {}),
         else => {},
     }
@@ -2787,6 +3025,10 @@ fn augmentFrontendGraphWithDeclarationFingerprints(
                     const owner_surface_id = try dependency_graph.getOrPutNode(frontendOwnerSurfaceNodeKey(function_key.owner));
                     try dependency_graph.addEdge(node_id, owner_surface_id, .surface);
                 },
+                .macro_provider => |macro_key| {
+                    const owner_surface_id = try dependency_graph.getOrPutNode(frontendOwnerSurfaceNodeKey(macro_key.owner));
+                    try dependency_graph.addEdge(node_id, owner_surface_id, .surface);
+                },
                 else => {},
             }
         }
@@ -2801,6 +3043,130 @@ fn frontendOwnerSurfaceNodeKey(owner: zap.incremental_graph.DeclarationOwnerKey)
         } };
     }
     return .{ .package_surface = owner.package };
+}
+
+fn appendCachedMacroExpansionDependencies(
+    alloc: std.mem.Allocator,
+    dependencies: *std.ArrayListUnmanaged(MacroExpansionGraphDependency),
+    cached: []const MacroExpansionGraphDependency,
+) CompileError!void {
+    try dependencies.appendSlice(alloc, cached);
+}
+
+fn cloneMacroExpansionDependencySlice(
+    alloc: std.mem.Allocator,
+    dependencies: []const MacroExpansionGraphDependency,
+) CompileError![]const MacroExpansionGraphDependency {
+    return alloc.dupe(MacroExpansionGraphDependency, dependencies) catch return error.OutOfMemory;
+}
+
+fn macroExpansionConsumerNodeKey(
+    key_allocator: std.mem.Allocator,
+    graph: *const zap.scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+    consumer: @import("macro.zig").MacroEngine.MacroExpansionConsumer,
+) CompileError!zap.incremental_graph.NodeKey {
+    switch (consumer) {
+        .function => |function_consumer| {
+            const owner = frontendOwnerKeyForScope(
+                key_allocator,
+                graph,
+                function_consumer.owner_scope,
+                interner,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnsupportedDeclarationFingerprint => return error.IrFailed,
+            };
+            const declaration_kind: zap.incremental_graph.FunctionDeclarationKind =
+                if (owner.kind == .@"struct") .struct_method else .free;
+            const function_key = frontendAstFunctionKey(
+                key_allocator,
+                function_consumer.decl,
+                owner,
+                declaration_kind,
+                interner,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnsupportedDeclarationFingerprint => return error.IrFailed,
+            };
+            return .{ .function_body = function_key };
+        },
+        .struct_scope => |scope_id| {
+            const owner = frontendOwnerKeyForScope(
+                key_allocator,
+                graph,
+                scope_id,
+                interner,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.UnsupportedDeclarationFingerprint => return error.IrFailed,
+            };
+            return frontendOwnerSurfaceNodeKey(owner);
+        },
+        .package => return frontendPackageSurfaceNodeKey(),
+    }
+}
+
+fn appendMacroExpansionDependenciesFromEngine(
+    list_allocator: std.mem.Allocator,
+    key_allocator: std.mem.Allocator,
+    dependencies: *std.ArrayListUnmanaged(MacroExpansionGraphDependency),
+    graph: *const zap.scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+    engine_dependencies: []const @import("macro.zig").MacroEngine.MacroExpansionDependency,
+) CompileError!void {
+    for (engine_dependencies) |dependency| {
+        const consumer = try macroExpansionConsumerNodeKey(
+            key_allocator,
+            graph,
+            interner,
+            dependency.consumer,
+        );
+        const provider = frontendMacroProviderNodeKey(
+            key_allocator,
+            graph,
+            dependency.macro_family_id,
+            interner,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedDeclarationFingerprint => return error.IrFailed,
+        };
+        try dependencies.append(list_allocator, .{
+            .consumer = consumer,
+            .provider = provider,
+        });
+    }
+}
+
+fn augmentFrontendGraphWithMacroExpansionDependencies(
+    dependency_graph: *zap.incremental_graph.Graph,
+    dependencies: []const MacroExpansionGraphDependency,
+) CompileError!void {
+    for (dependencies) |dependency| {
+        const consumer_id = try dependency_graph.getOrPutNode(dependency.consumer);
+        const provider_id = try dependency_graph.getOrPutNode(dependency.provider);
+        try dependency_graph.addEdge(consumer_id, provider_id, .macro_expansion);
+    }
+}
+
+fn augmentFrontendGraphWithCachedMacroExpansionDependencies(
+    dependency_graph: *zap.incremental_graph.Graph,
+    expanded_structs: *const std.StringHashMap(*FrontendIncrementalState.CachedExpandedStruct),
+    expanded_top_level: ?*FrontendIncrementalState.CachedExpandedTopLevel,
+) CompileError!void {
+    var iter = expanded_structs.iterator();
+    while (iter.next()) |entry| {
+        try augmentFrontendGraphWithMacroExpansionDependencies(
+            dependency_graph,
+            entry.value_ptr.*.macro_expansion_dependencies,
+        );
+    }
+    if (expanded_top_level) |top_level| {
+        try augmentFrontendGraphWithMacroExpansionDependencies(
+            dependency_graph,
+            top_level.macro_expansion_dependencies,
+        );
+    }
 }
 
 fn augmentFrontendGraphWithFunctions(
@@ -4083,14 +4449,10 @@ const Pipeline = struct {
         // a `@target` access then reports its own diagnostic.
         hir_builder.target = zap.target_triple.resolve(self.options.ctfe_target);
         const hir_program = hir_builder.buildProgram(desugared) catch {
-            for (hir_builder.errors.items) |hir_err| {
-                self.ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
-            }
+            for (hir_builder.errors.items) |hir_err| reportHirBuilderError(&self.ctx.diag_engine, hir_err);
             return self.failWithExisting(error.HirFailed);
         };
-        for (hir_builder.errors.items) |hir_err| {
-            self.ctx.diag_engine.err(hir_err.message, hir_err.span) catch {};
-        }
+        for (hir_builder.errors.items) |hir_err| reportHirBuilderError(&self.ctx.diag_engine, hir_err);
         if (self.hasNewErrors()) return self.failWithExisting(error.HirFailed);
         return .{ .program = hir_program, .next_group_id = hir_builder.next_group_id };
     }
@@ -4493,6 +4855,8 @@ fn stagedMacroExpandAndDesugar(
             collector,
             diag_engine,
             &compiled_executor,
+            null,
+            alloc,
             &shared_closure_counter,
         );
         const expand_ms = staged_timer.lapMs();
@@ -4539,6 +4903,8 @@ fn stagedMacroExpandAndDesugar(
             collector,
             diag_engine,
             &compiled_executor,
+            null,
+            alloc,
             &shared_closure_counter,
         );
         try expanded_structs.append(alloc, .{ .name = original.name, .program = desugared });
@@ -4553,6 +4919,8 @@ fn stagedMacroExpandAndDesugar(
             collector,
             diag_engine,
             &compiled_executor,
+            null,
+            alloc,
             &shared_closure_counter,
         );
         break :blk expanded;
@@ -4862,6 +5230,11 @@ fn cachedOrExpandTopLevelProgram(
 
     if (!expansion_required) {
         if (cache.state.expanded_top_level) |entry| {
+            try appendCachedMacroExpansionDependencies(
+                alloc,
+                cache.macro_expansion_dependencies,
+                entry.macro_expansion_dependencies,
+            );
             try updateImplDeclsInProgram(collector, &entry.program);
             return entry.program;
         }
@@ -4875,6 +5248,8 @@ fn cachedOrExpandTopLevelProgram(
             collector,
             diag_engine,
             compiled_executor,
+            cache,
+            alloc,
             shared_closure_counter,
         );
         try updateImplDeclsInProgram(collector, &expanded);
@@ -4886,11 +5261,13 @@ fn cachedOrExpandTopLevelProgram(
     artifact.* = .{
         .arena = std.heap.ArenaAllocator.init(cache.state.allocator),
         .signature = signature,
+        .macro_expansion_dependencies = &.{},
         .program = .{ .structs = &.{}, .top_items = &.{} },
     };
     errdefer artifact.destroy(cache.state.allocator);
 
     const artifact_alloc = artifact.arena.allocator();
+    const dependency_start = cache.macro_expansion_dependencies.items.len;
     const expanded_program = try expandAndDesugarTopLevelProgram(
         artifact_alloc,
         top_level_items,
@@ -4898,7 +5275,13 @@ fn cachedOrExpandTopLevelProgram(
         collector,
         diag_engine,
         compiled_executor,
+        cache,
+        artifact_alloc,
         shared_closure_counter,
+    );
+    artifact.macro_expansion_dependencies = try cloneMacroExpansionDependencySlice(
+        artifact_alloc,
+        cache.macro_expansion_dependencies.items[dependency_start..],
     );
     artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
     try updateImplDeclsInProgram(collector, &artifact.program);
@@ -4921,6 +5304,11 @@ fn cachedOrExpandStagedStruct(
         !cache.changed_declaration_structs.contains(original.name))
     {
         if (cached) |entry| {
+            try appendCachedMacroExpansionDependencies(
+                alloc,
+                cache.macro_expansion_dependencies,
+                entry.macro_expansion_dependencies,
+            );
             try reCollectFunctionsInProgram(collector, &entry.program);
             try updateImplDeclsInProgram(collector, &entry.program);
             return .{ .program = entry.program, .cache_hit = true };
@@ -4933,12 +5321,14 @@ fn cachedOrExpandStagedStruct(
         .arena = std.heap.ArenaAllocator.init(cache.state.allocator),
         .name = &.{},
         .declares_macro_provider = structProgramDeclaresMacro(original.program),
+        .macro_expansion_dependencies = &.{},
         .program = .{ .structs = &.{}, .top_items = &.{} },
     };
     errdefer artifact.destroy(cache.state.allocator);
 
     const artifact_alloc = artifact.arena.allocator();
     artifact.name = artifact_alloc.dupe(u8, original.name) catch return error.OutOfMemory;
+    const dependency_start = cache.macro_expansion_dependencies.items.len;
     const expanded_program = try expandAndDesugarStagedStruct(
         artifact_alloc,
         original,
@@ -4946,7 +5336,13 @@ fn cachedOrExpandStagedStruct(
         collector,
         diag_engine,
         compiled_executor,
+        cache,
+        artifact_alloc,
         shared_closure_counter,
+    );
+    artifact.macro_expansion_dependencies = try cloneMacroExpansionDependencySlice(
+        artifact_alloc,
+        cache.macro_expansion_dependencies.items[dependency_start..],
     );
     artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
     try reCollectFunctionsInProgram(collector, &artifact.program);
@@ -4986,6 +5382,8 @@ fn expandAndDesugarTopLevelProgram(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+    cache: ?*ExpansionCacheWork,
+    dependency_key_allocator: std.mem.Allocator,
     shared_closure_counter: *u32,
 ) CompileError!ast.Program {
     const top_program = ast.Program{ .structs = &.{}, .top_items = top_items };
@@ -5004,6 +5402,16 @@ fn expandAndDesugarTopLevelProgram(
         diag_engine.err(macro_err.message, macro_err.span) catch {};
     }
     if (diag_engine.errorCount() > error_baseline) return error.MacroExpansionFailed;
+    if (cache) |expansion_cache| {
+        try appendMacroExpansionDependenciesFromEngine(
+            alloc,
+            dependency_key_allocator,
+            expansion_cache.macro_expansion_dependencies,
+            &collector.graph,
+            interner,
+            macro_engine.expansionDependencies(),
+        );
+    }
 
     var desugarer = zap.Desugarer.initWithSharedClosureCounter(alloc, interner, &collector.graph, shared_closure_counter);
     const desugared = desugarer.desugarProgram(&expanded) catch {
@@ -5024,6 +5432,8 @@ fn expandAndDesugarStagedStruct(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+    cache: ?*ExpansionCacheWork,
+    dependency_key_allocator: std.mem.Allocator,
     shared_closure_counter: *u32,
 ) CompileError!ast.Program {
     const error_baseline = diag_engine.errorCount();
@@ -5061,6 +5471,16 @@ fn expandAndDesugarStagedStruct(
         diag_engine.err(macro_err.message, macro_err.span) catch {};
     }
     if (diag_engine.errorCount() > error_baseline) return error.MacroExpansionFailed;
+    if (cache) |expansion_cache| {
+        try appendMacroExpansionDependenciesFromEngine(
+            alloc,
+            dependency_key_allocator,
+            expansion_cache.macro_expansion_dependencies,
+            &collector.graph,
+            interner,
+            macro_engine.expansionDependencies(),
+        );
+    }
 
     try reCollectFunctionsInProgram(collector, &expanded);
     try updateImplDeclsInProgram(collector, &expanded);
@@ -5078,7 +5498,16 @@ fn expandAndDesugarStagedStruct(
     try registerSynthesizedClosureTypes(collector, &desugared);
     try reCollectFunctionsInProgram(collector, &desugared);
     try updateImplDeclsInProgram(collector, &desugared);
-    try expandGraphImplsForProgram(alloc, &desugared, interner, collector, diag_engine, compiled_executor);
+    try expandGraphImplsForProgram(
+        alloc,
+        &desugared,
+        interner,
+        collector,
+        diag_engine,
+        compiled_executor,
+        cache,
+        dependency_key_allocator,
+    );
     return desugared;
 }
 
@@ -5089,6 +5518,8 @@ fn expandGraphImplsForProgram(
     collector: *zap.Collector,
     diag_engine: *zap.DiagnosticEngine,
     compiled_executor: *@import("macro.zig").CompiledMacroExecutor,
+    cache: ?*ExpansionCacheWork,
+    dependency_key_allocator: std.mem.Allocator,
 ) CompileError!void {
     for (collector.graph.impls.items) |*entry| {
         var target_in_program = false;
@@ -5119,6 +5550,16 @@ fn expandGraphImplsForProgram(
         };
         for (macro_engine.errors.items) |macro_err| {
             diag_engine.err(macro_err.message, macro_err.span) catch {};
+        }
+        if (cache) |expansion_cache| {
+            try appendMacroExpansionDependenciesFromEngine(
+                alloc,
+                dependency_key_allocator,
+                expansion_cache.macro_expansion_dependencies,
+                &collector.graph,
+                interner,
+                macro_engine.expansionDependencies(),
+            );
         }
 
         var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
@@ -5194,14 +5635,10 @@ fn compileStagedStructHir(
     hir_builder.target = zap.target_triple.resolve(ctfe_target);
     sub_timer.reset();
     const hir_program = hir_builder.buildProgram(desugared) catch {
-        for (hir_builder.errors.items) |hir_err| {
-            diag_engine.err(hir_err.message, hir_err.span) catch {};
-        }
+        for (hir_builder.errors.items) |hir_err| reportHirBuilderError(diag_engine, hir_err);
         return error.HirFailed;
     };
-    for (hir_builder.errors.items) |hir_err| {
-        diag_engine.err(hir_err.message, hir_err.span) catch {};
-    }
+    for (hir_builder.errors.items) |hir_err| reportHirBuilderError(diag_engine, hir_err);
     const hb_ms = sub_timer.lapMs();
     if (profilingEnabled() and (tc_ms + hb_ms) >= 100) {
         std.debug.print("\n[hir-stage struct={s} type_check_ms={d} hir_build_ms={d}]\n", .{ struct_name, tc_ms, hb_ms });
@@ -5894,6 +6331,10 @@ fn compileStructByStructIncrementalFinal(
         );
     }
     if (affected_functions.count() == 0) {
+        incrementalTrace(
+            "frontend-final-summary scope=none reason=no-affected-functions affected_functions=0 total_functions={d} force_full=false",
+            .{pre_final.program.functions.len},
+        );
         pre_final.arc_ownership.deinit();
         return .{
             .ir_program = cached_program,
@@ -5920,6 +6361,10 @@ fn compileStructByStructIncrementalFinal(
             "frontend-final scope=all reason=all-functions-affected affected_functions={d} total_functions={d}",
             .{ affected_functions.count(), pre_final.program.functions.len },
         );
+        incrementalTrace(
+            "frontend-final-summary scope=all reason=all-functions-affected affected_functions={d} total_functions={d} force_full=true",
+            .{ affected_functions.count(), pre_final.program.functions.len },
+        );
         var result = try finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
         result.incremental_backend_force_full = true;
         return result;
@@ -5929,12 +6374,20 @@ fn compileStructByStructIncrementalFinal(
         !unaffectedFunctionIdentitiesStable(pre_final.program, cached_program, &affected_functions))
     {
         incrementalTrace("frontend-final scope=all reason=function-layout-or-identity-change", .{});
+        incrementalTrace(
+            "frontend-final-summary scope=all reason=function-layout-or-identity-change affected_functions={d} total_functions={d} force_full=true",
+            .{ affected_functions.count(), pre_final.program.functions.len },
+        );
         var result = try finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
         result.incremental_backend_force_full = true;
         return result;
     }
     if (!typeDefinitionsStable(pre_final.program.type_defs, cached_program.type_defs)) {
         incrementalTrace("frontend-final scope=all reason=type-definitions-changed", .{});
+        incrementalTrace(
+            "frontend-final-summary scope=all reason=type-definitions-changed affected_functions={d} total_functions={d} force_full=true",
+            .{ affected_functions.count(), pre_final.program.functions.len },
+        );
         var result = try finishMergedIr(alloc, ctx, options, pre_final.shared_store, pre_final.program, pre_final.arc_ownership);
         result.incremental_backend_force_full = true;
         return result;
@@ -5958,6 +6411,10 @@ fn compileStructByStructIncrementalFinal(
         cached_program,
         component_result.ir_program,
         &affected_functions,
+    );
+    incrementalTrace(
+        "frontend-final-summary scope=selected affected_functions={d} total_functions={d} force_full=false",
+        .{ backend_affected_function_ids.len, pre_final.program.functions.len },
     );
 
     return .{
@@ -7464,6 +7921,94 @@ test "incremental frontend propagates changed callee behavior through indirect c
     broken.deinit();
 }
 
+test "incremental frontend macro provider body changes select only expansion consumers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const provider_structs = [_][]const u8{"MacroProvider"};
+    const caller_structs = [_][]const u8{"Caller"};
+    const observer_structs = [_][]const u8{"Observer"};
+    try file_to_structs.put("lib/macro_provider.zap", &provider_structs);
+    try file_to_structs.put("lib/caller.zap", &caller_structs);
+    try file_to_structs.put("lib/observer.zap", &observer_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    const provider_dependents = [_][]const u8{ "lib/caller.zap", "lib/observer.zap" };
+    try file_imported_by.put("lib/macro_provider.zap", &provider_dependents);
+
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+    const struct_order = [_][]const u8{ "MacroProvider", "Caller", "Observer" };
+
+    const provider_v1_source =
+        "pub struct MacroProvider {\n" ++
+        "  pub macro answer() -> Expr {\n" ++
+        "    quote { 1 }\n" ++
+        "  }\n" ++
+        "}\n";
+    const provider_v2_source =
+        "pub struct MacroProvider {\n" ++
+        "  pub macro answer() -> Expr {\n" ++
+        "    quote { 2 }\n" ++
+        "  }\n" ++
+        "}\n";
+    const caller_source =
+        "pub struct Caller {\n" ++
+        "  pub fn value() -> i64 { MacroProvider.answer() }\n" ++
+        "}\n";
+    const observer_source =
+        "pub struct Observer {\n" ++
+        "  pub fn value() -> i64 { 7 }\n" ++
+        "}\n";
+
+    var initial_units = [_]SourceUnit{
+        .{ .file_path = "lib/macro_provider.zap", .source = provider_v1_source, .primary_struct_name = "MacroProvider" },
+        .{ .file_path = "lib/caller.zap", .source = caller_source, .primary_struct_name = "Caller" },
+        .{ .file_path = "lib/observer.zap", .source = observer_source, .primary_struct_name = "Observer" },
+    };
+    var initial = try state.prepare(alloc, &initial_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    try expectCtfeInt(alloc, initial.result.ir_program, "Caller__value__0", 1);
+    try expectCtfeInt(alloc, initial.result.ir_program, "Observer__value__0", 7);
+    try initial.commit();
+    initial.deinit();
+
+    var changed_units = [_]SourceUnit{
+        .{ .file_path = "lib/macro_provider.zap", .source = provider_v2_source, .primary_struct_name = "MacroProvider" },
+        .{ .file_path = "lib/caller.zap", .source = caller_source, .primary_struct_name = "Caller" },
+        .{ .file_path = "lib/observer.zap", .source = observer_source, .primary_struct_name = "Observer" },
+    };
+    var changed = try state.prepare(alloc, &changed_units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_order,
+    });
+    defer changed.deinit();
+
+    try std.testing.expect(nodeIdSliceContainsKind(&changed.new_dependency_graph, changed.changed_graph_roots, .macro_provider));
+    try expectCtfeInt(alloc, changed.result.ir_program, "Caller__value__0", 2);
+    try expectCtfeInt(alloc, changed.result.ir_program, "Observer__value__0", 7);
+    try std.testing.expectEqual(@as(usize, 1), changed.result.incremental_backend_affected_function_ids.len);
+    const affected_function = functionById(
+        changed.result.ir_program,
+        changed.result.incremental_backend_affected_function_ids[0],
+    ).?;
+    try std.testing.expectEqualStrings("Caller", affected_function.struct_name.?);
+    try std.testing.expectEqualStrings("value__0", affected_function.local_name);
+}
+
 test "incremental frontend commit stores durable source and struct graph nodes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8471,6 +9016,47 @@ test "incremental frontend declaration fingerprints root body-only edits at func
     try std.testing.expectEqual(zap.incremental_graph.NodeKind.function_body, root_key.kind());
 }
 
+test "incremental frontend declaration fingerprints root macro body edits at macro provider" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const previous_source =
+        "pub struct MacroProvider {\n" ++
+        "  pub macro answer() -> Expr {\n" ++
+        "    quote { 1 }\n" ++
+        "  }\n" ++
+        "}\n";
+    const current_source =
+        "pub struct MacroProvider {\n" ++
+        "  pub macro answer() -> Expr {\n" ++
+        "    quote { 2 }\n" ++
+        "  }\n" ++
+        "}\n";
+
+    const previous = try testDeclarationFingerprintsFromSource(alloc, previous_source);
+    const current = try testDeclarationFingerprintsFromSource(alloc, current_source);
+
+    var dependency_graph = zap.incremental_graph.Graph.init(std.testing.allocator);
+    defer dependency_graph.deinit();
+    const current_sets = [_]?zap.incremental_graph.DeclarationFingerprintSet{current};
+    try augmentFrontendGraphWithDeclarationFingerprints(&dependency_graph, &current_sets);
+
+    var selection = try zap.incremental_graph.selectChangedDeclarationRoots(
+        std.testing.allocator,
+        &dependency_graph,
+        previous,
+        current,
+    );
+    defer selection.deinit(std.testing.allocator);
+
+    try std.testing.expect(selection.isPrecise());
+    try std.testing.expectEqual(@as(usize, 1), selection.roots.len);
+    const root_key = dependency_graph.nodeKey(selection.roots[0]).?;
+    try std.testing.expectEqual(zap.incremental_graph.NodeKind.macro_provider, root_key.kind());
+    try std.testing.expectEqualStrings("answer", root_key.macro_provider.local_name);
+}
+
 test "incremental frontend declaration fingerprints group multi-clause body edits" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -8845,6 +9431,20 @@ fn expectCtfeBool(
 
     try std.testing.expect(value == .bool_val);
     try std.testing.expectEqual(expected, value.bool_val);
+}
+
+fn expectCtfeInt(
+    alloc: std.mem.Allocator,
+    program: ir.Program,
+    function_name: []const u8,
+    expected: i64,
+) !void {
+    var interpreter = zap.ctfe.Interpreter.init(alloc, &program);
+    defer interpreter.deinit();
+    const value = try interpreter.evalByName(function_name, &.{});
+
+    try std.testing.expect(value == .int);
+    try std.testing.expectEqual(expected, value.int);
 }
 
 /// Runs the pre-drop ARC ownership pipeline. Semantic/correctness passes always

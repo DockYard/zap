@@ -8116,7 +8116,19 @@ pub const TypeChecker = struct {
                     }
                     if (t == .tuple) {
                         const field_name = self.interner.get(fa.field);
-                        const tuple_index = std.fmt.parseUnsigned(u32, field_name, 10) catch return TypeStore.UNKNOWN;
+                        const tuple_index = std.fmt.parseUnsigned(u32, field_name, 10) catch {
+                            try self.addHardError(
+                                try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "tuple field access requires a numeric index, got `{s}`",
+                                    .{field_name},
+                                ),
+                                fa.meta.span,
+                                "tuple fields are positional",
+                                "use a numeric tuple index like `.0`, or call a function with `Struct.function(value, ...)`",
+                            );
+                            return TypeStore.UNKNOWN;
+                        };
                         if (tuple_index < t.tuple.elements.len) {
                             return t.tuple.elements[tuple_index];
                         }

@@ -112,22 +112,22 @@ pub struct TupleTest {
   }
 
   describe("tuple patterns with atom literals") {
-    test("match :ok atom in tuple") {
-      assert(extract_ok({:ok, 42}) == 42)
+    test("match :ready atom in tuple") {
+      assert(extract_ready({:ready, 42}) == 42)
     }
 
     test("non-matching atom falls through to wildcard") {
-      assert(extract_ok({:error, 0}) == 0 - 1)
+      assert(extract_ready({:waiting, 0}) == 0 - 1)
     }
 
     test("unknown atom falls through to wildcard") {
-      assert(extract_ok({:unknown, 99}) == 0 - 1)
+      assert(extract_ready({:unknown, 99}) == 0 - 1)
     }
   }
 
-  fn extract_ok(t :: {Atom, i64}) -> i64 {
+  fn extract_ready(t :: {Atom, i64}) -> i64 {
     case t {
-      {:ok, v} -> v
+      {:ready, value} -> value
       {_, _} -> 0 - 1
     }
   }

@@ -2601,6 +2601,8 @@ pub const HirBuilder = struct {
     pub const Error = struct {
         message: []const u8,
         span: ast.SourceSpan,
+        label: ?[]const u8 = null,
+        help: ?[]const u8 = null,
     };
 
     pub fn init(
@@ -2661,6 +2663,32 @@ pub const HirBuilder = struct {
         self.expected_type_stack.deinit(self.allocator);
         self.alias_resolution_stack.deinit(self.allocator);
         self.errors.deinit(self.allocator);
+    }
+
+    fn addTupleFieldNameError(self: *HirBuilder, field: ast.StringId, span: ast.SourceSpan) !void {
+        const field_name = self.interner.get(field);
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "tuple field access requires a numeric index, got `{s}`",
+                .{field_name},
+            ),
+            .span = span,
+            .label = "tuple fields are positional",
+            .help = "use a numeric tuple index like `.0`, or call a function with `Struct.function(value, ...)`",
+        });
+    }
+
+    fn addTupleIndexOutOfBoundsError(self: *HirBuilder, index: u32, arity: usize, span: ast.SourceSpan) !void {
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "tuple index {d} is out of bounds for arity {d}",
+                .{ index, arity },
+            ),
+            .span = span,
+            .label = "tuple index out of bounds",
+        });
     }
 
     fn isNativeTypeName(self: *const HirBuilder, kind: scope_mod.NativeTypeKind, name: ast.StringId) bool {
@@ -5360,17 +5388,18 @@ pub const HirBuilder = struct {
                         return try self.buildTypeValueExpr(v.name, v.meta.span);
                     }
                 }
-                // Last-resort fallback when a var_ref didn't resolve to a
-                // capture, parameter, named function, or scope-graph binding.
-                // Reaching here typically means the type checker accepted a
-                // reference that the HIR build path can't ground (e.g. a
-                // synthetic helper's parameter not yet in scope). Emit a
-                // local_get of slot 0 so downstream code has *something*; the
-                // backend will surface any genuine miss as a Zig compile error
-                // rather than a silent runtime read of a wrong value.
+                try self.errors.append(self.allocator, .{
+                    .message = try std.fmt.allocPrint(
+                        self.allocator,
+                        "I cannot find a variable named `{s}`",
+                        .{name_text},
+                    ),
+                    .span = v.meta.span,
+                    .label = "not found in this scope",
+                });
                 return try self.create(Expr, .{
-                    .kind = .{ .local_get = 0 },
-                    .type_id = resolved_type,
+                    .kind = .nil_lit,
+                    .type_id = types_mod.TypeStore.UNKNOWN,
                     .span = v.meta.span,
                 });
             },
@@ -6497,11 +6526,9 @@ pub const HirBuilder = struct {
                     if (object_type == .tuple) {
                         const field_name = self.interner.get(fa.field);
                         const tuple_index = std.fmt.parseUnsigned(u32, field_name, 10) catch {
+                            try self.addTupleFieldNameError(fa.field, fa.meta.span);
                             return try self.create(Expr, .{
-                                .kind = .{ .field_get = .{
-                                    .object = object,
-                                    .field = fa.field,
-                                } },
+                                .kind = .nil_lit,
                                 .type_id = types_mod.TypeStore.UNKNOWN,
                                 .span = fa.meta.span,
                             });
@@ -6516,6 +6543,12 @@ pub const HirBuilder = struct {
                                 .span = fa.meta.span,
                             });
                         }
+                        try self.addTupleIndexOutOfBoundsError(tuple_index, object_type.tuple.elements.len, fa.meta.span);
+                        return try self.create(Expr, .{
+                            .kind = .nil_lit,
+                            .type_id = types_mod.TypeStore.UNKNOWN,
+                            .span = fa.meta.span,
+                        });
                     }
                 }
                 const field_type = self.fieldAccessResultType(object.type_id, fa.field);

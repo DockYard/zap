@@ -23,7 +23,7 @@ pub struct Simd {
     Zig's SIMD runtime bridge.
     """
 
-  pub macro vector(lanes :: Integer, lane_type :: Type, tuple_expression :: Expr) -> Expr {
+  pub macro vector(lanes :: Integer, lane_type :: Type, tuple_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     vector_type = type_tuple(lane_type, lanes)
     typed_tuple = type_annotate(tuple_expression, vector_type)
     raw_call = quote {
@@ -31,11 +31,7 @@ pub struct Simd {
     }
     typed_call = type_annotate(raw_call, vector_type)
 
-    if lanes in [2, 3, 4, 8, 16] {
-      quote { unquote(typed_call) }
-    } else {
-      quote { :zig.Simd.unsupported_shape() }
-    }
+    quote { unquote(typed_call) }
   }
 
   @doc = """
@@ -45,122 +41,110 @@ pub struct Simd {
     `{i32, i32, i32, i32}` tuple.
     """
 
-  pub macro splat(lanes :: Integer, _lane_type :: Type, _scalar_expression :: Expr) -> Expr if lanes not in [2, 3, 4, 8, 16] {
-    quote { :zig.Simd.unsupported_shape() }
-  }
-
-  pub macro splat(lanes :: Integer, i8, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, i8, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_i8(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, i8, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, i16, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, i16, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_i16(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, i16, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, i32, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, i32, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_i32(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, i32, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, i64, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, i64, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_i64(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, i64, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, i128, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, i128, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_i128(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, i128, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, u8, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, u8, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_u8(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, u8, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, u16, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, u16, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_u16(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, u16, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, u32, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, u32, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_u32(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, u32, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, u64, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, u64, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_u64(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, u64, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, u128, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, u128, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_u128(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, u128, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, usize, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, usize, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_usize(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, usize, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, isize, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, isize, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_isize(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, isize, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, f16, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, f16, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_f16(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, f16, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, f32, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, f32, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_f32(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, f32, raw_call)
   }
 
-  pub macro splat(lanes :: Integer, f64, scalar_expression :: Expr) -> Expr {
+  pub macro splat(lanes :: Integer, f64, scalar_expression :: Expr) -> Expr if lanes in [2, 3, 4, 8, 16] {
     raw_call = quote { :zig.Simd.splat_f64(unquote(lanes), unquote(scalar_expression)) }
 
     Simd.typed_vector_call(quote { unquote(lanes) }, f64, raw_call)
-  }
-
-  pub macro splat(_lanes :: Integer, _lane_type :: Type, _scalar_expression :: Expr) -> Expr {
-    quote { :zig.Simd.unsupported_shape() }
   }
 
   @doc = """
     Reduces a lane tuple with `:add`, `:min`, or `:max`.
     """
 
-  pub macro reduce(operation :: Atom, value :: Expr) -> Expr {
-    if operation == :add {
-      quote { Simd.reduce_add(unquote(value)) }
-    } else {
-      if operation == :min {
-        quote { Simd.reduce_min(unquote(value)) }
-      } else {
-        if operation == :max {
-          quote { Simd.reduce_max(unquote(value)) }
-        } else {
-          quote { :zig.Simd.unsupported_shape() }
-        }
-      }
-    }
+  pub macro reduce(:add, value :: Expr) -> Expr {
+    quote { Simd.reduce_add(unquote(value)) }
+  }
+
+  pub macro reduce(:min, value :: Expr) -> Expr {
+    quote { Simd.reduce_min(unquote(value)) }
+  }
+
+  pub macro reduce(:max, value :: Expr) -> Expr {
+    quote { Simd.reduce_max(unquote(value)) }
   }
 
   @doc = """
