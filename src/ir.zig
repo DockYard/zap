@@ -3524,6 +3524,80 @@ pub fn forEachChildStream(
     }
 }
 
+/// Like `forEachChildStream`, but passes each child sub-stream's
+/// canonical `ChildStreamSlot` (`kind` + arm/case `index`) alongside
+/// the stream. Consumers that need to RECORD a navigable coordinate
+/// for a nested position (e.g. perceus construction/deconstruction
+/// discovery building `StreamStep` paths) use this so they never
+/// hand-maintain the slot mapping — which is exactly how
+/// `union_switch.else_instrs` came to be skipped (audit
+/// perceus-region--02 / the S1 desync class). Yields slots in the
+/// same canonical order as `forEachChildStream`.
+pub fn forEachChildStreamWithSlot(
+    instr: *const Instruction,
+    context: anytype,
+    comptime visitFn: fn (ctx: @TypeOf(context), slot: ChildStreamSlot, stream: []const Instruction) void,
+) void {
+    const Adapter = struct {
+        ctx: @TypeOf(context),
+        // A per-kind running index reproduces the arm/case index for
+        // the multi-instance slot kinds. `forEachChildStream` visits
+        // arms/cases in slice order, so the n-th visit of a given kind
+        // is index n — the same index `escape_lattice.ChildSlot`
+        // records.
+        case_arm_cond_idx: u32 = 0,
+        case_arm_body_idx: u32 = 0,
+        switch_lit_case_idx: u32 = 0,
+        switch_ret_case_idx: u32 = 0,
+        union_switch_case_idx: u32 = 0,
+        union_switch_ret_case_idx: u32 = 0,
+
+        fn onStream(self: *@This(), child: ChildStream) void {
+            const index: u32 = switch (child.kind) {
+                .case_arm_cond => blk: {
+                    const i = self.case_arm_cond_idx;
+                    self.case_arm_cond_idx += 1;
+                    break :blk i;
+                },
+                .case_arm_body => blk: {
+                    const i = self.case_arm_body_idx;
+                    self.case_arm_body_idx += 1;
+                    break :blk i;
+                },
+                .switch_lit_case => blk: {
+                    const i = self.switch_lit_case_idx;
+                    self.switch_lit_case_idx += 1;
+                    break :blk i;
+                },
+                .switch_ret_case => blk: {
+                    const i = self.switch_ret_case_idx;
+                    self.switch_ret_case_idx += 1;
+                    break :blk i;
+                },
+                .union_switch_case => blk: {
+                    const i = self.union_switch_case_idx;
+                    self.union_switch_case_idx += 1;
+                    break :blk i;
+                },
+                .union_switch_ret_case => blk: {
+                    const i = self.union_switch_ret_case_idx;
+                    self.union_switch_ret_case_idx += 1;
+                    break :blk i;
+                },
+                else => 0,
+            };
+            visitFn(self.ctx, .{ .kind = child.kind, .index = index }, child.stream);
+        }
+    };
+    var adapter = Adapter{ .ctx = context };
+    forEachChildStream(instr, &adapter, Adapter.onStream);
+}
+
+/// Map a canonical `ChildStreamSlot` back to the analysis-side
+/// `escape_lattice.ChildSlot`... declared in `escape_lattice` to avoid
+/// a circular import (`escape_lattice` imports `ir`, not vice versa).
+/// See `escape_lattice.ChildSlot.toStreamSlot` for the forward map.
+
 /// Compile-time guarantee that `forEachChildStream` yields every
 /// `Instruction` variant that carries a nested `[]const Instruction`
 /// sub-stream. Walks every union payload type via `@typeInfo`; if a
@@ -3810,6 +3884,309 @@ fn forEachInstructionChildren(
         }
     };
     forEachChildStream(instr, Adapter{ .ctx = context }, Adapter.onStream);
+}
+
+// ============================================================
+// Qualified instruction coordinates (P1J3, audit findings
+// arc-param--01 / perceus-region--02)
+// ============================================================
+//
+// An instruction's *position* in a function — its `(block, path,
+// instr_index)` coordinate — is NOT stable across the analysis →
+// ownership-rewrite → drop-insertion → materialization pipeline.
+// Count-mutating passes (`rewriteOwnedConsumeSites`,
+// `insertScopeExitDrops`) insert and delete instructions, and
+// contification splits blocks and splices in callee bodies, so a
+// bare `instr_index` recorded by one stage points at a different
+// instruction by the time a later stage consumes it.
+//
+// Two failure modes recur across the codebase and are addressed
+// here with one shared facility:
+//
+//   1. A nested-stream index conflated with a top-level index.
+//      A coordinate whose `path` descends into a `case_block` arm
+//      carries an `instr_index` that is local to that arm's stream,
+//      NOT the enclosing block. Indexing the top-level block with it
+//      (as `perceus.zig`'s Phase-2 discovery did) grabs the wrong
+//      instruction whenever the nested index happens to be in range.
+//      `instructionAtPath` always navigates `path` from the
+//      top-level stream before applying `instr_index` to the
+//      innermost stream, so the two index spaces can never be
+//      conflated.
+//
+//   2. A coordinate gone stale because the stream was mutated
+//      between capture and use. `InstructionIdentity` records a
+//      mutation-resistant fingerprint (instruction tag + primary
+//      defined local) of the instruction a coordinate was meant to
+//      address. A consumer re-resolves the coordinate to a live
+//      instruction and compares fingerprints; on mismatch it refuses
+//      to act on the coordinate (rather than silently misplacing an
+//      operation at a shifted position) and a debug assertion fires
+//      so the drift surfaces loudly.
+//
+// `escape_lattice.zig` (which imports `ir`, not vice versa) maps its
+// stored `StreamStep`/`ChildSlot` records onto these `ir`-owned
+// types via `streamSlotForChildSlot`. Keeping the navigation logic
+// here lets every coordinate consumer — `arc_materialize`, perceus,
+// and the lambda-set/call-site machinery — share one resolver
+// instead of re-deriving stream descent by hand.
+
+/// One child sub-stream of a parent instruction, addressed by its
+/// canonical `ChildStreamKind` plus, for the multi-instance kinds
+/// (case arms, switch/union cases), the index within the parent's
+/// `arms`/`cases` slice. `index` is unused (0) for single-instance
+/// kinds such as `if_then`, `case_pre`, or `optional_dispatch_nil`.
+pub const ChildStreamSlot = struct {
+    kind: ChildStreamKind,
+    index: u32 = 0,
+
+    pub fn eql(a: ChildStreamSlot, b: ChildStreamSlot) bool {
+        return a.kind == b.kind and a.index == b.index;
+    }
+};
+
+/// One descent step toward a nested instruction stream: the index of
+/// the parent instruction within the *current* stream, and which of
+/// its child sub-streams to enter. Mirrors `escape_lattice.StreamStep`
+/// but is owned by `ir` so the navigation primitives below carry no
+/// dependency on `escape_lattice`.
+pub const StreamPathStep = struct {
+    parent_instr_index: u32,
+    slot: ChildStreamSlot,
+};
+
+/// Return the child sub-stream of `parent` identified by `slot`, or
+/// `null` if `parent` does not host that slot (wrong instruction tag,
+/// or an out-of-range arm/case index). The slot→stream mapping is
+/// kept in lock-step with `forEachChildStream`'s canonical set of
+/// child streams.
+pub fn childStreamAtSlot(parent: *const Instruction, slot: ChildStreamSlot) ?[]const Instruction {
+    switch (slot.kind) {
+        .if_then => return if (parent.* == .if_expr) parent.if_expr.then_instrs else null,
+        .if_else => return if (parent.* == .if_expr) parent.if_expr.else_instrs else null,
+        .case_pre => return if (parent.* == .case_block) parent.case_block.pre_instrs else null,
+        .case_arm_cond => {
+            if (parent.* != .case_block) return null;
+            const arms = parent.case_block.arms;
+            if (slot.index >= arms.len) return null;
+            return arms[slot.index].cond_instrs;
+        },
+        .case_arm_body => {
+            if (parent.* != .case_block) return null;
+            const arms = parent.case_block.arms;
+            if (slot.index >= arms.len) return null;
+            return arms[slot.index].body_instrs;
+        },
+        .case_default => return if (parent.* == .case_block) parent.case_block.default_instrs else null,
+        .switch_lit_case => {
+            if (parent.* != .switch_literal) return null;
+            const cases = parent.switch_literal.cases;
+            if (slot.index >= cases.len) return null;
+            return cases[slot.index].body_instrs;
+        },
+        .switch_lit_default => return if (parent.* == .switch_literal) parent.switch_literal.default_instrs else null,
+        .switch_ret_case => {
+            if (parent.* != .switch_return) return null;
+            const cases = parent.switch_return.cases;
+            if (slot.index >= cases.len) return null;
+            return cases[slot.index].body_instrs;
+        },
+        .switch_ret_default => return if (parent.* == .switch_return) parent.switch_return.default_instrs else null,
+        .union_switch_case => {
+            if (parent.* != .union_switch) return null;
+            const cases = parent.union_switch.cases;
+            if (slot.index >= cases.len) return null;
+            return cases[slot.index].body_instrs;
+        },
+        .union_switch_else => {
+            if (parent.* != .union_switch) return null;
+            if (!parent.union_switch.has_else) return null;
+            return parent.union_switch.else_instrs;
+        },
+        .union_switch_ret_case => {
+            if (parent.* != .union_switch_return) return null;
+            const cases = parent.union_switch_return.cases;
+            if (slot.index >= cases.len) return null;
+            return cases[slot.index].body_instrs;
+        },
+        .try_handler => return if (parent.* == .try_call_named) parent.try_call_named.handler_instrs else null,
+        .try_success => return if (parent.* == .try_call_named) parent.try_call_named.success_instrs else null,
+        .guard_body => return if (parent.* == .guard_block) parent.guard_block.body else null,
+        .optional_dispatch_nil => return if (parent.* == .optional_dispatch) parent.optional_dispatch.nil_instrs else null,
+        .optional_dispatch_struct => return if (parent.* == .optional_dispatch) parent.optional_dispatch.struct_instrs else null,
+    }
+}
+
+/// Navigate `path` from `top_stream` (a top-level block's instruction
+/// slice) to the innermost nested stream it addresses. Returns `null`
+/// if any step is out of range or names a slot the parent instruction
+/// does not host — i.e. the path does not match the current IR shape.
+/// An empty `path` returns `top_stream` unchanged.
+///
+/// This is the single correct way to resolve a `(path, instr_index)`
+/// coordinate: callers MUST walk `path` here and only then index the
+/// returned stream with `instr_index`. Comparing `instr_index`
+/// against `top_stream.len` (the nested-vs-top-level conflation of
+/// audit finding perceus-region--02) is always wrong for a non-empty
+/// path.
+pub fn streamAtPath(top_stream: []const Instruction, path: []const StreamPathStep) ?[]const Instruction {
+    var stream = top_stream;
+    for (path) |step| {
+        if (step.parent_instr_index >= stream.len) return null;
+        const parent = &stream[step.parent_instr_index];
+        stream = childStreamAtSlot(parent, step.slot) orelse return null;
+    }
+    return stream;
+}
+
+/// Resolve a full `(path, instr_index)` coordinate to the instruction
+/// it addresses, navigating `path` from `top_stream` first. Returns
+/// `null` if the path does not match the IR shape or `instr_index` is
+/// out of range in the innermost stream.
+pub fn instructionAtPath(
+    top_stream: []const Instruction,
+    path: []const StreamPathStep,
+    instr_index: u32,
+) ?*const Instruction {
+    const stream = streamAtPath(top_stream, path) orelse return null;
+    if (instr_index >= stream.len) return null;
+    return &stream[instr_index];
+}
+
+/// The primary local an instruction defines (its `dest`, or the bound
+/// destination of a `jump`/`optional_dispatch`), or `null` for
+/// instructions that define no local (`ret`, `field_set`, `release`,
+/// terminators, …). Used as the mutation-resistant component of
+/// `InstructionIdentity`: the ownership-rewrite and drop-insertion
+/// passes that run between coordinate capture and consumption rebuild
+/// instruction *slices* but never renumber the dest local of a
+/// surviving instruction, so a tag+dest fingerprint pins the intended
+/// anchor even as its stream position shifts.
+pub fn primaryDefinedLocal(instr: *const Instruction) ?LocalId {
+    return switch (instr.*) {
+        .const_int => |x| x.dest,
+        .const_float => |x| x.dest,
+        .const_string => |x| x.dest,
+        .const_bool => |x| x.dest,
+        .const_atom => |x| x.dest,
+        .const_nil => |dest| dest,
+        .local_get => |x| x.dest,
+        .local_set => |x| x.dest,
+        .move_value => |x| x.dest,
+        .share_value => |x| x.dest,
+        .param_get => |x| x.dest,
+        .borrow_value => |x| x.dest,
+        .copy_value => |x| x.dest,
+        .tuple_init => |x| x.dest,
+        .list_init => |x| x.dest,
+        .list_cons => |x| x.dest,
+        .map_init => |x| x.dest,
+        .struct_init => |x| x.dest,
+        .union_init => |x| x.dest,
+        .box_as_protocol => |x| x.dest,
+        .protocol_dispatch => |x| x.dest,
+        .protocol_box_unbox => |x| x.dest,
+        .protocol_box_vtable_eq => |x| x.dest,
+        .enum_literal => |x| x.dest,
+        .field_get => |x| x.dest,
+        .index_get => |x| x.dest,
+        .list_len_check => |x| x.dest,
+        .list_get => |x| x.dest,
+        .list_is_not_empty => |x| x.dest,
+        .list_head => |x| x.dest,
+        .list_tail => |x| x.dest,
+        .map_has_key => |x| x.dest,
+        .map_get => |x| x.dest,
+        .binary_op => |x| x.dest,
+        .unary_op => |x| x.dest,
+        .call_direct => |x| x.dest,
+        .call_named => |x| x.dest,
+        .call_closure => |x| x.dest,
+        .call_dispatch => |x| x.dest,
+        .call_builtin => |x| x.dest,
+        .try_call_named => |x| x.dest,
+        .error_catch => |x| x.dest,
+        .unwrap_error_union => |x| x.dest,
+        .if_expr => |x| x.dest,
+        .case_block => |x| x.dest,
+        .switch_literal => |x| x.dest,
+        .union_switch => |x| x.dest,
+        .match_atom => |x| x.dest,
+        .match_variant_tag => |x| x.dest,
+        .variant_payload_get => |x| x.dest,
+        .match_int => |x| x.dest,
+        .match_float => |x| x.dest,
+        .match_string => |x| x.dest,
+        .match_type => |x| x.dest,
+        .make_closure => |x| x.dest,
+        .capture_get => |x| x.dest,
+        .optional_unwrap => |x| x.dest,
+        .bin_len_check => |x| x.dest,
+        .bin_read_float => |x| x.dest,
+        .bin_slice => |x| x.dest,
+        .bin_match_prefix => |x| x.dest,
+        .int_widen => |x| x.dest,
+        .float_widen => |x| x.dest,
+        .typed_undef => |x| x.dest,
+        .phi => |x| x.dest,
+        .reset => |x| x.dest,
+        .reuse_alloc => |x| x.dest,
+        .optional_dispatch => |x| x.payload_local,
+        .jump => |x| x.bind_dest,
+        // No single primary dest (defines two locals, or none).
+        .bin_read_int,
+        .bin_read_utf8,
+        .tail_call,
+        .ret,
+        .field_set,
+        .set_safety,
+        .guard_block,
+        .branch,
+        .cond_branch,
+        .switch_tag,
+        .switch_return,
+        .union_switch_return,
+        .match_fail,
+        .match_error_return,
+        .ret_raise,
+        .cond_return,
+        .case_break,
+        .retain,
+        .release,
+        .dbg_stmt,
+        .dbg_var,
+        => null,
+    };
+}
+
+/// A mutation-resistant fingerprint of an instruction, used to verify
+/// that a captured `(block, path, instr_index)` coordinate still
+/// addresses the instruction it was recorded against after
+/// intervening passes reshaped the stream. Two instructions with the
+/// same `tag` and the same `anchor_local` are treated as the same
+/// anchor; a differing fingerprint means the coordinate drifted and
+/// must not be acted upon.
+pub const InstructionIdentity = struct {
+    tag: std.meta.Tag(Instruction),
+    /// `primaryDefinedLocal` of the instruction at capture time, or
+    /// `null` if it defines no local. Stable across the count-mutating
+    /// ARC passes that run between capture and consumption.
+    anchor_local: ?LocalId,
+
+    pub fn eql(a: InstructionIdentity, b: InstructionIdentity) bool {
+        if (a.tag != b.tag) return false;
+        if (a.anchor_local == null and b.anchor_local == null) return true;
+        if (a.anchor_local == null or b.anchor_local == null) return false;
+        return a.anchor_local.? == b.anchor_local.?;
+    }
+};
+
+/// Capture the `InstructionIdentity` of `instr`.
+pub fn fingerprintInstruction(instr: *const Instruction) InstructionIdentity {
+    return .{
+        .tag = std.meta.activeTag(instr.*),
+        .anchor_local = primaryDefinedLocal(instr),
+    };
 }
 
 // ============================================================
@@ -19452,4 +19829,152 @@ test "countInstructionRecords counts every instruction including the union_switc
     var counter = Counter{};
     forEachInstruction(&function, &counter, Counter.visit);
     try std.testing.expectEqual(@as(usize, 6), counter.count);
+}
+
+// ============================================================
+// Qualified instruction coordinate regression tests
+// (P1J3, audit findings arc-param--01 / perceus-region--02).
+// ============================================================
+
+test "streamAtPath navigates into a case_block arm body rather than the top-level block" {
+    // Top-level block: [const_nil(2), case_block{arm0 body = [const_nil(20),
+    // tuple_init], default = [...]}]. The deconstruction's coordinate is
+    // path=[{parent=1, case_arm_body 0}], instr_index=1 — addressing the
+    // tuple_init INSIDE arm 0, whose stream-local index (1) is < the
+    // top-level block length (2). A consumer that indexed the top-level
+    // block with instr_index=1 (the perceus-region--02 bug) would grab the
+    // case_block itself; the path-walking resolver must reach the arm body.
+    const arm0_body = [_]Instruction{
+        .{ .const_nil = 20 },
+        .{ .tuple_init = .{ .dest = 21, .elements = &.{} } },
+    };
+    const default_body = [_]Instruction{.{ .const_nil = 30 }};
+    const arms = [_]IrCaseArm{
+        .{ .cond_instrs = &.{}, .condition = 0, .body_instrs = &arm0_body, .result = null },
+    };
+    const block_instrs = [_]Instruction{
+        .{ .const_nil = 2 },
+        .{ .case_block = .{
+            .dest = 0,
+            .pre_instrs = &.{},
+            .arms = &arms,
+            .default_instrs = &default_body,
+            .default_result = null,
+        } },
+    };
+
+    const path = [_]StreamPathStep{
+        .{ .parent_instr_index = 1, .slot = .{ .kind = .case_arm_body, .index = 0 } },
+    };
+
+    const inner = streamAtPath(&block_instrs, &path) orelse return error.PathDidNotResolve;
+    try std.testing.expectEqual(@as(usize, 2), inner.len);
+
+    const resolved = instructionAtPath(&block_instrs, &path, 1) orelse return error.InstrDidNotResolve;
+    try std.testing.expect(resolved.* == .tuple_init);
+    try std.testing.expectEqual(@as(LocalId, 21), resolved.tuple_init.dest);
+}
+
+test "instructionAtPath rejects an out-of-range nested index instead of mis-indexing the top-level block" {
+    // The nested arm body has length 1, but the recorded instr_index is 5.
+    // The resolver must return null (coordinate does not match the IR
+    // shape), NOT silently fall back to the top-level block.
+    const arm0_body = [_]Instruction{.{ .const_nil = 20 }};
+    const arms = [_]IrCaseArm{
+        .{ .cond_instrs = &.{}, .condition = 0, .body_instrs = &arm0_body, .result = null },
+    };
+    const block_instrs = [_]Instruction{
+        .{ .const_nil = 2 },
+        .{ .case_block = .{
+            .dest = 0,
+            .pre_instrs = &.{},
+            .arms = &arms,
+            .default_instrs = &.{},
+            .default_result = null,
+        } },
+    };
+    const path = [_]StreamPathStep{
+        .{ .parent_instr_index = 1, .slot = .{ .kind = .case_arm_body, .index = 0 } },
+    };
+    try std.testing.expect(instructionAtPath(&block_instrs, &path, 5) == null);
+}
+
+test "childStreamAtSlot resolves union_switch.else_instrs only when has_else" {
+    const case0_body = [_]Instruction{.{ .const_nil = 10 }};
+    const else_body = [_]Instruction{ .{ .const_nil = 11 }, .{ .const_nil = 12 } };
+    const cases = [_]UnionCase{
+        .{ .variant_name = "A", .field_bindings = &.{}, .body_instrs = &case0_body, .return_value = null },
+    };
+    const with_else = Instruction{ .union_switch = .{
+        .dest = 0,
+        .scrutinee = 1,
+        .cases = &cases,
+        .else_instrs = &else_body,
+        .else_result = null,
+        .has_else = true,
+    } };
+    const else_stream = childStreamAtSlot(&with_else, .{ .kind = .union_switch_else }) orelse
+        return error.ElseDidNotResolve;
+    try std.testing.expectEqual(@as(usize, 2), else_stream.len);
+    // case 0 resolves; case 1 (out of range) does not.
+    try std.testing.expect(childStreamAtSlot(&with_else, .{ .kind = .union_switch_case, .index = 0 }) != null);
+    try std.testing.expect(childStreamAtSlot(&with_else, .{ .kind = .union_switch_case, .index = 1 }) == null);
+
+    const without_else = Instruction{ .union_switch = .{
+        .dest = 0,
+        .scrutinee = 1,
+        .cases = &cases,
+        .else_instrs = &.{},
+        .else_result = null,
+        .has_else = false,
+    } };
+    // No else prong when has_else is false — the slot must not resolve.
+    try std.testing.expect(childStreamAtSlot(&without_else, .{ .kind = .union_switch_else }) == null);
+}
+
+test "InstructionIdentity survives a stream mutation between coordinate capture and resolution" {
+    // Capture a coordinate (instr_index) and the fingerprint of the
+    // instruction it addresses. Then mutate the stream — insert two
+    // instructions BEFORE it, exactly as insertScopeExitDrops /
+    // rewriteOwnedConsumeSites do — shifting its position. Re-resolving the
+    // ORIGINAL instr_index now lands on a different instruction (the bare
+    // coordinate is stale), and the fingerprint comparison detects the
+    // drift. Re-resolving the SHIFTED position matches the fingerprint.
+    const original = [_]Instruction{
+        .{ .const_nil = 1 },
+        .{ .tuple_init = .{ .dest = 42, .elements = &.{} } },
+    };
+    const captured_index: u32 = 1;
+    const captured_identity = fingerprintInstruction(&original[captured_index]);
+    try std.testing.expectEqual(std.meta.Tag(Instruction).tuple_init, captured_identity.tag);
+    try std.testing.expectEqual(@as(?LocalId, 42), captured_identity.anchor_local);
+
+    // Mutate: two fresh releases inserted at the front (count-mutating
+    // pass), pushing the tuple_init from index 1 to index 3.
+    const mutated = [_]Instruction{
+        .{ .release = .{ .value = 7 } },
+        .{ .release = .{ .value = 8 } },
+        .{ .const_nil = 1 },
+        .{ .tuple_init = .{ .dest = 42, .elements = &.{} } },
+    };
+
+    // The stale bare coordinate now points at a DIFFERENT instruction;
+    // fingerprint comparison must flag the mismatch.
+    const at_stale = instructionAtPath(&mutated, &.{}, captured_index) orelse return error.StaleDidNotResolve;
+    try std.testing.expect(!captured_identity.eql(fingerprintInstruction(at_stale)));
+
+    // The corrected position matches the captured identity.
+    const at_correct = instructionAtPath(&mutated, &.{}, 3) orelse return error.CorrectDidNotResolve;
+    try std.testing.expect(captured_identity.eql(fingerprintInstruction(at_correct)));
+}
+
+test "primaryDefinedLocal extracts dest for defining instructions and null for terminators" {
+    const ti = Instruction{ .tuple_init = .{ .dest = 9, .elements = &.{} } };
+    try std.testing.expectEqual(@as(?LocalId, 9), primaryDefinedLocal(&ti));
+
+    const rel = Instruction{ .release = .{ .value = 5 } };
+    try std.testing.expectEqual(@as(?LocalId, null), primaryDefinedLocal(&rel));
+
+    const r = Instruction{ .ret = .{ .value = 3 } };
+    try std.testing.expectEqual(@as(?LocalId, null), primaryDefinedLocal(&r));
 }

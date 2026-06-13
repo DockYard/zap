@@ -65,7 +65,29 @@ pub const StreamStep = struct {
     parent_instr_index: u32,
     /// Which nested stream of the parent instruction to enter.
     child: ChildSlot,
+
+    /// Project onto the `ir`-owned `StreamPathStep` consumed by the
+    /// shared coordinate resolver.
+    pub fn toStreamPathStep(self: StreamStep) ir.StreamPathStep {
+        return .{
+            .parent_instr_index = self.parent_instr_index,
+            .slot = self.child.toStreamSlot(),
+        };
+    }
 };
+
+/// Convert a stored `[]const StreamStep` coordinate path into the
+/// `ir`-owned `[]ir.StreamPathStep` the shared resolver
+/// (`ir.streamAtPath` / `ir.instructionAtPath`) consumes. The returned
+/// slice is allocated with `allocator` and owned by the caller.
+pub fn toStreamPath(
+    allocator: std.mem.Allocator,
+    path: []const StreamStep,
+) ![]ir.StreamPathStep {
+    const out = try allocator.alloc(ir.StreamPathStep, path.len);
+    for (path, 0..) |step, i| out[i] = step.toStreamPathStep();
+    return out;
+}
 
 /// Which child stream of an instruction with nested streams. Each
 /// constructor is the IR-side parallel of a recursion case in
@@ -82,12 +104,72 @@ pub const ChildSlot = union(enum) {
     switch_return_case: u32, // case index within `switch_return.cases`
     switch_return_default,
     union_switch_case: u32, // case index within `union_switch.cases`
+    /// `union_switch.else_instrs` — the catch-all `_` prong. Present
+    /// only when `has_else` is set. Yielded after all `cases`,
+    /// matching `ir.forEachChildStream`'s canonical order.
+    union_switch_else,
     union_switch_return_case: u32, // case index within `union_switch_return.cases`
     try_call_named_success,
     try_call_named_handler,
     guard_block_body,
     optional_dispatch_nil,
     optional_dispatch_struct,
+
+    /// Project onto the `ir`-owned `ChildStreamSlot` used by the shared
+    /// coordinate resolver (`ir.streamAtPath` / `ir.instructionAtPath`).
+    /// The two enumerations are kept in lock-step; this is the single
+    /// crossing point from the analysis-side `ChildSlot` to `ir`'s
+    /// canonical `ChildStreamKind`.
+    pub fn toStreamSlot(self: ChildSlot) ir.ChildStreamSlot {
+        return switch (self) {
+            .if_expr_then => .{ .kind = .if_then },
+            .if_expr_else => .{ .kind = .if_else },
+            .case_block_pre => .{ .kind = .case_pre },
+            .case_block_arm_cond => |idx| .{ .kind = .case_arm_cond, .index = idx },
+            .case_block_arm_body => |idx| .{ .kind = .case_arm_body, .index = idx },
+            .case_block_default => .{ .kind = .case_default },
+            .switch_literal_case => |idx| .{ .kind = .switch_lit_case, .index = idx },
+            .switch_literal_default => .{ .kind = .switch_lit_default },
+            .switch_return_case => |idx| .{ .kind = .switch_ret_case, .index = idx },
+            .switch_return_default => .{ .kind = .switch_ret_default },
+            .union_switch_case => |idx| .{ .kind = .union_switch_case, .index = idx },
+            .union_switch_else => .{ .kind = .union_switch_else },
+            .union_switch_return_case => |idx| .{ .kind = .union_switch_ret_case, .index = idx },
+            .try_call_named_success => .{ .kind = .try_success },
+            .try_call_named_handler => .{ .kind = .try_handler },
+            .guard_block_body => .{ .kind = .guard_body },
+            .optional_dispatch_nil => .{ .kind = .optional_dispatch_nil },
+            .optional_dispatch_struct => .{ .kind = .optional_dispatch_struct },
+        };
+    }
+
+    /// Inverse of `toStreamSlot`: build the analysis-side `ChildSlot`
+    /// from a canonical `ir.ChildStreamSlot`. Used by perceus discovery
+    /// to record `StreamStep` paths directly from the slots
+    /// `ir.forEachChildStreamWithSlot` yields, so the slot mapping is
+    /// never hand-maintained at the discovery sites.
+    pub fn fromStreamSlot(slot: ir.ChildStreamSlot) ChildSlot {
+        return switch (slot.kind) {
+            .if_then => .if_expr_then,
+            .if_else => .if_expr_else,
+            .case_pre => .case_block_pre,
+            .case_arm_cond => .{ .case_block_arm_cond = slot.index },
+            .case_arm_body => .{ .case_block_arm_body = slot.index },
+            .case_default => .case_block_default,
+            .switch_lit_case => .{ .switch_literal_case = slot.index },
+            .switch_lit_default => .switch_literal_default,
+            .switch_ret_case => .{ .switch_return_case = slot.index },
+            .switch_ret_default => .switch_return_default,
+            .union_switch_case => .{ .union_switch_case = slot.index },
+            .union_switch_else => .union_switch_else,
+            .union_switch_ret_case => .{ .union_switch_return_case = slot.index },
+            .try_success => .try_call_named_success,
+            .try_handler => .try_call_named_handler,
+            .guard_body => .guard_block_body,
+            .optional_dispatch_nil => .optional_dispatch_nil,
+            .optional_dispatch_struct => .optional_dispatch_struct,
+        };
+    }
 };
 
 /// Identifier for an insertion point in the IR for ARC operations.
@@ -110,6 +192,19 @@ pub const InsertionPoint = struct {
     /// Whether to insert before or after the instruction at
     /// `instr_index`.
     position: enum { before, after },
+    /// Mutation-resistant fingerprint of the *anchor* instruction this
+    /// point was recorded against (the instruction at `instr_index`
+    /// the operation inserts before/after). Captured at analysis time;
+    /// the materializer re-resolves the coordinate against the final
+    /// IR shape and refuses to act if the live instruction's
+    /// fingerprint differs — the coordinate went stale because an
+    /// intervening pass (ownership rewrite, drop insertion,
+    /// contification) reshaped the stream (audit arc-param--01).
+    /// `null` for points with no anchor instruction — an "append at
+    /// end of stream" position (`instr_index == stream.len`) — or for
+    /// records produced before identity capture was wired in (they
+    /// fall back to bounds-only checking).
+    expected_identity: ?ir.InstructionIdentity = null,
 };
 
 // ============================================================
