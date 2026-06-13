@@ -673,51 +673,28 @@ fn emitTailCallRewritabilityDiagnostic(
     );
 }
 
-/// Recurse into every nested instruction stream owned by `instr`.
+/// Recurse into every nested instruction stream owned by `instr`, via
+/// the canonical `ir.forEachChildStream` enumerator — so the verifier
+/// examines `union_switch.else_instrs` (previously skipped, leaving the
+/// catch-all arm's V1-V11 invariants silently unchecked). Audit finding
+/// arc-drop-verify--01.
 fn verifyChildren(
     ctx: *VerifyContext,
     instr: *const ir.Instruction,
 ) VerifyError!void {
-    switch (instr.*) {
-        .if_expr => |ie| {
-            try verifyStream(ctx, ie.then_instrs);
-            try verifyStream(ctx, ie.else_instrs);
-        },
-        .case_block => |cb| {
-            try verifyStream(ctx, cb.pre_instrs);
-            for (cb.arms) |arm| {
-                try verifyStream(ctx, arm.cond_instrs);
-                try verifyStream(ctx, arm.body_instrs);
-            }
-            try verifyStream(ctx, cb.default_instrs);
-        },
-        .switch_literal => |sl| {
-            for (sl.cases) |c| try verifyStream(ctx, c.body_instrs);
-            try verifyStream(ctx, sl.default_instrs);
-        },
-        .switch_return => |sr| {
-            for (sr.cases) |c| try verifyStream(ctx, c.body_instrs);
-            try verifyStream(ctx, sr.default_instrs);
-        },
-        .union_switch => |us| {
-            for (us.cases) |c| try verifyStream(ctx, c.body_instrs);
-        },
-        .union_switch_return => |usr| {
-            for (usr.cases) |c| try verifyStream(ctx, c.body_instrs);
-        },
-        .try_call_named => |tc| {
-            try verifyStream(ctx, tc.handler_instrs);
-            try verifyStream(ctx, tc.success_instrs);
-        },
-        .guard_block => |gb| {
-            try verifyStream(ctx, gb.body);
-        },
-        .optional_dispatch => |od| {
-            try verifyStream(ctx, od.nil_instrs);
-            try verifyStream(ctx, od.struct_instrs);
-        },
-        else => {},
-    }
+    const Ctx = struct {
+        ctx: *VerifyContext,
+        err: ?VerifyError = null,
+        fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
+            if (self_ctx.err != null) return;
+            verifyStream(self_ctx.ctx, child.stream) catch |e| {
+                self_ctx.err = e;
+            };
+        }
+    };
+    var local = Ctx{ .ctx = ctx };
+    ir.forEachChildStream(instr, &local, Ctx.onStream);
+    if (local.err) |e| return e;
 }
 
 /// Look up `local_id`'s ownership class. Returns `.trivial` for
@@ -1196,50 +1173,29 @@ const UniquenessCheckWalker = struct {
         }
     }
 
+    /// Recurse into every child stream via the canonical enumerator so
+    /// the InstructionId numbering matches the uniqueness analyzer
+    /// (including `union_switch.else_instrs`, previously skipped — which
+    /// both desynced the id space feeding `isUnique(my_id)` and left
+    /// unchecked-mutation sites inside the catch-all unverified). Audit
+    /// finding uniqueness--01 / arc-drop-verify--01.
     fn walkChildren(
         self: *UniquenessCheckWalker,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                try self.walkStream(ie.then_instrs);
-                try self.walkStream(ie.else_instrs);
-            },
-            .case_block => |cb| {
-                try self.walkStream(cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    try self.walkStream(arm.cond_instrs);
-                    try self.walkStream(arm.body_instrs);
-                }
-                try self.walkStream(cb.default_instrs);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sr.default_instrs);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .try_call_named => |tcn| {
-                try self.walkStream(tcn.handler_instrs);
-                try self.walkStream(tcn.success_instrs);
-            },
-            .guard_block => |gb| {
-                try self.walkStream(gb.body);
-            },
-            .optional_dispatch => |od| {
-                try self.walkStream(od.nil_instrs);
-                try self.walkStream(od.struct_instrs);
-            },
-            else => {},
-        }
+        const Ctx = struct {
+            walker: *UniquenessCheckWalker,
+            err: ?error{OutOfMemory} = null,
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                ctx.walker.walkStream(child.stream) catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .walker = self };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 
     fn checkUncheckedCallSite(
@@ -2940,51 +2896,28 @@ fn v8SeedFromStream(
     stream: []const ir.Instruction,
     resolved: *std.AutoHashMapUnmanaged(u32, ir.LocalId),
 ) error{OutOfMemory}!void {
-    for (stream) |instr| {
-        switch (instr) {
-            .param_get => |pg| {
-                const gop = try resolved.getOrPut(allocator, pg.index);
-                if (!gop.found_existing) gop.value_ptr.* = pg.dest;
-            },
-            .if_expr => |ie| {
-                try v8SeedFromStream(allocator, ie.then_instrs, resolved);
-                try v8SeedFromStream(allocator, ie.else_instrs, resolved);
-            },
-            .case_block => |cb| {
-                try v8SeedFromStream(allocator, cb.pre_instrs, resolved);
-                for (cb.arms) |arm| {
-                    try v8SeedFromStream(allocator, arm.cond_instrs, resolved);
-                    try v8SeedFromStream(allocator, arm.body_instrs, resolved);
-                }
-                try v8SeedFromStream(allocator, cb.default_instrs, resolved);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try v8SeedFromStream(allocator, c.body_instrs, resolved);
-                try v8SeedFromStream(allocator, sl.default_instrs, resolved);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try v8SeedFromStream(allocator, c.body_instrs, resolved);
-                try v8SeedFromStream(allocator, sr.default_instrs, resolved);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try v8SeedFromStream(allocator, c.body_instrs, resolved);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try v8SeedFromStream(allocator, c.body_instrs, resolved);
-            },
-            .try_call_named => |tc| {
-                try v8SeedFromStream(allocator, tc.success_instrs, resolved);
-                try v8SeedFromStream(allocator, tc.handler_instrs, resolved);
-            },
-            .guard_block => |gb| {
-                try v8SeedFromStream(allocator, gb.body, resolved);
-            },
-            .optional_dispatch => |od| {
-                try v8SeedFromStream(allocator, od.nil_instrs, resolved);
-                try v8SeedFromStream(allocator, od.struct_instrs, resolved);
-            },
-            else => {},
+    for (stream) |*instr| {
+        if (instr.* == .param_get) {
+            const pg = instr.param_get;
+            const gop = try resolved.getOrPut(allocator, pg.index);
+            if (!gop.found_existing) gop.value_ptr.* = pg.dest;
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs, previously skipped).
+        const Ctx = struct {
+            allocator: std.mem.Allocator,
+            resolved: *std.AutoHashMapUnmanaged(u32, ir.LocalId),
+            err: ?error{OutOfMemory} = null,
+            fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
+                if (self_ctx.err != null) return;
+                v8SeedFromStream(self_ctx.allocator, child.stream, self_ctx.resolved) catch |e| {
+                    self_ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .allocator = allocator, .resolved = resolved };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 }
 
@@ -3098,6 +3031,15 @@ fn v8VerifyInstruction(
                 var s = try state.copy();
                 defer s.deinit();
                 try v8VerifyStream(function, &s, c.body_instrs);
+                try state.mergeMax(&s);
+            }
+            // The catch-all `_` prong is one more forward-dataflow arm,
+            // merged into the parent state exactly like a case body.
+            // Audit finding arc-drop-verify--01.
+            if (us.has_else) {
+                var s = try state.copy();
+                defer s.deinit();
+                try v8VerifyStream(function, &s, us.else_instrs);
                 try state.mergeMax(&s);
             }
         },
@@ -3376,6 +3318,14 @@ fn v9WalkInstructionChildren(
             for (us.cases) |c| {
                 if (v9WalkStreamBackward(walker, c.body_instrs, c.body_instrs.len)) return true;
             }
+            // The catch-all `_` prong can also produce the searched-for
+            // local; without it the V9 producer search misses it. (This
+            // walker is a backward producer search whose result is
+            // order-independent — "does any producer exist".) Audit
+            // finding arc-drop-verify--01.
+            if (us.has_else) {
+                if (v9WalkStreamBackward(walker, us.else_instrs, us.else_instrs.len)) return true;
+            }
         },
         .union_switch_return => |usr| {
             for (usr.cases) |c| {
@@ -3423,49 +3373,29 @@ fn v9SeedParamGets(
     stream: []const ir.Instruction,
     resolved: *std.AutoHashMapUnmanaged(u32, ir.LocalId),
 ) error{OutOfMemory}!void {
-    for (stream) |instr| {
-        switch (instr) {
-            .param_get => |pg| {
-                const gop = try resolved.getOrPut(allocator, pg.index);
-                if (!gop.found_existing) gop.value_ptr.* = pg.dest;
-            },
-            .if_expr => |ie| {
-                try v9SeedParamGets(allocator, ie.then_instrs, resolved);
-                try v9SeedParamGets(allocator, ie.else_instrs, resolved);
-            },
-            .case_block => |cb| {
-                try v9SeedParamGets(allocator, cb.pre_instrs, resolved);
-                for (cb.arms) |arm| {
-                    try v9SeedParamGets(allocator, arm.cond_instrs, resolved);
-                    try v9SeedParamGets(allocator, arm.body_instrs, resolved);
-                }
-                try v9SeedParamGets(allocator, cb.default_instrs, resolved);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try v9SeedParamGets(allocator, c.body_instrs, resolved);
-                try v9SeedParamGets(allocator, sl.default_instrs, resolved);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try v9SeedParamGets(allocator, c.body_instrs, resolved);
-                try v9SeedParamGets(allocator, sr.default_instrs, resolved);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try v9SeedParamGets(allocator, c.body_instrs, resolved);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try v9SeedParamGets(allocator, c.body_instrs, resolved);
-            },
-            .try_call_named => |tc| {
-                try v9SeedParamGets(allocator, tc.success_instrs, resolved);
-                try v9SeedParamGets(allocator, tc.handler_instrs, resolved);
-            },
-            .guard_block => |gb| try v9SeedParamGets(allocator, gb.body, resolved),
-            .optional_dispatch => |od| {
-                try v9SeedParamGets(allocator, od.nil_instrs, resolved);
-                try v9SeedParamGets(allocator, od.struct_instrs, resolved);
-            },
-            else => {},
+    for (stream) |*instr| {
+        if (instr.* == .param_get) {
+            const pg = instr.param_get;
+            const gop = try resolved.getOrPut(allocator, pg.index);
+            if (!gop.found_existing) gop.value_ptr.* = pg.dest;
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs, previously
+        // skipped). Param collection is order-independent.
+        const Ctx = struct {
+            allocator: std.mem.Allocator,
+            resolved: *std.AutoHashMapUnmanaged(u32, ir.LocalId),
+            err: ?error{OutOfMemory} = null,
+            fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
+                if (self_ctx.err != null) return;
+                v9SeedParamGets(self_ctx.allocator, child.stream, self_ctx.resolved) catch |e| {
+                    self_ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .allocator = allocator, .resolved = resolved };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 }
 
@@ -3479,49 +3409,30 @@ fn v9CheckAllReleases(function: *const ir.Function) void {
 }
 
 fn v9CheckStream(function: *const ir.Function, stream: []const ir.Instruction) void {
-    for (stream, 0..) |instr, idx| {
-        switch (instr) {
-            .release => |r| {
-                // V1/V4 already check that .release on .borrowed
-                // locals is invalid; V9 only fires for .owned locals.
-                if (r.value < function.local_ownership.len) {
-                    if (function.local_ownership[r.value] != .owned) continue;
-                }
-                v9CheckRelease(function, stream, idx, r.value);
-            },
-            .if_expr => |ie| {
-                v9CheckStream(function, ie.then_instrs);
-                v9CheckStream(function, ie.else_instrs);
-            },
-            .case_block => |cb| {
-                v9CheckStream(function, cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    v9CheckStream(function, arm.cond_instrs);
-                    v9CheckStream(function, arm.body_instrs);
-                }
-                v9CheckStream(function, cb.default_instrs);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| v9CheckStream(function, c.body_instrs);
-                v9CheckStream(function, sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| v9CheckStream(function, c.body_instrs);
-                v9CheckStream(function, sr.default_instrs);
-            },
-            .union_switch => |us| for (us.cases) |c| v9CheckStream(function, c.body_instrs),
-            .union_switch_return => |usr| for (usr.cases) |c| v9CheckStream(function, c.body_instrs),
-            .try_call_named => |tc| {
-                v9CheckStream(function, tc.success_instrs);
-                v9CheckStream(function, tc.handler_instrs);
-            },
-            .guard_block => |gb| v9CheckStream(function, gb.body),
-            .optional_dispatch => |od| {
-                v9CheckStream(function, od.nil_instrs);
-                v9CheckStream(function, od.struct_instrs);
-            },
-            else => {},
+    for (stream, 0..) |*instr, idx| {
+        if (instr.* == .release) {
+            const r = instr.release;
+            // V1/V4 already check that .release on .borrowed locals is
+            // invalid; V9 only fires for .owned locals. A non-owned
+            // release is skipped (no producer check needed).
+            const owned = if (r.value < function.local_ownership.len)
+                function.local_ownership[r.value] == .owned
+            else
+                true;
+            if (owned) v9CheckRelease(function, stream, idx, r.value);
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs, previously
+        // skipped, leaving releases inside the catch-all's producer
+        // check unverified). Audit finding arc-drop-verify--01.
+        const Ctx = struct {
+            function: *const ir.Function,
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                v9CheckStream(self.function, child.stream);
+            }
+        };
+        var ctx = Ctx{ .function = function };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
     }
 }
 
