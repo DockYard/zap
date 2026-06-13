@@ -297,8 +297,22 @@ pub const ArcOptimizer = struct {
                 .local = op.value,
             };
 
-            // If this value can skip ARC, don't emit the operation.
-            if (self.skip_arc.contains(vkey)) {
+            // Perceus `.reset` / `.reuse_alloc` ops are STRUCTURAL: they are
+            // driven by `ctx.reuse_pairs`, which the optimizer never touches.
+            // A `.reset` op's `value` is the deconstructed scrutinee, which
+            // the region solver can independently classify stack/eliminated
+            // and place in `skip_arc`. Dropping the `.reset` here while its
+            // reuse pair survives leaves the construction's `reuse_token`
+            // with no defining `.reset` IR — materialization then emits a
+            // reuse referencing an undefined token and the backend aborts
+            // with `error.EmitFailed` (perceus-region--03). Reset/reuse and
+            // reuse_pairs must move in lockstep, so these kinds are exempt
+            // from skip-based elimination entirely.
+            const is_perceus_structural = op.kind == .reset or op.kind == .reuse_alloc;
+
+            // If this value can skip ARC, don't emit the operation —
+            // unless it is a structural Perceus op (see above).
+            if (!is_perceus_structural and self.skip_arc.contains(vkey)) {
                 self.allocator.free(op.insertion_point.path);
                 continue;
             }
@@ -388,6 +402,106 @@ test "ArcOptimizer skips ARC for stack-allocated values" {
 
     // The retain operation should have been eliminated.
     try testing.expectEqual(@as(usize, 0), ctx.arc_ops.items.len);
+}
+
+test "ArcOptimizer never drops a Perceus .reset whose reuse pair survives" {
+    // perceus-region--03: the optimizer eliminates any arc_op whose value
+    // is in skip_arc, with no check of op.kind. A Perceus `.reset` op's
+    // value is the deconstructed scrutinee; when that scrutinee is ALSO
+    // region-classified stack/eliminated it lands in skip_arc and the
+    // `.reset` is dropped — but ctx.reuse_pairs still references the pair,
+    // so materialization later stamps a reuse_token with no defining
+    // `.reset` and aborts emission. `.reset`/`.reuse_alloc` are structural
+    // (driven by reuse_pairs, untouched by the optimizer) and must move in
+    // lockstep with the pairs: they must never be skip-eliminated.
+    const alloc = testing.allocator;
+
+    // A scrutinee (local 0) deconstructed and reused; local 1 is the
+    // reconstructed value.
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    const blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &instrs },
+    };
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "test_fn",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .void,
+            .body = &blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{
+        .functions = &functions,
+        .type_defs = &.{},
+        .entry = 0,
+    };
+
+    var ctx = lattice.AnalysisContext.init(alloc);
+    defer ctx.deinit();
+
+    // Classify the scrutinee (local 0) as stack-eliminated so it lands in
+    // skip_arc — the exact co-occurrence (owned reuse source + region
+    // elimination) that drops the reset.
+    const scrut_key = lattice.ValueKey{ .function = 0, .local = 0 };
+    _ = try ctx.joinEscape(scrut_key, .no_escape);
+    try ctx.alloc_strategies.put(0, .stack_function);
+    try ctx.alloc_summaries.put(0, lattice.AllocSiteSummary.init(0, 0));
+    try ctx.alloc_site_for_value.put(scrut_key, 0);
+
+    // A reuse pair whose reset.source is the scrutinee.
+    try ctx.reuse_pairs.append(alloc, .{
+        .match_site = 0,
+        .alloc_site = 0,
+        .reset = .{ .dest = 10000, .source = 0, .source_type = 0 },
+        .reuse = .{
+            .dest = 1,
+            .token = 10000,
+            .insertion_point = .{ .function = 0, .block = 0, .instr_index = 1, .position = .before },
+            .constructor_tag = 0,
+            .dest_type = 0,
+        },
+        .kind = .static_reuse,
+    });
+
+    // The matching `.reset` (value = scrutinee) and `.reuse_alloc` arc_ops,
+    // as generateReusePair emits them. Each owns its path slice.
+    try ctx.arc_ops.append(alloc, .{
+        .kind = .reset,
+        .value = 0,
+        .insertion_point = .{ .function = 0, .block = 0, .path = try alloc.dupe(lattice.StreamStep, &.{}), .instr_index = 0, .position = .before },
+        .reason = .perceus_reuse,
+    });
+    try ctx.arc_ops.append(alloc, .{
+        .kind = .reuse_alloc,
+        .value = 1,
+        .insertion_point = .{ .function = 0, .block = 0, .path = try alloc.dupe(lattice.StreamStep, &.{}), .instr_index = 1, .position = .before },
+        .reason = .perceus_reuse,
+    });
+
+    var optimizer = ArcOptimizer.init(alloc, &program, &ctx);
+    defer optimizer.deinit();
+    try optimizer.optimize();
+
+    // The reuse pair survives (the optimizer does not touch reuse_pairs),
+    // so the `.reset` op defining its token MUST survive too. Pre-fix the
+    // `.reset` is dropped because its value (the scrutinee) is in skip_arc.
+    var saw_reset = false;
+    var saw_reuse_alloc = false;
+    for (ctx.arc_ops.items) |op| {
+        if (op.kind == .reset and op.value == 0) saw_reset = true;
+        if (op.kind == .reuse_alloc and op.value == 1) saw_reuse_alloc = true;
+    }
+    try testing.expect(optimizer.shouldSkipArc(scrut_key));
+    try testing.expect(saw_reset);
+    try testing.expect(saw_reuse_alloc);
 }
 
 test "ArcOptimizer marks borrowed params as skippable" {
