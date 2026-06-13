@@ -168,6 +168,17 @@ pub const Cfg = struct {
                     for (us.cases) |case| {
                         try scanInstructionsForEdges(cfg, from_label, case.body_instrs);
                     }
+                    if (us.has_else) {
+                        try scanInstructionsForEdges(cfg, from_label, us.else_instrs);
+                    }
+                },
+                .try_call_named => |tcn| {
+                    try scanInstructionsForEdges(cfg, from_label, tcn.handler_instrs);
+                    try scanInstructionsForEdges(cfg, from_label, tcn.success_instrs);
+                },
+                .optional_dispatch => |od| {
+                    try scanInstructionsForEdges(cfg, from_label, od.nil_instrs);
+                    try scanInstructionsForEdges(cfg, from_label, od.struct_instrs);
                 },
                 else => {},
             }
@@ -656,6 +667,11 @@ pub const UseDefInfo = struct {
                 for (tcn.args) |arg| {
                     try info.recordUse(arg, block);
                 }
+                try info.recordUse(tcn.input_local, block);
+                try scanInstructionsForUseDef(info, block, tcn.handler_instrs);
+                if (tcn.handler_result) |hr| try info.recordUse(hr, block);
+                try scanInstructionsForUseDef(info, block, tcn.success_instrs);
+                if (tcn.success_result) |sr| try info.recordUse(sr, block);
             },
             .call_closure => |cc| {
                 try info.recordDef(cc.dest, block);
@@ -737,6 +753,10 @@ pub const UseDefInfo = struct {
                 for (us.cases) |case| {
                     try scanInstructionsForUseDef(info, block, case.body_instrs);
                     if (case.return_value) |rv| try info.recordUse(rv, block);
+                }
+                if (us.has_else) {
+                    try scanInstructionsForUseDef(info, block, us.else_instrs);
+                    if (us.else_result) |er| try info.recordUse(er, block);
                 }
             },
             .optional_dispatch => |od| {
@@ -1182,7 +1202,24 @@ fn instructionUsesLocal(local: ir.LocalId, instr: ir.Instruction) bool {
                 if (case.return_value != null and case.return_value.? == local) return true;
                 if (containsLocalUse(local, case.body_instrs)) return true;
             }
+            if (us.has_else) {
+                if (us.else_result != null and us.else_result.? == local) return true;
+                if (containsLocalUse(local, us.else_instrs)) return true;
+            }
             return false;
+        },
+        .try_call_named => |tcn| {
+            if (tcn.dest == local or tcn.input_local == local) return true;
+            for (tcn.args) |arg| if (arg == local) return true;
+            if (tcn.handler_result != null and tcn.handler_result.? == local) return true;
+            if (tcn.success_result != null and tcn.success_result.? == local) return true;
+            return containsLocalUse(local, tcn.handler_instrs) or containsLocalUse(local, tcn.success_instrs);
+        },
+        .optional_dispatch => |od| {
+            if (od.payload_local == local) return true;
+            if (od.nil_result != null and od.nil_result.? == local) return true;
+            if (od.struct_result != null and od.struct_result.? == local) return true;
+            return containsLocalUse(local, od.nil_instrs) or containsLocalUse(local, od.struct_instrs);
         },
         .ret => |ret_instr| return ret_instr.value != null and ret_instr.value.? == local,
         .cond_return => |cr| return cr.condition == local or (cr.value != null and cr.value.? == local),
@@ -1467,6 +1504,36 @@ pub const ConstraintGenerator = struct {
                     }
                     try self.generateForInstructions(0, case.body_instrs);
                 }
+                if (us.has_else) {
+                    if (us.else_result) |er| {
+                        try self.addConstraint(self.regionOf(er), self.regionOf(us.dest), .assignment);
+                    }
+                    try self.generateForInstructions(0, us.else_instrs);
+                }
+            },
+            .try_call_named => |tcn| {
+                // Lowers to an if-else whose value is `dest`; both branch
+                // results flow into `dest` (like if_expr's phi_merge).
+                const dest_region = self.regionOf(tcn.dest);
+                if (tcn.handler_result) |hr| {
+                    try self.addConstraint(self.regionOf(hr), dest_region, .phi_merge);
+                }
+                if (tcn.success_result) |sr| {
+                    try self.addConstraint(self.regionOf(sr), dest_region, .phi_merge);
+                }
+                try self.generateForInstructions(0, tcn.handler_instrs);
+                try self.generateForInstructions(0, tcn.success_instrs);
+            },
+            .optional_dispatch => |od| {
+                // Both prongs yield the function's return value.
+                if (od.nil_result) |nr| {
+                    try self.addConstraint(self.regionOf(nr), .heap, .return_value);
+                }
+                if (od.struct_result) |sr| {
+                    try self.addConstraint(self.regionOf(sr), .heap, .return_value);
+                }
+                try self.generateForInstructions(0, od.nil_instrs);
+                try self.generateForInstructions(0, od.struct_instrs);
             },
 
             // Aggregate constructors: elements flow into the aggregate.
