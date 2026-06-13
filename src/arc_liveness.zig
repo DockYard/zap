@@ -318,6 +318,17 @@ pub const ArcOwnership = struct {
     /// remains `.owned` in the original IR metadata.
     non_owning_param_refetches: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
 
+    /// Total number of instruction records the analyzer flattened for
+    /// this function — i.e. the count of every instruction (top-level
+    /// and nested) in canonical flatten order. Every id-mirroring
+    /// consumer (drop insertion, ownership rewriters, uniqueness,
+    /// verifier) must walk EXACTLY this many instructions; a mismatch
+    /// means the consumer's structural traversal diverged from the
+    /// analyzer's `flattenChildren` and its InstructionId keys are
+    /// desynchronized. `assertConsumerWalkMatches` checks this in debug
+    /// builds so any future drift fails loudly. (Audit R1.)
+    record_count: usize = 0,
+
     pub fn deinit(self: *ArcOwnership, allocator: std.mem.Allocator) void {
         self.consume_share_sites.deinit(allocator);
         self.return_source_locals.deinit(allocator);
@@ -361,6 +372,40 @@ pub const ArcOwnership = struct {
         return self.last_use_sites.contains(lastUseKey(local, id));
     }
 };
+
+/// Count every instruction (top-level and nested, in canonical flatten
+/// order) in `function`, using `ir.forEachChildStream` — the single
+/// source of truth the analyzer's `flattenChildren` also uses. This is
+/// the count an id-mirroring consumer's structural walk MUST reproduce.
+pub fn countInstructionRecords(function: *const ir.Function) usize {
+    const Counter = struct {
+        count: usize = 0,
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            _ = instr;
+            self.count += 1;
+        }
+    };
+    var counter = Counter{};
+    ir.forEachInstruction(function, &counter, Counter.visit);
+    return counter.count;
+}
+
+/// Debug-only assertion (Audit R1): an id-mirroring consumer that walked
+/// `function` and arrived at `consumer_next_id` must have visited exactly
+/// as many instructions as the analyzer recorded. A mismatch proves the
+/// consumer's structural traversal diverged from `flattenChildren` (the
+/// historical `union_switch.else_instrs` skip), so its InstructionId keys
+/// are desynchronized and its drop/move/uniqueness decisions are
+/// mis-keyed. Fails loudly here instead of silently miscompiling.
+///
+/// No-op in release builds (`std.debug.assert` compiles out), so it adds
+/// zero cost to shipped binaries.
+pub fn assertConsumerWalkMatches(
+    ownership: *const ArcOwnership,
+    consumer_next_id: usize,
+) void {
+    std.debug.assert(consumer_next_id == ownership.record_count);
+}
 
 /// Predicate signature accepted by `computeArcOwnership`. Phases 1-2
 /// pass `defaultArcManagedTypeId` (which mirrors `IrBuilder.isArcManagedType`).
@@ -494,6 +539,11 @@ pub fn computeArcOwnershipWithProgram(
 
     var ownership: ArcOwnership = .{};
     errdefer ownership.deinit(allocator);
+
+    // Record the authoritative instruction count so id-mirroring
+    // consumers can assert their structural walk visits exactly as many
+    // instructions (see `assertConsumerWalkMatches`).
+    ownership.record_count = analyzer.records.items.len;
 
     // Mirror the analyzer's dense `arc_locals` list into the public
     // `arc_managed_locals` set so downstream consumers (notably
@@ -683,72 +733,63 @@ const Analyzer = struct {
         }
     }
 
+    /// Assign `InstructionId`s to every nested sub-stream of `instr`, in
+    /// canonical flatten order, via `ir.forEachChildStream` — the single
+    /// source of truth for structural recursion. This is the AUTHORITY
+    /// the drop-insertion / ownership / uniqueness / verifier walkers must
+    /// mirror; routing it through `forEachChildStream` (which itself yields
+    /// `union_switch.else_instrs` when `has_else` and both
+    /// `optional_dispatch` arms) guarantees every consumer that also routes
+    /// through the enumerator numbers identically.
     fn flattenChildren(
         self: *Analyzer,
         instr: *const ir.Instruction,
         parent_id: InstructionId,
     ) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                try self.flattenStream(ie.then_instrs, .{ .if_then = parent_id });
-                try self.flattenStream(ie.else_instrs, .{ .if_else = parent_id });
-            },
-            .case_block => |cb| {
-                try self.flattenStream(cb.pre_instrs, .{ .case_pre = parent_id });
-                for (cb.arms) |arm| {
-                    try self.flattenStream(arm.cond_instrs, .{ .case_arm_cond = parent_id });
-                    try self.flattenStream(arm.body_instrs, .{ .case_arm_body = parent_id });
-                }
-                try self.flattenStream(cb.default_instrs, .{ .case_default = parent_id });
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |case| {
-                    try self.flattenStream(case.body_instrs, .{ .switch_lit_case = parent_id });
-                }
-                try self.flattenStream(sl.default_instrs, .{ .switch_lit_default = parent_id });
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |case| {
-                    try self.flattenStream(case.body_instrs, .{ .switch_ret_case = parent_id });
-                }
-                try self.flattenStream(sr.default_instrs, .{ .switch_ret_default = parent_id });
-            },
-            .union_switch => |us| {
-                for (us.cases) |case| {
-                    try self.flattenStream(case.body_instrs, .{ .union_switch_case = parent_id });
-                }
-                if (us.has_else) {
-                    try self.flattenStream(us.else_instrs, .{ .union_switch_case = parent_id });
-                }
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |case| {
-                    try self.flattenStream(case.body_instrs, .{ .union_switch_ret_case = parent_id });
-                }
-            },
-            .try_call_named => |tc| {
-                try self.flattenStream(tc.handler_instrs, .{ .try_handler = parent_id });
-                try self.flattenStream(tc.success_instrs, .{ .try_success = parent_id });
-            },
-            .guard_block => |gb| {
-                try self.flattenStream(gb.body, .{ .guard_body = parent_id });
-            },
-            .optional_dispatch => |od| {
-                // Phase D (Phase 6 redux plan §3.D): recurse into both
-                // arm bodies so every instruction inside receives an
-                // `InstructionId`. The drop-insertion rebuilder mirrors
-                // this exact traversal order and depends on ID numbering
-                // being identical. Without this recursion, terminators
-                // inside the synthetic if/else of an `optional_dispatch`
-                // never get a `live_before_ret` snapshot, and scope-exit
-                // drops for ARC-managed locals live across those
-                // terminators are silently omitted — surfaced as the
-                // segfault suspect (e) in the diagnosis brief §12.
-                try self.flattenStream(od.nil_instrs, .{ .optional_dispatch_nil = parent_id });
-                try self.flattenStream(od.struct_instrs, .{ .optional_dispatch_struct = parent_id });
-            },
-            else => {},
-        }
+        const Ctx = struct {
+            analyzer: *Analyzer,
+            parent_id: InstructionId,
+            err: ?error{OutOfMemory} = null,
+            fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
+                if (self_ctx.err != null) return;
+                self_ctx.analyzer.flattenStream(
+                    child.stream,
+                    parentLinkForChildKind(child.kind, self_ctx.parent_id),
+                ) catch |e| {
+                    self_ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .analyzer = self, .parent_id = parent_id };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
+    }
+
+    /// Map a canonical `ChildStreamKind` to the analyzer's `ParentLink`
+    /// for the given parent instruction id. The analyzer's structural-
+    /// successor computation relies on these tags; the `union_switch.else`
+    /// prong reuses the `union_switch_case` link (its exit semantics match
+    /// a case-arm body — both yield the union_switch's value to a merge).
+    fn parentLinkForChildKind(kind: ir.ChildStreamKind, parent_id: InstructionId) ParentLink {
+        return switch (kind) {
+            .if_then => .{ .if_then = parent_id },
+            .if_else => .{ .if_else = parent_id },
+            .case_pre => .{ .case_pre = parent_id },
+            .case_arm_cond => .{ .case_arm_cond = parent_id },
+            .case_arm_body => .{ .case_arm_body = parent_id },
+            .case_default => .{ .case_default = parent_id },
+            .switch_lit_case => .{ .switch_lit_case = parent_id },
+            .switch_lit_default => .{ .switch_lit_default = parent_id },
+            .switch_ret_case => .{ .switch_ret_case = parent_id },
+            .switch_ret_default => .{ .switch_ret_default = parent_id },
+            .union_switch_case, .union_switch_else => .{ .union_switch_case = parent_id },
+            .union_switch_ret_case => .{ .union_switch_ret_case = parent_id },
+            .try_handler => .{ .try_handler = parent_id },
+            .try_success => .{ .try_success = parent_id },
+            .guard_body => .{ .guard_body = parent_id },
+            .optional_dispatch_nil => .{ .optional_dispatch_nil = parent_id },
+            .optional_dispatch_struct => .{ .optional_dispatch_struct = parent_id },
+        };
     }
 
     // ----------------------------------------------------------
@@ -1189,6 +1230,21 @@ const Analyzer = struct {
                     var body_in = try self.processStream(case.body_instrs, arm_live_after);
                     defer body_in.deinit(self.allocator);
                 }
+                // The catch-all `_` prong (`else_instrs`) yields the
+                // union_switch's value to the same merge as a case-arm
+                // body, so its enclosing live-after is the parent's —
+                // identical to a `cases` arm. Without processing it, the
+                // backward dataflow leaves every else-prong instruction's
+                // live-after at its empty initialization, so
+                // `classifyLastUses` flags EVERY ARC use inside the
+                // catch-all as a last use (false `move_value`/consume
+                // authorization → use-after-free) and emits no scope-exit
+                // drops for ARC locals that die there (leak). See audit
+                // finding arc-liveness--01.
+                if (us.has_else) {
+                    var else_in = try self.processStream(us.else_instrs, arm_live_after);
+                    defer else_in.deinit(self.allocator);
+                }
             },
             .union_switch_return => |usr| {
                 var empty = try LiveSet.init(self.allocator, @intCast(self.arc_locals.items.len));
@@ -1520,6 +1576,14 @@ const Analyzer = struct {
                     for (union_switch.cases) |case| {
                         var body_in = try self.processStream(case.body_instrs, parent_live_after);
                         defer body_in.deinit(self.analyzer.allocator);
+                    }
+                    // The catch-all `_` prong yields to the same merge as a
+                    // case arm (parent live-after). Processing it keeps
+                    // non-ARC-aggregate last-use records correct for tuples
+                    // whose components are read inside the catch-all body.
+                    if (union_switch.has_else) {
+                        var else_in = try self.processStream(union_switch.else_instrs, parent_live_after);
+                        defer else_in.deinit(self.analyzer.allocator);
                     }
                 },
                 .union_switch_return => |union_switch_return| {
@@ -1985,6 +2049,31 @@ const Analyzer = struct {
                     } else {
                         join.intersectWith(&arm_owns);
                         consumed_join.unionWith(&arm_consumed);
+                    }
+                }
+                // The catch-all `_` prong joins the post-switch `owns`
+                // exactly like a case arm: its `else_result` transfers into
+                // `us.dest`, and its arm-end `owns` intersects into the
+                // join. Omitting it left the join missing the else path's
+                // ownership, so a local owned only on the catch-all path
+                // either leaked (never released) or was double-released
+                // (released against a join that excluded it). See audit
+                // finding arc-liveness--01 / arc-own-2--01.
+                if (us.has_else) {
+                    var else_owns = try owns.clone(self.allocator);
+                    defer else_owns.deinit(self.allocator);
+                    var else_consumed = try consumed_owned_param_slots.clone(self.allocator);
+                    defer else_consumed.deinit(self.allocator);
+                    try self.forwardOwnsStream(us.else_instrs, &else_owns, &else_consumed, ownership);
+                    self.applyAggregateResultTransfer(us.else_result, us.dest, &else_owns);
+                    self.normalizeAggregateExitOwns(&else_owns, &entry_owns, us.dest);
+                    if (!has_join) {
+                        join.copyFrom(&else_owns);
+                        consumed_join.copyFrom(&else_consumed);
+                        has_join = true;
+                    } else {
+                        join.intersectWith(&else_owns);
+                        consumed_join.unionWith(&else_consumed);
                     }
                 }
                 if (has_join) {
@@ -2967,43 +3056,18 @@ const WriteBackWalker = struct {
         self.consumes_marked += 1;
     }
 
+    /// Recurse into every child stream via the canonical enumerator so
+    /// the InstructionId numbering matches `flattenChildren` exactly —
+    /// including `union_switch.else_instrs` and `optional_dispatch` arms,
+    /// both previously skipped here (masked only because
+    /// `consume_share_sites` is empty under the borrow ABI; audit
+    /// finding arc-liveness--01).
     fn walkChildren(self: *WriteBackWalker, instr: *const ir.Instruction) void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                self.walkStream(ie.then_instrs);
-                self.walkStream(ie.else_instrs);
-            },
-            .case_block => |cb| {
-                self.walkStream(cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    self.walkStream(arm.cond_instrs);
-                    self.walkStream(arm.body_instrs);
-                }
-                self.walkStream(cb.default_instrs);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| self.walkStream(c.body_instrs);
-                self.walkStream(sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| self.walkStream(c.body_instrs);
-                self.walkStream(sr.default_instrs);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| self.walkStream(c.body_instrs);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| self.walkStream(c.body_instrs);
-            },
-            .try_call_named => |tc| {
-                self.walkStream(tc.handler_instrs);
-                self.walkStream(tc.success_instrs);
-            },
-            .guard_block => |gb| {
-                self.walkStream(gb.body);
-            },
-            else => {},
-        }
+        ir.forEachChildStream(instr, self, onChildStream);
+    }
+
+    fn onChildStream(self: *WriteBackWalker, child: ir.ChildStream) void {
+        self.walkStream(child.stream);
     }
 };
 
@@ -3319,25 +3383,22 @@ fn sideChannelSeedParamAliases(
     alias_set: *std.ArrayListUnmanaged(ir.LocalId),
 ) void {
     for (stream) |*instr| {
-        switch (instr.*) {
-            .param_get => |pg| {
-                if (pg.index == param_index) _ = sideChannelAppendAlias(alias_set, pg.dest);
-            },
-            .if_expr => |ie| {
-                sideChannelSeedParamAliases(ie.then_instrs, param_index, alias_set);
-                sideChannelSeedParamAliases(ie.else_instrs, param_index, alias_set);
-            },
-            .case_block => |cb| {
-                sideChannelSeedParamAliases(cb.pre_instrs, param_index, alias_set);
-                for (cb.arms) |arm| {
-                    sideChannelSeedParamAliases(arm.cond_instrs, param_index, alias_set);
-                    sideChannelSeedParamAliases(arm.body_instrs, param_index, alias_set);
-                }
-                sideChannelSeedParamAliases(cb.default_instrs, param_index, alias_set);
-            },
-            .guard_block => |gb| sideChannelSeedParamAliases(gb.body, param_index, alias_set),
-            else => {},
+        if (instr.* == .param_get) {
+            const pg = instr.param_get;
+            if (pg.index == param_index) _ = sideChannelAppendAlias(alias_set, pg.dest);
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs, try_call_named,
+        // optional_dispatch, etc. that the old hand-rolled switch omitted).
+        const Seed = struct {
+            param_index: usize,
+            alias_set: *std.ArrayListUnmanaged(ir.LocalId),
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                sideChannelSeedParamAliases(child.stream, self.param_index, self.alias_set);
+            }
+        };
+        var seed = Seed{ .param_index = param_index, .alias_set = alias_set };
+        ir.forEachChildStream(instr, &seed, Seed.onStream);
     }
 }
 
@@ -3368,23 +3429,24 @@ fn sideChannelExtendParamAliases(
                     if (sideChannelAppendAlias(alias_set, sv.dest)) changed = true;
                 }
             },
-            .if_expr => |ie| {
-                if (sideChannelExtendParamAliases(ie.then_instrs, alias_set)) changed = true;
-                if (sideChannelExtendParamAliases(ie.else_instrs, alias_set)) changed = true;
-            },
-            .case_block => |cb| {
-                if (sideChannelExtendParamAliases(cb.pre_instrs, alias_set)) changed = true;
-                for (cb.arms) |arm| {
-                    if (sideChannelExtendParamAliases(arm.cond_instrs, alias_set)) changed = true;
-                    if (sideChannelExtendParamAliases(arm.body_instrs, alias_set)) changed = true;
-                }
-                if (sideChannelExtendParamAliases(cb.default_instrs, alias_set)) changed = true;
-            },
-            .guard_block => |gb| {
-                if (sideChannelExtendParamAliases(gb.body, alias_set)) changed = true;
-            },
             else => {},
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator so aliases created inside ANY control-flow construct
+        // (including union_switch.else_instrs, try_call_named, and
+        // optional_dispatch arms — previously not walked here at all) are
+        // tracked. Keeps the Gap-4 return-source-elision gate from
+        // under-approximating the alias set.
+        const Ext = struct {
+            alias_set: *std.ArrayListUnmanaged(ir.LocalId),
+            changed: bool = false,
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                if (sideChannelExtendParamAliases(child.stream, self.alias_set)) self.changed = true;
+            }
+        };
+        var ext = Ext{ .alias_set = alias_set };
+        ir.forEachChildStream(instr, &ext, Ext.onStream);
+        if (ext.changed) changed = true;
     }
     return changed;
 }
@@ -3394,33 +3456,30 @@ fn sideChannelStreamConsumesAlias(
     alias_set: []const ir.LocalId,
 ) bool {
     for (stream) |*instr| {
-        switch (instr.*) {
-            .call_builtin => |cb| {
-                for (cb.args, 0..) |arg, slot| {
-                    if (sideChannelStashBuiltinArg(cb.name, slot) and
-                        sideChannelAliasContains(alias_set, arg))
-                    {
-                        return true;
-                    }
+        if (instr.* == .call_builtin) {
+            const cb = instr.call_builtin;
+            for (cb.args, 0..) |arg, slot| {
+                if (sideChannelStashBuiltinArg(cb.name, slot) and
+                    sideChannelAliasContains(alias_set, arg))
+                {
+                    return true;
                 }
-            },
-            .if_expr => |ie| {
-                if (sideChannelStreamConsumesAlias(ie.then_instrs, alias_set)) return true;
-                if (sideChannelStreamConsumesAlias(ie.else_instrs, alias_set)) return true;
-            },
-            .case_block => |cb| {
-                if (sideChannelStreamConsumesAlias(cb.pre_instrs, alias_set)) return true;
-                for (cb.arms) |arm| {
-                    if (sideChannelStreamConsumesAlias(arm.cond_instrs, alias_set)) return true;
-                    if (sideChannelStreamConsumesAlias(arm.body_instrs, alias_set)) return true;
-                }
-                if (sideChannelStreamConsumesAlias(cb.default_instrs, alias_set)) return true;
-            },
-            .guard_block => |gb| {
-                if (sideChannelStreamConsumesAlias(gb.body, alias_set)) return true;
-            },
-            else => {},
+            }
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs, try_call_named,
+        // optional_dispatch, switch_* that the old switch omitted).
+        const Consumes = struct {
+            alias_set: []const ir.LocalId,
+            found: bool = false,
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                if (self.found) return;
+                if (sideChannelStreamConsumesAlias(child.stream, self.alias_set)) self.found = true;
+            }
+        };
+        var consumes = Consumes{ .alias_set = alias_set };
+        ir.forEachChildStream(instr, &consumes, Consumes.onStream);
+        if (consumes.found) return true;
     }
     return false;
 }
@@ -3848,43 +3907,16 @@ const DisjointChecker = struct {
         std.debug.assert(!self.ownership.return_source_locals.contains(sv.source));
     }
 
+    /// Recurse into every child stream via the canonical enumerator so
+    /// the InstructionId numbering matches `flattenChildren` (including
+    /// `union_switch.else_instrs` and `optional_dispatch` arms; audit
+    /// finding arc-liveness--01).
     fn walkChildren(self: *DisjointChecker, instr: *const ir.Instruction) void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                self.walkStream(ie.then_instrs);
-                self.walkStream(ie.else_instrs);
-            },
-            .case_block => |cb| {
-                self.walkStream(cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    self.walkStream(arm.cond_instrs);
-                    self.walkStream(arm.body_instrs);
-                }
-                self.walkStream(cb.default_instrs);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| self.walkStream(c.body_instrs);
-                self.walkStream(sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| self.walkStream(c.body_instrs);
-                self.walkStream(sr.default_instrs);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| self.walkStream(c.body_instrs);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| self.walkStream(c.body_instrs);
-            },
-            .try_call_named => |tc| {
-                self.walkStream(tc.handler_instrs);
-                self.walkStream(tc.success_instrs);
-            },
-            .guard_block => |gb| {
-                self.walkStream(gb.body);
-            },
-            else => {},
-        }
+        ir.forEachChildStream(instr, self, onChildStream);
+    }
+
+    fn onChildStream(self: *DisjointChecker, child: ir.ChildStream) void {
+        self.walkStream(child.stream);
     }
 };
 
@@ -4355,6 +4387,12 @@ fn collectArmResults(instr: ir.Instruction, out: *[16]ir.LocalId) usize {
         },
         .union_switch => |x| {
             for (x.cases) |c| if (c.return_value) |l| append(out, &n, l);
+            // The catch-all prong's result participates in the aggregate
+            // exactly like a case-arm result; include it so return-source
+            // / ARC-managed propagation never misses an else-only result.
+            if (x.has_else) {
+                if (x.else_result) |l| append(out, &n, l);
+            }
         },
         else => {},
     }
