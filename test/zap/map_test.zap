@@ -256,4 +256,108 @@ pub struct Zap.MapTest {
       assert(List.length(values) == 3)
     }
   }
+
+  # ----------------------------------------------------------------
+  # arc-own-1--02 regression: count-mutating ARC rewrites must not
+  # leave the move-vs-copy classifier keying a STALE InstructionId
+  # space.
+  #
+  # `arc_ownership.rewriteOwnedConsumeBuiltinSites` changes the
+  # instruction count before classification — it drops the post-call
+  # `release` for a consumed `Map.put` receiver and can expand a
+  # consumed `borrow_value` into `copy_value` + `retain`. The
+  # classifier then reconstructs InstructionIds positionally and gates
+  # `move_value` vs `copy_value` on `ArcOwnership.isLastUseAt`. Before
+  # the fix (recompute ownership after every count-mutating rewrite),
+  # classify consulted the table the analyzer built against the
+  # PRE-rewrite IR, mis-keying every gate after the first count change:
+  # a conservative `copy_value` (an extra retain → leak under
+  # `Memory.Tracking`) at best, an unsound `move_value` at a
+  # non-last-use read (premature free / use-after-free) at worst.
+  #
+  # Each shape mutates an ARC `Map` local with a stream-shrinking
+  # `Map.put` (or a recoverable raise, whose side-channel stash is
+  # covered by `alwaysConsumingBuiltinArg`), then makes a move/copy
+  # decision that depends on path-sensitive last-use — a binding read
+  # once per branch arm, whose flat use-count is >1 but whose per-path
+  # last-use is 1. The `assert_no_leaks` blocks pin the net
+  # live-allocation delta to zero under `Memory.Tracking` (an
+  # over-copy leaks, an over-move reclaims a still-referenced cell); a
+  # documented no-op under the default `Memory.ARC` corpus manager,
+  # where the value assertions still pin correct results through the
+  # rewritten IR.
+  describe("arc-own-1--02: Map.put shrinks the stream before a per-arm last-use branch") {
+    test("conditional map mutation returns the expected size on both arms") {
+      # `accumulate_map(true)` re-puts the existing `:base` key (size stays
+      # 1); the `false` arm adds `:extra` (size 2). The point is that the
+      # values are correct through the count-mutated/reclassified IR.
+      assert(Map.size(accumulate_map(true)) == 1)
+      assert(Map.size(accumulate_map(false)) == 2)
+    }
+
+    test("conditional map mutation is leak-free under Tracking") {
+      assert_no_leaks {
+        a = accumulate_map(true)
+        assert(Map.get(a, :base, 0) == 1)
+        b = accumulate_map(false)
+        assert(Map.get(b, :extra, 0) == 9)
+      }
+    }
+  }
+
+  describe("arc-own-1--02: recursive Map accumulator fed through a conditional last-use") {
+    test("recursive accumulation reaches the loop bound") {
+      assert(Map.size(build_then_branch(0)) == 1)
+      assert(Map.size(build_then_branch(3)) == 4)
+    }
+
+    test("recursive accumulation is leak-free under Tracking") {
+      assert_no_leaks {
+        result = build_then_branch(4)
+        assert(Map.size(result) == 5)
+      }
+    }
+  }
+
+  # `Map.put` drops the post-call release (stream shrinks); the mutated
+  # `updated` map is then read once in each `cond` arm — flat use-count
+  # 2, per-path last-use 1.
+  fn accumulate_map(flag :: Bool) -> %{Atom -> i64} {
+    updated = Map.put(%{base: 1}, :base, 1)
+    cond {
+      flag -> updated
+      true -> Map.put(updated, :extra, 9)
+    }
+  }
+
+  # `seed` is built with a stream-shrinking `Map.put`, then read once in
+  # each arm of an `if`: the then-arm forwards it into a recursive
+  # accumulator at last use (move), the else-arm returns it directly
+  # (also last use). Mirrors the `cleared` / `count_kmers_loop` shape
+  # cited in the classifier comments.
+  fn build_then_branch(n :: i64) -> %{Atom -> i64} {
+    seed = Map.put(%{}, :start, 0)
+    if n > 0 {
+      accumulate_loop(seed, n)
+    } else {
+      seed
+    }
+  }
+
+  fn accumulate_loop(acc :: %{Atom -> i64}, n :: i64) -> %{Atom -> i64} {
+    if n <= 0 {
+      acc
+    } else {
+      accumulate_loop(Map.put(acc, key_for(n), n), n - 1)
+    }
+  }
+
+  fn key_for(n :: i64) -> Atom {
+    cond {
+      n == 1 -> :k1
+      n == 2 -> :k2
+      n == 3 -> :k3
+      true -> :kx
+    }
+  }
 }
