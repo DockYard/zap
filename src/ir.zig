@@ -3642,6 +3642,23 @@ fn comptime_child_stream_exhaustiveness() void {
 /// the payload struct, or a slice of arm/case structs each holding a
 /// `body_instrs`/`cond_instrs` slice).
 fn typeContainsInstructionStream(comptime T: type) bool {
+    return typeContainsInstructionStreamGuarded(T, &.{});
+}
+
+/// Cycle-safe core of `typeContainsInstructionStream`. `seen` is the
+/// comptime list of aggregate types already on the current recursion
+/// stack; re-entering one (the IR type graph is cyclic — `Instruction`
+/// references itself via slices, `ZigType` references itself via
+/// `[]const ZigType` / `*const ZigType`, etc.) returns `false` so the
+/// walk terminates. This is correct because every real sub-stream is a
+/// `[]const Instruction` slice (or an array of one), detected at the
+/// pointer/array arm BEFORE any aggregate is re-entered.
+fn typeContainsInstructionStreamGuarded(comptime T: type, comptime seen: []const type) bool {
+    comptime {
+        for (seen) |s| {
+            if (s == T) return false;
+        }
+    }
     const info = @typeInfo(T);
     switch (info) {
         .pointer => |ptr| {
@@ -3649,17 +3666,33 @@ fn typeContainsInstructionStream(comptime T: type) bool {
             // `Instruction`; any other slice is inspected by element type.
             if (ptr.size == .slice) {
                 if (ptr.child == Instruction) return true;
-                return typeContainsInstructionStream(ptr.child);
+                return typeContainsInstructionStreamGuarded(ptr.child, seen);
             }
             return false;
         },
         .@"struct" => |st| {
+            const next = seen ++ [_]type{T};
             inline for (st.fields) |f| {
-                if (comptime typeContainsInstructionStream(f.type)) return true;
+                if (comptime typeContainsInstructionStreamGuarded(f.type, next)) return true;
             }
             return false;
         },
-        .optional => |opt| return typeContainsInstructionStream(opt.child),
+        .@"union" => |un| {
+            // A sub-stream nested inside a tagged-union payload field must
+            // also be caught, so an `Instruction` variant carrying a stream
+            // through an inner union cannot evade the exhaustiveness check.
+            const next = seen ++ [_]type{T};
+            inline for (un.fields) |f| {
+                if (comptime typeContainsInstructionStreamGuarded(f.type, next)) return true;
+            }
+            return false;
+        },
+        .array => |arr| {
+            // A fixed `[N]Instruction` (or an array of stream-bearing
+            // aggregates) carries a sub-stream just as a slice does.
+            return typeContainsInstructionStreamGuarded(arr.child, seen);
+        },
+        .optional => |opt| return typeContainsInstructionStreamGuarded(opt.child, seen),
         else => return false,
     }
 }
@@ -15702,6 +15735,57 @@ fn maxLocalSetIndexInExpr(expr: *const hir_mod.Expr) LocalId {
         .union_init => |ui| {
             max_local = @max(max_local, maxLocalSetIndexInExpr(ui.value));
         },
+        .match => |*m| {
+            // The match scrutinee plus the entire decision tree, whose
+            // `bind`/`success` nodes reserve `local_index` values from the
+            // same per-clause space. Skipping it (the prior `else` arm) let
+            // a decision-tree binding's `local_index` collide with a later
+            // `local_set`, rebinding a live ARC-managed local mid-function.
+            max_local = @max(max_local, maxLocalSetIndexInExpr(m.scrutinee));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(m.decision));
+        },
+        .tuple_init => |elements| {
+            for (elements) |element| {
+                max_local = @max(max_local, maxLocalSetIndexInExpr(element));
+            }
+        },
+        .list_init => |elements| {
+            for (elements) |element| {
+                max_local = @max(max_local, maxLocalSetIndexInExpr(element));
+            }
+        },
+        .list_cons => |*lc| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(lc.head));
+            max_local = @max(max_local, maxLocalSetIndexInExpr(lc.tail));
+        },
+        .map_init => |entries| {
+            for (entries) |entry| {
+                max_local = @max(max_local, maxLocalSetIndexInExpr(entry.key));
+                max_local = @max(max_local, maxLocalSetIndexInExpr(entry.value));
+            }
+        },
+        .struct_init => |*si| {
+            for (si.fields) |field| {
+                max_local = @max(max_local, maxLocalSetIndexInExpr(field.value));
+            }
+        },
+        .field_get => |*fg| max_local = @max(max_local, maxLocalSetIndexInExpr(fg.object)),
+        .tuple_index_get => |*tig| max_local = @max(max_local, maxLocalSetIndexInExpr(tig.object)),
+        .list_index_get => |*lig| max_local = @max(max_local, maxLocalSetIndexInExpr(lig.list)),
+        .list_head_get => |*lhg| max_local = @max(max_local, maxLocalSetIndexInExpr(lhg.list)),
+        .list_tail_get => |*ltg| max_local = @max(max_local, maxLocalSetIndexInExpr(ltg.list)),
+        .map_value_get => |*mvg| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(mvg.map));
+            max_local = @max(max_local, maxLocalSetIndexInExpr(mvg.key));
+        },
+        .panic => |operand| max_local = @max(max_local, maxLocalSetIndexInExpr(operand)),
+        .unwrap => |operand| max_local = @max(max_local, maxLocalSetIndexInExpr(operand)),
+        .ret_raise => |*rr| max_local = @max(max_local, maxLocalSetIndexInExpr(rr.stash_call)),
+        .closure_create => |*cc| {
+            for (cc.captures) |capture| {
+                max_local = @max(max_local, maxLocalSetIndexInExpr(capture.expr));
+            }
+        },
         .error_pipe => |ep| {
             for (ep.steps) |step| {
                 max_local = @max(max_local, maxLocalSetIndexInExpr(step.expr));
@@ -15734,7 +15818,98 @@ fn maxLocalSetIndexInExpr(expr: *const hir_mod.Expr) LocalId {
                 max_local = @max(max_local, maxLocalSetIndexInBlock(after_block));
             }
         },
-        else => {},
+        // Leaves: no nested expression and no reserved local index. Listed
+        // explicitly (no `else`) so a future binding- or sub-expression-
+        // bearing `ExprKind` cannot silently re-open the local-collision
+        // class — adding such a variant forces a decision here.
+        .int_lit,
+        .float_lit,
+        .string_lit,
+        .atom_lit,
+        .bool_lit,
+        .nil_lit,
+        .local_get,
+        .param_get,
+        .capture_get,
+        .never,
+        => {},
+    }
+    return max_local;
+}
+
+/// Returns one past the largest `local_index` reserved anywhere in a
+/// match decision tree (the `bind` nodes and `success`-leaf bindings),
+/// recursing every sub-decision and the expressions they carry. The
+/// `scrutinee_id` fields on the check/extract/switch nodes index a
+/// SEPARATE match-scrutinee table — they are NOT local indices and are
+/// deliberately excluded. Mirrors `maxLocalSetIndexInExpr`.
+fn maxLocalSetIndexInDecision(decision: *const hir_mod.Decision) LocalId {
+    var max_local: LocalId = 0;
+    switch (decision.*) {
+        .success => |*leaf| {
+            for (leaf.bindings) |binding| {
+                max_local = @max(max_local, binding.local_index + 1);
+            }
+        },
+        .failure => {},
+        .guard => |*g| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(g.condition));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(g.success));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(g.failure));
+        },
+        .switch_tag => |*sn| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(sn.scrutinee));
+            for (sn.cases) |case| max_local = @max(max_local, maxLocalSetIndexInDecision(case.next));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(sn.default));
+        },
+        .switch_literal => |*sn| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(sn.scrutinee));
+            for (sn.cases) |case| max_local = @max(max_local, maxLocalSetIndexInDecision(case.next));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(sn.default));
+        },
+        .check_tuple => |*cn| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(cn.scrutinee));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.success));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.failure));
+        },
+        .check_list => |*cn| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(cn.scrutinee));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.success));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.failure));
+        },
+        .check_list_cons => |*cn| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(cn.scrutinee));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.success));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.failure));
+        },
+        .check_binary => |*cn| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(cn.scrutinee));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.success));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.failure));
+        },
+        .bind => |*bn| {
+            max_local = @max(max_local, bn.local_index + 1);
+            max_local = @max(max_local, maxLocalSetIndexInExpr(bn.source));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(bn.next));
+        },
+        .extract_struct => |*en| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(en.scrutinee));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(en.success));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(en.failure));
+        },
+        .extract_map => |*en| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(en.scrutinee));
+            for (en.keys) |key_extraction| {
+                max_local = @max(max_local, maxLocalSetIndexInExpr(key_extraction.key));
+            }
+            max_local = @max(max_local, maxLocalSetIndexInDecision(en.success));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(en.failure));
+        },
+        .switch_variant => |*sn| {
+            max_local = @max(max_local, maxLocalSetIndexInExpr(sn.scrutinee));
+            for (sn.cases) |case| max_local = @max(max_local, maxLocalSetIndexInDecision(case.next));
+            max_local = @max(max_local, maxLocalSetIndexInDecision(sn.default));
+        },
     }
     return max_local;
 }
