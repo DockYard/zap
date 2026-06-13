@@ -621,6 +621,8 @@ fn retargetNestedStreams(
         },
         .union_switch => |us| {
             for (us.cases) |c| R.go(c.body_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
+            // Catch-all `_` prong, previously skipped.
+            if (us.has_else) R.go(us.else_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
         },
         .union_switch_return => |usr| {
             for (usr.cases) |c| R.go(c.body_instrs, from_name, from_local, from_id, to_name, to_local, to_id);
@@ -1357,46 +1359,21 @@ const ShareSetWalker = struct {
     }
 
     fn recurseChildren(self: *ShareSetWalker, instr: *const ir.Instruction) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                try self.walkStream(ie.then_instrs);
-                try self.walkStream(ie.else_instrs);
-            },
-            .case_block => |cb| {
-                try self.walkStream(cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    try self.walkStream(arm.cond_instrs);
-                    try self.walkStream(arm.body_instrs);
-                }
-                try self.walkStream(cb.default_instrs);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sr.default_instrs);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .try_call_named => |tcn| {
-                try self.walkStream(tcn.handler_instrs);
-                try self.walkStream(tcn.success_instrs);
-            },
-            .guard_block => |gb| {
-                try self.walkStream(gb.body);
-            },
-            .optional_dispatch => |od| {
-                try self.walkStream(od.nil_instrs);
-                try self.walkStream(od.struct_instrs);
-            },
-            else => {},
-        }
+        // Recurse into every child stream via the canonical enumerator
+        // (covers union_switch.else_instrs, previously skipped).
+        const Ctx = struct {
+            walker: *ShareSetWalker,
+            err: ?error{OutOfMemory} = null,
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                ctx.walker.walkStream(child.stream) catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .walker = self };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 
     fn processInstruction(
@@ -1664,6 +1641,8 @@ fn collectTentativeCalleesIntoStream(
             },
             .union_switch => |us| {
                 for (us.cases) |c| try collectTentativeCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
+                // Catch-all `_` prong: collect its call-graph edges too.
+                if (us.has_else) try collectTentativeCalleesIntoStream(allocator, caller_id, us.else_instrs, name_to_id, callers_of);
             },
             .union_switch_return => |usr| {
                 for (usr.cases) |c| try collectTentativeCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
@@ -2124,6 +2103,14 @@ const TentativeAnalyzer = struct {
                 defer snap.deinit(self.allocator);
                 for (us.cases) |c| {
                     try self.walkStream(c.body_instrs);
+                    try self.restore(&snap);
+                }
+                // The catch-all `_` prong is walked like a case arm so its
+                // call sites (which the tentative-rewrite dataflow audits)
+                // are seen and its id space stays aligned. See audit
+                // findings uniqueness--04 / arc-own-1--01.
+                if (us.has_else) {
+                    try self.walkStream(us.else_instrs);
                     try self.restore(&snap);
                 }
             },
@@ -2814,6 +2801,7 @@ fn scanAllocatorWrapperStream(stream: []const ir.Instruction, ctx: *AllocatorWra
             },
             .union_switch => |us| {
                 for (us.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
+                if (us.has_else) scanAllocatorWrapperStream(us.else_instrs, ctx);
             },
             .union_switch_return => |usr| {
                 for (usr.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
@@ -2850,46 +2838,21 @@ const TentativeDemotionWalker = struct {
     }
 
     fn walkChildren(self: *TentativeDemotionWalker, instr: *const ir.Instruction) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                try self.walkStream(ie.then_instrs);
-                try self.walkStream(ie.else_instrs);
-            },
-            .case_block => |cb| {
-                try self.walkStream(cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    try self.walkStream(arm.cond_instrs);
-                    try self.walkStream(arm.body_instrs);
-                }
-                try self.walkStream(cb.default_instrs);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sr.default_instrs);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .try_call_named => |tcn| {
-                try self.walkStream(tcn.handler_instrs);
-                try self.walkStream(tcn.success_instrs);
-            },
-            .guard_block => |gb| {
-                try self.walkStream(gb.body);
-            },
-            .optional_dispatch => |od| {
-                try self.walkStream(od.nil_instrs);
-                try self.walkStream(od.struct_instrs);
-            },
-            else => {},
-        }
+        // Recurse into every child stream via the canonical enumerator
+        // (covers union_switch.else_instrs, previously skipped).
+        const Ctx = struct {
+            walker: *TentativeDemotionWalker,
+            err: ?error{OutOfMemory} = null,
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                ctx.walker.walkStream(child.stream) catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .walker = self };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 
     fn maybeDemoteCallee(self: *TentativeDemotionWalker, my_id: arc_liveness.InstructionId) error{OutOfMemory}!void {
@@ -3247,46 +3210,21 @@ const SiteWalker = struct {
     }
 
     fn recurseChildren(self: *SiteWalker, instr: *const ir.Instruction) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                try self.walkStream(ie.then_instrs);
-                try self.walkStream(ie.else_instrs);
-            },
-            .case_block => |cb| {
-                try self.walkStream(cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    try self.walkStream(arm.cond_instrs);
-                    try self.walkStream(arm.body_instrs);
-                }
-                try self.walkStream(cb.default_instrs);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sr.default_instrs);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .try_call_named => |tcn| {
-                try self.walkStream(tcn.handler_instrs);
-                try self.walkStream(tcn.success_instrs);
-            },
-            .guard_block => |gb| {
-                try self.walkStream(gb.body);
-            },
-            .optional_dispatch => |od| {
-                try self.walkStream(od.nil_instrs);
-                try self.walkStream(od.struct_instrs);
-            },
-            else => {},
-        }
+        // Recurse into every child stream via the canonical enumerator
+        // (covers union_switch.else_instrs, previously skipped).
+        const Ctx = struct {
+            walker: *SiteWalker,
+            err: ?error{OutOfMemory} = null,
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                ctx.walker.walkStream(child.stream) catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .walker = self };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 
     fn processInstruction(
@@ -3667,6 +3605,9 @@ fn streamHasOwnedZapCalleeConsumingAlias(
                 for (us.cases) |c| {
                     if (streamHasOwnedZapCalleeConsumingAlias(c.body_instrs, alias_set, lift_set, name_to_id, program)) return true;
                 }
+                if (us.has_else) {
+                    if (streamHasOwnedZapCalleeConsumingAlias(us.else_instrs, alias_set, lift_set, name_to_id, program)) return true;
+                }
             },
             .union_switch_return => |usr| {
                 for (usr.cases) |c| {
@@ -3738,6 +3679,9 @@ fn collectParamAliasesIntoStream(
             .union_switch => |us| {
                 for (us.cases) |c| {
                     if (collectParamAliasesIntoStream(c.body_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
+                }
+                if (us.has_else) {
+                    if (collectParamAliasesIntoStream(us.else_instrs, param_index, alias_buf, alias_len, max_aliases)) changed = true;
                 }
             },
             .union_switch_return => |usr| {
@@ -3839,6 +3783,9 @@ fn streamHasOwnedBuiltinConsumingAlias(
             .union_switch => |us| {
                 for (us.cases) |c| {
                     if (streamHasOwnedBuiltinConsumingAlias(c.body_instrs, alias_set)) return true;
+                }
+                if (us.has_else) {
+                    if (streamHasOwnedBuiltinConsumingAlias(us.else_instrs, alias_set)) return true;
                 }
             },
             .union_switch_return => |usr| {
@@ -4406,6 +4353,13 @@ fn scanChildStreamsMaybeTarget(
                 if (ctx.found) return .target_not_found;
                 if (s == .target_found_and_done) any_target = true;
             }
+            // The catch-all `_` prong is a peer arm and must be scanned
+            // for the target like any case body. Previously skipped.
+            if (us.has_else) {
+                const s = scanStreamSuccessors(us.else_instrs, ctx);
+                if (ctx.found) return .target_not_found;
+                if (s == .target_found_and_done) any_target = true;
+            }
             if (any_target) return .target_found_and_done;
             return .target_not_found;
         },
@@ -4486,6 +4440,12 @@ fn scanInstructionChildrenPostTarget(
         .union_switch => |us| {
             for (us.cases) |c| {
                 scanStreamPostTarget(c.body_instrs, ctx);
+                if (ctx.found) return;
+            }
+            // The catch-all `_` prong is a structural successor of the
+            // share like any case body; scan it for refetches too.
+            if (us.has_else) {
+                scanStreamPostTarget(us.else_instrs, ctx);
                 if (ctx.found) return;
             }
         },
