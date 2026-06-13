@@ -8744,3 +8744,191 @@ test "arc_ownership: elideBorrowedPassThroughShares refuses non-owned share dest
     try expectBorrowedPassThroughUnchanged(&fixture.functions[1], 1);
     try std.testing.expectEqual(ir.OwnershipClass.trivial, fixture.functions[1].local_ownership[1]);
 }
+
+// ============================================================
+// arc-own-1--02: count-mutating-rewrite / stale-id consistency.
+//
+// `rewriteOwnedConsumeBuiltinSites` changes the instruction count
+// (it drops the post-call `release` for a consumed receiver, and can
+// expand a `borrow_value` into `copy_value`+`retain`). The downstream
+// id-consuming passes — `classifyAndNormalizeWithProgram`'s three move
+// gates and the second builtin-consume run — reconstruct InstructionIds
+// purely positionally from the *current* IR. If they are handed the
+// same ownership table the analyzer built against the *pre-mutation* IR,
+// every id after the first count change is off by the count delta and
+// the `last_use_map` / `last_use_sites` lookups are mis-keyed.
+//
+// The fix (compiler.zig) recomputes `ProgramArcOwnership` immediately
+// after each count-mutating rewrite so the id-consuming pass keys into a
+// table whose `record_count` matches the IR it walks. These tests pin
+// the invariant `consumerWalkMatches` enforces: a table captured before
+// the count mutation no longer matches the post-mutation walk (the bug),
+// and a recomputed table does (the fix).
+
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites mutates instruction count, desyncing a pre-mutation ownership table" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Same shape as the canonical "Map.put at last-use" rewrite test:
+    //   [0] const_int %0
+    //   [1] share_value %1 <- %0
+    //   [2] call_builtin "Map.put" args=[%1, %2, %3] dest=%4
+    //   [3] release %1
+    //   [4] ret
+    // At %0's last-use the share becomes move_value and the release of
+    // %1 is DROPPED, so the instruction count falls from 5 to 4.
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 1;
+    args[1] = 5;
+    args[2] = 6;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .share;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0, .type_hint = null } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .ret = .{ .value = null } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .trivial, .trivial, .owned, .trivial, .trivial,
+    });
+    var function = ir.Function{
+        .id = 700,
+        .name = "Mod__stale_id_guard__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 7,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    // Capture the instruction count the analyzer would have recorded
+    // BEFORE any mutation, exactly as `computeArcOwnership` stamps
+    // `record_count`. A real analysis would also populate
+    // `last_use_sites`; the count is the load-bearing field for the
+    // consistency invariant, so the synthetic table mirrors it.
+    const pre_count = arc_liveness.countInstructionRecords(&function);
+    try std.testing.expectEqual(@as(usize, 5), pre_count);
+
+    var stale_ownership: arc_liveness.ArcOwnership = .{};
+    defer stale_ownership.deinit(arena);
+    try stale_ownership.last_use_map.put(arena, 0, 1);
+    stale_ownership.record_count = pre_count;
+
+    // A positional consumer walking the PRE-mutation IR matches.
+    try std.testing.expect(arc_liveness.consumerWalkMatches(&stale_ownership, pre_count));
+
+    try rewriteOwnedConsumeBuiltinSites(arena, &function, &stale_ownership);
+
+    // The rewrite dropped the release: the count is now strictly lower.
+    const post_count = arc_liveness.countInstructionRecords(&function);
+    try std.testing.expectEqual(@as(usize, 4), post_count);
+    try std.testing.expect(post_count != pre_count);
+
+    // THE BUG: an id-consuming pass (e.g. classify's StreamRewriter)
+    // walking the post-mutation IR arrives at `post_count`, but the
+    // stale table still records `pre_count`. The keys are desynced.
+    try std.testing.expect(!arc_liveness.consumerWalkMatches(&stale_ownership, post_count));
+
+    // THE FIX: a table recomputed against the post-mutation IR records
+    // `post_count`, so the same id-consuming walk is back in sync.
+    var fresh_ownership: arc_liveness.ArcOwnership = .{};
+    defer fresh_ownership.deinit(arena);
+    fresh_ownership.record_count = post_count;
+    try std.testing.expect(arc_liveness.consumerWalkMatches(&fresh_ownership, post_count));
+}
+
+test "arc_ownership: borrow->copy expansion in builtin consume rewrite grows instruction count" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // `List.push(list, value)` always consumes its element argument.
+    // When the element is a borrowed alias of a lifetime-extended cell,
+    // the rewrite expands the `borrow_value` into `copy_value`+`retain`
+    // (two instructions where there was one), so the count GROWS — the
+    // `+K` insertion-shift direction the audit flags as the structurally
+    // unsound side of the desync.
+    //   [0] param_get %0        (the list receiver; borrowed param)
+    //   [1] param_get %1        (the source cell; owned param, extended)
+    //   [2] borrow_value %2 <- %1
+    //   [3] call_builtin "List.push" args=[%0, %2] dest=%3
+    //   [4] ret
+    const push_args = try arena.alloc(ir.LocalId, 2);
+    push_args[0] = 0;
+    push_args[1] = 2;
+    const push_modes = try arena.alloc(ir.ValueMode, 2);
+    push_modes[0] = .borrow;
+    push_modes[1] = .borrow;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .borrow_value = .{ .dest = 2, .source = 1 } },
+        .{ .call_builtin = .{
+            .dest = 3,
+            .name = "List.push",
+            .args = push_args,
+            .arg_modes = push_modes,
+        } },
+        .{ .ret = .{ .value = null } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .borrowed, .owned, .borrowed, .owned,
+    });
+    const params = try arena.dupe(ir.Param, &[_]ir.Param{
+        .{ .name = "list", .type_expr = .void, .type_id = null },
+        .{ .name = "value", .type_expr = .void, .type_id = null },
+    });
+    const param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{ .borrowed, .owned });
+    var function = ir.Function{
+        .id = 701,
+        .name = "Mod__push_borrow_copy__1",
+        .scope_id = 0,
+        .arity = 2,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    const pre_count = arc_liveness.countInstructionRecords(&function);
+    try std.testing.expectEqual(@as(usize, 5), pre_count);
+
+    var stale_ownership: arc_liveness.ArcOwnership = .{};
+    defer stale_ownership.deinit(arena);
+    stale_ownership.record_count = pre_count;
+
+    try rewriteOwnedConsumeBuiltinSites(arena, &function, &stale_ownership);
+
+    // borrow_value -> copy_value + retain: count grew by one.
+    const post_count = arc_liveness.countInstructionRecords(&function);
+    try std.testing.expectEqual(@as(usize, 6), post_count);
+    try std.testing.expect(post_count > pre_count);
+
+    // Stale table desynced in the growth direction too.
+    try std.testing.expect(!arc_liveness.consumerWalkMatches(&stale_ownership, post_count));
+}

@@ -394,13 +394,45 @@ pub fn countInstructionRecords(function: *const ir.Function) usize {
     return counter.count;
 }
 
-/// Debug-only assertion (Audit R1): an id-mirroring consumer that walked
-/// `function` and arrived at `consumer_next_id` must have visited exactly
-/// as many instructions as the analyzer recorded. A mismatch proves the
-/// consumer's structural traversal diverged from `flattenChildren` (the
-/// historical `union_switch.else_instrs` skip), so its InstructionId keys
-/// are desynchronized and its drop/move/uniqueness decisions are
-/// mis-keyed. Fails loudly here instead of silently miscompiling.
+/// Non-panicking peer of `assertConsumerWalkMatches`: returns `true`
+/// when an id-mirroring consumer's final `next_id` matches the analyzer
+/// record count this ownership table was built against, and `true`
+/// (vacuously) when `record_count` is null (synthetic unit-test table
+/// with no analyzer flatten to mirror). Returns `false` only on a
+/// genuine desync. Exposed so tests can assert the consistency invariant
+/// without tripping the debug panic.
+///
+/// A `false` result has two distinct root causes, both fatal to the
+/// consumer's InstructionId keys:
+///   1. Structural traversal drift — the consumer recurses into a
+///      different sub-stream set than `flattenChildren` (the historical
+///      `union_switch.else_instrs` skip; Audit R1 / arc-own-1--01).
+///   2. Stale ownership table — the table was computed against an IR
+///      shape with a different instruction count than the one the
+///      consumer is now walking, because a count-mutating rewrite ran
+///      between the analysis and this consumer without an intervening
+///      recompute (Audit arc-own-1--02). The consumer walks the mutated
+///      IR (different `next_id`) while keying into last-use data built
+///      for the pre-mutation IR.
+pub fn consumerWalkMatches(
+    ownership: *const ArcOwnership,
+    consumer_next_id: usize,
+) bool {
+    const expected = ownership.record_count orelse return true;
+    return consumer_next_id == expected;
+}
+
+/// Debug-only assertion (Audit R1 + arc-own-1--02): an id-mirroring
+/// consumer that walked `function` and arrived at `consumer_next_id`
+/// must have visited exactly as many instructions as the analyzer
+/// recorded into the ownership table it is consuming. A mismatch proves
+/// either that the consumer's structural traversal diverged from
+/// `flattenChildren` (the historical `union_switch.else_instrs` skip) or
+/// that the ownership table is stale relative to the current IR (a
+/// count-mutating rewrite ran without an intervening recompute). In
+/// both cases the consumer's InstructionId keys are desynchronized and
+/// its drop/move/uniqueness decisions are mis-keyed. Fails loudly here
+/// instead of silently miscompiling.
 ///
 /// No-op in release builds (`std.debug.assert` compiles out), so it adds
 /// zero cost to shipped binaries. Also a no-op when `record_count` is
@@ -411,8 +443,7 @@ pub fn assertConsumerWalkMatches(
     ownership: *const ArcOwnership,
     consumer_next_id: usize,
 ) void {
-    const expected = ownership.record_count orelse return;
-    std.debug.assert(consumer_next_id == expected);
+    std.debug.assert(consumerWalkMatches(ownership, consumer_next_id));
 }
 
 /// Predicate signature accepted by `computeArcOwnership`. Phases 1-2
