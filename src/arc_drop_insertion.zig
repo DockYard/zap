@@ -1145,18 +1145,31 @@ fn relocateDropsInTopLevelStream(
 
     // A plain `.release` (a `List`/`Map`/indirect-storage owner) is only safe
     // to relocate when its value cannot be read again after the proposed
-    // last-use point through a path the top-level last-use scan cannot see:
-    // chiefly a `shareAnyPersistent` deep-clone (GAP-B clone-on-share / a
-    // recursive struct stored into another owner) that follows the value's
-    // children. The provably-safe condition is that the dropped local is
-    // PURELY LOCALLY CONSUMED in this stream — never embedded into an
-    // aggregate (`struct_init`/`list_init`/…), never the source of a
-    // `share_value` or a persistent / box-share `retain`, and the pre-drop
-    // region is straight-line (no nested sub-streams that could host a hidden
-    // use). A boxed-existential drop (`.protocol_box_drop`) is always
-    // relocatable: each owner holds an INDEPENDENT box (transient borrows are
-    // `protocol_box_retain`, persistent shares clone via `protocol_box_share`),
-    // so freeing the box after its last use cannot dangle another owner.
+    // last-use point through a path the last-use scan cannot see: chiefly a
+    // `shareAnyPersistent` deep-clone (GAP-B clone-on-share / a recursive
+    // struct stored into another owner) that follows the value's children.
+    // The provably-safe condition is that the dropped local is PURELY LOCALLY
+    // CONSUMED in this stream — never embedded into an aggregate
+    // (`struct_init`/`list_init`/…), never the source of a `share_value` or a
+    // persistent / box-share `retain` — AND the pre-drop region is
+    // straight-line. `localIsEmbeddedOrShared` is a TOP-LEVEL scan; the
+    // straight-line guard (no nested sub-streams) is what keeps it sufficient
+    // for the plain path, since a hidden deep-clone could otherwise hide in an
+    // arm the scan never visits.
+    //
+    // A boxed-existential drop (`.protocol_box_drop`) is exempt from BOTH the
+    // straight-line and embedded-or-shared guards. The deep-clone hazard those
+    // guards defend against does not apply: each box owner is INDEPENDENT
+    // (transient borrows are `protocol_box_retain`, persistent / aggregate
+    // shares clone the inner via `protocol_box_share`), so freeing a box after
+    // its OWN last use can never dangle another owner. The one remaining
+    // hazard — freeing the box before a LATER use of the box itself inside a
+    // nested arm — is handled by `lastUseInPreDropRegion`, which recurses
+    // through every nested sub-stream (audit arc-drop-verify--02): a use in an
+    // `if`/`case` arm is reported at the enclosing branch's top-level index, so
+    // the drop relocates to AFTER the branch and the box stays live across it.
+    // This is why the box exemption is sound for branchy regions without the
+    // straight-line guard, while preserving the relocation optimization.
     const region_is_straight_line = streamRegionIsStraightLine(stream[0..drop_run_start]);
 
     for (stream[drop_run_start..terminator_index]) |drop_instr| {
@@ -1176,8 +1189,11 @@ fn relocateDropsInTopLevelStream(
         if (last_use) |use_index| {
             try relocations.append(allocator, .{ .drop = drop_instr, .after_index = use_index });
         } else {
-            // No top-level use found (unused owned local, or last use in a
-            // nested sub-stream / the terminator args). Leave at scope exit.
+            // No use found anywhere in the pre-drop region (an unused owned
+            // local, or its only uses are in the terminator args). Leave the
+            // drop at scope exit. A use nested inside a branch/case arm is NOT
+            // this case: `lastUseInPreDropRegion` reports it at the enclosing
+            // top-level index, pinning the drop after the branch.
             try kept_drops.append(allocator, drop_instr);
         }
     }
@@ -1278,15 +1294,111 @@ fn localIsEmbeddedOrShared(region: []const ir.Instruction, local: ir.LocalId) bo
     return false;
 }
 
+/// Grow `closure` by one forward alias pass over `instr` and every NESTED
+/// sub-stream it hosts: any ownership-neutral copy
+/// (`copy_value`/`borrow_value`/`local_get`/`move_value`/`share_value`) whose
+/// SOURCE is already in the closure adds its DEST. Recurses through all child
+/// streams via the canonical `ir.forEachChildStream` so an alias created
+/// inside a branch/case arm (e.g. a `copy_value` of the box in an `if`
+/// then-arm) is tracked — closing the gap that made `lastUseInPreDropRegion`
+/// top-level-only (audit arc-drop-verify--02). Sets `changed` true when it
+/// added at least one new member. Errors propagate (no swallowed OOM).
+fn growAliasClosureThroughInstruction(
+    allocator: std.mem.Allocator,
+    instr: *const ir.Instruction,
+    closure: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+    changed: *bool,
+) error{OutOfMemory}!void {
+    const alias: ?struct { src: ir.LocalId, dest: ir.LocalId } = switch (instr.*) {
+        .copy_value => |x| .{ .src = x.source, .dest = x.dest },
+        .borrow_value => |x| .{ .src = x.source, .dest = x.dest },
+        .local_get => |x| .{ .src = x.source, .dest = x.dest },
+        .move_value => |x| .{ .src = x.source, .dest = x.dest },
+        .share_value => |x| .{ .src = x.source, .dest = x.dest },
+        else => null,
+    };
+    if (alias) |a| {
+        if (closure.contains(a.src) and !closure.contains(a.dest)) {
+            try closure.put(allocator, a.dest, {});
+            changed.* = true;
+        }
+    }
+
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        closure: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+        changed: *bool,
+        err: ?error{OutOfMemory} = null,
+        fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+            if (ctx.err != null) return;
+            for (child.stream) |*nested| {
+                growAliasClosureThroughInstruction(ctx.allocator, nested, ctx.closure, ctx.changed) catch |e| {
+                    ctx.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    var ctx = Ctx{ .allocator = allocator, .closure = closure, .changed = changed };
+    ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+    if (ctx.err) |e| return e;
+}
+
+/// True when `instr`, or ANY instruction in ANY of its nested sub-streams
+/// (recursively, via `ir.forEachChildStream`), reads a local in `closure`.
+/// Used by `lastUseInPreDropRegion` to anchor a nested use of the dropped box
+/// (e.g. a dispatch inside an `if`/`case` arm) to its enclosing TOP-LEVEL
+/// instruction's index — `arc_liveness.collectUses` itself sees only an
+/// instruction's own immediate operands (for a branch op: the condition and
+/// arm RESULT locals, never the locals consumed inside an arm body).
+fn instructionOrChildrenUseClosure(
+    instr: *const ir.Instruction,
+    closure: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
+) bool {
+    var uses = arc_liveness.UseList{};
+    defer uses.deinit(std.heap.page_allocator);
+    arc_liveness.collectUses(instr.*, &uses);
+    for (uses.slice()) |used_local| {
+        if (closure.contains(used_local)) return true;
+    }
+
+    const Ctx = struct {
+        closure: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
+        found: bool = false,
+        fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+            if (ctx.found) return;
+            for (child.stream) |*nested| {
+                if (instructionOrChildrenUseClosure(nested, ctx.closure)) {
+                    ctx.found = true;
+                    return;
+                }
+            }
+        }
+    };
+    var ctx = Ctx{ .closure = closure };
+    ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+    return ctx.found;
+}
+
 /// Compute the last index in `region` (a top-level pre-drop instruction
 /// slice) at which `drop_local` or any local in its forward alias closure is
-/// used. Returns `null` when no use exists in this region (the local's uses
-/// are all in nested sub-streams, or it is unused).
+/// used — INCLUDING uses nested inside that index's sub-streams. Returns
+/// `null` when no use exists in this region (the local is unused before the
+/// drop run).
 ///
 /// The forward alias closure follows ownership-neutral copies
 /// (`copy_value`/`borrow_value`/`local_get`/`move_value`/`share_value`): a
 /// box parked in `add5` is read only by a `copy_value` whose result feeds the
 /// dispatch call, so the box's effective extent is that of the copy.
+///
+/// Both the alias closure and the use scan recurse through nested sub-streams
+/// (audit arc-drop-verify--02). A use inside a branch/case arm is reported at
+/// the index of its ENCLOSING top-level instruction (the whole `if_expr` /
+/// `case_block`), so the caller relocates the drop to AFTER that branch — the
+/// box stays live across the entire conditional and is never freed before an
+/// arm reads it. This makes the box-relocation optimization SOUND for branchy
+/// regions instead of relying on the unconditional `kind == .protocol_box_drop`
+/// exemption (which freed the box ahead of a nested last use).
 fn lastUseInPreDropRegion(
     allocator: std.mem.Allocator,
     region: []const ir.Instruction,
@@ -1296,40 +1408,22 @@ fn lastUseInPreDropRegion(
     defer closure.deinit(allocator);
     try closure.put(allocator, drop_local, {});
 
-    // Grow the alias closure to a fixed point. Forward pass each iteration:
-    // any copy whose SOURCE is in the closure adds its DEST.
+    // Grow the alias closure to a fixed point, walking top-level AND nested
+    // instructions each iteration so aliases created inside arms are seen.
     var changed = true;
     while (changed) {
         changed = false;
-        for (region) |instr| {
-            const alias: ?struct { src: ir.LocalId, dest: ir.LocalId } = switch (instr) {
-                .copy_value => |x| .{ .src = x.source, .dest = x.dest },
-                .borrow_value => |x| .{ .src = x.source, .dest = x.dest },
-                .local_get => |x| .{ .src = x.source, .dest = x.dest },
-                .move_value => |x| .{ .src = x.source, .dest = x.dest },
-                .share_value => |x| .{ .src = x.source, .dest = x.dest },
-                else => null,
-            };
-            if (alias) |a| {
-                if (closure.contains(a.src) and !closure.contains(a.dest)) {
-                    try closure.put(allocator, a.dest, {});
-                    changed = true;
-                }
-            }
+        for (region) |*instr| {
+            try growAliasClosureThroughInstruction(allocator, instr, &closure, &changed);
         }
     }
 
-    // Scan for the last instruction whose use set intersects the closure.
+    // Scan for the last top-level instruction whose use set — including the
+    // use sets of every nested sub-stream it hosts — intersects the closure.
     var last_use: ?usize = null;
-    for (region, 0..) |instr, idx| {
-        var uses = arc_liveness.UseList{};
-        defer uses.deinit(std.heap.page_allocator);
-        arc_liveness.collectUses(instr, &uses);
-        for (uses.slice()) |used_local| {
-            if (closure.contains(used_local)) {
-                last_use = idx;
-                break;
-            }
+    for (region, 0..) |*instr, idx| {
+        if (instructionOrChildrenUseClosure(instr, &closure)) {
+            last_use = idx;
         }
     }
     return last_use;
