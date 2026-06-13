@@ -3322,6 +3322,13 @@ fn addAnalysisSummaryEdgesFromInstructions(
                 for (value.cases) |case| {
                     try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, policy, callers_by_callee);
                 }
+                // The catch-all `_` prong can call functions whose summaries
+                // the caller's final IR depends on; without this edge a
+                // callee invoked only from the else arm is not marked dirty
+                // when its summary changes → stale incremental rebuild.
+                if (value.has_else) {
+                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.else_instrs, policy, callers_by_callee);
+                }
             },
             .union_switch_return => |value| {
                 for (value.cases) |case| {
@@ -6891,6 +6898,13 @@ fn addCallEdgesFromInstructions(
                 for (value.cases) |case| {
                     try addCallEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, callers_by_callee);
                 }
+                // A callee invoked only from the catch-all `_` prong must
+                // still register a reverse call edge, or it will not be
+                // marked dirty when its signature/summary changes →
+                // stale incremental rebuild.
+                if (value.has_else) {
+                    try addCallEdgesFromInstructions(alloc, program, caller_id, value.else_instrs, callers_by_callee);
+                }
             },
             .union_switch_return => |value| {
                 for (value.cases) |case| {
@@ -10177,6 +10191,28 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
                 std.debug.print(":\n", .{});
                 dumpStream(od.struct_instrs, indent + 4);
             },
+            .union_switch => |us| {
+                for (us.cases, 0..) |c, ci| {
+                    std.debug.print("{s}  case[{d}] {s}:\n", .{ spaces[0..used], ci, c.variant_name });
+                    dumpStream(c.body_instrs, indent + 4);
+                }
+                if (us.has_else) {
+                    std.debug.print("{s}  else:\n", .{spaces[0..used]});
+                    dumpStream(us.else_instrs, indent + 4);
+                }
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases, 0..) |c, ci| {
+                    std.debug.print("{s}  case[{d}] {s}:\n", .{ spaces[0..used], ci, c.variant_name });
+                    dumpStream(c.body_instrs, indent + 4);
+                }
+            },
+            .try_call_named => |tcn| {
+                std.debug.print("{s}  handler:\n", .{spaces[0..used]});
+                dumpStream(tcn.handler_instrs, indent + 4);
+                std.debug.print("{s}  success:\n", .{spaces[0..used]});
+                dumpStream(tcn.success_instrs, indent + 4);
+            },
             else => {},
         }
     }
@@ -13456,4 +13492,101 @@ test "Phase 2 memory adapters: runtime rewrite cache separates refcount sized ex
     try std.testing.expect(sized_src.ptr != unsized_src.ptr);
     try std.testing.expect(std.mem.indexOf(u8, sized_src, "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = true;") != null);
     try std.testing.expect(std.mem.indexOf(u8, unsized_src, "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = false;") != null);
+}
+
+// GAP-P1-04: a callee invoked only from a `union_switch` catch-all `_`
+// prong (`else_instrs`) must still produce a reverse call-graph edge, or
+// the incremental dependency graph misses it and the caller is not
+// rebuilt when the callee changes. Pre-fix `addCallEdgesFromInstructions`
+// iterated only `cases`, so the edge was absent.
+test "GAP-P1-04: dependency graph records edge for callee in union_switch else_instrs" {
+    const alloc = std.testing.allocator;
+
+    // caller (id 0) body:
+    //   union_switch %scrutinee {
+    //     case SomeVariant -> { (no call) }
+    //     _ -> { call_named "callee" }
+    //   }
+    const else_instrs = [_]ir.Instruction{
+        .{ .call_named = .{
+            .dest = 9,
+            .name = "callee",
+            .args = &.{},
+            .arg_modes = &.{},
+        } },
+    };
+    const case_body = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 8, .value = 0 } },
+    };
+    const cases = [_]ir.UnionCase{
+        .{
+            .variant_name = "SomeVariant",
+            .field_bindings = &.{},
+            .body_instrs = &case_body,
+            .return_value = null,
+        },
+    };
+    const caller_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 1, .index = 0 } },
+        .{ .union_switch = .{
+            .dest = 0,
+            .scrutinee = 1,
+            .cases = &cases,
+            .else_instrs = &else_instrs,
+            .else_result = null,
+            .has_else = true,
+        } },
+        .{ .ret = .{ .value = null } },
+    };
+    const caller_blocks = [_]ir.Block{.{ .label = 0, .instructions = &caller_instrs }};
+
+    const callee_instrs = [_]ir.Instruction{
+        .{ .ret = .{ .value = null } },
+    };
+    const callee_blocks = [_]ir.Block{.{ .label = 0, .instructions = &callee_instrs }};
+
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "caller",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{.{ .name = "scrutinee", .type_expr = .any }},
+            .return_type = .void,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "callee",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .void,
+            .body = &callee_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var callers_by_callee = std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)).init(alloc);
+    defer {
+        var it = callers_by_callee.valueIterator();
+        while (it.next()) |list| list.deinit(alloc);
+        callers_by_callee.deinit();
+    }
+
+    try addCallEdgesFromInstructions(alloc, program, 0, &caller_instrs, &callers_by_callee);
+
+    // callee (id 1) must list caller (id 0) as a caller. Pre-fix the
+    // else-arm call was never walked, so callee had no entry at all.
+    const callee_callers = callers_by_callee.get(1);
+    try std.testing.expect(callee_callers != null);
+    var saw_caller = false;
+    for (callee_callers.?.items) |caller_id| {
+        if (caller_id == 0) saw_caller = true;
+    }
+    try std.testing.expect(saw_caller);
 }
