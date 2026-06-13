@@ -3760,3 +3760,126 @@ test "Phase E.5 Gap 6: isBorrowedParameterLocal works when param_get is allocate
     // numerical LocalId.
     try std.testing.expect(isBorrowedParameterLocal(fn_with_binding, param_dest.?));
 }
+
+test "arc-drop-verify--02: protocol_box_drop is NOT relocated above an if_expr that uses the box in an arm" {
+    // Regression for arc-drop-verify--02. A boxed-existential
+    // (`.protocol_box_drop`) owner is used at top level (its last TOP-LEVEL
+    // use) and AGAIN inside an `if_expr` arm (its TRUE last use). The arm's
+    // use is invisible to `arc_liveness.collectUses` (which collects only the
+    // condition + arm RESULT locals, never the locals used inside an arm
+    // body). Before the fix the box drop was made relocatable unconditionally
+    // and relocated to its last top-level use — ABOVE the `if_expr` — so the
+    // arm read a freed vtable-bearing box (use-after-free under
+    // Memory.Tracking). The drop must stay AT OR AFTER the branch.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Locals: 0 = the boxed-existential owner (`add5`). 1 = condition.
+    // Branch-arm body: copy the box into a transient (2) and dispatch on it
+    // (3). The arm's result is a fresh int (4) so collectUses(if_expr) yields
+    // only {condition, then_result, else_result} — never local 0.
+    const then_instrs = try arena.alloc(ir.Instruction, 3);
+    then_instrs[0] = .{ .copy_value = .{ .dest = 2, .source = 0 } };
+    then_instrs[1] = .{ .call_dispatch = .{ .dest = 3, .group_id = 0, .args = &.{2}, .arg_modes = &.{} } };
+    then_instrs[2] = .{ .const_int = .{ .dest = 4, .value = 0 } };
+
+    const else_instrs = try arena.alloc(ir.Instruction, 1);
+    else_instrs[0] = .{ .const_int = .{ .dest = 5, .value = 0 } };
+
+    const stream = try arena.alloc(ir.Instruction, 5);
+    // Top-level dispatch of the box: copy into a transient (6) then dispatch.
+    // This is the box's last TOP-LEVEL use.
+    stream[0] = .{ .copy_value = .{ .dest = 6, .source = 0 } };
+    stream[1] = .{ .call_dispatch = .{ .dest = 7, .group_id = 0, .args = &.{6}, .arg_modes = &.{} } };
+    // The branch whose then-arm dispatches the box again (its true last use).
+    stream[2] = .{ .if_expr = .{
+        .dest = 8,
+        .condition = 1,
+        .then_instrs = then_instrs,
+        .then_result = 4,
+        .else_instrs = else_instrs,
+        .else_result = 5,
+    } };
+    // Scope-exit drop run (single boxed-existential drop) + terminator.
+    stream[3] = .{ .release = .{ .value = 0, .kind = .protocol_box_drop, .protocol_name = "Callable" } };
+    stream[4] = .{ .ret = .{ .value = 8 } };
+
+    const result = try relocateDropsInTopLevelStream(arena, stream);
+    // Either the stream is unchanged (drop kept at scope exit — null) or it
+    // was rebuilt. In both cases the `.protocol_box_drop` of local 0 must
+    // appear AT OR AFTER the `if_expr`, never before it.
+    const final_stream = result orelse stream;
+
+    var if_index: ?usize = null;
+    var drop_index: ?usize = null;
+    for (final_stream, 0..) |instr, idx| {
+        switch (instr) {
+            .if_expr => if_index = idx,
+            .release => |r| {
+                if (r.value == 0 and r.kind == .protocol_box_drop) drop_index = idx;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(if_index != null);
+    try std.testing.expect(drop_index != null);
+    // The box's drop must NOT be relocated above the branch that uses it.
+    try std.testing.expect(drop_index.? > if_index.?);
+}
+
+test "arc-drop-verify--02: protocol_box_drop IS still relocated to a top-level last use when no branch uses the box" {
+    // The fix must PRESERVE the optimization where it is safe. With a
+    // straight-line region (and no nested use of the box), the box drop is
+    // relocated to immediately after its last top-level use — exactly as
+    // before. This guards against the over-conservative "any branch present
+    // pins the drop" regression: here a branch exists but does NOT use the
+    // box, so relocation to the top-level last use is still sound.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Branch arm that does NOT reference the box (local 0).
+    const then_instrs = try arena.alloc(ir.Instruction, 1);
+    then_instrs[0] = .{ .const_int = .{ .dest = 4, .value = 1 } };
+    const else_instrs = try arena.alloc(ir.Instruction, 1);
+    else_instrs[0] = .{ .const_int = .{ .dest = 5, .value = 0 } };
+
+    const stream = try arena.alloc(ir.Instruction, 5);
+    stream[0] = .{ .copy_value = .{ .dest = 6, .source = 0 } };
+    stream[1] = .{ .call_dispatch = .{ .dest = 7, .group_id = 0, .args = &.{6}, .arg_modes = &.{} } };
+    stream[2] = .{ .if_expr = .{
+        .dest = 8,
+        .condition = 1,
+        .then_instrs = then_instrs,
+        .then_result = 4,
+        .else_instrs = else_instrs,
+        .else_result = 5,
+    } };
+    stream[3] = .{ .release = .{ .value = 0, .kind = .protocol_box_drop, .protocol_name = "Callable" } };
+    stream[4] = .{ .ret = .{ .value = 8 } };
+
+    const result = try relocateDropsInTopLevelStream(arena, stream);
+    // The box's last use is the top-level dispatch (index 1). Relocation must
+    // move the drop to immediately after it — i.e. BEFORE the (box-free)
+    // if_expr — which proves the optimization is preserved.
+    try std.testing.expect(result != null);
+    const final_stream = result.?;
+
+    var if_index: ?usize = null;
+    var drop_index: ?usize = null;
+    for (final_stream, 0..) |instr, idx| {
+        switch (instr) {
+            .if_expr => if_index = idx,
+            .release => |r| {
+                if (r.value == 0 and r.kind == .protocol_box_drop) drop_index = idx;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(if_index != null);
+    try std.testing.expect(drop_index != null);
+    // Drop relocated ABOVE the branch (the box is not used in it).
+    try std.testing.expect(drop_index.? < if_index.?);
+}

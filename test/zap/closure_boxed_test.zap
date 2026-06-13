@@ -43,6 +43,45 @@ pub struct Zap.ClosureBoxedTest {
       assert(f1(10) == 15)
     }
 
+    test("boxed closure used inside an if arm is not freed before the branch") {
+      # arc-drop-verify--02 regression — a boxed `Callable` closure (`add5`)
+      # whose scope-exit `.protocol_box_drop` was made relocatable
+      # UNCONDITIONALLY and then relocated to its last TOP-LEVEL use using a
+      # last-use scan that could not see nested sub-streams. The box is
+      # dispatched at top level (`add5(10)`, its last top-level use) and AGAIN
+      # inside an `if` arm. The branch-arm dispatch is the box's true last
+      # use, but it is invisible to the top-level scan, so before the fix the
+      # drop was relocated above the branch and the arm read a freed
+      # vtable-bearing box (use-after-free under `Memory.Tracking`). The drop
+      # must stay at scope exit (the box outlives the branch); the results
+      # must be correct and the net live-allocation delta zero.
+      assert_no_leaks {
+        add5 = Zap.ClosureFactory.make_adder(5)
+        top = add5(10)
+        assert(top == 15)
+        branch = if top == 15 { add5(2) } else { 0 }
+        assert(branch == 7)
+      }
+    }
+
+    test("boxed closure used inside a case arm is not freed before the case") {
+      # arc-drop-verify--02 regression (case form) — same root cause as the
+      # `if` variant, exercising `case_block` nested arm bodies, whose uses
+      # `collectUses` likewise excludes (only the arm RESULT locals are
+      # collected, never the locals used INSIDE the arm body). The box's last
+      # use is the dispatch inside the matched arm.
+      assert_no_leaks {
+        add5 = Zap.ClosureFactory.make_adder(5)
+        top = add5(10)
+        assert(top == 15)
+        branch = case top {
+          15 -> add5(3)
+          _ -> 0
+        }
+        assert(branch == 8)
+      }
+    }
+
     test("boxed closure environment is released exactly once (no leak)") {
       # FCC Phase 2 — proves the leak subsystem now covers boxed `Callable`
       # closures: a capturing closure (its boxed environment) and a
