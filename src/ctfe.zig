@@ -978,6 +978,17 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
             hasher.update(v.name);
             hashLocalIds(hasher, v.args);
             for (v.arg_modes) |mode| hasher.update(&[_]u8{@intFromEnum(mode)});
+            // The handler and success continuation bodies are part of the
+            // instruction's identity: two try_call_named instructions
+            // differing only in those bodies (or their result/payload
+            // bindings) must hash distinctly, or a CTFE memo cache returns
+            // the wrong cached comptime result.
+            hasher.update(std.mem.asBytes(&v.input_local));
+            for (v.handler_instrs) |nested| hashInstruction(hasher, nested);
+            if (v.handler_result) |hr| hasher.update(std.mem.asBytes(&hr));
+            for (v.success_instrs) |nested| hashInstruction(hasher, nested);
+            if (v.success_result) |sr| hasher.update(std.mem.asBytes(&sr));
+            if (v.payload_local) |pl| hasher.update(std.mem.asBytes(&pl));
         },
         .call_closure => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
@@ -1092,6 +1103,13 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
                 for (case.body_instrs) |nested| hashInstruction(hasher, nested);
                 if (case.return_value) |rv| hasher.update(std.mem.asBytes(&rv));
             }
+            // The catch-all `_` prong is part of the instruction's identity:
+            // two union_switches differing only in `else_instrs`/`else_result`
+            // must hash distinctly, or a CTFE memo cache returns the wrong
+            // cached comptime result.
+            hasher.update(std.mem.asBytes(&v.has_else));
+            for (v.else_instrs) |nested| hashInstruction(hasher, nested);
+            if (v.else_result) |er| hasher.update(std.mem.asBytes(&er));
         },
         .optional_dispatch => |v| {
             hasher.update(std.mem.asBytes(&v.scrutinee_param));
@@ -2911,6 +2929,15 @@ pub const Interpreter = struct {
                         return .continued;
                     }
                 }
+                // No explicit variant matched: fall into the catch-all `_`
+                // prong (`else_instrs` / `else_result`) when present, exactly
+                // like the runtime `union_switch` lowering. Only when there
+                // is no catch-all is this a genuine match failure.
+                if (us.has_else) {
+                    const result = try self.execBranch(us.else_instrs, us.else_result, frame);
+                    frame.setLocal(us.dest, result);
+                    return .continued;
+                }
                 try self.emitError(.match_failure, "no matching union variant");
                 return error.CtfeFailure;
             },
@@ -2939,6 +2966,12 @@ pub const Interpreter = struct {
                         frame.setLocal(us.dest, result);
                         return .continued;
                     }
+                }
+                // Catch-all `_` prong, as on the union_val path above.
+                if (us.has_else) {
+                    const result = try self.execBranch(us.else_instrs, us.else_result, frame);
+                    frame.setLocal(us.dest, result);
+                    return .continued;
                 }
                 try self.emitError(.match_failure, "no matching struct type");
                 return error.CtfeFailure;
@@ -4398,6 +4431,39 @@ fn scanMaxLocal(instrs: []const ir.Instruction) u32 {
                     max = @max(max, scanMaxLocal(arm.cond_instrs));
                     max = @max(max, scanMaxLocal(arm.body_instrs));
                 }
+            },
+            .switch_literal => |sl| {
+                max = @max(max, @max(sl.dest, sl.scrutinee));
+                for (sl.cases) |c| max = @max(max, scanMaxLocal(c.body_instrs));
+                max = @max(max, scanMaxLocal(sl.default_instrs));
+            },
+            .switch_return => |sr| {
+                for (sr.cases) |c| max = @max(max, scanMaxLocal(c.body_instrs));
+                max = @max(max, scanMaxLocal(sr.default_instrs));
+            },
+            .union_switch => |us| {
+                max = @max(max, @max(us.dest, us.scrutinee));
+                for (us.cases) |c| max = @max(max, scanMaxLocal(c.body_instrs));
+                // The catch-all `_` prong sizes the CTFE frame too: a local
+                // defined only inside `else_instrs` would otherwise overflow
+                // the `locals` array at `frame.setLocal` during evaluation.
+                if (us.has_else) max = @max(max, scanMaxLocal(us.else_instrs));
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |c| max = @max(max, scanMaxLocal(c.body_instrs));
+            },
+            .try_call_named => |tcn| {
+                max = @max(max, tcn.dest);
+                max = @max(max, scanMaxLocal(tcn.handler_instrs));
+                max = @max(max, scanMaxLocal(tcn.success_instrs));
+            },
+            .optional_dispatch => |od| {
+                max = @max(max, od.payload_local);
+                max = @max(max, scanMaxLocal(od.nil_instrs));
+                max = @max(max, scanMaxLocal(od.struct_instrs));
+            },
+            .guard_block => |gb| {
+                max = @max(max, scanMaxLocal(gb.body));
             },
             .ret => |r| if (r.value) |v| {
                 max = @max(max, v);
@@ -9108,4 +9174,157 @@ test "capability: runtime-only builtins fail at compile time" {
     const arg_result = interp.evalFunction(0, &.{});
     try testing.expectError(error.CtfeFailure, arg_result);
     try testing.expectEqual(CtfeErrorKind.capability_violation, interp.errors.items[0].kind);
+}
+
+// GAP-P1-05: a comptime-evaluated `case` over a union whose runtime value
+// matches none of the explicit variants must fall into the catch-all `_`
+// prong (`else_instrs` / `else_result`) instead of raising a spurious
+// "no matching union variant" compile error. Pre-fix `execUnionSwitch`
+// ignored `else_instrs`, so this errored on valid code.
+test "GAP-P1-05: comptime union_switch falls into else_instrs on no match" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // fn pick():
+    //   %0 = const_int 7
+    //   %1 = union_init MyUnion.VariantB(%0)   // not in explicit cases
+    //   union_switch %1 {
+    //     case VariantA -> { %3 = const_int 1; result %3 }
+    //     _ -> { %4 = const_int 999; result %4 }
+    //   } -> %2
+    //   ret %2
+    const case_body = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 3, .value = 1 } },
+    };
+    const cases = [_]ir.UnionCase{.{
+        .variant_name = "VariantA",
+        .field_bindings = &.{},
+        .body_instrs = &case_body,
+        .return_value = 3,
+    }};
+    const else_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 4, .value = 999 } },
+    };
+
+    const func = ir.Function{
+        .id = 0,
+        .name = "pick",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = 7 } },
+                .{ .union_init = .{
+                    .dest = 1,
+                    .union_type = "MyUnion",
+                    .variant_name = "VariantB",
+                    .value = 0,
+                } },
+                .{ .union_switch = .{
+                    .dest = 2,
+                    .scrutinee = 1,
+                    .cases = &cases,
+                    .else_instrs = &else_instrs,
+                    .else_result = 4,
+                    .has_else = true,
+                } },
+                .{ .ret = .{ .value = 2 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const result = try interp.evalFunction(0, &.{});
+    try testing.expectEqual(@as(i64, 999), result.int);
+}
+
+fn hashOneInstruction(instr: ir.Instruction) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hashInstruction(&hasher, instr);
+    return hasher.final();
+}
+
+// GAP-P1-06: two `union_switch` instructions that differ ONLY in their
+// catch-all `_` prong (`else_instrs` / `else_result`) must hash to
+// distinct values, or a CTFE memoization cache keyed on this hash returns
+// the wrong cached comptime result. Pre-fix `hashInstruction` omitted the
+// else prong entirely, so these collided.
+test "GAP-P1-06: union_switch hash distinguishes else_instrs" {
+    const shared_case = [_]ir.UnionCase{.{
+        .variant_name = "SomeVariant",
+        .field_bindings = &.{},
+        .body_instrs = &.{.{ .const_int = .{ .dest = 5, .value = 1 } }},
+        .return_value = 5,
+    }};
+
+    const else_a = [_]ir.Instruction{.{ .const_int = .{ .dest = 6, .value = 100 } }};
+    const else_b = [_]ir.Instruction{.{ .const_int = .{ .dest = 6, .value = 200 } }};
+
+    const switch_a = ir.Instruction{ .union_switch = .{
+        .dest = 0,
+        .scrutinee = 1,
+        .cases = &shared_case,
+        .else_instrs = &else_a,
+        .else_result = 6,
+        .has_else = true,
+    } };
+    const switch_b = ir.Instruction{ .union_switch = .{
+        .dest = 0,
+        .scrutinee = 1,
+        .cases = &shared_case,
+        .else_instrs = &else_b,
+        .else_result = 6,
+        .has_else = true,
+    } };
+
+    try testing.expect(hashOneInstruction(switch_a) != hashOneInstruction(switch_b));
+
+    // A union_switch with no catch-all must also differ from one that has
+    // one, even when the explicit cases are identical.
+    const switch_no_else = ir.Instruction{ .union_switch = .{
+        .dest = 0,
+        .scrutinee = 1,
+        .cases = &shared_case,
+    } };
+    try testing.expect(hashOneInstruction(switch_a) != hashOneInstruction(switch_no_else));
+}
+
+// GAP-P1-06 (try-body coverage): two `try_call_named` instructions that
+// differ ONLY in their handler/success continuation bodies must hash to
+// distinct values. Pre-fix `hashInstruction` hashed only the call shape
+// (dest/name/args/modes), so differing bodies collided.
+test "GAP-P1-06: try_call_named hash distinguishes handler/success bodies" {
+    const handler_a = [_]ir.Instruction{.{ .const_int = .{ .dest = 2, .value = 1 } }};
+    const handler_b = [_]ir.Instruction{.{ .const_int = .{ .dest = 2, .value = 9 } }};
+
+    const try_a = ir.Instruction{ .try_call_named = .{
+        .dest = 0,
+        .name = "step__try",
+        .args = &.{1},
+        .arg_modes = &.{.move},
+        .input_local = 1,
+        .handler_instrs = &handler_a,
+        .handler_result = 2,
+    } };
+    const try_b = ir.Instruction{ .try_call_named = .{
+        .dest = 0,
+        .name = "step__try",
+        .args = &.{1},
+        .arg_modes = &.{.move},
+        .input_local = 1,
+        .handler_instrs = &handler_b,
+        .handler_result = 2,
+    } };
+
+    try testing.expect(hashOneInstruction(try_a) != hashOneInstruction(try_b));
 }
