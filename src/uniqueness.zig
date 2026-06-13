@@ -265,19 +265,29 @@ pub fn analyzeUniquenessFullEx(
 
     errdefer analyzer.result.deinit(allocator);
 
+    // arc-own-1--02: when a non-null `ownership` table is supplied, the
+    // analyzer keys `ownership.isLastUseAt(local, my_id)` (the
+    // index_get-destructure and list_cons tail-consume paths) by
+    // InstructionIds it reconstructs positionally while walking
+    // `function`. That is sound only when `ownership` was computed
+    // against THIS instruction count. Every production caller now
+    // recomputes ownership against the IR it passes here — the
+    // interprocedural fixpoint and the per-function rewrite run on the
+    // post-classify shape `post_ownership` matches, and all three ARC
+    // verifiers recompute fresh ownership against the IR they verify
+    // (`runArcOwnershipVerifier`, `runArcDropInsertionVerifier`,
+    // `runArcVerifier`). The P1J1 audit left this cross-check off
+    // precisely because the pre-drop verifier reused a stale table; with
+    // that verifier recompute in place the table is id-consistent here,
+    // so the assertion now guards the path. No-op in release; no-op for
+    // synthetic unit-test tables whose `record_count` is null.
+    if (ownership) |owned| {
+        arc_liveness.assertConsumerWalkMatches(owned, arc_liveness.countInstructionRecords(function));
+    }
+
     for (function.body) |block| {
         try analyzer.walkStream(block.instructions);
     }
-
-    // Note: a `record_count`-vs-`next_id` cross-check is intentionally NOT
-    // performed here. `analyzeUniquenessFullEx` is invoked both on the IR
-    // snapshot the ownership table was computed from AND, later, by the ARC
-    // verifier on post-drop-insertion IR whose instruction count has since
-    // changed (releases inserted) — so the supplied table's `record_count`
-    // need not match this walk. The canonical-enumerator id alignment is
-    // asserted at the drop-insertion site (which walks the same snapshot
-    // the ownership was computed from); see
-    // `arc_drop_insertion.insertScopeExitDrops`.
 
     return analyzer.result;
 }

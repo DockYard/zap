@@ -9464,9 +9464,9 @@ fn runArcOwnershipAndVerify(
     var uniqueness_artifacts = try computeArcUniquenessArtifacts(alloc, program, type_store, options);
     defer uniqueness_artifacts.deinit(alloc);
     if (policy.rewrite_unchecked_uniqueness) {
-        try runOptionalUncheckedUniquenessRewrite(alloc, program, &uniqueness_artifacts, options);
+        try runOptionalUncheckedUniquenessRewrite(alloc, program, &uniqueness_artifacts, type_store, options);
     }
-    try runArcOwnershipVerifier(alloc, program, &uniqueness_artifacts, options);
+    try runArcOwnershipVerifier(alloc, program, &uniqueness_artifacts, type_store, options);
 }
 
 const ArcUniquenessArtifacts = struct {
@@ -9493,14 +9493,12 @@ fn runRequiredArcOwnershipNormalization(
     options: CompileOptions,
 ) CompileError!void {
     // Phase 4 (dense Map): rewrite owned-mutating call_builtin sites
-    // (`Map.put`/`.delete`/`.merge`) at last-use BEFORE
-    // classifyAndNormalize. The pass uses `last_use_map` (computed
-    // before any IR mutation) to gate per-call-site share→move
-    // rewrites; classifyAndNormalize replaces `local_get` with
-    // `copy_value`/etc. and strips trailing `.retain` instructions,
-    // which shifts the InstructionId-by-position relationship that
-    // last_use_map keys depend on. Running here keeps the IR shape
-    // identical to the one the analyzer saw.
+    // (`Map.put`/`.delete`/`.merge`) at last-use. The pass uses
+    // `last_use_map`/`last_use_sites` (computed against the IR shape the
+    // analyzer saw) to gate per-call-site share→move rewrites, and it
+    // reconstructs the matching share's InstructionId positionally — so
+    // it must consult the SAME ownership table the analyzer built (the
+    // `ownership` argument), which still matches the pre-rewrite IR.
     //
     // The matching consume-effect for the analyzer's dataflow lives
     // in `arc_liveness.applyOwnsEffect`'s `.call_builtin` branch (it
@@ -9514,10 +9512,33 @@ fn runRequiredArcOwnershipNormalization(
         zap.arc_ownership.rewriteOwnedConsumeBuiltinSites(alloc, function, fn_ownership) catch return error.OutOfMemory;
     }
 
+    // arc-own-1--02: `rewriteOwnedConsumeBuiltinSites` is count-mutating
+    // — it drops the post-call `release` for a consumed receiver and can
+    // expand a `borrow_value` into `copy_value`+`retain`. The incoming
+    // `ownership` table was built against the PRE-rewrite IR, so its
+    // InstructionId-keyed `last_use_map`/`last_use_sites` no longer line
+    // up with the post-rewrite instruction positions. `classifyAndNormalize`
+    // reconstructs ids purely positionally and gates `move_value` vs
+    // `copy_value` on `isLastUseAt(source, local_get_id)`; consulting the
+    // stale table would mis-key every gate after the first count change
+    // (conservative copy-instead-of-move at best, an unsound move at a
+    // non-last-use read — over-release/use-after-free — at worst). Recompute
+    // ownership against the post-rewrite IR before classify so the gates key
+    // into a table whose `record_count`/last-use ids match the IR classify
+    // walks. This mirrors the recompute already done after classify in
+    // `computeArcUniquenessArtifacts` and after the whole rewrite at the
+    // pipeline level; the boundary between the builtin rewrite and classify
+    // had been missing it.
+    progressStage(options, "ARC: recomputing ownership after owned builtins", .{});
+    var post_builtin_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer post_builtin_ownership.deinit();
+
     progressStage(options, "ARC: classifying ownership", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
-        const fn_ownership = ownership.get(function.id) orelse continue;
+        const fn_ownership = post_builtin_ownership.get(function.id) orelse continue;
         zap.arc_ownership.classifyAndNormalizeWithProgram(alloc, function, fn_ownership, type_store, program) catch return error.OutOfMemory;
     }
     // Phase E.9 step 2: for each function whose param_conventions
@@ -9665,6 +9686,7 @@ fn runOptionalUncheckedUniquenessRewrite(
     alloc: std.mem.Allocator,
     program: *ir.Program,
     uniqueness_artifacts: *const ArcUniquenessArtifacts,
+    type_store: *const zap.types.TypeStore,
     options: CompileOptions,
 ) CompileError!void {
     progressStage(options, "ARC: rewriting unique call sites", .{});
@@ -9695,13 +9717,35 @@ fn runOptionalUncheckedUniquenessRewrite(
         }
         // Wrapper bypass can introduce new direct call_builtin sites
         // after the first consume rewrite has already run. Re-run the
-        // builtin consume rewrite against the post-classification
-        // ownership table so direct `List.push_owned_unchecked` /
+        // builtin consume rewrite so direct `List.push_owned_unchecked` /
         // `List.set_owned_unchecked` sites drop releases for element
         // arguments consumed by the runtime ABI.
-        if (fn_ownership) |ownership_for_function| {
-            zap.arc_ownership.rewriteOwnedConsumeBuiltinSites(alloc, function, ownership_for_function) catch return error.OutOfMemory;
-        }
+        //
+        // arc-own-1--02 (second instance): the `rewriteUncheckedUniqueness
+        // Sites*` pass above is count-mutating — it expands consumed
+        // `borrow_value` args into `copy_value`+`retain`. The
+        // `uniqueness_artifacts.post_ownership` table was computed by
+        // `computeArcUniquenessArtifacts` BEFORE that expansion, so its
+        // InstructionId-keyed `last_use_map`/`last_use_sites` no longer
+        // match this function's post-rewrite instruction positions. The
+        // re-run of `rewriteOwnedConsumeBuiltinSites` reconstructs ids
+        // positionally and gates share→move on those keys, so feeding it the
+        // stale table mis-keys the gate (the same desync the first instance
+        // exhibits before classify). Recompute this single function's
+        // ownership against its post-uniqueness-rewrite IR and feed the fresh
+        // table to the re-run. Only this function's IR changed, so the
+        // shared `post_ownership` artifact stays valid for later iterations.
+        var rerun_ownership = zap.arc_liveness.computeArcOwnershipWithProgram(
+            alloc,
+            function,
+            type_store,
+            zap.arc_liveness.defaultArcManagedTypeId,
+            program,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer rerun_ownership.deinit(alloc);
+        zap.arc_ownership.rewriteOwnedConsumeBuiltinSites(alloc, function, &rerun_ownership) catch return error.OutOfMemory;
     }
 }
 
@@ -9712,11 +9756,36 @@ fn runArcOwnershipVerifier(
     alloc: std.mem.Allocator,
     program: *const ir.Program,
     uniqueness_artifacts: *const ArcUniquenessArtifacts,
+    type_store: *const zap.types.TypeStore,
     options: CompileOptions,
 ) CompileError!void {
+    // arc-own-1--02: `verifyFull` re-invokes the per-function uniqueness
+    // analysis (`analyzeUniquenessFull`), which keys
+    // `ownership.isLastUseAt(local, id)` by positionally-reconstructed
+    // InstructionIds. `uniqueness_artifacts.post_ownership` was computed
+    // in `computeArcUniquenessArtifacts` BEFORE the optional
+    // `rewriteUncheckedUniquenessSites*` pass, which is count-mutating
+    // (borrow→copy expansion). Reusing that stale table here would
+    // mis-key the verifier's tuple-destructure last-use checks against
+    // the current IR. Recompute ownership fresh against the post-rewrite
+    // IR — matching the discipline the post-drop and post-materialize
+    // verifiers already follow (`runArcDropInsertionVerifier`,
+    // `runArcVerifier`). `signatures`/`program_uniqueness` are keyed by
+    // (function, slot), not per-instruction id, so a count change does
+    // not invalidate them; only the id-keyed ownership table needs the
+    // recompute. This is also the path the P1J1 audit explicitly left
+    // un-asserted because the table was stale here; with the recompute
+    // it is now id-consistent and the consistency assertion inside
+    // `analyzeUniquenessFullEx` (added below) holds.
+    progressStage(options, "ARC: recomputing ownership for verification", .{});
+    var verify_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer verify_ownership.deinit();
+
     progressStage(options, "ARC: verifying ownership invariants", .{});
     for (program.functions) |*function| {
-        const fn_ownership = uniqueness_artifacts.post_ownership.get(function.id);
+        const fn_ownership = verify_ownership.get(function.id);
         zap.arc_verifier.verifyFull(
             alloc,
             function,

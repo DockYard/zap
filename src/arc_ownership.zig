@@ -152,6 +152,19 @@ pub fn classifyAndNormalizeWithProgram(
 
     preclassifyBorrowedAliases(function, &use_summary);
 
+    // arc-own-1--02: the move gates below (`shouldMove`,
+    // `shouldMoveIntoAggregate`, `shouldMoveIntoOwnedConsume`) key
+    // `ownership.isLastUseAt(source, local_get_id)` by InstructionIds
+    // reconstructed positionally from the IR this pass walks. That is
+    // sound only when `ownership` was computed against THIS instruction
+    // count. A count-mutating predecessor (`rewriteOwnedConsumeBuiltin
+    // Sites`) handed a stale table would desync every gate after the
+    // first count change. Assert the table is in sync before walking so
+    // any future regression fails loudly in debug instead of silently
+    // mis-keying the move/copy decision (no-op in release; no-op for
+    // synthetic unit-test tables whose `record_count` is null).
+    arc_liveness.assertConsumerWalkMatches(ownership, arc_liveness.countInstructionRecords(function));
+
     var rewriter = StreamRewriter{
         .allocator = allocator,
         .function = function,
@@ -2317,6 +2330,18 @@ pub fn rewriteOwnedConsumeBuiltinSites(
     function: *ir.Function,
     fn_ownership: *const arc_liveness.ArcOwnership,
 ) !void {
+    // arc-own-1--02: the last-use gate at the share→move site
+    // (`fn_ownership.last_use_map.get(site.share.source) == site.id`)
+    // compares against a positionally-reconstructed InstructionId, so
+    // `fn_ownership` must have been computed against THIS instruction
+    // count. The pipeline runs this pass twice — once on the analyzer
+    // table (pre-classify) and once after the count-mutating
+    // `rewriteUncheckedUniquenessSites*`; the second run must receive a
+    // table recomputed against the post-rewrite IR. Assert the table is
+    // in sync so a stale hand-off fails loudly in debug (no-op in
+    // release; no-op for synthetic unit-test tables).
+    arc_liveness.assertConsumerWalkMatches(fn_ownership, arc_liveness.countInstructionRecords(function));
+
     var rewriter = BuiltinConsumeSiteRewriter{
         .allocator = allocator,
         .function = function,
@@ -2811,6 +2836,16 @@ fn rewriteUncheckedUniquenessSitesInternal(
     program: ?*const ir.Program,
     ownership: ?*const arc_liveness.ArcOwnership,
 ) !void {
+    // arc-own-1--02: `planListTailConsume` consults
+    // `ownership.isLastUseAt(lt.list, id)` with a positionally
+    // reconstructed id, so a non-null `ownership` table must match THIS
+    // instruction count. Assert in sync so a stale hand-off fails loudly
+    // in debug (no-op in release; skipped when `ownership` is null or a
+    // synthetic unit-test table).
+    if (ownership) |owned| {
+        arc_liveness.assertConsumerWalkMatches(owned, arc_liveness.countInstructionRecords(function));
+    }
+
     var rewriter = UncheckedUniquenessSiteRewriter{
         .allocator = allocator,
         .function = function,
