@@ -4056,12 +4056,96 @@ pub const UseList = struct {
     }
 };
 
+/// Single source of truth for the *arm-result* locals of an
+/// aggregating control-flow instruction — the locals that flow into
+/// the instruction's `dest` from whichever arm executes at runtime.
+///
+/// This includes the catch-all / default prong's result for every
+/// variant that has one (`if_expr.else_result`, `case_block`/
+/// `switch_literal`/`switch_return` `default_result`,
+/// `union_switch.else_result`, `optional_dispatch.nil_result`). It
+/// exists because the catch-all result was historically enumerated
+/// independently in `collectUses` and `collectArmResults`, and those
+/// hand-rolled lists drifted apart — `collectUses` silently dropped
+/// `union_switch.else_result` (audit class S1). Routing both through
+/// this one walker makes that drift structurally impossible: a new
+/// aggregating variant (or a new arm-result slot) is added here once
+/// and both consumers pick it up.
+///
+/// Non-aggregating opcodes yield nothing. The scrutinee / condition
+/// of an aggregating opcode is a *use* but not an *arm result*, so it
+/// is intentionally NOT yielded here — `collectUses` appends it
+/// separately.
+fn forEachArmResult(
+    instr: ir.Instruction,
+    context: anytype,
+    comptime visitFn: fn (ctx: @TypeOf(context), result_local: ir.LocalId) void,
+) void {
+    switch (instr) {
+        .if_expr => |x| {
+            if (x.then_result) |l| visitFn(context, l);
+            if (x.else_result) |l| visitFn(context, l);
+        },
+        .case_block => |x| {
+            for (x.arms) |arm| if (arm.result) |l| visitFn(context, l);
+            if (x.default_result) |l| visitFn(context, l);
+        },
+        .switch_literal => |x| {
+            for (x.cases) |c| if (c.result) |l| visitFn(context, l);
+            if (x.default_result) |l| visitFn(context, l);
+        },
+        .switch_return => |x| {
+            for (x.cases) |c| if (c.return_value) |l| visitFn(context, l);
+            if (x.default_result) |l| visitFn(context, l);
+        },
+        .union_switch_return => |x| {
+            for (x.cases) |c| if (c.return_value) |l| visitFn(context, l);
+        },
+        .union_switch => |x| {
+            for (x.cases) |c| if (c.return_value) |l| visitFn(context, l);
+            // The catch-all prong's result participates in the
+            // aggregate exactly like a case-arm result; yield it so
+            // every consumer (last-use / ownership classification,
+            // return-source / ARC-managed propagation) sees an
+            // else-only result. Omitting it here was GAP-P1R2-01.
+            if (x.has_else) {
+                if (x.else_result) |l| visitFn(context, l);
+            }
+        },
+        .optional_dispatch => |x| {
+            if (x.nil_result) |l| visitFn(context, l);
+            if (x.struct_result) |l| visitFn(context, l);
+        },
+        else => {},
+    }
+}
+
 /// Append every local that this instruction reads (uses) to `buf`.
 /// Sub-streams of nested instructions are NOT included — the
 /// dataflow visits them separately. Only the immediate uses by the
 /// instruction's own opcode are collected.
 pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
     const allocator = std.heap.page_allocator; // overflow only
+    // Arm-result locals of aggregating control-flow opcodes (if_expr,
+    // case_block, switch_literal, switch_return, union_switch[_return],
+    // optional_dispatch) are direct uses by the merge/join point: they
+    // materialise the opcode's `dest`. Collect them through the single
+    // shared walker so this list cannot drift from `collectArmResults`
+    // again (GAP-P1R2-01: the catch-all `union_switch.else_result` was
+    // previously dropped here). The aggregating arms below only append
+    // the scrutinee / condition, which are uses but not arm results.
+    const ArmResultAppender = struct {
+        buf: *UseList,
+        allocator: std.mem.Allocator,
+        fn visit(ctx: @This(), result_local: ir.LocalId) void {
+            ctx.buf.append(ctx.allocator, result_local) catch {};
+        }
+    };
+    forEachArmResult(
+        instr,
+        ArmResultAppender{ .buf = buf, .allocator = allocator },
+        ArmResultAppender.visit,
+    );
     switch (instr) {
         .const_int, .const_float, .const_string, .const_bool, .const_atom => {},
         .const_nil => {},
@@ -4139,50 +4223,27 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
         // union); the payload it produces is the dest.
         .unwrap_error_union => |x| buf.append(allocator, x.source) catch {},
         .set_safety => {},
-        .if_expr => |x| {
-            buf.append(allocator, x.condition) catch {};
-            // then_result / else_result are uses by the join point;
-            // those uses are accounted for through the join's
-            // `live_after` propagation since they materialise the
-            // if_expr.dest. Treat them as direct uses of the if_expr
-            // for liveness purposes.
-            if (x.then_result) |l| buf.append(allocator, l) catch {};
-            if (x.else_result) |l| buf.append(allocator, l) catch {};
-        },
+        // Arm results (then_result / else_result) are appended by the
+        // shared `forEachArmResult` walk above; here we only add the
+        // condition, which is a use but not an arm result.
+        .if_expr => |x| buf.append(allocator, x.condition) catch {},
         .guard_block => |x| buf.append(allocator, x.condition) catch {},
-        .case_block => |x| {
-            for (x.arms) |arm| {
-                if (arm.result) |l| buf.append(allocator, l) catch {};
-            }
-            if (x.default_result) |l| buf.append(allocator, l) catch {};
-        },
+        // Arm/default results appended by `forEachArmResult` above.
+        .case_block => {},
         .branch => {},
         .cond_branch => |x| buf.append(allocator, x.condition) catch {},
         .switch_tag => |x| buf.append(allocator, x.scrutinee) catch {},
-        .switch_literal => |x| {
-            buf.append(allocator, x.scrutinee) catch {};
-            for (x.cases) |case| {
-                if (case.result) |l| buf.append(allocator, l) catch {};
-            }
-            if (x.default_result) |l| buf.append(allocator, l) catch {};
-        },
-        .switch_return => |x| {
-            for (x.cases) |case| {
-                if (case.return_value) |l| buf.append(allocator, l) catch {};
-            }
-            if (x.default_result) |l| buf.append(allocator, l) catch {};
-        },
-        .union_switch_return => |x| {
-            for (x.cases) |case| {
-                if (case.return_value) |l| buf.append(allocator, l) catch {};
-            }
-        },
-        .union_switch => |x| {
-            buf.append(allocator, x.scrutinee) catch {};
-            for (x.cases) |case| {
-                if (case.return_value) |l| buf.append(allocator, l) catch {};
-            }
-        },
+        // Scrutinee is a use; case/default results via `forEachArmResult`.
+        .switch_literal => |x| buf.append(allocator, x.scrutinee) catch {},
+        // Case/default results appended by `forEachArmResult` above; the
+        // scrutinee of a `switch_return` is a param index, not a local.
+        .switch_return => {},
+        // Case results appended by `forEachArmResult` above; scrutinee is
+        // a param index, not a local.
+        .union_switch_return => {},
+        // Scrutinee is a use; case + catch-all (`else_result`) results
+        // via `forEachArmResult` above (GAP-P1R2-01).
+        .union_switch => |x| buf.append(allocator, x.scrutinee) catch {},
         .match_atom => |x| buf.append(allocator, x.scrutinee) catch {},
         .match_variant_tag => |x| buf.append(allocator, x.scrutinee) catch {},
         .variant_payload_get => |x| buf.append(allocator, x.scrutinee) catch {},
@@ -4261,15 +4322,12 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
         // interned `undef` value, not a Zap local.
         .typed_undef => {},
         .phi => |x| for (x.sources) |src| buf.append(allocator, src.value) catch {},
-        .optional_dispatch => |x| {
-            // scrutinee_param is a param index (not a local); payload_local
-            // is a def; nested nil_instrs / struct_instrs are visited
-            // separately by the dataflow. The arm results flow into the
-            // function via terminators in each arm (the nested streams),
-            // not via this opcode directly.
-            if (x.nil_result) |l| buf.append(allocator, l) catch {};
-            if (x.struct_result) |l| buf.append(allocator, l) catch {};
-        },
+        // scrutinee_param is a param index (not a local); payload_local
+        // is a def; nested nil_instrs / struct_instrs are visited
+        // separately by the dataflow. The arm results (nil_result /
+        // struct_result) are appended by the shared `forEachArmResult`
+        // walk above, so this opcode has no remaining direct-use local.
+        .optional_dispatch => {},
         // `.dbg_var` references the named local as a debug-info use; the
         // liveness analysis must treat it as a real use so the local
         // stays alive across the marker, otherwise an earlier release
@@ -4401,41 +4459,84 @@ fn aggregateDest(instr: ir.Instruction) ?ir.LocalId {
 
 /// Collects up to 16 arm-result locals from an aggregating
 /// instruction. Returns the count.
+///
+/// Delegates the per-arm enumeration to the shared `forEachArmResult`
+/// walker so this list and `collectUses`'s arm-result list are derived
+/// from one source and cannot drift apart (audit class S1; the catch-all
+/// `union_switch.else_result` previously diverged — GAP-P1R2-01). The
+/// only callers (`identifyArcLocals` / `propagateReturnSourcesThrough
+/// Aggregates`) gate on `aggregateDest`, so in practice this is invoked
+/// only for if_expr / case_block / switch_literal / union_switch; the
+/// extra variants the shared walker also handles are simply never
+/// reached here.
 fn collectArmResults(instr: ir.Instruction, out: *[16]ir.LocalId) usize {
     var n: usize = 0;
-    const append = struct {
-        fn add(slot: *[16]ir.LocalId, count: *usize, l: ir.LocalId) void {
-            if (count.* < slot.len) {
-                slot.*[count.*] = l;
-                count.* += 1;
+    const ArmResultCollector = struct {
+        out: *[16]ir.LocalId,
+        n: *usize,
+        fn visit(ctx: @This(), result_local: ir.LocalId) void {
+            if (ctx.n.* < ctx.out.len) {
+                ctx.out.*[ctx.n.*] = result_local;
+                ctx.n.* += 1;
             }
         }
-    }.add;
-    switch (instr) {
-        .if_expr => |x| {
-            if (x.then_result) |l| append(out, &n, l);
-            if (x.else_result) |l| append(out, &n, l);
-        },
-        .case_block => |x| {
-            for (x.arms) |arm| if (arm.result) |l| append(out, &n, l);
-            if (x.default_result) |l| append(out, &n, l);
-        },
-        .switch_literal => |x| {
-            for (x.cases) |c| if (c.result) |l| append(out, &n, l);
-            if (x.default_result) |l| append(out, &n, l);
-        },
-        .union_switch => |x| {
-            for (x.cases) |c| if (c.return_value) |l| append(out, &n, l);
-            // The catch-all prong's result participates in the aggregate
-            // exactly like a case-arm result; include it so return-source
-            // / ARC-managed propagation never misses an else-only result.
-            if (x.has_else) {
-                if (x.else_result) |l| append(out, &n, l);
-            }
-        },
-        else => {},
-    }
+    };
+    forEachArmResult(instr, ArmResultCollector{ .out = out, .n = &n }, ArmResultCollector.visit);
     return n;
+}
+
+test "arc_liveness: collectUses collects union_switch.else_result of a passthrough catch-all (GAP-P1R2-01)" {
+    // S1 catch-all-skip regression: a `union_switch` whose `_` prong
+    // yields a value computed BEFORE the switch (the passthrough
+    // `_ -> existing_value` shape) carries that value in
+    // `else_result`. `collectUses` must report it as a direct use of
+    // the `union_switch` node — otherwise the merge-point use is
+    // invisible to last-use/ownership classification (dropped release
+    // → leak, or premature move → UAF), exactly the soundness hole
+    // audit class S1 targets.
+    //
+    // Built as an in-memory `union_switch` literal so the assertion
+    // does not depend on whether the front-end ever lowers a
+    // passthrough catch-all to this exact IR shape.
+    const scrutinee_local: ir.LocalId = 1;
+    const case_result_local: ir.LocalId = 2;
+    const else_result_local: ir.LocalId = 3;
+    const dest_local: ir.LocalId = 4;
+
+    const cases = [_]ir.UnionCase{.{
+        .variant_name = "Some",
+        .field_bindings = &.{},
+        .body_instrs = &.{},
+        .return_value = case_result_local,
+    }};
+
+    const instr = ir.Instruction{ .union_switch = .{
+        .dest = dest_local,
+        .scrutinee = scrutinee_local,
+        .cases = &cases,
+        .else_instrs = &.{},
+        .else_result = else_result_local,
+        .has_else = true,
+    } };
+
+    var uses: UseList = .{};
+    defer uses.deinit(std.testing.allocator);
+    collectUses(instr, &uses);
+
+    const found = uses.slice();
+    var saw_else_result = false;
+    var saw_scrutinee = false;
+    var saw_case_result = false;
+    for (found) |local| {
+        if (local == else_result_local) saw_else_result = true;
+        if (local == scrutinee_local) saw_scrutinee = true;
+        if (local == case_result_local) saw_case_result = true;
+    }
+    // Siblings that were already collected (sanity that the arm runs).
+    try std.testing.expect(saw_scrutinee);
+    try std.testing.expect(saw_case_result);
+    // The load-bearing assertion: the catch-all result is a use.
+    try std.testing.expect(saw_else_result);
 }
 
 /// Whether a `ZigType` represents a heap-allocated, ARC-managed shape.
@@ -5764,6 +5865,7 @@ test "arc_liveness: live_before_ret keys all map to ret-equivalent terminator in
         next_id: InstructionId = 0,
         id_to_tag: *std.AutoHashMapUnmanaged(InstructionId, std.meta.Tag(ir.Instruction)),
         allocator: std.mem.Allocator,
+        pending_error: ?error{OutOfMemory} = null,
 
         fn walkFunction(self: *@This(), func: *const ir.Function) error{OutOfMemory}!void {
             for (func.body) |block| try self.walkStream(block.instructions);
@@ -5779,50 +5881,24 @@ test "arc_liveness: live_before_ret keys all map to ret-equivalent terminator in
         }
 
         fn walkChildren(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!void {
-            switch (instr.*) {
-                .if_expr => |ie| {
-                    try self.walkStream(ie.then_instrs);
-                    try self.walkStream(ie.else_instrs);
-                },
-                .case_block => |cb| {
-                    try self.walkStream(cb.pre_instrs);
-                    for (cb.arms) |arm| {
-                        try self.walkStream(arm.cond_instrs);
-                        try self.walkStream(arm.body_instrs);
-                    }
-                    try self.walkStream(cb.default_instrs);
-                },
-                .switch_literal => |sl| {
-                    for (sl.cases) |c| try self.walkStream(c.body_instrs);
-                    try self.walkStream(sl.default_instrs);
-                },
-                .switch_return => |sr| {
-                    for (sr.cases) |c| try self.walkStream(c.body_instrs);
-                    try self.walkStream(sr.default_instrs);
-                },
-                .union_switch => |us| {
-                    for (us.cases) |c| try self.walkStream(c.body_instrs);
-                },
-                .union_switch_return => |usr| {
-                    for (usr.cases) |c| try self.walkStream(c.body_instrs);
-                },
-                .try_call_named => |tc| {
-                    try self.walkStream(tc.handler_instrs);
-                    try self.walkStream(tc.success_instrs);
-                },
-                .guard_block => |gb| {
-                    try self.walkStream(gb.body);
-                },
-                .optional_dispatch => |od| {
-                    // Phase D: walker mirrors `flattenChildren`'s
-                    // recursion into both arm bodies so the
-                    // InstructionId numbering used in this test
-                    // matches the analyzer's exactly.
-                    try self.walkStream(od.nil_instrs);
-                    try self.walkStream(od.struct_instrs);
-                },
-                else => {},
+            // Recurse via the canonical enumerator so this test walker
+            // cannot drift from the production traversal (it previously
+            // skipped `union_switch.else_instrs` — GAP-P1R2-02/FU-3).
+            // `forEachChildStream`'s callback is void-returning, so the
+            // OOM from the recursive `walkStream` is stashed and
+            // re-raised after the walk.
+            ir.forEachChildStream(instr, self, visitChildStream);
+            if (self.pending_error) |err| {
+                self.pending_error = null;
+                return err;
             }
+        }
+
+        fn visitChildStream(self: *@This(), child: ir.ChildStream) void {
+            if (self.pending_error != null) return;
+            self.walkStream(child.stream) catch |err| {
+                self.pending_error = err;
+            };
         }
     };
     var walker = Walker{
@@ -5941,6 +6017,7 @@ test "arc_liveness: analyzer recurses into optional_dispatch arms without crashi
         allocator: std.mem.Allocator,
         instructions_inside_optional: usize = 0,
         depth_in_optional: usize = 0,
+        pending_error: ?error{OutOfMemory} = null,
 
         fn walkFunction(self: *@This(), func: *const ir.Function) error{OutOfMemory}!void {
             for (func.body) |block| try self.walkStream(block.instructions);
@@ -5960,48 +6037,27 @@ test "arc_liveness: analyzer recurses into optional_dispatch arms without crashi
         }
 
         fn walkChildren(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!void {
-            switch (instr.*) {
-                .if_expr => |ie| {
-                    try self.walkStream(ie.then_instrs);
-                    try self.walkStream(ie.else_instrs);
-                },
-                .case_block => |cb| {
-                    try self.walkStream(cb.pre_instrs);
-                    for (cb.arms) |arm| {
-                        try self.walkStream(arm.cond_instrs);
-                        try self.walkStream(arm.body_instrs);
-                    }
-                    try self.walkStream(cb.default_instrs);
-                },
-                .switch_literal => |sl| {
-                    for (sl.cases) |c| try self.walkStream(c.body_instrs);
-                    try self.walkStream(sl.default_instrs);
-                },
-                .switch_return => |sr| {
-                    for (sr.cases) |c| try self.walkStream(c.body_instrs);
-                    try self.walkStream(sr.default_instrs);
-                },
-                .union_switch => |us| {
-                    for (us.cases) |c| try self.walkStream(c.body_instrs);
-                },
-                .union_switch_return => |usr| {
-                    for (usr.cases) |c| try self.walkStream(c.body_instrs);
-                },
-                .try_call_named => |tc| {
-                    try self.walkStream(tc.handler_instrs);
-                    try self.walkStream(tc.success_instrs);
-                },
-                .guard_block => |gb| {
-                    try self.walkStream(gb.body);
-                },
-                .optional_dispatch => |od| {
-                    self.depth_in_optional += 1;
-                    try self.walkStream(od.nil_instrs);
-                    try self.walkStream(od.struct_instrs);
-                    self.depth_in_optional -= 1;
-                },
-                else => {},
+            // Recurse via the canonical enumerator so this test walker
+            // cannot drift from the production traversal (it previously
+            // skipped `union_switch.else_instrs` — GAP-P1R2-02/FU-3).
+            // `forEachChildStream` yields exactly both arm bodies of an
+            // `optional_dispatch`, so bumping `depth_in_optional` around
+            // the whole walk reproduces the old per-arm wrapping exactly.
+            const in_optional = instr.* == .optional_dispatch;
+            if (in_optional) self.depth_in_optional += 1;
+            ir.forEachChildStream(instr, self, visitChildStream);
+            if (in_optional) self.depth_in_optional -= 1;
+            if (self.pending_error) |err| {
+                self.pending_error = null;
+                return err;
             }
+        }
+
+        fn visitChildStream(self: *@This(), child: ir.ChildStream) void {
+            if (self.pending_error != null) return;
+            self.walkStream(child.stream) catch |err| {
+                self.pending_error = err;
+            };
         }
     };
     var walker = Walker{
