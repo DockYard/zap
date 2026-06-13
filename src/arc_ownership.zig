@@ -576,6 +576,24 @@ const BorrowedResultPromoter = struct {
                     if (cases_changed) {
                         copy.cases = new_cases;
                         changed = true;
+                    } else {
+                        self.allocator.free(new_cases);
+                    }
+                }
+                // The catch-all `_` prong is rewritten and result-promoted
+                // exactly like a case arm; without this, a borrowed value
+                // flowing out of the else prong (via else_result) was never
+                // promoted with copy+retain, so the caller released a
+                // borrowed cell (refcount underflow / double free). See
+                // audit finding arc-own-2--01.
+                if (copy.has_else) {
+                    if (try self.rewriteStream(copy.else_instrs, null)) |rewritten| {
+                        copy.else_instrs = rewritten;
+                        changed = true;
+                    }
+                    if (try self.promoteValueAtEnd(&copy.else_instrs, copy.else_result, require_owned)) |promoted| {
+                        copy.else_result = promoted;
+                        changed = true;
                     }
                 }
                 return if (changed) ir.Instruction{ .union_switch = copy } else null;
@@ -985,60 +1003,31 @@ fn collectConsumeShareDestsInStream(
     }
 }
 
+/// Recurse into every nested sub-stream via the canonical enumerator
+/// (covers `union_switch.else_instrs`, previously skipped) so the
+/// per-stream consume-share scan in `collectConsumeShareDestsInStream`
+/// runs over every region.
 fn collectConsumeShareDestsInInstr(
     allocator: std.mem.Allocator,
     instr: *const ir.Instruction,
     index: *const ConventionIndex,
     consume_share_dests: *std.AutoHashMapUnmanaged(ir.LocalId, void),
 ) error{OutOfMemory}!void {
-    switch (instr.*) {
-        .if_expr => |ie| {
-            try collectConsumeShareDestsInStream(allocator, ie.then_instrs, index, consume_share_dests);
-            try collectConsumeShareDestsInStream(allocator, ie.else_instrs, index, consume_share_dests);
-        },
-        .case_block => |cb| {
-            try collectConsumeShareDestsInStream(allocator, cb.pre_instrs, index, consume_share_dests);
-            for (cb.arms) |arm| {
-                try collectConsumeShareDestsInStream(allocator, arm.cond_instrs, index, consume_share_dests);
-                try collectConsumeShareDestsInStream(allocator, arm.body_instrs, index, consume_share_dests);
-            }
-            try collectConsumeShareDestsInStream(allocator, cb.default_instrs, index, consume_share_dests);
-        },
-        .switch_literal => |sl| {
-            for (sl.cases) |c| {
-                try collectConsumeShareDestsInStream(allocator, c.body_instrs, index, consume_share_dests);
-            }
-            try collectConsumeShareDestsInStream(allocator, sl.default_instrs, index, consume_share_dests);
-        },
-        .switch_return => |sr| {
-            for (sr.cases) |c| {
-                try collectConsumeShareDestsInStream(allocator, c.body_instrs, index, consume_share_dests);
-            }
-            try collectConsumeShareDestsInStream(allocator, sr.default_instrs, index, consume_share_dests);
-        },
-        .union_switch => |us| {
-            for (us.cases) |c| {
-                try collectConsumeShareDestsInStream(allocator, c.body_instrs, index, consume_share_dests);
-            }
-        },
-        .union_switch_return => |usr| {
-            for (usr.cases) |c| {
-                try collectConsumeShareDestsInStream(allocator, c.body_instrs, index, consume_share_dests);
-            }
-        },
-        .try_call_named => |tcn| {
-            try collectConsumeShareDestsInStream(allocator, tcn.handler_instrs, index, consume_share_dests);
-            try collectConsumeShareDestsInStream(allocator, tcn.success_instrs, index, consume_share_dests);
-        },
-        .guard_block => |gb| {
-            try collectConsumeShareDestsInStream(allocator, gb.body, index, consume_share_dests);
-        },
-        .optional_dispatch => |od| {
-            try collectConsumeShareDestsInStream(allocator, od.nil_instrs, index, consume_share_dests);
-            try collectConsumeShareDestsInStream(allocator, od.struct_instrs, index, consume_share_dests);
-        },
-        else => {},
-    }
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        index: *const ConventionIndex,
+        consume_share_dests: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+        err: ?error{OutOfMemory} = null,
+        fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
+            if (self_ctx.err != null) return;
+            collectConsumeShareDestsInStream(self_ctx.allocator, child.stream, self_ctx.index, self_ctx.consume_share_dests) catch |e| {
+                self_ctx.err = e;
+            };
+        }
+    };
+    var ctx = Ctx{ .allocator = allocator, .index = index, .consume_share_dests = consume_share_dests };
+    ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+    if (ctx.err) |e| return e;
 }
 
 fn lookupCalleeConventionsForCall(
@@ -1921,202 +1910,25 @@ const StreamRewriter = struct {
         return try new_instrs.toOwnedSlice(self.allocator);
     }
 
-    /// If `instr` has nested instruction streams, rewrite each one.
-    /// Returns a copy of `instr` with the rebuilt streams when any
-    /// child needed rewriting; otherwise `null`.
+    /// If `instr` has nested instruction streams, rewrite each one via
+    /// the canonical `ir.mapChildStreams` transformer — which visits
+    /// sub-streams in the exact order `arc_liveness.flattenStream`
+    /// numbers them (so `next_id` stays aligned with the analyzer's id
+    /// space) and now rewrites `union_switch.else_instrs`, previously
+    /// skipped here. Returns a copy of `instr` with the rebuilt streams
+    /// when any child changed; otherwise `null`.
     fn rewriteChildren(
         self: *StreamRewriter,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!?ir.Instruction {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                const new_then = try self.rewriteStream(ie.then_instrs);
-                const new_else = try self.rewriteStream(ie.else_instrs);
-                if (new_then == null and new_else == null) return null;
-                var copy = ie;
-                if (new_then) |s| copy.then_instrs = s;
-                if (new_else) |s| copy.else_instrs = s;
-                return ir.Instruction{ .if_expr = copy };
-            },
-            .case_block => |cb| {
-                // Traversal order MUST match `arc_liveness.flattenStream`:
-                // `pre_instrs` first, then per-arm `cond_instrs` +
-                // `body_instrs`, then `default_instrs`. Any deviation
-                // mis-aligns `next_id` with the analyzer's id space and
-                // breaks downstream `last_use_sites` / `last_use_map`
-                // queries.
-                var any_arm_change = false;
-                const new_pre = try self.rewriteStream(cb.pre_instrs);
-                if (new_pre != null) any_arm_change = true;
-                var new_arms = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
-                var arms_changed = false;
-                for (cb.arms, 0..) |arm, idx| {
-                    var arm_copy = arm;
-                    const new_cond = try self.rewriteStream(arm.cond_instrs);
-                    const new_body = try self.rewriteStream(arm.body_instrs);
-                    if (new_cond) |s| {
-                        arm_copy.cond_instrs = s;
-                        arms_changed = true;
-                    }
-                    if (new_body) |s| {
-                        arm_copy.body_instrs = s;
-                        arms_changed = true;
-                    }
-                    new_arms[idx] = arm_copy;
-                }
-                const new_default = try self.rewriteStream(cb.default_instrs);
-                if (new_default != null) any_arm_change = true;
-                if (!any_arm_change and !arms_changed) {
-                    self.allocator.free(new_arms);
-                    return null;
-                }
-                var copy = cb;
-                if (new_pre) |s| copy.pre_instrs = s;
-                if (new_default) |s| copy.default_instrs = s;
-                if (arms_changed) {
-                    copy.arms = new_arms;
-                } else {
-                    self.allocator.free(new_arms);
-                }
-                return ir.Instruction{ .case_block = copy };
-            },
-            .switch_literal => |sl| {
-                // Traversal order MUST match `arc_liveness.flattenStream`:
-                // cases first, then default. See `case_block` above for
-                // why id alignment matters.
-                var any_change = false;
-                var new_cases = try self.allocator.alloc(ir.LitCase, sl.cases.len);
-                var cases_changed = false;
-                for (sl.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                const new_default = try self.rewriteStream(sl.default_instrs);
-                if (new_default != null) any_change = true;
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sl;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_literal = copy };
-            },
-            .switch_return => |sr| {
-                // Traversal order MUST match `arc_liveness.flattenStream`:
-                // cases first, then default.
-                var any_change = false;
-                var new_cases = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
-                var cases_changed = false;
-                for (sr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                const new_default = try self.rewriteStream(sr.default_instrs);
-                if (new_default != null) any_change = true;
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sr;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_return = copy };
-            },
-            .union_switch => |us| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, us.cases.len);
-                var cases_changed = false;
-                for (us.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = us;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch = copy };
-            },
-            .union_switch_return => |usr| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
-                var cases_changed = false;
-                for (usr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = usr;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch_return = copy };
-            },
-            .try_call_named => |tcn| {
-                const new_handler = try self.rewriteStream(tcn.handler_instrs);
-                const new_success = try self.rewriteStream(tcn.success_instrs);
-                if (new_handler == null and new_success == null) return null;
-                var copy = tcn;
-                if (new_handler) |s| copy.handler_instrs = s;
-                if (new_success) |s| copy.success_instrs = s;
-                return ir.Instruction{ .try_call_named = copy };
-            },
-            .guard_block => |gb| {
-                const new_body = try self.rewriteStream(gb.body);
-                if (new_body == null) return null;
-                var copy = gb;
-                copy.body = new_body.?;
-                return ir.Instruction{ .guard_block = copy };
-            },
-            .optional_dispatch => |od| {
-                // Phase D (Phase 6 redux plan §3.D): recurse into both
-                // arm bodies so borrow/copy classification applies
-                // uniformly to every `.local_get` regardless of nesting
-                // depth. Without this, a `.local_get` inside an
-                // optional_dispatch arm would never be normalized to
-                // `.borrow_value` / `.copy_value` and the Phase 6.8
-                // emitLocalGet retain would survive past
-                // `arc_ownership` — leaving a refcount imbalance the
-                // verifier (Phase E) cannot reach.
-                const new_nil = try self.rewriteStream(od.nil_instrs);
-                const new_struct = try self.rewriteStream(od.struct_instrs);
-                if (new_nil == null and new_struct == null) return null;
-                var copy = od;
-                if (new_nil) |s| copy.nil_instrs = s;
-                if (new_struct) |s| copy.struct_instrs = s;
-                return ir.Instruction{ .optional_dispatch = copy };
-            },
-            else => return null,
-        }
+        return ir.mapChildStreams(self.allocator, instr, self, rewriteChildStream);
+    }
+
+    fn rewriteChildStream(
+        self: *StreamRewriter,
+        child: ir.ChildStream,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        return self.rewriteStream(child.stream);
     }
 };
 
@@ -2367,179 +2179,22 @@ const ConsumeSiteRewriter = struct {
         return try new_instrs.toOwnedSlice(self.allocator);
     }
 
+    /// Rewrite every child stream via the canonical `ir.mapChildStreams`
+    /// transformer — visits sub-streams in the analyzer's flatten order
+    /// (so `next_id` stays aligned) and now rewrites
+    /// `union_switch.else_instrs`, previously skipped here.
     fn rewriteChildren(
         self: *ConsumeSiteRewriter,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!?ir.Instruction {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                const new_then = try self.rewriteStream(ie.then_instrs);
-                const new_else = try self.rewriteStream(ie.else_instrs);
-                if (new_then == null and new_else == null) return null;
-                var copy = ie;
-                if (new_then) |s| copy.then_instrs = s;
-                if (new_else) |s| copy.else_instrs = s;
-                return ir.Instruction{ .if_expr = copy };
-            },
-            .case_block => |cb| {
-                var any_change = false;
-                const new_pre = try self.rewriteStream(cb.pre_instrs);
-                if (new_pre != null) any_change = true;
-                const new_default = try self.rewriteStream(cb.default_instrs);
-                if (new_default != null) any_change = true;
-                var new_arms = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
-                var arms_changed = false;
-                for (cb.arms, 0..) |arm, idx| {
-                    var arm_copy = arm;
-                    const new_cond = try self.rewriteStream(arm.cond_instrs);
-                    const new_body = try self.rewriteStream(arm.body_instrs);
-                    if (new_cond) |s| {
-                        arm_copy.cond_instrs = s;
-                        arms_changed = true;
-                    }
-                    if (new_body) |s| {
-                        arm_copy.body_instrs = s;
-                        arms_changed = true;
-                    }
-                    new_arms[idx] = arm_copy;
-                }
-                if (!any_change and !arms_changed) {
-                    self.allocator.free(new_arms);
-                    return null;
-                }
-                var copy = cb;
-                if (new_pre) |s| copy.pre_instrs = s;
-                if (new_default) |s| copy.default_instrs = s;
-                if (arms_changed) {
-                    copy.arms = new_arms;
-                } else {
-                    self.allocator.free(new_arms);
-                }
-                return ir.Instruction{ .case_block = copy };
-            },
-            .switch_literal => |sl| {
-                var any_change = false;
-                const new_default = try self.rewriteStream(sl.default_instrs);
-                if (new_default != null) any_change = true;
-                var new_cases = try self.allocator.alloc(ir.LitCase, sl.cases.len);
-                var cases_changed = false;
-                for (sl.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sl;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_literal = copy };
-            },
-            .switch_return => |sr| {
-                var any_change = false;
-                const new_default = try self.rewriteStream(sr.default_instrs);
-                if (new_default != null) any_change = true;
-                var new_cases = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
-                var cases_changed = false;
-                for (sr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sr;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_return = copy };
-            },
-            .union_switch => |us| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, us.cases.len);
-                var cases_changed = false;
-                for (us.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = us;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch = copy };
-            },
-            .union_switch_return => |usr| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
-                var cases_changed = false;
-                for (usr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = usr;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch_return = copy };
-            },
-            .try_call_named => |tcn| {
-                const new_handler = try self.rewriteStream(tcn.handler_instrs);
-                const new_success = try self.rewriteStream(tcn.success_instrs);
-                if (new_handler == null and new_success == null) return null;
-                var copy = tcn;
-                if (new_handler) |s| copy.handler_instrs = s;
-                if (new_success) |s| copy.success_instrs = s;
-                return ir.Instruction{ .try_call_named = copy };
-            },
-            .guard_block => |gb| {
-                const new_body = try self.rewriteStream(gb.body);
-                if (new_body == null) return null;
-                var copy = gb;
-                copy.body = new_body.?;
-                return ir.Instruction{ .guard_block = copy };
-            },
-            .optional_dispatch => |od| {
-                const new_nil = try self.rewriteStream(od.nil_instrs);
-                const new_struct = try self.rewriteStream(od.struct_instrs);
-                if (new_nil == null and new_struct == null) return null;
-                var copy = od;
-                if (new_nil) |s| copy.nil_instrs = s;
-                if (new_struct) |s| copy.struct_instrs = s;
-                return ir.Instruction{ .optional_dispatch = copy };
-            },
-            else => return null,
-        }
+        return ir.mapChildStreams(self.allocator, instr, self, rewriteChildStream);
+    }
+
+    fn rewriteChildStream(
+        self: *ConsumeSiteRewriter,
+        child: ir.ChildStream,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        return self.rewriteStream(child.stream);
     }
 
     /// For a call instruction, return a freshly-allocated slice of
@@ -2708,52 +2363,24 @@ fn countStreamInstructionIds(
     return id;
 }
 
+/// Count the InstructionIds occupied by `instr`'s nested sub-streams,
+/// recursing via the canonical `ir.forEachChildStream` so the numbering
+/// matches `arc_liveness.flattenChildren` exactly — including
+/// `union_switch.else_instrs`, previously skipped here, which had shifted
+/// every subsequent id below the analyzer's key.
 fn countNestedStreamInstructionIds(
     instr: *const ir.Instruction,
     start_id: arc_liveness.InstructionId,
 ) arc_liveness.InstructionId {
-    var id = start_id;
-    switch (instr.*) {
-        .if_expr => |ie| {
-            id = countStreamInstructionIds(ie.then_instrs, id);
-            id = countStreamInstructionIds(ie.else_instrs, id);
-        },
-        .case_block => |cb| {
-            id = countStreamInstructionIds(cb.pre_instrs, id);
-            for (cb.arms) |arm| {
-                id = countStreamInstructionIds(arm.cond_instrs, id);
-                id = countStreamInstructionIds(arm.body_instrs, id);
-            }
-            id = countStreamInstructionIds(cb.default_instrs, id);
-        },
-        .switch_literal => |sl| {
-            for (sl.cases) |c| id = countStreamInstructionIds(c.body_instrs, id);
-            id = countStreamInstructionIds(sl.default_instrs, id);
-        },
-        .switch_return => |sr| {
-            for (sr.cases) |c| id = countStreamInstructionIds(c.body_instrs, id);
-            id = countStreamInstructionIds(sr.default_instrs, id);
-        },
-        .union_switch => |us| {
-            for (us.cases) |c| id = countStreamInstructionIds(c.body_instrs, id);
-        },
-        .union_switch_return => |usr| {
-            for (usr.cases) |c| id = countStreamInstructionIds(c.body_instrs, id);
-        },
-        .try_call_named => |tcn| {
-            id = countStreamInstructionIds(tcn.handler_instrs, id);
-            id = countStreamInstructionIds(tcn.success_instrs, id);
-        },
-        .guard_block => |gb| {
-            id = countStreamInstructionIds(gb.body, id);
-        },
-        .optional_dispatch => |od| {
-            id = countStreamInstructionIds(od.nil_instrs, id);
-            id = countStreamInstructionIds(od.struct_instrs, id);
-        },
-        else => {},
-    }
-    return id;
+    const Ctx = struct {
+        id: arc_liveness.InstructionId,
+        fn onStream(self: *@This(), child: ir.ChildStream) void {
+            self.id = countStreamInstructionIds(child.stream, self.id);
+        }
+    };
+    var ctx = Ctx{ .id = start_id };
+    ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+    return ctx.id;
 }
 
 const BuiltinConsumeSiteRewriter = struct {
@@ -3013,179 +2640,22 @@ const BuiltinConsumeSiteRewriter = struct {
         return true;
     }
 
+    /// Rewrite every child stream via the canonical `ir.mapChildStreams`
+    /// transformer — visits sub-streams in the analyzer's flatten order
+    /// (so `next_id` stays aligned) and now rewrites
+    /// `union_switch.else_instrs`, previously skipped here.
     fn rewriteChildren(
         self: *BuiltinConsumeSiteRewriter,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!?ir.Instruction {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                const new_then = try self.rewriteStream(ie.then_instrs);
-                const new_else = try self.rewriteStream(ie.else_instrs);
-                if (new_then == null and new_else == null) return null;
-                var copy = ie;
-                if (new_then) |s| copy.then_instrs = s;
-                if (new_else) |s| copy.else_instrs = s;
-                return ir.Instruction{ .if_expr = copy };
-            },
-            .case_block => |cb| {
-                var any_change = false;
-                const new_pre = try self.rewriteStream(cb.pre_instrs);
-                if (new_pre != null) any_change = true;
-                const new_default = try self.rewriteStream(cb.default_instrs);
-                if (new_default != null) any_change = true;
-                var new_arms = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
-                var arms_changed = false;
-                for (cb.arms, 0..) |arm, idx| {
-                    var arm_copy = arm;
-                    const new_cond = try self.rewriteStream(arm.cond_instrs);
-                    const new_body = try self.rewriteStream(arm.body_instrs);
-                    if (new_cond) |s| {
-                        arm_copy.cond_instrs = s;
-                        arms_changed = true;
-                    }
-                    if (new_body) |s| {
-                        arm_copy.body_instrs = s;
-                        arms_changed = true;
-                    }
-                    new_arms[idx] = arm_copy;
-                }
-                if (!any_change and !arms_changed) {
-                    self.allocator.free(new_arms);
-                    return null;
-                }
-                var copy = cb;
-                if (new_pre) |s| copy.pre_instrs = s;
-                if (new_default) |s| copy.default_instrs = s;
-                if (arms_changed) {
-                    copy.arms = new_arms;
-                } else {
-                    self.allocator.free(new_arms);
-                }
-                return ir.Instruction{ .case_block = copy };
-            },
-            .switch_literal => |sl| {
-                var any_change = false;
-                const new_default = try self.rewriteStream(sl.default_instrs);
-                if (new_default != null) any_change = true;
-                var new_cases = try self.allocator.alloc(ir.LitCase, sl.cases.len);
-                var cases_changed = false;
-                for (sl.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sl;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_literal = copy };
-            },
-            .switch_return => |sr| {
-                var any_change = false;
-                const new_default = try self.rewriteStream(sr.default_instrs);
-                if (new_default != null) any_change = true;
-                var new_cases = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
-                var cases_changed = false;
-                for (sr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sr;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_return = copy };
-            },
-            .union_switch => |us| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, us.cases.len);
-                var cases_changed = false;
-                for (us.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = us;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch = copy };
-            },
-            .union_switch_return => |usr| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
-                var cases_changed = false;
-                for (usr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = usr;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch_return = copy };
-            },
-            .try_call_named => |tcn| {
-                const new_handler = try self.rewriteStream(tcn.handler_instrs);
-                const new_success = try self.rewriteStream(tcn.success_instrs);
-                if (new_handler == null and new_success == null) return null;
-                var copy = tcn;
-                if (new_handler) |s| copy.handler_instrs = s;
-                if (new_success) |s| copy.success_instrs = s;
-                return ir.Instruction{ .try_call_named = copy };
-            },
-            .guard_block => |gb| {
-                const new_body = try self.rewriteStream(gb.body);
-                if (new_body == null) return null;
-                var copy = gb;
-                copy.body = new_body.?;
-                return ir.Instruction{ .guard_block = copy };
-            },
-            .optional_dispatch => |od| {
-                const new_nil = try self.rewriteStream(od.nil_instrs);
-                const new_struct = try self.rewriteStream(od.struct_instrs);
-                if (new_nil == null and new_struct == null) return null;
-                var copy = od;
-                if (new_nil) |s| copy.nil_instrs = s;
-                if (new_struct) |s| copy.struct_instrs = s;
-                return ir.Instruction{ .optional_dispatch = copy };
-            },
-            else => return null,
-        }
+        return ir.mapChildStreams(self.allocator, instr, self, rewriteChildStream);
+    }
+
+    fn rewriteChildStream(
+        self: *BuiltinConsumeSiteRewriter,
+        child: ir.ChildStream,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        return self.rewriteStream(child.stream);
     }
 };
 
@@ -3611,193 +3081,22 @@ const UncheckedUniquenessSiteRewriter = struct {
         } };
     }
 
+    /// Rewrite every child stream via the canonical `ir.mapChildStreams`
+    /// transformer — visits sub-streams in the analyzer's flatten order
+    /// (so `next_id` stays aligned) and now rewrites
+    /// `union_switch.else_instrs`, previously skipped here.
     fn rewriteChildren(
         self: *UncheckedUniquenessSiteRewriter,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!?ir.Instruction {
-        // CRITICAL: this walker must visit nested sub-streams in the
-        // EXACT SAME ORDER as `uniqueness.Analyzer.walkChildren`.
-        // The id assignment in the first pass mirrors that traversal,
-        // and the rewriter's site queries against `Uniqueness.sites`
-        // are keyed by id. A mismatched traversal order produces
-        // different ids for the same instruction between the analyzer
-        // and the rewriter — causing the rewrite gate to consult the
-        // wrong site predicate. The verifier then re-runs the analyzer
-        // and (correctly) sees a different id space, surfacing as a
-        // uniqueness violation diagnostic.
-        switch (instr.*) {
-            .if_expr => |ie| {
-                const new_then = try self.rewriteStream(ie.then_instrs);
-                const new_else = try self.rewriteStream(ie.else_instrs);
-                if (new_then == null and new_else == null) return null;
-                var copy = ie;
-                if (new_then) |s| copy.then_instrs = s;
-                if (new_else) |s| copy.else_instrs = s;
-                return ir.Instruction{ .if_expr = copy };
-            },
-            .case_block => |cb| {
-                // Analyzer order: pre, then arms (cond+body each),
-                // then default. Match that here.
-                var any_change = false;
-                const new_pre = try self.rewriteStream(cb.pre_instrs);
-                if (new_pre != null) any_change = true;
-                var new_arms = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
-                var arms_changed = false;
-                for (cb.arms, 0..) |arm, idx| {
-                    var arm_copy = arm;
-                    const new_cond = try self.rewriteStream(arm.cond_instrs);
-                    const new_body = try self.rewriteStream(arm.body_instrs);
-                    if (new_cond) |s| {
-                        arm_copy.cond_instrs = s;
-                        arms_changed = true;
-                    }
-                    if (new_body) |s| {
-                        arm_copy.body_instrs = s;
-                        arms_changed = true;
-                    }
-                    new_arms[idx] = arm_copy;
-                }
-                const new_default = try self.rewriteStream(cb.default_instrs);
-                if (new_default != null) any_change = true;
-                if (!any_change and !arms_changed) {
-                    self.allocator.free(new_arms);
-                    return null;
-                }
-                var copy = cb;
-                if (new_pre) |s| copy.pre_instrs = s;
-                if (new_default) |s| copy.default_instrs = s;
-                if (arms_changed) {
-                    copy.arms = new_arms;
-                } else {
-                    self.allocator.free(new_arms);
-                }
-                return ir.Instruction{ .case_block = copy };
-            },
-            .switch_literal => |sl| {
-                // Analyzer order: cases first, then default.
-                var any_change = false;
-                var new_cases = try self.allocator.alloc(ir.LitCase, sl.cases.len);
-                var cases_changed = false;
-                for (sl.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                const new_default = try self.rewriteStream(sl.default_instrs);
-                if (new_default != null) any_change = true;
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sl;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_literal = copy };
-            },
-            .switch_return => |sr| {
-                // Analyzer order: cases first, then default.
-                var any_change = false;
-                var new_cases = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
-                var cases_changed = false;
-                for (sr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                const new_default = try self.rewriteStream(sr.default_instrs);
-                if (new_default != null) any_change = true;
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sr;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_return = copy };
-            },
-            .union_switch => |us| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, us.cases.len);
-                var cases_changed = false;
-                for (us.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = us;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch = copy };
-            },
-            .union_switch_return => |usr| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
-                var cases_changed = false;
-                for (usr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = usr;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch_return = copy };
-            },
-            .try_call_named => |tcn| {
-                const new_handler = try self.rewriteStream(tcn.handler_instrs);
-                const new_success = try self.rewriteStream(tcn.success_instrs);
-                if (new_handler == null and new_success == null) return null;
-                var copy = tcn;
-                if (new_handler) |s| copy.handler_instrs = s;
-                if (new_success) |s| copy.success_instrs = s;
-                return ir.Instruction{ .try_call_named = copy };
-            },
-            .guard_block => |gb| {
-                const new_body = try self.rewriteStream(gb.body);
-                if (new_body == null) return null;
-                var copy = gb;
-                copy.body = new_body.?;
-                return ir.Instruction{ .guard_block = copy };
-            },
-            .optional_dispatch => |od| {
-                const new_nil = try self.rewriteStream(od.nil_instrs);
-                const new_struct = try self.rewriteStream(od.struct_instrs);
-                if (new_nil == null and new_struct == null) return null;
-                var copy = od;
-                if (new_nil) |s| copy.nil_instrs = s;
-                if (new_struct) |s| copy.struct_instrs = s;
-                return ir.Instruction{ .optional_dispatch = copy };
-            },
-            else => return null,
-        }
+        return ir.mapChildStreams(self.allocator, instr, self, rewriteChildStream);
+    }
+
+    fn rewriteChildStream(
+        self: *UncheckedUniquenessSiteRewriter,
+        child: ir.ChildStream,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        return self.rewriteStream(child.stream);
     }
 };
 
@@ -3896,63 +3195,30 @@ fn findRuntimeOwnedMutatingCall(function: *const ir.Function) ?[]const u8 {
     return null;
 }
 
+/// Recurse via the canonical enumerator (covers
+/// `union_switch.else_instrs`, previously skipped) to find the first
+/// non-unchecked owned-mutating builtin call in `stream` or any nested
+/// sub-stream.
 fn findRuntimeOwnedMutatingCallInStream(stream: []const ir.Instruction) ?[]const u8 {
     for (stream) |*instr| {
-        switch (instr.*) {
-            .call_builtin => |cb| {
-                if (arc_liveness.ownedMutatingBuiltinSlot(cb.name) != null and
-                    !arc_liveness.isUncheckedOwnedMutatingBuiltin(cb.name))
-                {
-                    return cb.name;
-                }
-            },
-            .if_expr => |ie| {
-                if (findRuntimeOwnedMutatingCallInStream(ie.then_instrs)) |n| return n;
-                if (findRuntimeOwnedMutatingCallInStream(ie.else_instrs)) |n| return n;
-            },
-            .case_block => |cb| {
-                if (findRuntimeOwnedMutatingCallInStream(cb.pre_instrs)) |n| return n;
-                for (cb.arms) |arm| {
-                    if (findRuntimeOwnedMutatingCallInStream(arm.cond_instrs)) |n| return n;
-                    if (findRuntimeOwnedMutatingCallInStream(arm.body_instrs)) |n| return n;
-                }
-                if (findRuntimeOwnedMutatingCallInStream(cb.default_instrs)) |n| return n;
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| {
-                    if (findRuntimeOwnedMutatingCallInStream(c.body_instrs)) |n| return n;
-                }
-                if (findRuntimeOwnedMutatingCallInStream(sl.default_instrs)) |n| return n;
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| {
-                    if (findRuntimeOwnedMutatingCallInStream(c.body_instrs)) |n| return n;
-                }
-                if (findRuntimeOwnedMutatingCallInStream(sr.default_instrs)) |n| return n;
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| {
-                    if (findRuntimeOwnedMutatingCallInStream(c.body_instrs)) |n| return n;
-                }
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    if (findRuntimeOwnedMutatingCallInStream(c.body_instrs)) |n| return n;
-                }
-            },
-            .try_call_named => |tcn| {
-                if (findRuntimeOwnedMutatingCallInStream(tcn.handler_instrs)) |n| return n;
-                if (findRuntimeOwnedMutatingCallInStream(tcn.success_instrs)) |n| return n;
-            },
-            .guard_block => |gb| {
-                if (findRuntimeOwnedMutatingCallInStream(gb.body)) |n| return n;
-            },
-            .optional_dispatch => |od| {
-                if (findRuntimeOwnedMutatingCallInStream(od.nil_instrs)) |n| return n;
-                if (findRuntimeOwnedMutatingCallInStream(od.struct_instrs)) |n| return n;
-            },
-            else => {},
+        if (instr.* == .call_builtin) {
+            const cb = instr.call_builtin;
+            if (arc_liveness.ownedMutatingBuiltinSlot(cb.name) != null and
+                !arc_liveness.isUncheckedOwnedMutatingBuiltin(cb.name))
+            {
+                return cb.name;
+            }
         }
+        const Finder = struct {
+            found: ?[]const u8 = null,
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                if (self.found != null) return;
+                if (findRuntimeOwnedMutatingCallInStream(child.stream)) |n| self.found = n;
+            }
+        };
+        var finder = Finder{};
+        ir.forEachChildStream(instr, &finder, Finder.onStream);
+        if (finder.found) |n| return n;
     }
     return null;
 }
@@ -4276,179 +3542,22 @@ const BorrowedPassThroughRewriter = struct {
         return try new_instrs.toOwnedSlice(self.allocator);
     }
 
+    /// Rewrite every child stream via the canonical `ir.mapChildStreams`
+    /// transformer — visits sub-streams in the analyzer's flatten order
+    /// (so `next_id` stays aligned) and now rewrites
+    /// `union_switch.else_instrs`, previously skipped here.
     fn rewriteChildren(
         self: *BorrowedPassThroughRewriter,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!?ir.Instruction {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                const new_then = try self.rewriteStream(ie.then_instrs);
-                const new_else = try self.rewriteStream(ie.else_instrs);
-                if (new_then == null and new_else == null) return null;
-                var copy = ie;
-                if (new_then) |s| copy.then_instrs = s;
-                if (new_else) |s| copy.else_instrs = s;
-                return ir.Instruction{ .if_expr = copy };
-            },
-            .case_block => |cb| {
-                var any_change = false;
-                const new_pre = try self.rewriteStream(cb.pre_instrs);
-                if (new_pre != null) any_change = true;
-                const new_default = try self.rewriteStream(cb.default_instrs);
-                if (new_default != null) any_change = true;
-                var new_arms = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
-                var arms_changed = false;
-                for (cb.arms, 0..) |arm, idx| {
-                    var arm_copy = arm;
-                    const new_cond = try self.rewriteStream(arm.cond_instrs);
-                    const new_body = try self.rewriteStream(arm.body_instrs);
-                    if (new_cond) |s| {
-                        arm_copy.cond_instrs = s;
-                        arms_changed = true;
-                    }
-                    if (new_body) |s| {
-                        arm_copy.body_instrs = s;
-                        arms_changed = true;
-                    }
-                    new_arms[idx] = arm_copy;
-                }
-                if (!any_change and !arms_changed) {
-                    self.allocator.free(new_arms);
-                    return null;
-                }
-                var copy = cb;
-                if (new_pre) |s| copy.pre_instrs = s;
-                if (new_default) |s| copy.default_instrs = s;
-                if (arms_changed) {
-                    copy.arms = new_arms;
-                } else {
-                    self.allocator.free(new_arms);
-                }
-                return ir.Instruction{ .case_block = copy };
-            },
-            .switch_literal => |sl| {
-                var any_change = false;
-                const new_default = try self.rewriteStream(sl.default_instrs);
-                if (new_default != null) any_change = true;
-                var new_cases = try self.allocator.alloc(ir.LitCase, sl.cases.len);
-                var cases_changed = false;
-                for (sl.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sl;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_literal = copy };
-            },
-            .switch_return => |sr| {
-                var any_change = false;
-                const new_default = try self.rewriteStream(sr.default_instrs);
-                if (new_default != null) any_change = true;
-                var new_cases = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
-                var cases_changed = false;
-                for (sr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!any_change and !cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = sr;
-                if (new_default) |s| copy.default_instrs = s;
-                if (cases_changed) {
-                    copy.cases = new_cases;
-                } else {
-                    self.allocator.free(new_cases);
-                }
-                return ir.Instruction{ .switch_return = copy };
-            },
-            .union_switch => |us| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, us.cases.len);
-                var cases_changed = false;
-                for (us.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = us;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch = copy };
-            },
-            .union_switch_return => |usr| {
-                var new_cases = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
-                var cases_changed = false;
-                for (usr.cases, 0..) |c, idx| {
-                    var c_copy = c;
-                    const new_body = try self.rewriteStream(c.body_instrs);
-                    if (new_body) |s| {
-                        c_copy.body_instrs = s;
-                        cases_changed = true;
-                    }
-                    new_cases[idx] = c_copy;
-                }
-                if (!cases_changed) {
-                    self.allocator.free(new_cases);
-                    return null;
-                }
-                var copy = usr;
-                copy.cases = new_cases;
-                return ir.Instruction{ .union_switch_return = copy };
-            },
-            .try_call_named => |tcn| {
-                const new_handler = try self.rewriteStream(tcn.handler_instrs);
-                const new_success = try self.rewriteStream(tcn.success_instrs);
-                if (new_handler == null and new_success == null) return null;
-                var copy = tcn;
-                if (new_handler) |s| copy.handler_instrs = s;
-                if (new_success) |s| copy.success_instrs = s;
-                return ir.Instruction{ .try_call_named = copy };
-            },
-            .guard_block => |gb| {
-                const new_body = try self.rewriteStream(gb.body);
-                if (new_body == null) return null;
-                var copy = gb;
-                copy.body = new_body.?;
-                return ir.Instruction{ .guard_block = copy };
-            },
-            .optional_dispatch => |od| {
-                const new_nil = try self.rewriteStream(od.nil_instrs);
-                const new_struct = try self.rewriteStream(od.struct_instrs);
-                if (new_nil == null and new_struct == null) return null;
-                var copy = od;
-                if (new_nil) |s| copy.nil_instrs = s;
-                if (new_struct) |s| copy.struct_instrs = s;
-                return ir.Instruction{ .optional_dispatch = copy };
-            },
-            else => return null,
-        }
+        return ir.mapChildStreams(self.allocator, instr, self, rewriteChildStream);
+    }
+
+    fn rewriteChildStream(
+        self: *BorrowedPassThroughRewriter,
+        child: ir.ChildStream,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        return self.rewriteStream(child.stream);
     }
 };
 
@@ -4627,57 +3736,23 @@ fn callUsesArgExactlyOnce(instr: ir.Instruction, arg_local: ir.LocalId) bool {
     return count == 1;
 }
 
+/// Count uses of `local` in `instr` and all its nested sub-streams,
+/// recursing via the canonical enumerator (covers
+/// `union_switch.else_instrs`, previously skipped — an undercount there
+/// could flip the elideBorrowedPassThroughShares soundness gate from
+/// refuse to allow). Used by the != 1 / != 3 exact-count soundness gates.
 fn countLocalUsesRecursive(instr: ir.Instruction, local: ir.LocalId) usize {
-    var count = countImmediateLocalUses(instr, local);
-    switch (instr) {
-        .if_expr => |if_expr| {
-            count += countLocalUsesInStream(if_expr.then_instrs, local);
-            count += countLocalUsesInStream(if_expr.else_instrs, local);
-        },
-        .case_block => |case_block| {
-            count += countLocalUsesInStream(case_block.pre_instrs, local);
-            for (case_block.arms) |arm| {
-                count += countLocalUsesInStream(arm.cond_instrs, local);
-                count += countLocalUsesInStream(arm.body_instrs, local);
-            }
-            count += countLocalUsesInStream(case_block.default_instrs, local);
-        },
-        .switch_literal => |switch_literal| {
-            for (switch_literal.cases) |case| {
-                count += countLocalUsesInStream(case.body_instrs, local);
-            }
-            count += countLocalUsesInStream(switch_literal.default_instrs, local);
-        },
-        .switch_return => |switch_return| {
-            for (switch_return.cases) |case| {
-                count += countLocalUsesInStream(case.body_instrs, local);
-            }
-            count += countLocalUsesInStream(switch_return.default_instrs, local);
-        },
-        .union_switch => |union_switch| {
-            for (union_switch.cases) |case| {
-                count += countLocalUsesInStream(case.body_instrs, local);
-            }
-        },
-        .union_switch_return => |union_switch_return| {
-            for (union_switch_return.cases) |case| {
-                count += countLocalUsesInStream(case.body_instrs, local);
-            }
-        },
-        .try_call_named => |try_call_named| {
-            count += countLocalUsesInStream(try_call_named.handler_instrs, local);
-            count += countLocalUsesInStream(try_call_named.success_instrs, local);
-        },
-        .guard_block => |guard_block| {
-            count += countLocalUsesInStream(guard_block.body, local);
-        },
-        .optional_dispatch => |optional_dispatch| {
-            count += countLocalUsesInStream(optional_dispatch.nil_instrs, local);
-            count += countLocalUsesInStream(optional_dispatch.struct_instrs, local);
-        },
-        else => {},
-    }
-    return count;
+    const count = countImmediateLocalUses(instr, local);
+    const Ctx = struct {
+        local: ir.LocalId,
+        count: usize = 0,
+        fn onStream(self: *@This(), child: ir.ChildStream) void {
+            self.count += countLocalUsesInStream(child.stream, self.local);
+        }
+    };
+    var ctx = Ctx{ .local = local };
+    ir.forEachChildStream(&instr, &ctx, Ctx.onStream);
+    return count + ctx.count;
 }
 
 fn countLocalUsesInStream(stream: []const ir.Instruction, local: ir.LocalId) usize {
@@ -4715,57 +3790,22 @@ fn countImmediateLocalUses(instr: ir.Instruction, local: ir.LocalId) usize {
     return count;
 }
 
+/// Count definitions of `local` in `instr` and all its nested
+/// sub-streams, recursing via the canonical enumerator (covers
+/// `union_switch.else_instrs`, previously skipped). Used by the
+/// elideBorrowedPassThroughShares != 1 soundness gate.
 fn countLocalDefsRecursive(instr: ir.Instruction, local: ir.LocalId) usize {
-    var count = countImmediateLocalDefs(instr, local);
-    switch (instr) {
-        .if_expr => |if_expr| {
-            count += countLocalDefsInStream(if_expr.then_instrs, local);
-            count += countLocalDefsInStream(if_expr.else_instrs, local);
-        },
-        .case_block => |case_block| {
-            count += countLocalDefsInStream(case_block.pre_instrs, local);
-            for (case_block.arms) |arm| {
-                count += countLocalDefsInStream(arm.cond_instrs, local);
-                count += countLocalDefsInStream(arm.body_instrs, local);
-            }
-            count += countLocalDefsInStream(case_block.default_instrs, local);
-        },
-        .switch_literal => |switch_literal| {
-            for (switch_literal.cases) |case| {
-                count += countLocalDefsInStream(case.body_instrs, local);
-            }
-            count += countLocalDefsInStream(switch_literal.default_instrs, local);
-        },
-        .switch_return => |switch_return| {
-            for (switch_return.cases) |case| {
-                count += countLocalDefsInStream(case.body_instrs, local);
-            }
-            count += countLocalDefsInStream(switch_return.default_instrs, local);
-        },
-        .union_switch => |union_switch| {
-            for (union_switch.cases) |case| {
-                count += countLocalDefsInStream(case.body_instrs, local);
-            }
-        },
-        .union_switch_return => |union_switch_return| {
-            for (union_switch_return.cases) |case| {
-                count += countLocalDefsInStream(case.body_instrs, local);
-            }
-        },
-        .try_call_named => |try_call_named| {
-            count += countLocalDefsInStream(try_call_named.handler_instrs, local);
-            count += countLocalDefsInStream(try_call_named.success_instrs, local);
-        },
-        .guard_block => |guard_block| {
-            count += countLocalDefsInStream(guard_block.body, local);
-        },
-        .optional_dispatch => |optional_dispatch| {
-            count += countLocalDefsInStream(optional_dispatch.nil_instrs, local);
-            count += countLocalDefsInStream(optional_dispatch.struct_instrs, local);
-        },
-        else => {},
-    }
-    return count;
+    const count = countImmediateLocalDefs(instr, local);
+    const Ctx = struct {
+        local: ir.LocalId,
+        count: usize = 0,
+        fn onStream(self: *@This(), child: ir.ChildStream) void {
+            self.count += countLocalDefsInStream(child.stream, self.local);
+        }
+    };
+    var ctx = Ctx{ .local = local };
+    ir.forEachChildStream(&instr, &ctx, Ctx.onStream);
+    return count + ctx.count;
 }
 
 fn countLocalDefsInStream(stream: []const ir.Instruction, local: ir.LocalId) usize {
