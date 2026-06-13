@@ -232,4 +232,92 @@ pub struct UnionTest {
       }
     }
   }
+
+  # ----------------------------------------------------------------------
+  # Permanent guard for the chained-sub-stream live-after question raised by
+  # audit finding arc-liveness--02 (investigated and found NOT to be a defect;
+  # this guard locks the correct behavior in so a future regression surfaces).
+  #
+  # An EXHAUSTIVE tagged-union `case` (every variant matched by tag, no wildcard,
+  # no guards) lowers to a `case_block` whose `pre_instrs` is a single
+  # `union_switch` (a non-terminator tail), with `arms`/`default_instrs` empty.
+  # In NON-tail position the `case_block`'s external live-after holds an ARC
+  # local that is read inside an arm body AND read again AFTER the case
+  # (`keep_list_across_exhaustive_case` produces exactly this shape: the bare
+  # `union_switch` tail with the held List live across the case).
+  #
+  # The finding's theory was that the backward liveness pass, threading only the
+  # structured arms' live-in into `pre_instrs`, would lose the case's external
+  # live-after at the `case_block` -> `union_switch` boundary and mis-flag the
+  # in-arm read as the local's last use (a false `last_use_site` authorizing a
+  # premature release / in-place mutation of a still-live cell). In practice this
+  # cannot occur: every `union_switch` arm body ends in a terminator
+  # (`case_break`/`match_fail`), and the backward walk forces a terminator's
+  # live-after to the empty set, so the threaded live-after never reaches the
+  # in-arm instructions — the held value's liveness across the `case` is carried
+  # by the OUTER instruction stream (its post-case read), and no premature
+  # release is emitted. These tests read an ARC value inside an arm of a non-tail
+  # exhaustive variant `case` AND after it, and assert under `Memory.Tracking`
+  # that the value is neither freed early nor leaked.
+  describe("ARC value read inside a non-tail exhaustive variant case and after it (arc-liveness--02 guard)") {
+    test("string survives an exhaustive variant case that also reads it inside an arm") {
+      assert(UnionTest.keep_string_across_exhaustive_case(CatchallShape(i64).Circle(1)) == 22)
+      assert(UnionTest.keep_string_across_exhaustive_case(CatchallShape(i64).Square(2)) == 22)
+      assert(UnionTest.keep_string_across_exhaustive_case(CatchallShape(i64).Triangle(3)) == 11)
+    }
+
+    test("list survives an exhaustive variant case that also reads it inside an arm") {
+      assert(UnionTest.keep_list_across_exhaustive_case(CatchallShape(i64).Circle(1)) == 6)
+      assert(UnionTest.keep_list_across_exhaustive_case(CatchallShape(i64).Triangle(3)) == 3)
+    }
+  }
+
+  describe("ARC value held across a non-tail exhaustive variant case — leak freedom (arc-liveness--02 guard)") {
+    test("string read inside an exhaustive-case arm and after it is released exactly once") {
+      assert_no_leaks {
+        total = UnionTest.keep_string_across_exhaustive_case(CatchallShape(i64).Circle(1))
+        assert(total == 22)
+      }
+    }
+
+    test("list read inside an exhaustive-case arm and after it is released exactly once") {
+      assert_no_leaks {
+        total = UnionTest.keep_list_across_exhaustive_case(CatchallShape(i64).Circle(1))
+        assert(total == 6)
+      }
+    }
+  }
+
+  # `payload` (an ARC String) is bound BEFORE an exhaustive, NON-tail variant
+  # `case` over all three `CatchallShape` tags. It is read INSIDE the Circle and
+  # Square arms (`String.length(payload)`) AND read AGAIN after the case, then
+  # both reads are summed. The `case` is in non-tail position (an `after` read
+  # and an addition follow it), so the held value must stay live through the
+  # `union_switch`; this guard asserts that it does (no premature free / leak).
+  fn keep_string_across_exhaustive_case(shape :: CatchallShape(i64)) -> i64 {
+    payload = "hello world"
+    inner = case shape {
+      CatchallShape.Circle(_) -> String.length(payload)
+      CatchallShape.Square(_) -> String.length(payload)
+      CatchallShape.Triangle(_) -> 0
+    }
+    after = String.length(payload)
+    after + inner
+  }
+
+  # Same shape as above but with an ARC List held across the exhaustive,
+  # non-tail variant `case` and read both inside an arm and after the case. This
+  # function reaches the ARC liveness analyzer as a bare-`union_switch`-tailed
+  # `case_block` whose external live-after holds the List local, i.e. the exact
+  # shape arc-liveness--02 was about.
+  fn keep_list_across_exhaustive_case(shape :: CatchallShape(i64)) -> i64 {
+    items = [1, 2, 3]
+    inner = case shape {
+      CatchallShape.Circle(_) -> List.length(items)
+      CatchallShape.Square(_) -> List.length(items)
+      CatchallShape.Triangle(_) -> 0
+    }
+    after = List.length(items)
+    after + inner
+  }
 }
