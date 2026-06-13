@@ -3590,6 +3590,184 @@ fn typeContainsInstructionStream(comptime T: type) bool {
     }
 }
 
+/// Reconstruct `instr` with each child instruction sub-stream replaced
+/// by `rebuildFn(ctx, child)` — where a `null` return means "this
+/// sub-stream is unchanged". The callback is invoked once per child
+/// stream in the SAME canonical order as `forEachChildStream` (and
+/// therefore the same order `arc_liveness.flattenChildren` numbers
+/// instructions), so a rebuilder built on this function visits streams
+/// in lock-step with the analyzer.
+///
+/// Returns `null` if no sub-stream changed (the caller keeps the
+/// original instruction). Otherwise returns a copy of `instr` with the
+/// changed sub-streams written into freshly-allocated arm/case arrays as
+/// needed. THE single source of truth for transforming an instruction's
+/// nested streams — every drop-insertion / ownership rebuilder is built
+/// on it, so none can skip `union_switch.else_instrs` again.
+///
+/// `rebuildFn` may return `error{OutOfMemory}` (or a superset); the
+/// error set is inferred from the callback.
+pub fn mapChildStreams(
+    allocator: std.mem.Allocator,
+    instr: *const Instruction,
+    context: anytype,
+    comptime rebuildFn: anytype,
+) !?Instruction {
+    switch (instr.*) {
+        .if_expr => |ie| {
+            const new_then = try rebuildFn(context, ChildStream{ .kind = .if_then, .stream = ie.then_instrs });
+            const new_else = try rebuildFn(context, ChildStream{ .kind = .if_else, .stream = ie.else_instrs });
+            if (new_then == null and new_else == null) return null;
+            var copy = ie;
+            if (new_then) |s| copy.then_instrs = s;
+            if (new_else) |s| copy.else_instrs = s;
+            return Instruction{ .if_expr = copy };
+        },
+        .case_block => |cb| {
+            const new_pre = try rebuildFn(context, ChildStream{ .kind = .case_pre, .stream = cb.pre_instrs });
+            var new_arms: ?[]IrCaseArm = null;
+            for (cb.arms, 0..) |arm, idx| {
+                const new_cond = try rebuildFn(context, ChildStream{ .kind = .case_arm_cond, .stream = arm.cond_instrs });
+                const new_body = try rebuildFn(context, ChildStream{ .kind = .case_arm_body, .stream = arm.body_instrs });
+                if (new_cond == null and new_body == null) continue;
+                if (new_arms == null) {
+                    const buf = try allocator.alloc(IrCaseArm, cb.arms.len);
+                    for (cb.arms, 0..) |orig, j| buf[j] = orig;
+                    new_arms = buf;
+                }
+                var arm_copy = arm;
+                if (new_cond) |s| arm_copy.cond_instrs = s;
+                if (new_body) |s| arm_copy.body_instrs = s;
+                new_arms.?[idx] = arm_copy;
+            }
+            const new_default = try rebuildFn(context, ChildStream{ .kind = .case_default, .stream = cb.default_instrs });
+            if (new_pre == null and new_arms == null and new_default == null) return null;
+            var copy = cb;
+            if (new_pre) |s| copy.pre_instrs = s;
+            if (new_arms) |a| copy.arms = a;
+            if (new_default) |s| copy.default_instrs = s;
+            return Instruction{ .case_block = copy };
+        },
+        .switch_literal => |sl| {
+            var new_cases: ?[]LitCase = null;
+            for (sl.cases, 0..) |c, idx| {
+                const new_body = try rebuildFn(context, ChildStream{ .kind = .switch_lit_case, .stream = c.body_instrs });
+                if (new_body == null) continue;
+                if (new_cases == null) {
+                    const buf = try allocator.alloc(LitCase, sl.cases.len);
+                    for (sl.cases, 0..) |orig, j| buf[j] = orig;
+                    new_cases = buf;
+                }
+                var case_copy = c;
+                case_copy.body_instrs = new_body.?;
+                new_cases.?[idx] = case_copy;
+            }
+            const new_default = try rebuildFn(context, ChildStream{ .kind = .switch_lit_default, .stream = sl.default_instrs });
+            if (new_cases == null and new_default == null) return null;
+            var copy = sl;
+            if (new_cases) |c| copy.cases = c;
+            if (new_default) |s| copy.default_instrs = s;
+            return Instruction{ .switch_literal = copy };
+        },
+        .switch_return => |sr| {
+            var new_cases: ?[]ReturnCase = null;
+            for (sr.cases, 0..) |c, idx| {
+                const new_body = try rebuildFn(context, ChildStream{ .kind = .switch_ret_case, .stream = c.body_instrs });
+                if (new_body == null) continue;
+                if (new_cases == null) {
+                    const buf = try allocator.alloc(ReturnCase, sr.cases.len);
+                    for (sr.cases, 0..) |orig, j| buf[j] = orig;
+                    new_cases = buf;
+                }
+                var case_copy = c;
+                case_copy.body_instrs = new_body.?;
+                new_cases.?[idx] = case_copy;
+            }
+            const new_default = try rebuildFn(context, ChildStream{ .kind = .switch_ret_default, .stream = sr.default_instrs });
+            if (new_cases == null and new_default == null) return null;
+            var copy = sr;
+            if (new_cases) |c| copy.cases = c;
+            if (new_default) |s| copy.default_instrs = s;
+            return Instruction{ .switch_return = copy };
+        },
+        .union_switch => |us| {
+            var new_cases: ?[]UnionCase = null;
+            for (us.cases, 0..) |c, idx| {
+                const new_body = try rebuildFn(context, ChildStream{ .kind = .union_switch_case, .stream = c.body_instrs });
+                if (new_body == null) continue;
+                if (new_cases == null) {
+                    const buf = try allocator.alloc(UnionCase, us.cases.len);
+                    for (us.cases, 0..) |orig, j| buf[j] = orig;
+                    new_cases = buf;
+                }
+                var case_copy = c;
+                case_copy.body_instrs = new_body.?;
+                new_cases.?[idx] = case_copy;
+            }
+            // The catch-all `_` prong, rebuilt AFTER the cases — the
+            // sub-stream every rebuilder historically skipped.
+            const new_else = if (us.has_else)
+                try rebuildFn(context, ChildStream{ .kind = .union_switch_else, .stream = us.else_instrs })
+            else
+                null;
+            if (new_cases == null and new_else == null) return null;
+            var copy = us;
+            if (new_cases) |c| copy.cases = c;
+            if (new_else) |s| copy.else_instrs = s;
+            return Instruction{ .union_switch = copy };
+        },
+        .union_switch_return => |usr| {
+            var new_cases: ?[]UnionCase = null;
+            for (usr.cases, 0..) |c, idx| {
+                const new_body = try rebuildFn(context, ChildStream{ .kind = .union_switch_ret_case, .stream = c.body_instrs });
+                if (new_body == null) continue;
+                if (new_cases == null) {
+                    const buf = try allocator.alloc(UnionCase, usr.cases.len);
+                    for (usr.cases, 0..) |orig, j| buf[j] = orig;
+                    new_cases = buf;
+                }
+                var case_copy = c;
+                case_copy.body_instrs = new_body.?;
+                new_cases.?[idx] = case_copy;
+            }
+            if (new_cases == null) return null;
+            var copy = usr;
+            if (new_cases) |c| copy.cases = c;
+            return Instruction{ .union_switch_return = copy };
+        },
+        .try_call_named => |tc| {
+            const new_handler = try rebuildFn(context, ChildStream{ .kind = .try_handler, .stream = tc.handler_instrs });
+            const new_success = try rebuildFn(context, ChildStream{ .kind = .try_success, .stream = tc.success_instrs });
+            if (new_handler == null and new_success == null) return null;
+            var copy = tc;
+            if (new_handler) |s| copy.handler_instrs = s;
+            if (new_success) |s| copy.success_instrs = s;
+            return Instruction{ .try_call_named = copy };
+        },
+        .guard_block => |gb| {
+            const new_body = try rebuildFn(context, ChildStream{ .kind = .guard_body, .stream = gb.body });
+            if (new_body == null) return null;
+            var copy = gb;
+            copy.body = new_body.?;
+            return Instruction{ .guard_block = copy };
+        },
+        .optional_dispatch => |od| {
+            const new_nil = try rebuildFn(context, ChildStream{ .kind = .optional_dispatch_nil, .stream = od.nil_instrs });
+            const new_struct = try rebuildFn(context, ChildStream{ .kind = .optional_dispatch_struct, .stream = od.struct_instrs });
+            if (new_nil == null and new_struct == null) return null;
+            var copy = od;
+            if (new_nil) |s| copy.nil_instrs = s;
+            if (new_struct) |s| copy.struct_instrs = s;
+            return Instruction{ .optional_dispatch = copy };
+        },
+        // Variants with no child instruction streams: nothing to rebuild.
+        // Listed via `else` here (the exhaustiveness guarantee already
+        // comes from `forEachChildStream`'s no-`else` switch + the comptime
+        // check, both of which `mapChildStreams` mirrors structurally).
+        else => return null,
+    }
+}
+
 /// Walks every instruction in `function` (top-level and nested
 /// inside structural sub-streams) in depth-first order, invoking
 /// `visitor.visit(instruction_pointer)` for each. Used by analysis

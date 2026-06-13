@@ -330,46 +330,19 @@ const ComponentReleaseCollector = struct {
         self: *ComponentReleaseCollector,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                try self.discoverStream(ie.then_instrs);
-                try self.discoverStream(ie.else_instrs);
-            },
-            .case_block => |cb| {
-                try self.discoverStream(cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    try self.discoverStream(arm.cond_instrs);
-                    try self.discoverStream(arm.body_instrs);
-                }
-                try self.discoverStream(cb.default_instrs);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try self.discoverStream(c.body_instrs);
-                try self.discoverStream(sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try self.discoverStream(c.body_instrs);
-                try self.discoverStream(sr.default_instrs);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try self.discoverStream(c.body_instrs);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try self.discoverStream(c.body_instrs);
-            },
-            .try_call_named => |tc| {
-                try self.discoverStream(tc.handler_instrs);
-                try self.discoverStream(tc.success_instrs);
-            },
-            .guard_block => |gb| {
-                try self.discoverStream(gb.body);
-            },
-            .optional_dispatch => |od| {
-                try self.discoverStream(od.nil_instrs);
-                try self.discoverStream(od.struct_instrs);
-            },
-            else => {},
-        }
+        const Ctx = struct {
+            collector: *ComponentReleaseCollector,
+            err: ?error{OutOfMemory} = null,
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                ctx.collector.discoverStream(child.stream) catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .collector = self };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 
     fn computePathSensitiveLastUses(self: *ComponentReleaseCollector) error{OutOfMemory}!void {
@@ -410,52 +383,31 @@ const ComponentReleaseCollector = struct {
         }
     }
 
+    /// Mirror `arc_liveness.flattenChildren`'s InstructionId numbering by
+    /// recursing into every child stream via the canonical enumerator —
+    /// including `union_switch.else_instrs`, previously skipped, which had
+    /// shifted every subsequent id below the analyzer's key.
     fn numberChildren(
         self: *ComponentReleaseCollector,
         instr: *const ir.Instruction,
         next_id: *arc_liveness.InstructionId,
         pointer_to_id: *std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
     ) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                try self.numberStream(ie.then_instrs, next_id, pointer_to_id);
-                try self.numberStream(ie.else_instrs, next_id, pointer_to_id);
-            },
-            .case_block => |cb| {
-                try self.numberStream(cb.pre_instrs, next_id, pointer_to_id);
-                for (cb.arms) |arm| {
-                    try self.numberStream(arm.cond_instrs, next_id, pointer_to_id);
-                    try self.numberStream(arm.body_instrs, next_id, pointer_to_id);
-                }
-                try self.numberStream(cb.default_instrs, next_id, pointer_to_id);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try self.numberStream(c.body_instrs, next_id, pointer_to_id);
-                try self.numberStream(sl.default_instrs, next_id, pointer_to_id);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try self.numberStream(c.body_instrs, next_id, pointer_to_id);
-                try self.numberStream(sr.default_instrs, next_id, pointer_to_id);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try self.numberStream(c.body_instrs, next_id, pointer_to_id);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try self.numberStream(c.body_instrs, next_id, pointer_to_id);
-            },
-            .try_call_named => |tc| {
-                try self.numberStream(tc.handler_instrs, next_id, pointer_to_id);
-                try self.numberStream(tc.success_instrs, next_id, pointer_to_id);
-            },
-            .guard_block => |gb| {
-                try self.numberStream(gb.body, next_id, pointer_to_id);
-            },
-            .optional_dispatch => |od| {
-                try self.numberStream(od.nil_instrs, next_id, pointer_to_id);
-                try self.numberStream(od.struct_instrs, next_id, pointer_to_id);
-            },
-            else => {},
-        }
+        const Ctx = struct {
+            collector: *ComponentReleaseCollector,
+            next_id: *arc_liveness.InstructionId,
+            pointer_to_id: *std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
+            err: ?error{OutOfMemory} = null,
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                ctx.collector.numberStream(child.stream, ctx.next_id, ctx.pointer_to_id) catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .collector = self, .next_id = next_id, .pointer_to_id = pointer_to_id };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 
     fn recordLastUse(
@@ -526,6 +478,13 @@ const ComponentReleaseCollector = struct {
         }
     }
 
+    /// Recurse into every nested sub-stream via `ir.forEachChildStream`
+    /// (the canonical enumerator), preserving the existing per-slot
+    /// dataflow: `case_block.pre_instrs` shares the parent's active-
+    /// extraction set (control flows straight through), every other
+    /// sub-stream is branched (cloned active set per arm). Routing through
+    /// the enumerator means `union_switch.else_instrs` — previously
+    /// skipped here — is now scheduled like any other arm.
     fn scheduleChildren(
         self: *ComponentReleaseCollector,
         instr: *const ir.Instruction,
@@ -533,54 +492,33 @@ const ComponentReleaseCollector = struct {
         active: *ActiveExtractions,
         by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
     ) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |if_expr| {
-                try self.scheduleBranchedStream(if_expr.then_instrs, pointer_to_id, active, by_last_use);
-                try self.scheduleBranchedStream(if_expr.else_instrs, pointer_to_id, active, by_last_use);
-            },
-            .case_block => |case_block| {
-                try self.scheduleStream(case_block.pre_instrs, pointer_to_id, active, by_last_use);
-                for (case_block.arms) |arm| {
-                    try self.scheduleBranchedStream(arm.cond_instrs, pointer_to_id, active, by_last_use);
-                    try self.scheduleBranchedStream(arm.body_instrs, pointer_to_id, active, by_last_use);
-                }
-                try self.scheduleBranchedStream(case_block.default_instrs, pointer_to_id, active, by_last_use);
-            },
-            .switch_literal => |switch_literal| {
-                for (switch_literal.cases) |case| {
-                    try self.scheduleBranchedStream(case.body_instrs, pointer_to_id, active, by_last_use);
-                }
-                try self.scheduleBranchedStream(switch_literal.default_instrs, pointer_to_id, active, by_last_use);
-            },
-            .switch_return => |switch_return| {
-                for (switch_return.cases) |case| {
-                    try self.scheduleBranchedStream(case.body_instrs, pointer_to_id, active, by_last_use);
-                }
-                try self.scheduleBranchedStream(switch_return.default_instrs, pointer_to_id, active, by_last_use);
-            },
-            .union_switch => |union_switch| {
-                for (union_switch.cases) |case| {
-                    try self.scheduleBranchedStream(case.body_instrs, pointer_to_id, active, by_last_use);
-                }
-            },
-            .union_switch_return => |union_switch_return| {
-                for (union_switch_return.cases) |case| {
-                    try self.scheduleBranchedStream(case.body_instrs, pointer_to_id, active, by_last_use);
-                }
-            },
-            .try_call_named => |try_call_named| {
-                try self.scheduleBranchedStream(try_call_named.handler_instrs, pointer_to_id, active, by_last_use);
-                try self.scheduleBranchedStream(try_call_named.success_instrs, pointer_to_id, active, by_last_use);
-            },
-            .guard_block => |guard_block| {
-                try self.scheduleBranchedStream(guard_block.body, pointer_to_id, active, by_last_use);
-            },
-            .optional_dispatch => |optional_dispatch| {
-                try self.scheduleBranchedStream(optional_dispatch.nil_instrs, pointer_to_id, active, by_last_use);
-                try self.scheduleBranchedStream(optional_dispatch.struct_instrs, pointer_to_id, active, by_last_use);
-            },
-            else => {},
-        }
+        const Ctx = struct {
+            collector: *ComponentReleaseCollector,
+            pointer_to_id: *const std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
+            active: *ActiveExtractions,
+            by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
+            err: ?error{OutOfMemory} = null,
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                const result = if (child.kind == .case_pre)
+                    // pre_instrs runs before the arms in the parent scope:
+                    // it shares the active set (no clone).
+                    ctx.collector.scheduleStream(child.stream, ctx.pointer_to_id, ctx.active, ctx.by_last_use)
+                else
+                    ctx.collector.scheduleBranchedStream(child.stream, ctx.pointer_to_id, ctx.active, ctx.by_last_use);
+                result catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{
+            .collector = self,
+            .pointer_to_id = pointer_to_id,
+            .active = active,
+            .by_last_use = by_last_use,
+        };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 
     fn scheduleBranchedStream(
@@ -790,6 +728,13 @@ const ComponentAggregateLiveness = struct {
                 for (union_switch.cases) |case| {
                     var body_in = try self.processStream(case.body_instrs, parent_live_after);
                     defer body_in.deinit(self.collector.allocator);
+                }
+                // Catch-all `_` prong yields to the same merge as a case
+                // arm; process it so component-aggregate last-use records
+                // stay correct (mirrors arc_liveness.NonArcAggregateLiveness).
+                if (union_switch.has_else) {
+                    var else_in = try self.processStream(union_switch.else_instrs, parent_live_after);
+                    defer else_in.deinit(self.collector.allocator);
                 }
             },
             .union_switch_return => |union_switch_return| {
@@ -1014,166 +959,22 @@ const ComponentReleaseRebuilder = struct {
         return buf;
     }
 
+    /// Rebuild every child stream via `ir.mapChildStreams` — the
+    /// canonical transformer that visits sub-streams in the same order
+    /// `arc_liveness.flattenChildren` numbers them and writes back
+    /// `union_switch.else_instrs` (previously skipped here).
     fn rebuildChildren(
         self: *ComponentReleaseRebuilder,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!?ir.Instruction {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                const new_then = try self.rebuildStream(ie.then_instrs);
-                const new_else = try self.rebuildStream(ie.else_instrs);
-                if (new_then == null and new_else == null) return null;
-                var copy = ie;
-                if (new_then) |s| copy.then_instrs = s;
-                if (new_else) |s| copy.else_instrs = s;
-                return ir.Instruction{ .if_expr = copy };
-            },
-            .case_block => |cb| {
-                const new_pre = try self.rebuildStream(cb.pre_instrs);
-                var arms_changed = false;
-                var new_arms: ?[]ir.IrCaseArm = null;
-                {
-                    var local_new_arms: ?[]ir.IrCaseArm = null;
-                    for (cb.arms, 0..) |arm, idx| {
-                        const new_cond = try self.rebuildStream(arm.cond_instrs);
-                        const new_body = try self.rebuildStream(arm.body_instrs);
-                        if (new_cond == null and new_body == null) continue;
-                        if (local_new_arms == null) {
-                            const buf = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
-                            for (cb.arms, 0..) |orig_arm, j| buf[j] = orig_arm;
-                            local_new_arms = buf;
-                        }
-                        var arm_copy = arm;
-                        if (new_cond) |s| arm_copy.cond_instrs = s;
-                        if (new_body) |s| arm_copy.body_instrs = s;
-                        local_new_arms.?[idx] = arm_copy;
-                        arms_changed = true;
-                    }
-                    new_arms = local_new_arms;
-                }
-                const new_default = try self.rebuildStream(cb.default_instrs);
-                if (new_pre == null and !arms_changed and new_default == null) return null;
-                var copy = cb;
-                if (new_pre) |s| copy.pre_instrs = s;
-                if (new_arms) |arms| copy.arms = arms;
-                if (new_default) |s| copy.default_instrs = s;
-                return ir.Instruction{ .case_block = copy };
-            },
-            .switch_literal => |sl| {
-                var any_case_changed = false;
-                var new_cases: ?[]ir.LitCase = null;
-                for (sl.cases, 0..) |case, idx| {
-                    const new_body = try self.rebuildStream(case.body_instrs);
-                    if (new_body == null) continue;
-                    if (new_cases == null) {
-                        const buf = try self.allocator.alloc(ir.LitCase, sl.cases.len);
-                        for (sl.cases, 0..) |orig, j| buf[j] = orig;
-                        new_cases = buf;
-                    }
-                    var case_copy = case;
-                    case_copy.body_instrs = new_body.?;
-                    new_cases.?[idx] = case_copy;
-                    any_case_changed = true;
-                }
-                const new_default = try self.rebuildStream(sl.default_instrs);
-                if (!any_case_changed and new_default == null) return null;
-                var copy = sl;
-                if (new_cases) |cases| copy.cases = cases;
-                if (new_default) |s| copy.default_instrs = s;
-                return ir.Instruction{ .switch_literal = copy };
-            },
-            .switch_return => |sr| {
-                var any_case_changed = false;
-                var new_cases: ?[]ir.ReturnCase = null;
-                for (sr.cases, 0..) |case, idx| {
-                    const new_body = try self.rebuildStream(case.body_instrs);
-                    if (new_body == null) continue;
-                    if (new_cases == null) {
-                        const buf = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
-                        for (sr.cases, 0..) |orig, j| buf[j] = orig;
-                        new_cases = buf;
-                    }
-                    var case_copy = case;
-                    case_copy.body_instrs = new_body.?;
-                    new_cases.?[idx] = case_copy;
-                    any_case_changed = true;
-                }
-                const new_default = try self.rebuildStream(sr.default_instrs);
-                if (!any_case_changed and new_default == null) return null;
-                var copy = sr;
-                if (new_cases) |cases| copy.cases = cases;
-                if (new_default) |s| copy.default_instrs = s;
-                return ir.Instruction{ .switch_return = copy };
-            },
-            .union_switch => |us| {
-                var any_case_changed = false;
-                var new_cases: ?[]ir.UnionCase = null;
-                for (us.cases, 0..) |case, idx| {
-                    const new_body = try self.rebuildStream(case.body_instrs);
-                    if (new_body == null) continue;
-                    if (new_cases == null) {
-                        const buf = try self.allocator.alloc(ir.UnionCase, us.cases.len);
-                        for (us.cases, 0..) |orig, j| buf[j] = orig;
-                        new_cases = buf;
-                    }
-                    var case_copy = case;
-                    case_copy.body_instrs = new_body.?;
-                    new_cases.?[idx] = case_copy;
-                    any_case_changed = true;
-                }
-                if (!any_case_changed) return null;
-                var copy = us;
-                if (new_cases) |cases| copy.cases = cases;
-                return ir.Instruction{ .union_switch = copy };
-            },
-            .union_switch_return => |usr| {
-                var any_case_changed = false;
-                var new_cases: ?[]ir.UnionCase = null;
-                for (usr.cases, 0..) |case, idx| {
-                    const new_body = try self.rebuildStream(case.body_instrs);
-                    if (new_body == null) continue;
-                    if (new_cases == null) {
-                        const buf = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
-                        for (usr.cases, 0..) |orig, j| buf[j] = orig;
-                        new_cases = buf;
-                    }
-                    var case_copy = case;
-                    case_copy.body_instrs = new_body.?;
-                    new_cases.?[idx] = case_copy;
-                    any_case_changed = true;
-                }
-                if (!any_case_changed) return null;
-                var copy = usr;
-                if (new_cases) |cases| copy.cases = cases;
-                return ir.Instruction{ .union_switch_return = copy };
-            },
-            .try_call_named => |tc| {
-                const new_handler = try self.rebuildStream(tc.handler_instrs);
-                const new_success = try self.rebuildStream(tc.success_instrs);
-                if (new_handler == null and new_success == null) return null;
-                var copy = tc;
-                if (new_handler) |s| copy.handler_instrs = s;
-                if (new_success) |s| copy.success_instrs = s;
-                return ir.Instruction{ .try_call_named = copy };
-            },
-            .guard_block => |gb| {
-                const new_body = try self.rebuildStream(gb.body);
-                if (new_body == null) return null;
-                var copy = gb;
-                copy.body = new_body.?;
-                return ir.Instruction{ .guard_block = copy };
-            },
-            .optional_dispatch => |od| {
-                const new_nil = try self.rebuildStream(od.nil_instrs);
-                const new_struct = try self.rebuildStream(od.struct_instrs);
-                if (new_nil == null and new_struct == null) return null;
-                var copy = od;
-                if (new_nil) |s| copy.nil_instrs = s;
-                if (new_struct) |s| copy.struct_instrs = s;
-                return ir.Instruction{ .optional_dispatch = copy };
-            },
-            else => return null,
-        }
+        return ir.mapChildStreams(self.allocator, instr, self, rebuildChildStream);
+    }
+
+    fn rebuildChildStream(
+        self: *ComponentReleaseRebuilder,
+        child: ir.ChildStream,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        return self.rebuildStream(child.stream);
     }
 };
 
@@ -1233,6 +1034,14 @@ pub fn insertScopeExitDrops(
             block_ptr.instructions = new_slice;
         }
     }
+
+    // Audit R1: the rebuilder must have numbered exactly as many
+    // instructions as the analyzer recorded. A mismatch proves the
+    // rebuilder's structural traversal diverged from `flattenChildren`
+    // (the historical `union_switch.else_instrs` skip), mis-keying every
+    // `live_before_ret`/`owned_at_ret` lookup after the divergent
+    // instruction. Fail loudly in debug; no-op in release.
+    arc_liveness.assertConsumerWalkMatches(ownership, rebuilder.next_id);
 }
 
 // ============================================================
@@ -1651,71 +1460,22 @@ const StreamRebuilder = struct {
         parent_id: arc_liveness.InstructionId,
     ) error{OutOfMemory}!ChildResult {
         switch (instr.*) {
-            .if_expr => |ie| {
-                const new_then = try self.rebuildStream(ie.then_instrs);
-                const new_else = try self.rebuildStream(ie.else_instrs);
-                if (new_then == null and new_else == null) return .{ .rebuilt = null };
-                var copy = ie;
-                if (new_then) |s| copy.then_instrs = s;
-                if (new_else) |s| copy.else_instrs = s;
-                return .{ .rebuilt = ir.Instruction{ .if_expr = copy } };
-            },
-            .case_block => |cb| {
-                const new_pre = try self.rebuildStream(cb.pre_instrs);
-                var arms_changed = false;
-                var new_arms: ?[]ir.IrCaseArm = null;
-                {
-                    var local_new_arms: ?[]ir.IrCaseArm = null;
-                    for (cb.arms, 0..) |arm, idx| {
-                        const new_cond = try self.rebuildStream(arm.cond_instrs);
-                        const new_body = try self.rebuildStream(arm.body_instrs);
-                        if (new_cond == null and new_body == null) continue;
-                        if (local_new_arms == null) {
-                            const buf = try self.allocator.alloc(ir.IrCaseArm, cb.arms.len);
-                            // Copy original arms by-value so untouched
-                            // arms keep their original sub-stream
-                            // slices.
-                            for (cb.arms, 0..) |orig_arm, j| buf[j] = orig_arm;
-                            local_new_arms = buf;
-                        }
-                        var arm_copy = arm;
-                        if (new_cond) |s| arm_copy.cond_instrs = s;
-                        if (new_body) |s| arm_copy.body_instrs = s;
-                        local_new_arms.?[idx] = arm_copy;
-                        arms_changed = true;
-                    }
-                    new_arms = local_new_arms;
-                }
-                const new_default = try self.rebuildStream(cb.default_instrs);
-                if (new_pre == null and !arms_changed and new_default == null) return .{ .rebuilt = null };
-                var copy = cb;
-                if (new_pre) |s| copy.pre_instrs = s;
-                if (new_arms) |arms| copy.arms = arms;
-                if (new_default) |s| copy.default_instrs = s;
-                return .{ .rebuilt = ir.Instruction{ .case_block = copy } };
-            },
-            .switch_literal => |sl| {
-                var any_case_changed = false;
-                var new_cases: ?[]ir.LitCase = null;
-                for (sl.cases, 0..) |case, idx| {
-                    const new_body = try self.rebuildStream(case.body_instrs);
-                    if (new_body == null) continue;
-                    if (new_cases == null) {
-                        const buf = try self.allocator.alloc(ir.LitCase, sl.cases.len);
-                        for (sl.cases, 0..) |orig, j| buf[j] = orig;
-                        new_cases = buf;
-                    }
-                    var case_copy = case;
-                    case_copy.body_instrs = new_body.?;
-                    new_cases.?[idx] = case_copy;
-                    any_case_changed = true;
-                }
-                const new_default = try self.rebuildStream(sl.default_instrs);
-                if (!any_case_changed and new_default == null) return .{ .rebuilt = null };
-                var copy = sl;
-                if (new_cases) |cases| copy.cases = cases;
-                if (new_default) |s| copy.default_instrs = s;
-                return .{ .rebuilt = ir.Instruction{ .switch_literal = copy } };
+            // switch_return / union_switch_return additionally append a
+            // per-arm `arm_retain`, and optional_dispatch appends a
+            // payload release — those three remain explicit below. Every
+            // other control-flow shape is a pure structural stream
+            // rebuild handled by the canonical `ir.mapChildStreams`
+            // transformer (which now rebuilds `union_switch.else_instrs`
+            // too, in lock-step with the analyzer's numbering).
+            .if_expr,
+            .case_block,
+            .switch_literal,
+            .union_switch,
+            .try_call_named,
+            .guard_block,
+            => {
+                const rebuilt = try ir.mapChildStreams(self.allocator, instr, self, rebuildPlainChildStream);
+                return .{ .rebuilt = rebuilt };
             },
             .switch_return => |sr| {
                 var any_case_changed = false;
@@ -1746,27 +1506,6 @@ const StreamRebuilder = struct {
                 if (new_default) |s| copy.default_instrs = s;
                 return .{ .rebuilt = ir.Instruction{ .switch_return = copy } };
             },
-            .union_switch => |us| {
-                var any_case_changed = false;
-                var new_cases: ?[]ir.UnionCase = null;
-                for (us.cases, 0..) |case, idx| {
-                    const new_body = try self.rebuildStream(case.body_instrs);
-                    if (new_body == null) continue;
-                    if (new_cases == null) {
-                        const buf = try self.allocator.alloc(ir.UnionCase, us.cases.len);
-                        for (us.cases, 0..) |orig, j| buf[j] = orig;
-                        new_cases = buf;
-                    }
-                    var case_copy = case;
-                    case_copy.body_instrs = new_body.?;
-                    new_cases.?[idx] = case_copy;
-                    any_case_changed = true;
-                }
-                if (!any_case_changed) return .{ .rebuilt = null };
-                var copy = us;
-                if (new_cases) |cases| copy.cases = cases;
-                return .{ .rebuilt = ir.Instruction{ .union_switch = copy } };
-            },
             .union_switch_return => |usr| {
                 var any_case_changed = false;
                 var new_cases: ?[]ir.UnionCase = null;
@@ -1794,30 +1533,13 @@ const StreamRebuilder = struct {
                 if (new_cases) |cases| copy.cases = cases;
                 return .{ .rebuilt = ir.Instruction{ .union_switch_return = copy } };
             },
-            .try_call_named => |tc| {
-                const new_handler = try self.rebuildStream(tc.handler_instrs);
-                const new_success = try self.rebuildStream(tc.success_instrs);
-                if (new_handler == null and new_success == null) return .{ .rebuilt = null };
-                var copy = tc;
-                if (new_handler) |s| copy.handler_instrs = s;
-                if (new_success) |s| copy.success_instrs = s;
-                return .{ .rebuilt = ir.Instruction{ .try_call_named = copy } };
-            },
-            .guard_block => |gb| {
-                const new_body = try self.rebuildStream(gb.body);
-                if (new_body == null) return .{ .rebuilt = null };
-                var copy = gb;
-                copy.body = new_body.?;
-                return .{ .rebuilt = ir.Instruction{ .guard_block = copy } };
-            },
             .optional_dispatch => |od| {
-                // Phase D (Phase 6 redux plan §3.D): recurse into both
-                // arm bodies. The traversal order MUST match the
-                // analyzer's `flattenChildren` exactly: nil_instrs
-                // first, then struct_instrs. Any deviation here would
-                // shift the InstructionId numbering and break the
-                // `live_before_ret` lookup for instructions following
-                // the optional_dispatch in the parent stream.
+                // The traversal order MUST match the analyzer's
+                // `flattenChildren` exactly: nil_instrs first, then
+                // struct_instrs. Any deviation here would shift the
+                // InstructionId numbering and break the `live_before_ret`
+                // lookup for instructions following the optional_dispatch
+                // in the parent stream.
                 const new_nil = try self.rebuildStream(od.nil_instrs);
                 const new_struct = try self.rebuildStream(od.struct_instrs);
 
@@ -1861,6 +1583,17 @@ const StreamRebuilder = struct {
             },
             else => return .{ .rebuilt = null },
         }
+    }
+
+    /// `ir.mapChildStreams` callback for the pure structural-rebuild
+    /// variants: just recursively rebuild the child stream. (The
+    /// arm-retain and payload-release shapes are handled by their own
+    /// explicit arms in `rebuildChildren`.)
+    fn rebuildPlainChildStream(
+        self: *StreamRebuilder,
+        child: ir.ChildStream,
+    ) error{OutOfMemory}!?[]const ir.Instruction {
+        return self.rebuildStream(child.stream);
     }
 
     fn dropsBeforeInstruction(
@@ -2167,48 +1900,24 @@ fn instructionsContainOwnedOptionalDispatch(
     function: *const ir.Function,
     stream: []const ir.Instruction,
 ) bool {
-    for (stream) |instr| {
-        switch (instr) {
-            .optional_dispatch => |od| {
-                if (optionalDispatchPayloadRelease(function, od) != null) return true;
-                if (instructionsContainOwnedOptionalDispatch(function, od.nil_instrs)) return true;
-                if (instructionsContainOwnedOptionalDispatch(function, od.struct_instrs)) return true;
-            },
-            .if_expr => |ie| {
-                if (instructionsContainOwnedOptionalDispatch(function, ie.then_instrs)) return true;
-                if (instructionsContainOwnedOptionalDispatch(function, ie.else_instrs)) return true;
-            },
-            .case_block => |cb| {
-                if (instructionsContainOwnedOptionalDispatch(function, cb.pre_instrs)) return true;
-                for (cb.arms) |arm| {
-                    if (instructionsContainOwnedOptionalDispatch(function, arm.cond_instrs)) return true;
-                    if (instructionsContainOwnedOptionalDispatch(function, arm.body_instrs)) return true;
-                }
-                if (instructionsContainOwnedOptionalDispatch(function, cb.default_instrs)) return true;
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| if (instructionsContainOwnedOptionalDispatch(function, c.body_instrs)) return true;
-                if (instructionsContainOwnedOptionalDispatch(function, sl.default_instrs)) return true;
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| if (instructionsContainOwnedOptionalDispatch(function, c.body_instrs)) return true;
-                if (instructionsContainOwnedOptionalDispatch(function, sr.default_instrs)) return true;
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| if (instructionsContainOwnedOptionalDispatch(function, c.body_instrs)) return true;
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| if (instructionsContainOwnedOptionalDispatch(function, c.body_instrs)) return true;
-            },
-            .try_call_named => |tc| {
-                if (instructionsContainOwnedOptionalDispatch(function, tc.handler_instrs)) return true;
-                if (instructionsContainOwnedOptionalDispatch(function, tc.success_instrs)) return true;
-            },
-            .guard_block => |gb| {
-                if (instructionsContainOwnedOptionalDispatch(function, gb.body)) return true;
-            },
-            else => {},
+    for (stream) |*instr| {
+        if (instr.* == .optional_dispatch) {
+            if (optionalDispatchPayloadRelease(function, instr.optional_dispatch) != null) return true;
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs that the old
+        // hand-rolled switch skipped).
+        const Finder = struct {
+            function: *const ir.Function,
+            found: bool = false,
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                if (self.found) return;
+                if (instructionsContainOwnedOptionalDispatch(self.function, child.stream)) self.found = true;
+            }
+        };
+        var finder = Finder{ .function = function };
+        ir.forEachChildStream(instr, &finder, Finder.onStream);
+        if (finder.found) return true;
     }
     return false;
 }
@@ -2400,58 +2109,21 @@ fn collectLocalSetValueLocalsInStream(
     stream: []const ir.Instruction,
     out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
 ) void {
-    // Mirror the nested-stream traversal of `rewriteProtocolBoxReleasesInStream`
-    // exactly so a `local_set` buried in any control-flow arm is observed.
-    for (stream) |instr| {
-        switch (instr) {
-            .local_set => |ls| out.put(std.heap.page_allocator, ls.value, {}) catch {},
-            .if_expr => |ie| {
-                collectLocalSetValueLocalsInStream(ie.then_instrs, out);
-                collectLocalSetValueLocalsInStream(ie.else_instrs, out);
-            },
-            .case_block => |cb| {
-                collectLocalSetValueLocalsInStream(cb.pre_instrs, out);
-                for (cb.arms) |arm| {
-                    collectLocalSetValueLocalsInStream(arm.cond_instrs, out);
-                    collectLocalSetValueLocalsInStream(arm.body_instrs, out);
-                }
-                collectLocalSetValueLocalsInStream(cb.default_instrs, out);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| {
-                    collectLocalSetValueLocalsInStream(c.body_instrs, out);
-                }
-                collectLocalSetValueLocalsInStream(sl.default_instrs, out);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| {
-                    collectLocalSetValueLocalsInStream(c.body_instrs, out);
-                }
-                collectLocalSetValueLocalsInStream(sr.default_instrs, out);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    collectLocalSetValueLocalsInStream(c.body_instrs, out);
-                }
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| {
-                    collectLocalSetValueLocalsInStream(c.body_instrs, out);
-                }
-            },
-            .optional_dispatch => |od| {
-                collectLocalSetValueLocalsInStream(od.nil_instrs, out);
-                collectLocalSetValueLocalsInStream(od.struct_instrs, out);
-            },
-            .guard_block => |gb| {
-                collectLocalSetValueLocalsInStream(gb.body, out);
-            },
-            .try_call_named => |tc| {
-                collectLocalSetValueLocalsInStream(tc.handler_instrs, out);
-                collectLocalSetValueLocalsInStream(tc.success_instrs, out);
-            },
-            else => {},
+    // Recurse into every nested sub-stream via the canonical enumerator
+    // (covers union_switch.else_instrs that the old switch skipped) so a
+    // `local_set` buried in any control-flow arm is observed.
+    for (stream) |*instr| {
+        if (instr.* == .local_set) {
+            out.put(std.heap.page_allocator, instr.local_set.value, {}) catch {};
         }
+        const Ctx = struct {
+            out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                collectLocalSetValueLocalsInStream(child.stream, self.out);
+            }
+        };
+        var ctx = Ctx{ .out = out };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
     }
 }
 
@@ -2463,13 +2135,15 @@ fn rewriteProtocolBoxReleasesInStream(
     for (stream) |*instr_ptr| {
         switch (instr_ptr.*) {
             .release => |rel| {
-                if (rel.kind != .release) continue;
-                const protocol_name = function.protocol_box_locals.get(rel.value) orelse continue;
-                instr_ptr.* = .{ .release = .{
-                    .value = rel.value,
-                    .kind = .protocol_box_drop,
-                    .protocol_name = protocol_name,
-                } };
+                if (rel.kind == .release) {
+                    if (function.protocol_box_locals.get(rel.value)) |protocol_name| {
+                        instr_ptr.* = .{ .release = .{
+                            .value = rel.value,
+                            .kind = .protocol_box_drop,
+                            .protocol_name = protocol_name,
+                        } };
+                    }
+                }
             },
             // Symmetric to the release rewrite: a `.retain` of a known
             // protocol-box local must route through the synthetic
@@ -2498,81 +2172,52 @@ fn rewriteProtocolBoxReleasesInStream(
             // Already-rewritten box retains are left alone (idempotent
             // re-run guard).
             .retain => |ret| {
-                if (ret.kind == .protocol_box_retain or ret.kind == .protocol_box_share) continue;
-                const protocol_name = function.protocol_box_locals.get(ret.value) orelse continue;
-                // A `.persistent` box retain becomes a genuine new-owner SHARE
-                // (clone under no-REFCOUNT_V1) ONLY when its value is bound to a
-                // named local — it appears as a `local_set.value`. A
-                // `.persistent` retain on a box that is consumed in place (a
-                // dispatch/call receiver the conservative classifier copied
-                // rather than borrowed) is NOT a new owner: its scope-exit drop
-                // is suppressed as a transient, so cloning it would leak.
-                // Treat such an in-place `.persistent` box retain as a plain
-                // `.protocol_box_retain` (refcount bump under a refcount
-                // manager; no-op under no-REFCOUNT_V1, balanced by the
-                // transient's suppressed release).
-                const box_kind: ir.RetainKind = switch (ret.kind) {
-                    .persistent => if (binding_targets.contains(ret.value))
-                        .protocol_box_share
-                    else
-                        .protocol_box_retain,
-                    .normal => .protocol_box_retain,
-                    .protocol_box_retain, .protocol_box_share => unreachable,
-                };
-                instr_ptr.* = .{ .retain = .{
-                    .value = ret.value,
-                    .kind = box_kind,
-                    .protocol_name = protocol_name,
-                } };
-            },
-            .if_expr => |*ie| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(ie.then_instrs), binding_targets);
-                rewriteProtocolBoxReleasesInStream(function, @constCast(ie.else_instrs), binding_targets);
-            },
-            .case_block => |*cb| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(cb.pre_instrs), binding_targets);
-                for (cb.arms) |*arm_const| {
-                    const arm: *ir.IrCaseArm = @constCast(arm_const);
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(arm.cond_instrs), binding_targets);
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(arm.body_instrs), binding_targets);
+                // Already-rewritten box retains are left alone (idempotent
+                // re-run guard); a non-box retain is left alone too.
+                if (ret.kind != .protocol_box_retain and ret.kind != .protocol_box_share) {
+                    if (function.protocol_box_locals.get(ret.value)) |protocol_name| {
+                        // A `.persistent` box retain becomes a genuine
+                        // new-owner SHARE (clone under no-REFCOUNT_V1) ONLY
+                        // when its value is bound to a named local — it
+                        // appears as a `local_set.value`. A `.persistent`
+                        // retain on a box consumed in place is NOT a new
+                        // owner: its scope-exit drop is suppressed as a
+                        // transient, so cloning it would leak. Treat such an
+                        // in-place `.persistent` box retain as a plain
+                        // `.protocol_box_retain`.
+                        const box_kind: ir.RetainKind = switch (ret.kind) {
+                            .persistent => if (binding_targets.contains(ret.value))
+                                .protocol_box_share
+                            else
+                                .protocol_box_retain,
+                            .normal => .protocol_box_retain,
+                            .protocol_box_retain, .protocol_box_share => unreachable,
+                        };
+                        instr_ptr.* = .{ .retain = .{
+                            .value = ret.value,
+                            .kind = box_kind,
+                            .protocol_name = protocol_name,
+                        } };
+                    }
                 }
-                rewriteProtocolBoxReleasesInStream(function, @constCast(cb.default_instrs), binding_targets);
-            },
-            .switch_literal => |*sl| {
-                for (sl.cases) |*c| {
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs), binding_targets);
-                }
-                rewriteProtocolBoxReleasesInStream(function, @constCast(sl.default_instrs), binding_targets);
-            },
-            .switch_return => |*sr| {
-                for (sr.cases) |*c| {
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs), binding_targets);
-                }
-                rewriteProtocolBoxReleasesInStream(function, @constCast(sr.default_instrs), binding_targets);
-            },
-            .union_switch_return => |*usr| {
-                for (usr.cases) |*c| {
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs), binding_targets);
-                }
-            },
-            .union_switch => |*us| {
-                for (us.cases) |*c| {
-                    rewriteProtocolBoxReleasesInStream(function, @constCast(c.body_instrs), binding_targets);
-                }
-            },
-            .optional_dispatch => |*od| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(od.nil_instrs), binding_targets);
-                rewriteProtocolBoxReleasesInStream(function, @constCast(od.struct_instrs), binding_targets);
-            },
-            .guard_block => |*gb| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(gb.body), binding_targets);
-            },
-            .try_call_named => |*tc| {
-                rewriteProtocolBoxReleasesInStream(function, @constCast(tc.handler_instrs), binding_targets);
-                rewriteProtocolBoxReleasesInStream(function, @constCast(tc.success_instrs), binding_targets);
             },
             else => {},
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs that the old
+        // hand-rolled switch skipped). The streams are `[]const` but the
+        // underlying IR was allocated mutably by the IR builder; the
+        // `@constCast` here matches the in-place mutation contract this
+        // pass already relied on for its other sub-stream recursions.
+        const Ctx = struct {
+            function: *const ir.Function,
+            binding_targets: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                rewriteProtocolBoxReleasesInStream(self.function, @constCast(child.stream), self.binding_targets);
+            }
+        };
+        var ctx = Ctx{ .function = function, .binding_targets = binding_targets };
+        ir.forEachChildStream(instr_ptr, &ctx, Ctx.onStream);
     }
 }
 
