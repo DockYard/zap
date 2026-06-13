@@ -269,6 +269,13 @@ pub fn analyzeUniquenessFullEx(
         try analyzer.walkStream(block.instructions);
     }
 
+    // Audit R1: the uniqueness walk's InstructionId numbering must match
+    // the analyzer's record count, or its `isLastUseAt` queries (which key
+    // the `*_owned_unchecked` rewrite) are mis-keyed. Only checkable when
+    // an ownership table is supplied (its `isLastUseAt` is the consumer).
+    // Fail loudly in debug; no-op in release.
+    if (ownership) |o| arc_liveness.assertConsumerWalkMatches(o, analyzer.next_id);
+
     return analyzer.result;
 }
 
@@ -660,6 +667,18 @@ const Analyzer = struct {
                 defer snap.deinit(self.allocator);
                 for (us.cases) |c| {
                     try self.walkStream(c.body_instrs);
+                    try self.restore(&snap);
+                }
+                // The catch-all `_` prong is walked like a case arm
+                // (snapshot/restore) so its call sites and escape flows are
+                // analyzed AND its InstructionId numbering matches the
+                // analyzer's flattenChildren. Skipping it both desynced the
+                // id space (every isLastUseAt query after the union_switch
+                // consulted the wrong instruction) and hid shared-arg flows
+                // inside the catch-all from uniqueness demotion. See audit
+                // finding uniqueness--01.
+                if (us.has_else) {
+                    try self.walkStream(us.else_instrs);
                     try self.restore(&snap);
                 }
             },
@@ -1697,39 +1716,21 @@ fn scanAllocatorWrapperStream(
             .try_call_named, .call_dispatch, .call_closure, .tail_call => {
                 ctx.other_call_count.* += 1;
             },
-            .if_expr => |ie| {
-                scanAllocatorWrapperStream(ie.then_instrs, ctx);
-                scanAllocatorWrapperStream(ie.else_instrs, ctx);
-            },
-            .case_block => |cb| {
-                scanAllocatorWrapperStream(cb.pre_instrs, ctx);
-                for (cb.arms) |arm| {
-                    scanAllocatorWrapperStream(arm.cond_instrs, ctx);
-                    scanAllocatorWrapperStream(arm.body_instrs, ctx);
-                }
-                scanAllocatorWrapperStream(cb.default_instrs, ctx);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
-                scanAllocatorWrapperStream(sl.default_instrs, ctx);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
-                scanAllocatorWrapperStream(sr.default_instrs, ctx);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
-            },
-            .guard_block => |gb| scanAllocatorWrapperStream(gb.body, ctx),
-            .optional_dispatch => |od| {
-                scanAllocatorWrapperStream(od.nil_instrs, ctx);
-                scanAllocatorWrapperStream(od.struct_instrs, ctx);
-            },
             else => {},
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs, previously
+        // skipped). The call-counting arms above are all leaf
+        // instructions with no child streams, so this is a no-op for
+        // them.
+        const Ctx = struct {
+            ctx: *AllocatorWrapperScan,
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                scanAllocatorWrapperStream(child.stream, self.ctx);
+            }
+        };
+        var rec = Ctx{ .ctx = ctx };
+        ir.forEachChildStream(instr, &rec, Ctx.onStream);
     }
 }
 

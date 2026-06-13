@@ -312,41 +312,28 @@ fn walkStreamForCallees(
                     });
                 }
             },
-            .if_expr => |ie| {
-                try walkStreamForCallees(allocator, ie.then_instrs, name_to_id, edges);
-                try walkStreamForCallees(allocator, ie.else_instrs, name_to_id, edges);
-            },
-            .case_block => |cb| {
-                try walkStreamForCallees(allocator, cb.pre_instrs, name_to_id, edges);
-                for (cb.arms) |arm| {
-                    try walkStreamForCallees(allocator, arm.cond_instrs, name_to_id, edges);
-                    try walkStreamForCallees(allocator, arm.body_instrs, name_to_id, edges);
-                }
-                try walkStreamForCallees(allocator, cb.default_instrs, name_to_id, edges);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try walkStreamForCallees(allocator, c.body_instrs, name_to_id, edges);
-                try walkStreamForCallees(allocator, sl.default_instrs, name_to_id, edges);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try walkStreamForCallees(allocator, c.body_instrs, name_to_id, edges);
-                try walkStreamForCallees(allocator, sr.default_instrs, name_to_id, edges);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try walkStreamForCallees(allocator, c.body_instrs, name_to_id, edges);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try walkStreamForCallees(allocator, c.body_instrs, name_to_id, edges);
-            },
-            .guard_block => |gb| {
-                try walkStreamForCallees(allocator, gb.body, name_to_id, edges);
-            },
-            .optional_dispatch => |od| {
-                try walkStreamForCallees(allocator, od.nil_instrs, name_to_id, edges);
-                try walkStreamForCallees(allocator, od.struct_instrs, name_to_id, edges);
-            },
             else => {},
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs, previously
+        // skipped, so call-graph edges from a catch-all body are no
+        // longer lost). Leaf call instructions have no child streams,
+        // so this is a no-op for them.
+        const Ctx = struct {
+            allocator: std.mem.Allocator,
+            name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+            edges: *std.ArrayListUnmanaged(CallEdge),
+            err: ?error{OutOfMemory} = null,
+            fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
+                if (self_ctx.err != null) return;
+                walkStreamForCallees(self_ctx.allocator, child.stream, self_ctx.name_to_id, self_ctx.edges) catch |e| {
+                    self_ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .allocator = allocator, .name_to_id = name_to_id, .edges = edges };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 }
 
@@ -917,6 +904,15 @@ const FlowWalker = struct {
                 for (us.cases) |c| {
                     try self.walkStream(c.body_instrs);
                     if (c.return_value) |rv| try self.mergeArmResultIntoDest(us.dest, rv);
+                }
+                // The catch-all `_` prong merges its result into the
+                // union_switch's dest exactly like a case arm; walking it
+                // also keeps the id space aligned and lets its tuple_pending
+                // witnesses participate in the arm merge. See audit finding
+                // uniqueness--01.
+                if (us.has_else) {
+                    try self.walkStream(us.else_instrs);
+                    if (us.else_result) |er| try self.mergeArmResultIntoDest(us.dest, er);
                 }
             },
             .union_switch_return => |usr| {

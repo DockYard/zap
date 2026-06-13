@@ -436,41 +436,29 @@ fn collectCalleesIntoStream(
                     try recordEdge(allocator, target, caller_id, callers_of);
                 }
             },
-            .if_expr => |ie| {
-                try collectCalleesIntoStream(allocator, caller_id, ie.then_instrs, name_to_id, callers_of);
-                try collectCalleesIntoStream(allocator, caller_id, ie.else_instrs, name_to_id, callers_of);
-            },
-            .case_block => |cb| {
-                try collectCalleesIntoStream(allocator, caller_id, cb.pre_instrs, name_to_id, callers_of);
-                for (cb.arms) |arm| {
-                    try collectCalleesIntoStream(allocator, caller_id, arm.cond_instrs, name_to_id, callers_of);
-                    try collectCalleesIntoStream(allocator, caller_id, arm.body_instrs, name_to_id, callers_of);
-                }
-                try collectCalleesIntoStream(allocator, caller_id, cb.default_instrs, name_to_id, callers_of);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try collectCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
-                try collectCalleesIntoStream(allocator, caller_id, sl.default_instrs, name_to_id, callers_of);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try collectCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
-                try collectCalleesIntoStream(allocator, caller_id, sr.default_instrs, name_to_id, callers_of);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try collectCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try collectCalleesIntoStream(allocator, caller_id, c.body_instrs, name_to_id, callers_of);
-            },
-            .guard_block => |gb| {
-                try collectCalleesIntoStream(allocator, caller_id, gb.body, name_to_id, callers_of);
-            },
-            .optional_dispatch => |od| {
-                try collectCalleesIntoStream(allocator, caller_id, od.nil_instrs, name_to_id, callers_of);
-                try collectCalleesIntoStream(allocator, caller_id, od.struct_instrs, name_to_id, callers_of);
-            },
             else => {},
         }
+        // Recurse into every nested sub-stream via the canonical
+        // enumerator (covers union_switch.else_instrs, previously
+        // skipped, so callers_of edges from a catch-all body are no
+        // longer lost — those edges drive the demotion cascade). Leaf
+        // call instructions have no child streams.
+        const Ctx = struct {
+            allocator: std.mem.Allocator,
+            caller_id: ir.FunctionId,
+            name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+            callers_of: *std.AutoHashMapUnmanaged(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+            err: ?error{OutOfMemory} = null,
+            fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
+                if (self_ctx.err != null) return;
+                collectCalleesIntoStream(self_ctx.allocator, self_ctx.caller_id, child.stream, self_ctx.name_to_id, self_ctx.callers_of) catch |e| {
+                    self_ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .allocator = allocator, .caller_id = caller_id, .name_to_id = name_to_id, .callers_of = callers_of };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 }
 
@@ -514,50 +502,29 @@ const DemotionWalker = struct {
         }
     }
 
+    /// Recurse into every child stream via the canonical enumerator so
+    /// the InstructionId numbering matches `flattenChildren` (including
+    /// `union_switch.else_instrs`, previously skipped — which both desynced
+    /// the id space feeding `maybeDemoteCallee`'s `arg_sites` lookup and
+    /// hid call sites inside the catch-all from demotion). Audit finding
+    /// uniqueness--01.
     fn walkChildren(
         self: *DemotionWalker,
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                try self.walkStream(ie.then_instrs);
-                try self.walkStream(ie.else_instrs);
-            },
-            .case_block => |cb| {
-                try self.walkStream(cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    try self.walkStream(arm.cond_instrs);
-                    try self.walkStream(arm.body_instrs);
-                }
-                try self.walkStream(cb.default_instrs);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| try self.walkStream(c.body_instrs);
-                try self.walkStream(sr.default_instrs);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| try self.walkStream(c.body_instrs);
-            },
-            .try_call_named => |tcn| {
-                try self.walkStream(tcn.handler_instrs);
-                try self.walkStream(tcn.success_instrs);
-            },
-            .guard_block => |gb| {
-                try self.walkStream(gb.body);
-            },
-            .optional_dispatch => |od| {
-                try self.walkStream(od.nil_instrs);
-                try self.walkStream(od.struct_instrs);
-            },
-            else => {},
-        }
+        const Ctx = struct {
+            walker: *DemotionWalker,
+            err: ?error{OutOfMemory} = null,
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                ctx.walker.walkStream(child.stream) catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .walker = self };
+        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 
     fn maybeDemoteCallee(
