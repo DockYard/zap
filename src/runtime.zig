@@ -6847,24 +6847,196 @@ pub const ArcRuntime = struct {
         }
     }
 
-    /// Reset a value for Perceus-style reuse. If the reference count is 1,
-    /// return an opaque reuse token for the existing allocation. Otherwise,
-    /// release the current value and return null.
-    pub fn resetAny(allocator: std.mem.Allocator, ptr: anytype) ?*anyopaque {
-        if (refCountAny(ptr) == 1) {
-            return @ptrCast(@constCast(ptr));
+    /// A Perceus reuse token: the live storage of a uniquely-owned cell
+    /// (`resetAny` found rc==1) together with the exact size/alignment
+    /// footprint of that cell's user payload AND of its whole heap
+    /// allocation.
+    ///
+    /// The footprint is what makes reuse *sound*. The Perceus pass pairs a
+    /// deconstruction with a construction by matching element/field COUNT,
+    /// which is NOT a byte-size match for heterogeneously-typed aggregates
+    /// (e.g. a `{i64,i8}` cell and a `{i64,BigStruct}` cell are both
+    /// 2-field). Reusing the smaller cell's storage to construct the larger
+    /// aggregate would store past the original allocation — a heap buffer
+    /// overflow in the compiled program. `reuseAllocByType` therefore
+    /// consults `payload_size`/`payload_align` and refuses to reuse a cell
+    /// that cannot hold the new type, falling back to a fresh allocation
+    /// (and freeing the unfit cell, whose children the deconstruction
+    /// already extracted).
+    ///
+    /// Fields:
+    ///   * `value_ptr`     — pointer to the user payload of the reusable
+    ///                       cell (the same pointer the deconstruction read
+    ///                       fields from), or `null` when rc>1 (no reuse).
+    ///   * `payload_size`  — `@sizeOf` of the deconstructed type: the byte
+    ///                       capacity available at `value_ptr` for a reused
+    ///                       construction.
+    ///   * `payload_align` — `@alignOf` of the deconstructed type: the
+    ///                       guaranteed alignment of `value_ptr`.
+    ///   * `cell_base`     — base address of the whole heap allocation
+    ///                       (the header, if any, sits here), used to free
+    ///                       the cell on the decline path.
+    ///   * `cell_size` / `cell_align` — the exact `(size, alignment)` the
+    ///                       allocation was requested with, so the decline
+    ///                       path can issue the matching shallow free.
+    pub const ReuseToken = extern struct {
+        value_ptr: ?*anyopaque,
+        payload_size: usize,
+        payload_align: usize,
+        cell_base: ?[*]u8,
+        cell_size: usize,
+        cell_align: usize,
+
+        /// The null token (rc>1, or no reuse possible). `reuseAllocByType`
+        /// allocates fresh when handed this.
+        pub const none: ReuseToken = .{
+            .value_ptr = null,
+            .payload_size = 0,
+            .payload_align = 0,
+            .cell_base = null,
+            .cell_size = 0,
+            .cell_align = 0,
+        };
+    };
+
+    /// Recover the whole-allocation footprint of a reusable cell of type
+    /// `O` from its user-payload pointer, mirroring exactly how `allocAny`
+    /// laid the cell out. Returns `(cell_base, cell_size, cell_align)` —
+    /// the address and `(size, alignment)` originally passed to the
+    /// manager's allocate slot — so the reuse-decline path can issue the
+    /// matching shallow free.
+    fn reusableCellFootprint(comptime O: type, value_ptr: *O) struct { base: [*]u8, size: usize, alignment: usize } {
+        if (comptime hasInlineArcHeader(O)) {
+            // The `ArcHeader` is field 0 of `O` itself (no prepended
+            // header), so the payload pointer is the cell base. These
+            // types own bespoke pools / variable-length buffers and are
+            // only ever reused same-type (so the decline path that
+            // consumes this footprint never fires for them); record the
+            // fixed struct footprint for completeness.
+            return .{
+                .base = @ptrCast(@alignCast(value_ptr)),
+                .size = @sizeOf(O),
+                .alignment = @alignOf(O),
+            };
         }
-        releaseAny(allocator, ptr);
-        return null;
+        if (comptime !refcount_v1_active) {
+            // INDIVIDUAL_NO_REFCOUNT: header-less cell sized via
+            // `nonRefcountedCellSize`; the payload pointer IS the cell base.
+            return .{
+                .base = @ptrCast(@alignCast(value_ptr)),
+                .size = nonRefcountedCellSize(O),
+                .alignment = @alignOf(O),
+            };
+        }
+        const has_sized_extension = if (comptime !active_manager_source_available)
+            active_manager_state.refcount_has_sized_extension
+        else
+            comptime refcount_sized_extension_active;
+        if (has_sized_extension) {
+            // Side-table layout: the slot is 100% payload, so the payload
+            // pointer is the cell base and the request was `@sizeOf(O)`.
+            return .{
+                .base = @ptrCast(@alignCast(value_ptr)),
+                .size = @sizeOf(O),
+                .alignment = @alignOf(O),
+            };
+        }
+        // v1.0 inline-header layout: the payload sits at `value_offset`
+        // past an `ArcHeader` at the cell base.
+        const layout = LegacyArcInnerLayout(O);
+        return .{
+            .base = legacyArcInnerBaseFromValuePtr(O, value_ptr),
+            .size = layout.size,
+            .alignment = layout.alignment,
+        };
     }
 
-    /// Convert a Perceus reuse token back into a typed allocation. If the token
-    /// is present, reuse that storage; otherwise allocate a fresh value.
-    pub fn reuseAllocByType(comptime T: type, allocator: std.mem.Allocator, token: ?*anyopaque) *T {
-        if (token) |ptr| {
-            return @ptrCast(@alignCast(ptr));
+    /// Reset a value for Perceus-style reuse. If the reference count is 1,
+    /// return a reuse token carrying the live cell and its size/alignment
+    /// footprint. Otherwise, release the current value and return the null
+    /// token.
+    ///
+    /// The footprint lets the paired `reuseAllocByType` refuse to overflow
+    /// a cell that is too small (or too weakly aligned) for the new type —
+    /// the Perceus reuse-compatibility predicate matches field/element
+    /// COUNT, not byte size, so an unsafe pairing is reachable from valid
+    /// source and must be caught here.
+    pub fn resetAny(allocator: std.mem.Allocator, ptr: anytype) ReuseToken {
+        if (refCountAny(ptr) == 1) {
+            const O = arcPtrChild(@TypeOf(ptr));
+            // `ptr` may be a `?*const O` (the IR threads reset sources as
+            // nullable pointers); rc==1 implies non-null. Unwrap and strip
+            // const to obtain the live cell's payload pointer.
+            const non_null: *const O = if (comptime arcPtrIsOptional(@TypeOf(ptr))) ptr.? else ptr;
+            const value_ptr: *O = @constCast(non_null);
+            const footprint = reusableCellFootprint(O, value_ptr);
+            return .{
+                .value_ptr = @ptrCast(value_ptr),
+                .payload_size = @sizeOf(O),
+                .payload_align = @alignOf(O),
+                .cell_base = footprint.base,
+                .cell_size = footprint.size,
+                .cell_align = footprint.alignment,
+            };
+        }
+        releaseAny(allocator, ptr);
+        return ReuseToken.none;
+    }
+
+    /// Convert a Perceus reuse token back into a typed allocation.
+    ///
+    /// Reuse the token's storage in place ONLY when the cell can actually
+    /// hold `T`: its payload byte capacity is at least `@sizeOf(T)` and its
+    /// payload alignment is at least `@alignOf(T)`. Otherwise — a too-small
+    /// or under-aligned cell, or a null token (rc>1) — allocate a fresh
+    /// `T`. When an unfit-but-live cell is declined, free its now-empty
+    /// shell (the deconstruction already extracted its children) so the
+    /// decline path never leaks.
+    pub fn reuseAllocByType(comptime T: type, allocator: std.mem.Allocator, token: ReuseToken) *T {
+        if (token.value_ptr) |ptr| {
+            if (@sizeOf(T) <= token.payload_size and @alignOf(T) <= token.payload_align) {
+                return @ptrCast(@alignCast(ptr));
+            }
+            // The reset cell cannot hold `T`. Reusing it would overflow the
+            // original allocation (and `@alignCast` to a stricter alignment
+            // is UB). Free the empty shell and allocate fresh.
+            if (token.cell_base) |base| {
+                freeRawCell(base, token.cell_size, token.cell_align);
+            }
         }
         return allocator.create(T) catch @panic("ArcRuntime.reuseAllocByType: out of memory");
+    }
+
+    /// Shallow-free a raw heap cell through the active manager's
+    /// deallocate slot using the exact `(size, alignment)` it was
+    /// allocated with. The cell must already have had its children
+    /// released (Perceus extracts them during deconstruction), so no
+    /// deep-walk is performed here. Used by the reuse-decline path.
+    fn freeRawCell(base: [*]u8, size: usize, alignment: usize) void {
+        if (size == 0) return;
+        if (comptime reclamation_model == .bulk_or_never or reclamation_model == .traced) {
+            // Pure elision: the manager reclaims in bulk / never. No
+            // individual free (matches `releaseAny`/`freeInlineHeaderCell`).
+            return;
+        }
+        if (active_manager_state.shutdown_complete) {
+            @panic("zap runtime: memory dispatch after shutdown");
+        }
+        ensureMemoryStartup();
+        if (comptime !active_manager_source_available) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: reuse-decline free dispatched with no active memory manager");
+            }
+        }
+        const ctx = active_manager_state.context orelse
+            @panic("zap runtime: reuse-decline free dispatched with null manager context");
+        if (comptime !active_manager_source_available) {
+            const core = active_manager_state.core orelse
+                @panic("zap runtime: reuse-decline free dispatched with no active memory manager");
+            core.deallocate(ctx, base, size, @intCast(alignment));
+        } else {
+            active_manager.deallocate(ctx, base, size, @intCast(alignment));
+        }
     }
 };
 
@@ -8514,7 +8686,7 @@ test "ArcRuntime.resetAny returns token for unique value" {
     const allocator = testing.allocator;
     const ptr = ArcRuntime.allocAny(i64, allocator, 42);
     const token = ArcRuntime.resetAny(allocator, ptr);
-    try testing.expect(token != null);
+    try testing.expect(token.value_ptr != null);
     const reused = ArcRuntime.reuseAllocByType(i64, allocator, token);
     reused.* = 7;
     try testing.expectEqual(@as(i64, 7), reused.*);
@@ -8526,8 +8698,76 @@ test "ArcRuntime.resetAny releases shared value and yields null token" {
     const ptr = ArcRuntime.allocAny(i64, allocator, 10);
     ArcRuntime.retainAny(ptr);
     const token = ArcRuntime.resetAny(allocator, ptr);
-    try testing.expect(token == null);
+    try testing.expect(token.value_ptr == null);
     ArcRuntime.releaseAny(allocator, ptr);
+}
+
+test "ArcRuntime.reuseAllocByType refuses to reuse a cell too small for the new type" {
+    // perceus-region--01: a cell allocated for a SMALL type, freed for
+    // Perceus reuse, must never be handed back as a LARGER type — doing
+    // so reinterprets the small allocation as the larger one and the
+    // caller's field stores overflow the original cell (heap corruption
+    // in every release-mode binary). The size-class match the Perceus
+    // predicate performs (same field/element COUNT) is not a byte-size
+    // match, so this configuration is reachable from valid Zap source.
+    const allocator = testing.allocator;
+
+    const Small = struct { a: u8 };
+    const Large = struct { a: u64, b: u64, c: u64, d: u64 };
+    comptime {
+        // Guard the premise: Large genuinely cannot fit in Small's cell.
+        std.debug.assert(@sizeOf(Large) > @sizeOf(Small));
+    }
+
+    const small_ptr = ArcRuntime.allocAny(Small, allocator, .{ .a = 1 });
+    const token = ArcRuntime.resetAny(allocator, small_ptr);
+    try testing.expect(token.value_ptr != null);
+    // The token records the small cell's payload footprint so the reuse
+    // sink can detect that Large does not fit.
+    try testing.expectEqual(@as(usize, @sizeOf(Small)), token.payload_size);
+
+    // The reused cell must be able to hold the full Large value. Writing
+    // every field must not corrupt memory; under the bug this stored past
+    // the Small allocation.
+    const reused = ArcRuntime.reuseAllocByType(Large, allocator, token);
+    reused.* = .{ .a = 0xAAAA_AAAA_AAAA_AAAA, .b = 0xBBBB_BBBB_BBBB_BBBB, .c = 0xCCCC_CCCC_CCCC_CCCC, .d = 0xDDDD_DDDD_DDDD_DDDD };
+    try testing.expectEqual(@as(u64, 0xAAAA_AAAA_AAAA_AAAA), reused.a);
+    try testing.expectEqual(@as(u64, 0xDDDD_DDDD_DDDD_DDDD), reused.d);
+
+    // A cell that cannot hold Large must NOT be reused in place: the
+    // returned pointer must differ from the original small cell's payload.
+    // The unfit shell was freed by the decline path; `reused` is a fresh
+    // allocation from `allocator` (the null-token fresh path).
+    try testing.expect(@intFromPtr(reused) != @intFromPtr(small_ptr));
+
+    allocator.destroy(reused);
+}
+
+test "ArcRuntime.reuseAllocByType still reuses a cell large enough for the new type" {
+    // perceus-region--01: when the new type fits the reset cell (same or
+    // smaller byte size and compatible alignment), reuse MUST still happen
+    // in place — the optimization is preserved, only unsafe reuse is refused.
+    const allocator = testing.allocator;
+
+    const Big = struct { a: u64, b: u64 };
+    const SmallerFit = struct { a: u32 };
+    comptime {
+        std.debug.assert(@sizeOf(SmallerFit) <= @sizeOf(Big));
+        std.debug.assert(@alignOf(SmallerFit) <= @alignOf(Big));
+    }
+
+    const big_ptr = ArcRuntime.allocAny(Big, allocator, .{ .a = 7, .b = 9 });
+    const token = ArcRuntime.resetAny(allocator, big_ptr);
+    try testing.expect(token.value_ptr != null);
+
+    const reused = ArcRuntime.reuseAllocByType(SmallerFit, allocator, token);
+    reused.* = .{ .a = 123 };
+    try testing.expectEqual(@as(u32, 123), reused.a);
+
+    // The Big cell can hold SmallerFit, so reuse must occur in place.
+    try testing.expect(@intFromPtr(reused) == @intFromPtr(big_ptr));
+
+    ArcRuntime.releaseArcAny(SmallerFit, allocator, reused);
 }
 
 test "String.compare orders bytes lexicographically" {

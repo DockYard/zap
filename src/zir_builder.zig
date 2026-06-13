@@ -1410,6 +1410,23 @@ pub const ZirDriver = struct {
         return ref;
     }
 
+    /// Emit a reference to `zap_runtime.ArcRuntime.ReuseToken.none` — the
+    /// null reuse token. `reuseAllocByType` now takes a sized
+    /// `ReuseToken` (carrying the reset cell's byte footprint so it can
+    /// refuse to overflow a too-small cell), so the no-token construction
+    /// path must hand it the canonical empty token rather than `void`.
+    fn emitReuseTokenNone(self: *ZirDriver) BuildError!u32 {
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const arc_runtime = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.arc_runtime);
+        if (arc_runtime == error_ref) return error.EmitFailed;
+        const token_ty = zir_builder_emit_field_val(self.handle, arc_runtime, "ReuseToken", 10);
+        if (token_ty == error_ref) return error.EmitFailed;
+        const none_ref = zir_builder_emit_field_val(self.handle, token_ty, "none", 4);
+        if (none_ref == error_ref) return error.EmitFailed;
+        return none_ref;
+    }
+
     fn emitMemoryStartupForEntryFromRuntime(self: *ZirDriver, rt_import: u32) BuildError!void {
         const startup_fn = zir_builder_emit_field_val(self.handle, rt_import, "memoryStartupForEntry", 21);
         if (startup_fn == error_ref) return error.EmitFailed;
@@ -9777,7 +9794,7 @@ pub const ZirDriver = struct {
                 const token_ref = if (ra.token) |token|
                     try self.refForLocal(token)
                 else
-                    zir_builder_emit_void(self.handle);
+                    try self.emitReuseTokenNone();
                 if (token_ref == error_ref) return error.EmitFailed;
                 const ref = try self.emitReuseAllocCall(type_ref, token_ref);
                 try self.setLocal(ra.dest, ref);
