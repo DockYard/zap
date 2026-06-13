@@ -353,6 +353,11 @@ fn maxLocalInInstruction(instr: ir.Instruction) ir.LocalId {
         .switch_literal => |sl| maxSwitchLiteralLocal(sl),
         .switch_return => |sr| maxSwitchReturnLocal(sr),
         .case_block => |cb| maxCaseBlockLocal(cb),
+        .union_switch => |us| maxUnionSwitchLocal(us),
+        .union_switch_return => |usr| maxUnionSwitchReturnLocal(usr),
+        .try_call_named => |tcn| maxTryCallNamedLocal(tcn),
+        .optional_dispatch => |od| maxOptionalDispatchLocal(od),
+        .guard_block => |gb| maxGuardBlockLocal(gb),
         .call_closure => |cc| cc.dest,
         .ret => |ret| ret.value orelse 0,
         else => 0,
@@ -413,6 +418,54 @@ fn maxCaseBlockLocal(cb: ir.CaseBlock) ir.LocalId {
     }
     for (cb.default_instrs) |instr| max_local = @max(max_local, maxLocalInInstruction(instr));
     if (cb.default_result) |result| max_local = @max(max_local, result);
+    return max_local;
+}
+
+fn maxUnionSwitchLocal(us: ir.UnionSwitch) ir.LocalId {
+    var max_local = @max(us.dest, us.scrutinee);
+    for (us.cases) |case| {
+        for (case.body_instrs) |instr| max_local = @max(max_local, maxLocalInInstruction(instr));
+        if (case.return_value) |value| max_local = @max(max_local, value);
+    }
+    if (us.has_else) {
+        for (us.else_instrs) |instr| max_local = @max(max_local, maxLocalInInstruction(instr));
+        if (us.else_result) |value| max_local = @max(max_local, value);
+    }
+    return max_local;
+}
+
+fn maxUnionSwitchReturnLocal(usr: ir.UnionSwitchReturn) ir.LocalId {
+    var max_local: ir.LocalId = 0;
+    for (usr.cases) |case| {
+        for (case.body_instrs) |instr| max_local = @max(max_local, maxLocalInInstruction(instr));
+        if (case.return_value) |value| max_local = @max(max_local, value);
+    }
+    return max_local;
+}
+
+fn maxTryCallNamedLocal(tcn: ir.TryCallNamed) ir.LocalId {
+    var max_local = @max(tcn.dest, tcn.input_local);
+    for (tcn.args) |arg| max_local = @max(max_local, arg);
+    for (tcn.handler_instrs) |instr| max_local = @max(max_local, maxLocalInInstruction(instr));
+    if (tcn.handler_result) |value| max_local = @max(max_local, value);
+    for (tcn.success_instrs) |instr| max_local = @max(max_local, maxLocalInInstruction(instr));
+    if (tcn.success_result) |value| max_local = @max(max_local, value);
+    if (tcn.payload_local) |value| max_local = @max(max_local, value);
+    return max_local;
+}
+
+fn maxOptionalDispatchLocal(od: ir.OptionalDispatch) ir.LocalId {
+    var max_local = od.payload_local;
+    for (od.nil_instrs) |instr| max_local = @max(max_local, maxLocalInInstruction(instr));
+    if (od.nil_result) |value| max_local = @max(max_local, value);
+    for (od.struct_instrs) |instr| max_local = @max(max_local, maxLocalInInstruction(instr));
+    if (od.struct_result) |value| max_local = @max(max_local, value);
+    return max_local;
+}
+
+fn maxGuardBlockLocal(gb: ir.GuardBlock) ir.LocalId {
+    var max_local = gb.condition;
+    for (gb.body) |instr| max_local = @max(max_local, maxLocalInInstruction(instr));
     return max_local;
 }
 

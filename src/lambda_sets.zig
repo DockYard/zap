@@ -380,6 +380,34 @@ pub const LambdaSetAnalyzer = struct {
                     }
                 }
             },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    for (c.body_instrs) |sub| {
+                        try self.registerCallReturnSites(func_id, sub);
+                    }
+                }
+                if (us.has_else) {
+                    for (us.else_instrs) |sub| {
+                        try self.registerCallReturnSites(func_id, sub);
+                    }
+                }
+            },
+            .try_call_named => |tcn| {
+                for (tcn.handler_instrs) |sub| {
+                    try self.registerCallReturnSites(func_id, sub);
+                }
+                for (tcn.success_instrs) |sub| {
+                    try self.registerCallReturnSites(func_id, sub);
+                }
+            },
+            .optional_dispatch => |od| {
+                for (od.nil_instrs) |sub| {
+                    try self.registerCallReturnSites(func_id, sub);
+                }
+                for (od.struct_instrs) |sub| {
+                    try self.registerCallReturnSites(func_id, sub);
+                }
+            },
             else => {},
         }
     }
@@ -482,6 +510,34 @@ pub const LambdaSetAnalyzer = struct {
                     for (c.body_instrs) |sub| {
                         try self.seedInstruction(func_id, sub);
                     }
+                }
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    for (c.body_instrs) |sub| {
+                        try self.seedInstruction(func_id, sub);
+                    }
+                }
+                if (us.has_else) {
+                    for (us.else_instrs) |sub| {
+                        try self.seedInstruction(func_id, sub);
+                    }
+                }
+            },
+            .try_call_named => |tcn| {
+                for (tcn.handler_instrs) |sub| {
+                    try self.seedInstruction(func_id, sub);
+                }
+                for (tcn.success_instrs) |sub| {
+                    try self.seedInstruction(func_id, sub);
+                }
+            },
+            .optional_dispatch => |od| {
+                for (od.nil_instrs) |sub| {
+                    try self.seedInstruction(func_id, sub);
+                }
+                for (od.struct_instrs) |sub| {
+                    try self.seedInstruction(func_id, sub);
                 }
             },
             else => {},
@@ -721,6 +777,44 @@ pub const LambdaSetAnalyzer = struct {
                     }
                 }
             },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    for (c.body_instrs, 0..) |sub, idx| {
+                        try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
+                    }
+                }
+                if (us.has_else) {
+                    for (us.else_instrs, 0..) |sub, idx| {
+                        try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
+                    }
+                }
+            },
+            .try_call_named => |tcn| {
+                for (tcn.handler_instrs, 0..) |sub, idx| {
+                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
+                }
+                for (tcn.success_instrs, 0..) |sub, idx| {
+                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
+                }
+            },
+            .optional_dispatch => |od| {
+                for (od.nil_instrs, 0..) |sub, idx| {
+                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
+                }
+                if (od.nil_result) |nr| {
+                    if (nr == changed_local) {
+                        try self.propagateReturn(func_id, nr);
+                    }
+                }
+                for (od.struct_instrs, 0..) |sub, idx| {
+                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
+                }
+                if (od.struct_result) |sr| {
+                    if (sr == changed_local) {
+                        try self.propagateReturn(func_id, sr);
+                    }
+                }
+            },
             else => {},
         }
     }
@@ -874,6 +968,34 @@ pub const LambdaSetAnalyzer = struct {
                     for (c.body_instrs) |sub| {
                         try self.propagateParamInstr(func_id, sub, param_index, param_set);
                     }
+                }
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    for (c.body_instrs) |sub| {
+                        try self.propagateParamInstr(func_id, sub, param_index, param_set);
+                    }
+                }
+                if (us.has_else) {
+                    for (us.else_instrs) |sub| {
+                        try self.propagateParamInstr(func_id, sub, param_index, param_set);
+                    }
+                }
+            },
+            .try_call_named => |tcn| {
+                for (tcn.handler_instrs) |sub| {
+                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
+                }
+                for (tcn.success_instrs) |sub| {
+                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
+                }
+            },
+            .optional_dispatch => |od| {
+                for (od.nil_instrs) |sub| {
+                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
+                }
+                for (od.struct_instrs) |sub| {
+                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
                 }
             },
             else => {},
@@ -1070,6 +1192,34 @@ pub const LambdaSetAnalyzer = struct {
                     for (c.body_instrs, 0..) |sub, idx| {
                         try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
                     }
+                }
+            },
+            .union_switch => |us| {
+                for (us.cases) |c| {
+                    for (c.body_instrs, 0..) |sub, idx| {
+                        try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
+                    }
+                }
+                if (us.has_else) {
+                    for (us.else_instrs, 0..) |sub, idx| {
+                        try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
+                    }
+                }
+            },
+            .try_call_named => |tcn| {
+                for (tcn.handler_instrs, 0..) |sub, idx| {
+                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
+                }
+                for (tcn.success_instrs, 0..) |sub, idx| {
+                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
+                }
+            },
+            .optional_dispatch => |od| {
+                for (od.nil_instrs, 0..) |sub, idx| {
+                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
+                }
+                for (od.struct_instrs, 0..) |sub, idx| {
+                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
                 }
             },
             else => {},
