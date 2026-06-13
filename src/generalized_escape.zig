@@ -446,7 +446,25 @@ pub const GeneralizedEscapeAnalyzer = struct {
             },
             .try_call_named => |tcn| {
                 try self.seedCallArgsNoSummary(func_id, tcn.args, tcn.arg_modes);
-                try self.setEscapeAndEnqueue(func_id, tcn.dest, .function_local);
+                // `try_call_named` lowers to an if-else whose value is `dest`
+                // (see ir.TryCallNamed): the success branch runs
+                // `success_instrs` and yields `success_result`; the handler
+                // branch runs `handler_instrs` and yields `handler_result`.
+                // Both bodies must be seeded so values allocated/used inside
+                // them are analyzed, and the two branch results join into
+                // `dest` — mirroring the `if_expr` arm exactly. Skipping the
+                // bodies (the prior behavior) left their locals defaulted to
+                // `.bottom` (stack-eligible) even when they escape via `dest`.
+                try self.seedInstructions(func_id, tcn.handler_instrs);
+                try self.seedInstructions(func_id, tcn.success_instrs);
+                var joined: EscapeState = .function_local;
+                if (tcn.handler_result) |hr| {
+                    joined = EscapeState.join(joined, self.ctx.getEscape(.{ .function = func_id, .local = hr }));
+                }
+                if (tcn.success_result) |sr| {
+                    joined = EscapeState.join(joined, self.ctx.getEscape(.{ .function = func_id, .local = sr }));
+                }
+                try self.setEscapeAndEnqueue(func_id, tcn.dest, joined);
             },
             .call_closure => |cc| {
                 try self.seedCallArgsNoSummary(func_id, cc.args, cc.arg_modes);
@@ -568,6 +586,19 @@ pub const GeneralizedEscapeAnalyzer = struct {
                     try self.seedInstructions(func_id, c.body_instrs);
                     if (c.return_value) |rv| {
                         try self.raiseEscape(func_id, rv, .global_escape);
+                    }
+                }
+                // The catch-all `_` prong (`else_instrs` / `else_result`,
+                // present only when `has_else`) is a full case arm: its body
+                // must be seeded and its result raised exactly like an
+                // explicit case's `return_value`. Skipping it left a value
+                // allocated/escaping inside the `_` arm defaulted to
+                // `.bottom` (stack-eligible) → `shouldSkipArc` would
+                // stack-allocate an escaping value → use-after-free.
+                if (us.has_else) {
+                    try self.seedInstructions(func_id, us.else_instrs);
+                    if (us.else_result) |er| {
+                        try self.raiseEscape(func_id, er, .global_escape);
                     }
                 }
             },
@@ -2488,4 +2519,166 @@ test "make_closure has per-capture tracking" {
     try std.testing.expect(femap != null);
     // Two captures → two field states.
     try std.testing.expectEqual(@as(usize, 2), femap.?.field_states.len);
+}
+
+// GAP-P1-01: a value allocated inside the catch-all `_` arm of a
+// `union_switch` (`else_instrs`) whose `else_result` is the arm's value
+// must be seeded and treated as escaping exactly like an explicit case
+// arm's `return_value`. Pre-fix the `else_instrs` were never seeded, so
+// the local defaulted to `.bottom` (stack-eligible) → `shouldSkipArc`
+// would stack-allocate a value that genuinely escapes → use-after-free.
+test "value allocated in union_switch else_instrs escapes globally" {
+    const allocator = std.testing.allocator;
+
+    // fn example(scrutinee):
+    //   union_switch %scrutinee {
+    //     case SomeVariant -> { ... }            // (no allocation)
+    //     _ -> { %2 = struct_init { x: %3 }; result %2 }
+    //   } -> %0
+    //
+    // The `_` arm builds a struct and yields it as the switch result;
+    // the result of a `union_switch` arm is treated as globally escaping
+    // by this pass (mirroring the explicit-case `return_value` handling).
+    const else_const = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 3, .value = 7 } },
+        .{ .struct_init = .{
+            .dest = 2,
+            .type_name = "Point",
+            .fields = &.{
+                .{ .name = "x", .value = 3 },
+            },
+        } },
+    };
+
+    const case_body = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+    };
+    const cases = [_]ir.UnionCase{
+        .{
+            .variant_name = "SomeVariant",
+            .field_bindings = &.{},
+            .body_instrs = &case_body,
+            .return_value = 4,
+        },
+    };
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 1, .index = 0 } },
+        .{ .union_switch = .{
+            .dest = 0,
+            .scrutinee = 1,
+            .cases = &cases,
+            .else_instrs = &else_const,
+            .else_result = 2,
+            .has_else = true,
+        } },
+        .{ .ret = .{ .value = 0 } },
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &instrs },
+    };
+
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "example",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &.{.{ .name = "scrutinee", .type_expr = .any }},
+        .return_type = .{ .struct_ref = "Point" },
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+
+    const program = makeTestProgram(&functions);
+    var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
+    defer analyzer.deinit();
+    var ctx = try analyzer.analyze();
+    defer ctx.deinit();
+
+    // The struct built in the `_` arm must NOT be stack-eligible: it
+    // escapes as the switch result. Pre-fix it was never seeded so it
+    // defaulted to `.bottom`, which `isStackEligible()` reports `true`.
+    const else_struct_escape = ctx.getEscape(.{ .function = 0, .local = 2 });
+    try std.testing.expect(else_struct_escape == .global_escape);
+    try std.testing.expect(!else_struct_escape.isStackEligible());
+}
+
+// GAP-P1-02: values allocated inside `try_call_named.handler_instrs` and
+// `success_instrs` must be seeded by the escape pass. Pre-fix neither body
+// was descended into, so a value allocated there defaulted to `.bottom`
+// (stack-eligible) even when it escapes → use-after-free.
+test "value allocated in try_call_named handler/success bodies is analyzed" {
+    const allocator = std.testing.allocator;
+
+    // fn example(input):
+    //   %0 = try_call_named "step__try", args=[%1], input=%1
+    //          handler { %3 = const_int 9; %2 = struct_init { x: %3 }; -> %2 }
+    //          success { %5 = const_int 1; %4 = struct_init { y: %5 }; -> %4 }
+    //   ret %0
+    const handler_body = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 3, .value = 9 } },
+        .{ .struct_init = .{
+            .dest = 2,
+            .type_name = "Failure",
+            .fields = &.{.{ .name = "x", .value = 3 }},
+        } },
+    };
+    const success_body = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 5, .value = 1 } },
+        .{ .struct_init = .{
+            .dest = 4,
+            .type_name = "Success",
+            .fields = &.{.{ .name = "y", .value = 5 }},
+        } },
+    };
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 1, .index = 0 } },
+        .{ .try_call_named = .{
+            .dest = 0,
+            .name = "step__try",
+            .args = &.{1},
+            .arg_modes = &.{.move},
+            .input_local = 1,
+            .handler_instrs = &handler_body,
+            .handler_result = 2,
+            .success_instrs = &success_body,
+            .success_result = 4,
+            .payload_local = 6,
+        } },
+        .{ .ret = .{ .value = 0 } },
+    };
+
+    const blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &instrs },
+    };
+
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "example",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &.{.{ .name = "input", .type_expr = .any }},
+        .return_type = .void,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    }};
+
+    const program = makeTestProgram(&functions);
+    var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
+    defer analyzer.deinit();
+    var ctx = try analyzer.analyze();
+    defer ctx.deinit();
+
+    // Both structs were registered as allocation sites and seeded with a
+    // real escape state (no_escape or higher), not the default `.bottom`.
+    // Pre-fix the bodies were never descended into, so these locals were
+    // never seeded and `getEscape` returned the `.bottom` default.
+    const handler_struct = ctx.getEscape(.{ .function = 0, .local = 2 });
+    const success_struct = ctx.getEscape(.{ .function = 0, .local = 4 });
+    try std.testing.expect(handler_struct != .bottom);
+    try std.testing.expect(success_struct != .bottom);
 }
