@@ -3318,6 +3318,278 @@ pub fn defaultResultConvention(
     return .trivial;
 }
 
+// ============================================================
+// Canonical child-stream enumeration.
+//
+// Every ARC / ownership / uniqueness / verifier pass that recurses
+// into an instruction's nested sub-streams MUST visit exactly the same
+// set of sub-streams, in exactly the same depth-first order, as
+// `arc_liveness.flattenChildren` (the authority that assigns each
+// instruction its `InstructionId`). Historically that traversal was
+// hand-copied into ~a dozen `switch (instr)` sites across five files,
+// and the copies drifted: every consumer skipped `union_switch
+// .else_instrs` (the catch-all `_` arm of a `case` over a tagged
+// union) while the analyzer numbered it, desynchronizing the whole
+// `InstructionId` space after any such instruction and leaving the
+// catch-all body entirely unanalyzed (audit findings
+// arc-drop-verify--01, arc-liveness--01, arc-own-1--01, arc-own-2--01,
+// uniqueness--01).
+//
+// `forEachChildStream` is the single source of truth for "what are an
+// instruction's child instruction streams, and in what canonical
+// order". Every traversal is rewritten on top of it so they can never
+// diverge again, and `comptime_child_stream_exhaustiveness` (below)
+// fails compilation if a newly-added `Instruction` variant carries a
+// `[]const Instruction` sub-stream that this function does not yield.
+// ============================================================
+
+/// Identifies which sub-stream slot of a parent instruction a child
+/// stream occupies. The ordering of the variants is the canonical
+/// depth-first flatten order; consumers that need per-slot semantics
+/// (the liveness analyzer's `ParentLink`, the backward/forward
+/// dataflow's per-arm live-after selection) switch on this.
+pub const ChildStreamKind = enum {
+    if_then,
+    if_else,
+    case_pre,
+    case_arm_cond,
+    case_arm_body,
+    case_default,
+    switch_lit_case,
+    switch_lit_default,
+    switch_ret_case,
+    switch_ret_default,
+    union_switch_case,
+    /// `union_switch.else_instrs` — the catch-all `_` prong, yielded
+    /// AFTER all `cases` (matching `arc_liveness.flattenChildren`) and
+    /// only when `has_else` is set.
+    union_switch_else,
+    union_switch_ret_case,
+    try_handler,
+    try_success,
+    guard_body,
+    optional_dispatch_nil,
+    optional_dispatch_struct,
+};
+
+/// One child instruction sub-stream of a parent instruction, tagged
+/// with its canonical slot kind.
+pub const ChildStream = struct {
+    kind: ChildStreamKind,
+    stream: []const Instruction,
+};
+
+/// Invoke `visitFn(ctx, child)` for every child instruction sub-stream
+/// of `instr`, in canonical flatten order. THE single source of truth
+/// for structural recursion over the IR.
+///
+/// The `switch` is intentionally exhaustive (no `else` arm) so that
+/// adding an `Instruction` variant forces a decision here; the
+/// companion `comptime_child_stream_exhaustiveness` check additionally
+/// guarantees a variant carrying a `[]const Instruction` sub-stream
+/// cannot be added without being yielded.
+pub fn forEachChildStream(
+    instr: *const Instruction,
+    context: anytype,
+    comptime visitFn: fn (ctx: @TypeOf(context), child: ChildStream) void,
+) void {
+    comptime comptime_child_stream_exhaustiveness();
+    switch (instr.*) {
+        .if_expr => |ie| {
+            visitFn(context, .{ .kind = .if_then, .stream = ie.then_instrs });
+            visitFn(context, .{ .kind = .if_else, .stream = ie.else_instrs });
+        },
+        .case_block => |cb| {
+            visitFn(context, .{ .kind = .case_pre, .stream = cb.pre_instrs });
+            for (cb.arms) |arm| {
+                visitFn(context, .{ .kind = .case_arm_cond, .stream = arm.cond_instrs });
+                visitFn(context, .{ .kind = .case_arm_body, .stream = arm.body_instrs });
+            }
+            visitFn(context, .{ .kind = .case_default, .stream = cb.default_instrs });
+        },
+        .switch_literal => |sl| {
+            for (sl.cases) |c| visitFn(context, .{ .kind = .switch_lit_case, .stream = c.body_instrs });
+            visitFn(context, .{ .kind = .switch_lit_default, .stream = sl.default_instrs });
+        },
+        .switch_return => |sr| {
+            for (sr.cases) |c| visitFn(context, .{ .kind = .switch_ret_case, .stream = c.body_instrs });
+            visitFn(context, .{ .kind = .switch_ret_default, .stream = sr.default_instrs });
+        },
+        .union_switch => |us| {
+            for (us.cases) |c| visitFn(context, .{ .kind = .union_switch_case, .stream = c.body_instrs });
+            if (us.has_else) {
+                visitFn(context, .{ .kind = .union_switch_else, .stream = us.else_instrs });
+            }
+        },
+        .union_switch_return => |usr| {
+            for (usr.cases) |c| visitFn(context, .{ .kind = .union_switch_ret_case, .stream = c.body_instrs });
+        },
+        .try_call_named => |tc| {
+            visitFn(context, .{ .kind = .try_handler, .stream = tc.handler_instrs });
+            visitFn(context, .{ .kind = .try_success, .stream = tc.success_instrs });
+        },
+        .guard_block => |gb| {
+            visitFn(context, .{ .kind = .guard_body, .stream = gb.body });
+        },
+        .optional_dispatch => |od| {
+            visitFn(context, .{ .kind = .optional_dispatch_nil, .stream = od.nil_instrs });
+            visitFn(context, .{ .kind = .optional_dispatch_struct, .stream = od.struct_instrs });
+        },
+        // Variants with no child instruction streams. Enumerated
+        // explicitly (no `else`) so a new variant must be classified
+        // here; `comptime_child_stream_exhaustiveness` cross-checks that
+        // none of these actually carry a `[]const Instruction`.
+        .const_int,
+        .const_float,
+        .const_string,
+        .const_bool,
+        .const_atom,
+        .const_nil,
+        .local_get,
+        .local_set,
+        .move_value,
+        .share_value,
+        .param_get,
+        .borrow_value,
+        .copy_value,
+        .tuple_init,
+        .list_init,
+        .list_cons,
+        .map_init,
+        .struct_init,
+        .union_init,
+        .box_as_protocol,
+        .protocol_dispatch,
+        .protocol_box_unbox,
+        .protocol_box_vtable_eq,
+        .enum_literal,
+        .field_get,
+        .field_set,
+        .index_get,
+        .list_len_check,
+        .list_get,
+        .list_is_not_empty,
+        .list_head,
+        .list_tail,
+        .map_has_key,
+        .map_get,
+        .binary_op,
+        .unary_op,
+        .call_direct,
+        .call_named,
+        .call_closure,
+        .call_dispatch,
+        .call_builtin,
+        .tail_call,
+        .error_catch,
+        .unwrap_error_union,
+        .set_safety,
+        .branch,
+        .cond_branch,
+        .switch_tag,
+        .match_atom,
+        .match_variant_tag,
+        .variant_payload_get,
+        .match_int,
+        .match_float,
+        .match_string,
+        .match_type,
+        .match_fail,
+        .match_error_return,
+        .ret_raise,
+        .ret,
+        .cond_return,
+        .case_break,
+        .jump,
+        .make_closure,
+        .capture_get,
+        .optional_unwrap,
+        .bin_len_check,
+        .bin_read_int,
+        .bin_read_float,
+        .bin_slice,
+        .bin_read_utf8,
+        .bin_match_prefix,
+        .retain,
+        .release,
+        .reset,
+        .reuse_alloc,
+        .int_widen,
+        .float_widen,
+        .typed_undef,
+        .phi,
+        .dbg_stmt,
+        .dbg_var,
+        => {},
+    }
+}
+
+/// Compile-time guarantee that `forEachChildStream` yields every
+/// `Instruction` variant that carries a nested `[]const Instruction`
+/// sub-stream. Walks every union payload type via `@typeInfo`; if a
+/// payload (directly, or through a slice of structs) contains a
+/// `[]const Instruction` field but the variant's tag is not in the
+/// hand-maintained `handled` set below, compilation fails with a
+/// message naming the variant. This makes the canonical enumerator
+/// impossible to leave incomplete when a new control-flow instruction
+/// is added.
+fn comptime_child_stream_exhaustiveness() void {
+    @setEvalBranchQuota(20000);
+    const handled = [_][]const u8{
+        "if_expr",
+        "case_block",
+        "switch_literal",
+        "switch_return",
+        "union_switch",
+        "union_switch_return",
+        "try_call_named",
+        "guard_block",
+        "optional_dispatch",
+    };
+    const fields = @typeInfo(Instruction).@"union".fields;
+    inline for (fields) |field| {
+        if (comptime typeContainsInstructionStream(field.type)) {
+            comptime var is_handled = false;
+            inline for (handled) |name| {
+                if (comptime std.mem.eql(u8, name, field.name)) is_handled = true;
+            }
+            if (!is_handled) {
+                @compileError("ir.forEachChildStream does not handle Instruction." ++
+                    field.name ++ ", which carries a nested `[]const Instruction` sub-stream. " ++
+                    "Add a branch yielding its child stream(s) and list it in the `handled` set.");
+            }
+        }
+    }
+}
+
+/// Comptime: does type `T` contain (directly, or through a slice of
+/// structs) a `[]const Instruction` field? Detects every nested
+/// instruction stream regardless of how it is wrapped (a bare slice on
+/// the payload struct, or a slice of arm/case structs each holding a
+/// `body_instrs`/`cond_instrs` slice).
+fn typeContainsInstructionStream(comptime T: type) bool {
+    const info = @typeInfo(T);
+    switch (info) {
+        .pointer => |ptr| {
+            // `[]const Instruction` is a slice (many-item pointer) of
+            // `Instruction`; any other slice is inspected by element type.
+            if (ptr.size == .slice) {
+                if (ptr.child == Instruction) return true;
+                return typeContainsInstructionStream(ptr.child);
+            }
+            return false;
+        },
+        .@"struct" => |st| {
+            inline for (st.fields) |f| {
+                if (comptime typeContainsInstructionStream(f.type)) return true;
+            }
+            return false;
+        },
+        .optional => |opt| return typeContainsInstructionStream(opt.child),
+        else => return false,
+    }
+}
+
 /// Walks every instruction in `function` (top-level and nested
 /// inside structural sub-streams) in depth-first order, invoking
 /// `visitor.visit(instruction_pointer)` for each. Used by analysis
@@ -3333,7 +3605,7 @@ pub fn forEachInstruction(
     }
 }
 
-fn forEachInstructionInStream(
+pub fn forEachInstructionInStream(
     stream: []const Instruction,
     context: anytype,
     comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) void,
@@ -3344,60 +3616,22 @@ fn forEachInstructionInStream(
     }
 }
 
+/// Recurse into every child instruction stream of `instr`, in canonical
+/// flatten order, via `forEachChildStream` — the single source of truth
+/// for the structural recursion. (Previously a hand-rolled `switch` that
+/// skipped `union_switch.else_instrs`.)
 fn forEachInstructionChildren(
     instr: *const Instruction,
     context: anytype,
     comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) void,
 ) void {
-    switch (instr.*) {
-        .if_expr => |ie| {
-            forEachInstructionInStream(ie.then_instrs, context, visitFn);
-            forEachInstructionInStream(ie.else_instrs, context, visitFn);
-        },
-        .case_block => |cb| {
-            forEachInstructionInStream(cb.pre_instrs, context, visitFn);
-            for (cb.arms) |arm| {
-                forEachInstructionInStream(arm.cond_instrs, context, visitFn);
-                forEachInstructionInStream(arm.body_instrs, context, visitFn);
-            }
-            forEachInstructionInStream(cb.default_instrs, context, visitFn);
-        },
-        .switch_literal => |sl| {
-            for (sl.cases) |c| forEachInstructionInStream(c.body_instrs, context, visitFn);
-            forEachInstructionInStream(sl.default_instrs, context, visitFn);
-        },
-        .switch_return => |sr| {
-            for (sr.cases) |c| forEachInstructionInStream(c.body_instrs, context, visitFn);
-            forEachInstructionInStream(sr.default_instrs, context, visitFn);
-        },
-        .union_switch => |us| {
-            for (us.cases) |c| forEachInstructionInStream(c.body_instrs, context, visitFn);
-        },
-        .union_switch_return => |usr| {
-            for (usr.cases) |c| forEachInstructionInStream(c.body_instrs, context, visitFn);
-        },
-        .try_call_named => |tc| {
-            forEachInstructionInStream(tc.handler_instrs, context, visitFn);
-            forEachInstructionInStream(tc.success_instrs, context, visitFn);
-        },
-        .guard_block => |gb| {
-            forEachInstructionInStream(gb.body, context, visitFn);
-        },
-        .optional_dispatch => |od| {
-            // Phase D (Phase 6 redux plan §3.D): recurse into both
-            // arm bodies so any visitor — use-summary walker, drop
-            // counter, verifier, IR dumper — sees every instruction
-            // regardless of nesting. The arc-liveness analyzer and
-            // arc-drop-insertion rebuilder use a separate region-tree
-            // walk with their own InstructionId assignment, so this
-            // helper's traversal order is orthogonal to theirs; it
-            // is only required to be consistent (which it is — nil
-            // first, then struct, mirroring the structural shape).
-            forEachInstructionInStream(od.nil_instrs, context, visitFn);
-            forEachInstructionInStream(od.struct_instrs, context, visitFn);
-        },
-        else => {},
-    }
+    const Adapter = struct {
+        ctx: @TypeOf(context),
+        fn onStream(self: @This(), child: ChildStream) void {
+            forEachInstructionInStream(child.stream, self.ctx, visitFn);
+        }
+    };
+    forEachChildStream(instr, Adapter{ .ctx = context }, Adapter.onStream);
 }
 
 // ============================================================
@@ -5816,40 +6050,21 @@ pub const IrBuilder = struct {
     /// decide if a function's signature needs the loopification
     /// lowering path: `loopify = !isTcoEligible AND containsTailCall`.
     fn containsTailCall(instrs: []const Instruction) bool {
-        for (instrs) |instr| {
-            switch (instr) {
-                .tail_call => return true,
-                .switch_return => |sr| {
-                    for (sr.cases) |c| if (containsTailCall(c.body_instrs)) return true;
-                    if (containsTailCall(sr.default_instrs)) return true;
-                },
-                .union_switch_return => |usr| {
-                    for (usr.cases) |c| if (containsTailCall(c.body_instrs)) return true;
-                },
-                .union_switch => |us| {
-                    for (us.cases) |c| if (containsTailCall(c.body_instrs)) return true;
-                },
-                .optional_dispatch => |od| {
-                    if (containsTailCall(od.nil_instrs)) return true;
-                    if (containsTailCall(od.struct_instrs)) return true;
-                },
-                .switch_literal => |sl| {
-                    for (sl.cases) |c| if (containsTailCall(c.body_instrs)) return true;
-                    if (containsTailCall(sl.default_instrs)) return true;
-                },
-                .case_block => |cb| {
-                    if (containsTailCall(cb.pre_instrs)) return true;
-                    for (cb.arms) |arm| {
-                        if (containsTailCall(arm.cond_instrs)) return true;
-                        if (containsTailCall(arm.body_instrs)) return true;
-                    }
-                    if (containsTailCall(cb.default_instrs)) return true;
-                },
-                .guard_block => |gb| {
-                    if (containsTailCall(gb.body)) return true;
-                },
-                else => {},
-            }
+        for (instrs) |*instr| {
+            if (instr.* == .tail_call) return true;
+            // Recurse into every child stream via the canonical
+            // enumerator so no sub-stream (notably
+            // `union_switch.else_instrs`) can be missed.
+            const Finder = struct {
+                found: bool = false,
+                fn onStream(self: *@This(), child: ChildStream) void {
+                    if (self.found) return;
+                    if (containsTailCall(child.stream)) self.found = true;
+                }
+            };
+            var finder = Finder{};
+            forEachChildStream(instr, &finder, Finder.onStream);
+            if (finder.found) return true;
         }
         return false;
     }
