@@ -269,12 +269,15 @@ pub fn analyzeUniquenessFullEx(
         try analyzer.walkStream(block.instructions);
     }
 
-    // Audit R1: the uniqueness walk's InstructionId numbering must match
-    // the analyzer's record count, or its `isLastUseAt` queries (which key
-    // the `*_owned_unchecked` rewrite) are mis-keyed. Only checkable when
-    // an ownership table is supplied (its `isLastUseAt` is the consumer).
-    // Fail loudly in debug; no-op in release.
-    if (ownership) |o| arc_liveness.assertConsumerWalkMatches(o, analyzer.next_id);
+    // Note: a `record_count`-vs-`next_id` cross-check is intentionally NOT
+    // performed here. `analyzeUniquenessFullEx` is invoked both on the IR
+    // snapshot the ownership table was computed from AND, later, by the ARC
+    // verifier on post-drop-insertion IR whose instruction count has since
+    // changed (releases inserted) — so the supplied table's `record_count`
+    // need not match this walk. The canonical-enumerator id alignment is
+    // asserted at the drop-insertion site (which walks the same snapshot
+    // the ownership was computed from); see
+    // `arc_drop_insertion.insertScopeExitDrops`.
 
     return analyzer.result;
 }

@@ -19326,3 +19326,130 @@ test "findProtocolImplVTable resolves parametric specialization" {
         return error.MissingLoggerForTaggedI64;
     try std.testing.expectEqualStrings("LoggerVTable_for_Tagged_i64", vt_name);
 }
+
+// ============================================================
+// Canonical child-stream enumerator regression tests (Audit R1).
+// ============================================================
+
+test "forEachChildStream yields union_switch.else_instrs after the cases when has_else" {
+    // Build a `union_switch` with two case bodies and a catch-all else
+    // prong. The enumerator MUST yield every case body (in order) and then
+    // the else prong — the exact region every consumer historically
+    // skipped (audit findings arc-*--01 / uniqueness--01).
+    const case0_body = [_]Instruction{.{ .const_nil = 10 }};
+    const case1_body = [_]Instruction{ .{ .const_nil = 11 }, .{ .const_nil = 12 } };
+    const else_body = [_]Instruction{.{ .const_nil = 13 }};
+
+    const cases = [_]UnionCase{
+        .{ .variant_name = "A", .field_bindings = &.{}, .body_instrs = &case0_body, .return_value = null },
+        .{ .variant_name = "B", .field_bindings = &.{}, .body_instrs = &case1_body, .return_value = null },
+    };
+
+    const instr = Instruction{ .union_switch = .{
+        .dest = 0,
+        .scrutinee = 1,
+        .cases = &cases,
+        .else_instrs = &else_body,
+        .else_result = null,
+        .has_else = true,
+    } };
+
+    const Collected = struct {
+        kinds: std.ArrayListUnmanaged(ChildStreamKind) = .empty,
+        lens: std.ArrayListUnmanaged(usize) = .empty,
+        fn onStream(self: *@This(), child: ChildStream) void {
+            self.kinds.append(std.testing.allocator, child.kind) catch unreachable;
+            self.lens.append(std.testing.allocator, child.stream.len) catch unreachable;
+        }
+    };
+    var collected = Collected{};
+    defer collected.kinds.deinit(std.testing.allocator);
+    defer collected.lens.deinit(std.testing.allocator);
+
+    forEachChildStream(&instr, &collected, Collected.onStream);
+
+    // Exactly three child streams, in canonical order: case A, case B,
+    // then the else prong — else LAST, never skipped.
+    try std.testing.expectEqual(@as(usize, 3), collected.kinds.items.len);
+    try std.testing.expectEqual(ChildStreamKind.union_switch_case, collected.kinds.items[0]);
+    try std.testing.expectEqual(ChildStreamKind.union_switch_case, collected.kinds.items[1]);
+    try std.testing.expectEqual(ChildStreamKind.union_switch_else, collected.kinds.items[2]);
+    try std.testing.expectEqual(@as(usize, 1), collected.lens.items[0]);
+    try std.testing.expectEqual(@as(usize, 2), collected.lens.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), collected.lens.items[2]);
+}
+
+test "forEachChildStream omits union_switch.else_instrs when has_else is false" {
+    const case0_body = [_]Instruction{.{ .const_nil = 10 }};
+    const cases = [_]UnionCase{
+        .{ .variant_name = "A", .field_bindings = &.{}, .body_instrs = &case0_body, .return_value = null },
+    };
+    const instr = Instruction{ .union_switch = .{
+        .dest = 0,
+        .scrutinee = 1,
+        .cases = &cases,
+        .else_instrs = &.{},
+        .else_result = null,
+        .has_else = false,
+    } };
+
+    const Counter = struct {
+        count: usize = 0,
+        fn onStream(self: *@This(), child: ChildStream) void {
+            _ = child;
+            self.count += 1;
+        }
+    };
+    var counter = Counter{};
+    forEachChildStream(&instr, &counter, Counter.onStream);
+    // Only the single case body; the empty else prong is NOT yielded.
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+}
+
+test "countInstructionRecords counts every instruction including the union_switch catch-all" {
+    // A top-level block: [const_nil(scrutinee), union_switch{2 cases, else}].
+    // Total instruction count = 1 (scrutinee) + 1 (union_switch) + 1
+    // (case A body) + 2 (case B body) + 1 (else body) = 6. A walker that
+    // skipped else_instrs would count 5 and desync.
+    const case0_body = [_]Instruction{.{ .const_nil = 10 }};
+    const case1_body = [_]Instruction{ .{ .const_nil = 11 }, .{ .const_nil = 12 } };
+    const else_body = [_]Instruction{.{ .const_nil = 13 }};
+    const cases = [_]UnionCase{
+        .{ .variant_name = "A", .field_bindings = &.{}, .body_instrs = &case0_body, .return_value = null },
+        .{ .variant_name = "B", .field_bindings = &.{}, .body_instrs = &case1_body, .return_value = null },
+    };
+    const block_instrs = [_]Instruction{
+        .{ .const_nil = 1 },
+        .{ .union_switch = .{
+            .dest = 0,
+            .scrutinee = 1,
+            .cases = &cases,
+            .else_instrs = &else_body,
+            .else_result = null,
+            .has_else = true,
+        } },
+    };
+    const blocks = [_]Block{.{ .label = 0, .instructions = &block_instrs }};
+    const function = Function{
+        .id = 0,
+        .name = "t",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .any,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    };
+
+    const Counter = struct {
+        count: usize = 0,
+        fn visit(self: *@This(), instr: *const Instruction) void {
+            _ = instr;
+            self.count += 1;
+        }
+    };
+    var counter = Counter{};
+    forEachInstruction(&function, &counter, Counter.visit);
+    try std.testing.expectEqual(@as(usize, 6), counter.count);
+}

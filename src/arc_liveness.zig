@@ -327,7 +327,11 @@ pub const ArcOwnership = struct {
     /// analyzer's `flattenChildren` and its InstructionId keys are
     /// desynchronized. `assertConsumerWalkMatches` checks this in debug
     /// builds so any future drift fails loudly. (Audit R1.)
-    record_count: usize = 0,
+    ///
+    /// `null` when this table was NOT produced by `computeArcOwnership`
+    /// (e.g. a synthetic table hand-built by a unit test): there is no
+    /// analyzer flatten to mirror, so the cross-check is skipped.
+    record_count: ?usize = null,
 
     pub fn deinit(self: *ArcOwnership, allocator: std.mem.Allocator) void {
         self.consume_share_sites.deinit(allocator);
@@ -399,12 +403,16 @@ pub fn countInstructionRecords(function: *const ir.Function) usize {
 /// mis-keyed. Fails loudly here instead of silently miscompiling.
 ///
 /// No-op in release builds (`std.debug.assert` compiles out), so it adds
-/// zero cost to shipped binaries.
+/// zero cost to shipped binaries. Also a no-op when `record_count` is
+/// null (the ownership table was not produced by `computeArcOwnership`,
+/// e.g. a synthetic unit-test table — there is no analyzer flatten to
+/// mirror).
 pub fn assertConsumerWalkMatches(
     ownership: *const ArcOwnership,
     consumer_next_id: usize,
 ) void {
-    std.debug.assert(consumer_next_id == ownership.record_count);
+    const expected = ownership.record_count orelse return;
+    std.debug.assert(consumer_next_id == expected);
 }
 
 /// Predicate signature accepted by `computeArcOwnership`. Phases 1-2
