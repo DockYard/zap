@@ -5838,6 +5838,17 @@ pub const ZirDriver = struct {
                     for (us.cases) |case| {
                         if (findClosureTargetInInstrsRec(case.body_instrs, local, visited, visited_alloc)) |target| return target;
                     }
+                    if (us.has_else) {
+                        if (findClosureTargetInInstrsRec(us.else_instrs, local, visited, visited_alloc)) |target| return target;
+                    }
+                },
+                .try_call_named => |tcn| {
+                    if (findClosureTargetInInstrsRec(tcn.handler_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (findClosureTargetInInstrsRec(tcn.success_instrs, local, visited, visited_alloc)) |target| return target;
+                },
+                .optional_dispatch => |od| {
+                    if (findClosureTargetInInstrsRec(od.nil_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (findClosureTargetInInstrsRec(od.struct_instrs, local, visited, visited_alloc)) |target| return target;
                 },
                 else => {},
             }
