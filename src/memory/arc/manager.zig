@@ -1290,14 +1290,18 @@ const ZapMemorySection = extern struct {
     core: ZapMemoryManagerCoreV1,
 };
 
-/// The section payload. Exported so the linker does not dead-strip it.
+/// The section payload. Kept `pub` so the Phase-4 source-registered
+/// dispatch path (`runtime.zig`'s `bindSourceActiveManager`) can read it
+/// directly as `active_manager.zap_memory_section`, and `@export`ed (below)
+/// in non-test builds so the linker symbol the weak-extern/driver path
+/// discovers is present and not dead-stripped.
 ///
 /// `abi_minor = 1` because this manager exposes the v1.1 extended
 /// `ZapRefcountCapabilityV1` vtable (6 slots / 48 bytes — see spec
 /// section 8). A consumer that only knows v1.0 reads the vtable's
 /// `desc.size = 48` and ignores the trailing four slots per spec
 /// section 2.3.
-pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) = .{
+pub const zap_memory_section: ZapMemorySection = .{
     .meta = .{
         .magic = ZMEM_MAGIC,
         .abi_major = 1,
@@ -1321,6 +1325,38 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .get_capability_desc = arcGetCapabilityDesc,
     },
 };
+
+// Emit the mandatory `zap_memory_section` LINKER SYMBOL only in non-test
+// builds. (The `pub const` above always stays visible as a Zig decl — see
+// below — so this gates ONLY the exported symbol, not the value.)
+//
+// `zap_memory_section` is a MANDATORY exported symbol (spec §3.2): the
+// runtime's `externalMemorySection` discovers it via a weak `@extern`, and
+// the driver's post-link check (`assertExportsManagerSymbol`) enforces its
+// presence in every standalone-compiled manager object. Production manager
+// objects are built by `zap_fork_compile_zig_to_object`, which is never a
+// test build, so the symbol is always present where the contract requires it.
+//
+// The value must ALSO remain a `pub const` decl unconditionally: the Phase-4
+// source-registered dispatch path (`runtime.zig`'s `bindSourceActiveManager`)
+// reads it directly as `active_manager.zap_memory_section` via `@hasDecl` —
+// a Zig-decl access, NOT the linker symbol — so a user binary that registers
+// this manager as its active source needs the decl regardless of `export`.
+//
+// Under `builtin.is_test` the SYMBOL is dead: `runtime.zig`'s
+// `externalMemorySection` early-returns null in test mode (see its
+// `if (builtin.is_test) return null;` guard), so no test ever reads the
+// section through the linker. Gating EMISSION on `!builtin.is_test` lets BOTH
+// the ARC and Tracking managers be imported into the same `zig build test`
+// binary (`src/root.zig`'s aggregation) without colliding on the single,
+// strongly-linked `zap_memory_section` symbol — two unconditional `export`s
+// of the same name in one binary is a duplicate-symbol link error. The
+// `.section` reproduces the prior `linksection(SECTION_NAME)` byte-for-byte.
+comptime {
+    if (!builtin.is_test) {
+        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Uniform first-party manager interface (Phase 4)

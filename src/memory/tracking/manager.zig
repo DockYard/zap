@@ -1473,7 +1473,7 @@ comptime {
     _ = @as(*const RefcountSizedClassFn, refcountSizedClass);
 }
 
-pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) = .{
+pub const zap_memory_section: ZapMemorySection = .{
     .meta = .{
         .magic = ZMEM_MAGIC,
         .abi_major = 1,
@@ -1497,6 +1497,32 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .get_capability_desc = trackingGetCapabilityDesc,
     },
 };
+
+// Emit the mandatory `zap_memory_section` LINKER SYMBOL only in non-test
+// builds. (The `pub const` above always stays visible as a Zig decl so this
+// gates ONLY the exported symbol, not the value — see the matching block in
+// `src/memory/arc/manager.zig` for the full rationale.)
+//
+// The symbol contract is documented above (spec §3.2 / §10.5: MANDATORY name,
+// weak-extern discovery, driver post-link enforcement). Production manager
+// objects are built standalone by `zap_fork_compile_zig_to_object` (never a
+// test build), so the symbol is always present where the contract requires it.
+// The value must stay a `pub const` decl unconditionally because the Phase-4
+// source-registered path (`runtime.zig`'s `bindSourceActiveManager`) reads it
+// as `active_manager.zap_memory_section` via `@hasDecl` — a decl access, not
+// the linker symbol.
+//
+// Under `builtin.is_test` the symbol is dead — `runtime.zig`'s
+// `externalMemorySection` early-returns null in test mode — so gating
+// emission on `!builtin.is_test` lets the Tracking and ARC managers coexist
+// in the same `zig build test` binary (`src/root.zig`'s aggregation) without
+// a duplicate `zap_memory_section` symbol. The `.section` reproduces the
+// prior `linksection(SECTION_NAME)` byte-for-byte.
+comptime {
+    if (!builtin.is_test) {
+        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Behavioural test scaffolding (in-process)
