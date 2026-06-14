@@ -106,6 +106,31 @@ pub fn AstVisitor(comptime Context: type) type {
                 .type_decl, .opaque_decl, .union_decl => {},
                 .function, .priv_function, .macro, .priv_macro => |func| try visitFunctionDecl(ctx, func),
                 .attribute => |attr| try visitAttributeDecl(ctx, attr),
+                // `pub error N { ... }` / bare `error N { ... }` — pre-desugar
+                // top items (the desugar pass later rewrites these to a struct +
+                // `Error` impl). Walk the body items so a pre-desugar visitor
+                // sees the functions/attributes declared inside, mirroring
+                // `walkStructDecl`'s item iteration.
+                .error_decl, .priv_error_decl => |err_decl| try visitErrorDecl(ctx, err_decl),
+            }
+        }
+
+        pub fn visitErrorDecl(ctx: *Context, decl: *const ast.ErrorDecl) anyerror!void {
+            if (@hasDecl(Context, "visitErrorDecl")) {
+                return Context.visitErrorDecl(ctx, decl);
+            }
+            try walkErrorDecl(ctx, decl);
+        }
+
+        pub fn walkErrorDecl(ctx: *Context, decl: *const ast.ErrorDecl) anyerror!void {
+            for (decl.items) |item| {
+                switch (item) {
+                    .function, .priv_function, .macro, .priv_macro => |func| try visitFunctionDecl(ctx, func),
+                    .struct_decl => |sd| try visitStructDecl(ctx, sd),
+                    .attribute => |attr| try visitAttributeDecl(ctx, attr),
+                    .struct_level_expr => |expr| try visitExpr(ctx, expr),
+                    else => {},
+                }
             }
         }
 
@@ -195,6 +220,7 @@ pub fn AstVisitor(comptime Context: type) type {
                 .function_decl => |func| try visitFunctionDecl(ctx, func),
                 .macro_decl => |func| try visitFunctionDecl(ctx, func),
                 .import_decl => {},
+                .attribute => |attr| try visitAttributeDecl(ctx, attr),
             }
         }
 
@@ -219,7 +245,7 @@ pub fn AstVisitor(comptime Context: type) type {
 
         pub fn walkExpr(ctx: *Context, expr: *const ast.Expr) anyerror!void {
             switch (expr.*) {
-                .int_literal, .float_literal, .string_literal, .atom_literal, .bool_literal, .nil_literal, .var_ref, .struct_ref, .attr_ref, .function_ref, .intrinsic => {},
+                .int_literal, .float_literal, .string_literal, .atom_literal, .bool_literal, .nil_literal, .var_ref, .struct_ref, .attr_ref, .function_ref, .intrinsic, .poison => {},
                 .string_interpolation => |si| {
                     for (si.parts) |part| {
                         switch (part) {
@@ -320,6 +346,20 @@ pub fn AstVisitor(comptime Context: type) type {
                 },
                 .anonymous_function => |anon| try visitFunctionDecl(ctx, anon.decl),
                 .type_annotated => |ta| try visitExpr(ctx, ta.expr),
+                // `try do ... rescue <clauses> [after ...]` — recurse into the
+                // body statements, each rescue clause (pattern + optional guard
+                // + body, mirroring `walkCase`), and the optional after block.
+                // `type_annotation` on a clause is a `TypeExpr`, which this
+                // visitor does not traverse.
+                .try_rescue => |tr| {
+                    try visitBlock(ctx, tr.body);
+                    for (tr.rescue_clauses) |clause| {
+                        try visitPattern(ctx, clause.pattern);
+                        if (clause.guard) |g| try visitExpr(ctx, g);
+                        try visitBlock(ctx, clause.body);
+                    }
+                    if (tr.after_block) |after| try visitBlock(ctx, after);
+                },
             }
         }
 
@@ -363,6 +403,12 @@ pub fn AstVisitor(comptime Context: type) type {
                         .string_literal => {},
                     }
                 },
+                // `Qualifier.Variant(<payload>)` — recurse into the optional
+                // payload sub-pattern (the `type_args` are `TypeExpr`s, which
+                // this visitor does not traverse, matching its expr/pattern-only
+                // scope). Mirrors the payload recursion in `desugar.zig`'s
+                // `collectPatternBindings`.
+                .tagged_union_variant => |tuv| if (tuv.payload) |payload| try visitPattern(ctx, payload),
             }
         }
     };
