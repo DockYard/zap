@@ -252,4 +252,72 @@ pub struct ClosureTest {
     produced = escaped(base)
     Map.has_key?(produced, :added)
   }
+
+  # FU-13 (P2J1b) end-to-end soundness guard for uniqueness--02 /
+  # arc-param--02. `mutate_via_put` is a named, owned-mutating function
+  # (forwards its Map receiver straight into `Map.put`) exercised through
+  # BOTH paths that, before P2J1, disagreed about its receiver convention:
+  #   (a) a DIRECT consuming call (`direct_mutate`) — the path that would
+  #       promote the receiver to `.owned`; and
+  #   (b) a VALUE escape (`make_closure` via `escaped = mutate_via_put`)
+  #       invoked indirectly — the path P2J1 vetoes, because an indirect
+  #       caller may hand it a shared cell.
+  # When both coexist, P2J1's value-escape veto keeps the receiver
+  # `.borrowed`, and the convention fixpoint CASCADES that demotion through
+  # `Map.put` (a borrowing caller forces `Map.put`'s receiver `.borrowed`
+  # too), so the merged IR forwards the receiver by share (rc-checked) and
+  # the runtime copy-on-writes — no in-place mutation of the caller's
+  # shared cell. This test pins that end-to-end safety: the receiver is
+  # parked in an outer aggregate (rc>=2), so any unsound in-place mutation
+  # would corrupt the parked alias and surface here. (The narrower IR
+  # shape FU-13 directly reconciles — a `move_value` of a value-escape-
+  # demoted `.borrowed` source feeding an `.owned` `call_named`/
+  # `call_direct` slot, which V6 rejects pre-fix — is proven
+  # fail-pre/pass-post by the deterministic unit test
+  # "rewriteOwnedConsumeSites copies-on-write a borrowed-param share into
+  # an owned slot (FU-13)" in src/arc_ownership.zig; the convention
+  # cascade prevents that exact shape from arising in this Map-forwarding
+  # corpus case, so this test passes both pre- and post-fix and stands as
+  # the runtime soundness complement.)
+  describe("value-escape + direct-consume reconciliation (FU-13)") {
+    test("escaped + directly-consumed owned-mutating fn leaves parked alias intact") {
+      assert(escape_and_direct_call_preserves_alias())
+    }
+
+    test("escaped + directly-consumed owned-mutating fn still returns its mutation") {
+      assert(escape_and_direct_call_has_mutation())
+    }
+  }
+
+  fn mutate_via_put(receiver :: %{Atom => i64}) -> %{Atom => i64} {
+    Map.put(receiver, :added, 999)
+  }
+
+  # Direct consuming caller: builds a fresh map, hands it to `mutate_via_put`
+  # at last-use, and uses the result. This is the call shape that, before
+  # P2J1, promoted `mutate_via_put`'s receiver to `.owned`.
+  fn direct_mutate() -> Bool {
+    fresh = %{seed: 1}
+    produced = mutate_via_put(fresh)
+    Map.has_key?(produced, :added)
+  }
+
+  fn escape_and_direct_call_preserves_alias() -> Bool {
+    direct_ok = direct_mutate()
+    shared_map = %{kept: 7}
+    parked = [shared_map]
+    escaped = mutate_via_put
+    _result = escaped(shared_map)
+    observed = List.get(parked, 0)
+    direct_ok and not Map.has_key?(observed, :added) and Map.has_key?(observed, :kept)
+  }
+
+  fn escape_and_direct_call_has_mutation() -> Bool {
+    direct_ok = direct_mutate()
+    base = %{origin: 1}
+    escaped = mutate_via_put
+    produced = escaped(base)
+    direct_ok and Map.has_key?(produced, :added)
+  }
+
 }

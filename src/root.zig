@@ -107,7 +107,9 @@ test {
     _ = @import("analysis_pipeline.zig");
     _ = @import("arc_optimizer.zig");
     _ = @import("arc_liveness.zig");
+    _ = @import("arc_ownership.zig");
     _ = @import("arc_param_convention.zig");
+    _ = @import("arc_verifier.zig");
     _ = @import("arc_drop_insertion.zig");
     _ = @import("arc_materialize.zig");
     _ = @import("uniqueness.zig");
