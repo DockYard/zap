@@ -16499,19 +16499,43 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                             return .{ .function = .{ .params = zig_params, .return_type = ret_ptr, .raises = ft.raises } };
                         },
                         .union_type => |ut| {
-                            // T | nil → ?T (Zig optional)
-                            if (ut.members.len == 2) {
-                                var non_nil: ?types_mod.TypeId = null;
-                                for (ut.members) |m| {
-                                    if (m == types_mod.TypeStore.NIL) continue;
-                                    non_nil = m;
+                            // A union lowers to a Zig optional (`?T`) ONLY when
+                            // it is a GENUINE nullable union — exactly one NIL
+                            // member plus exactly one non-NIL member (`T | nil`).
+                            // The optional IS the correct representation for a
+                            // nullable single type, but applying it to ANY
+                            // two-member union is a type-soundness hole: for a
+                            // union of two non-nil members (e.g. `i64 | String`)
+                            // the earlier code kept only the LAST member and
+                            // lowered to `?String`, silently erasing the other
+                            // member's discriminant and applying nil-ness
+                            // semantics to a value that is never null
+                            // (IR-3--01). Count NIL vs non-NIL members
+                            // explicitly and require exactly one of each,
+                            // mirroring the authoritative `saw_payload and
+                            // saw_nil` invariant in `findOptionalUnionTypeId`.
+                            // Every other union configuration — two non-nil
+                            // members, three-plus members with or without nil —
+                            // takes the general path so each variant keeps its
+                            // own runtime identity (today `.any`/`anytype`;
+                            // long-term a real tagged sum-type lowering).
+                            var nil_count: usize = 0;
+                            var non_nil_member: ?types_mod.TypeId = null;
+                            var non_nil_count: usize = 0;
+                            for (ut.members) |member_type_id| {
+                                if (member_type_id == types_mod.TypeStore.NIL) {
+                                    nil_count += 1;
+                                } else {
+                                    non_nil_count += 1;
+                                    non_nil_member = member_type_id;
                                 }
-                                if (non_nil) |inner| {
-                                    const inner_zig = typeIdToZigTypeWithStore(inner, type_store);
-                                    const inner_ptr = ts.allocator.create(ZigType) catch return .any;
-                                    inner_ptr.* = inner_zig;
-                                    return .{ .optional = inner_ptr };
-                                }
+                            }
+                            if (nil_count == 1 and non_nil_count == 1) {
+                                const inner = non_nil_member.?;
+                                const inner_zig = typeIdToZigTypeWithStore(inner, type_store);
+                                const inner_ptr = ts.allocator.create(ZigType) catch return .any;
+                                inner_ptr.* = inner_zig;
+                                return .{ .optional = inner_ptr };
                             }
                             // General union types → anytype
                             return .any;
@@ -19818,6 +19842,124 @@ test "typeIdToZigTypeWithStore lowers protocol_constraint to ZigType.protocol_bo
     const zig_type = typeIdToZigTypeWithStore(pc_id, &store);
     try std.testing.expect(zig_type == .protocol_box);
     try std.testing.expectEqualStrings("Error", zig_type.protocol_box);
+}
+
+test "typeIdToZigTypeWithStore: two-member non-nil union does NOT lower to an optional (IR-3--01)" {
+    // Regression for the type-soundness hole IR-3--01: a two-member union
+    // whose members are BOTH non-nil (e.g. `i64 | String`) must NOT lower to
+    // `?String` (the Zig optional of the last member). The previous code
+    // assumed any two-member union was `T | nil` and kept whichever member was
+    // not NIL — for two non-nil members that silently selected the LAST one and
+    // erased the other's discriminant, producing type confusion (an `i64`
+    // misrepresented as a nullable `String`). A non-nullable union must take
+    // the general path (`.any`), never the optional.
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    defer store.deinit();
+
+    const members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
+    defer std.testing.allocator.free(members);
+    members[0] = types_mod.TypeStore.I64;
+    members[1] = types_mod.TypeStore.STRING;
+    const union_id = try store.addType(.{ .union_type = .{ .members = members } });
+
+    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    // The defining symptom of the bug was `.optional`; assert it is gone.
+    try std.testing.expect(zig_type != .optional);
+    // Non-nullable unions have no single runtime representation today, so they
+    // take the general `.any` path.
+    try std.testing.expect(zig_type == .any);
+}
+
+test "typeIdToZigTypeWithStore: coercible two-member non-nil union does NOT lower to an optional (IR-3--01)" {
+    // The silent-miscompile variant the audit calls out: a union of two
+    // coercible integer members (`i32 | i64`) used to lower to `?i64` and
+    // silently compile with the union tag erased and nil-ness semantics
+    // wrongly applied to a value that is never null. It must take the general
+    // path, not the optional.
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    defer store.deinit();
+
+    const members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
+    defer std.testing.allocator.free(members);
+    members[0] = types_mod.TypeStore.I32;
+    members[1] = types_mod.TypeStore.I64;
+    const union_id = try store.addType(.{ .union_type = .{ .members = members } });
+
+    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    try std.testing.expect(zig_type != .optional);
+    try std.testing.expect(zig_type == .any);
+}
+
+test "typeIdToZigTypeWithStore: genuine T | nil union still lowers to an optional (IR-3--01 control)" {
+    // The optional optimization is correct for a GENUINE nullable union —
+    // exactly one non-nil member plus `nil`. The IR-3--01 gate must preserve
+    // it: `i64 | nil` lowers to `?i64`.
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    defer store.deinit();
+
+    const members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
+    defer std.testing.allocator.free(members);
+    members[0] = types_mod.TypeStore.I64;
+    members[1] = types_mod.TypeStore.NIL;
+    const union_id = try store.addType(.{ .union_type = .{ .members = members } });
+
+    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    // The optional's inner ZigType is heap-allocated on the store allocator by
+    // `typeIdToZigTypeWithStore`; in production that allocator is an arena, but
+    // the leak-checking test allocator requires an explicit free here.
+    defer std.testing.allocator.destroy(zig_type.optional);
+    try std.testing.expect(zig_type == .optional);
+    try std.testing.expect(zig_type.optional.* == .i64);
+}
+
+test "typeIdToZigTypeWithStore: nil member ordering does not change the genuine-optional result (IR-3--01 control)" {
+    // The gate must count members regardless of order: `nil | i64` is just as
+    // much a genuine nullable union as `i64 | nil`. The pre-fix code, which
+    // kept the LAST non-nil member, happened to work here only by accident;
+    // the explicit nil/non-nil counting makes order irrelevant.
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    defer store.deinit();
+
+    const members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
+    defer std.testing.allocator.free(members);
+    members[0] = types_mod.TypeStore.NIL;
+    members[1] = types_mod.TypeStore.I64;
+    const union_id = try store.addType(.{ .union_type = .{ .members = members } });
+
+    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    // See the sibling control test: free the heap-allocated optional inner type.
+    defer std.testing.allocator.destroy(zig_type.optional);
+    try std.testing.expect(zig_type == .optional);
+    try std.testing.expect(zig_type.optional.* == .i64);
+}
+
+test "typeIdToZigTypeWithStore: three-member union containing nil does NOT lower to an optional (IR-3--01 adjacent)" {
+    // Adjacent-site audit: a union with more than two members must take the
+    // general path even when one member is nil (`i64 | String | nil`). Only the
+    // exactly-one-nil-plus-exactly-one-non-nil shape is a genuine optional.
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    defer store.deinit();
+
+    const members = try std.testing.allocator.alloc(types_mod.TypeId, 3);
+    defer std.testing.allocator.free(members);
+    members[0] = types_mod.TypeStore.I64;
+    members[1] = types_mod.TypeStore.STRING;
+    members[2] = types_mod.TypeStore.NIL;
+    const union_id = try store.addType(.{ .union_type = .{ .members = members } });
+
+    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    try std.testing.expect(zig_type != .optional);
+    try std.testing.expect(zig_type == .any);
 }
 
 test "zigTypeToStr renders ZigType.protocol_box as zap_runtime.ProtocolBox" {

@@ -389,4 +389,77 @@ pub struct UnionTest {
       CatchallShape.Triangle(n) -> n
     }
   }
+
+  # ----------------------------------------------------------------------
+  # End-to-end regression guard for IR-3--01 (ad-hoc two-member NON-nil union
+  # must NOT lower to an optional of the last member).
+  #
+  # An ANONYMOUS union annotation `A | B` (a `union_type` of two non-nil
+  # members, distinct from a declared `union Name { ... }` tagged union) used to
+  # be mis-lowered by `typeIdToZigTypeWithStore` to `?B` — the Zig optional of
+  # the LAST member — on the false assumption that any two-member union is
+  # `T | nil`. For `i64 | String` that erased the `i64` discriminant. The
+  # optional lowering is now gated on a GENUINE nullable union (exactly one nil
+  # member + exactly one non-nil member); every other two-member union takes the
+  # general path so its members keep their own runtime identity. The precise
+  # pre-fix/post-fix witness for the lowering itself is the unit-test cluster in
+  # `src/ir.zig` ("two-member non-nil union does NOT lower to an optional"); the
+  # tests below are the live-execution complement, asserting that an `i64 |
+  # String` parameter compiles and that BOTH members keep their own runtime
+  # identity under `is_integer?`/`is_string?`. The genuine-nullable control
+  # (`CatchallShape(i64) | nil`) must still behave as an optional.
+  describe("ad-hoc two-member non-nil union keeps both members distinct (IR-3--01)") {
+    test("integer variant of i64 | String is identified as an integer") {
+      assert(UnionTest.ad_hoc_kind(42) == "integer")
+    }
+
+    test("string variant of i64 | String is identified as a string") {
+      assert(UnionTest.ad_hoc_kind("text") == "string")
+    }
+
+    test("integer variant of i64 | String is not misread as a string") {
+      assert(UnionTest.ad_hoc_is_string(42) == false)
+    }
+
+    test("string variant of i64 | String is recognized as a string") {
+      assert(UnionTest.ad_hoc_is_string("text") == true)
+    }
+  }
+
+  describe("genuine nullable union still lowers as an optional (IR-3--01 control)") {
+    test("present value in a CatchallShape(i64) | nil parameter is not nil") {
+      assert(UnionTest.maybe_is_present(CatchallShape(i64).Circle(1)) == true)
+    }
+
+    test("nil in a CatchallShape(i64) | nil parameter is nil") {
+      assert(UnionTest.maybe_is_present(nil) == false)
+    }
+  }
+
+  # `value` is an ad-hoc union of two NON-nil members. Discriminating it at
+  # runtime requires that the integer and string members retain distinct
+  # identities — exactly what the optional mis-lowering destroyed.
+  fn ad_hoc_kind(value :: i64 | String) -> String {
+    if is_integer?(value) {
+      "integer"
+    } else {
+      "string"
+    }
+  }
+
+  # The complementary discrimination: an integer member of an `i64 | String`
+  # value must NOT be reported as a string. Pre-fix, with the parameter lowered
+  # to `?String`, the integer member is indistinguishable from the string
+  # member (both collapse onto the optional-of-String representation).
+  fn ad_hoc_is_string(value :: i64 | String) -> Bool {
+    is_string?(value)
+  }
+
+  # Genuine `T | nil` control: a single non-nil member plus `nil` MUST keep the
+  # optional lowering so a present value and an absent value are distinguishable
+  # via `!= nil`. This is the legitimate optimization the IR-3--01 gate must
+  # preserve.
+  fn maybe_is_present(value :: CatchallShape(i64) | nil) -> Bool {
+    value != nil
+  }
 }
