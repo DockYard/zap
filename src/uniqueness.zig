@@ -3,6 +3,7 @@ const ir = @import("ir.zig");
 const arc_liveness = @import("arc_liveness.zig");
 const uniqueness_interprocedural = @import("uniqueness_interprocedural.zig");
 const uniqueness_signature = @import("uniqueness_signature.zig");
+const uniqueness_decision = @import("uniqueness_decision.zig");
 
 // ============================================================
 // uniqueness — static-uniqueness analysis (Phase 3 of the dense-map plan).
@@ -954,7 +955,7 @@ const Analyzer = struct {
                     if (slot >= cd.args.len) return null;
                     return .{ .receiver = cd.args[slot] };
                 }
-                if (calleeFunctionOwnedReceiverSlot(callee)) |slot| {
+                if (uniqueness_decision.ownedReceiverSlot(callee)) |slot| {
                     if (slot >= cd.args.len) return null;
                     return .{ .receiver = cd.args[slot] };
                 }
@@ -995,15 +996,12 @@ const Analyzer = struct {
     /// index when the function has the `.owned` slot + `.owned` result
     /// convention pair. Returns null when the program reference is
     /// absent (test scaffolding), the name doesn't match, or the
-    /// function isn't an owned-mutating Zap-fn wrapper.
+    /// function isn't an owned-mutating Zap-fn wrapper. Delegates the
+    /// convention-pair decision to the shared `uniqueness_decision`
+    /// authority so it cannot drift from the TentativeAnalyzer's copy.
     fn calleeOwnedReceiverSlot(self: *const Analyzer, name: []const u8) ?usize {
         const program = self.program orelse return null;
-        for (program.functions) |*func| {
-            if (std.mem.eql(u8, func.name, name)) {
-                return calleeFunctionOwnedReceiverSlot(func);
-            }
-        }
-        return null;
+        return uniqueness_decision.ownedReceiverSlotByName(program, name);
     }
 
     /// Apply the dataflow transfer function for `instr`. Updates
@@ -1508,121 +1506,63 @@ const Analyzer = struct {
     /// consumed (e.g. a fresh-allocator wrapper or a non-mutating call).
     /// Used by `applyEffect`'s `try_call_named` arg-effect to clear the
     /// consumed receiver's uniqueness, matching `applyCalleeEffect`.
+    ///
+    /// Delegates to the shared `uniqueness_decision` authority so the
+    /// receiver-slot decision is identical to the TentativeAnalyzer's.
+    /// Returns null when the program reference is absent (the
+    /// owned-mutating-builtin slot is still recognized name-only).
     fn calleeReceiverSlotForTryCall(self: *const Analyzer, name: []const u8) ?usize {
         if (arc_liveness.ownedMutatingBuiltinSlot(name)) |slot| return slot;
-        if (self.calleeOwnedReceiverSlot(name)) |slot| return slot;
-        return null;
+        const program = self.program orelse return null;
+        return uniqueness_decision.calleeReceiverSlotForTryCall(program, name);
     }
 
-    /// uniqueness--04 — does the callee `function_id`'s signature prove
-    /// that its `slot` parameter's uniqueness flows WHOLE-RETURN through
-    /// to the result? True only when the per-slot signature class is
-    /// `preserves_uniqueness` AND the witness is the whole return value
-    /// (`preserves_to_return_component == null`, i.e. the result is the
-    /// parameter itself or its rc=1 derivative — NOT one component of a
-    /// tuple return). This is the soundness witness the `.owned`/`.owned`
-    /// convention pair lacks: the convention pair establishes only that
-    /// the caller transferred a +1 and receives a +1 back, never that the
-    /// returned cell is fresh/unaliased. A function that returns its
-    /// `.owned` receiver unchanged (an accumulator base case) is PU but
-    /// its result is the SAME cell the caller passed — unique only when
-    /// that cell was unique on entry.
-    ///
-    /// Returns false when no signature table is wired (test scaffolding /
-    /// non-production callers): the safe, conservative default. Returns
-    /// false for absent functions or out-of-range slots.
-    fn signatureWholeReturnPreservesUniqueness(
-        self: *const Analyzer,
-        function_id: ir.FunctionId,
-        slot: usize,
-    ) bool {
-        const sigs = self.signatures orelse return false;
-        const sig = sigs.forFunction(function_id) orelse return false;
-        if (slot >= sig.params.len) return false;
-        const param_sig = sig.params[slot];
-        return param_sig.class == .preserves_uniqueness and
-            param_sig.preserves_to_return_component == null;
-    }
-
-    /// uniqueness--04 — resolve `name` to a FunctionId, then delegate to
-    /// `signatureWholeReturnPreservesUniqueness`. False when the name is
-    /// unresolvable or no signatures are wired.
-    fn signatureWholeReturnPreservesUniquenessByName(
-        self: *const Analyzer,
-        name: []const u8,
-        slot: usize,
-    ) bool {
-        const function_id = self.lookupByName(name) orelse return false;
-        return self.signatureWholeReturnPreservesUniqueness(function_id, slot);
-    }
-
-    /// uniqueness--04 — whether a call whose callee matches the
-    /// `.owned` receiver slot + `.owned` result convention pair (slot
-    /// `slot`) produces a PROVABLY-UNIQUE result. The convention pair
-    /// alone is insufficient (uniqueness--04): a callee can legitimately
-    /// have an `.owned` receiver and `.owned` result yet `return` an
-    /// alias of that receiver (or a captured/shared value) rather than a
-    /// freshly-produced cell. The result is provably unique only when the
-    /// callee's signature proves the slot's uniqueness flows whole-return
-    /// (PU, whole-return witness) AND the receiver was actually unique at
-    /// this call site (`pre_arg_unique[slot]`):
-    ///   * PU whole-return + receiver unique → result inherits the
-    ///     receiver's (proven) uniqueness → unique.
-    ///   * PU whole-return + receiver shared → the result may be the
-    ///     shared cell (alias case) → NOT unique.
-    /// When signatures are absent, falls back to NOT unique (conservative).
+    /// uniqueness--04 — whether a call whose callee matches the `.owned`
+    /// receiver slot + `.owned` result convention pair (slot `slot`)
+    /// produces a PROVABLY-UNIQUE result, given the pre-call per-arg
+    /// uniqueness snapshot. Delegates the freshness gate to the shared
+    /// `uniqueness_decision` authority. Returns false (conservative) when
+    /// no signature table or program reference is wired.
     fn conventionPairResultUnique(
         self: *const Analyzer,
         name: []const u8,
         slot: usize,
         pre_arg_unique: []const bool,
     ) bool {
-        if (slot >= pre_arg_unique.len) return false;
-        if (!pre_arg_unique[slot]) return false;
-        return self.signatureWholeReturnPreservesUniquenessByName(name, slot);
+        const program = self.program orelse return false;
+        return uniqueness_decision.conventionPairResultUnique(self.signatures, program, name, slot, pre_arg_unique);
     }
 
-    /// Convention-pair result-unique decision for a `call_direct`
-    /// callee resolved to a concrete function. Mirrors
-    /// `conventionPairResultUnique` but keys the signature lookup on the
-    /// resolved `function.id` directly.
+    /// Convention-pair result-unique decision for a `call_direct` callee
+    /// resolved to a concrete function. Delegates to the shared
+    /// `uniqueness_decision` authority, keyed on `function.id`.
     fn conventionPairResultUniqueByFunction(
         self: *const Analyzer,
         function: *const ir.Function,
         slot: usize,
         pre_arg_unique: []const bool,
     ) bool {
-        if (slot >= pre_arg_unique.len) return false;
-        if (!pre_arg_unique[slot]) return false;
-        return self.signatureWholeReturnPreservesUniqueness(function.id, slot);
+        return uniqueness_decision.conventionPairResultUniqueByFunction(self.signatures, function, slot, pre_arg_unique);
     }
 
     /// uniqueness--03 / uniqueness--04 — whether the SUCCESS-path result
     /// of calling `name` is unique by the callee's runtime contract,
-    /// given the pre-call per-arg uniqueness snapshot. This is the single
-    /// authority for the success-callee classification, shared by the
-    /// regular `call_named` dest path and the `try_call_named` success-arm
-    /// so they agree by construction. The three contract shapes mirror
-    /// `applyCalleeEffect`:
-    ///   1. owned-mutating builtin (`ownedMutatingBuiltinSlot != null`) —
-    ///      runtime contract guarantees a fresh rc=1 result.
-    ///   2. fresh-allocator wrapper (rc=1 by construction).
-    ///   3. Zap fn convention pair (`.owned` receiver slot + `.owned`
-    ///      result) — uniqueness--04: unique ONLY when the callee's
-    ///      signature proves whole-return PU AND the receiver was unique
-    ///      at the call site (`conventionPairResultUnique`). The
-    ///      convention pair alone does NOT prove result freshness.
+    /// given the pre-call per-arg uniqueness snapshot. This is the
+    /// classification the regular `call_named` dest path and the
+    /// `try_call_named` success-arm both consume; delegating it to the
+    /// shared `uniqueness_decision` authority is what guarantees the
+    /// canonical Analyzer and the TentativeAnalyzer agree by construction
+    /// (the recurring FU-15 drift class). Returns false (conservative)
+    /// when no signature table or program reference is wired; the
+    /// owned-mutating-builtin shape is still recognized name-only.
     fn calleeContractResultUnique(
         self: *const Analyzer,
         name: []const u8,
         pre_arg_unique: []const bool,
     ) bool {
         if (arc_liveness.ownedMutatingBuiltinSlot(name) != null) return true;
-        if (self.calleeIsFreshAllocatorWrapper(name)) return true;
-        if (self.calleeOwnedReceiverSlot(name)) |slot| {
-            return self.conventionPairResultUnique(name, slot, pre_arg_unique);
-        }
-        return false;
+        const program = self.program orelse return false;
+        return uniqueness_decision.calleeContractResultUnique(self.signatures, program, name, pre_arg_unique);
     }
 
     /// Apply the per-callee dataflow effect. Recognises three shapes:
@@ -1711,11 +1651,11 @@ const Analyzer = struct {
         // uniqueness--04: fresh-allocator wrappers (unique result on every
         // path) take precedence over the convention-pair gate, mirroring
         // the by-name path.
-        if (functionIsFreshAllocatorWrapperWithProgram(function, self.program)) {
+        if (uniqueness_decision.isFreshAllocatorWrapper(function, self.program)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
-        if (calleeFunctionOwnedReceiverSlot(function)) |slot| {
+        if (uniqueness_decision.ownedReceiverSlot(function)) |slot| {
             // Receiver consumed regardless of result freshness.
             if (slot < args.len) {
                 _ = self.unique.remove(args[slot]);
@@ -1822,203 +1762,20 @@ const Analyzer = struct {
     /// Look up the callee by name and decide whether it is a thin
     /// fresh-allocator wrapper. Returns false when the program
     /// reference is absent (test scaffolding) or the name doesn't
-    /// match.
+    /// match. Delegates to the shared `uniqueness_decision` authority.
     fn calleeIsFreshAllocatorWrapper(self: *const Analyzer, name: []const u8) bool {
         const program = self.program orelse return false;
-        for (program.functions) |*func| {
-            if (std.mem.eql(u8, func.name, name)) {
-                return functionIsFreshAllocatorWrapperWithProgram(func, program);
-            }
-        }
-        return false;
+        return uniqueness_decision.isFreshAllocatorWrapperByName(program, name);
     }
 };
 
-/// uniqueness (Phase 1.4): is `function` a thin Zap-fn wrapper around a
-/// runtime fresh-allocator intrinsic? The pattern:
-///
-///     pub fn new_filled(size :: i64, init :: i64) -> List(i64) {
-///       :zig.List.new_filled(size, init)
-///     }
-///
-/// lowers to a body containing exactly one owned-bearing call —
-/// `call_builtin name=List:i64.new_filled` — followed by a `ret`
-/// of that call's dest. Such wrappers inherit the runtime's "fresh
-/// allocation, refcount=1" contract; the uniqueness dataflow treats their
-/// result as `definitely_unique`.
-///
-/// The check is structural: walk every instruction in the function's
-/// body. The wrapper is fresh when its body contains EXACTLY ONE
-/// allocator-producing call site (either a `call_builtin` that passes
-/// `arc_liveness.isFreshAllocatorBuiltin`, or a `call_named`/`call_direct`
-/// whose target is ITSELF a fresh-allocator wrapper) and zero other
-/// non-fresh calls. Transitive recognition is essential for benchmark
-/// patterns like `ones(n) -> List.new_filled(n, 1.0)` where the user
-/// wraps the runtime allocator in a thin Zap helper — without
-/// transitive recognition, every such wrapper's caller observes a
-/// non-unique result and the uniqueness fixpoint cascades demotions
-/// through the rest of the program.
-///
-/// The function's `result_convention == .owned` is also required, since
-/// only ARC-managed returns participate in uniqueness analysis.
-///
-/// We don't require the ret to literally be `value=allocator_dest`
-/// because the IR builder may emit local_set/move chains between the
-/// call and the ret. The single-call invariant plus `result_convention
-/// == .owned` is sufficient.
-///
-/// Recursion safety: cycles among Zap-fn wrappers (e.g. mutual
-/// recursion that ends up calling List.new_filled at some depth) are
-/// not legitimate fresh-allocator chains — fresh allocator semantics
-/// require a syntactically-bounded call depth. The recursion depth is
-/// capped at a small constant; chains exceeding the cap are rejected
-/// (the safe default). The cap also prevents stack overflow on
-/// pathological IR shapes.
-pub fn functionIsFreshAllocatorWrapper(function: *const ir.Function) bool {
-    return functionIsFreshAllocatorWrapperWithProgram(function, null);
-}
-
-/// Transitive variant: when `program` is non-null, calls to other Zap
-/// functions are followed and recognised as fresh when the callee is
-/// itself a fresh-allocator wrapper. Without `program`, only direct
-/// `call_builtin` to a runtime allocator counts (the legacy behaviour).
-pub fn functionIsFreshAllocatorWrapperWithProgram(
-    function: *const ir.Function,
-    program: ?*const ir.Program,
-) bool {
-    return functionIsFreshAllocatorWrapperWithDepth(function, program, 0);
-}
-
-/// Maximum chain depth for transitive fresh-allocator recognition.
-/// In practice the deepest legitimate chain is 1–2 hops (user wrapper
-/// around runtime intrinsic). The cap defends against pathological IR
-/// shapes and recursive cycles.
-const FRESH_ALLOCATOR_MAX_DEPTH: usize = 8;
-
-fn functionIsFreshAllocatorWrapperWithDepth(
-    function: *const ir.Function,
-    program: ?*const ir.Program,
-    depth: usize,
-) bool {
-    if (function.result_convention != .owned) return false;
-    if (depth >= FRESH_ALLOCATOR_MAX_DEPTH) return false;
-    var allocator_count: usize = 0;
-    var other_call_count: usize = 0;
-    var ctx = AllocatorWrapperScan{
-        .allocator_count = &allocator_count,
-        .other_call_count = &other_call_count,
-        .program = program,
-        .depth = depth,
-    };
-    for (function.body) |block| {
-        scanAllocatorWrapperStream(block.instructions, &ctx);
-    }
-    return allocator_count == 1 and other_call_count == 0;
-}
-
-const AllocatorWrapperScan = struct {
-    allocator_count: *usize,
-    other_call_count: *usize,
-    /// Optional program reference. When non-null, `call_named` /
-    /// `call_direct` targets are resolved and (transitively) checked
-    /// via `functionIsFreshAllocatorWrapperWithDepth`. When null, every
-    /// non-builtin call counts as "other".
-    program: ?*const ir.Program = null,
-    /// Current recursion depth. Passed to nested calls so transitive
-    /// chains observe the same cap.
-    depth: usize = 0,
-};
-
-fn lookupProgramFunctionByName(program: *const ir.Program, name: []const u8) ?*const ir.Function {
-    for (program.functions) |*func| {
-        if (std.mem.eql(u8, func.name, name)) return func;
-    }
-    return null;
-}
-
-fn lookupProgramFunctionById(program: *const ir.Program, function_id: ir.FunctionId) ?*const ir.Function {
-    for (program.functions) |*func| {
-        if (func.id == function_id) return func;
-    }
-    return null;
-}
-
-fn scanAllocatorWrapperStream(
-    stream: []const ir.Instruction,
-    ctx: *AllocatorWrapperScan,
-) void {
-    for (stream) |*instr| {
-        switch (instr.*) {
-            .call_builtin => |cb| {
-                if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
-                    ctx.allocator_count.* += 1;
-                } else {
-                    ctx.other_call_count.* += 1;
-                }
-            },
-            // For Zap function calls, follow the chain when the program
-            // is available: a call to another fresh-allocator wrapper
-            // counts as an allocator call, not an "other" call. This
-            // is the transitive recognition that lets benchmark
-            // helpers like `ones(n) -> List.new_filled(n, 1.0)` flow
-            // through to callers as fresh allocations.
-            .call_named => |cn| {
-                if (ctx.program) |program| {
-                    if (lookupProgramFunctionByName(program, cn.name)) |target| {
-                        if (functionIsFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
-                            ctx.allocator_count.* += 1;
-                            continue;
-                        }
-                    }
-                }
-                ctx.other_call_count.* += 1;
-            },
-            .call_direct => |cd| {
-                if (ctx.program) |program| {
-                    if (lookupProgramFunctionById(program, cd.function)) |target| {
-                        if (functionIsFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
-                            ctx.allocator_count.* += 1;
-                            continue;
-                        }
-                    }
-                }
-                ctx.other_call_count.* += 1;
-            },
-            .try_call_named, .call_dispatch, .call_closure, .tail_call => {
-                ctx.other_call_count.* += 1;
-            },
-            else => {},
-        }
-        // Recurse into every nested sub-stream via the canonical
-        // enumerator (covers union_switch.else_instrs, previously
-        // skipped). The call-counting arms above are all leaf
-        // instructions with no child streams, so this is a no-op for
-        // them.
-        const Ctx = struct {
-            ctx: *AllocatorWrapperScan,
-            fn onStream(self: *@This(), child: ir.ChildStream) void {
-                scanAllocatorWrapperStream(child.stream, self.ctx);
-            }
-        };
-        var rec = Ctx{ .ctx = ctx };
-        ir.forEachChildStream(instr, &rec, Ctx.onStream);
-    }
-}
-
-/// Return the index of the first `.owned` parameter slot when
-/// `function` has at least one such slot AND `result_convention == .owned`.
-/// Returns null otherwise. The `.owned` + `.owned` pair is the
-/// contract established by `arc_param_convention.inferConventions`:
-/// the caller transferred a +1 into the slot, the callee consumes it
-/// (either by forwarding to an owned-mutating builtin or by
-/// self-recursive accumulator passing), and the result is a fresh +1.
-fn calleeFunctionOwnedReceiverSlot(function: *const ir.Function) ?usize {
-    if (function.result_convention != .owned) return null;
-    for (function.param_conventions, 0..) |conv, idx| {
-        if (conv == .owned) return idx;
-    }
-    return null;
-}
+// The fresh-allocator-wrapper recognition, owned-receiver-slot lookup, and
+// program-function lookups that used to live here are now the single source of
+// truth in `uniqueness_decision.zig`, shared with the
+// `arc_param_convention.TentativeAnalyzer` so the two copies of the uniqueness
+// dataflow cannot drift (audit follow-up FU-15). The `Analyzer`'s thin method
+// wrappers above (`calleeIsFreshAllocatorWrapper`, `calleeOwnedReceiverSlot`)
+// delegate into that module.
 
 const Snapshot = struct {
     set: std.AutoHashMapUnmanaged(ir.LocalId, void),
@@ -2957,7 +2714,7 @@ test "uniqueness--04: fresh-allocator wrapper callee keeps dest unique regardles
     //
     // Callee `make_map() -> Map.new()` — body is exactly one
     // fresh-allocator builtin call, recognised by
-    // `functionIsFreshAllocatorWrapper`.
+    // `uniqueness_decision.isFreshAllocatorWrapper`.
     //
     // Caller stream:
     //   [0] call_named "make_map" args=[] dest=%0   -- fresh, unique

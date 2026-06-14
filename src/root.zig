@@ -41,6 +41,7 @@ pub const arc_verifier = @import("arc_verifier.zig");
 pub const arc_drop_insertion = @import("arc_drop_insertion.zig");
 pub const arc_materialize = @import("arc_materialize.zig");
 pub const uniqueness = @import("uniqueness.zig");
+pub const uniqueness_decision = @import("uniqueness_decision.zig");
 pub const uniqueness_interprocedural = @import("uniqueness_interprocedural.zig");
 pub const uniqueness_signature = @import("uniqueness_signature.zig");
 pub const uniqueness_fixpoint = @import("uniqueness_fixpoint.zig");
@@ -146,6 +147,7 @@ test {
     _ = @import("arc_drop_insertion.zig");
     _ = @import("arc_materialize.zig");
     _ = @import("uniqueness.zig");
+    _ = @import("uniqueness_decision.zig");
     _ = @import("uniqueness_interprocedural.zig");
     _ = @import("uniqueness_signature.zig");
     _ = @import("uniqueness_fixpoint.zig");

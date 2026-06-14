@@ -5,6 +5,7 @@ const types_mod = @import("types.zig");
 const uniqueness_signature = @import("uniqueness_signature.zig");
 const uniqueness_fixpoint = @import("uniqueness_fixpoint.zig");
 const uniqueness_interprocedural = @import("uniqueness_interprocedural.zig");
+const uniqueness_decision = @import("uniqueness_decision.zig");
 const elision = @import("memory/elision.zig");
 
 // ============================================================
@@ -1769,11 +1770,13 @@ fn analyzeFunctionTentative(
         .extracted = .empty,
         .next_id = 0,
         .result = .{},
+        .try_call_success_unique = .empty,
     };
     defer {
         analyzer.unique.deinit(allocator);
         analyzer.deinitTuplePending();
         analyzer.deinitExtracted();
+        analyzer.try_call_success_unique.deinit(allocator);
     }
     errdefer analyzer.result.deinit(allocator);
 
@@ -1844,6 +1847,16 @@ const TentativeAnalyzer = struct {
     extracted: std.AutoHashMapUnmanaged(ir.LocalId, TentativeExtractedSource),
     next_id: arc_liveness.InstructionId,
     result: TentativeFunctionUniqueness,
+    /// GAP-P2-03T — per-`try_call_named` stash of the SUCCESS-arm
+    /// payload's uniqueness, keyed by the instruction's id. Written in
+    /// `applyEffect` (where the pre-call per-arg uniqueness snapshot is
+    /// available, before the receiver is consumed) and consumed in
+    /// `walkChildren` when meeting the handler and success arm results
+    /// into `tcn.dest`. Mirrors `uniqueness.Analyzer.try_call_success_unique`.
+    /// The stash is required because `walkChildren` runs AFTER
+    /// `applyEffect` has already cleared the receiver's uniqueness bit and
+    /// could no longer reconstruct the success-callee contract.
+    try_call_success_unique: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, bool),
 
     fn deinitTuplePending(self: *TentativeAnalyzer) void {
         var iter = self.tuple_pending.valueIterator();
@@ -2063,7 +2076,7 @@ const TentativeAnalyzer = struct {
             try self.classifyCallSite(instr, my_id);
             try self.applyEffect(instr, my_id);
             try self.promoteAtLastUse(my_id);
-            try self.walkChildren(instr);
+            try self.walkChildren(instr, my_id);
         }
     }
 
@@ -2083,7 +2096,7 @@ const TentativeAnalyzer = struct {
         for (keys.items) |k| try self.promoteExtractedAt(k, my_id);
     }
 
-    fn walkChildren(self: *TentativeAnalyzer, instr: *const ir.Instruction) error{OutOfMemory}!void {
+    fn walkChildren(self: *TentativeAnalyzer, instr: *const ir.Instruction, my_id: arc_liveness.InstructionId) error{OutOfMemory}!void {
         switch (instr.*) {
             .if_expr => |ie| {
                 const snap = try self.snapshot();
@@ -2152,12 +2165,60 @@ const TentativeAnalyzer = struct {
                 }
             },
             .try_call_named => |tcn| {
+                // GAP-P2-03T — `tcn.dest` is the if-else MERGE of the
+                // success-arm value and the handler-arm value (ir.zig
+                // TryCallNamed; the ZIR builder binds both `success_result` and
+                // `handler_result` into `dest`). dest is unique iff BOTH arms
+                // yield a unique value. Walk each arm from the pre-call
+                // snapshot, observe each arm's result-local uniqueness, then
+                // MEET them into dest — mirroring `uniqueness.Analyzer`'s
+                // `walkChildren` so the two analyzers agree. Walk order
+                // (handler first, then success) matches
+                // `arc_liveness.flattenChildren` / `ir.forEachChildStream` so
+                // the InstructionId space stays aligned.
+                //
+                // The success-arm value is `success_result` when present, else
+                // the unwrapped callee payload — whose uniqueness is the
+                // success-callee contract stashed in `applyEffect` under the
+                // uniqueness--04 freshness gate. The handler-arm value is
+                // `handler_result` when present, else void (never unique).
+                const success_payload_unique = self.try_call_success_unique.get(my_id) orelse false;
+
                 const snap = try self.snapshot();
                 defer snap.deinit(self.allocator);
+
+                // Handler arm.
                 try self.walkStream(tcn.handler_instrs);
+                const handler_arm_unique = if (tcn.handler_result) |hr|
+                    self.unique.contains(hr)
+                else
+                    false;
                 try self.restore(&snap);
+
+                // Success arm. Bind the unwrapped payload's uniqueness so any
+                // destructure/mutation inside `success_instrs` observes it —
+                // matching the ZIR lowering that binds the payload before
+                // emitting `success_instrs`.
+                if (tcn.payload_local) |pl| {
+                    if (success_payload_unique) {
+                        try self.unique.put(self.allocator, pl, {});
+                    } else {
+                        _ = self.unique.remove(pl);
+                    }
+                }
                 try self.walkStream(tcn.success_instrs);
+                const success_arm_unique = if (tcn.success_result) |sr|
+                    self.unique.contains(sr)
+                else
+                    success_payload_unique;
                 try self.restore(&snap);
+
+                // Meet both arm results into dest.
+                if (handler_arm_unique and success_arm_unique) {
+                    try self.unique.put(self.allocator, tcn.dest, {});
+                } else {
+                    _ = self.unique.remove(tcn.dest);
+                }
             },
             .guard_block => |gb| {
                 const snap = try self.snapshot();
@@ -2224,7 +2285,7 @@ const TentativeAnalyzer = struct {
                     if (slot >= cd.args.len) return null;
                     return .{ .receiver = cd.args[slot] };
                 }
-                if (calleeFunctionOwnedReceiverSlotByPointer(callee)) |slot| {
+                if (uniqueness_decision.ownedReceiverSlot(callee)) |slot| {
                     if (slot >= cd.args.len) return null;
                     return .{ .receiver = cd.args[slot] };
                 }
@@ -2275,12 +2336,7 @@ const TentativeAnalyzer = struct {
     }
 
     fn calleeOwnedReceiverSlot(self: *const TentativeAnalyzer, name: []const u8) ?usize {
-        for (self.program.functions) |*func| {
-            if (std.mem.eql(u8, func.name, name)) {
-                return calleeFunctionOwnedReceiverSlotByPointer(func);
-            }
-        }
-        return null;
+        return uniqueness_decision.ownedReceiverSlotByName(self.program, name);
     }
 
     fn applyEffect(self: *TentativeAnalyzer, instr: *const ir.Instruction, my_id: arc_liveness.InstructionId) error{OutOfMemory}!void {
@@ -2427,13 +2483,43 @@ const TentativeAnalyzer = struct {
                 }
             },
             .try_call_named => |tcn| {
+                // GAP-P2-03T — a `try_call_named`'s dest is NOT a plain call
+                // result: it is the if-else MERGE of the success-arm value and
+                // the handler-arm value (ir.zig TryCallNamed; the ZIR lowering
+                // binds both arms into `dest`). Classifying dest from the
+                // success-callee contract alone (the old
+                // `applyCalleeEffect(name, args, dest, pre)` call) ignored the
+                // handler arm, which can bind a SHARED/aliased value into the
+                // same dest on the no-match path. In the TentativeAnalyzer that
+                // over-optimism could admit an UNSOUND `.borrowed -> .owned`
+                // promotion (the pre-flight gate this dataflow feeds), so the
+                // dest must be classified by MEETING both arm results in
+                // `walkChildren` — exactly as the canonical
+                // `uniqueness.Analyzer` does.
+                //
+                // Here in `applyEffect` we only apply the call's ARG effect
+                // (consume the receiver, dissolve arg pending entries) and
+                // STASH the success-payload's uniqueness for the meet. The
+                // stash is required because the meet runs after this arm has
+                // cleared the receiver bit and could no longer reconstruct the
+                // success-callee contract (uniqueness--04's freshness gate
+                // consults the receiver's call-site uniqueness). We do NOT call
+                // `applyCalleeEffect` — that would (wrongly) set dest from the
+                // success contract alone.
                 const pre = try self.snapshotArgUnique(tcn.args);
                 defer self.allocator.free(pre);
+                const success_payload_unique = self.calleeContractResultUnique(tcn.name, pre);
+                try self.try_call_success_unique.put(self.allocator, my_id, success_payload_unique);
+
                 for (tcn.args) |arg| {
                     self.escapeIfExtractedLocal(arg);
                     self.escapePending(arg);
                 }
-                try self.applyCalleeEffect(tcn.name, tcn.args, tcn.dest, pre);
+                if (self.calleeReceiverSlotForTryCall(tcn.name)) |slot| {
+                    if (slot < tcn.args.len) {
+                        _ = self.unique.remove(tcn.args[slot]);
+                    }
+                }
             },
             .call_closure => |cc| {
                 for (cc.args) |arg| {
@@ -2595,29 +2681,12 @@ const TentativeAnalyzer = struct {
         }
     }
 
-    /// uniqueness--04 (tentative mirror) — does the callee `function_id`'s
-    /// signature prove its `slot` parameter's uniqueness flows WHOLE-RETURN
-    /// through to the result (PU class with a whole-return witness, i.e.
-    /// `preserves_to_return_component == null`)? See the canonical
-    /// `uniqueness.Analyzer.signatureWholeReturnPreservesUniqueness` for
-    /// the soundness rationale. False for absent functions / out-of-range
-    /// slots — the conservative default.
-    fn signatureWholeReturnPreservesUniqueness(
-        self: *const TentativeAnalyzer,
-        function_id: ir.FunctionId,
-        slot: usize,
-    ) bool {
-        const sig = self.signatures.forFunction(function_id) orelse return false;
-        if (slot >= sig.params.len) return false;
-        const param_sig = sig.params[slot];
-        return param_sig.class == .preserves_uniqueness and
-            param_sig.preserves_to_return_component == null;
-    }
-
     /// uniqueness--04 (tentative mirror) — convention-pair result-unique
-    /// decision keyed by callee name. Unique only when the callee's
+    /// decision keyed by callee name. Delegates to the shared
+    /// `uniqueness_decision` authority so it cannot drift from the
+    /// canonical `uniqueness.Analyzer`. Unique only when the callee's
     /// signature proves whole-return PU AND the receiver was unique at the
-    /// call site. The `.owned`/`.owned` convention pair alone is NOT
+    /// call site; the `.owned`/`.owned` convention pair alone is NOT
     /// sufficient evidence of result freshness.
     fn conventionPairResultUnique(
         self: *const TentativeAnalyzer,
@@ -2625,23 +2694,43 @@ const TentativeAnalyzer = struct {
         slot: usize,
         pre_arg_unique: []const bool,
     ) bool {
-        if (slot >= pre_arg_unique.len) return false;
-        if (!pre_arg_unique[slot]) return false;
-        const function_id = self.lookupByName(name) orelse return false;
-        return self.signatureWholeReturnPreservesUniqueness(function_id, slot);
+        return uniqueness_decision.conventionPairResultUnique(self.signatures, self.program, name, slot, pre_arg_unique);
     }
 
     /// uniqueness--04 (tentative mirror) — convention-pair result-unique
-    /// decision keyed by a resolved `call_direct` callee.
+    /// decision keyed by a resolved `call_direct` callee. Delegates to the
+    /// shared `uniqueness_decision` authority.
     fn conventionPairResultUniqueByFunction(
         self: *const TentativeAnalyzer,
         function: *const ir.Function,
         slot: usize,
         pre_arg_unique: []const bool,
     ) bool {
-        if (slot >= pre_arg_unique.len) return false;
-        if (!pre_arg_unique[slot]) return false;
-        return self.signatureWholeReturnPreservesUniqueness(function.id, slot);
+        return uniqueness_decision.conventionPairResultUniqueByFunction(self.signatures, function, slot, pre_arg_unique);
+    }
+
+    /// GAP-P2-03T (tentative mirror) — whether the SUCCESS-path result of
+    /// calling `name` is unique by the callee's runtime contract, given
+    /// the pre-call per-arg uniqueness snapshot. Delegates to the shared
+    /// `uniqueness_decision` authority — the SAME function the canonical
+    /// `uniqueness.Analyzer` consumes — so the `try_call_named`
+    /// success-arm classification is identical in both analyzers.
+    fn calleeContractResultUnique(
+        self: *const TentativeAnalyzer,
+        name: []const u8,
+        pre_arg_unique: []const bool,
+    ) bool {
+        return uniqueness_decision.calleeContractResultUnique(self.signatures, self.program, name, pre_arg_unique);
+    }
+
+    /// GAP-P2-03T (tentative mirror) — the receiver slot a `try_call_named`
+    /// to `name` consumes when its success-callee contract is
+    /// owned-mutating. Delegates to the shared `uniqueness_decision`
+    /// authority. Used by `applyEffect`'s `try_call_named` arg-effect to
+    /// clear the consumed receiver's uniqueness, matching the plain-call
+    /// receiver removal.
+    fn calleeReceiverSlotForTryCall(self: *const TentativeAnalyzer, name: []const u8) ?usize {
+        return uniqueness_decision.calleeReceiverSlotForTryCall(self.program, name);
     }
 
     fn applyCalleeEffect(
@@ -2706,11 +2795,11 @@ const TentativeAnalyzer = struct {
         }
         // uniqueness--04: fresh-allocator wrappers take precedence over the
         // convention-pair gate.
-        if (functionIsFreshAllocatorWrapperWithProgram(function, self.program)) {
+        if (uniqueness_decision.isFreshAllocatorWrapper(function, self.program)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
-        if (calleeFunctionOwnedReceiverSlotByPointer(function)) |slot| {
+        if (uniqueness_decision.ownedReceiverSlot(function)) |slot| {
             // Receiver consumed regardless of result freshness.
             if (slot < args.len) {
                 _ = self.unique.remove(args[slot]);
@@ -2730,12 +2819,7 @@ const TentativeAnalyzer = struct {
     }
 
     fn calleeIsFreshAllocatorWrapper(self: *const TentativeAnalyzer, name: []const u8) bool {
-        for (self.program.functions) |*func| {
-            if (std.mem.eql(u8, func.name, name)) {
-                return functionIsFreshAllocatorWrapperWithProgram(func, self.program);
-            }
-        }
-        return false;
+        return uniqueness_decision.isFreshAllocatorWrapperByName(self.program, name);
     }
 
     fn snapshot(self: *TentativeAnalyzer) error{OutOfMemory}!TentativeSnapshot {
@@ -2765,157 +2849,18 @@ const TentativeSnapshot = struct {
     }
 };
 
-fn calleeFunctionOwnedReceiverSlotByPointer(function: *const ir.Function) ?usize {
-    if (function.result_convention != .owned) return null;
-    for (function.param_conventions, 0..) |conv, idx| {
-        if (conv == .owned) return idx;
-    }
-    return null;
-}
-
-/// Mirror of `uniqueness.functionIsFreshAllocatorWrapper` —
-/// duplicated to avoid the import dependency cycle (arc_param_convention
-/// -> uniqueness -> uniqueness_interprocedural -> arc_param_convention would
-/// be a cycle).
-///
-/// Recognises thin Zap-fn wrappers around runtime allocator intrinsics
-/// (`List.new_filled`, `Map.new`, etc.). A function counts as fresh
-/// when its body has exactly ONE allocator-producing call site and
-/// zero other non-fresh calls. The recognition is TRANSITIVE: a
-/// `call_named`/`call_direct` whose target is itself a fresh-allocator
-/// wrapper counts as an allocator call. This is essential for
-/// benchmark patterns like `ones(n) -> List.new_filled(n, 1.0)` where
-/// the user wraps the runtime allocator in a thin Zap helper.
-fn functionIsFreshAllocatorWrapperByPointer(function: *const ir.Function) bool {
-    return functionIsFreshAllocatorWrapperWithProgram(function, null);
-}
-
-fn functionIsFreshAllocatorWrapperWithProgram(
-    function: *const ir.Function,
-    program: ?*const ir.Program,
-) bool {
-    return functionIsFreshAllocatorWrapperWithDepth(function, program, 0);
-}
-
-/// Same recursion-depth cap as `uniqueness.FRESH_ALLOCATOR_MAX_DEPTH`.
-const FRESH_ALLOCATOR_MAX_DEPTH: usize = 8;
-
-fn functionIsFreshAllocatorWrapperWithDepth(
-    function: *const ir.Function,
-    program: ?*const ir.Program,
-    depth: usize,
-) bool {
-    if (function.result_convention != .owned) return false;
-    if (depth >= FRESH_ALLOCATOR_MAX_DEPTH) return false;
-    var allocator_count: usize = 0;
-    var other_call_count: usize = 0;
-    var ctx = AllocatorWrapperScanCtx{
-        .allocator_count = &allocator_count,
-        .other_call_count = &other_call_count,
-        .program = program,
-        .depth = depth,
-    };
-    for (function.body) |block| {
-        scanAllocatorWrapperStream(block.instructions, &ctx);
-    }
-    return allocator_count == 1 and other_call_count == 0;
-}
-
-const AllocatorWrapperScanCtx = struct {
-    allocator_count: *usize,
-    other_call_count: *usize,
-    program: ?*const ir.Program = null,
-    depth: usize = 0,
-};
-
-fn lookupAllocatorTargetByName(program: *const ir.Program, name: []const u8) ?*const ir.Function {
-    for (program.functions) |*func| {
-        if (std.mem.eql(u8, func.name, name)) return func;
-    }
-    return null;
-}
-
-fn lookupAllocatorTargetById(program: *const ir.Program, function_id: ir.FunctionId) ?*const ir.Function {
-    for (program.functions) |*func| {
-        if (func.id == function_id) return func;
-    }
-    return null;
-}
-
-fn scanAllocatorWrapperStream(stream: []const ir.Instruction, ctx: *AllocatorWrapperScanCtx) void {
-    for (stream) |*instr| {
-        switch (instr.*) {
-            .call_builtin => |cb| {
-                if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
-                    ctx.allocator_count.* += 1;
-                } else {
-                    ctx.other_call_count.* += 1;
-                }
-            },
-            // Transitive recognition: a call to another fresh-allocator
-            // wrapper counts as an allocator call when the program is
-            // available. Mutual recursion is bounded by the depth cap.
-            .call_named => |cn| {
-                if (ctx.program) |program| {
-                    if (lookupAllocatorTargetByName(program, cn.name)) |target| {
-                        if (functionIsFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
-                            ctx.allocator_count.* += 1;
-                            continue;
-                        }
-                    }
-                }
-                ctx.other_call_count.* += 1;
-            },
-            .call_direct => |cd| {
-                if (ctx.program) |program| {
-                    if (lookupAllocatorTargetById(program, cd.function)) |target| {
-                        if (functionIsFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
-                            ctx.allocator_count.* += 1;
-                            continue;
-                        }
-                    }
-                }
-                ctx.other_call_count.* += 1;
-            },
-            .try_call_named, .call_dispatch, .call_closure, .tail_call => {
-                ctx.other_call_count.* += 1;
-            },
-            .if_expr => |ie| {
-                scanAllocatorWrapperStream(ie.then_instrs, ctx);
-                scanAllocatorWrapperStream(ie.else_instrs, ctx);
-            },
-            .case_block => |cb| {
-                scanAllocatorWrapperStream(cb.pre_instrs, ctx);
-                for (cb.arms) |arm| {
-                    scanAllocatorWrapperStream(arm.cond_instrs, ctx);
-                    scanAllocatorWrapperStream(arm.body_instrs, ctx);
-                }
-                scanAllocatorWrapperStream(cb.default_instrs, ctx);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
-                scanAllocatorWrapperStream(sl.default_instrs, ctx);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
-                scanAllocatorWrapperStream(sr.default_instrs, ctx);
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
-                if (us.has_else) scanAllocatorWrapperStream(us.else_instrs, ctx);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| scanAllocatorWrapperStream(c.body_instrs, ctx);
-            },
-            .guard_block => |gb| scanAllocatorWrapperStream(gb.body, ctx),
-            .optional_dispatch => |od| {
-                scanAllocatorWrapperStream(od.nil_instrs, ctx);
-                scanAllocatorWrapperStream(od.struct_instrs, ctx);
-            },
-            else => {},
-        }
-    }
-}
+// The owned-receiver-slot lookup and the fresh-allocator-wrapper recognition
+// that used to live here (duplicated from `uniqueness.zig` to avoid the
+// `arc_param_convention -> uniqueness_interprocedural -> uniqueness` import
+// cycle) are now the single source of truth in the leaf module
+// `uniqueness_decision.zig`, shared with the canonical `uniqueness.Analyzer`.
+// Consolidating them closes audit follow-up FU-15: the two copies had already
+// drifted (this copy's scanner hand-maintained a variant list with an
+// `else => {}` instead of the canonical `ir.forEachChildStream`, so it would
+// have silently dropped any new child-stream-bearing instruction). The
+// `TentativeAnalyzer`'s method wrappers (`calleeOwnedReceiverSlot`,
+// `calleeIsFreshAllocatorWrapper`, `conventionPairResultUnique`, etc.) all
+// delegate into that module.
 
 const TentativeDemotionWalker = struct {
     allocator: std.mem.Allocator,
@@ -5714,4 +5659,424 @@ test "arc_param_convention: liftSetSurvivesUniquenessCheck observes approved slo
     // Conventions must be restored on every exit path.
     try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[0].param_conventions[0]);
     try std.testing.expectEqual(ir.ParamConvention.borrowed, program.functions[1].param_conventions[0]);
+}
+
+// ============================================================
+// GAP-P2-03T / NOTE-P2-A — TentativeAnalyzer try_call_named parity
+//
+// These tests run the production `analyzeFunctionTentative` analyzer
+// directly (the same pass `analyzeProgramTentative` runs at every
+// worklist step) and assert on its `TentativeFunctionUniqueness.sites`
+// map — the per-owned-mutating-call-site uniqueness record that the
+// convention-inference demotion walker (`TentativeDemotionWalker`)
+// consumes to decide whether a `.borrowed -> .owned` promotion is
+// admissible. A `try_call_named` whose dest is the if-else MERGE of a
+// (unique) success payload and a SHARED handler value must NOT leave
+// the dest unique; if it does, a downstream owned-mutating builtin over
+// that dest is wrongly recorded unique and the promotion gate is fooled.
+//
+// The canonical `uniqueness.Analyzer` mirrors of these live at
+// `uniqueness.zig` "uniqueness--03: ..." / "uniqueness--04: ...". The
+// TentativeAnalyzer copy of the dataflow historically drifted (FU-15);
+// these lock parity on the soundness-relevant `try_call_named` dest
+// classification.
+// ============================================================
+
+/// Build a minimal caller `ir.Function` for hand-rolled TentativeAnalyzer
+/// tests. All locals are `.owned`; the arena owns every slice.
+fn buildTentativeCaller(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    instructions: []const ir.Instruction,
+    local_count: u32,
+) !ir.Function {
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, instructions),
+    };
+    const ownership = try arena.alloc(ir.OwnershipClass, local_count);
+    for (ownership) |*o| o.* = .owned;
+    return ir.Function{
+        .id = 0,
+        .name = name,
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = local_count,
+        .param_conventions = &.{},
+        .local_ownership = ownership,
+        .result_convention = .borrowed,
+    };
+}
+
+/// Build a callee whose convention pair (`.owned` receiver slot +
+/// `.owned` result) makes a `try_call_named` targeting it classify its
+/// SUCCESS-path payload as unique. Body is empty — only the conventions
+/// drive `calleeOwnedReceiverSlot`. Mirrors
+/// `uniqueness.buildOwnedReceiverCallee`.
+fn buildTentativeOwnedReceiverCallee(
+    arena: std.mem.Allocator,
+    id: ir.FunctionId,
+    name: []const u8,
+) !ir.Function {
+    const param_conv = try arena.alloc(ir.ParamConvention, 1);
+    param_conv[0] = .owned;
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = &.{} };
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "receiver", .type_expr = .void };
+    return ir.Function{
+        .id = id,
+        .name = name,
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 0,
+        .param_conventions = param_conv,
+        .local_ownership = try arena.alloc(ir.OwnershipClass, 0),
+        .result_convention = .owned,
+    };
+}
+
+/// Install a whole-return PU signature (slot 0 preserves uniqueness,
+/// whole-return witness) for `callee_id`. Mirrors
+/// `uniqueness.installWholeReturnPuSignature`.
+fn installTentativeWholeReturnPuSignature(
+    signatures: *uniqueness_signature.ProgramSignatures,
+    callee_id: ir.FunctionId,
+) !void {
+    const arena_alloc = signatures.arena.allocator();
+    const params = try arena_alloc.alloc(uniqueness_signature.ParamSig, 1);
+    params[0] = uniqueness_signature.ParamSig.preservesUniqueness(null);
+    try signatures.by_function.put(std.testing.allocator, callee_id, .{
+        .params = params,
+        .return_components = &.{},
+    });
+}
+
+/// Run `analyzeFunctionTentative` on `caller` within `program`, with a
+/// fixpoint that marks every `.owned` slot of every function unique
+/// (the optimistic seed `analyzeProgramTentative` uses) and an empty
+/// rewritten-share set. Returns the analyzer's per-call-site uniqueness.
+fn runTentativeForTest(
+    allocator: std.mem.Allocator,
+    caller: *const ir.Function,
+    program: *const ir.Program,
+    signatures: *const uniqueness_signature.ProgramSignatures,
+) !TentativeFunctionUniqueness {
+    var fixpoint: uniqueness_interprocedural.ProgramUniqueness = .{};
+    defer fixpoint.deinit(allocator);
+    for (program.functions) |func| {
+        if (func.param_conventions.len == 0) {
+            try fixpoint.by_function.put(allocator, func.id, &.{});
+            continue;
+        }
+        const slots = try allocator.alloc(bool, func.param_conventions.len);
+        for (func.param_conventions, 0..) |conv, idx| {
+            slots[idx] = (conv == .owned);
+        }
+        try fixpoint.by_function.put(allocator, func.id, slots);
+    }
+
+    var rewritten: RewrittenShareSet = .{};
+    defer rewritten.deinit(allocator);
+
+    return analyzeFunctionTentative(
+        allocator,
+        caller,
+        program,
+        &fixpoint,
+        &rewritten,
+        signatures,
+        null,
+    );
+}
+
+test "GAP-P2-03T: TentativeAnalyzer try_call_named dest is NOT unique when the handler arm yields a shared value" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Direct parity mirror of `uniqueness.zig`'s "uniqueness--03:
+    // try_call_named dest is NOT unique when the handler arm yields a
+    // shared value", but exercising the TentativeAnalyzer (the
+    // convention-inference pre-flight clone).
+    //
+    // The catch-basin `x |> step_fn(...) ~> handler` lowers to a
+    // `try_call_named` whose dest is the if-else MERGE of the success
+    // payload and the handler result. `step_fn`'s convention pair
+    // (.owned receiver + .owned result) makes the SUCCESS payload unique,
+    // but the handler binds %1 — a SHARED alias (rc>=2) of the fallback
+    // map %0 — into the same dest. The dest is therefore NOT unique.
+    //
+    // Caller stream:
+    //   [0] map_init %0 = {}                -- fallback map (the parked alias)
+    //   [1] share_value %1 <- %0            -- %1 SHARED (rc>=2), NOT unique
+    //   [2] map_init %2 = {}                -- fresh receiver, unique
+    //   [3] move_value %3 <- %2             -- transfer to the call arg
+    //   [4] try_call_named dest=%4 name="step_fn" args=[%3]
+    //         handler_result = %1           -- SHARED value into dest (no-match)
+    //         success_result = null         -- success value = owned payload
+    //   [5] const_int %5 = 0
+    //   [6] const_int %6 = 0
+    //   [7] move_value %7 <- %4
+    //   [8] call_builtin "Map.put" args=[%7,%5,%6] dest=%8  (owned-mutating site)
+    //
+    // PRE-FIX: dest %4 marked unique from the success contract alone, so
+    //          the owned-mutating Map.put at id 8 records its receiver %7
+    //          unique -> the promotion gate is fooled.
+    // POST-FIX: dest %4 unique only if BOTH arms unique; the handler arm
+    //          is shared, so the site at id 8 records NOT unique.
+    const callee = try buildTentativeOwnedReceiverCallee(arena, 1, "step_fn");
+
+    const try_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{3});
+    const try_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.move});
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 7;
+    put_args[1] = 5;
+    put_args[2] = 6;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .map_init = .{ .dest = 2, .entries = &.{} } },
+        .{ .move_value = .{ .dest = 3, .source = 2 } },
+        .{ .try_call_named = .{
+            .dest = 4,
+            .name = "step_fn",
+            .args = try_args,
+            .arg_modes = try_arg_modes,
+            .input_local = 0,
+            .handler_instrs = &.{},
+            .handler_result = 1,
+            .success_instrs = &.{},
+            .success_result = null,
+            .payload_local = null,
+        } },
+        .{ .const_int = .{ .dest = 5, .value = 0 } },
+        .{ .const_int = .{ .dest = 6, .value = 0 } },
+        .{ .move_value = .{ .dest = 7, .source = 4 } },
+        .{ .call_builtin = .{
+            .dest = 8,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+    };
+    var caller = try buildTentativeCaller(arena, "caller", &caller_instrs, 9);
+    caller.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = caller;
+    functions[1] = callee;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var signatures = uniqueness_signature.ProgramSignatures.init(std.testing.allocator);
+    defer signatures.deinit(std.testing.allocator);
+    try installTentativeWholeReturnPuSignature(&signatures, 1);
+
+    var result = try runTentativeForTest(std.testing.allocator, &caller, &program, &signatures);
+    defer result.deinit(std.testing.allocator);
+
+    // The owned-mutating Map.put at instruction id 8 must record its
+    // receiver as NOT unique: the dest it was moved from aliases a shared
+    // cell on the handler path.
+    const recorded = result.sites.get(8);
+    try std.testing.expect(recorded != null);
+    try std.testing.expect(!recorded.?);
+}
+
+test "GAP-P2-03T: TentativeAnalyzer try_call_named dest IS unique when BOTH arms yield unique values (optimization preserved)" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Parity mirror of `uniqueness.zig`'s "uniqueness--03: ... BOTH arms
+    // ... (optimization preserved)". The handler yields a FRESH map
+    // (unique) instead of a shared alias, so the meet keeps the dest
+    // unique and the downstream owned-mutating Map.put records unique.
+    //
+    // Caller stream:
+    //   [0] map_init %0 = {}                -- fresh receiver, unique
+    //   [1] move_value %1 <- %0             -- transfer to the call arg
+    //   [2] try_call_named dest=%2 name="step_fn" args=[%1]
+    //         handler_instrs:
+    //           [.] map_init %5 = {}        -- FRESH handler fallback, unique
+    //         handler_result = %5           -- unique value into dest (no-match)
+    //         success_result = null         -- success value = owned payload
+    //   [3] const_int %3 = 0
+    //   [4] const_int %4 = 0
+    //   [.] move_value %6 <- %2
+    //   [.] call_builtin "Map.put" args=[%6,%3,%4] dest=%7 (owned-mutating site)
+    //
+    // The handler's map_init occupies an InstructionId between the
+    // try_call_named (id 2) and the const_int — the handler stream is
+    // numbered immediately after the parent in `walkStream`/`walkChildren`,
+    // exactly as `arc_liveness.flattenChildren` orders it. Ids:
+    //   0 map_init, 1 move, 2 try_call_named, 3 handler map_init,
+    //   4 const_int, 5 const_int, 6 move, 7 call_builtin Map.put.
+    const callee = try buildTentativeOwnedReceiverCallee(arena, 1, "step_fn");
+
+    const try_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const try_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.move});
+    const handler_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .map_init = .{ .dest = 5, .entries = &.{} } },
+    });
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 6;
+    put_args[1] = 3;
+    put_args[2] = 4;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .try_call_named = .{
+            .dest = 2,
+            .name = "step_fn",
+            .args = try_args,
+            .arg_modes = try_arg_modes,
+            .input_local = 0,
+            .handler_instrs = handler_instrs,
+            .handler_result = 5,
+            .success_instrs = &.{},
+            .success_result = null,
+            .payload_local = null,
+        } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .move_value = .{ .dest = 6, .source = 2 } },
+        .{ .call_builtin = .{
+            .dest = 7,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+    };
+    var caller = try buildTentativeCaller(arena, "caller_both_unique", &caller_instrs, 8);
+    caller.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = caller;
+    functions[1] = callee;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var signatures = uniqueness_signature.ProgramSignatures.init(std.testing.allocator);
+    defer signatures.deinit(std.testing.allocator);
+    try installTentativeWholeReturnPuSignature(&signatures, 1);
+
+    var result = try runTentativeForTest(std.testing.allocator, &caller, &program, &signatures);
+    defer result.deinit(std.testing.allocator);
+
+    // Both arms unique -> dest unique -> the owned-mutating Map.put at
+    // instruction id 7 records its receiver unique.
+    const recorded = result.sites.get(7);
+    try std.testing.expect(recorded != null);
+    try std.testing.expect(recorded.?);
+}
+
+test "NOTE-P2-A: TentativeAnalyzer applies the uniqueness--04 return-freshness gate on a try_call_named success payload" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // The TentativeAnalyzer must apply the uniqueness--04 freshness gate
+    // to the `try_call_named` SUCCESS payload: an `.owned`/`.owned`
+    // convention pair alone does NOT prove the result is fresh. When the
+    // receiver passed at the call site is SHARED (rc>=2), the success
+    // payload is the (possibly aliased) receiver cell — NOT unique — even
+    // though the success arm is the only path that reaches dest.
+    //
+    // Caller stream:
+    //   [0] map_init %0 = {}                -- the map
+    //   [1] share_value %1 <- %0            -- park alias; %0 now rc>=2, NOT unique
+    //   [2] try_call_named dest=%2 name="accum_step" args=[%0]
+    //         handler_result = null         -- void handler (never unique)
+    //         success_result = null         -- success value = success payload
+    //   [3] const_int %3 = 0
+    //   [4] const_int %4 = 0
+    //   [5] move_value %5 <- %2
+    //   [6] call_builtin "Map.put" args=[%5,%3,%4] dest=%6 (owned-mutating site)
+    //
+    // `accum_step` has the `.owned`/`.owned` convention pair AND a
+    // whole-return-PU signature (it returns its receiver) — so the
+    // success payload's uniqueness is GATED on the receiver's call-site
+    // uniqueness. The receiver %0 is shared, so the success payload is
+    // NOT unique, the handler (void) is NOT unique, dest is NOT unique,
+    // and the Map.put at id 6 records NOT unique.
+    //
+    // Without the gate (pre-fix), the convention pair would mark the
+    // success payload unique unconditionally and id 6 would record unique.
+    const callee = try buildTentativeOwnedReceiverCallee(arena, 1, "accum_step");
+
+    const try_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{0});
+    const try_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.move});
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 5;
+    put_args[1] = 3;
+    put_args[2] = 4;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .try_call_named = .{
+            .dest = 2,
+            .name = "accum_step",
+            .args = try_args,
+            .arg_modes = try_arg_modes,
+            .input_local = 0,
+            .handler_instrs = &.{},
+            .handler_result = null,
+            .success_instrs = &.{},
+            .success_result = null,
+            .payload_local = null,
+        } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .move_value = .{ .dest = 5, .source = 2 } },
+        .{ .call_builtin = .{
+            .dest = 6,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+    };
+    var caller = try buildTentativeCaller(arena, "caller_gate", &caller_instrs, 7);
+    caller.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = caller;
+    functions[1] = callee;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var signatures = uniqueness_signature.ProgramSignatures.init(std.testing.allocator);
+    defer signatures.deinit(std.testing.allocator);
+    try installTentativeWholeReturnPuSignature(&signatures, 1);
+
+    var result = try runTentativeForTest(std.testing.allocator, &caller, &program, &signatures);
+    defer result.deinit(std.testing.allocator);
+
+    // The freshness gate denies the success-payload uniqueness because
+    // the receiver was shared; the owned-mutating Map.put at id 6 records
+    // its receiver as NOT unique.
+    const recorded = result.sites.get(6);
+    try std.testing.expect(recorded != null);
+    try std.testing.expect(!recorded.?);
 }

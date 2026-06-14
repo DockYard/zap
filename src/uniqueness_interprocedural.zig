@@ -420,14 +420,6 @@ pub fn analyzeFunctionWithFixpoint(
     );
 }
 
-fn calleeFunctionOwnedReceiverSlot(function: *const ir.Function) ?usize {
-    if (function.result_convention != .owned) return null;
-    for (function.param_conventions, 0..) |conv, idx| {
-        if (conv == .owned) return idx;
-    }
-    return null;
-}
-
 /// Walk a function's body and append the function id to `callers_of`
 /// for every callee we can resolve.
 fn collectCalleeFunctionIds(

@@ -3292,7 +3292,7 @@ fn calleeInfoFromCall(instr: ir.Instruction) ?CalleeInfo {
 /// Return the index of the first `.owned` parameter slot when
 /// `function` has at least one such slot AND
 /// `result_convention == .owned`. Returns null otherwise. Mirror of
-/// `uniqueness.calleeFunctionOwnedReceiverSlot` to keep the
+/// `uniqueness_decision.ownedReceiverSlot` to keep the
 /// rewriter and analyzer in lock-step on what counts as an owned-
 /// mutating Zap-fn wrapper.
 fn functionHasOwnedReceiverConvention(function: *const ir.Function) ?usize {
