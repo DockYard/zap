@@ -704,12 +704,61 @@ const Analyzer = struct {
                 }
             },
             .try_call_named => |tcn| {
+                // uniqueness--03 — `tcn.dest` is the if-else MERGE of the
+                // success-arm value and the handler-arm value (ir.zig
+                // TryCallNamed; the ZIR builder binds both `success_result`
+                // and `handler_result` into `dest`). dest is unique iff BOTH
+                // arms yield a unique value. We walk each arm from the
+                // pre-call `unique` snapshot, observe each arm's result-local
+                // uniqueness, then MEET them into dest — exactly the shape the
+                // fixpoint's `FlowWalker.mergeArmResultIntoDest` already uses
+                // for this instruction. Walk order (handler first, then
+                // success) mirrors `arc_liveness.flattenChildren` /
+                // `ir.forEachChildStream` so the InstructionId space stays
+                // aligned.
+                //
+                // The success-arm value is `success_result` when present, else
+                // the unwrapped callee payload — whose uniqueness is the
+                // success-callee contract (`calleeContractResultUnique`). The
+                // handler-arm value is `handler_result` when present, else
+                // void (never unique).
+                const success_payload_unique = self.calleeContractResultUnique(tcn.name);
+
                 const snap = try self.snapshot();
                 defer snap.deinit(self.allocator);
+
+                // Handler arm.
                 try self.walkStream(tcn.handler_instrs);
+                const handler_arm_unique = if (tcn.handler_result) |hr|
+                    self.unique.contains(hr)
+                else
+                    false;
                 try self.restore(&snap);
+
+                // Success arm. Bind the unwrapped payload's uniqueness so any
+                // destructure/mutation inside `success_instrs` observes it —
+                // matching the ZIR lowering that binds the payload before
+                // emitting `success_instrs`.
+                if (tcn.payload_local) |pl| {
+                    if (success_payload_unique) {
+                        try self.unique.put(self.allocator, pl, {});
+                    } else {
+                        _ = self.unique.remove(pl);
+                    }
+                }
                 try self.walkStream(tcn.success_instrs);
+                const success_arm_unique = if (tcn.success_result) |sr|
+                    self.unique.contains(sr)
+                else
+                    success_payload_unique;
                 try self.restore(&snap);
+
+                // Meet both arm results into dest.
+                if (handler_arm_unique and success_arm_unique) {
+                    try self.unique.put(self.allocator, tcn.dest, {});
+                } else {
+                    _ = self.unique.remove(tcn.dest);
+                }
             },
             .guard_block => |gb| {
                 const snap = try self.snapshot();
@@ -1189,13 +1238,35 @@ const Analyzer = struct {
                 }
             },
             .try_call_named => |tcn| {
-                const pre = try self.snapshotArgUnique(tcn.args);
-                defer self.allocator.free(pre);
+                // uniqueness--03: a `try_call_named`'s dest is NOT a plain
+                // call result — it is the if-else MERGE of the success-arm
+                // value and the handler-arm value (see ir.zig TryCallNamed
+                // and the ZIR lowering that binds both arms into `dest`).
+                // Classifying dest from the success-callee contract alone
+                // (the old `applyCalleeEffect(name, args, dest, pre)` call)
+                // ignored the handler arm, which can bind a SHARED/aliased
+                // value to the same dest on the no-match path — licensing a
+                // later `*_owned_unchecked` in-place mutation of a possibly
+                // rc>=2 cell (silent heap corruption).
+                //
+                // The dest is therefore classified by MEETING both arm
+                // results in `walkChildren` (dest unique iff BOTH arms yield
+                // a unique value), mirroring how the fixpoint's
+                // `FlowWalker.mergeArmResultIntoDest` already meets
+                // `handler_result` and `success_result` into `tcn.dest`. Here
+                // in `applyEffect` we only apply the call's ARG effect
+                // (consume the receiver, dissolve arg pending entries); the
+                // dest meet runs after the arms are walked. The receiver
+                // consumption matches `applyCalleeEffect`'s receiver removal.
                 for (tcn.args) |arg| {
                     self.escapeIfExtractedLocal(arg);
                     self.escapePending(arg);
                 }
-                try self.applyCalleeEffect(tcn.name, tcn.args, tcn.dest, pre);
+                if (self.calleeReceiverSlotForTryCall(tcn.name)) |slot| {
+                    if (slot < tcn.args.len) {
+                        _ = self.unique.remove(tcn.args[slot]);
+                    }
+                }
             },
             .tail_call => |tc| {
                 // Tail-calls also consume their args; their pending
@@ -1396,6 +1467,35 @@ const Analyzer = struct {
             // that produce values should explicitly opt in here.
             else => {},
         }
+    }
+
+    /// uniqueness--03 — the receiver slot that a `try_call_named` to
+    /// `name` consumes, when its success-callee contract is owned-mutating
+    /// (owned-mutating builtin pattern OR a Zap function with an `.owned`
+    /// receiver slot + `.owned` result). Returns null when no slot is
+    /// consumed (e.g. a fresh-allocator wrapper or a non-mutating call).
+    /// Used by `applyEffect`'s `try_call_named` arg-effect to clear the
+    /// consumed receiver's uniqueness, matching `applyCalleeEffect`.
+    fn calleeReceiverSlotForTryCall(self: *const Analyzer, name: []const u8) ?usize {
+        if (arc_liveness.ownedMutatingBuiltinSlot(name)) |slot| return slot;
+        if (self.calleeOwnedReceiverSlot(name)) |slot| return slot;
+        return null;
+    }
+
+    /// uniqueness--03 — whether the SUCCESS-path result of calling `name`
+    /// is unique by the callee's runtime contract. This is the single
+    /// authority for the success-callee classification, shared by the
+    /// regular `call_named`/`try_call_named` paths so the success-arm
+    /// uniqueness of a `try_call_named` and the dest of a plain call agree
+    /// by construction. The three contract shapes mirror `applyCalleeEffect`:
+    ///   1. owned-mutating builtin (`ownedMutatingBuiltinSlot != null`)
+    ///   2. Zap fn convention pair (`.owned` receiver slot + `.owned` result)
+    ///   3. fresh-allocator wrapper (rc=1 by construction)
+    fn calleeContractResultUnique(self: *const Analyzer, name: []const u8) bool {
+        if (arc_liveness.ownedMutatingBuiltinSlot(name) != null) return true;
+        if (self.calleeOwnedReceiverSlot(name) != null) return true;
+        if (self.calleeIsFreshAllocatorWrapper(name)) return true;
+        return false;
     }
 
     /// Apply the per-callee dataflow effect. Recognises three shapes:
@@ -2257,6 +2357,209 @@ test "uniqueness: non-owned-mutating call sites are absent from the result" {
 
     try testing.expect(!u.isUnique(2));
     try testing.expect(!u.sites.contains(2));
+}
+
+/// uniqueness--03 test helper — build a callee function whose convention
+/// pair (`.owned` receiver slot + `.owned` result) makes a `try_call_named`
+/// targeting it classify its SUCCESS-path payload as unique. The body is
+/// empty; only the conventions matter for `calleeOwnedReceiverSlot`.
+fn buildOwnedReceiverCallee(
+    arena: std.mem.Allocator,
+    id: ir.FunctionId,
+    name: []const u8,
+) !ir.Function {
+    const param_conv = try arena.alloc(ir.ParamConvention, 1);
+    param_conv[0] = .owned;
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = &.{} };
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "receiver", .type_expr = .void };
+    return ir.Function{
+        .id = id,
+        .name = name,
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 0,
+        .param_conventions = param_conv,
+        .local_ownership = try arena.alloc(ir.OwnershipClass, 0),
+        .result_convention = .owned,
+    };
+}
+
+test "uniqueness--03: try_call_named dest is NOT unique when the handler arm yields a shared value" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // The catch-basin `x |> step_fn(...) ~> handler` lowers to a
+    // `try_call_named` whose dest is the if-else MERGE of the success
+    // payload and the handler result (ir.zig TryCallNamed doc; the ZIR
+    // builder binds both arms into `dest`). `step_fn`'s convention pair
+    // (.owned receiver + .owned result) makes the SUCCESS payload unique,
+    // but the handler binds %1 — a SHARED alias (rc>=2) of the fallback
+    // map %0 — into the same dest. The dest is therefore NOT unique: on
+    // the no-match path it aliases a shared cell.
+    //
+    // Caller stream:
+    //   [0] map_init %0 = {}                -- fallback map (the parked alias)
+    //   [1] share_value %1 <- %0            -- %1 SHARED (rc>=2), NOT unique
+    //   [2] map_init %2 = {}                -- fresh receiver, unique
+    //   [3] move_value %3 <- %2             -- transfer to the call arg
+    //   [4] try_call_named dest=%4 name="step_fn" args=[%3]
+    //         handler_result = %1           -- SHARED value into dest (no-match)
+    //         success_result = null         -- success value = owned-mutating payload
+    //   [5] const_int %5 = 0
+    //   [6] const_int %6 = 0
+    //   [7] move_value %7 <- %4
+    //   [8] call_builtin "Map.put" args=[%7,%5,%6] dest=%8
+    //
+    // PRE-FIX: dest %4 is marked unique from the success contract alone, so
+    //          Map.put at id 8 is classified unique -> _owned_unchecked over
+    //          a possibly-rc>=2 cell on the error path (silent corruption).
+    // POST-FIX: dest %4 unique only if BOTH arms unique; the handler arm is
+    //          shared, so id 8 is NOT unique.
+    const callee = try buildOwnedReceiverCallee(arena, 1, "step_fn");
+
+    const try_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{3});
+    const try_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.move});
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 7;
+    put_args[1] = 5;
+    put_args[2] = 6;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .map_init = .{ .dest = 2, .entries = &.{} } },
+        .{ .move_value = .{ .dest = 3, .source = 2 } },
+        .{ .try_call_named = .{
+            .dest = 4,
+            .name = "step_fn",
+            .args = try_args,
+            .arg_modes = try_arg_modes,
+            .input_local = 0,
+            .handler_instrs = &.{},
+            .handler_result = 1,
+            .success_instrs = &.{},
+            .success_result = null,
+            .payload_local = null,
+        } },
+        .{ .const_int = .{ .dest = 5, .value = 0 } },
+        .{ .const_int = .{ .dest = 6, .value = 0 } },
+        .{ .move_value = .{ .dest = 7, .source = 4 } },
+        .{ .call_builtin = .{
+            .dest = 8,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+    };
+    var caller = try buildTestFunction(arena, "caller", &caller_instrs, 9);
+    caller.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = caller;
+    functions[1] = callee;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var u = try analyzeUniqueness(testing.allocator, &caller, &program);
+    defer u.deinit(testing.allocator);
+
+    // Sanity: the success-callee contract alone WOULD classify the dest
+    // unique. The defining assertion is that the handler arm's shared
+    // value prevents that — the Map.put at id 8 must NOT be unique.
+    try testing.expect(!u.isUnique(8));
+}
+
+test "uniqueness--03: try_call_named dest IS unique when BOTH arms yield unique values (optimization preserved)" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Same shape as the corruption test, but the handler yields a FRESH
+    // map (unique) instead of a shared alias. Both arms are unique, so
+    // the meet keeps the dest unique and the downstream Map.put is still
+    // rewritten to the unchecked variant. This proves the meet-both-arms
+    // fix does not pessimize the genuinely-sound case.
+    //
+    // Caller stream:
+    //   [0] map_init %0 = {}                -- fresh receiver, unique
+    //   [1] move_value %1 <- %0             -- transfer to the call arg
+    //   [2] try_call_named dest=%2 name="step_fn" args=[%1]
+    //         handler_instrs:
+    //           [a] map_init %5 = {}        -- FRESH handler fallback, unique
+    //         handler_result = %5           -- unique value into dest (no-match)
+    //         success_result = null         -- success value = owned-mutating payload
+    //   [3] const_int %3 = 0
+    //   [4] const_int %4 = 0
+    //   [6] move_value %6 <- %2
+    //   [7] call_builtin "Map.put" args=[%6,%3,%4] dest=%7
+    //
+    // Note: the handler's map_init occupies an InstructionId between the
+    // try_call_named (id 2) and the const_int (id 3 in the flatten order:
+    // handler stream is numbered immediately after the parent). Local ids
+    // are independent of instruction ids; %5 is the handler map.
+    const callee = try buildOwnedReceiverCallee(arena, 1, "step_fn");
+
+    const try_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const try_arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{.move});
+    const handler_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .map_init = .{ .dest = 5, .entries = &.{} } },
+    });
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 6;
+    put_args[1] = 3;
+    put_args[2] = 4;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .try_call_named = .{
+            .dest = 2,
+            .name = "step_fn",
+            .args = try_args,
+            .arg_modes = try_arg_modes,
+            .input_local = 0,
+            .handler_instrs = handler_instrs,
+            .handler_result = 5,
+            .success_instrs = &.{},
+            .success_result = null,
+            .payload_local = null,
+        } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .move_value = .{ .dest = 6, .source = 2 } },
+        .{ .call_builtin = .{
+            .dest = 7,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+    };
+    var caller = try buildTestFunction(arena, "caller_both_unique", &caller_instrs, 8);
+    caller.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = caller;
+    functions[1] = callee;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var u = try analyzeUniqueness(testing.allocator, &caller, &program);
+    defer u.deinit(testing.allocator);
+
+    // Both arms unique -> dest unique -> Map.put at id 7 is unique.
+    try testing.expect(u.isUnique(7));
 }
 
 /// Phase 2.5 — synthesize a minimal `ArcOwnership` for tests that
