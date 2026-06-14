@@ -82,12 +82,44 @@ pub const target_caps = @import("target_caps.zig");
 pub const target_fold = @import("target_fold.zig");
 
 test {
+    // ----------------------------------------------------------------
+    // INVARIANT — every test-bearing `src/*.zig` module that compiles
+    // under the host `zap` module graph MUST be referenced here.
+    //
+    // In Zig, a top-level `pub const x = @import("x.zig")` does NOT run
+    // x.zig's `test {}` blocks. Only a reference inside THIS aggregating
+    // `test {}` block pulls a module's tests into `zig build test`. A
+    // test-bearing module left out is silently dead — it compiles, but
+    // its guarantees never run. The meta-test below
+    // (`test "every test-bearing src module is aggregated"`) walks the
+    // `src/` tree at test time and FAILS if a module with `test {}`
+    // blocks is missing from the set listed here, so this invariant can
+    // never silently regress.
+    //
+    // DELIBERATE EXCLUSIONS (each covered elsewhere — kept out on purpose;
+    // the meta-test's allow-list mirrors this list):
+    //   * `src/root.zig` — this file (the aggregator itself).
+    //   * `src/zir_integration_tests.zig` — driven by the separate
+    //     `zig build zir-test` step (needs the installed `zap` binary).
+    //   * `src/main.zig` — the CLI executable root; built as its own test
+    //     target by `build.zig` (`main_tests`, wired into `zig build test`).
+    //   * `src/runtime_os/posix.zig`, `src/runtime_os/wasi.zig`,
+    //     `src/runtime_os/windows.zig`, `src/runtime_os/windows_argv_test.zig`
+    //     — each compiled by `build.zig` against its OWN target (native /
+    //     wasm32-wasi / x86_64-windows-gnu) so per-target std-API breaks
+    //     surface; they cannot share the host `zap` module's single target.
+    //   * `src/runtime_os_portability_gate.zig`,
+    //     `src/target_capability_audit.zig` — built as dedicated
+    //     `build.zig` test targets (the audit needs the generated
+    //     `stdlib_sources` import the `zap` module does not provide).
+    // ----------------------------------------------------------------
     _ = @import("target_triple.zig");
     _ = @import("target_caps.zig");
     _ = @import("target_fold.zig");
     _ = @import("token.zig");
     _ = @import("lexer.zig");
     _ = @import("ast.zig");
+    _ = @import("ast_visitor.zig");
     _ = @import("parser.zig");
     _ = @import("scope.zig");
     _ = @import("collector.zig");
@@ -105,6 +137,7 @@ test {
     _ = @import("lambda_sets.zig");
     _ = @import("perceus.zig");
     _ = @import("analysis_pipeline.zig");
+    _ = @import("contification_rewrite.zig");
     _ = @import("arc_optimizer.zig");
     _ = @import("arc_liveness.zig");
     _ = @import("arc_ownership.zig");
@@ -125,6 +158,8 @@ test {
     _ = @import("error_ir.zig");
     _ = @import("error_format.zig");
     _ = @import("error_json.zig");
+    _ = @import("error_codes.zig");
+    _ = @import("lints.zig");
     _ = @import("similarity.zig");
     _ = @import("project.zig");
     _ = @import("compiler.zig");
@@ -141,22 +176,33 @@ test {
     _ = @import("monomorphize.zig");
     _ = @import("env.zig");
     _ = @import("wyhash.zig");
+    _ = @import("progress.zig");
+    // Crash-reporter offline-symbolization pair: `addr2line.zig` resolves a
+    // runtime address against the `.zap-symbols` sidecar parsed by
+    // `zap_symbol_table.zig` (addr2line imports the table). Both carry
+    // pure unit tests that run natively on the host.
+    _ = @import("zap_symbol_table.zig");
+    _ = @import("addr2line.zig");
     _ = @import("memory/section_parser.zig");
     _ = @import("memory/abi.zig");
     _ = @import("memory/driver.zig");
     _ = @import("memory/elision.zig");
-    // The tracking manager carries inline behavioural tests for canary
-    // detection, leak reporting, invalid-free, and size/alignment
-    // mismatch. The integration tests in `memory/driver.zig` validate
-    // the section/symbol pipeline using synthesised objects; this
-    // import drives the manager's actual runtime behaviour through the
-    // capturing diagnostic-writer hook declared in `tracking/manager.zig`.
+    // First-party memory managers — inline behavioural tests.
     //
-    // Importing the manager into the test binary pulls in its
-    // `pub export const zap_memory_section` — the only `zap_memory_section`
-    // export in the test binary. `runtime.zig`'s `externalMemorySection`
-    // early-returns null in `builtin.is_test` mode, so the symbol's
-    // presence is harmless: the test-only ARC fallback continues to
-    // drive every test allocation.
+    // The Tracking manager carries inline tests for canary detection, leak
+    // reporting, invalid-free, and size/alignment mismatch; the ARC manager
+    // carries tests for its slab-pool refcount layout and ABI asserts. The
+    // integration tests in `memory/driver.zig` validate the section/symbol
+    // pipeline using synthesised objects; these imports drive the managers'
+    // actual runtime behaviour.
+    //
+    // Both managers declare `zap_memory_section`, but each now gates that
+    // export behind `!builtin.is_test` (see the `comptime { @export(...) }`
+    // block in each manager). `runtime.zig`'s `externalMemorySection`
+    // early-returns null under `builtin.is_test`, so the symbol is dead in
+    // the test binary — gating it out lets BOTH managers be aggregated here
+    // without a duplicate `zap_memory_section` symbol, while the test-only
+    // ARC fallback continues to drive every test allocation.
     _ = @import("memory/tracking/manager.zig");
+    _ = @import("memory/arc/manager.zig");
 }
