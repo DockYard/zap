@@ -208,4 +208,48 @@ pub struct ClosureTest {
   fn mode_test() -> i64 {
     IO.mode(IO.Mode.Normal, fn() -> i64 { 42 })
   }
+
+  # Runtime guard for the value-escape ownership contract closed by audit
+  # findings uniqueness--02 / arc-param--02. `mutate_receiver` is a named,
+  # owned-mutating function (it forwards its Map receiver straight into
+  # `Map.put`, the dense-Map in-place-mutation sink). Here it is taken as
+  # a VALUE (`make_closure`) and invoked through that value with a
+  # receiver that is ALSO parked in an outer aggregate, so the cell is
+  # shared (rc>=2). The interprocedural uniqueness fixpoint and the
+  # parameter-convention inference must both treat a value-escaping
+  # function conservatively (not unique-on-entry, not `.owned`), so the
+  # shared cell is COW-cloned rather than mutated in place. These tests
+  # assert the parked alias survives unchanged through the escaped call,
+  # under default ARC and `Memory.Tracking`, locking in that contract so
+  # a future regression that re-promotes a value-escaping function would
+  # corrupt the parked alias (and surface here) instead of silently.
+  describe("value-escape ownership soundness (uniqueness--02 / arc-param--02)") {
+    test("escaped owned-mutating fn does not corrupt a parked shared receiver") {
+      assert(escape_preserves_parked_alias())
+    }
+
+    test("escaped owned-mutating fn still returns its own mutation") {
+      assert(escape_result_has_mutation())
+    }
+  }
+
+  fn mutate_receiver(receiver :: %{Atom => i64}) -> %{Atom => i64} {
+    Map.put(receiver, :added, 999)
+  }
+
+  fn escape_preserves_parked_alias() -> Bool {
+    shared_map = %{kept: 7}
+    parked = [shared_map]
+    escaped = mutate_receiver
+    _result = escaped(shared_map)
+    observed = List.get(parked, 0)
+    not Map.has_key?(observed, :added) and Map.has_key?(observed, :kept)
+  }
+
+  fn escape_result_has_mutation() -> Bool {
+    base = %{origin: 1}
+    escaped = mutate_receiver
+    produced = escaped(base)
+    Map.has_key?(produced, :added)
+  }
 }
