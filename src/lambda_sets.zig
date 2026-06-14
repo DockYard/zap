@@ -815,6 +815,149 @@ pub const LambdaSetAnalyzer = struct {
                     }
                 }
             },
+
+            // escape--01: value-aliasing opcodes forward a closure value to a
+            // new local. A closure flowing through any of these must carry its
+            // lambda set with it; dropping the edge (the pre-fix `else => {}`)
+            // let a closure reaching a merge ONLY via an alias contribute the
+            // empty set, so the merge looked wrongly SINGLETON and codegen
+            // direct-dispatched to the lone "member" — calling the WRONG
+            // function on the path the aliased closure actually took. These
+            // mirror the value-forwarding semantics `interprocedural.zig`
+            // already models (move_value/share_value/…): dest ← source.
+            .move_value => |mv| {
+                if (mv.source == changed_local) {
+                    try self.propagateUnion(func_id, mv.dest, func_id, mv.source);
+                }
+            },
+            .copy_value => |cv| {
+                if (cv.source == changed_local) {
+                    try self.propagateUnion(func_id, cv.dest, func_id, cv.source);
+                }
+            },
+            .share_value => |sv| {
+                if (sv.source == changed_local) {
+                    try self.propagateUnion(func_id, sv.dest, func_id, sv.source);
+                }
+            },
+            .borrow_value => |bv| {
+                if (bv.source == changed_local) {
+                    try self.propagateUnion(func_id, bv.dest, func_id, bv.source);
+                }
+            },
+            .optional_unwrap => |ou| {
+                if (ou.source == changed_local) {
+                    try self.propagateUnion(func_id, ou.dest, func_id, ou.source);
+                }
+            },
+            .unwrap_error_union => |ueu| {
+                if (ueu.source == changed_local) {
+                    try self.propagateUnion(func_id, ueu.dest, func_id, ueu.source);
+                }
+            },
+            .error_catch => |ec| {
+                // dest is the if-else merge of the success payload (`source`)
+                // and the handler value (`catch_value`); a closure can reach it
+                // through EITHER arm, so union both.
+                if (ec.source == changed_local) {
+                    try self.propagateUnion(func_id, ec.dest, func_id, ec.source);
+                }
+                if (ec.catch_value == changed_local) {
+                    try self.propagateUnion(func_id, ec.dest, func_id, ec.catch_value);
+                }
+            },
+
+            // escape--01: closure flow THROUGH aggregates. A closure stored
+            // into an aggregate component and later read back must still carry
+            // its set. We do not track per-slot membership, so the aggregate
+            // local conservatively carries the UNION of its components' sets
+            // (writes, below), and any read out of an aggregate conservatively
+            // receives the aggregate's whole set (reads, further below). This
+            // can only ENLARGE a set — never shrink it to a spurious singleton
+            // — which is exactly the soundness direction the finding requires.
+            .tuple_init => |ti| {
+                for (ti.elements) |elem| {
+                    if (elem == changed_local) {
+                        try self.propagateUnion(func_id, ti.dest, func_id, elem);
+                    }
+                }
+            },
+            .list_init => |li| {
+                for (li.elements) |elem| {
+                    if (elem == changed_local) {
+                        try self.propagateUnion(func_id, li.dest, func_id, elem);
+                    }
+                }
+            },
+            .list_cons => |lc| {
+                if (lc.head == changed_local) {
+                    try self.propagateUnion(func_id, lc.dest, func_id, lc.head);
+                }
+                if (lc.tail == changed_local) {
+                    try self.propagateUnion(func_id, lc.dest, func_id, lc.tail);
+                }
+            },
+            .map_init => |mi| {
+                for (mi.entries) |entry| {
+                    if (entry.value == changed_local) {
+                        try self.propagateUnion(func_id, mi.dest, func_id, entry.value);
+                    }
+                    if (entry.key == changed_local) {
+                        try self.propagateUnion(func_id, mi.dest, func_id, entry.key);
+                    }
+                }
+            },
+            .struct_init => |si| {
+                for (si.fields) |field| {
+                    if (field.value == changed_local) {
+                        try self.propagateUnion(func_id, si.dest, func_id, field.value);
+                    }
+                }
+            },
+            .union_init => |ui| {
+                if (ui.value == changed_local) {
+                    try self.propagateUnion(func_id, ui.dest, func_id, ui.value);
+                }
+            },
+
+            // Aggregate reads: dest receives the (conservative) set of the
+            // aggregate it reads from.
+            .field_get => |fg| {
+                if (fg.object == changed_local) {
+                    try self.propagateUnion(func_id, fg.dest, func_id, fg.object);
+                }
+            },
+            .index_get => |ig| {
+                if (ig.object == changed_local) {
+                    try self.propagateUnion(func_id, ig.dest, func_id, ig.object);
+                }
+            },
+            .list_get => |lg2| {
+                if (lg2.list == changed_local) {
+                    try self.propagateUnion(func_id, lg2.dest, func_id, lg2.list);
+                }
+            },
+            .list_head => |lh| {
+                if (lh.list == changed_local) {
+                    try self.propagateUnion(func_id, lh.dest, func_id, lh.list);
+                }
+            },
+            .list_tail => |lt| {
+                if (lt.list == changed_local) {
+                    try self.propagateUnion(func_id, lt.dest, func_id, lt.list);
+                }
+            },
+            .map_get => |mg| {
+                if (mg.map == changed_local) {
+                    try self.propagateUnion(func_id, mg.dest, func_id, mg.map);
+                }
+            },
+            .variant_payload_get => |vpg| {
+                if (vpg.scrutinee == changed_local) {
+                    try self.propagateUnion(func_id, vpg.dest, func_id, vpg.scrutinee);
+                }
+            },
+
             else => {},
         }
     }
@@ -1432,6 +1575,162 @@ test "two closures yield switch_dispatch" {
     for (analyzer.call_site_decisions.items) |d| {
         if (d.callee_local == 2 and d.function == 0) {
             try testing.expectEqual(lattice.SpecializationDecision.switch_dispatch, d.decision);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+// escape--01: lambda-set membership MUST propagate through value-aliasing
+// opcodes (move_value/copy_value/share_value/borrow_value/optional_unwrap/
+// error_catch). Pre-fix, `propagateInstruction` ended in `else => {}` and
+// dropped these edges, so a closure reaching a merge ONLY through an aliasing
+// edge contributed nothing and the merged set looked wrongly SINGLETON.
+// Codegen then trusts a singleton for DIRECT dispatch -> wrong function.
+//
+// Shape:
+//   %0 = make_closure(fn_a)
+//   %1 = make_closure(fn_b)
+//   %2 = move_value(%1)         // aliasing op: lambda_set[%2] must be {fn_b}
+//   if cond { %3 := %0 } else { %3 := %2 }   // merge {fn_a} ∪ {fn_b}
+//   %4 = call_closure(%3)
+// The callee set at %3 must be {fn_a, fn_b} (NOT singleton).
+test "escape--01: lambda set propagates through move_value aliasing (not wrongly singleton)" {
+    const allocator = testing.allocator;
+
+    const main_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 1, .captures = &.{} } },
+        .{ .make_closure = .{ .dest = 1, .function = 2, .captures = &.{} } },
+        // Aliasing op the pre-fix propagation dropped entirely.
+        .{ .move_value = .{ .dest = 2, .source = 1 } },
+        .{ .const_bool = .{ .dest = 5, .value = true } },
+        .{ .if_expr = .{
+            .dest = 3,
+            .condition = 5,
+            .then_instrs = &.{},
+            .then_result = 0,
+            .else_instrs = &.{},
+            .else_result = 2,
+        } },
+        .{ .call_closure = .{ .dest = 4, .callee = 3, .args = &.{}, .arg_modes = &.{}, .return_type = .void } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const main_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &main_instrs },
+    };
+    const empty_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const empty_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &empty_instrs },
+    };
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "fn_a", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &empty_blocks, .is_closure = true, .captures = &.{} },
+        .{ .id = 2, .name = "fn_b", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &empty_blocks, .is_closure = true, .captures = &.{} },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var analyzer = try LambdaSetAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+    try analyzer.analyze();
+
+    // move_value dest must carry the source's set.
+    const aliased = analyzer.getLambdaSet(.{ .function = 0, .local = 2 }).?;
+    try testing.expectEqual(@as(usize, 1), aliased.size());
+    try testing.expect(aliased.contains(2));
+
+    // The merge MUST be both closures — NOT a wrongly-singleton {fn_a}.
+    const merged = analyzer.getLambdaSet(.{ .function = 0, .local = 3 }).?;
+    try testing.expectEqual(@as(usize, 2), merged.size());
+    try testing.expect(merged.contains(1));
+    try testing.expect(merged.contains(2));
+
+    // The call site must NOT be a singleton direct_call.
+    var found = false;
+    for (analyzer.call_site_decisions.items) |d| {
+        if (d.callee_local == 3 and d.function == 0) {
+            try testing.expect(!d.lambda_set.isSingleton());
+            try testing.expectEqual(lattice.SpecializationDecision.switch_dispatch, d.decision);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+// escape--01: lambda-set membership MUST propagate OUT of an aggregate. A
+// closure stored into a tuple/struct and later read back via index_get/
+// field_get/variant_payload_get carries the set forward. Pre-fix these reads
+// were dropped, so a closure that flowed only through an aggregate vanished
+// from the merged set, producing a wrongly-singleton set.
+//
+// Shape:
+//   %0 = make_closure(fn_a)
+//   %1 = make_closure(fn_b)
+//   %2 = tuple_init(%1)         // store fn_b into a tuple
+//   %3 = index_get(%2, 0)       // read it back: lambda_set[%3] must be {fn_b}
+//   if cond { %4 := %0 } else { %4 := %3 }
+//   %5 = call_closure(%4)
+test "escape--01: lambda set propagates through aggregate store/load (index_get)" {
+    const allocator = testing.allocator;
+
+    const elems = [_]ir.LocalId{1};
+    const main_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 1, .captures = &.{} } },
+        .{ .make_closure = .{ .dest = 1, .function = 2, .captures = &.{} } },
+        .{ .tuple_init = .{ .dest = 2, .elements = &elems } },
+        .{ .index_get = .{ .dest = 3, .object = 2, .index = 0 } },
+        .{ .const_bool = .{ .dest = 6, .value = true } },
+        .{ .if_expr = .{
+            .dest = 4,
+            .condition = 6,
+            .then_instrs = &.{},
+            .then_result = 0,
+            .else_instrs = &.{},
+            .else_result = 3,
+        } },
+        .{ .call_closure = .{ .dest = 5, .callee = 4, .args = &.{}, .arg_modes = &.{}, .return_type = .void } },
+        .{ .ret = .{ .value = 5 } },
+    };
+    const main_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &main_instrs },
+    };
+    const empty_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const empty_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &empty_instrs },
+    };
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "fn_a", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &empty_blocks, .is_closure = true, .captures = &.{} },
+        .{ .id = 2, .name = "fn_b", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &empty_blocks, .is_closure = true, .captures = &.{} },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var analyzer = try LambdaSetAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+    try analyzer.analyze();
+
+    // index_get of a closure-bearing aggregate must carry every closure that
+    // was stored into ANY slot of the aggregate (conservative aggregate flow).
+    const loaded = analyzer.getLambdaSet(.{ .function = 0, .local = 3 }).?;
+    try testing.expect(loaded.contains(2));
+
+    // The merge MUST contain both — NOT a wrongly-singleton {fn_a}.
+    const merged = analyzer.getLambdaSet(.{ .function = 0, .local = 4 }).?;
+    try testing.expect(merged.contains(1));
+    try testing.expect(merged.contains(2));
+    try testing.expect(merged.size() >= 2);
+
+    var found = false;
+    for (analyzer.call_site_decisions.items) |d| {
+        if (d.callee_local == 4 and d.function == 0) {
+            try testing.expect(!d.lambda_set.isSingleton());
             found = true;
         }
     }

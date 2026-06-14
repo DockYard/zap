@@ -497,4 +497,79 @@ pub struct ClosureTest {
     Map.has_key?(produced, :count)
   }
 
+  # End-to-end runtime soundness complement for audit finding escape--01.
+  # Lambda-set 0-CFA propagation used to drop value-aliasing and aggregate
+  # opcodes (move_value/copy_value/share_value/field_get/index_get/…), so a
+  # closure that reached a call site ONLY through an aggregate read or an
+  # alias contributed the EMPTY set; when unioned with a tracked closure the
+  # merged lambda set could look wrongly SINGLETON, and the ZIR backend
+  # (release-mode lambda specialization) would then DIRECT-dispatch to that
+  # lone member with no runtime tag check — calling the WRONG function on the
+  # path the aggregate/aliased closure actually took.
+  #
+  # `pick_via_field` selects between TWO closures that each reach the call
+  # site through a `ClosureTestTransform` struct field (the previously-
+  # dropped `field_get` aggregate edge), with DISTINCT behavior (+1 vs +100).
+  # `pick_via_alias` selects between two closures that reach the call through
+  # a local alias of a field read (the `move_value`/`share_value`-style edge
+  # propagation also dropped). Both arms share the boxed closure type so the
+  # `if` is well-typed. If aggregate/alias edges are dropped, these calls
+  # lose their lambda sets entirely; the fix restores correct membership so
+  # dispatch selects the right target on each path.
+  #
+  # Honesty note: lambda specialization is enabled only in release frontend
+  # modes (debug skips it), so under the default `zap test` (debug) this
+  # test passes both pre- and post-fix. The authoritative fail-pre/pass-post
+  # proofs for escape--01 are the deterministic analyzer unit tests
+  # "escape--01: lambda set propagates through move_value aliasing (not
+  # wrongly singleton)" and "escape--01: lambda set propagates through
+  # aggregate store/load (index_get)" in src/lambda_sets.zig, which assert
+  # the merged set is NOT singleton (they CRASH pre-fix on the dropped
+  # edge's null set and PASS post-fix). This runtime guard locks in correct
+  # dispatch through aggregate/alias edges end to end and is the release-mode
+  # regression complement.
+  describe("lambda-set aggregate/alias dispatch soundness (escape--01)") {
+    test("closure selected from a struct field dispatches to the correct target") {
+      assert(pick_via_field(0) == 1)
+      assert(pick_via_field(1) == 100)
+    }
+
+    test("closure selected through a local alias dispatches to the correct target") {
+      assert(pick_via_alias(0) == 2)
+      assert(pick_via_alias(1) == 200)
+    }
+  }
+
+  fn pick_via_field(flag :: i64) -> i64 {
+    # `flag` selects WHICH closure is stored into the aggregate (struct), then
+    # `holder.op` reads it back out — the `struct_init` write + `field_get`
+    # read edges lambda-set propagation used to drop. Exactly one closure is
+    # constructed and consumed (no unused closure left to leak under
+    # Memory.Tracking). The lambda set at `holder.op` must carry BOTH possible
+    # closures (the struct came from either branch), so dispatch resolves the
+    # correct target on each path.
+    holder = if flag == 0 {
+      %ClosureTestTransform{op: fn(value :: i64) -> i64 { value + 1 }}
+    } else {
+      %ClosureTestTransform{op: fn(value :: i64) -> i64 { value + 100 }}
+    }
+    holder.op(0)
+  }
+
+  fn pick_via_alias(flag :: i64) -> i64 {
+    # `flag` selects which closure-bearing struct is built; `aliased` re-binds
+    # that aggregate (a value-forwarding move/share/copy — the alias edge
+    # lambda-set propagation used to drop), and `aliased.op` reads the closure
+    # back out. The closure's set must follow it through the aggregate AND the
+    # alias for dispatch to resolve correctly. Exactly one closure is
+    # constructed and consumed.
+    holder = if flag == 0 {
+      %ClosureTestTransform{op: fn(value :: i64) -> i64 { value + 2 }}
+    } else {
+      %ClosureTestTransform{op: fn(value :: i64) -> i64 { value + 200 }}
+    }
+    aliased = holder
+    aliased.op(0)
+  }
+
 }
