@@ -1148,10 +1148,34 @@ pub const ClosureEnvTier = enum {
     escaping,
 };
 
+/// Identity of a closure call site, keyed by the STABLE local that holds the
+/// callee closure within its function — NOT by a positional `(block,
+/// instr_index)` coordinate.
+///
+/// audit findings escape--03 / zirb-1--01: the previous positional key was
+/// produced by the lambda-set analyzer with a broken nested-stream encoding
+/// (`outer_index + body_offset`) and consumed by the ZIR builder using only
+/// the TOP-LEVEL block index (`current_instr_index` is never updated during
+/// nested-stream emission). The two could not agree: a nested `call_closure`
+/// either missed its record entirely or collided with an unrelated call's,
+/// binding the call to the WRONG target function. Worse, the positional key
+/// also went stale across the count-mutating ARC passes that run between
+/// lambda-set analysis and ZIR emission (the same arc-param--01 staleness
+/// class), so even a correctly-encoded path would not survive to emission.
+///
+/// A closure call's specialization depends only on the lambda set of the
+/// callee local, which the analyzer keys by `(function, local)` — the same
+/// `ValueKey` the per-binding consumer (`getLambdaSet`) already uses. Keying
+/// the call-site map by that identity makes producer and consumer read the
+/// SAME field of the SAME instruction, so they cannot disagree, and the key
+/// is collision-free (distinct callees in distinct branches → distinct keys;
+/// the same callee called twice correctly shares one decision) and immune to
+/// instruction-position shifts. `callee` is the `call_closure.callee` local
+/// (a `LocalId`, monotonically unique within its function and preserved
+/// across every IR-mutating pass).
 pub const CallSiteKey = struct {
     function: ir.FunctionId,
-    block: ir.LabelId,
-    instr_index: u32,
+    callee: ir.LocalId,
 };
 
 pub const CallSiteSpecialization = struct {

@@ -572,4 +572,64 @@ pub struct ClosureTest {
     aliased.op(0)
   }
 
+  # End-to-end runtime soundness complement for audit findings escape--03 /
+  # zirb-1--01. The per-call-site specialization table was keyed by a
+  # positional `(block, instr_index)` coordinate. The lambda-set analyzer
+  # encoded a NESTED call_closure's index as `outer_index + body_offset`,
+  # while the ZIR backend looked it up using only the TOP-LEVEL instruction
+  # index (`current_instr_index` is never updated during nested-stream
+  # emission). A `call_closure` that is the FIRST instruction of an if/case
+  # branch therefore keyed at the enclosing if/case's own index, and the
+  # then/else branches collided at one key — so a nested closure call bound
+  # to an UNRELATED call's specialization and direct-dispatched to the wrong
+  # target. The fix keys on the stable, position-free `(function, callee)`
+  # identity, which is collision-free and agrees between producer and
+  # consumer.
+  #
+  # `branch_dispatch` calls two DIFFERENT closure-valued parameters in
+  # opposite branches of a `case`, each call the first instruction of its
+  # arm — the exact colliding shape. With distinct closures passed for the
+  # two params, a key collision would make both arms call the same target.
+  #
+  # Honesty note: like escape--01 above, this is release-gated (lambda
+  # specialization is off in debug), so it passes both pre- and post-fix
+  # under the default debug `zap test`. The authoritative fail-pre/pass-post
+  # proof is the deterministic unit test
+  # "escape--03/zirb-1--01: nested closure calls in opposite branches get
+  # distinct keys" in src/lambda_sets.zig, which asserts the two nested call
+  # sites resolve to DISTINCT keys each bound to its own callee's set (it
+  # references the new key shape that does not exist pre-fix). This runtime
+  # guard locks in correct per-branch dispatch end to end.
+  describe("nested vs top-level call-site key distinctness (escape--03 / zirb-1--01)") {
+    test("closures called in opposite case branches each bind their own target") {
+      assert(branch_dispatch(0, fn(x :: i64) -> i64 { x + 3 }, fn(x :: i64) -> i64 { x + 7 }) == 13)
+      assert(branch_dispatch(1, fn(x :: i64) -> i64 { x + 3 }, fn(x :: i64) -> i64 { x + 7 }) == 17)
+    }
+
+    test("a nested branch closure call and a top-level closure call bind distinct targets") {
+      assert(nested_and_toplevel(0) == 1041)
+      assert(nested_and_toplevel(1) == 1071)
+    }
+  }
+
+  fn branch_dispatch(mode :: i64, left :: fn(i64) -> i64, right :: fn(i64) -> i64) -> i64 {
+    case mode {
+      0 -> left(10)
+      _ -> right(10)
+    }
+  }
+
+  fn nested_and_toplevel(mode :: i64) -> i64 {
+    # A top-level closure call ...
+    top = apply(1000, fn(x :: i64) -> i64 { x + 1 })
+    # ... alongside a nested closure call selected per branch. Pre-fix the
+    # nested call (first instruction of each arm) collided with the
+    # if_expr/case key; post-fix each binds its own callee identity.
+    branch = case mode {
+      0 -> apply(40, fn(x :: i64) -> i64 { x + 0 })
+      _ -> apply(70, fn(x :: i64) -> i64 { x + 0 })
+    }
+    top + branch
+  }
+
 }

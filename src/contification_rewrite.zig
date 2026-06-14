@@ -54,10 +54,13 @@ fn rewriteBlock(
 
         if (instr_index + 1 >= block.instructions.len) continue;
 
+        // audit escape--03 / zirb-1--01: key by the stable call-site identity
+        // (function + callee local), NOT a positional `(block, instr_index)`
+        // coordinate. The bare index collided across nested streams and could
+        // not be reproduced by the consumer.
         const spec = ctx.getCallSiteSpecialization(.{
             .function = function_id,
-            .block = block.label,
-            .instr_index = @intCast(instr_index),
+            .callee = cc.callee,
         }) orelse continue;
         if (spec.decision != .contified) continue;
         if (!spec.lambda_set.isSingleton()) continue;
@@ -523,7 +526,7 @@ test "rewrite contified non-tail call into continuation jump" {
     defer ctx.deinit();
     const members = try allocator.alloc(ir.FunctionId, 1);
     members[0] = 1;
-    try ctx.call_specializations.put(.{ .function = 0, .block = 0, .instr_index = 1 }, .{
+    try ctx.call_specializations.put(.{ .function = 0, .callee = 0 }, .{
         .decision = .contified,
         .lambda_set = .{ .members = members },
     });
@@ -576,7 +579,7 @@ test "rewrite contified capturing closure into continuation jump" {
     defer ctx.deinit();
     const members = try allocator.alloc(ir.FunctionId, 1);
     members[0] = 1;
-    try ctx.call_specializations.put(.{ .function = 0, .block = 0, .instr_index = 2 }, .{
+    try ctx.call_specializations.put(.{ .function = 0, .callee = 0 }, .{
         .decision = .contified,
         .lambda_set = .{ .members = members },
     });
@@ -631,7 +634,7 @@ test "rewrite contified closure supports field get and direct call" {
     defer ctx.deinit();
     const members = try allocator.alloc(ir.FunctionId, 1);
     members[0] = 2;
-    try ctx.call_specializations.put(.{ .function = 0, .block = 0, .instr_index = 1 }, .{
+    try ctx.call_specializations.put(.{ .function = 0, .callee = 0 }, .{
         .decision = .contified,
         .lambda_set = .{ .members = members },
     });
@@ -688,7 +691,7 @@ test "rewrite contified closure supports if expr body" {
     defer ctx.deinit();
     const members = try allocator.alloc(ir.FunctionId, 1);
     members[0] = 1;
-    try ctx.call_specializations.put(.{ .function = 0, .block = 0, .instr_index = 1 }, .{
+    try ctx.call_specializations.put(.{ .function = 0, .callee = 0 }, .{
         .decision = .contified,
         .lambda_set = .{ .members = members },
     });
@@ -737,7 +740,7 @@ test "rewrite contified closure supports switch literal body" {
     defer ctx.deinit();
     const members = try allocator.alloc(ir.FunctionId, 1);
     members[0] = 1;
-    try ctx.call_specializations.put(.{ .function = 0, .block = 0, .instr_index = 1 }, .{
+    try ctx.call_specializations.put(.{ .function = 0, .callee = 0 }, .{
         .decision = .contified,
         .lambda_set = .{ .members = members },
     });
@@ -791,7 +794,7 @@ test "rewrite contified closure supports case block body" {
     defer ctx.deinit();
     const members = try allocator.alloc(ir.FunctionId, 1);
     members[0] = 1;
-    try ctx.call_specializations.put(.{ .function = 0, .block = 0, .instr_index = 1 }, .{
+    try ctx.call_specializations.put(.{ .function = 0, .callee = 0 }, .{
         .decision = .contified,
         .lambda_set = .{ .members = members },
     });
@@ -834,7 +837,7 @@ test "rewrite skips contified closure with multi-block body" {
     defer ctx.deinit();
     const members = try allocator.alloc(ir.FunctionId, 1);
     members[0] = 1;
-    try ctx.call_specializations.put(.{ .function = 0, .block = 0, .instr_index = 1 }, .{
+    try ctx.call_specializations.put(.{ .function = 0, .callee = 0 }, .{
         .decision = .contified,
         .lambda_set = .{ .members = members },
     });
@@ -882,7 +885,7 @@ test "rewrite skips contified closure with unsupported continuation suffix" {
     defer ctx.deinit();
     const members = try allocator.alloc(ir.FunctionId, 1);
     members[0] = 1;
-    try ctx.call_specializations.put(.{ .function = 0, .block = 0, .instr_index = 1 }, .{
+    try ctx.call_specializations.put(.{ .function = 0, .callee = 0 }, .{
         .decision = .contified,
         .lambda_set = .{ .members = members },
     });

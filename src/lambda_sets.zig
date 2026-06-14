@@ -126,11 +126,14 @@ pub const ParamKey = struct {
 pub const CallSiteDecision = struct {
     /// Function containing this call site.
     function: ir.FunctionId,
-    /// Block label where the call resides.
-    block: ir.LabelId,
-    /// Index of the instruction within the block.
-    instr_index: u32,
-    /// The local holding the callee closure.
+    /// The local holding the callee closure. This — together with
+    /// `function` — is the STABLE, position-free identity of the call site
+    /// (audit escape--03 / zirb-1--01): it is the `call_closure.callee`
+    /// `LocalId`, unique within its function and preserved across every
+    /// IR-mutating pass, so producer and consumer key on the same field of
+    /// the same instruction and cannot disagree. No `(block, instr_index)`
+    /// coordinate is recorded, because a positional key collided across
+    /// nested streams and went stale across the count-mutating ARC passes.
     callee_local: ir.LocalId,
     /// Computed specialization decision.
     decision: lattice.SpecializationDecision,
@@ -1239,134 +1242,77 @@ pub const LambdaSetAnalyzer = struct {
     fn computeDecisions(self: *LambdaSetAnalyzer) !void {
         for (self.program.functions) |func| {
             for (func.body) |block| {
-                for (block.instructions, 0..) |instr, instr_idx| {
-                    try self.computeInstrDecision(func.id, block.label, @intCast(instr_idx), instr);
+                for (block.instructions) |instr| {
+                    try self.computeInstrDecision(func.id, instr);
                 }
             }
         }
     }
 
+    /// Record the specialization decision for every `call_closure` reachable
+    /// from `instr` (itself plus every nested sub-stream). The decision is
+    /// keyed solely by `(func_id, cc.callee)` — the stable, position-free
+    /// call-site identity (audit escape--03 / zirb-1--01). No `instr_index`
+    /// is computed or recorded, eliminating the broken `outer_index +
+    /// body_offset` nested-stream encoding that collided distinct call sites
+    /// (and that the consumer, keyed only by the top-level index, could not
+    /// reproduce). Nested sub-streams are visited via the canonical
+    /// `ir.forEachChildStream` enumerator so coverage cannot drift from the
+    /// IR's actual child-stream set.
     fn computeInstrDecision(
         self: *LambdaSetAnalyzer,
         func_id: ir.FunctionId,
-        block_label: ir.LabelId,
-        instr_index: u32,
         instr: ir.Instruction,
-    ) !void {
-        switch (instr) {
-            .call_closure => |cc| {
-                const callee_key = lattice.ValueKey{ .function = func_id, .local = cc.callee };
-                const set = self.lambda_sets.getPtr(callee_key);
+    ) error{OutOfMemory}!void {
+        if (instr == .call_closure) {
+            const cc = instr.call_closure;
+            const callee_key = lattice.ValueKey{ .function = func_id, .local = cc.callee };
+            const set = self.lambda_sets.getPtr(callee_key);
 
-                var ls: lattice.LambdaSet = undefined;
-                var is_contifiable = false;
+            var ls: lattice.LambdaSet = undefined;
+            var is_contifiable = false;
 
-                if (set) |s| {
-                    ls = try s.toLambdaSet(self.allocator);
-                    // Check contifiability: singleton must be contifiable
-                    if (s.isSingleton()) {
-                        is_contifiable = self.isContifiable(s.members.items[0]);
-                    }
-                } else {
-                    ls = lattice.LambdaSet.empty();
+            if (set) |s| {
+                ls = try s.toLambdaSet(self.allocator);
+                // Check contifiability: singleton must be contifiable
+                if (s.isSingleton()) {
+                    is_contifiable = self.isContifiable(s.members.items[0]);
                 }
+            } else {
+                ls = lattice.LambdaSet.empty();
+            }
 
-                const decision = lattice.specializationForLambdaSet(ls, is_contifiable);
-                try self.call_site_decisions.append(self.allocator, .{
-                    .function = func_id,
-                    .block = block_label,
-                    .instr_index = instr_index,
-                    .callee_local = cc.callee,
-                    .decision = decision,
-                    .lambda_set = ls,
-                });
-            },
-            .if_expr => |ie| {
-                for (ie.then_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-                for (ie.else_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-            },
-            .case_block => |cb| {
-                for (cb.pre_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-                for (cb.arms) |arm| {
-                    for (arm.cond_instrs, 0..) |sub, idx| {
-                        try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                    }
-                    for (arm.body_instrs, 0..) |sub, idx| {
-                        try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                    }
-                }
-                for (cb.default_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-            },
-            .guard_block => |gb| {
-                for (gb.body, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| {
-                    for (c.body_instrs, 0..) |sub, idx| {
-                        try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                    }
-                }
-                for (sl.default_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| {
-                    for (c.body_instrs, 0..) |sub, idx| {
-                        try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                    }
-                }
-                for (sr.default_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    for (c.body_instrs, 0..) |sub, idx| {
-                        try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                    }
-                }
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| {
-                    for (c.body_instrs, 0..) |sub, idx| {
-                        try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                    }
-                }
-                if (us.has_else) {
-                    for (us.else_instrs, 0..) |sub, idx| {
-                        try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                    }
-                }
-            },
-            .try_call_named => |tcn| {
-                for (tcn.handler_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-                for (tcn.success_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-            },
-            .optional_dispatch => |od| {
-                for (od.nil_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-                for (od.struct_instrs, 0..) |sub, idx| {
-                    try self.computeInstrDecision(func_id, block_label, @intCast(instr_index + idx), sub);
-                }
-            },
-            else => {},
+            const decision = lattice.specializationForLambdaSet(ls, is_contifiable);
+            try self.call_site_decisions.append(self.allocator, .{
+                .function = func_id,
+                .callee_local = cc.callee,
+                .decision = decision,
+                .lambda_set = ls,
+            });
         }
+
+        // Recurse into every nested sub-stream (if/case/switch/guard/try/
+        // optional-dispatch arms, including `union_switch.else_instrs`) via the
+        // canonical enumerator, so child-stream coverage cannot drift from the
+        // IR's actual set. The enumerator's callback cannot return an error, so
+        // capture the first allocation failure in the adapter and re-raise it.
+        const Ctx = struct {
+            analyzer: *LambdaSetAnalyzer,
+            func_id: ir.FunctionId,
+            err: ?error{OutOfMemory} = null,
+            fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
+                if (self_ctx.err != null) return;
+                for (child.stream) |sub| {
+                    self_ctx.analyzer.computeInstrDecision(self_ctx.func_id, sub) catch |e| {
+                        self_ctx.err = e;
+                        return;
+                    };
+                }
+            }
+        };
+        var ctx = Ctx{ .analyzer = self, .func_id = func_id };
+        ir.forEachChildStream(&instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
     }
 
     // --------------------------------------------------------
@@ -1409,14 +1355,25 @@ pub const LambdaSetAnalyzer = struct {
                 @memcpy(members, decision.lambda_set.members);
                 break :blk lattice.LambdaSet{ .members = members };
             };
-            try ctx.call_specializations.put(.{
+            // Key by the stable, position-free call-site identity (audit
+            // escape--03 / zirb-1--01). The same closure local called more than
+            // once in a function (`f.(); f.()`) yields multiple decisions for
+            // the same `(function, callee)`; they are identical (the decision
+            // depends only on the callee's lambda set), so overwriting is
+            // correct — but we MUST free the displaced set's members to avoid
+            // the leak the finding flagged on every key reuse.
+            const key = lattice.CallSiteKey{
                 .function = decision.function,
-                .block = decision.block,
-                .instr_index = decision.instr_index,
-            }, .{
+                .callee = decision.callee_local,
+            };
+            if (try ctx.call_specializations.fetchPut(key, .{
                 .decision = decision.decision,
                 .lambda_set = copied_set,
-            });
+            })) |displaced| {
+                if (displaced.value.lambda_set.members.len > 0) {
+                    self.allocator.free(displaced.value.lambda_set.members);
+                }
+            }
         }
     }
 
@@ -2457,4 +2414,118 @@ test "call_named resolves to function and propagates" {
     const ls = analyzer.getLambdaSet(key);
     try testing.expect(ls != null);
     try testing.expect(ls.?.contains(2));
+}
+
+// escape--03 / zirb-1--01: a NESTED call_closure (inside an if-expr branch)
+// and a TOP-LEVEL call_closure (and two nested calls in opposite branches)
+// must get DISTINCT CallSiteKeys, so a nested call binds to its OWN
+// specialization, never an unrelated call's. Pre-fix the producer encoded the
+// nested instr_index as `outer_index + body_offset`, so a branch's offset-0
+// call_closure collided with the if_expr's own index (and the then/else
+// branches collided with each other), and the consumer (keyed by the outer
+// instruction's index) fetched the WRONG decision -> direct call to the wrong
+// closure. The fix keys on the stable, position-free callee identity
+// (function, callee_local), which is collision-free by construction and
+// agrees between the producer (`populateContext`) and the consumer.
+//
+// Shape (`f` is a higher-order fn taking two closure params, calling each in
+// opposite branches — each call is the FIRST instruction of its branch):
+//   fn f(a, b):
+//     %0 = param_get 0          // a -> lambda_set {fn_a}
+//     %1 = param_get 1          // b -> lambda_set {fn_b}
+//     %2 = const_bool
+//     if %2 { %3 := call_closure(%0) } else { %4 := call_closure(%1) }
+//     ret ...
+test "escape--03/zirb-1--01: nested closure calls in opposite branches get distinct keys" {
+    const allocator = testing.allocator;
+
+    // f: calls param a in the then-branch, param b in the else-branch.
+    const then_call = [_]ir.Instruction{
+        .{ .call_closure = .{ .dest = 3, .callee = 0, .args = &.{}, .arg_modes = &.{}, .return_type = .i64 } },
+    };
+    const else_call = [_]ir.Instruction{
+        .{ .call_closure = .{ .dest = 4, .callee = 1, .args = &.{}, .arg_modes = &.{}, .return_type = .i64 } },
+    };
+    const f_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .const_bool = .{ .dest = 2, .value = true } },
+        .{ .if_expr = .{
+            .dest = 5,
+            .condition = 2,
+            .then_instrs = &then_call,
+            .then_result = 3,
+            .else_instrs = &else_call,
+            .else_result = 4,
+        } },
+        .{ .ret = .{ .value = 5 } },
+    };
+    const f_blocks = [_]ir.Block{.{ .label = 0, .instructions = &f_instrs }};
+    const f_params = [_]ir.Param{
+        .{ .name = "a", .type_expr = .any },
+        .{ .name = "b", .type_expr = .any },
+    };
+
+    // main: build two distinct closures and pass them to f.
+    const main_args = [_]ir.LocalId{ 0, 1 };
+    const main_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 2, .captures = &.{} } },
+        .{ .make_closure = .{ .dest = 1, .function = 3, .captures = &.{} } },
+        .{ .call_named = .{ .dest = 2, .name = "f", .args = &main_args, .arg_modes = &.{} } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    const main_blocks = [_]ir.Block{.{ .label = 0, .instructions = &main_instrs }};
+
+    const a_instrs = [_]ir.Instruction{ .{ .const_int = .{ .dest = 0, .value = 1 } }, .{ .ret = .{ .value = 0 } } };
+    const a_blocks = [_]ir.Block{.{ .label = 0, .instructions = &a_instrs }};
+    const b_instrs = [_]ir.Instruction{ .{ .const_int = .{ .dest = 0, .value = 2 } }, .{ .ret = .{ .value = 0 } } };
+    const b_blocks = [_]ir.Block{.{ .label = 0, .instructions = &b_instrs }};
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "f", .scope_id = 0, .arity = 2, .params = &f_params, .return_type = .i64, .body = &f_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 2, .name = "fn_a", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &a_blocks, .is_closure = true, .captures = &.{} },
+        .{ .id = 3, .name = "fn_b", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &b_blocks, .is_closure = true, .captures = &.{} },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var analyzer = try LambdaSetAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+    try analyzer.analyze();
+
+    // The two nested call sites must have produced two DISTINCT decisions,
+    // one per callee local, each carrying its own closure's singleton set.
+    var saw_a = false;
+    var saw_b = false;
+    for (analyzer.call_site_decisions.items) |d| {
+        if (d.function != 1) continue;
+        if (d.callee_local == 0) {
+            try testing.expect(d.lambda_set.contains(2));
+            try testing.expect(!d.lambda_set.contains(3));
+            saw_a = true;
+        } else if (d.callee_local == 1) {
+            try testing.expect(d.lambda_set.contains(3));
+            try testing.expect(!d.lambda_set.contains(2));
+            saw_b = true;
+        }
+    }
+    try testing.expect(saw_a);
+    try testing.expect(saw_b);
+
+    // The producer-side keys, materialized into the AnalysisContext the ZIR
+    // consumer reads, must be DISTINCT (no collision) and each must resolve to
+    // the correct callee's specialization — the property that guarantees the
+    // then-branch binds fn_a and the else-branch binds fn_b.
+    var ctx = lattice.AnalysisContext.init(allocator);
+    defer ctx.deinit();
+    try analyzer.populateContext(&ctx);
+
+    const spec_a = ctx.getCallSiteSpecialization(.{ .function = 1, .callee = 0 });
+    const spec_b = ctx.getCallSiteSpecialization(.{ .function = 1, .callee = 1 });
+    try testing.expect(spec_a != null);
+    try testing.expect(spec_b != null);
+    try testing.expect(spec_a.?.lambda_set.contains(2));
+    try testing.expect(!spec_a.?.lambda_set.contains(3));
+    try testing.expect(spec_b.?.lambda_set.contains(3));
+    try testing.expect(!spec_b.?.lambda_set.contains(2));
 }

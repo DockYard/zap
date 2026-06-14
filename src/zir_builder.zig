@@ -857,8 +857,6 @@ pub const ZirDriver = struct {
     /// the return position, so the call instruction itself may not carry
     /// enough information to recover `List(T)`.
     current_function_return_type: ir.ZigType = .void,
-    /// Label of the current block.
-    current_block_label: ir.LabelId = 0,
     /// True when the current function is a closure (has captures).
     current_function_is_closure: bool = false,
     /// When the function being emitted is a loopification candidate
@@ -5520,7 +5518,6 @@ pub const ZirDriver = struct {
 
         // Emit body blocks.
         for (func.body) |block| {
-            self.current_block_label = block.label;
             self.current_block_instructions = block.instructions;
 
             for (block.instructions, 0..) |instr, instr_idx| {
@@ -5608,12 +5605,22 @@ pub const ZirDriver = struct {
 
     // -- Instruction dispatch -------------------------------------------------
 
-    fn getCallSiteSpecialization(self: *const ZirDriver) ?@import("escape_lattice.zig").CallSiteSpecialization {
+    /// Look up the lambda-set specialization for a `call_closure` whose callee
+    /// closure is held in `callee_local`. The call site is identified by its
+    /// STABLE `(function, callee_local)` identity — NOT by a positional
+    /// `(block, instr_index)` coordinate (audit escape--03 / zirb-1--01). The
+    /// old positional key was never updated during nested-stream emission
+    /// (`current_instr_index` is only assigned in the top-level block loop), so
+    /// nested closure calls consulted the table with the OUTER instruction's
+    /// index and bound to the WRONG target. Reading the callee local directly
+    /// off the instruction makes this consumer key on the same field the
+    /// producer (`lambda_sets.populateContext`) keyed on, so they cannot
+    /// disagree across nested streams or instruction-position shifts.
+    fn getCallSiteSpecialization(self: *const ZirDriver, callee_local: ir.LocalId) ?@import("escape_lattice.zig").CallSiteSpecialization {
         if (self.analysis_context) |actx| {
             return actx.getCallSiteSpecialization(.{
                 .function = self.current_function_id,
-                .block = self.current_block_label,
-                .instr_index = self.current_instr_index,
+                .callee = callee_local,
             });
         }
         return null;
@@ -5976,8 +5983,24 @@ pub const ZirDriver = struct {
         return true;
     }
 
+    /// True when the `call_closure` defining `local` is a TOP-LEVEL
+    /// instruction immediately followed by `ret local` — the shape that lets
+    /// the contified-singleton path emit a musttail call and skip the
+    /// following `ret`. `current_instr_index` / `current_block_instructions`
+    /// track only the TOP-LEVEL block walk, so for a NESTED `call_closure`
+    /// (inside an if/case/guard arm) this check would read an unrelated
+    /// top-level instruction (audit zirb-1--01, the secondary `isTailReturnOf`
+    /// hazard). Guard by confirming the top-level instruction at
+    /// `current_instr_index` is itself the `call_closure` defining `local`; a
+    /// nested call fails that check and is never treated as a tail return (its
+    /// branch yields through the if-else merge, not a function `ret`, so the
+    /// musttail rewrite would be unsound there anyway).
     fn isTailReturnOf(self: *const ZirDriver, local: ir.LocalId) bool {
-        const next_idx = @as(usize, self.current_instr_index) + 1;
+        const cur_idx = @as(usize, self.current_instr_index);
+        if (cur_idx >= self.current_block_instructions.len) return false;
+        const here = self.current_block_instructions[cur_idx];
+        if (here != .call_closure or here.call_closure.dest != local) return false;
+        const next_idx = cur_idx + 1;
         if (next_idx >= self.current_block_instructions.len) return false;
         return switch (self.current_block_instructions[next_idx]) {
             .ret => |r| r.value != null and r.value.? == local,
@@ -8830,7 +8853,7 @@ pub const ZirDriver = struct {
                 // It could be either a bare function pointer or a closure struct
                 // with {call_fn, env}. Use Kernel.callCallableN for dispatch.
                 if (callee_is_param) {
-                    if (self.getCallSiteSpecialization()) |spec| {
+                    if (self.getCallSiteSpecialization(cc.callee)) |spec| {
                         switch (spec.decision) {
                             .direct_call, .contified => {
                                 if (spec.lambda_set.isSingleton()) {
@@ -8936,7 +8959,7 @@ pub const ZirDriver = struct {
                     }
                 }
 
-                if (self.getCallSiteSpecialization()) |spec| {
+                if (self.getCallSiteSpecialization(cc.callee)) |spec| {
                     switch (spec.decision) {
                         .unreachable_call => {
                             // Fall through to dynamic dispatch. The unreachable
