@@ -2276,7 +2276,7 @@ fn compileBinaryCheck(
         if (pat.?.* != .binary_match) continue;
 
         const segments = pat.?.binary_match.segments;
-        const min_byte_size = computeBinaryMinByteSize(segments);
+        const min_byte_size = try computeBinaryMinByteSize(segments);
 
         const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
         var success_rows: std.ArrayList(PatternRow) = .empty;
@@ -2316,11 +2316,20 @@ fn compileBinaryCheck(
     return chain;
 }
 
+/// Largest binary-pattern width (in bytes) representable downstream — the
+/// IR's `BinOffset.static` is a `u32`. Sizes are accumulated in `u64` and
+/// checked against this so a hostile `size(n)` literal (n up to 2^32-1)
+/// cannot wrap the accumulator or panic the compiler (audit ir-1--07).
+const max_binary_pattern_bytes: u64 = std.math.maxInt(u32);
+
 /// Compute the minimum byte size required by a binary pattern's segments.
 /// Sub-byte integer/float types accumulate bit-wise and round up; string
-/// segments with literal sizes contribute their byte length.
-fn computeBinaryMinByteSize(segments: []const BinaryMatchSegment) u32 {
-    var min_bits: u32 = 0;
+/// segments with literal sizes contribute their byte length. All arithmetic
+/// is performed in `u64`; a pattern whose minimum width exceeds
+/// `max_binary_pattern_bytes` is rejected with a diagnostic rather than
+/// overflowing a `u32` (audit ir-1--07).
+fn computeBinaryMinByteSize(segments: []const BinaryMatchSegment) !u32 {
+    var min_bits: u64 = 0;
     for (segments) |seg| {
         switch (seg.type_spec) {
             .default => min_bits += 8,
@@ -2330,7 +2339,7 @@ fn computeBinaryMinByteSize(segments: []const BinaryMatchSegment) u32 {
                 if (min_bits % 8 != 0) min_bits = (min_bits + 7) / 8 * 8;
                 if (seg.size) |sz| {
                     switch (sz) {
-                        .literal => |n| min_bits += n * 8,
+                        .literal => |n| min_bits += @as(u64, n) * 8,
                         .variable => {},
                     }
                 }
@@ -2339,8 +2348,11 @@ fn computeBinaryMinByteSize(segments: []const BinaryMatchSegment) u32 {
             .utf16 => min_bits += 16,
             .utf32 => min_bits += 32,
         }
+        if (min_bits > max_binary_pattern_bytes * 8) return error.BinaryPatternTooLarge;
     }
-    return (min_bits + 7) / 8;
+    const min_bytes = (min_bits + 7) / 8;
+    if (min_bytes > max_binary_pattern_bytes) return error.BinaryPatternTooLarge;
+    return @intCast(min_bytes);
 }
 
 fn literalEquals(a: LiteralValue, b: LiteralValue) bool {

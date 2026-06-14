@@ -1477,6 +1477,7 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
         .bin_match_prefix => |value| .{ .bin_match_prefix = .{
             .dest = value.dest,
             .source = value.source,
+            .offset = value.offset,
             .expected = try cloneBytes(allocator, value.expected),
         } },
         .reuse_alloc => |value| .{ .reuse_alloc = .{
@@ -2711,12 +2712,156 @@ pub const BinReadUtf8 = struct {
 pub const BinMatchPrefix = struct {
     dest: LocalId,
     source: LocalId,
+    /// Byte offset at which the prefix is compared. A string-literal
+    /// segment is not always the first segment of a pattern, so the
+    /// comparison must start at the segment's true position rather than
+    /// always at byte 0 (audit ir-1--01).
+    offset: BinOffset,
     expected: []const u8,
 };
 
 pub const BinOffset = union(enum) {
     static: u32,
     dynamic: LocalId,
+};
+
+/// Largest binary-pattern segment size or total pattern width permitted
+/// before the IR builder raises a diagnostic instead of overflowing the
+/// offset arithmetic. A pattern wider than 2^32-1 bytes cannot be
+/// expressed by `BinOffset.static` (a `u32`) and is, in any case, a
+/// pathological/hostile input rather than a real protocol grammar. We
+/// compute all running offsets in `u64` and check against this ceiling so
+/// user-controlled `size(n)` literals can never wrap a `u32` or panic the
+/// compiler (audit ir-1--07).
+const max_binary_pattern_bytes: u64 = std.math.maxInt(u32);
+
+/// Tracks the running read position while lowering a binary pattern's
+/// segments. The position ALWAYS advances after every segment — fixed
+/// AND variable/dynamic alike — so each subsequent segment reads from the
+/// correctly-advanced offset. This is the single source of truth for
+/// binary-pattern offset advancement, shared by both the function-clause
+/// (`emitBinaryBindings`) and case-expression (`emitBinarySegmentExtractions`)
+/// lowering paths, which previously each carried an identical broken model
+/// that stopped advancing after the first variable-size segment (audit
+/// ir-1--01 / ir-2--02).
+///
+/// While no dynamic-size segment has been seen the offset is a compile-time
+/// constant (`static_bytes` whole bytes plus `bit_offset` sub-byte bits).
+/// Once a runtime-sized segment (`String-size(var)`, `utf8`) is consumed
+/// the accumulated constant is folded into a runtime local (`dynamic_local`)
+/// and every later advance emits `const_int` + `add` to produce a fresh
+/// running-offset local. All arithmetic is `u64` with explicit overflow
+/// diagnostics (audit ir-1--07).
+const BinOffsetTracker = struct {
+    /// Whole bytes consumed so far; valid while `!is_dynamic`.
+    static_bytes: u64 = 0,
+    /// Sub-byte bits consumed within the current byte (0..7); valid while
+    /// `!is_dynamic` (a dynamic-size segment always lands on a byte
+    /// boundary, so the tracker is byte-aligned before going dynamic).
+    bit_offset: u8 = 0,
+    /// Once true, the running BYTE offset lives in `dynamic_local` and the
+    /// static fields are no longer consulted.
+    is_dynamic: bool = false,
+    dynamic_local: LocalId = 0,
+
+    /// The `BinOffset` at which the NEXT segment should be read. Callers
+    /// reading a byte-aligned value (default/multi-byte int, float, slice,
+    /// utf8) must call `flushBits` first; sub-byte reads consult
+    /// `bitOffsetInByte` for the intra-byte shift.
+    fn current(self: *const BinOffsetTracker) !BinOffset {
+        if (self.is_dynamic) return .{ .dynamic = self.dynamic_local };
+        if (self.static_bytes > max_binary_pattern_bytes) return error.BinaryPatternTooLarge;
+        return .{ .static = @intCast(self.static_bytes) };
+    }
+
+    /// Sub-byte bit offset within the current byte (0..7). Only meaningful
+    /// in the static phase; a dynamic offset is always byte-aligned.
+    fn bitOffsetInByte(self: *const BinOffsetTracker) u8 {
+        return self.bit_offset;
+    }
+
+    /// Advance past any pending sub-byte bits to the next byte boundary.
+    /// Required before every byte-aligned read so a sub-byte segment
+    /// preceding a float/string/utf8/multi-byte-int segment does not leave
+    /// the read mis-positioned (audit ir-1--01: only the integer arm used
+    /// to flush).
+    fn flushBits(self: *BinOffsetTracker, builder: *IrBuilder) !void {
+        if (self.bit_offset == 0) return;
+        self.bit_offset = 0;
+        try self.advanceBytes(builder, 1);
+    }
+
+    /// Advance by `byte_count` whole bytes. Works in BOTH the static and
+    /// dynamic phases — the prior code guarded every advance with
+    /// `if (!offset_is_dynamic)`, which is exactly why offsets froze after
+    /// the first variable-size segment (audit ir-1--01 / ir-2--02).
+    fn advanceBytes(self: *BinOffsetTracker, builder: *IrBuilder, byte_count: u64) !void {
+        if (byte_count == 0) return;
+        if (!self.is_dynamic) {
+            self.static_bytes = std.math.add(u64, self.static_bytes, byte_count) catch
+                return error.BinaryPatternTooLarge;
+            if (self.static_bytes > max_binary_pattern_bytes) return error.BinaryPatternTooLarge;
+            return;
+        }
+        if (byte_count > max_binary_pattern_bytes) return error.BinaryPatternTooLarge;
+        const delta_local = builder.next_local;
+        builder.next_local += 1;
+        try builder.current_instrs.append(builder.allocator, .{
+            .const_int = .{ .dest = delta_local, .value = @intCast(byte_count) },
+        });
+        const new_offset = builder.next_local;
+        builder.next_local += 1;
+        try builder.current_instrs.append(builder.allocator, .{
+            .binary_op = .{ .dest = new_offset, .op = .add, .lhs = self.dynamic_local, .rhs = delta_local },
+        });
+        self.dynamic_local = new_offset;
+    }
+
+    /// Advance by a number of sub-byte bits (a sub-byte integer segment).
+    /// Carries full bytes into the byte offset. Only used in the static
+    /// phase; sub-byte segments after a dynamic boundary are not supported
+    /// by the single-byte runtime reader and are rejected by the caller.
+    fn advanceBits(self: *BinOffsetTracker, builder: *IrBuilder, bits: u16) !void {
+        std.debug.assert(!self.is_dynamic);
+        const total: u32 = @as(u32, self.bit_offset) + bits;
+        const whole_bytes: u64 = total / 8;
+        self.bit_offset = @intCast(total % 8);
+        try self.advanceBytes(builder, whole_bytes);
+    }
+
+    /// Advance by a runtime length held in `len_local` (a variable-size
+    /// `String-size(var)` or a utf8 codepoint's byte length). Transitions
+    /// the tracker to the dynamic phase, folding the accumulated static
+    /// offset (which is byte-aligned — callers flush bits first) into the
+    /// new running offset local, then adds `len_local`. In the dynamic
+    /// phase it simply adds `len_local` to the prior running offset, so a
+    /// SECOND variable-size segment also advances correctly (audit
+    /// ir-2--02).
+    fn advanceDynamic(self: *BinOffsetTracker, builder: *IrBuilder, len_local: LocalId) !void {
+        std.debug.assert(self.bit_offset == 0);
+        if (!self.is_dynamic) {
+            if (self.static_bytes > max_binary_pattern_bytes) return error.BinaryPatternTooLarge;
+            const base_local = builder.next_local;
+            builder.next_local += 1;
+            try builder.current_instrs.append(builder.allocator, .{
+                .const_int = .{ .dest = base_local, .value = @intCast(self.static_bytes) },
+            });
+            const new_offset = builder.next_local;
+            builder.next_local += 1;
+            try builder.current_instrs.append(builder.allocator, .{
+                .binary_op = .{ .dest = new_offset, .op = .add, .lhs = base_local, .rhs = len_local },
+            });
+            self.dynamic_local = new_offset;
+            self.is_dynamic = true;
+            return;
+        }
+        const new_offset = builder.next_local;
+        builder.next_local += 1;
+        try builder.current_instrs.append(builder.allocator, .{
+            .binary_op = .{ .dest = new_offset, .op = .add, .lhs = self.dynamic_local, .rhs = len_local },
+        });
+        self.dynamic_local = new_offset;
+    }
 };
 
 /// Flavor of retain. Each kind selects a different runtime helper at
@@ -5928,17 +6073,7 @@ pub const IrBuilder = struct {
 
         const single_clause = [_]hir_mod.Clause{clause.*};
         self.next_local = computeMaxBindingLocalForClauses(single_clause[0..]);
-        try self.emitTupleBindings(clause);
-        try self.emitStructBindings(clause);
-        try self.emitBinaryBindings(clause);
-        try self.emitMapBindings(clause);
-        const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
-        // Phase 3.b: skip the implicit trailing `ret` when the body already
-        // diverges (e.g. its tail is a propagating `raise` lowered to
-        // `ret_raise`), so no unreachable `ret` follows the error-return.
-        if (!self.currentInstrsEndInTerminator()) {
-            try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
-        }
+        try self.emitClauseBindingsAndBody(clause);
         const entry_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
 
         const raw_name = if (group.name < self.interner.strings.items.len)
@@ -6188,18 +6323,10 @@ pub const IrBuilder = struct {
         var uses_decision_tree = false;
 
         if (group.clauses.len == 1) {
-            // Single clause — no dispatch needed
-            // Emit tuple/struct/binary/map bindings if present
-            try self.emitTupleBindings(first_clause);
-            try self.emitStructBindings(first_clause);
-            try self.emitBinaryBindings(first_clause);
-            try self.emitMapBindings(first_clause);
-            const result_local = try self.lowerBlockExpecting(first_clause.body, first_clause.return_type);
-            // Phase 3.b: skip the trailing `ret` when the body already
-            // diverges (its tail is a propagating `raise` -> `ret_raise`).
-            if (!self.currentInstrsEndInTerminator()) {
-                try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
-            }
+            // Single clause — no dispatch needed. Emit tuple/struct/binary/map
+            // bindings and the body; a binary pattern's length/prefix checks
+            // gate the body via a guard + match_fail (audit ir-1--02).
+            try self.emitClauseBindingsAndBody(first_clause);
         } else if (self.canSwitchDispatch(group)) |switch_param| {
             // Emit switch_return for integer literal dispatch
             var return_cases: std.ArrayList(ReturnCase) = .empty;
@@ -6332,17 +6459,50 @@ pub const IrBuilder = struct {
 
                 const saved = self.current_instrs;
                 self.current_instrs = .empty;
-                if (!is_nil_clause) {
-                    // The struct clause might destructure other params via
-                    // tuple/struct/binary/map patterns. Only emit those
-                    // bindings; the optional-param itself is handled by
-                    // the ZIR redirect rather than an explicit binding.
+
+                // The struct clause might destructure other params via
+                // tuple/struct/binary/map patterns. When it carries a binary
+                // pattern, its length/prefix checks gate the branch body
+                // through a guard + match_fail so a non-matching binary
+                // argument fails the match rather than binding zeros (audit
+                // ir-1--02); in that case the guarded body emits its own
+                // `ret`, so the dispatch's trailing ret is suppressed
+                // (`result = null`).
+                var bin_data: std.ArrayList(BinaryParamData) = .empty;
+                const bin_condition: ?LocalId = if (is_nil_clause)
+                    null
+                else
+                    try self.emitBinaryMatchConditions(&clause, &bin_data);
+
+                var body_result: ?LocalId = null;
+                if (bin_condition) |condition| {
+                    const inner_saved = self.current_instrs;
+                    self.current_instrs = .empty;
                     try self.emitTupleBindings(&clause);
                     try self.emitStructBindings(&clause);
-                    try self.emitBinaryBindings(&clause);
+                    try self.emitBinaryExtractions(&clause, bin_data.items);
                     try self.emitMapBindings(&clause);
+                    const inner_result = try self.lowerBlockExpecting(clause.body, clause.return_type);
+                    if (!self.currentInstrsEndInTerminator()) {
+                        try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = inner_result } });
+                    }
+                    const guarded_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                    self.current_instrs = inner_saved;
+                    try self.current_instrs.append(self.allocator, .{
+                        .guard_block = .{ .condition = condition, .body = guarded_body },
+                    });
+                    try self.current_instrs.append(self.allocator, .{
+                        .match_fail = .{ .message = "no matching clause", .kind = .match_clause },
+                    });
+                } else {
+                    if (!is_nil_clause) {
+                        try self.emitTupleBindings(&clause);
+                        try self.emitStructBindings(&clause);
+                        try self.emitBinaryExtractions(&clause, bin_data.items);
+                        try self.emitMapBindings(&clause);
+                    }
+                    body_result = try self.lowerBlockExpecting(clause.body, clause.return_type);
                 }
-                const body_result = try self.lowerBlockExpecting(clause.body, clause.return_type);
                 const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
 
@@ -7719,66 +7879,233 @@ pub const IrBuilder = struct {
     }
 
     /// Emit binary extraction instructions to populate binary binding locals.
-    fn emitBinaryBindings(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
-        // Find params that have binary patterns
+    /// Records the runtime data local for one binary-pattern parameter so
+    /// the match-condition and extraction passes share a single `param_get`.
+    const BinaryParamData = struct {
+        param_index: u32,
+        data_local: LocalId,
+    };
+
+    /// Compute the minimum byte size a binary pattern requires, in `u64`
+    /// with an explicit overflow diagnostic so a hostile `size(n)` literal
+    /// (n up to 2^32-1) cannot wrap the accumulator or panic the compiler
+    /// (audit ir-1--07). Mirrors `hir.computeBinaryMinByteSize`.
+    fn binaryPatternMinBytes(self: *IrBuilder, segments: []const hir_mod.BinaryMatchSegment) !u32 {
+        var min_bits: u64 = 0;
+        for (segments) |seg| {
+            switch (seg.type_spec) {
+                .default => min_bits += 8,
+                .integer => |i| min_bits += i.bits,
+                .float => |f| min_bits += f.bits,
+                .string => {
+                    if (min_bits % 8 != 0) min_bits = (min_bits + 7) / 8 * 8;
+                    if (seg.string_literal) |sl| {
+                        min_bits += @as(u64, self.interner.get(sl).len) * 8;
+                    } else if (seg.size) |sz| {
+                        switch (sz) {
+                            .literal => |n| min_bits += @as(u64, n) * 8,
+                            .variable => {},
+                        }
+                    }
+                },
+                .utf8 => min_bits += 8,
+                .utf16 => min_bits += 16,
+                .utf32 => min_bits += 32,
+            }
+            if (min_bits > max_binary_pattern_bytes * 8) return error.BinaryPatternTooLarge;
+        }
+        const min_bytes = (min_bits + 7) / 8;
+        if (min_bytes > max_binary_pattern_bytes) return error.BinaryPatternTooLarge;
+        return @intCast(min_bytes);
+    }
+
+    /// Emit the MATCH CONDITIONS for every binary-pattern parameter of a
+    /// clause: a `param_get` plus a `bin_len_check` and one offset-aware
+    /// `bin_match_prefix` per string-literal segment. Returns the
+    /// conjunction of all of those checks (or `null` when the clause has no
+    /// binary params / no checks), so the caller can wrap the extractions
+    /// and body in a `guard_block` whose failure edge propagates a match
+    /// failure rather than binding zeroed garbage (audit ir-1--02). Each
+    /// binary param's data local is recorded in `out_data` so
+    /// `emitBinaryExtractions` reuses the same `param_get`.
+    fn emitBinaryMatchConditions(
+        self: *IrBuilder,
+        clause: *const hir_mod.Clause,
+        out_data: *std.ArrayList(BinaryParamData),
+    ) !?LocalId {
+        var condition: ?LocalId = null;
         for (clause.params, 0..) |param, param_idx_usize| {
             const param_idx: u32 = @intCast(param_idx_usize);
             const pat = param.pattern orelse continue;
             if (pat.* != .binary_match) continue;
 
-            // Get param local
             const data_local = self.next_local;
             self.next_local += 1;
             try self.current_instrs.append(self.allocator, .{
                 .param_get = .{ .dest = data_local, .index = param_idx },
             });
+            try out_data.append(self.allocator, .{ .param_index = param_idx, .data_local = data_local });
 
-            // Calculate min byte size and emit length check
-            // For sub-byte types, accumulate bits then convert to bytes
-            var min_bits: u32 = 0;
-            for (pat.binary_match.segments) |seg| {
-                switch (seg.type_spec) {
-                    .default => min_bits += 8,
-                    .integer => |i| min_bits += i.bits,
-                    .float => |f| min_bits += f.bits,
-                    .string => {
-                        // Flush any partial byte first
-                        if (min_bits % 8 != 0) min_bits = (min_bits + 7) / 8 * 8;
-                        if (seg.string_literal) |sl| {
-                            min_bits += @as(u32, @intCast(self.interner.get(sl).len)) * 8;
-                        } else if (seg.size) |sz| {
-                            switch (sz) {
-                                .literal => |n| min_bits += n * 8,
-                                .variable => {},
-                            }
-                        }
-                    },
-                    .utf8 => min_bits += 8,
-                    .utf16 => min_bits += 16,
-                    .utf32 => min_bits += 32,
-                }
-            }
-            const min_bytes = (min_bits + 7) / 8;
+            const min_bytes = try self.binaryPatternMinBytes(pat.binary_match.segments);
             if (min_bytes > 0) {
                 const len_check = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
                     .bin_len_check = .{ .dest = len_check, .scrutinee = data_local, .min_len = min_bytes },
                 });
-                // Wrap remaining extractions in a guard block
-                // (for single-clause we just emit inline — the check ensures safety)
+                condition = if (condition) |c| try self.emitAnd(c, len_check) else len_check;
             }
 
-            // Track running byte and bit offsets
-            var byte_offset: u32 = 0;
-            var bit_offset: u8 = 0; // bits consumed within current byte (for sub-byte types)
-            var offset_is_dynamic = false;
-            var dynamic_offset_local: LocalId = 0;
+            // Offset-aware prefix checks. A string-literal segment is
+            // validated at its true byte position, not always at byte 0
+            // (audit ir-1--01). The conditions pass computes prefix offsets
+            // PURELY at compile time (no IR emission) so it never duplicates
+            // the extraction pass's reads. A prefix that follows a
+            // runtime-sized segment (its byte position is not statically
+            // known) is rejected with a diagnostic rather than silently
+            // checked at the wrong offset.
+            const prefix_cond = try self.emitBinaryPrefixChecks(pat.binary_match.segments, data_local);
+            if (prefix_cond) |pc| {
+                condition = if (condition) |c| try self.emitAnd(c, pc) else pc;
+            }
+        }
+        return condition;
+    }
 
+    /// Emit one offset-aware `bin_match_prefix` per string-literal segment,
+    /// returning their conjunction (or `null` when the pattern has no
+    /// literals). Prefix byte offsets are computed at compile time with no
+    /// IR emission, so this never duplicates the extraction pass. A literal
+    /// whose byte position is not statically known — because a
+    /// runtime-sized segment (`String-size(var)` / `utf8`) precedes it — is
+    /// rejected, never validated at the wrong position.
+    fn emitBinaryPrefixChecks(
+        self: *IrBuilder,
+        segments: []const hir_mod.BinaryMatchSegment,
+        data_local: LocalId,
+    ) !?LocalId {
+        var condition: ?LocalId = null;
+        var static_byte: u64 = 0;
+        var static_bit: u8 = 0;
+        var statically_known = true;
+        for (segments) |seg| {
+            if (seg.string_literal) |sl| {
+                if (!statically_known) return error.BinaryPatternPrefixAfterDynamic;
+                if (static_bit != 0) {
+                    static_byte += 1;
+                    static_bit = 0;
+                }
+                if (static_byte > max_binary_pattern_bytes) return error.BinaryPatternTooLarge;
+                const prefix_str = self.interner.get(sl);
+                const prefix_check = self.next_local;
+                self.next_local += 1;
+                try self.current_instrs.append(self.allocator, .{
+                    .bin_match_prefix = .{
+                        .dest = prefix_check,
+                        .source = data_local,
+                        .offset = .{ .static = @intCast(static_byte) },
+                        .expected = prefix_str,
+                    },
+                });
+                condition = if (condition) |c| try self.emitAnd(c, prefix_check) else prefix_check;
+                static_byte += prefix_str.len;
+                continue;
+            }
+            // Advance the compile-time offset past a non-literal segment, or
+            // mark the offset no-longer-statically-known once a runtime-sized
+            // segment is seen (so a later literal is rejected, not mis-placed).
+            switch (seg.type_spec) {
+                .default => {
+                    if (static_bit != 0) {
+                        static_byte += 1;
+                        static_bit = 0;
+                    }
+                    static_byte += 1;
+                },
+                .integer => |int_spec| {
+                    if (int_spec.bits < 8) {
+                        const total: u32 = static_bit + int_spec.bits;
+                        static_byte += total / 8;
+                        static_bit = @intCast(total % 8);
+                    } else {
+                        if (static_bit != 0) {
+                            static_byte += 1;
+                            static_bit = 0;
+                        }
+                        static_byte += (@as(u64, int_spec.bits) + 7) / 8;
+                    }
+                },
+                .float => |float_spec| {
+                    if (static_bit != 0) {
+                        static_byte += 1;
+                        static_bit = 0;
+                    }
+                    static_byte += @as(u64, float_spec.bits) / 8;
+                },
+                .string => {
+                    if (static_bit != 0) {
+                        static_byte += 1;
+                        static_bit = 0;
+                    }
+                    if (seg.size) |size| switch (size) {
+                        .literal => |n| static_byte += n,
+                        .variable => statically_known = false,
+                    } else {
+                        // Unsized "rest" consumes the remainder; nothing can
+                        // statically follow it.
+                        statically_known = false;
+                    }
+                },
+                .utf8 => {
+                    if (static_bit != 0) {
+                        static_byte += 1;
+                        static_bit = 0;
+                    }
+                    statically_known = false;
+                },
+                .utf16, .utf32 => statically_known = false,
+            }
+            if (static_byte > max_binary_pattern_bytes) return error.BinaryPatternTooLarge;
+        }
+        return condition;
+    }
+
+    /// Emit the read instructions (`bin_read_int`/`bin_read_float`/
+    /// `bin_slice`/`bin_read_utf8`) for every binary-pattern parameter,
+    /// reusing the data locals recorded by `emitBinaryMatchConditions`.
+    /// Uses the shared `BinOffsetTracker` so EVERY segment advances the
+    /// offset (audit ir-1--01 / ir-2--02).
+    fn emitBinaryExtractions(
+        self: *IrBuilder,
+        clause: *const hir_mod.Clause,
+        data: []const BinaryParamData,
+    ) !void {
+        for (clause.params, 0..) |param, param_idx_usize| {
+            const param_idx: u32 = @intCast(param_idx_usize);
+            const pat = param.pattern orelse continue;
+            if (pat.* != .binary_match) continue;
+
+            const data_local = blk: {
+                for (data) |d| {
+                    if (d.param_index == param_idx) break :blk d.data_local;
+                }
+                // The conditions pass always records every binary param, so
+                // a missing entry is an internal inconsistency.
+                return error.BinaryParamDataMissing;
+            };
+
+            var tracker: BinOffsetTracker = .{};
             for (pat.binary_match.segments, 0..) |seg, seg_idx_usize| {
                 const seg_idx: u32 = @intCast(seg_idx_usize);
 
-                // Find the binding for this segment (if any)
+                // String-literal prefix segments only advance the offset
+                // here; their value check was emitted by the conditions pass.
+                if (seg.string_literal) |sl| {
+                    try tracker.flushBits(self);
+                    try tracker.advanceBytes(self, self.interner.get(sl).len);
+                    continue;
+                }
+
                 var binding_local: ?LocalId = null;
                 for (clause.binary_bindings) |binding| {
                     if (binding.param_index == param_idx and binding.segment_index == seg_idx) {
@@ -7787,205 +8114,275 @@ pub const IrBuilder = struct {
                     }
                 }
 
-                // Handle string literal prefix segments
-                if (seg.string_literal) |sl| {
-                    const prefix_str = self.interner.get(sl);
-                    const prefix_check = self.next_local;
-                    self.next_local += 1;
+                try self.lowerBinarySegment(&tracker, .{ .clause = clause }, seg, data_local, binding_local);
+            }
+        }
+    }
+
+    /// Emit all of a single-clause function's parameter bindings
+    /// (tuple/struct/binary/map), its body, and the trailing `ret`, with the
+    /// binary pattern's length/prefix checks gating the whole thing.
+    ///
+    /// When the clause has binary-pattern parameters, the extractions, the
+    /// other-parameter bindings, the body, and the `ret` are wrapped in a
+    /// `guard_block` conditioned on the conjunction of every `bin_len_check`
+    /// and `bin_match_prefix`; a `match_fail{.match_clause}` follows so a
+    /// non-matching argument (too short / wrong prefix) raises the
+    /// no-matching-clause error instead of binding zeroed garbage (audit
+    /// ir-1--02). Without binary params it is the plain inline sequence.
+    fn emitClauseBindingsAndBody(self: *IrBuilder, clause: *const hir_mod.Clause) !void {
+        var bin_data: std.ArrayList(BinaryParamData) = .empty;
+        const bin_condition = try self.emitBinaryMatchConditions(clause, &bin_data);
+
+        if (bin_condition == null) {
+            // No binary checks: emit bindings + body inline.
+            try self.emitTupleBindings(clause);
+            try self.emitStructBindings(clause);
+            try self.emitBinaryExtractions(clause, bin_data.items);
+            try self.emitMapBindings(clause);
+            const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
+            // Phase 3.b: skip the implicit trailing `ret` when the body
+            // already diverges (its tail is a propagating raise -> ret_raise).
+            if (!self.currentInstrsEndInTerminator()) {
+                try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+            }
+            return;
+        }
+
+        // Wrap the extractions + remaining bindings + body + ret in a guard
+        // so a failed binary match cannot fall through with zeroed bindings.
+        const saved = self.current_instrs;
+        self.current_instrs = .empty;
+        try self.emitTupleBindings(clause);
+        try self.emitStructBindings(clause);
+        try self.emitBinaryExtractions(clause, bin_data.items);
+        try self.emitMapBindings(clause);
+        const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
+        if (!self.currentInstrsEndInTerminator()) {
+            try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+        }
+        const guarded_body = try self.current_instrs.toOwnedSlice(self.allocator);
+        self.current_instrs = saved;
+        try self.current_instrs.append(self.allocator, .{
+            .guard_block = .{ .condition = bin_condition.?, .body = guarded_body },
+        });
+        try self.current_instrs.append(self.allocator, .{
+            .match_fail = .{ .message = "no matching clause", .kind = .match_clause },
+        });
+    }
+
+    /// Lower ONE binary segment to its read instruction(s) and advance the
+    /// shared offset tracker. The single source of per-segment lowering for
+    /// both the function-clause and case-expression paths.
+    fn lowerBinarySegment(
+        self: *IrBuilder,
+        tracker: *BinOffsetTracker,
+        resolver: BinarySizeResolver,
+        seg: hir_mod.BinaryMatchSegment,
+        data_local: LocalId,
+        binding_local: ?LocalId,
+    ) !void {
+        switch (seg.type_spec) {
+            .default => {
+                try tracker.flushBits(self);
+                const offset = try tracker.current();
+                if (binding_local) |dest| {
                     try self.current_instrs.append(self.allocator, .{
-                        .bin_match_prefix = .{
-                            .dest = prefix_check,
+                        .bin_read_int = .{
+                            .dest = dest,
                             .source = data_local,
-                            .expected = prefix_str,
+                            .offset = offset,
+                            .bits = 8,
+                            .signed = false,
+                            .endianness = .big,
                         },
                     });
-                    byte_offset += @intCast(prefix_str.len);
-                    continue;
                 }
-
-                const current_offset: BinOffset = if (offset_is_dynamic)
-                    .{ .dynamic = dynamic_offset_local }
-                else
-                    .{ .static = byte_offset };
-
-                switch (seg.type_spec) {
-                    .default => {
-                        // Flush any partial bit offset to byte boundary
-                        if (bit_offset > 0) {
-                            byte_offset += 1;
-                            bit_offset = 0;
-                        }
-                        if (binding_local) |dest| {
-                            try self.current_instrs.append(self.allocator, .{
-                                .bin_read_int = .{
-                                    .dest = dest,
-                                    .source = data_local,
-                                    .offset = current_offset,
-                                    .bits = 8,
-                                    .signed = false,
-                                    .endianness = .big,
-                                },
-                            });
-                        }
-                        if (!offset_is_dynamic) byte_offset += 1;
-                    },
-                    .integer => |int_spec| {
-                        if (int_spec.bits < 8) {
-                            // Sub-byte: track bit offset, compute shift
-                            // Bits are extracted MSB-first within a byte
-                            const shift: u8 = 8 - bit_offset - @as(u8, @intCast(int_spec.bits));
-                            if (binding_local) |dest| {
-                                try self.current_instrs.append(self.allocator, .{
-                                    .bin_read_int = .{
-                                        .dest = dest,
-                                        .source = data_local,
-                                        .offset = current_offset,
-                                        .bits = int_spec.bits,
-                                        .signed = int_spec.signed,
-                                        .endianness = seg.endianness,
-                                        .bit_offset = shift,
-                                    },
-                                });
-                            }
-                            bit_offset += @intCast(int_spec.bits);
-                            if (bit_offset >= 8) {
-                                byte_offset += bit_offset / 8;
-                                bit_offset = bit_offset % 8;
-                            }
-                        } else {
-                            // Flush any partial bit offset
-                            if (bit_offset > 0) {
-                                byte_offset += 1;
-                                bit_offset = 0;
-                            }
-                            if (binding_local) |dest| {
-                                try self.current_instrs.append(self.allocator, .{
-                                    .bin_read_int = .{
-                                        .dest = dest,
-                                        .source = data_local,
-                                        .offset = current_offset,
-                                        .bits = int_spec.bits,
-                                        .signed = int_spec.signed,
-                                        .endianness = seg.endianness,
-                                    },
-                                });
-                            }
-                            if (!offset_is_dynamic) byte_offset += (int_spec.bits + 7) / 8;
-                        }
-                    },
-                    .float => |float_spec| {
-                        if (binding_local) |dest| {
-                            try self.current_instrs.append(self.allocator, .{
-                                .bin_read_float = .{
-                                    .dest = dest,
-                                    .source = data_local,
-                                    .offset = current_offset,
-                                    .bits = float_spec.bits,
-                                    .endianness = seg.endianness,
-                                },
-                            });
-                        }
-                        if (!offset_is_dynamic) byte_offset += float_spec.bits / 8;
-                    },
-                    .string => {
-                        if (seg.size) |size| {
-                            switch (size) {
-                                .literal => |n| {
-                                    if (binding_local) |dest| {
-                                        try self.current_instrs.append(self.allocator, .{
-                                            .bin_slice = .{
-                                                .dest = dest,
-                                                .source = data_local,
-                                                .offset = current_offset,
-                                                .length = .{ .static = n },
-                                            },
-                                        });
-                                    }
-                                    if (!offset_is_dynamic) byte_offset += n;
-                                },
-                                .variable => |var_name| {
-                                    // A `size(name)` whose `name` is not an
-                                    // earlier binary binding cannot be lowered
-                                    // correctly. Fail loudly rather than
-                                    // silently slicing at local 0 (ir-1--09).
-                                    const var_local = findBinaryVarLocal(clause, var_name) orelse
-                                        return error.BinarySizeVarUnresolved;
-                                    if (binding_local) |dest| {
-                                        try self.current_instrs.append(self.allocator, .{
-                                            .bin_slice = .{
-                                                .dest = dest,
-                                                .source = data_local,
-                                                .offset = current_offset,
-                                                .length = .{ .dynamic = var_local },
-                                            },
-                                        });
-                                    }
-                                    // After a dynamic-size segment, offset becomes dynamic
-                                    if (!offset_is_dynamic) {
-                                        // new_offset = byte_offset + var_local
-                                        const static_base = self.next_local;
-                                        self.next_local += 1;
-                                        try self.current_instrs.append(self.allocator, .{
-                                            .const_int = .{ .dest = static_base, .value = @intCast(byte_offset) },
-                                        });
-                                        dynamic_offset_local = self.next_local;
-                                        self.next_local += 1;
-                                        try self.current_instrs.append(self.allocator, .{
-                                            .binary_op = .{ .dest = dynamic_offset_local, .op = .add, .lhs = static_base, .rhs = var_local },
-                                        });
-                                        offset_is_dynamic = true;
-                                    }
-                                },
-                            }
-                        } else {
-                            // Rest of data
+                try tracker.advanceBytes(self, 1);
+            },
+            .integer => |int_spec| {
+                if (int_spec.bits < 8) {
+                    // Sub-byte fields are read MSB-first from a SINGLE byte;
+                    // the runtime reader (`readBitsU`) only touches one byte,
+                    // so a field that straddles a byte boundary cannot be
+                    // lowered by this scheme. Reject it with a diagnostic
+                    // instead of underflowing the `u8` shift (audit ir-1--07).
+                    if (tracker.is_dynamic) return error.BinaryPatternSubByteAfterDynamic;
+                    const bit_in_byte = tracker.bitOffsetInByte();
+                    if (bit_in_byte + int_spec.bits > 8) return error.BinaryPatternBitStraddle;
+                    const shift: u8 = 8 - bit_in_byte - @as(u8, @intCast(int_spec.bits));
+                    const offset = try tracker.current();
+                    if (binding_local) |dest| {
+                        try self.current_instrs.append(self.allocator, .{
+                            .bin_read_int = .{
+                                .dest = dest,
+                                .source = data_local,
+                                .offset = offset,
+                                .bits = int_spec.bits,
+                                .signed = int_spec.signed,
+                                .endianness = seg.endianness,
+                                .bit_offset = shift,
+                            },
+                        });
+                    }
+                    try tracker.advanceBits(self, int_spec.bits);
+                } else {
+                    try tracker.flushBits(self);
+                    const offset = try tracker.current();
+                    if (binding_local) |dest| {
+                        try self.current_instrs.append(self.allocator, .{
+                            .bin_read_int = .{
+                                .dest = dest,
+                                .source = data_local,
+                                .offset = offset,
+                                .bits = int_spec.bits,
+                                .signed = int_spec.signed,
+                                .endianness = seg.endianness,
+                            },
+                        });
+                    }
+                    try tracker.advanceBytes(self, (@as(u64, int_spec.bits) + 7) / 8);
+                }
+            },
+            .float => |float_spec| {
+                try tracker.flushBits(self);
+                const offset = try tracker.current();
+                if (binding_local) |dest| {
+                    try self.current_instrs.append(self.allocator, .{
+                        .bin_read_float = .{
+                            .dest = dest,
+                            .source = data_local,
+                            .offset = offset,
+                            .bits = float_spec.bits,
+                            .endianness = seg.endianness,
+                        },
+                    });
+                }
+                try tracker.advanceBytes(self, @as(u64, float_spec.bits) / 8);
+            },
+            .string => {
+                try tracker.flushBits(self);
+                if (seg.size) |size| {
+                    switch (size) {
+                        .literal => |n| {
+                            const offset = try tracker.current();
                             if (binding_local) |dest| {
                                 try self.current_instrs.append(self.allocator, .{
                                     .bin_slice = .{
                                         .dest = dest,
                                         .source = data_local,
-                                        .offset = current_offset,
-                                        .length = null,
+                                        .offset = offset,
+                                        .length = .{ .static = n },
                                     },
                                 });
                             }
-                        }
-                    },
-                    .utf8 => {
-                        if (binding_local) |dest| {
-                            const len_local = self.next_local;
-                            self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{
-                                .bin_read_utf8 = .{
-                                    .dest_codepoint = dest,
-                                    .dest_len = len_local,
-                                    .source = data_local,
-                                    .offset = current_offset,
-                                },
-                            });
-                            // UTF-8 is variable width — offset becomes dynamic
-                            if (!offset_is_dynamic) {
-                                const static_base = self.next_local;
-                                self.next_local += 1;
+                            try tracker.advanceBytes(self, n);
+                        },
+                        .variable => |var_name| {
+                            // A `size(name)` whose `name` is not an earlier
+                            // binary binding cannot be lowered correctly; fail
+                            // loudly rather than slicing at local 0 (ir-1--09).
+                            const var_local = resolver.resolve(var_name) orelse
+                                return error.BinarySizeVarUnresolved;
+                            const offset = try tracker.current();
+                            if (binding_local) |dest| {
                                 try self.current_instrs.append(self.allocator, .{
-                                    .const_int = .{ .dest = static_base, .value = @intCast(byte_offset) },
+                                    .bin_slice = .{
+                                        .dest = dest,
+                                        .source = data_local,
+                                        .offset = offset,
+                                        .length = .{ .dynamic = var_local },
+                                    },
                                 });
-                                dynamic_offset_local = self.next_local;
-                                self.next_local += 1;
-                                try self.current_instrs.append(self.allocator, .{
-                                    .binary_op = .{ .dest = dynamic_offset_local, .op = .add, .lhs = static_base, .rhs = len_local },
-                                });
-                                offset_is_dynamic = true;
                             }
-                        }
-                    },
-                    .utf16, .utf32 => {
-                        // TODO: implement utf16/utf32
-                    },
+                            // Advance past the variable-size segment so every
+                            // LATER segment reads from the right offset — the
+                            // core fix for audit ir-1--01 / ir-2--02.
+                            try tracker.advanceDynamic(self, var_local);
+                        },
+                    }
+                } else {
+                    // Unsized "rest of data": null length, distinct from an
+                    // explicit zero-length slice (audit ir-1--03). Nothing
+                    // can follow a rest segment, so no advance is needed.
+                    const offset = try tracker.current();
+                    if (binding_local) |dest| {
+                        try self.current_instrs.append(self.allocator, .{
+                            .bin_slice = .{
+                                .dest = dest,
+                                .source = data_local,
+                                .offset = offset,
+                                .length = null,
+                            },
+                        });
+                    }
                 }
-            }
+            },
+            .utf8 => {
+                try tracker.flushBits(self);
+                const offset = try tracker.current();
+                if (binding_local) |dest| {
+                    const len_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .bin_read_utf8 = .{
+                            .dest_codepoint = dest,
+                            .dest_len = len_local,
+                            .source = data_local,
+                            .offset = offset,
+                        },
+                    });
+                    // UTF-8 is variable width — advance by the runtime byte
+                    // length so later segments read correctly (audit ir-1--01:
+                    // an unbound utf8 segment used to skip the advance).
+                    try tracker.advanceDynamic(self, len_local);
+                } else {
+                    // An unbound utf8 segment (`_::utf8`) consumes a runtime
+                    // width, but with no binding there is no length local to
+                    // advance by, so any following segment cannot be
+                    // positioned. Reject rather than silently mis-aligning
+                    // every later segment (the prior code skipped the advance
+                    // entirely — audit ir-1--01).
+                    return error.BinaryPatternUnboundUtf8;
+                }
+            },
+            .utf16, .utf32 => return error.BinaryPatternUtf16Utf32Unsupported,
         }
     }
+
+    /// Resolves a binary segment `size(name)` reference to the local that
+    /// holds the value of an EARLIER segment named `name`. The two lowering
+    /// paths store earlier-segment bindings differently — a function clause
+    /// in `clause.binary_bindings`, a case arm in `arm.bindings` — so the
+    /// shared per-segment lowering takes whichever applies.
+    const BinarySizeResolver = union(enum) {
+        clause: *const hir_mod.Clause,
+        case_arms: []const hir_mod.CaseArm,
+
+        /// Returns the local for the earlier segment named `var_name`, or
+        /// `null` when no such segment binding exists. The caller fails the
+        /// compile loudly on `null` rather than defaulting to local 0 (which
+        /// silently sliced an unrelated value — audit ir-1--09).
+        fn resolve(self: BinarySizeResolver, var_name: ast.StringId) ?LocalId {
+            switch (self) {
+                .clause => |clause| {
+                    for (clause.binary_bindings) |binding| {
+                        if (binding.name == var_name) return binding.local_index;
+                    }
+                    return null;
+                },
+                .case_arms => |arms| {
+                    for (arms) |arm| {
+                        for (arm.bindings) |binding| {
+                            if (binding.kind == .binary_element and binding.name == var_name)
+                                return binding.local_index;
+                        }
+                    }
+                    return null;
+                },
+            }
+        }
+    };
 
     /// Resolve a binary segment `size(name)` reference to the local holding an
     /// EARLIER same-clause segment binding of that name. Returns `null` when
@@ -8000,25 +8397,37 @@ pub const IrBuilder = struct {
         return null;
     }
 
-    /// Emit binary segment extraction instructions for case expression bindings.
-    /// Iterates over the binary match segments, computes byte/bit offsets, and
-    /// emits bin_read_int/bin_read_float/bin_slice instructions targeting the
-    /// binding locals from the case arm's CaseBinding entries.
+    /// Emit binary segment EXTRACTION instructions for case-expression
+    /// bindings, using the shared `lowerBinarySegment` so the offset
+    /// advancement model is identical to the function-clause path (audit
+    /// ir-1--01 / ir-2--02: this path used to freeze offsets after the first
+    /// dynamic segment and silently no-op variable-size string segments).
+    ///
+    /// String-literal value checks are NOT emitted here — the caller emits
+    /// them via `emitBinaryPrefixChecks` at the guard's outer level so a
+    /// failed (possibly non-leading) prefix fails the match. This routine
+    /// only advances the tracker past literal segments.
     fn emitBinarySegmentExtractions(
         self: *IrBuilder,
         segments: []const hir_mod.BinaryMatchSegment,
         data_local: LocalId,
         case_arms: []const hir_mod.CaseArm,
     ) !void {
-        var byte_offset: u32 = 0;
-        var bit_offset: u8 = 0;
-        var offset_is_dynamic = false;
-        var dynamic_offset_local: LocalId = 0;
-
+        var tracker: BinOffsetTracker = .{};
         for (segments, 0..) |seg, seg_idx_usize| {
             const seg_idx: u32 = @intCast(seg_idx_usize);
 
-            // Find the binding local for this segment (if any) from case arm bindings
+            // String-literal prefix segments only advance the offset here;
+            // their value check is emitted by the caller's
+            // `emitBinaryPrefixChecks`.
+            if (seg.string_literal) |sl| {
+                try tracker.flushBits(self);
+                try tracker.advanceBytes(self, self.interner.get(sl).len);
+                continue;
+            }
+
+            // Find the binding local for this segment (if any) from case arm
+            // bindings.
             var binding_local: ?LocalId = null;
             for (case_arms) |arm| {
                 for (arm.bindings) |binding| {
@@ -8030,157 +8439,7 @@ pub const IrBuilder = struct {
                 if (binding_local != null) break;
             }
 
-            // Handle string literal prefix segments
-            if (seg.string_literal) |sl| {
-                const prefix_str = self.interner.get(sl);
-                byte_offset += @intCast(prefix_str.len);
-                continue;
-            }
-
-            const current_offset: BinOffset = if (offset_is_dynamic)
-                .{ .dynamic = dynamic_offset_local }
-            else
-                .{ .static = byte_offset };
-
-            switch (seg.type_spec) {
-                .default => {
-                    if (bit_offset > 0) {
-                        byte_offset += 1;
-                        bit_offset = 0;
-                    }
-                    if (binding_local) |dest| {
-                        try self.current_instrs.append(self.allocator, .{
-                            .bin_read_int = .{
-                                .dest = dest,
-                                .source = data_local,
-                                .offset = current_offset,
-                                .bits = 8,
-                                .signed = false,
-                                .endianness = .big,
-                            },
-                        });
-                    }
-                    if (!offset_is_dynamic) byte_offset += 1;
-                },
-                .integer => |int_spec| {
-                    if (int_spec.bits < 8) {
-                        const shift: u8 = 8 - bit_offset - @as(u8, @intCast(int_spec.bits));
-                        if (binding_local) |dest| {
-                            try self.current_instrs.append(self.allocator, .{
-                                .bin_read_int = .{
-                                    .dest = dest,
-                                    .source = data_local,
-                                    .offset = current_offset,
-                                    .bits = int_spec.bits,
-                                    .signed = int_spec.signed,
-                                    .endianness = seg.endianness,
-                                    .bit_offset = shift,
-                                },
-                            });
-                        }
-                        bit_offset += @intCast(int_spec.bits);
-                        if (bit_offset >= 8) {
-                            byte_offset += bit_offset / 8;
-                            bit_offset = bit_offset % 8;
-                        }
-                    } else {
-                        if (bit_offset > 0) {
-                            byte_offset += 1;
-                            bit_offset = 0;
-                        }
-                        if (binding_local) |dest| {
-                            try self.current_instrs.append(self.allocator, .{
-                                .bin_read_int = .{
-                                    .dest = dest,
-                                    .source = data_local,
-                                    .offset = current_offset,
-                                    .bits = int_spec.bits,
-                                    .signed = int_spec.signed,
-                                    .endianness = seg.endianness,
-                                },
-                            });
-                        }
-                        if (!offset_is_dynamic) byte_offset += (int_spec.bits + 7) / 8;
-                    }
-                },
-                .float => |float_spec| {
-                    if (binding_local) |dest| {
-                        try self.current_instrs.append(self.allocator, .{
-                            .bin_read_float = .{
-                                .dest = dest,
-                                .source = data_local,
-                                .offset = current_offset,
-                                .bits = float_spec.bits,
-                                .endianness = seg.endianness,
-                            },
-                        });
-                    }
-                    if (!offset_is_dynamic) byte_offset += float_spec.bits / 8;
-                },
-                .string => {
-                    if (seg.size) |size| {
-                        switch (size) {
-                            .literal => |n| {
-                                if (binding_local) |dest| {
-                                    try self.current_instrs.append(self.allocator, .{
-                                        .bin_slice = .{
-                                            .dest = dest,
-                                            .source = data_local,
-                                            .offset = current_offset,
-                                            .length = .{ .static = n },
-                                        },
-                                    });
-                                }
-                                if (!offset_is_dynamic) byte_offset += n;
-                            },
-                            .variable => {
-                                // Dynamic-size string segments in case patterns
-                                // are not yet supported for extraction.
-                            },
-                        }
-                    } else {
-                        // Rest of data (no explicit size)
-                        if (binding_local) |dest| {
-                            try self.current_instrs.append(self.allocator, .{
-                                .bin_slice = .{
-                                    .dest = dest,
-                                    .source = data_local,
-                                    .offset = current_offset,
-                                    .length = null,
-                                },
-                            });
-                        }
-                    }
-                },
-                .utf8 => {
-                    if (binding_local) |dest| {
-                        const len_local = self.next_local;
-                        self.next_local += 1;
-                        try self.current_instrs.append(self.allocator, .{
-                            .bin_read_utf8 = .{
-                                .dest_codepoint = dest,
-                                .dest_len = len_local,
-                                .source = data_local,
-                                .offset = current_offset,
-                            },
-                        });
-                        if (!offset_is_dynamic) {
-                            const static_base = self.next_local;
-                            self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{
-                                .const_int = .{ .dest = static_base, .value = @intCast(byte_offset) },
-                            });
-                            dynamic_offset_local = self.next_local;
-                            self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{
-                                .binary_op = .{ .dest = dynamic_offset_local, .op = .add, .lhs = static_base, .rhs = len_local },
-                            });
-                            offset_is_dynamic = true;
-                        }
-                    }
-                },
-                .utf16, .utf32 => {},
-            }
+            try self.lowerBinarySegment(&tracker, .{ .case_arms = case_arms }, seg, data_local, binding_local);
         }
     }
 
@@ -10181,23 +10440,14 @@ pub const IrBuilder = struct {
                     .bin_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .min_len = cb.min_byte_size },
                 });
 
-                // Emit bin_match_prefix for each string literal prefix segment
-                // and AND the result with the length check condition.
+                // Emit one offset-aware bin_match_prefix per string-literal
+                // segment and AND the results with the length check. Computed
+                // at this outer level so the guard condition is evaluated
+                // before the guarded body (audit ir-1--01: prefixes are
+                // checked at their true byte position, not always at byte 0).
                 var condition_local = len_check_local;
-                for (cb.segments) |seg| {
-                    if (seg.string_literal) |sl| {
-                        const prefix_str = self.interner.get(sl);
-                        const prefix_check_local = self.next_local;
-                        self.next_local += 1;
-                        try self.current_instrs.append(self.allocator, .{
-                            .bin_match_prefix = .{
-                                .dest = prefix_check_local,
-                                .source = scrutinee_local,
-                                .expected = prefix_str,
-                            },
-                        });
-                        condition_local = try self.emitAnd(condition_local, prefix_check_local);
-                    }
+                if (try self.emitBinaryPrefixChecks(cb.segments, scrutinee_local)) |prefix_cond| {
+                    condition_local = try self.emitAnd(condition_local, prefix_cond);
                 }
 
                 const saved = self.current_instrs;
@@ -10437,11 +10687,33 @@ pub const IrBuilder = struct {
                     // `.list` joins the ARC-managed type set.
                     try self.recordListChildHirType(list_local, binding.local_index, .list);
                 }
-                // Emit binary/struct bindings
-                try self.emitBinaryBindings(clause);
-                try self.emitStructBindings(clause);
-                const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
-                try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+                // Emit binary/struct bindings. A binary pattern's length and
+                // prefix checks gate the body via a guard + match_fail so a
+                // non-matching argument fails the clause instead of binding
+                // zeroed garbage (audit ir-1--02). The offset-correct
+                // extractions go inside the guard.
+                var bin_data: std.ArrayList(BinaryParamData) = .empty;
+                const bin_condition = try self.emitBinaryMatchConditions(clause, &bin_data);
+                if (bin_condition) |condition| {
+                    const inner_saved = self.current_instrs;
+                    self.current_instrs = .empty;
+                    try self.emitBinaryExtractions(clause, bin_data.items);
+                    try self.emitStructBindings(clause);
+                    const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
+                    try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+                    const guarded_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                    self.current_instrs = inner_saved;
+                    try self.current_instrs.append(self.allocator, .{
+                        .guard_block = .{ .condition = condition, .body = guarded_body },
+                    });
+                    try self.current_instrs.append(self.allocator, .{
+                        .match_fail = .{ .message = "no matching clause", .kind = .match_clause },
+                    });
+                } else {
+                    try self.emitStructBindings(clause);
+                    const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
+                    try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
+                }
             },
             .failure => {
                 if (self.try_mode) {
@@ -10687,73 +10959,36 @@ pub const IrBuilder = struct {
                         }
                         if (!has_binary) continue;
 
+                        // Emit this clause's binary length + (offset-aware)
+                        // prefix checks at the per-clause level, then wrap the
+                        // offset-correct extractions and body in a guard
+                        // conditioned on the FULL conjunction. The prior code
+                        // scanned for a single `bin_match_prefix` and dropped
+                        // every later prefix check; this consumes them all
+                        // (audit ir-1--02) and uses the shared offset model
+                        // (audit ir-1--01 / ir-2--02). A clause whose checks
+                        // fail falls through to the next clause's guard, and
+                        // ultimately to `cb.failure`.
+                        var bin_data: std.ArrayList(BinaryParamData) = .empty;
+                        const clause_condition = try self.emitBinaryMatchConditions(&clause, &bin_data);
+
                         const inner_saved = self.current_instrs;
                         self.current_instrs = .empty;
-                        try self.emitBinaryBindings(&clause);
+                        try self.emitBinaryExtractions(&clause, bin_data.items);
                         const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
                         try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
-                        const all_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+                        const clause_body = try self.current_instrs.toOwnedSlice(self.allocator);
                         self.current_instrs = inner_saved;
 
-                        // Find any guard condition (bin_match_prefix or bin_len_check)
-                        // and split instructions: pre-guard setup vs guarded body.
-                        var guard_cond: ?LocalId = null;
-                        var split_idx: usize = 0;
-                        for (all_instrs, 0..) |instr, idx| {
-                            switch (instr) {
-                                .bin_match_prefix => |bmp| {
-                                    guard_cond = bmp.dest;
-                                    split_idx = idx + 1;
-                                    break;
-                                },
-                                else => {},
-                            }
-                        }
-
-                        if (guard_cond) |cond| {
-                            // Emit setup instructions, then wrap body in guard
-                            for (all_instrs[0..split_idx]) |instr| {
-                                try self.current_instrs.append(self.allocator, instr);
-                            }
+                        if (clause_condition) |cond| {
                             try self.current_instrs.append(self.allocator, .{
-                                .guard_block = .{ .condition = cond, .body = all_instrs[split_idx..] },
+                                .guard_block = .{ .condition = cond, .body = clause_body },
                             });
                         } else {
-                            // No string-literal prefix guard — wrap the whole body
-                            // in a length check guard to differentiate from fallback
-                            var clause_min_bits: u32 = 0;
-                            for (clause.params) |param| {
-                                if (param.pattern) |pat| {
-                                    if (pat.* == .binary_match) {
-                                        for (pat.binary_match.segments) |seg| {
-                                            clause_min_bits += switch (seg.type_spec) {
-                                                .default => 8,
-                                                .integer => |i| i.bits,
-                                                .float => |f| f.bits,
-                                                .string => 0,
-                                                .utf8 => 8,
-                                                .utf16 => 16,
-                                                .utf32 => 32,
-                                            };
-                                        }
-                                    }
-                                }
-                            }
-                            const clause_min_bytes = (clause_min_bits + 7) / 8;
-                            if (clause_min_bytes > 0) {
-                                const clause_len_check = self.next_local;
-                                self.next_local += 1;
-                                try self.current_instrs.append(self.allocator, .{
-                                    .bin_len_check = .{ .dest = clause_len_check, .scrutinee = scrutinee_local, .min_len = clause_min_bytes },
-                                });
-                                try self.current_instrs.append(self.allocator, .{
-                                    .guard_block = .{ .condition = clause_len_check, .body = all_instrs },
-                                });
-                            } else {
-                                // Zero min bytes — just emit inline
-                                for (all_instrs) |instr| {
-                                    try self.current_instrs.append(self.allocator, instr);
-                                }
+                            // No checks (e.g. a zero-width binary pattern) —
+                            // emit the body inline.
+                            for (clause_body) |instr| {
+                                try self.current_instrs.append(self.allocator, instr);
                             }
                         }
                     }

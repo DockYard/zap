@@ -2322,7 +2322,12 @@ pub const Interpreter = struct {
                     frame.setLocal(bmp.dest, .{ .bool_val = false });
                     return .continued;
                 };
-                frame.setLocal(bmp.dest, .{ .bool_val = std.mem.startsWith(u8, source, bmp.expected) });
+                // Compare at the segment's byte offset, not always at byte 0,
+                // mirroring the runtime helper (audit ir-1--01).
+                const offset = try self.resolveOffset(bmp.offset, frame);
+                const matches = offset <= source.len and
+                    std.mem.startsWith(u8, source[offset..], bmp.expected);
+                frame.setLocal(bmp.dest, .{ .bool_val = matches });
                 return .continued;
             },
 
@@ -7824,7 +7829,7 @@ test "interpreter: bin_match_prefix" {
             .label = 0,
             .instructions = &.{
                 .{ .param_get = .{ .dest = 0, .index = 0 } },
-                .{ .bin_match_prefix = .{ .dest = 1, .source = 0, .expected = "hel" } },
+                .{ .bin_match_prefix = .{ .dest = 1, .source = 0, .offset = .{ .static = 0 }, .expected = "hel" } },
                 .{ .ret = .{ .value = 1 } },
             },
         }},

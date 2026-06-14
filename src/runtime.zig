@@ -13333,139 +13333,207 @@ test "Zest selected case scan runs only the requested leaf case" {
 // ============================================================
 
 pub const BinaryHelpers = struct {
+    // Binary segment offsets and lengths are carried through the IR as
+    // signed 64-bit integers (the language's native integer type, matching
+    // `String.slice`'s `i64` indices and the dynamic-offset `add` chain the
+    // ZIR builder emits). These helpers therefore accept `i64` and convert
+    // to a buffer index internally: a negative offset/length is treated as
+    // out of bounds (clamped to the buffer end / zero), never as a huge
+    // unsigned value via wraparound. This is what lets a runtime-computed
+    // offset (`data[2..][0..len]`) reach these helpers without a separate
+    // unsigned cast that could mis-lower.
+
+    /// Convert a signed byte index to a `usize` clamped to `[0, buf_len]`.
+    /// Negative indices clamp to `buf_len` (i.e. "past the end"), so a
+    /// subsequent read/slice yields the empty/zero result rather than
+    /// indexing with a wrapped value.
+    fn byteIndex(offset: i64, buf_len: usize) usize {
+        if (offset < 0) return buf_len;
+        const unsigned: u64 = @intCast(offset);
+        if (unsigned > buf_len) return buf_len;
+        return @intCast(unsigned);
+    }
+
+    /// Clamp a signed length to `[0, max]`. Negative lengths clamp to 0.
+    fn byteLen(length: i64, max: usize) usize {
+        if (length < 0) return 0;
+        const unsigned: u64 = @intCast(length);
+        if (unsigned > max) return max;
+        return @intCast(unsigned);
+    }
+
     // --- Integer reads (byte-aligned) ---
     // Each function reads N bytes from data at the given byte offset
     // using big-endian byte order, returning a u64/i64.
     // The ZIR builder calls these because ZIR cannot express generic
     // std.mem.readInt calls with comptime type parameters.
 
-    pub fn readIntU8(data: []const u8, offset: usize) i64 {
-        if (offset >= data.len) return 0;
-        return @intCast(data[offset]);
+    pub fn readIntU8(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o >= data.len) return 0;
+        return @intCast(data[o]);
     }
 
-    pub fn readIntU16Big(data: []const u8, offset: usize) i64 {
-        if (offset + 2 > data.len) return 0;
-        return @intCast(std.mem.readInt(u16, data[offset..][0..2], .big));
+    pub fn readIntU16Big(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 2 > data.len) return 0;
+        return @intCast(std.mem.readInt(u16, data[o..][0..2], .big));
     }
 
-    pub fn readIntU16Little(data: []const u8, offset: usize) i64 {
-        if (offset + 2 > data.len) return 0;
-        return @intCast(std.mem.readInt(u16, data[offset..][0..2], .little));
+    pub fn readIntU16Little(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 2 > data.len) return 0;
+        return @intCast(std.mem.readInt(u16, data[o..][0..2], .little));
     }
 
-    pub fn readIntU32Big(data: []const u8, offset: usize) i64 {
-        if (offset + 4 > data.len) return 0;
-        return @intCast(std.mem.readInt(u32, data[offset..][0..4], .big));
+    pub fn readIntU32Big(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 4 > data.len) return 0;
+        return @intCast(std.mem.readInt(u32, data[o..][0..4], .big));
     }
 
-    pub fn readIntU32Little(data: []const u8, offset: usize) i64 {
-        if (offset + 4 > data.len) return 0;
-        return @intCast(std.mem.readInt(u32, data[offset..][0..4], .little));
+    pub fn readIntU32Little(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 4 > data.len) return 0;
+        return @intCast(std.mem.readInt(u32, data[o..][0..4], .little));
     }
 
-    pub fn readIntU64Big(data: []const u8, offset: usize) i64 {
-        if (offset + 8 > data.len) return 0;
-        return @bitCast(std.mem.readInt(u64, data[offset..][0..8], .big));
+    pub fn readIntU64Big(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 8 > data.len) return 0;
+        return @bitCast(std.mem.readInt(u64, data[o..][0..8], .big));
     }
 
-    pub fn readIntU64Little(data: []const u8, offset: usize) i64 {
-        if (offset + 8 > data.len) return 0;
-        return @bitCast(std.mem.readInt(u64, data[offset..][0..8], .little));
+    pub fn readIntU64Little(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 8 > data.len) return 0;
+        return @bitCast(std.mem.readInt(u64, data[o..][0..8], .little));
     }
 
-    pub fn readIntI8(data: []const u8, offset: usize) i64 {
-        if (offset >= data.len) return 0;
-        return @intCast(@as(i8, @bitCast(data[offset])));
+    pub fn readIntI8(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o >= data.len) return 0;
+        return @intCast(@as(i8, @bitCast(data[o])));
     }
 
-    pub fn readIntI16Big(data: []const u8, offset: usize) i64 {
-        if (offset + 2 > data.len) return 0;
-        return @intCast(std.mem.readInt(i16, data[offset..][0..2], .big));
+    pub fn readIntI16Big(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 2 > data.len) return 0;
+        return @intCast(std.mem.readInt(i16, data[o..][0..2], .big));
     }
 
-    pub fn readIntI16Little(data: []const u8, offset: usize) i64 {
-        if (offset + 2 > data.len) return 0;
-        return @intCast(std.mem.readInt(i16, data[offset..][0..2], .little));
+    pub fn readIntI16Little(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 2 > data.len) return 0;
+        return @intCast(std.mem.readInt(i16, data[o..][0..2], .little));
     }
 
-    pub fn readIntI32Big(data: []const u8, offset: usize) i64 {
-        if (offset + 4 > data.len) return 0;
-        return @intCast(std.mem.readInt(i32, data[offset..][0..4], .big));
+    pub fn readIntI32Big(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 4 > data.len) return 0;
+        return @intCast(std.mem.readInt(i32, data[o..][0..4], .big));
     }
 
-    pub fn readIntI32Little(data: []const u8, offset: usize) i64 {
-        if (offset + 4 > data.len) return 0;
-        return @intCast(std.mem.readInt(i32, data[offset..][0..4], .little));
+    pub fn readIntI32Little(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 4 > data.len) return 0;
+        return @intCast(std.mem.readInt(i32, data[o..][0..4], .little));
     }
 
-    pub fn readIntI64Big(data: []const u8, offset: usize) i64 {
-        if (offset + 8 > data.len) return 0;
-        return std.mem.readInt(i64, data[offset..][0..8], .big);
+    pub fn readIntI64Big(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 8 > data.len) return 0;
+        return std.mem.readInt(i64, data[o..][0..8], .big);
     }
 
-    pub fn readIntI64Little(data: []const u8, offset: usize) i64 {
-        if (offset + 8 > data.len) return 0;
-        return std.mem.readInt(i64, data[offset..][0..8], .little);
+    pub fn readIntI64Little(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 8 > data.len) return 0;
+        return std.mem.readInt(i64, data[o..][0..8], .little);
     }
 
     // Sub-byte read: extract `bits` bits from data[offset] >> bit_offset
-    pub fn readBitsU(data: []const u8, offset: usize, bit_offset: u3, bits: u8) i64 {
-        if (offset >= data.len) return 0;
-        const shifted: u8 = data[offset] >> bit_offset;
+    pub fn readBitsU(data: []const u8, offset: i64, bit_offset: u3, bits: u8) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o >= data.len) return 0;
+        const shifted: u8 = data[o] >> bit_offset;
         if (bits == 0 or bits >= 8) return @intCast(shifted);
         const mask: u8 = (@as(u8, 1) << @intCast(bits)) - 1;
         return @intCast(shifted & mask);
     }
 
     // --- Float reads ---
-    pub fn readF32Big(data: []const u8, offset: usize) f64 {
-        if (offset + 4 > data.len) return 0.0;
-        const int_val = std.mem.readInt(u32, data[offset..][0..4], .big);
+    pub fn readF32Big(data: []const u8, offset: i64) f64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 4 > data.len) return 0.0;
+        const int_val = std.mem.readInt(u32, data[o..][0..4], .big);
         return @floatCast(@as(f32, @bitCast(int_val)));
     }
 
-    pub fn readF32Little(data: []const u8, offset: usize) f64 {
-        if (offset + 4 > data.len) return 0.0;
-        const int_val = std.mem.readInt(u32, data[offset..][0..4], .little);
+    pub fn readF32Little(data: []const u8, offset: i64) f64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 4 > data.len) return 0.0;
+        const int_val = std.mem.readInt(u32, data[o..][0..4], .little);
         return @floatCast(@as(f32, @bitCast(int_val)));
     }
 
-    pub fn readF64Big(data: []const u8, offset: usize) f64 {
-        if (offset + 8 > data.len) return 0.0;
-        const int_val = std.mem.readInt(u64, data[offset..][0..8], .big);
+    pub fn readF64Big(data: []const u8, offset: i64) f64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 8 > data.len) return 0.0;
+        const int_val = std.mem.readInt(u64, data[o..][0..8], .big);
         return @bitCast(int_val);
     }
 
-    pub fn readF64Little(data: []const u8, offset: usize) f64 {
-        if (offset + 8 > data.len) return 0.0;
-        const int_val = std.mem.readInt(u64, data[offset..][0..8], .little);
+    pub fn readF64Little(data: []const u8, offset: i64) f64 {
+        const o = byteIndex(offset, data.len);
+        if (o + 8 > data.len) return 0.0;
+        const int_val = std.mem.readInt(u64, data[o..][0..8], .little);
         return @bitCast(int_val);
     }
 
     // --- Slice ---
-    // Returns data[offset..offset+length], or data[offset..] if length == 0 (sentinel for "rest")
-    pub fn slice(data: []const u8, offset: usize, length: usize) []const u8 {
-        const start = @min(offset, data.len);
-        if (length == 0) return data[start..];
-        const end = @min(std.math.add(usize, start, length) catch data.len, data.len);
-        return data[start..end];
+    // Returns data[offset..offset+length], clamped to the buffer bounds.
+    //
+    // A length of 0 yields an EMPTY slice — it is NOT a "rest of data"
+    // sentinel. The "rest of data" case (an unsized `String` segment) is
+    // lowered to `sliceRest` instead, so a legitimate zero-length segment
+    // (`String-size(0)` or a runtime length variable that is 0) is no
+    // longer indistinguishable from "the entire remainder" (audit
+    // ir-1--03). The CTFE interpreter already implements this split
+    // semantics for the identical `bin_slice` IR; this keeps runtime and
+    // comptime behavior aligned.
+    pub fn slice(data: []const u8, offset: i64, length: i64) []const u8 {
+        const start = byteIndex(offset, data.len);
+        const len = byteLen(length, data.len - start);
+        return data[start .. start + len];
+    }
+
+    // Returns data[offset..] — the "rest of data" for an unsized `String`
+    // segment. Distinct from `slice(data, offset, 0)`, which is empty.
+    pub fn sliceRest(data: []const u8, offset: i64) []const u8 {
+        const start = byteIndex(offset, data.len);
+        return data[start..];
     }
 
     // --- UTF-8 reads ---
-    // Returns the byte sequence length for the UTF-8 character at data[offset]
-    pub fn utf8ByteLen(data: []const u8, offset: usize) u64 {
-        if (offset >= data.len) return 1;
-        return @intCast(std.unicode.utf8ByteSequenceLength(data[offset]) catch 1);
+    // Returns the byte sequence length for the UTF-8 character at data[offset].
+    // Returns `i64` so the decoded length can feed both the offset-advance
+    // `add` chain and `utf8Decode`'s `len` parameter, which are all i64.
+    pub fn utf8ByteLen(data: []const u8, offset: i64) i64 {
+        const o = byteIndex(offset, data.len);
+        if (o >= data.len) return 1;
+        return @intCast(std.unicode.utf8ByteSequenceLength(data[o]) catch 1);
     }
 
     // Returns the decoded codepoint for the UTF-8 character at data[offset..offset+len]
-    pub fn utf8Decode(data: []const u8, offset: usize, len: usize) u64 {
-        if (offset + len > data.len or len == 0 or len > 4) return 0xFFFD;
-        const end = offset + len;
-        const byte_slice = data[offset..end];
+    pub fn utf8Decode(data: []const u8, offset: i64, len: i64) u64 {
+        const o = byteIndex(offset, data.len);
+        const l = byteLen(len, data.len - o);
+        if (o + l > data.len or l == 0 or l > 4) return 0xFFFD;
+        const end = o + l;
+        const byte_slice = data[o..end];
         // utf8Decode expects a fixed-size array per length
-        return switch (len) {
+        return switch (l) {
             1 => @intCast(byte_slice[0]),
             2 => @intCast(std.unicode.utf8Decode(byte_slice[0..2].*) catch 0xFFFD),
             3 => @intCast(std.unicode.utf8Decode(byte_slice[0..3].*) catch 0xFFFD),
@@ -13475,10 +13543,17 @@ pub const BinaryHelpers = struct {
     }
 
     // --- Prefix matching ---
-    // Returns true if data starts with the expected prefix
-    pub fn matchPrefix(data: []const u8, expected: []const u8) bool {
-        if (data.len < expected.len) return false;
-        return std.mem.eql(u8, data[0..expected.len], expected);
+    // Returns true if the bytes of `data` starting at `offset` begin with
+    // `expected`. The `offset` is required so a string-literal segment that
+    // is NOT the first segment of the pattern is compared at its true
+    // position rather than always at byte 0 (audit ir-1--01).
+    pub fn matchPrefix(data: []const u8, offset: i64, expected: []const u8) bool {
+        if (offset < 0) return false;
+        const o = byteIndex(offset, data.len);
+        if (o > data.len) return false;
+        const rest = data[o..];
+        if (rest.len < expected.len) return false;
+        return std.mem.eql(u8, rest[0..expected.len], expected);
     }
 };
 

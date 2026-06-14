@@ -9403,14 +9403,17 @@ pub const ZirDriver = struct {
                 try self.setLocal(brf.dest, ref);
             },
             .bin_slice => |bs| {
-                // Emit: @import("zap_runtime").BinaryHelpers.slice(source, offset, length)
-                // length=0 is the sentinel for "rest of data" (null length in IR)
+                // An explicit length lowers to BinaryHelpers.slice(source,
+                // offset, length); an absent length (`null` = "rest of data")
+                // lowers to BinaryHelpers.sliceRest(source, offset). The two
+                // are distinct runtime helpers so a legitimate ZERO-length
+                // slice yields "" rather than the entire remainder — the old
+                // in-band `length == 0` sentinel conflated them (audit
+                // ir-1--03). This matches the CTFE interpreter's semantics.
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
                 const helpers = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.binary_helpers);
                 if (helpers == error_ref) return error.EmitFailed;
-                const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "slice", 5);
-                if (fn_ref == error_ref) return error.EmitFailed;
 
                 const source_ref = try self.refForLocal(bs.source);
                 const offset_ref = switch (bs.offset) {
@@ -9419,17 +9422,26 @@ pub const ZirDriver = struct {
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
 
-                // null length means "rest of data" -- pass 0 as sentinel
-                const length_ref = if (bs.length) |len| switch (len) {
-                    .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
-                } else zir_builder_emit_int(self.handle, 0);
-                if (length_ref == error_ref) return error.EmitFailed;
-
-                const args = [_]u32{ source_ref, offset_ref, length_ref };
-                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &args, 3);
-                if (ref == error_ref) return error.EmitFailed;
-                try self.setLocal(bs.dest, ref);
+                if (bs.length) |len| {
+                    const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "slice", 5);
+                    if (fn_ref == error_ref) return error.EmitFailed;
+                    const length_ref = switch (len) {
+                        .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
+                        .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
+                    };
+                    if (length_ref == error_ref) return error.EmitFailed;
+                    const args = [_]u32{ source_ref, offset_ref, length_ref };
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &args, 3);
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(bs.dest, ref);
+                } else {
+                    const fn_ref = zir_builder_emit_field_val(self.handle, helpers, "sliceRest", 9);
+                    if (fn_ref == error_ref) return error.EmitFailed;
+                    const args = [_]u32{ source_ref, offset_ref };
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &args, 2);
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(bs.dest, ref);
+                }
             },
             .bin_read_utf8 => |bru| {
                 // Two calls: utf8ByteLen for dest_len, utf8Decode for dest_codepoint
@@ -9462,7 +9474,9 @@ pub const ZirDriver = struct {
                 try self.setLocal(bru.dest_codepoint, cp_ref);
             },
             .bin_match_prefix => |bmp| {
-                // Emit: @import("zap_runtime").BinaryHelpers.matchPrefix(source, expected)
+                // Emit: @import("zap_runtime").BinaryHelpers.matchPrefix(source, offset, expected)
+                // The offset positions the comparison at the segment's true
+                // byte position rather than always at byte 0 (audit ir-1--01).
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
                 const helpers = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.binary_helpers);
@@ -9471,11 +9485,16 @@ pub const ZirDriver = struct {
                 if (fn_ref == error_ref) return error.EmitFailed;
 
                 const source_ref = try self.refForLocal(bmp.source);
+                const offset_ref = switch (bmp.offset) {
+                    .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
+                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
+                };
+                if (offset_ref == error_ref) return error.EmitFailed;
                 const expected_ref = zir_builder_emit_str(self.handle, bmp.expected.ptr, @intCast(bmp.expected.len));
                 if (expected_ref == error_ref) return error.EmitFailed;
 
-                const args = [_]u32{ source_ref, expected_ref };
-                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &args, 2);
+                const args = [_]u32{ source_ref, offset_ref, expected_ref };
+                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, &args, 3);
                 if (ref == error_ref) return error.EmitFailed;
                 try self.setLocal(bmp.dest, ref);
             },
