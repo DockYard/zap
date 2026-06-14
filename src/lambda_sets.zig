@@ -24,11 +24,19 @@ const lattice = @import("escape_lattice.zig");
 pub const FunctionIdSet = struct {
     allocator: std.mem.Allocator,
     members: std.ArrayList(ir.FunctionId),
+    /// GAP-P2R-02 — the "unknown/top" lattice element. When true, this value's
+    /// closure provenance cannot be fully enumerated (it came from a
+    /// `call_dispatch` over a clause group or an opaque `call_builtin` result),
+    /// so the set stands for an unbounded collection. `members` may still hold
+    /// whatever subset was enumerable but is NOT authoritative. Top absorbs:
+    /// once set it stays set, and any union with a top operand becomes top.
+    is_top: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) FunctionIdSet {
         return .{
             .allocator = allocator,
             .members = .empty,
+            .is_top = false,
         };
     }
 
@@ -39,12 +47,26 @@ pub const FunctionIdSet = struct {
     pub fn clone(self: *const FunctionIdSet) !FunctionIdSet {
         var copy = FunctionIdSet.init(self.allocator);
         try copy.members.appendSlice(self.allocator, self.members.items);
+        copy.is_top = self.is_top;
         return copy;
+    }
+
+    /// GAP-P2R-02 — promote this set to the unknown/top element. Returns true
+    /// if the set changed (was not already top), so callers can decide whether
+    /// to re-enqueue dependents in the fixpoint.
+    pub fn markTop(self: *FunctionIdSet) bool {
+        if (self.is_top) return false;
+        self.is_top = true;
+        return true;
     }
 
     /// Add a FunctionId. Returns true if the set changed (id was new).
     /// Maintains sorted order for deterministic results.
     pub fn add(self: *FunctionIdSet, id: ir.FunctionId) !bool {
+        // A top set already over-approximates everything — adding a concrete
+        // member cannot make it more conservative, and must not flip it back to
+        // a finite (potentially singleton) enumeration.
+        if (self.is_top) return false;
         // Binary search for insertion point
         const items = self.members.items;
         var lo: usize = 0;
@@ -64,8 +86,11 @@ pub const FunctionIdSet = struct {
         return true;
     }
 
-    /// Add all members from another set. Returns true if any new member was added.
+    /// Add all members from another set. Returns true if any new member was
+    /// added (or this set was promoted to top by a top operand).
     pub fn addAll(self: *FunctionIdSet, other: *const FunctionIdSet) !bool {
+        if (other.is_top) return self.markTop();
+        if (self.is_top) return false;
         var changed = false;
         for (other.members.items) |id| {
             if (try self.add(id)) {
@@ -97,22 +122,27 @@ pub const FunctionIdSet = struct {
         return self.members.items.len;
     }
 
+    /// GAP-P2R-02 — a top set is never empty (it stands for an unknown,
+    /// possibly non-empty collection).
     pub fn isEmpty(self: *const FunctionIdSet) bool {
-        return self.members.items.len == 0;
+        return !self.is_top and self.members.items.len == 0;
     }
 
+    /// GAP-P2R-02 — a top set is never a singleton, even if exactly one member
+    /// was enumerable: the unknown residual means the real set is unbounded.
     pub fn isSingleton(self: *const FunctionIdSet) bool {
-        return self.members.items.len == 1;
+        return !self.is_top and self.members.items.len == 1;
     }
 
-    /// Convert to an immutable LambdaSet (allocates a new slice).
+    /// Convert to an immutable LambdaSet (allocates a new slice). Carries the
+    /// top flag so the consumer's specialization decision stays sound.
     pub fn toLambdaSet(self: *const FunctionIdSet, allocator: std.mem.Allocator) !lattice.LambdaSet {
         if (self.members.items.len == 0) {
-            return lattice.LambdaSet.empty();
+            return .{ .members = &.{}, .top = self.is_top };
         }
         const slice = try allocator.alloc(ir.FunctionId, self.members.items.len);
         @memcpy(slice, self.members.items);
-        return .{ .members = slice };
+        return .{ .members = slice, .top = self.is_top };
     }
 };
 
@@ -527,6 +557,44 @@ pub const LambdaSetAnalyzer = struct {
                     }
                 }
             },
+            .call_dispatch => |cd| {
+                // GAP-P2R-02 — a `call_dispatch` resolves at runtime to one of
+                // a clause group's member functions, any of which can RETURN a
+                // closure (constructed inside it, or forwarded from a parameter
+                // we cannot statically track). The pre-fix analysis dropped this
+                // edge entirely, so a closure returned from a dispatch
+                // contributed the EMPTY set; unioned with a tracked
+                // `make_closure` in a sibling branch the merge looked wrongly
+                // SINGLETON and codegen direct-dispatched to the lone "member"
+                // (the same wrong-function hazard escape--01 fixed for aliases).
+                // We over-approximate the dispatch result to the unknown/top
+                // element: its lambda set can never collapse to a spurious
+                // singleton, so the consumer falls back to sound dynamic
+                // dispatch. Top only affects values actually used as a
+                // call_closure callee, so a non-closure dispatch result is
+                // unaffected. Args are also visited so closures passed INTO the
+                // dispatch are still marked escaped.
+                for (cd.args) |arg| {
+                    try self.markClosuresEscaped(func_id, arg);
+                }
+                try self.markValueTop(func_id, cd.dest);
+            },
+            .call_builtin => |cb| {
+                // GAP-P2R-02 — a builtin is opaque (no IR body to analyze). If
+                // its result type can carry a closure, the returned value's
+                // provenance is unknowable, so it must be the unknown/top
+                // element rather than the (pre-fix) empty set that could merge
+                // into a spurious singleton. A builtin whose result cannot carry
+                // a closure (i64, string, a plain struct, …) is left alone — no
+                // pessimization. Args are visited so closures passed into the
+                // builtin are marked escaped.
+                for (cb.args) |arg| {
+                    try self.markClosuresEscaped(func_id, arg);
+                }
+                if (zigTypeCanCarryClosure(cb.result_type)) {
+                    try self.markValueTop(func_id, cb.dest);
+                }
+            },
             .try_call_named => |tcn| {
                 for (tcn.handler_instrs) |sub| {
                     try self.seedInstruction(func_id, sub);
@@ -544,6 +612,19 @@ pub const LambdaSetAnalyzer = struct {
                 }
             },
             else => {},
+        }
+    }
+
+    /// GAP-P2R-02 — promote the lambda set of `(func_id, local)` to the
+    /// unknown/top element and enqueue it if it changed, so the over-
+    /// approximation propagates through the fixpoint to every value the
+    /// closure flows to.
+    fn markValueTop(self: *LambdaSetAnalyzer, func_id: ir.FunctionId, local: ir.LocalId) !void {
+        const key = lattice.ValueKey{ .function = func_id, .local = local };
+        try self.ensureSet(key);
+        const set = self.lambda_sets.getPtr(key).?;
+        if (set.markTop()) {
+            try self.enqueue(func_id, local);
         }
     }
 
@@ -981,7 +1062,12 @@ pub const LambdaSetAnalyzer = struct {
         const src_set = self.lambda_sets.getPtr(src_key) orelse return;
         if (src_set.isEmpty()) return;
 
-        // Copy source members before any map mutation
+        // Copy source members and the top flag before any map mutation
+        // (ensureSet may rehash and invalidate `src_set`). GAP-P2R-02 — the
+        // top flag MUST be forwarded too, or a closure-typed value that became
+        // unknown upstream would silently re-narrow to a finite (possibly
+        // spurious-singleton) set as it flows through an alias/aggregate edge.
+        const src_is_top = src_set.is_top;
         const src_members = try self.allocator.alloc(ir.FunctionId, src_set.members.items.len);
         defer self.allocator.free(src_members);
         @memcpy(src_members, src_set.members.items);
@@ -990,8 +1076,11 @@ pub const LambdaSetAnalyzer = struct {
         try self.ensureSet(dest_key);
         const dest_set = self.lambda_sets.getPtr(dest_key).?;
 
-        // Add from copied members
+        // Add from copied members; merging a top source promotes dest to top.
         var changed = false;
+        if (src_is_top) {
+            if (dest_set.markTop()) changed = true;
+        }
         for (src_members) |id| {
             if (try dest_set.add(id)) {
                 changed = true;
@@ -1154,7 +1243,10 @@ pub const LambdaSetAnalyzer = struct {
         const ret_set = self.lambda_sets.getPtr(ret_key) orelse return;
         if (ret_set.isEmpty()) return;
 
-        // Copy source members before map mutation (ensureSet may rehash)
+        // Copy source members and the top flag before map mutation (ensureSet
+        // may rehash). GAP-P2R-02 — a callee that returns an unknown/top
+        // closure must mark every caller's receiving dest top, never re-narrow.
+        const src_is_top = ret_set.is_top;
         const src_members = try self.allocator.alloc(ir.FunctionId, ret_set.members.items.len);
         defer self.allocator.free(src_members);
         @memcpy(src_members, ret_set.members.items);
@@ -1165,6 +1257,9 @@ pub const LambdaSetAnalyzer = struct {
                 try self.ensureSet(dest_key);
                 const dest_set = self.lambda_sets.getPtr(dest_key).?;
                 var changed = false;
+                if (src_is_top) {
+                    if (dest_set.markTop()) changed = true;
+                }
                 for (src_members) |id| {
                     if (try dest_set.add(id)) {
                         changed = true;
@@ -1322,9 +1417,13 @@ pub const LambdaSetAnalyzer = struct {
     /// Get the lambda set for a given value binding.
     pub fn getLambdaSet(self: *const LambdaSetAnalyzer, key: lattice.ValueKey) ?lattice.LambdaSet {
         const set = self.lambda_sets.getPtr(key) orelse return null;
-        // Return a view without allocation (references internal storage)
-        if (set.members.items.len == 0) return lattice.LambdaSet.empty();
-        return .{ .members = set.members.items };
+        // Return a view without allocation (references internal storage).
+        // GAP-P2R-02 — the `top` flag MUST be carried through: a top set may
+        // be memberless, and a consumer that reads it via this query (rather
+        // than `toLambdaSet`) must still see it as unknown/top, not as an
+        // empty/finite set that could be mistaken for a singleton.
+        if (set.members.items.len == 0) return .{ .members = &.{}, .top = set.is_top };
+        return .{ .members = set.members.items, .top = set.is_top };
     }
 
     /// Get the specialization decision for a call site by index.
@@ -1403,6 +1502,44 @@ pub const LambdaSetAnalyzer = struct {
         return null;
     }
 };
+
+/// GAP-P2R-02 — can a value of this static type carry a closure (either a bare
+/// `*const fn(...)` value or a boxed callable existential)? Used to decide
+/// whether an opaque `call_builtin` result must be over-approximated to the
+/// unknown/top lambda set.
+///
+/// Conservative by construction (errs toward "yes"): a `.function` type IS a
+/// closure value; `.any` is statically unknown; a `.protocol_box` existential
+/// could box a callable (we deliberately do NOT pattern-match the protocol's
+/// Zap name — the compiler must stay agnostic of Zap struct/protocol names);
+/// and aggregate/wrapper types are checked recursively because a closure can
+/// hide inside a tuple/list/map/optional/ptr. Concrete scalar results (i64,
+/// string, struct_ref, …) return false, so non-closure builtins are never
+/// pessimized. Returning a false positive only enlarges a set to top (sound);
+/// a false negative would be the unsound direction, hence the bias.
+fn zigTypeCanCarryClosure(t: ir.ZigType) bool {
+    return switch (t) {
+        .function => true,
+        .any => true,
+        // A protocol existential is an opaque fat pointer; its inner value
+        // could be a callable. Treat conservatively without naming protocols.
+        .protocol_box => true,
+        // `term` is the heterogeneous runtime wrapper — it can hold anything,
+        // including a callable.
+        .term => true,
+        .tuple => |elems| {
+            for (elems) |elem| {
+                if (zigTypeCanCarryClosure(elem)) return true;
+            }
+            return false;
+        },
+        .list => |elem| zigTypeCanCarryClosure(elem.*),
+        .map => |m| zigTypeCanCarryClosure(m.key.*) or zigTypeCanCarryClosure(m.value.*),
+        .optional => |inner| zigTypeCanCarryClosure(inner.*),
+        .ptr => |inner| zigTypeCanCarryClosure(inner.*),
+        else => false,
+    };
+}
 
 // ============================================================
 // Tests
@@ -2528,4 +2665,208 @@ test "escape--03/zirb-1--01: nested closure calls in opposite branches get disti
     try testing.expect(!spec_a.?.lambda_set.contains(3));
     try testing.expect(spec_b.?.lambda_set.contains(3));
     try testing.expect(!spec_b.?.lambda_set.contains(2));
+}
+
+// GAP-P2R-02: a closure RETURNED from a `call_dispatch` (protocol/clause-group
+// dispatch) merged with a tracked `make_closure` in a sibling branch must NOT
+// collapse to a spurious singleton. Pre-fix, `propagateInstruction`/
+// `seedInstruction` dropped the `call_dispatch` return edge, so the dispatch
+// dest contributed the EMPTY set; unioned with `{fn_a}` the merge looked
+// SINGLETON and `specializationForLambdaSet` returned `.direct_call` — codegen
+// would direct-dispatch to fn_a on the path where the REAL callee came from the
+// dispatch (the escape--01 wrong-function hazard, narrower shape). The fix
+// over-approximates the dispatch result to the unknown/top element, so the
+// merge is top → NOT singleton → dynamic dispatch.
+//
+// Shape (in main):
+//   %0 = make_closure(fn_a)
+//   %1 = call_dispatch(group=7)        // returns SOME closure we cannot enumerate
+//   if cond { %2 := %0 } else { %2 := %1 }   // {fn_a} ∪ TOP = TOP
+//   %3 = call_closure(%2)
+test "GAP-P2R-02: closure returned from call_dispatch merged with make_closure is NOT a spurious singleton" {
+    const allocator = testing.allocator;
+
+    const main_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 1, .captures = &.{} } },
+        // Dispatch result: an unknowable closure. Pre-fix this contributed the
+        // empty set; the fix marks it top.
+        .{ .call_dispatch = .{ .dest = 1, .group_id = 7, .args = &.{}, .arg_modes = &.{} } },
+        .{ .const_bool = .{ .dest = 5, .value = true } },
+        .{ .if_expr = .{
+            .dest = 2,
+            .condition = 5,
+            .then_instrs = &.{},
+            .then_result = 0,
+            .else_instrs = &.{},
+            .else_result = 1,
+        } },
+        .{ .call_closure = .{ .dest = 3, .callee = 2, .args = &.{}, .arg_modes = &.{}, .return_type = .void } },
+        .{ .ret = .{ .value = 3 } },
+    };
+    const main_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &main_instrs },
+    };
+    const empty_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const empty_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &empty_instrs },
+    };
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "fn_a", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &empty_blocks, .is_closure = true, .captures = &.{} },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var analyzer = try LambdaSetAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+    try analyzer.analyze();
+
+    // The dispatch dest itself must be top.
+    const dispatch_set = analyzer.getLambdaSet(.{ .function = 0, .local = 1 }).?;
+    try testing.expect(dispatch_set.top);
+
+    // The merge MUST be top (NOT a wrongly-singleton {fn_a}).
+    const merged = analyzer.getLambdaSet(.{ .function = 0, .local = 2 }).?;
+    try testing.expect(merged.top);
+    try testing.expect(!merged.isSingleton());
+
+    // The call site must NOT be a direct_call. Top → dynamic dispatch.
+    var found = false;
+    for (analyzer.call_site_decisions.items) |d| {
+        if (d.callee_local == 2 and d.function == 0) {
+            try testing.expect(!d.lambda_set.isSingleton());
+            try testing.expect(d.decision != .direct_call);
+            try testing.expectEqual(lattice.SpecializationDecision.dyn_closure_dispatch, d.decision);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+// GAP-P2R-02: a closure read out of an OPAQUE `call_builtin` result (a builtin
+// whose result type can carry a closure) is unknowable and must be over-
+// approximated to top — same hazard as the dispatch case. A builtin whose
+// result CANNOT carry a closure must be left alone (covered by the negative
+// assertion in the singleton-preservation test below).
+//
+// Shape (in main):
+//   %0 = make_closure(fn_a)
+//   %1 = call_builtin "Store.get" -> result_type = fn() (a closure value)
+//   if cond { %2 := %0 } else { %2 := %1 }
+//   %3 = call_closure(%2)
+test "GAP-P2R-02: closure-typed call_builtin result merged with make_closure is NOT a spurious singleton" {
+    const allocator = testing.allocator;
+
+    // result_type = a bare fn() i64 — a closure value.
+    const fn_ret = ir.ZigType{ .i64 = {} };
+    const closure_result_type = ir.ZigType{ .function = .{ .params = &.{}, .return_type = &fn_ret } };
+
+    const main_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 1, .captures = &.{} } },
+        .{ .call_builtin = .{ .dest = 1, .name = "Store.get", .args = &.{}, .arg_modes = &.{}, .result_type = closure_result_type } },
+        .{ .const_bool = .{ .dest = 5, .value = true } },
+        .{ .if_expr = .{
+            .dest = 2,
+            .condition = 5,
+            .then_instrs = &.{},
+            .then_result = 0,
+            .else_instrs = &.{},
+            .else_result = 1,
+        } },
+        .{ .call_closure = .{ .dest = 3, .callee = 2, .args = &.{}, .arg_modes = &.{}, .return_type = .void } },
+        .{ .ret = .{ .value = 3 } },
+    };
+    const main_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &main_instrs },
+    };
+    const empty_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const empty_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &empty_instrs },
+    };
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "fn_a", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &empty_blocks, .is_closure = true, .captures = &.{} },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var analyzer = try LambdaSetAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+    try analyzer.analyze();
+
+    const builtin_set = analyzer.getLambdaSet(.{ .function = 0, .local = 1 }).?;
+    try testing.expect(builtin_set.top);
+
+    const merged = analyzer.getLambdaSet(.{ .function = 0, .local = 2 }).?;
+    try testing.expect(merged.top);
+    try testing.expect(!merged.isSingleton());
+
+    var found = false;
+    for (analyzer.call_site_decisions.items) |d| {
+        if (d.callee_local == 2 and d.function == 0) {
+            try testing.expect(d.decision != .direct_call);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+// GAP-P2R-02: the over-approximation must NOT pessimize. A genuinely-singleton
+// closure flowing to a call site still direct-dispatches (or contifies), and a
+// `call_builtin` whose result type CANNOT carry a closure (i64) must NOT mark
+// its dest top — so a singleton merged with such a builtin result stays a
+// singleton. This is the optimization-preserved companion to the two hazard
+// tests above.
+test "GAP-P2R-02: genuinely-singleton closure still direct-dispatches; non-closure builtin result is not top" {
+    const allocator = testing.allocator;
+
+    const main_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 1, .captures = &.{} } },
+        // A builtin returning i64 — CANNOT carry a closure, must NOT be top.
+        .{ .call_builtin = .{ .dest = 1, .name = "Integer.parse", .args = &.{}, .arg_modes = &.{}, .result_type = .i64 } },
+        .{ .call_closure = .{ .dest = 2, .callee = 0, .args = &.{}, .arg_modes = &.{}, .return_type = .void } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    const main_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &main_instrs },
+    };
+    const empty_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const empty_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &empty_instrs },
+    };
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "fn_a", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &empty_blocks, .is_closure = true, .captures = &.{} },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var analyzer = try LambdaSetAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+    try analyzer.analyze();
+
+    // The i64 builtin result must NOT be top (no pessimization).
+    if (analyzer.getLambdaSet(.{ .function = 0, .local = 1 })) |builtin_set| {
+        try testing.expect(!builtin_set.top);
+    }
+
+    // The genuine singleton at %0 still direct-dispatches (or contifies).
+    var found = false;
+    for (analyzer.call_site_decisions.items) |d| {
+        if (d.callee_local == 0 and d.function == 0) {
+            try testing.expect(d.lambda_set.isSingleton());
+            try testing.expect(d.decision == .direct_call or d.decision == .contified);
+            found = true;
+        }
+    }
+    try testing.expect(found);
 }

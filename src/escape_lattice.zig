@@ -830,21 +830,35 @@ pub const ReturnSummary = struct {
 
 /// A lambda set enumerates every closure that could flow to a
 /// call site. Used for defunctionalization/specialization.
+///
+/// GAP-P2R-02 — the set carries a `top` flag for the "unknown" lattice
+/// element: a value whose closure provenance the analysis cannot fully
+/// enumerate (e.g. a closure RETURNED from a `call_dispatch` over a clause
+/// group, or read out of an opaque `call_builtin` result). A top set is NOT a
+/// finite enumeration, so `specializationForLambdaSet` must never treat it as
+/// a singleton and direct-dispatch it — it falls back to dynamic dispatch.
+/// `top` strictly over-approximates: merging top with anything stays top, so a
+/// real closure flowing into a merge with a top sibling can never collapse the
+/// merge to a spurious singleton (the escape--01 hazard class).
 pub const LambdaSet = struct {
     /// Function IDs of closures in this set.
     members: []const ir.FunctionId,
+    /// GAP-P2R-02 — the "unknown/top" lattice element. When true, the set
+    /// stands for an unbounded/unknowable collection of closures; `members`
+    /// holds whatever subset was still enumerable but is NOT authoritative.
+    top: bool = false,
 
     pub fn empty() LambdaSet {
-        return .{ .members = &.{} };
+        return .{ .members = &.{}, .top = false };
     }
 
     pub fn singleton(func: ir.FunctionId) LambdaSet {
         // Note: Caller must ensure the slice lives long enough.
-        return .{ .members = &.{func} };
+        return .{ .members = &.{func}, .top = false };
     }
 
     pub fn clone(self: LambdaSet, allocator: std.mem.Allocator) !LambdaSet {
-        return .{ .members = try allocator.dupe(ir.FunctionId, self.members) };
+        return .{ .members = try allocator.dupe(ir.FunctionId, self.members), .top = self.top };
     }
 
     pub fn deinit(self: *LambdaSet, allocator: std.mem.Allocator) void {
@@ -856,12 +870,16 @@ pub const LambdaSet = struct {
         return self.members.len;
     }
 
+    /// A top set is never a singleton — even if exactly one member was
+    /// enumerable, the unknown residual means the real callee set is unbounded.
     pub fn isSingleton(self: LambdaSet) bool {
-        return self.members.len == 1;
+        return !self.top and self.members.len == 1;
     }
 
+    /// A top set is never empty (it stands for an unknown, possibly non-empty
+    /// collection), so it is never classified as dead/unreachable.
     pub fn isEmpty(self: LambdaSet) bool {
-        return self.members.len == 0;
+        return !self.top and self.members.len == 0;
     }
 
     pub fn contains(self: LambdaSet, func: ir.FunctionId) bool {
@@ -894,8 +912,16 @@ pub const SpecializationDecision = enum {
 pub const SWITCH_THRESHOLD: usize = 8;
 
 /// Determine specialization from lambda set size.
+///
+/// GAP-P2R-02 — a `top` (unknown) set must fall back to full dynamic dispatch:
+/// its callee set is not a finite enumeration, so neither the direct-call
+/// singleton optimization nor the bounded switch is sound. `isSingleton`/
+/// `isEmpty` already account for `top`, but a top set with an enumerable
+/// subset of size 2..SWITCH_THRESHOLD would otherwise be mis-classified as a
+/// (bounded) `switch_dispatch` — so check `top` explicitly first.
 pub fn specializationForLambdaSet(set: LambdaSet, is_contifiable: bool) SpecializationDecision {
     if (is_contifiable) return .contified;
+    if (set.top) return .dyn_closure_dispatch;
     if (set.isEmpty()) return .unreachable_call;
     if (set.isSingleton()) return .direct_call;
     if (set.size() <= SWITCH_THRESHOLD) return .switch_dispatch;
@@ -1624,6 +1650,39 @@ test "lambda set specialization decisions" {
 
     // Contifiable always wins.
     try std.testing.expectEqual(SpecializationDecision.contified, specializationForLambdaSet(empty, true));
+}
+
+test "GAP-P2R-02: a top (unknown) lambda set is never a singleton/empty and falls back to dynamic dispatch" {
+    // A top set with NO enumerable members must NOT be classified empty
+    // (`unreachable_call`) — it stands for an unknown, possibly non-empty
+    // collection — and must fall back to dynamic dispatch.
+    const top_empty = LambdaSet{ .members = &.{}, .top = true };
+    try std.testing.expect(!top_empty.isEmpty());
+    try std.testing.expect(!top_empty.isSingleton());
+    try std.testing.expectEqual(SpecializationDecision.dyn_closure_dispatch, specializationForLambdaSet(top_empty, false));
+
+    // A top set with exactly ONE enumerable member must NOT be mistaken for a
+    // singleton (`direct_call`): the unknown residual means the real callee
+    // set is unbounded. This is the precise spurious-singleton hazard the
+    // top element exists to prevent.
+    const top_one = LambdaSet{ .members = &.{7}, .top = true };
+    try std.testing.expect(!top_one.isSingleton());
+    try std.testing.expectEqual(SpecializationDecision.dyn_closure_dispatch, specializationForLambdaSet(top_one, false));
+
+    // A top set with a small enumerable subset (2..SWITCH_THRESHOLD) must NOT
+    // be classified as a bounded `switch_dispatch` either — `top` is checked
+    // before the size-based arms.
+    const top_two = LambdaSet{ .members = &.{ 7, 9 }, .top = true };
+    try std.testing.expectEqual(SpecializationDecision.dyn_closure_dispatch, specializationForLambdaSet(top_two, false));
+
+    // Contifiable still wins even over top (a closure proven called-only is
+    // contified regardless of provenance uncertainty).
+    try std.testing.expectEqual(SpecializationDecision.contified, specializationForLambdaSet(top_empty, true));
+
+    // A genuine singleton (NOT top) is still a direct call — no pessimization.
+    const real_one = LambdaSet{ .members = &.{7}, .top = false };
+    try std.testing.expect(real_one.isSingleton());
+    try std.testing.expectEqual(SpecializationDecision.direct_call, specializationForLambdaSet(real_one, false));
 }
 
 test "AnalysisContext clones function summaries and owns slices" {
