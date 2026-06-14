@@ -7904,7 +7904,12 @@ pub const IrBuilder = struct {
                                     if (!offset_is_dynamic) byte_offset += n;
                                 },
                                 .variable => |var_name| {
-                                    const var_local = findBinaryVarLocal(clause, var_name);
+                                    // A `size(name)` whose `name` is not an
+                                    // earlier binary binding cannot be lowered
+                                    // correctly. Fail loudly rather than
+                                    // silently slicing at local 0 (ir-1--09).
+                                    const var_local = findBinaryVarLocal(clause, var_name) orelse
+                                        return error.BinarySizeVarUnresolved;
                                     if (binding_local) |dest| {
                                         try self.current_instrs.append(self.allocator, .{
                                             .bin_slice = .{
@@ -7982,11 +7987,17 @@ pub const IrBuilder = struct {
         }
     }
 
-    fn findBinaryVarLocal(clause: *const hir_mod.Clause, var_name: ast.StringId) LocalId {
+    /// Resolve a binary segment `size(name)` reference to the local holding an
+    /// EARLIER same-clause segment binding of that name. Returns `null` when
+    /// the name is not an earlier binary binding so the caller can fail the
+    /// compile loudly: returning `LocalId 0` (the former behavior) silently
+    /// fed an UNRELATED local into `bin_slice`'s dynamic length/offset,
+    /// extracting a wrong slice with no diagnostic (audit finding ir-1--09).
+    fn findBinaryVarLocal(clause: *const hir_mod.Clause, var_name: ast.StringId) ?LocalId {
         for (clause.binary_bindings) |binding| {
             if (binding.name == var_name) return binding.local_index;
         }
-        return 0;
+        return null;
     }
 
     /// Emit binary segment extraction instructions for case expression bindings.
@@ -20406,4 +20417,63 @@ test "collectValueEscapingFunctions: make_closure / call_dispatch / entry escape
     try std.testing.expect(!escaping.contains(10));
     // The escaper itself is neither valued nor dispatched nor the entry.
     try std.testing.expect(!escaping.contains(50));
+}
+
+// ============================================================
+// A binary `size(name)` reference that is not an earlier segment
+// binding must NOT silently resolve to local 0 (audit finding
+// ir-1--09).
+//
+// `findBinaryVarLocal` returned `LocalId 0` on a miss, feeding an
+// UNRELATED local into `bin_slice`'s dynamic length/offset — a
+// silent wrong extraction. It now returns `?LocalId`; the caller
+// (`emitBinaryBindings`) fails the compile with
+// `error.BinarySizeVarUnresolved` instead. This unit test pins
+// the resolver contract and is revert-sensitive: the pre-fix
+// code returned a valid `LocalId 0` for an absent name.
+// ============================================================
+
+test "findBinaryVarLocal returns null for an unresolved size variable, never local 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const present = try interner.intern("len");
+    const absent = try interner.intern("not_a_segment");
+
+    // One earlier segment binding named `len` at local 7.
+    const segment = hir_mod.BinaryMatchSegment{
+        .pattern = null,
+        .type_spec = .{ .integer = .{ .signed = false, .bits = 8 } },
+        .endianness = .big,
+        .size = null,
+        .string_literal = null,
+    };
+    const bindings = [_]hir_mod.BinaryBinding{.{
+        .name = present,
+        .param_index = 0,
+        .segment_index = 0,
+        .local_index = 7,
+        .segment = segment,
+    }};
+
+    var clause: hir_mod.Clause = .{
+        .params = &.{},
+        .return_type = types_mod.TypeStore.NIL,
+        .decision = undefined, // findBinaryVarLocal never reads these
+        .body = undefined,
+        .refinement = null,
+        .tuple_bindings = &.{},
+        .binary_bindings = &bindings,
+    };
+
+    // A present name resolves to its binding local.
+    try std.testing.expectEqual(@as(?LocalId, 7), IrBuilder.findBinaryVarLocal(&clause, present));
+    // An absent name resolves to null (NOT a fabricated local 0).
+    try std.testing.expectEqual(@as(?LocalId, null), IrBuilder.findBinaryVarLocal(&clause, absent));
+
+    // And with NO bindings at all, an absent name is still null.
+    clause.binary_bindings = &.{};
+    try std.testing.expectEqual(@as(?LocalId, null), IrBuilder.findBinaryVarLocal(&clause, present));
 }
