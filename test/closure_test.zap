@@ -320,4 +320,92 @@ pub struct ClosureTest {
     direct_ok and Map.has_key?(produced, :added)
   }
 
+  # End-to-end runtime soundness complement for audit finding
+  # uniqueness--03. A `~>` catch basin lowers to a `try_call_named` whose
+  # dest is the if-else MERGE of the success-arm value and the handler-arm
+  # value. The uniqueness analyzer used to classify that dest unique from
+  # the SUCCESS-callee contract alone, ignoring that the handler (no-match)
+  # arm can bind a SHARED/aliased value to the same dest; a later
+  # owned-mutating `Map.put` on the basin result could then be rewritten to
+  # `put_owned_unchecked` and mutate an rc>=2 cell in place on the error
+  # path -- silent heap corruption.
+  #
+  # `step_enrich` is a partial, owned-mutating dispatch (it forwards its
+  # Map receiver straight into `Map.put`; the `:go` clause is the only
+  # match), exercised through BOTH a DIRECT consuming call (`direct_step`,
+  # the shape that promotes the receiver toward `.owned`) and the catch
+  # basin below. In the basin the dispatch atom `:stop` matches no clause,
+  # so the handler runs and yields the parked `shared_map` (rc>=2); the
+  # subsequent `Map.put` on the basin result is at its last use. The parked
+  # alias must survive unchanged on the no-match path, under default ARC and
+  # `Memory.Tracking`.
+  #
+  # Honesty note: this corpus case passes both pre- AND post-fix. The
+  # convention cascade keeps the basin-result `Map.put` receiver
+  # COW-classified for this catch-basin shape (the same cascade the FU-13
+  # case above documents), so the analyzer-level false-uniqueness does not
+  # reach a `*_owned_unchecked` emission here end to end. The authoritative
+  # fail-pre/pass-post proof for uniqueness--03 is the deterministic
+  # analyzer unit test
+  # "uniqueness--03: try_call_named dest is NOT unique when the handler arm
+  # yields a shared value" in src/uniqueness.zig, which asserts the dest
+  # classification directly. This runtime guard locks in the no-corruption
+  # behavior under both managers and is the regression complement: a future
+  # change that both re-introduces the analyzer bug AND removes the cascade
+  # masking would corrupt the parked alias and surface here. The
+  # matched-clause case confirms the success path still produces its own
+  # mutation.
+  describe("catch-basin handler-arm aliasing soundness (uniqueness--03)") {
+    test("no-match catch basin does not corrupt a parked shared alias") {
+      assert(catch_basin_handler_preserves_parked_alias())
+    }
+
+    test("matched catch basin still returns the success mutation") {
+      assert(catch_basin_success_has_mutation())
+    }
+  }
+
+  fn step_enrich(receiver :: %{Atom => i64}, :go :: Atom) -> %{Atom => i64} {
+    Map.put(receiver, :stepped, 999)
+  }
+
+  # Direct consuming caller: the call shape that promotes `step_enrich`'s
+  # receiver slot to `.owned`, which is what makes the catch-basin dest
+  # look unique from the success contract.
+  fn direct_step() -> Bool {
+    fresh = %{seed: 1}
+    produced = step_enrich(fresh, :go)
+    Map.has_key?(produced, :stepped)
+  }
+
+  fn catch_basin_handler_preserves_parked_alias() -> Bool {
+    direct_ok = direct_step()
+    shared_map = %{kept: 7}
+    parked = [shared_map]
+    # `:stop` matches no `step_enrich` clause -> the handler runs and
+    # yields the SHARED `shared_map` (rc>=2). The basin result is that
+    # shared cell on this path. Owned-mutating site on the basin result
+    # at its last use must COW (it is the rc>=2 shared cell on the
+    # no-match path), so the parked alias survives unchanged.
+    basin = shared_map
+    |> step_enrich(:stop)
+    ~> {
+      _ -> shared_map
+    }
+    _mutated = Map.put(basin, :added, 1)
+    observed = List.get(parked, 0)
+    direct_ok and not Map.has_key?(observed, :added) and Map.has_key?(observed, :kept)
+  }
+
+  fn catch_basin_success_has_mutation() -> Bool {
+    base = %{origin: 1}
+    # `:go` matches -> success path returns `Map.put(base, :stepped, 999)`.
+    basin = base
+    |> step_enrich(:go)
+    ~> {
+      _ -> base
+    }
+    Map.has_key?(basin, :stepped)
+  }
+
 }
