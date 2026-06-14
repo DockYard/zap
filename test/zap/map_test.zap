@@ -360,4 +360,72 @@ pub struct Zap.MapTest {
       true -> :kx
     }
   }
+
+  # ----------------------------------------------------------------
+  # runtime-3--02 (RT-19): Term.from must represent List/Map/tuple
+  # values LOSSLESSLY when they are stored into a heterogeneous
+  # collection.
+  #
+  # A collection literal whose values mix an aggregate (List/Map) and a
+  # scalar forces the value element type to the heterogeneous `Term`
+  # carrier (`unifyForCollection` collapses the value axis to TERM). Each
+  # value element then lowers through `Term.from` (`emitTermWrap` ->
+  # `:zig.Term.from`). Before the fix `Term.from` had no `.list`/`.map`/
+  # `.tuple` arm: a `?*const List(_)` / `?*const Map(_,_)` unwrapped
+  # through the generic `.optional`/`.pointer` arms to a size==.one
+  # pointer-to-struct and fell through to `.nil`, silently destroying the
+  # stored collection. A later `Map.get`/`List.at` then observed nil
+  # instead of the value — a silent miscompilation reachable from benign
+  # source. These tests pin the round-trip (the value comes back EQUAL to
+  # what was stored, never nil) for each aggregate kind.
+  #
+  # The default `Memory.ARC` corpus manager exercises the REFCOUNTED
+  # boxing path (the stored cell is retained through the box vtable on
+  # store and released on the container's drop); the `assert_no_leaks`
+  # blocks additionally pin the net live-allocation delta to zero under
+  # `Memory.Tracking` (where a boxed cell needs clone-on-share on extract
+  # and a deep-free on the container drop) — proving the new box vtable
+  # neither leaks the cell nor double-frees it.
+  describe("runtime-3--02: aggregate values round-trip through a heterogeneous Map") {
+    test("a List value stored beside a scalar comes back intact, not nil") {
+      hetero = %{items: [10, 20, 30], count: 3}
+      items = Map.get(hetero, :items, [0])
+      # PRE-FIX: `items` is the `[0]` default (the stored list was dropped
+      # as nil). POST-FIX: the original three-element list.
+      assert(List.length(items) == 3)
+      assert(List.at(items, 0) == 10)
+      assert(List.at(items, 1) == 20)
+      assert(List.at(items, 2) == 30)
+      # The scalar value in the same heterogeneous map is unaffected.
+      assert(Map.get(hetero, :count, 0) == 3)
+    }
+
+    test("a Map value stored beside a scalar comes back intact, not nil") {
+      hetero = %{inner: %{port: 8080, timeout: 30}, version: 1}
+      inner = Map.get(hetero, :inner, %{port: 0, timeout: 0})
+      # PRE-FIX: `inner` is the empty default. POST-FIX: the stored map.
+      assert(Map.get(inner, :port, 0) == 8080)
+      assert(Map.get(inner, :timeout, 0) == 30)
+      assert(Map.get(hetero, :version, 0) == 1)
+    }
+
+    test("aggregate-in-heterogeneous-Map round-trip is leak-free under Tracking") {
+      # Store a List and a Map value (each beside a scalar) into a
+      # heterogeneous map, read both back, and assert the net live
+      # allocation delta is zero. A pre-fix `.nil` store would have leaked
+      # the producer's cell (never owned by the map); an over-retain on
+      # the new box vtable would leak, an over-release would reclaim a
+      # still-referenced cell (invalid-free under Tracking).
+      assert_no_leaks {
+        list_holder = %{vals: [7, 8, 9], n: 3}
+        vals = Map.get(list_holder, :vals, [0])
+        assert(List.length(vals) == 3)
+        assert(List.at(vals, 2) == 9)
+
+        map_holder = %{cfg: %{a: 1, b: 2}, tag: 5}
+        cfg = Map.get(map_holder, :cfg, %{a: 0, b: 0})
+        assert(Map.get(cfg, :b, 0) == 2)
+      }
+    }
+  }
 }

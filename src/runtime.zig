@@ -4973,10 +4973,85 @@ pub const ArcRuntime = struct {
         return T == ProtocolBox;
     }
 
+    /// True iff `T` is the runtime heterogeneous `Term` carrier. `Term` is a
+    /// `union(enum)` whose `.list`/`.map` variants hold a `TermBox` (an erased
+    /// inline-header collection cell pointer plus a per-cell-type lifecycle
+    /// vtable). The generic field walk cannot retain/release/clone that box
+    /// (the cell's concrete type is erased), so — exactly like `isProtocolBox`
+    /// — every ARC walk entry point checks this FIRST and routes a `Term`
+    /// through its vtable (`termRetain`/`termRelease`/`termCloneInPlace`)
+    /// instead of the generic union-field recursion. A `Term` carrying a
+    /// scalar/string/atom/nil variant has no boxed cell, so the routed
+    /// helpers are a no-op for it.
+    pub fn isTerm(comptime T: type) bool {
+        return T == Term;
+    }
+
+    /// Register a new owner of any inline-header cell a `Term` boxes
+    /// (REFCOUNTED refcount bump via the box vtable; recurses into a `.tuple`'s
+    /// elements). No-op for scalar/string/atom/nil terms and under
+    /// non-refcounted models (the vtable `retain` slots are themselves no-ops
+    /// there — a second owner is given an independent buffer via `clone`).
+    pub fn termRetain(value: Term) void {
+        switch (value) {
+            .list, .map => |box| {
+                if (box.vtable) |vt| vt.retain(box.data_ptr);
+            },
+            .tuple => |elems| {
+                for (elems) |elem| termRetain(elem);
+            },
+            else => {},
+        }
+    }
+
+    /// Drop one owner of any inline-header cell a `Term` boxes, performing the
+    /// cell's full manager-aware teardown on the final owner (via the box
+    /// vtable's `release`); recurses into a `.tuple`'s elements. No-op for
+    /// scalar/string/atom/nil terms.
+    pub fn termRelease(value: Term) void {
+        switch (value) {
+            .list, .map => |box| {
+                if (box.vtable) |vt| vt.release(box.data_ptr);
+            },
+            .tuple => |elems| {
+                for (elems) |elem| termRelease(elem);
+            },
+            else => {},
+        }
+    }
+
+    /// Replace any inline-header cell a `Term` boxes with an INDEPENDENT deep
+    /// clone (clone-on-share) so a second owner uniquely owns its buffer;
+    /// recurses into a `.tuple`'s elements. Used under a no-REFCOUNT_V1 manager
+    /// where a cell has no refcount to express a shared owner. No-op for
+    /// scalar/string/atom/nil terms.
+    pub fn termCloneInPlace(slot: *Term) void {
+        switch (slot.*) {
+            .list => |box| {
+                if (box.vtable) |vt| slot.* = .{ .list = .{ .data_ptr = vt.clone(box.data_ptr), .vtable = box.vtable } };
+            },
+            .map => |box| {
+                if (box.vtable) |vt| slot.* = .{ .map = .{ .data_ptr = vt.clone(box.data_ptr), .vtable = box.vtable } };
+            },
+            // `.tuple` is left aliased: a whole tuple is never boxed into a
+            // `Term` by codegen (tuple LITERALS wrap their components
+            // individually — see `zir_builder` — and lower as Zig anonymous
+            // structs, never through `Term.from`), so a tuple `Term` is never
+            // shared and this clone is never reached for one. Cloning in place
+            // would have to mutate the shared `[]const Term` backing (wrong) or
+            // allocate a fresh slice with no matching free in `termRelease`
+            // (leak). Refusing to do either keeps the unreachable path safe; if
+            // whole-tuple boxing is ever added, give `.tuple` an owned backing
+            // slice plus a matching release first.
+            .tuple => {},
+            else => {},
+        }
+    }
+
     /// True iff `T` is a single-item pointer (optionally optional /
     /// `const`) whose pointee is `anyopaque` — a DELIBERATELY type-erased
-    /// pointer such as `Term.list: ?*const anyopaque` /
-    /// `Term.map: ?*const anyopaque`.
+    /// pointer (e.g. the `data_ptr`/`vtable` fields inside a `TermBox`, or a
+    /// raw `?*const anyopaque` handed across an FFI seam).
     ///
     /// The generic ARC field-walk classifies a `.pointer` with `size ==
     /// .one` as an independently-Arc-managed child and recurses into it
@@ -5028,6 +5103,11 @@ pub const ArcRuntime = struct {
 
     fn typeHasArcChildren(comptime T: type) bool {
         if (comptime isProtocolBox(T)) return true;
+        // `Term` owns ARC children through its `.list`/`.map` box vtables and
+        // its `.tuple` elements, but they are erased — the generic field walk
+        // would (wrongly) see only opaque pointers. Force the deep-walk on so
+        // the `isTerm` arm in each walker dispatches through the vtable.
+        if (comptime isTerm(T)) return true;
         return switch (@typeInfo(T)) {
             .@"struct" => |s| blk: {
                 inline for (s.fields) |field| {
@@ -5084,10 +5164,20 @@ pub const ArcRuntime = struct {
     /// (so the whole machinery comptime-elides) for plain-data element types.
     pub fn elementHasEagerlyFreedChild(comptime T: type) bool {
         if (comptime isProtocolBox(T)) return true;
+        // `Term` can box an inline-header `List`/`Map` cell (or carry a
+        // `.tuple` of such terms). Under a no-REFCOUNT_V1 manager (Tracking)
+        // a second owner of such a cell needs an independent buffer
+        // (clone-on-share) and the final owner must run the cell's deep-free;
+        // both are gated on this predicate (Term is a union, so
+        // `valuePointsToInlineHeaderCell` cannot see the boxed cell). Force it
+        // true so the `isTerm` arms in `releaseAndPoisonEagerChildren` /
+        // `cloneChildrenAnyInPlace` / `ownEntryValue` / `ownElement` fire and
+        // dispatch through the box vtable. A scalar `Term` makes those a no-op.
+        if (comptime isTerm(T)) return true;
         // An erased-opaque pointer (`?*const anyopaque`) is not eagerly
         // freed (nor freeable at all) by the generic walk — see
         // `pointerChildIsErasedOpaque`. Excluding it here keeps the whole
-        // eager-walk machinery comptime-elided for carriers like `Term`.
+        // eager-walk machinery comptime-elided for raw erased pointers.
         if (comptime pointerChildIsErasedOpaque(T)) return false;
         return switch (@typeInfo(T)) {
             .optional => |opt| elementHasEagerlyFreedChild(opt.child),
@@ -5660,6 +5750,14 @@ pub const ArcRuntime = struct {
             value.* = cloneProtocolBoxValue(value.*);
             return;
         }
+        // A `Term` clones its boxed cell (`.list`/`.map`) in place through the
+        // box vtable so a second owner of the carrying container uniquely owns
+        // an independent buffer; the generic union-field walk would leave the
+        // erased pointer aliased.
+        if (comptime isTerm(T)) {
+            termCloneInPlace(value);
+            return;
+        }
         // Skip the entire walk for types with no ARC children — the bit-copy
         // is already fully independent.
         if (comptime !typeHasArcChildren(T)) return;
@@ -6056,6 +6154,14 @@ pub const ArcRuntime = struct {
             releaseProtocolBoxValue(value);
             return;
         }
+        // A `Term` routes through its box vtable (`.list`/`.map`) — under
+        // REFCOUNTED this drops the boxed cell's refcount, freeing on the
+        // zero-transition; the generic union-field walk would only see erased
+        // opaque pointers and free nothing.
+        if (comptime isTerm(T)) {
+            termRelease(value);
+            return;
+        }
         // Skip the entire walk for types with no ARC children. This
         // keeps the deep-walk from emitting a runtime tag-switch (or any
         // field recursion) over pure-data aggregates — without this guard
@@ -6153,6 +6259,25 @@ pub const ArcRuntime = struct {
             slot.* = .{ .data_ptr = null, .vtable = null };
             return;
         }
+        // A `Term` releases its boxed cell (`.list`/`.map`) through the box
+        // vtable, then poisons the slot to `.nil` so a repeated release of an
+        // aliased carrying container frees nothing (the inline-header analog of
+        // the box-slot poison above). Scalar terms are released as a no-op and
+        // left intact.
+        if (comptime isTerm(T)) {
+            switch (slot.*) {
+                .list, .map => |box| {
+                    if (box.vtable) |vt| vt.release(box.data_ptr);
+                    slot.* = .{ .nil = {} };
+                },
+                .tuple => {
+                    termRelease(slot.*);
+                    slot.* = .{ .nil = {} };
+                },
+                else => {},
+            }
+            return;
+        }
         switch (@typeInfo(T)) {
             .optional => |opt| {
                 if (slot.*) |inner| {
@@ -6220,6 +6345,12 @@ pub const ArcRuntime = struct {
         }
         if (comptime isProtocolBox(T)) {
             retainProtocolBoxValue(value);
+            return;
+        }
+        // A `Term` routes through its box vtable (`.list`/`.map`) — bump the
+        // boxed cell's refcount for the new persistent owner.
+        if (comptime isTerm(T)) {
+            termRetain(value);
             return;
         }
         // Mirror `releaseChildrenAny`: skip the walk (and any runtime
@@ -8422,6 +8553,15 @@ pub fn List(comptime T: type) type {
         }
 
         fn releaseElementShape(comptime ElemT: type, value: ElemT, allocator: std.mem.Allocator) void {
+            // The heterogeneous `Term` carrier is a `union(enum)` that owns ARC
+            // children via its `.list`/`.map` box vtables; route it through the
+            // generic deep-walk (whose `isTerm` arm dispatches the vtable
+            // release). Scoped to `Term` so non-Term element types keep their
+            // existing shape-walk behaviour.
+            if (comptime ArcRuntime.isTerm(ElemT)) {
+                ArcRuntime.releaseChildrenAny(ElemT, allocator, value);
+                return;
+            }
             switch (@typeInfo(ElemT)) {
                 .optional => |opt| {
                     if (value) |inner| releaseElementShape(opt.child, inner, allocator);
@@ -8439,6 +8579,10 @@ pub fn List(comptime T: type) type {
         }
 
         fn retainElementShape(comptime ElemT: type, value: ElemT) void {
+            if (comptime ArcRuntime.isTerm(ElemT)) {
+                ArcRuntime.retainChildrenAny(ElemT, value);
+                return;
+            }
             switch (@typeInfo(ElemT)) {
                 .optional => |opt| {
                     if (value) |inner| retainElementShape(opt.child, inner);
@@ -14040,6 +14184,119 @@ fn listElementValue(comptime Element: type, value: anytype) Element {
 // types; `Term` is engaged only for the heterogeneous case.
 // ============================================================
 
+/// Per-cell-type vtable carried by a `Term` that boxes an inline-header
+/// collection cell (`List(T)` / `Map(K, V)`). The cell's concrete type is
+/// erased to break `Term`'s otherwise-recursive definition (a `Term` can
+/// hold a `List(Term)`), but a heterogeneous container holding the `Term`
+/// (e.g. `Map(atom, Term)`) still has to retain/release/clone the boxed
+/// cell when the container itself is shared/dropped — and it does NOT know
+/// the concrete cell type. The vtable supplies the three lifecycle
+/// operations monomorphised for the boxed cell, exactly mirroring
+/// `ProtocolBoxVTableHeader` for boxed existentials.
+///
+/// Every slot is the cell type's own manager-aware method, so a single
+/// indirect call does the right thing under every reclamation model:
+///   * REFCOUNTED — `retain` bumps / `release` drops the cell's inline
+///     refcount, freeing on the zero-transition.
+///   * INDIVIDUAL_NO_REFCOUNT (Tracking) — `clone` hands a second owner an
+///     independent buffer (clone-on-share); `release` deep-frees the cell's
+///     eagerly-freed grandchildren; the buffer itself is teardown-reclaimed.
+///   * BULK_OR_NEVER / TRACED — every slot is a no-op (bulk/never reclaim).
+pub const TermAggregateVTable = extern struct {
+    /// Register a new owner of the boxed cell (REFCOUNTED refcount bump;
+    /// no-op under non-refcounted models — the matching `clone` is used to
+    /// give a second owner an independent buffer there).
+    retain: *const fn (cell: ?*const anyopaque) callconv(.c) void,
+
+    /// Drop one owner of the boxed cell, performing the cell's full
+    /// manager-aware teardown on the final owner.
+    release: *const fn (cell: ?*const anyopaque) callconv(.c) void,
+
+    /// Produce an INDEPENDENT deep clone of the boxed cell for a new owner.
+    /// Used by the share path under a no-REFCOUNT_V1 manager (the cell has
+    /// no refcount, so a second owner must own its own buffer). Returns the
+    /// erased clone pointer.
+    clone: *const fn (cell: ?*const anyopaque) callconv(.c) ?*const anyopaque,
+};
+
+/// A `Term` payload for a boxed inline-header collection cell: the erased
+/// cell pointer plus its lifecycle vtable. `data_ptr == null` is the empty
+/// collection sentinel (e.g. an empty `List`/`Map`); `vtable` is a `.rodata`
+/// constant and is `null` only together with a `null` `data_ptr`.
+pub const TermBox = extern struct {
+    data_ptr: ?*const anyopaque,
+    vtable: ?*const TermAggregateVTable,
+};
+
+/// Build the comptime-constant `TermAggregateVTable` for an inline-header
+/// collection cell type `Cell` (`List(T)` / `Map(K, V)`). Each slot wraps
+/// the cell type's own `retain`/`release`/`cloneForShare`, casting the
+/// erased `?*const anyopaque` back to `?*const Cell`. The returned pointer
+/// addresses a per-`Cell` `.rodata` constant, so all boxes of the same cell
+/// type share one vtable.
+/// Memoised per-cell-type vtable holder. A generic struct (keyed on `Cell`)
+/// so Zig instantiates exactly ONE `vtable` constant per cell type — every
+/// `termVTableFor(Cell)` call returns the same `.rodata` address, keeping all
+/// boxes of one cell type pointing at a single shared vtable.
+fn TermVTableHolder(comptime Cell: type) type {
+    return struct {
+        fn retainAdapter(cell: ?*const anyopaque) callconv(.c) void {
+            _ = Cell.retain(@as(?*const Cell, @ptrCast(@alignCast(cell))));
+        }
+        fn releaseAdapter(cell: ?*const anyopaque) callconv(.c) void {
+            Cell.release(@as(?*const Cell, @ptrCast(@alignCast(cell))));
+        }
+        fn cloneAdapter(cell: ?*const anyopaque) callconv(.c) ?*const anyopaque {
+            return @as(?*const anyopaque, @ptrCast(Cell.cloneForShare(@as(?*const Cell, @ptrCast(@alignCast(cell))))));
+        }
+        const vtable = TermAggregateVTable{
+            .retain = retainAdapter,
+            .release = releaseAdapter,
+            .clone = cloneAdapter,
+        };
+    };
+}
+
+fn termVTableFor(comptime Cell: type) *const TermAggregateVTable {
+    return &TermVTableHolder(Cell).vtable;
+}
+
+/// True iff `T` is a (possibly-optional) single-item pointer to an
+/// inline-header collection cell that exposes the `cloneForShare` clone
+/// entry — the shapes `Term.from` boxes into `.list`/`.map`. Mirrors
+/// `ArcRuntime.valuePointsToInlineHeaderCell` but lives here so `Term`
+/// construction is self-contained.
+fn termPointsToInlineHeaderCell(comptime T: type) bool {
+    const info = @typeInfo(T);
+    const ptr_info = switch (info) {
+        .optional => |opt| @typeInfo(opt.child),
+        else => info,
+    };
+    if (ptr_info != .pointer) return false;
+    if (ptr_info.pointer.size != .one) return false;
+    const Cell = ptr_info.pointer.child;
+    return ArcRuntime.hasInlineArcHeader(Cell) and @hasDecl(Cell, "cloneForShare");
+}
+
+/// Recover the concrete inline-header cell type from a `?*const Cell` /
+/// `*const Cell` pointer type that satisfies `termPointsToInlineHeaderCell`.
+fn termCellType(comptime T: type) type {
+    const info = @typeInfo(T);
+    const ptr_info = switch (info) {
+        .optional => |opt| @typeInfo(opt.child),
+        else => info,
+    };
+    return ptr_info.pointer.child;
+}
+
+/// True iff `Cell` is a `Map(K, V)` (vs. a `List(T)`). Both expose
+/// `cloneForShare` and an inline `ArcHeader`; the discriminator is the
+/// element-type marker each exposes (`KeyType`/`ValueType` for `Map`,
+/// `Element` for `List`).
+fn termCellIsMap(comptime Cell: type) bool {
+    return @hasDecl(Cell, "KeyType") and @hasDecl(Cell, "ValueType");
+}
+
 pub const Term = union(enum) {
     int: i64,
     float: f64,
@@ -14047,13 +14304,15 @@ pub const Term = union(enum) {
     bool_val: bool,
     atom: u32,
     nil: void,
-    /// Erased ?*const List(Term). Stored as opaque pointer to avoid
-    /// the recursive type definition; callers reinterpret via the
-    /// helpers below.
-    list: ?*const anyopaque,
-    /// Erased ?*const Map(K, Term). The key type is irrelevant to
-    /// `Term` itself — collection-specific code knows the key type.
-    map: ?*const anyopaque,
+    /// A boxed `List(_)` cell: the erased cell pointer plus its lifecycle
+    /// vtable (see `TermBox`). Erased to break the otherwise-recursive type
+    /// (`Term` can hold `List(Term)`); the vtable lets a heterogeneous
+    /// container owning this `Term` retain/release/clone the cell without
+    /// knowing its concrete element type.
+    list: TermBox,
+    /// A boxed `Map(_, _)` cell. Same erased-pointer-plus-vtable shape as
+    /// `.list`; the key/value types are irrelevant to `Term` itself.
+    map: TermBox,
     /// Owned slice of child terms (small fixed-size aggregates).
     tuple: []const Term,
 
@@ -14062,6 +14321,22 @@ pub const Term = union(enum) {
     /// for scalars and slices.
     pub fn from(value: anytype) Term {
         const T = @TypeOf(value);
+        // An inline-header collection cell pointer (`?*const List(_)` /
+        // `*const List(_)` / `?*const Map(_,_)` / `*const Map(_,_)`) boxes
+        // into `.list`/`.map`, carrying the cell's lifecycle vtable. Checked
+        // before the generic `.pointer`/`.optional` arms because those would
+        // otherwise mis-classify the cell pointer (a `size == .one` pointer
+        // to a struct) and silently drop it as `.nil` — the runtime-3--02
+        // data-loss bug. Ownership: the value reaching `Term.from` is a
+        // MOVED owned reference (the codegen treats list/map-literal element
+        // positions as aggregate-store consume sites — see
+        // `arc_ownership.recordAggregateStoreUse`), so the box TAKES that
+        // single reference WITHOUT an extra retain. The container holding the
+        // resulting `Term` becomes the durable owner and releases the cell
+        // through the vtable when it is dropped.
+        if (comptime termPointsToInlineHeaderCell(T)) {
+            return termBoxFromCell(T, value);
+        }
         const ti = @typeInfo(T);
         return switch (ti) {
             .bool => .{ .bool_val = value },
@@ -14083,10 +14358,19 @@ pub const Term = union(enum) {
                 if (ptr_info.size == .slice and ptr_info.child == u8) {
                     break :blk .{ .str = value };
                 }
+                // A slice of `Term` is an aggregate tuple payload.
+                if (ptr_info.size == .slice and ptr_info.child == Term) {
+                    break :blk .{ .tuple = value };
+                }
                 if (ptr_info.size == .one) {
                     const child_info = @typeInfo(ptr_info.child);
                     if (child_info == .array and child_info.array.child == u8) {
                         break :blk .{ .str = value[0..] };
+                    }
+                    // A pointer to an array of `Term` (`*const [N]Term`) is a
+                    // tuple payload; surface it as a `[]const Term` slice.
+                    if (child_info == .array and child_info.array.child == Term) {
+                        break :blk .{ .tuple = value[0..] };
                     }
                 }
                 break :blk .{ .nil = {} };
@@ -14108,12 +14392,38 @@ pub const Term = union(enum) {
         };
     }
 
+    /// Box an inline-header collection cell pointer (`value`, of static type
+    /// `T` satisfying `termPointsToInlineHeaderCell`) into the matching
+    /// `.list`/`.map` variant with its lifecycle vtable. Does NOT retain —
+    /// the caller moved an owned reference in (see `from`).
+    fn termBoxFromCell(comptime T: type, value: T) Term {
+        const Cell = termCellType(T);
+        const data_ptr: ?*const anyopaque = blk: {
+            if (@typeInfo(T) == .optional) {
+                break :blk if (value) |cell| @as(?*const anyopaque, @ptrCast(cell)) else null;
+            }
+            break :blk @as(?*const anyopaque, @ptrCast(value));
+        };
+        const box = TermBox{ .data_ptr = data_ptr, .vtable = termVTableFor(Cell) };
+        return if (comptime termCellIsMap(Cell)) .{ .map = box } else .{ .list = box };
+    }
+
     /// Unwrap a `Term` into a concrete Zig value of type `T`. If the
     /// runtime variant does not match, returns the supplied default.
     /// Accepts `[]const u8` slices and `*const [N:0]u8` string-literal
     /// pointers transparently — both fan in to the `.str` variant.
     pub fn to(comptime T: type, t: Term, default: T) T {
         if (T == Term) return t;
+        // An inline-header collection cell target (`?*const List(_)` /
+        // `*const List(_)` / `?*const Map(_,_)` / `*const Map(_,_)`) recovers
+        // the boxed cell pointer from the matching `.list`/`.map` variant.
+        // Checked before the generic `.pointer`/`.optional` arms so a boxed
+        // aggregate round-trips losslessly (runtime-3--02). This is a pure
+        // reinterpret — ownership of the extracted cell is established by the
+        // container's extract path (`ownEntryValue`/`ownElement`), not here.
+        if (comptime termPointsToInlineHeaderCell(T)) {
+            return termCellFromBox(T, t, default);
+        }
         const ti = @typeInfo(T);
         return switch (ti) {
             .bool => if (t == .bool_val) t.bool_val else default,
@@ -14131,6 +14441,9 @@ pub const Term = union(enum) {
                 if (ptr_info.size == .slice and ptr_info.child == u8) {
                     break :blk if (t == .str) t.str else default;
                 }
+                if (ptr_info.size == .slice and ptr_info.child == Term) {
+                    break :blk if (t == .tuple) t.tuple else default;
+                }
                 break :blk default;
             },
             .optional => blk: {
@@ -14140,6 +14453,29 @@ pub const Term = union(enum) {
             .void => {},
             else => default,
         };
+    }
+
+    /// Recover an inline-header collection cell pointer of static type `T`
+    /// (satisfying `termPointsToInlineHeaderCell`) from a boxed `.list`/`.map`
+    /// `Term`. Returns `default` if the variant does not match the requested
+    /// cell kind. The boxed `data_ptr` is reinterpreted back to the concrete
+    /// `*const Cell`; a `null` `data_ptr` (empty-collection sentinel) yields a
+    /// `null` optional or `default` for a non-optional target.
+    fn termCellFromBox(comptime T: type, t: Term, default: T) T {
+        const Cell = termCellType(T);
+        const want_map = comptime termCellIsMap(Cell);
+        const box: TermBox = blk: {
+            if (want_map) {
+                break :blk if (t == .map) t.map else return default;
+            }
+            break :blk if (t == .list) t.list else return default;
+        };
+        if (@typeInfo(T) == .optional) {
+            const raw = box.data_ptr orelse return null;
+            return @as(*const Cell, @ptrCast(@alignCast(raw)));
+        }
+        const raw = box.data_ptr orelse return default;
+        return @as(*const Cell, @ptrCast(@alignCast(raw)));
     }
 
     /// Unwrap a `Term` to a value compatible with `default`'s static
@@ -14182,8 +14518,11 @@ pub const Term = union(enum) {
             .bool_val => a.bool_val == b.bool_val,
             .atom => a.atom == b.atom,
             .nil => true,
-            .list => a.list == b.list,
-            .map => a.map == b.map,
+            // Boxed collections compare by cell identity (same buffer
+            // pointer), matching the pre-box `?*const anyopaque` semantics:
+            // two distinct cells are never `eql` even if structurally equal.
+            .list => a.list.data_ptr == b.list.data_ptr,
+            .map => a.map.data_ptr == b.map.data_ptr,
             .tuple => blk: {
                 if (a.tuple.len != b.tuple.len) break :blk false;
                 for (a.tuple, b.tuple) |ea, eb| {
@@ -14212,8 +14551,10 @@ pub const Term = union(enum) {
             .bool_val => |v| if (v) @as(u32, 1) else @as(u32, 0),
             .atom => |v| v,
             .nil => 0,
-            .list => 0,
-            .map => 0,
+            // Hash the boxed cell by its buffer identity (consistent with the
+            // `Map(K, Term)` key hasher), matching `eql`'s identity semantics.
+            .list => |box| @truncate(@intFromPtr(box.data_ptr)),
+            .map => |box| @truncate(@intFromPtr(box.data_ptr)),
             .tuple => |elems| blk: {
                 var h: u32 = 2166136261;
                 for (elems) |elem| {
@@ -15336,8 +15677,8 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 .bool_val => |v| Wyhash.hashU32(seed, if (v) 1 else 0),
                 .atom => |v| Wyhash.hashU32(seed, v),
                 .nil => Wyhash.hashU64(seed, 0),
-                .list => |v| Wyhash.hashU64(seed, @intFromPtr(v)),
-                .map => |v| Wyhash.hashU64(seed, @intFromPtr(v)),
+                .list => |box| Wyhash.hashU64(seed, @intFromPtr(box.data_ptr)),
+                .map => |box| Wyhash.hashU64(seed, @intFromPtr(box.data_ptr)),
                 .tuple => |elems| blk: {
                     var h: u64 = seed;
                     for (elems) |elem| {
@@ -15430,6 +15771,14 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         fn releaseAnyShape(comptime T: type, value: T, allocator: std.mem.Allocator) void {
+            // Route the `Term` carrier (a `union(enum)` that owns ARC children
+            // via its `.list`/`.map` box vtables) through the generic deep-walk,
+            // whose `isTerm` arm dispatches the box vtable release. Scoped to
+            // `Term` so non-Term value types keep their existing shape walk.
+            if (comptime ArcRuntime.isTerm(T)) {
+                ArcRuntime.releaseChildrenAny(T, allocator, value);
+                return;
+            }
             switch (@typeInfo(T)) {
                 .optional => |opt| {
                     if (value) |inner| releaseAnyShape(opt.child, inner, allocator);
@@ -15447,6 +15796,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         fn retainAnyShape(comptime T: type, value: T) void {
+            if (comptime ArcRuntime.isTerm(T)) {
+                ArcRuntime.retainChildrenAny(T, value);
+                return;
+            }
             switch (@typeInfo(T)) {
                 .optional => |opt| {
                     if (value) |inner| retainAnyShape(opt.child, inner);
@@ -21288,19 +21641,19 @@ test "List(?*const Map) owned-unchecked mutators balance ARC element lifetimes" 
 }
 
 test "erased-opaque pointer child is NOT classified as an ARC-managed child" {
-    // A single-item pointer to `anyopaque` (e.g. `Term.list: ?*const anyopaque`,
-    // `Term.map: ?*const anyopaque`) is a DELIBERATELY type-erased pointer:
-    // the generic ARC field-walk cannot recover the pointee's size,
-    // alignment, or owned children, so it can neither deep-release nor
-    // clone it. Such a field MUST NOT be treated as an ARC-managed child
-    // by ANY of the comptime walkers/discriminators — its lifecycle is the
-    // responsibility of the concrete-typed owner that erased it.
+    // A RAW single-item pointer to `anyopaque` (e.g. a `?*const anyopaque`
+    // handed across an FFI seam, or the `data_ptr`/`vtable` fields buried
+    // inside a `TermBox`) is a DELIBERATELY type-erased pointer: the generic
+    // ARC field-walk cannot recover the pointee's size, alignment, or owned
+    // children, so it can neither deep-release nor clone it. Such a field MUST
+    // NOT be treated as an ARC-managed child by ANY of the comptime
+    // walkers/discriminators.
     //
-    // The two discriminators below drive every release / retain / clone
-    // walk; if either returns `true` for an erased-opaque pointer, the
-    // walker instantiates `releaseArcAny(anyopaque)` / `allocAny(anyopaque)`,
-    // which fails to compile under a no-REFCOUNT_V1 manager
-    // (`@alignOf(anyopaque)` / a by-value `anyopaque` parameter).
+    // The discriminators below drive every release / retain / clone walk; if
+    // any returns `true` for a raw erased-opaque pointer, the walker
+    // instantiates `releaseArcAny(anyopaque)` / `allocAny(anyopaque)`, which
+    // fails to compile under a no-REFCOUNT_V1 manager (`@alignOf(anyopaque)` /
+    // a by-value `anyopaque` parameter).
     comptime {
         if (ArcRuntime.elementHasEagerlyFreedChild(?*const anyopaque))
             @compileError("?*const anyopaque must not be an eagerly-freed ARC child");
@@ -21309,25 +21662,142 @@ test "erased-opaque pointer child is NOT classified as an ARC-managed child" {
         if (ArcRuntime.elementHasEagerlyFreedChild(*const anyopaque))
             @compileError("*const anyopaque must not be an eagerly-freed ARC child");
     }
-    // `Term` is the canonical erased-opaque carrier: a `union(enum)` whose
-    // `.list` / `.map` variants are `?*const anyopaque`. The generic ARC
-    // walkers must compile over it (instantiating every variant arm at
-    // comptime) and treat the erased variants as having no ARC child, so
-    // `Term` itself reports no eagerly-freed child.
+    // `TermBox` is NEVER walked by the generic field machinery: it only ever
+    // lives inside a `Term`, and every walker special-cases `Term` via
+    // `isTerm` BEFORE the generic union/struct recursion could descend into the
+    // box (whose `data_ptr` is erased and whose `vtable` is a `.rodata`
+    // function table, not an ARC cell). The box's lifecycle is driven solely by
+    // the `term*` helpers through that vtable.
+    // `Term` is the heterogeneous carrier whose `.list`/`.map` variants box an
+    // inline-header collection cell behind a lifecycle vtable (runtime-3--02).
+    // Unlike a raw erased pointer, `Term` DOES own ARC children — but only via
+    // the `isTerm` arms in the walkers, never the generic union-field walk. So
+    // it must report an eagerly-freed child (forcing the deep-walk on) while
+    // the walkers route it through the box vtable.
     comptime {
-        if (ArcRuntime.elementHasEagerlyFreedChild(Term))
-            @compileError("Term carries only erased-opaque pointers; it has no eagerly-freed ARC child");
+        if (!ArcRuntime.elementHasEagerlyFreedChild(Term))
+            @compileError("Term boxes inline-header cells; it must report an eagerly-freed child so the isTerm walk fires");
+        if (!ArcRuntime.isTerm(Term))
+            @compileError("ArcRuntime.isTerm must recognise the Term carrier");
     }
-    // Force instantiation of the release / clone walkers over `Term`. Under
-    // the buggy classification these fail to COMPILE for a no-REFCOUNT_V1
-    // manager; once erased-opaque pointers are excluded they compile and
-    // are no-ops for the erased variants (verified by the value surviving
-    // unchanged).
-    var erased_term: Term = .{ .list = null };
-    ArcRuntime.releaseAndPoisonEagerChildren(Term, std.heap.page_allocator, &erased_term);
-    ArcRuntime.cloneChildrenAnyInPlace(Term, std.heap.page_allocator, &erased_term);
-    try std.testing.expect(erased_term == .list);
-    try std.testing.expect(erased_term.list == null);
+    // The release / clone walkers must compile over `Term` AND be a safe no-op
+    // for a scalar or empty-box term (null vtable). A `.nil` term and an
+    // empty-collection box both survive the walk unchanged.
+    var scalar_term: Term = .{ .int = 42 };
+    ArcRuntime.releaseAndPoisonEagerChildren(Term, std.heap.page_allocator, &scalar_term);
+    ArcRuntime.cloneChildrenAnyInPlace(Term, std.heap.page_allocator, &scalar_term);
+    try std.testing.expect(scalar_term == .int and scalar_term.int == 42);
+
+    var empty_box_term: Term = .{ .list = .{ .data_ptr = null, .vtable = null } };
+    ArcRuntime.cloneChildrenAnyInPlace(Term, std.heap.page_allocator, &empty_box_term);
+    try std.testing.expect(empty_box_term == .list);
+    try std.testing.expect(empty_box_term.list.data_ptr == null);
+}
+
+test "Term.from round-trips List/Map/tuple values losslessly (runtime-3--02)" {
+    // runtime-3--02 / RT-19: `Term.from` silently converted List/Map/tuple
+    // values to `nil`, destroying any collection stored in a heterogeneous
+    // container. Each aggregate must wrap into its dedicated variant and
+    // unwrap back to the SAME value — never `.nil`.
+    const ListI64 = List(i64);
+    const MapU32I64 = Map(u32, i64);
+
+    // ---- List value ----
+    var list_value: ?*const ListI64 = ListI64.new_empty(3) orelse
+        @panic("list allocation failed");
+    list_value = ListI64.push(list_value, 1) orelse @panic("push failed");
+    list_value = ListI64.push(list_value, 2) orelse @panic("push failed");
+    list_value = ListI64.push(list_value, 3) orelse @panic("push failed");
+    defer ListI64.release(list_value);
+
+    const list_term = Term.from(list_value);
+    // PRE-FIX: this is `.nil` (data loss). POST-FIX: `.list`.
+    try std.testing.expect(list_term == .list);
+    const recovered_list = Term.to(?*const ListI64, list_term, null);
+    try std.testing.expect(recovered_list != null);
+    try std.testing.expectEqual(@intFromPtr(list_value.?), @intFromPtr(recovered_list.?));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.length(recovered_list));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(recovered_list, 1));
+
+    // ---- Map value ----
+    const map_keys = [_]u32{ 10, 20 };
+    const map_vals = [_]i64{ 100, 200 };
+    const map_value: ?*const MapU32I64 = MapU32I64.fromPairs(&map_keys, &map_vals, 2) orelse
+        @panic("map allocation failed");
+    defer MapU32I64.release(map_value);
+
+    const map_term = Term.from(map_value);
+    try std.testing.expect(map_term == .map);
+    const recovered_map = Term.to(?*const MapU32I64, map_term, null);
+    try std.testing.expect(recovered_map != null);
+    try std.testing.expectEqual(@intFromPtr(map_value.?), @intFromPtr(recovered_map.?));
+    try std.testing.expectEqual(@as(i64, 200), MapU32I64.get(recovered_map, 20, 0));
+
+    // ---- Tuple value ----
+    const tuple_value = [_]Term{ Term.from(@as(i64, 7)), Term.from("hi") };
+    const tuple_term = Term.from(@as([]const Term, &tuple_value));
+    try std.testing.expect(tuple_term == .tuple);
+    try std.testing.expectEqual(@as(usize, 2), tuple_term.tuple.len);
+    try std.testing.expect(Term.eql(tuple_term.tuple[0], Term.from(@as(i64, 7))));
+    try std.testing.expect(Term.eql(tuple_term.tuple[1], Term.from("hi")));
+}
+
+test "Term boxing a List into Map(K, Term) keeps the cell alive and frees it once (runtime-3--02 ownership)" {
+    // Ownership/refcount correctness under the host REFCOUNTED model: a List
+    // value stored into a heterogeneous `Map(atom, Term)` must be retained by
+    // the map (so it survives the producer's release), round-trip back as the
+    // SAME live cell, and be released EXACTLY ONCE when the map drops. PRE-FIX
+    // `Term.from` wrapped the list as `.nil`, so the map never referenced the
+    // cell (leak + the round-trip read back nil).
+    const ListI64 = List(i64);
+    const TermMap = Map(u32, Term);
+
+    // Refcount starts at 1, owned by `inner`.
+    var inner: ?*const ListI64 = ListI64.new_empty(4) orelse
+        @panic("list allocation failed");
+    inner = ListI64.push(inner, 5) orelse @panic("push failed");
+    inner = ListI64.push(inner, 6) orelse @panic("push failed");
+    inner = ListI64.push(inner, 7) orelse @panic("push failed");
+    inner = ListI64.push(inner, 8) orelse @panic("push failed");
+    try std.testing.expectEqual(@as(u32, 1), inner.?.header.count());
+
+    // `Map.put` boxes the value via `Term.from` (no retain in the box itself)
+    // and then `ownEntryValue`s it for storage — under REFCOUNTED that is a
+    // refcount bump through the box vtable. So the map registers a second owner
+    // of the boxed list: rc 1 -> 2 (the test's `inner` plus the map's entry).
+    // PRE-FIX the boxed value was `.nil`, so `ownEntryValue` was a no-op and rc
+    // stayed 1 — the cell was never owned by the map (leaked + lost).
+    var hetero: ?*const TermMap = TermMap.put(null, 1, Term.from(inner)) orelse
+        @panic("map put failed");
+    try std.testing.expectEqual(@as(u32, 2), inner.?.header.count());
+
+    // Drop the test's producer reference; the map remains the sole owner (rc 1).
+    // If the map had NOT retained (the pre-fix bug), this would free the cell
+    // out from under the map.
+    ListI64.release(inner);
+    try std.testing.expectEqual(@as(u32, 1), inner.?.header.count());
+
+    // Read the value back: it must be the SAME live list, not nil.
+    const stored = TermMap.get(hetero, 1, .{ .nil = {} });
+    try std.testing.expect(stored == .list);
+    const got = Term.to(?*const ListI64, stored, null);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqual(@intFromPtr(inner.?), @intFromPtr(got.?));
+    try std.testing.expectEqual(@as(i64, 4), ListI64.length(got));
+    try std.testing.expectEqual(@as(i64, 7), ListI64.get(got, 2));
+    // `Map.get` extracts an independently-owned copy under REFCOUNTED (a +1 on
+    // the same cell), so the cell is now shared by the map and the extracted
+    // owner: rc 1 -> 2.
+    try std.testing.expectEqual(@as(u32, 2), inner.?.header.count());
+    ListI64.release(got);
+    try std.testing.expectEqual(@as(u32, 1), inner.?.header.count());
+
+    // Releasing the map must release the boxed list exactly once (rc 1 -> 0,
+    // freed). Use the deep-walk release-count to prove the cell was reclaimed.
+    const before_freed = list_release_freed_total;
+    TermMap.release(hetero);
+    hetero = null;
+    try std.testing.expectEqual(before_freed + 1, list_release_freed_total);
 }
 
 test "List(?*const Map(u32, Term)) releases generated manifest-shaped maps once" {
