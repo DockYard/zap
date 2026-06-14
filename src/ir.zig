@@ -3593,6 +3593,154 @@ pub fn forEachChildStreamWithSlot(
     forEachChildStream(instr, &adapter, Adapter.onStream);
 }
 
+/// The set of functions that can be invoked through a path the direct
+/// call-site analyses (`call_named`/`call_direct`/`try_call_named`/
+/// `tail_call`) never observe — i.e. a function that "escapes as a
+/// value" or is otherwise indirectly invocable. Membership is keyed by
+/// `FunctionId`.
+///
+/// This is the SINGLE shared notion consumed by BOTH the
+/// interprocedural uniqueness fixpoint (`uniqueness_interprocedural`)
+/// and the parameter-convention inference (`arc_param_convention`) so
+/// the two analyses can never disagree about which functions are
+/// indirectly reachable (audit findings uniqueness--02, arc-param--02).
+///
+/// Soundness rationale: a function reached only via direct call sites
+/// has every caller visible, so the fixpoint/inference can prove (or
+/// refute) that its `.owned` parameters receive a unique value. A
+/// function reached through an INDIRECT path can be handed a shared
+/// (rc>1) cell by a caller the analysis cannot see, so its parameters
+/// must be treated conservatively (NOT unique-on-entry, NOT promotable
+/// to `.owned`). Demoting exactly this set — and no more — preserves
+/// the optimization for the common direct-call accumulator patterns
+/// while closing the silent-heap-corruption hole for value-escaping
+/// functions.
+///
+/// Escape channels (each maps a function-group id back to the concrete
+/// `Function`(s) it names, exactly as `call_direct.function` is
+/// resolved elsewhere):
+///   * `make_closure.function` — a named function (or function group)
+///     taken as a VALUE / funcref. The captured id is a
+///     `function_group_id`; the callable target is the `Function` with
+///     `id == group_id` (the common single-`Function`-per-group case)
+///     AND every `Function` with `source_group_id == group_id` (the
+///     type-only-overload case, where each clause is a distinct
+///     `Function` whose `source_group_id` is the group).
+///   * `call_dispatch.group_id` — runtime dispatch over a clause group;
+///     the same group-id → `Function`(s) resolution applies.
+///   * `program.entry` — the program entry point, invoked by the
+///     runtime with arguments from outside the analyzed program.
+///
+/// `call_closure` carries only a `LocalId` callee (the invoked value
+/// came from a local), so it pins no specific function id here; the
+/// function it ultimately invokes reached the local through a
+/// `make_closure` / dispatch / storage-load, all of which are covered
+/// by the channels above (or are not value-escapes of a named program
+/// function, in which case there is no `.owned` Zap-fn parameter to
+/// demote).
+pub const ValueEscapingFunctions = struct {
+    set: std.AutoHashMapUnmanaged(FunctionId, void) = .empty,
+
+    pub fn deinit(self: *ValueEscapingFunctions, allocator: std.mem.Allocator) void {
+        self.set.deinit(allocator);
+    }
+
+    pub fn contains(self: *const ValueEscapingFunctions, id: FunctionId) bool {
+        return self.set.contains(id);
+    }
+
+    pub fn count(self: *const ValueEscapingFunctions) usize {
+        return self.set.count();
+    }
+};
+
+/// Compute the `ValueEscapingFunctions` set for `program`. Caller owns
+/// the returned struct and must call `deinit`.
+pub fn collectValueEscapingFunctions(
+    allocator: std.mem.Allocator,
+    program: *const Program,
+) error{OutOfMemory}!ValueEscapingFunctions {
+    var result: ValueEscapingFunctions = .{};
+    errdefer result.deinit(allocator);
+
+    // The program entry point is invoked from outside the analyzed
+    // program (by the runtime), so its parameters are not under the
+    // control of any visible caller.
+    if (program.entry) |entry_id| {
+        try markGroupEscaping(allocator, program, entry_id, &result);
+    }
+
+    // Walk every instruction stream of every function, collecting the
+    // group ids materialized as values (`make_closure`) or invoked via
+    // dispatch (`call_dispatch`). The `forEachChildStream` enumerator
+    // reaches every nested sub-stream (including `union_switch`
+    // catch-all bodies and try/optional-dispatch bodies), so an escape
+    // buried in a catch-all arm is not missed.
+    for (program.functions) |*function| {
+        for (function.body) |block| {
+            try collectEscapingInStream(allocator, program, block.instructions, &result);
+        }
+    }
+
+    return result;
+}
+
+fn collectEscapingInStream(
+    allocator: std.mem.Allocator,
+    program: *const Program,
+    stream: []const Instruction,
+    result: *ValueEscapingFunctions,
+) error{OutOfMemory}!void {
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .make_closure => |mc| {
+                try markGroupEscaping(allocator, program, mc.function, result);
+            },
+            .call_dispatch => |cd| {
+                try markGroupEscaping(allocator, program, cd.group_id, result);
+            },
+            else => {},
+        }
+
+        const Ctx = struct {
+            allocator: std.mem.Allocator,
+            program: *const Program,
+            result: *ValueEscapingFunctions,
+            err: ?error{OutOfMemory} = null,
+            fn onStream(self_ctx: *@This(), child: ChildStream) void {
+                if (self_ctx.err != null) return;
+                collectEscapingInStream(self_ctx.allocator, self_ctx.program, child.stream, self_ctx.result) catch |e| {
+                    self_ctx.err = e;
+                };
+            }
+        };
+        var ctx = Ctx{ .allocator = allocator, .program = program, .result = result };
+        forEachChildStream(instr, &ctx, Ctx.onStream);
+        if (ctx.err) |e| return e;
+    }
+}
+
+/// Mark the `Function`(s) named by `group_id` as value-escaping. A
+/// group id resolves to the `Function` with `id == group_id` AND every
+/// `Function` whose `source_group_id == group_id` (the type-only-
+/// overload clause-entrypoint case). Both forms are marked so the
+/// callable target is covered regardless of how the group was lowered.
+fn markGroupEscaping(
+    allocator: std.mem.Allocator,
+    program: *const Program,
+    group_id: FunctionId,
+    result: *ValueEscapingFunctions,
+) error{OutOfMemory}!void {
+    try result.set.put(allocator, group_id, {});
+    for (program.functions) |function| {
+        if (function.source_group_id) |source_group| {
+            if (source_group == group_id) {
+                try result.set.put(allocator, function.id, {});
+            }
+        }
+    }
+}
+
 /// Map a canonical `ChildStreamSlot` back to the analysis-side
 /// `escape_lattice.ChildSlot`... declared in `escape_lattice` to avoid
 /// a circular import (`escape_lattice` imports `ir`, not vice versa).
@@ -20152,4 +20300,110 @@ test "primaryDefinedLocal extracts dest for defining instructions and null for t
 
     const r = Instruction{ .ret = .{ .value = 3 } };
     try std.testing.expectEqual(@as(?LocalId, null), primaryDefinedLocal(&r));
+}
+
+fn buildEscapeTestFunction(
+    arena: std.mem.Allocator,
+    id: FunctionId,
+    name: []const u8,
+    source_group_id: ?FunctionId,
+    instructions: []const Instruction,
+) !Function {
+    const blocks = try arena.alloc(Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = try arena.dupe(Instruction, instructions) };
+    return Function{
+        .id = id,
+        .name = name,
+        .source_group_id = source_group_id,
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 8,
+    };
+}
+
+test "collectValueEscapingFunctions: make_closure / call_dispatch / entry escape; direct-only does not" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Function 10: never referenced indirectly (direct-call only). Must
+    // NOT be in the escaping set.
+    const direct_only = try buildEscapeTestFunction(arena, 10, "direct_only", null, &.{
+        .{ .ret = .{ .value = null } },
+    });
+
+    // Function 20: taken as a value via make_closure inside `escaper`.
+    const valued = try buildEscapeTestFunction(arena, 20, "valued", null, &.{
+        .{ .ret = .{ .value = null } },
+    });
+
+    // Function 30: a dispatch group; its clause entrypoint (id 31,
+    // source_group_id 30) is the real callable. A call_dispatch on
+    // group 30 must mark BOTH 30 and 31.
+    const dispatch_group = try buildEscapeTestFunction(arena, 30, "dispatch_group", null, &.{
+        .{ .ret = .{ .value = null } },
+    });
+    const dispatch_clause = try buildEscapeTestFunction(arena, 31, "dispatch_clause", 30, &.{
+        .{ .ret = .{ .value = null } },
+    });
+
+    // Function 40: the program entry point.
+    const entry_fn = try buildEscapeTestFunction(arena, 40, "main", null, &.{
+        .{ .ret = .{ .value = null } },
+    });
+
+    // `escaper` body references function 20 via make_closure (buried in a
+    // union_switch catch-all to also prove nested-stream coverage) and
+    // dispatches on group 30 at the top level. It directly calls
+    // function 10 (which must therefore NOT escape).
+    const direct_call_args = try arena.alloc(LocalId, 0);
+    const dispatch_args = try arena.alloc(LocalId, 0);
+    const dispatch_modes = try arena.alloc(ValueMode, 0);
+    const make_closure_captures = try arena.alloc(LocalId, 0);
+    const else_instrs = try arena.alloc(Instruction, 1);
+    else_instrs[0] = .{ .make_closure = .{ .dest = 5, .function = 20, .captures = make_closure_captures } };
+    const escaper = try buildEscapeTestFunction(arena, 50, "escaper", null, &.{
+        .{ .call_direct = .{ .dest = 0, .function = 10, .args = direct_call_args, .arg_modes = &.{} } },
+        .{ .call_dispatch = .{ .dest = 1, .group_id = 30, .args = dispatch_args, .arg_modes = dispatch_modes } },
+        .{ .union_switch = .{
+            .dest = 2,
+            .scrutinee = 0,
+            .cases = &.{},
+            .else_instrs = else_instrs,
+            .else_result = 5,
+            .has_else = true,
+        } },
+        .{ .ret = .{ .value = null } },
+    });
+
+    const functions = try arena.alloc(Function, 6);
+    functions[0] = direct_only;
+    functions[1] = valued;
+    functions[2] = dispatch_group;
+    functions[3] = dispatch_clause;
+    functions[4] = entry_fn;
+    functions[5] = escaper;
+    const program = Program{ .functions = functions, .type_defs = &.{}, .entry = 40 };
+
+    var escaping = try collectValueEscapingFunctions(std.testing.allocator, &program);
+    defer escaping.deinit(std.testing.allocator);
+
+    // make_closure target (buried in catch-all).
+    try std.testing.expect(escaping.contains(20));
+    // call_dispatch group AND its source-group clause entrypoint.
+    try std.testing.expect(escaping.contains(30));
+    try std.testing.expect(escaping.contains(31));
+    // program entry.
+    try std.testing.expect(escaping.contains(40));
+
+    // Direct-only callee must NOT be in the escaping set — preserving the
+    // optimization for provably-direct functions.
+    try std.testing.expect(!escaping.contains(10));
+    // The escaper itself is neither valued nor dispatched nor the entry.
+    try std.testing.expect(!escaping.contains(50));
 }

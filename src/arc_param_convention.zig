@@ -746,6 +746,25 @@ fn runConventionInferenceFixpoint(
     );
     defer lift_set.deinit(allocator);
 
+    // Veto set for indirectly-invocable functions (audit finding
+    // arc-param--02). A parameter slot is promoted to `.owned` only when
+    // EVERY non-recursive caller passes it at last use; on promotion
+    // drop-insertion releases the parameter at every scope exit. But a
+    // function taken as a VALUE (`make_closure` / funcref), reached via
+    // `call_dispatch`, or the program entry point can be invoked by an
+    // indirect caller that keeps the borrow ABI (share + release) on the
+    // caller side — `arc_ownership`'s consume-site rewriter only adjusts
+    // `call_named`/`call_direct`/`try_call_named` sites — so promoting
+    // such a function's slot nets one extra release per indirect call
+    // (refcount underflow → double-free/use-after-free under ARC, or
+    // premature free under tracking managers). We therefore refuse to
+    // promote ANY parameter slot of a value-escaping function. This is
+    // the SAME `ir.collectValueEscapingFunctions` set the interprocedural
+    // uniqueness fixpoint demotes, so the caller/callee retain-release
+    // contracts agree across both analyses.
+    var escaping = try ir.collectValueEscapingFunctions(allocator, program);
+    defer escaping.deinit(allocator);
+
     // Fixpoint iteration: a callee's slot can be promoted only when every
     // caller's source local satisfies the consume gates, including the
     // borrowed-source veto (the chain root must NOT be a `param_get` of
@@ -765,6 +784,12 @@ fn runConventionInferenceFixpoint(
         changed = false;
         for (program.functions, 0..) |_, func_index| {
             const function: *ir.Function = @constCast(&program.functions[func_index]);
+            // Indirectly-invocable functions are never promoted: an
+            // unseen indirect caller may pass a value it still owns or
+            // shares, so an `.owned` callee ABI would over-release it
+            // (audit finding arc-param--02). Leaving every slot
+            // `.borrowed` keeps the borrow contract on both sides.
+            if (escaping.contains(function.id)) continue;
             const before = countOwnedSlots(function);
             try evaluateFunction(
                 function,
@@ -813,6 +838,10 @@ fn runConventionInferenceFixpoint(
     // mangled name.
     for (program.functions, 0..) |_, func_index| {
         const function: *ir.Function = @constCast(&program.functions[func_index]);
+        // Same indirectly-invocable veto as the main fixpoint: a
+        // value-escaping function's `.owned` ABI would be over-released
+        // by an unseen indirect caller (audit finding arc-param--02).
+        if (escaping.contains(function.id)) continue;
         const conventions: MutableConventions = @constCast(function.param_conventions);
         for (conventions, 0..) |conv, slot_index| {
             if (conv != .borrowed) continue;
@@ -3279,10 +3308,22 @@ const SiteWalker = struct {
                     share_dest_to_id,
                 );
             },
-            // call_dispatch resolves to a group of clauses; without
-            // a single concrete callee we cannot bind the convention
-            // here. Each clause is reached via call_direct from the
-            // dispatch trampoline; that path is already covered above.
+            // Indirect / unresolvable invocation forms record NO
+            // convention-binding site here, and that is correct: a site
+            // is what could PROMOTE a slot to `.owned`, but a function
+            // reached this way must instead be VETOED from promotion
+            // entirely (`runConventionInferenceFixpoint` skips every
+            // function in `ir.collectValueEscapingFunctions`). Recording
+            // these as direct sites would be unsound — they do not carry
+            // the at-last-use consume guarantee a direct caller does.
+            //   * `call_dispatch` resolves to a clause group; the group
+            //     (and its clause entrypoints) is in the escaping set, so
+            //     its parameters stay `.borrowed`.
+            //   * `call_closure` invokes a function VALUE; whatever named
+            //     function flowed into it was materialized by a
+            //     `make_closure`, which the escaping set captures.
+            //   * `call_builtin` targets a runtime intrinsic, not a Zap
+            //     function with inferred conventions.
             .call_dispatch,
             .call_closure,
             .call_builtin,

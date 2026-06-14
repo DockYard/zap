@@ -91,16 +91,32 @@ const uniqueness_signature = @import("uniqueness_signature.zig");
 // `true` here would surface as an `error.ArcInvariantViolation` at
 // build time, not as runtime undefined behaviour.
 //
-// Conservative fallback at unresolvable sites:
+// Conservative handling of indirectly-invocable functions:
 //
-// At call sites we can't statically resolve to a single callee
-// (`call_builtin`, `call_dispatch`, `call_closure`), the fixpoint
-// treats the argument as potentially shared from the callee's
-// perspective. For the receiver of an owned-mutating builtin, this
-// is irrelevant — the builtin's slot 0 isn't a Zap-fn parameter, so
-// uniqueness is decided by the caller's intraprocedural dataflow.
-// For other unresolvable shapes, we err on the side of demoting any
-// uniqueness claim.
+// The optimistic init above assumes every `.owned`-convention slot is
+// unique-on-entry, then DEMOTES a slot the moment a visible caller
+// passes a non-unique value. That is sound only when EVERY caller is
+// visible — i.e. the function is reached purely through direct call
+// sites (`call_named`/`call_direct`/`try_call_named`/`tail_call`),
+// which is where `arg_sites` entries (and therefore demotion edges)
+// come from.
+//
+// A function that ESCAPES AS A VALUE (referenced by `make_closure` /
+// funcref), is reached via `call_dispatch`, or is the program entry
+// point can be invoked by an indirect caller the fixpoint never sees —
+// and that caller may pass a shared (rc>1) cell. So at initialization
+// we DEMOTE every `.owned` slot of every function in
+// `ir.collectValueEscapingFunctions(program)` (the shared notion used
+// by `arc_param_convention` too, so the two analyses cannot disagree).
+// This is the conservative treatment the old comment here promised but
+// never implemented (audit finding uniqueness--02): an indirectly-
+// reached parameter must be borrowed-on-entry, not owned-unique,
+// otherwise its owned-mutating sites rewrite to `*_owned_unchecked`
+// in-place mutation over a possibly-shared cell.
+//
+// Note: a `call_closure` carries only a `LocalId` callee, so it pins no
+// specific function id; the function it invokes reached that local
+// through one of the channels above (covered) and is demoted there.
 //
 // ============================================================
 
@@ -236,6 +252,22 @@ pub fn analyzeProgramFull(
             slots[idx] = (conv == .owned);
         }
         try result.by_function.put(allocator, func.id, slots);
+    }
+
+    // Step 1b: conservatively demote every `.owned` slot of any function
+    // that is invocable through a path the direct call-site demotion
+    // never observes — a function taken as a value (`make_closure` /
+    // funcref), reached via `call_dispatch`, or the program entry point.
+    // Such a function can be handed a shared cell by an indirect caller
+    // the fixpoint cannot see, so unique-on-entry is unprovable and must
+    // start (and stay) `false`. The fixpoint never re-promotes, so this
+    // demotion is permanent (audit finding uniqueness--02).
+    var escaping = try ir.collectValueEscapingFunctions(allocator, program);
+    defer escaping.deinit(allocator);
+    var escaping_iter = escaping.set.iterator();
+    while (escaping_iter.next()) |entry| {
+        const slots = result.by_function.get(entry.key_ptr.*) orelse continue;
+        for (slots) |*slot| slot.* = false;
     }
 
     // Step 2: build name→id lookup (used to resolve call_named sites
@@ -890,6 +922,226 @@ test "uniqueness_interprocedural: parked-then-passed caller demotes wrapper's sl
     var u = try analyzeProgram(testing.allocator, &p.program);
     defer u.deinit(testing.allocator);
 
+    try testing.expect(!u.isUniqueOnEntry(0, 0));
+}
+
+test "uniqueness_interprocedural: function taken as a value (make_closure) is NOT unique-on-entry" {
+    // Audit finding uniqueness--02. F has an `.owned` receiver slot and
+    // an owned-mutating body. It is taken DIRECTLY as a value via
+    // `make_closure` and invoked via `call_closure` by an escaper that
+    // hands it a SHARED cell (parked in a list, rc>=2). No direct
+    // call_named/call_direct site exists, so the direct-site demotion
+    // path never observes the shared argument.
+    //
+    // Pre-fix: F's slot 0 stays optimistically `true` (the bug — its
+    // owned-mutating site would rewrite to `*_owned_unchecked` and
+    // corrupt the parked alias). Post-fix: F is in the value-escaping
+    // set, so slot 0 is demoted to `false` at fixpoint init.
+    //
+    // F body (slot 0 .owned, .owned result):
+    //   [0] param_get %0 <- param[0]
+    //   [1] move_value %1 <- %0
+    //   [2] const_int %2
+    //   [3] const_int %3
+    //   [4] call_builtin "Map.put" args=[%1,%2,%3] dest=%4
+    //   [5] ret %4
+    //
+    // escaper body (no params):
+    //   [0] map_init %0
+    //   [1] const_nil %1
+    //   [2] list_cons %2 = [%0 | %1]    -- parks %0 (rc>=2)
+    //   [3] make_closure %3 = F         -- F taken as a value
+    //   [4] call_closure %4 = %3(%0)    -- invoke with the shared map
+    //   [5] ret %4
+    var p = TestProgram.init(testing.allocator);
+    defer p.deinit();
+    const arena = p.allocator();
+
+    const f_conventions = [_]ir.ParamConvention{.owned};
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 1;
+    put_args[1] = 2;
+    put_args[2] = 3;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const f_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const f = try buildFunction(
+        arena,
+        0,
+        "F",
+        &f_instrs,
+        5,
+        &f_conventions,
+        .owned,
+    );
+
+    const cc_args = try arena.alloc(ir.LocalId, 1);
+    cc_args[0] = 0; // pass the shared (parked) map
+    const cc_modes = try arena.alloc(ir.ValueMode, 1);
+    cc_modes[0] = .move;
+    const make_closure_captures = try arena.alloc(ir.LocalId, 0);
+    const escaper_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .const_nil = 1 },
+        .{ .list_cons = .{ .dest = 2, .head = 0, .tail = 1 } },
+        .{ .make_closure = .{ .dest = 3, .function = 0, .captures = make_closure_captures } },
+        .{ .call_closure = .{
+            .dest = 4,
+            .callee = 3,
+            .args = cc_args,
+            .arg_modes = cc_modes,
+            .return_type = .any,
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const escaper_conventions = [_]ir.ParamConvention{};
+    const escaper = try buildFunction(
+        arena,
+        1,
+        "escaper",
+        &escaper_instrs,
+        5,
+        &escaper_conventions,
+        .owned,
+    );
+
+    const funcs = try arena.alloc(ir.Function, 2);
+    funcs[0] = f;
+    funcs[1] = escaper;
+    p.program.functions = funcs;
+
+    var u = try analyzeProgram(testing.allocator, &p.program);
+    defer u.deinit(testing.allocator);
+
+    // F escaped as a value — its slot 0 must NOT be proven unique-on-entry.
+    try testing.expect(!u.isUniqueOnEntry(0, 0));
+}
+
+test "uniqueness_interprocedural: value-escape demotion fires even when every direct caller passes unique" {
+    // Strengthened proof for audit finding uniqueness--02. Here F has a
+    // direct caller that passes a FRESH (unique) map — so the
+    // direct-site demotion path alone would leave F's slot 0 `true`
+    // (the same shape as the passing "caller passes fresh map" test).
+    // But F is ALSO taken as a value via `make_closure`. The value-
+    // escape demotion must still fire, proving the fix is about the
+    // ESCAPE channel, not merely about a non-unique direct argument.
+    //
+    // F body (slot 0 .owned, .owned result): forwards into Map.put.
+    // direct_caller body: passes a fresh map by move (unique at call).
+    // escaper body: make_closure(F) (F taken as a value).
+    var p = TestProgram.init(testing.allocator);
+    defer p.deinit();
+    const arena = p.allocator();
+
+    const f_conventions = [_]ir.ParamConvention{.owned};
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 1;
+    put_args[1] = 2;
+    put_args[2] = 3;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const f_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const f = try buildFunction(arena, 0, "F", &f_instrs, 5, &f_conventions, .owned);
+
+    // direct_caller: passes a fresh, unique map at last use.
+    const direct_args = try arena.alloc(ir.LocalId, 1);
+    direct_args[0] = 1;
+    const direct_modes = try arena.alloc(ir.ValueMode, 1);
+    direct_modes[0] = .move;
+    const direct_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "F",
+            .args = direct_args,
+            .arg_modes = direct_modes,
+        } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    const direct_conventions = [_]ir.ParamConvention{};
+    const direct_caller = try buildFunction(arena, 1, "direct_caller", &direct_instrs, 3, &direct_conventions, .owned);
+
+    // escaper: takes F as a value.
+    const make_closure_captures = try arena.alloc(ir.LocalId, 0);
+    const escaper_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 0, .captures = make_closure_captures } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const escaper_conventions = [_]ir.ParamConvention{};
+    const escaper = try buildFunction(arena, 2, "escaper", &escaper_instrs, 1, &escaper_conventions, .owned);
+
+    const funcs = try arena.alloc(ir.Function, 3);
+    funcs[0] = f;
+    funcs[1] = direct_caller;
+    funcs[2] = escaper;
+    p.program.functions = funcs;
+
+    var u = try analyzeProgram(testing.allocator, &p.program);
+    defer u.deinit(testing.allocator);
+
+    // Despite the unique direct caller, the value escape forces demotion.
+    try testing.expect(!u.isUniqueOnEntry(0, 0));
+}
+
+test "uniqueness_interprocedural: program entry point param is NOT unique-on-entry" {
+    // The program entry is invoked by the runtime with arguments from
+    // outside the analyzed program, so its `.owned` params cannot be
+    // proven unique-on-entry (audit finding uniqueness--02).
+    var p = TestProgram.init(testing.allocator);
+    defer p.deinit();
+    const arena = p.allocator();
+
+    const conventions = [_]ir.ParamConvention{.owned};
+    const fn0 = try buildFunction(
+        arena,
+        0,
+        "main",
+        &.{
+            .{ .param_get = .{ .dest = 0, .index = 0 } },
+            .{ .ret = .{ .value = null } },
+        },
+        1,
+        &conventions,
+        .owned,
+    );
+    const funcs = try arena.alloc(ir.Function, 1);
+    funcs[0] = fn0;
+    p.program.functions = funcs;
+    p.program.entry = 0;
+
+    var u = try analyzeProgram(testing.allocator, &p.program);
+    defer u.deinit(testing.allocator);
+
+    // Entry point — not provably unique-on-entry.
     try testing.expect(!u.isUniqueOnEntry(0, 0));
 }
 
