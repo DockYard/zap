@@ -3366,12 +3366,43 @@ pub const Parser = struct {
     // Literal parsing
     // ============================================================
 
+    /// Emit a rich "out-of-range integer literal" diagnostic for `text` at
+    /// `span` and return `error.ParseError`. Used by every integer-literal
+    /// parse site (expression, pattern, negated pattern, binary size, literal
+    /// type) so an unrepresentable literal becomes a clear in-band compile
+    /// error at the literal's source span instead of silently folding to `0`
+    /// — a silent miscompile (an all-ones `u64` mask or `i64`-MIN would
+    /// otherwise become `0` with no diagnostic). Mirrors the overflow policy
+    /// in `docs/literal-context-adoption.md`.
+    fn integerLiteralOutOfRange(self: *Parser, text: []const u8, span: ast.SourceSpan) anyerror {
+        try self.addRichError(
+            std.fmt.allocPrint(
+                self.allocator,
+                "the integer literal `{s}` is out of range",
+                .{text},
+            ) catch "integer literal is out of range",
+            span,
+            "does not fit in a 64-bit integer",
+            "integer literals must fit in the range -9223372036854775808..9223372036854775807 (i64)",
+        );
+        return error.ParseError;
+    }
+
+    /// Parse a (possibly negated) integer literal `text` as `i64`, base 0
+    /// (so `0x`/`0o`/`0b` prefixes are honored). On overflow/parse failure
+    /// emit `integerLiteralOutOfRange` and return `error.ParseError` rather
+    /// than folding to `0`. `text` must already have underscores stripped.
+    fn parseI64Literal(self: *Parser, text: []const u8, span: ast.SourceSpan) anyerror!i64 {
+        return std.fmt.parseInt(i64, text, 0) catch return self.integerLiteralOutOfRange(text, span);
+    }
+
     fn parseIntLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
+        const span = ast.SourceSpan.from(tok.loc);
         const text = self.stripNumericUnderscores(tok.slice(self.source));
-        const value = std.fmt.parseInt(i64, text, 0) catch 0;
+        const value = try self.parseI64Literal(text, span);
         return self.create(ast.Expr, .{
-            .int_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = value },
+            .int_literal = .{ .meta = .{ .span = span }, .value = value },
         });
     }
 
@@ -3390,7 +3421,7 @@ pub const Parser = struct {
                 'a' => 7,
                 'e' => 27,
                 'x', 'X' => if (text.len > 3)
-                    std.fmt.parseInt(i64, text[3..], 16) catch 0
+                    try self.parseI64Literal(text[3..], ast.SourceSpan.from(tok.loc))
                 else
                     0,
                 else => text[2],
@@ -3405,12 +3436,34 @@ pub const Parser = struct {
         });
     }
 
+    /// Emit a rich "could not parse float literal" diagnostic for `text` at
+    /// `span` and return `error.ParseError`. Replaces a silent fold to `0.0`
+    /// (the same wrong-default antipattern as integer overflow): an
+    /// unparseable float literal must surface a clear in-band compile error
+    /// at its source span, never compile silently to zero.
+    fn parseF64Literal(self: *Parser, text: []const u8, span: ast.SourceSpan) anyerror!f64 {
+        return std.fmt.parseFloat(f64, text) catch {
+            try self.addRichError(
+                std.fmt.allocPrint(
+                    self.allocator,
+                    "the float literal `{s}` is not a valid number",
+                    .{text},
+                ) catch "float literal is not a valid number",
+                span,
+                "not a valid floating-point value",
+                "float literals look like `3.14`, `1.0e10`, or `0.5`",
+            );
+            return error.ParseError;
+        };
+    }
+
     fn parseFloatLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
+        const span = ast.SourceSpan.from(tok.loc);
         const text = self.stripNumericUnderscores(tok.slice(self.source));
-        const value = std.fmt.parseFloat(f64, text) catch 0.0;
+        const value = try self.parseF64Literal(text, span);
         return self.create(ast.Expr, .{
-            .float_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = value },
+            .float_literal = .{ .meta = .{ .span = span }, .value = value },
         });
     }
 
@@ -4861,11 +4914,12 @@ pub const Parser = struct {
             },
             .int_literal => {
                 const tok = self.advance();
+                const span = ast.SourceSpan.from(tok.loc);
                 const text = self.stripNumericUnderscores(tok.slice(self.source));
-                const value = std.fmt.parseInt(i64, text, 0) catch 0;
+                const value = try self.parseI64Literal(text, span);
                 return self.create(ast.Pattern, .{
                     .literal = .{ .int = .{
-                        .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
+                        .meta = .{ .span = span },
                         .value = value,
                     } },
                 });
@@ -4885,7 +4939,7 @@ pub const Parser = struct {
                         'a' => 7,
                         'e' => 27,
                         'x', 'X' => if (text.len > 3)
-                            std.fmt.parseInt(i64, text[3..], 16) catch 0
+                            try self.parseI64Literal(text[3..], ast.SourceSpan.from(tok.loc))
                         else
                             0,
                         else => text[2],
@@ -4900,11 +4954,12 @@ pub const Parser = struct {
             },
             .float_literal => {
                 const tok = self.advance();
+                const span = ast.SourceSpan.from(tok.loc);
                 const text = self.stripNumericUnderscores(tok.slice(self.source));
-                const value = std.fmt.parseFloat(f64, text) catch 0.0;
+                const value = try self.parseF64Literal(text, span);
                 return self.create(ast.Pattern, .{
                     .literal = .{ .float = .{
-                        .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
+                        .meta = .{ .span = span },
                         .value = value,
                     } },
                 });
@@ -4966,12 +5021,23 @@ pub const Parser = struct {
                 _ = self.advance();
                 if (self.check(.int_literal)) {
                     const tok = self.advance();
-                    const text = self.stripNumericUnderscores(tok.slice(self.source));
-                    const value = std.fmt.parseInt(i64, text, 0) catch 0;
+                    const span = ast.SourceSpan.merge(start, ast.SourceSpan.from(tok.loc));
+                    const magnitude = self.stripNumericUnderscores(tok.slice(self.source));
+                    // Parse the SIGN together with the digits so the `i64`-MIN
+                    // boundary round-trips: the magnitude `9223372036854775808`
+                    // overflows `i64`, but `-9223372036854775808` is a valid
+                    // `i64`. Parsing the magnitude then negating would fail the
+                    // magnitude parse (formerly `catch 0`, silently matching 0).
+                    const signed_text = std.fmt.allocPrint(
+                        self.allocator,
+                        "-{s}",
+                        .{magnitude},
+                    ) catch return error.OutOfMemory;
+                    const value = try self.parseI64Literal(signed_text, span);
                     return self.create(ast.Pattern, .{
                         .literal = .{ .int = .{
-                            .meta = .{ .span = ast.SourceSpan.merge(start, ast.SourceSpan.from(tok.loc)) },
-                            .value = -value,
+                            .meta = .{ .span = span },
+                            .value = value,
                         } },
                     });
                 }
@@ -5448,8 +5514,24 @@ pub const Parser = struct {
     fn parseBinarySize(self: *Parser) !ast.BinarySegmentSize {
         if (self.check(.int_literal)) {
             const tok = self.advance();
+            const span = ast.SourceSpan.from(tok.loc);
             const text = self.stripNumericUnderscores(tok.slice(self.source));
-            const value = std.fmt.parseInt(u32, text, 0) catch 0;
+            // An out-of-range or unparseable size must diagnose, never fold to
+            // `0`: a silent `size(0)` weakens the binary pattern's minimum
+            // length requirement so it matches buffers it should reject.
+            const value = std.fmt.parseInt(u32, text, 0) catch {
+                try self.addRichError(
+                    std.fmt.allocPrint(
+                        self.allocator,
+                        "the binary segment size `{s}` is out of range",
+                        .{text},
+                    ) catch "binary segment size is out of range",
+                    span,
+                    "does not fit in a 32-bit unsigned integer",
+                    "binary segment sizes must be in the range 0..4294967295 (u32)",
+                );
+                return error.ParseError;
+            };
             return .{ .literal = value };
         }
         if (self.check(.identifier)) {
@@ -5792,10 +5874,16 @@ pub const Parser = struct {
         switch (self.peek()) {
             .int_literal => {
                 const tok = self.advance();
-                const text = tok.slice(self.source);
-                const value = std.fmt.parseInt(i64, text, 10) catch 0;
+                const span = ast.SourceSpan.from(tok.loc);
+                // Strip underscores and parse base 0 like every other integer
+                // literal site, so hex/octal/binary literal TYPES (`0xFF`) and
+                // underscored literals round-trip instead of silently folding
+                // to `0` (base-10 parse of `0xFF` formerly failed → `catch 0`,
+                // turning literal type `0xFF` into literal type `0`).
+                const text = self.stripNumericUnderscores(tok.slice(self.source));
+                const value = try self.parseI64Literal(text, span);
                 return self.create(ast.TypeExpr, .{
-                    .literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = .{ .int = value } },
+                    .literal = .{ .meta = .{ .span = span }, .value = .{ .int = value } },
                 });
             },
             .string_literal => {
@@ -9421,4 +9509,167 @@ test "poison expression node reports as a poison sentinel" {
     const poison_expr = ast.Expr{ .poison = .{ .meta = .{ .span = poison_span } } };
     try std.testing.expect(poison_expr == .poison);
     try std.testing.expectEqual(@as(u32, 1), poison_expr.getMeta().span.line);
+}
+
+// ============================================================
+// Out-of-range numeric literals raise a diagnostic, never fold
+// to 0 (audit findings parser-1--01 + parser-2--02 / FE-01).
+//
+// Every integer/float literal parse site (expression, pattern,
+// negated pattern, binary segment size, literal type) used to
+// `catch 0` / `catch 0.0` on overflow, silently miscompiling
+// the program. These tests pin the NEW behavior: an out-of-range
+// literal records a diagnostic and returns `error.ParseError`,
+// while valid boundary literals (incl. `i64`-MIN in pattern
+// position, and hex/underscored literals in type position) still
+// round-trip to their exact value.
+//
+// These are the unit-test face of the compile-fail diagnostic
+// path: an end-to-end compile-fail `.zap` would require the
+// banned `zir-test` target, so the diagnostic is verified here.
+// ============================================================
+
+test "expression: out-of-range integer literal raises a diagnostic, never folds to 0" {
+    // `9223372036854775808` is `i64`-MAX + 1. Pre-fix this folded to `0`
+    // (a silent miscompile); now it must record an out-of-range diagnostic.
+    const source = "9223372036854775808";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parseExpr());
+    try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "out of range") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "9223372036854775808") != null);
+}
+
+test "expression: a valid i64-MAX literal still parses" {
+    const source = "9223372036854775807";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const expr = try parser.parseExpr();
+    try std.testing.expect(expr.* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 9223372036854775807), expr.int_literal.value);
+    try std.testing.expectEqual(@as(usize, 0), parser.errors.items.len);
+}
+
+test "expression: an all-ones u64 hex mask raises a diagnostic, never folds to 0" {
+    // A `u64` bitmask with the high bit set overflows `i64`. Pre-fix this
+    // silently became `0` — a security-relevant zeroed permission mask.
+    const source = "0xFFFF_FFFF_FFFF_FFFF";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parseExpr());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "out of range") != null);
+}
+
+test "pattern: i64-MIN negative literal round-trips to the exact value, never folds to 0" {
+    // `-9223372036854775808` is a VALID `i64` whose magnitude overflows
+    // `i64`. Pre-fix the magnitude parse failed → `catch 0` → `-0`, so the
+    // pattern silently matched `0`. The fix parses sign+digits together.
+    const source = "-9223372036854775808";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const pat = try parser.parsePattern();
+    try std.testing.expect(pat.* == .literal);
+    try std.testing.expect(pat.literal == .int);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), pat.literal.int.value);
+    try std.testing.expectEqual(@as(usize, 0), parser.errors.items.len);
+}
+
+test "pattern: out-of-range integer literal raises a diagnostic, never folds to 0" {
+    const source = "99999999999999999999";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parsePattern());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "out of range") != null);
+}
+
+test "pattern: out-of-range negative literal (beyond i64-MIN) raises a diagnostic" {
+    // One past `i64`-MIN — genuinely unrepresentable in either sign.
+    const source = "-9223372036854775809";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parsePattern());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "out of range") != null);
+}
+
+test "literal type: hex literal type round-trips to its value, never folds to 0" {
+    // `parseLiteralType` formerly parsed base-10 with no underscore strip,
+    // so `0xFF` failed → `catch 0` → literal type `0`. Now it uses base 0.
+    const source = "0xFF";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .literal);
+    try std.testing.expect(type_expr.literal.value == .int);
+    try std.testing.expectEqual(@as(i64, 255), type_expr.literal.value.int);
+    try std.testing.expectEqual(@as(usize, 0), parser.errors.items.len);
+}
+
+test "literal type: underscored decimal literal type round-trips to its value" {
+    const source = "1_000_000";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const type_expr = try parser.parseTypeExpr();
+    try std.testing.expect(type_expr.* == .literal);
+    try std.testing.expect(type_expr.literal.value == .int);
+    try std.testing.expectEqual(@as(i64, 1_000_000), type_expr.literal.value.int);
+}
+
+test "literal type: out-of-range integer literal type raises a diagnostic, never folds to 0" {
+    const source = "99999999999999999999";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parseTypeExpr());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "out of range") != null);
+}
+
+test "binary segment size: out-of-range size raises a diagnostic, never folds to 0" {
+    // A `size(...)` literal that overflows `u32` formerly folded to `size(0)`,
+    // silently weakening the pattern's minimum-length requirement.
+    const source =
+        \\<<x :: String-size(99999999999)>>
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parsePattern());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    var saw_size_error = false;
+    for (parser.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "out of range") != null) saw_size_error = true;
+    }
+    try std.testing.expect(saw_size_error);
 }

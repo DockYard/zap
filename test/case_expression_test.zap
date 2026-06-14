@@ -40,6 +40,60 @@ pub struct CaseExpressionTest {
       assert(classify_point(3, 0) == "x-axis")
       assert(classify_point(3, 5) == "plane")
     }
+
+    # Boundary integer literals must round-trip to their exact value,
+    # never silently fold to 0 (audit findings parser-1--01 / parser-2--02).
+    # (The i64 MINIMUM `-9223372036854775808` cannot be written in
+    # expression position — its magnitude overflows i64 storage, so it now
+    # raises a diagnostic rather than folding to 0; its correct PATTERN-
+    # position round-trip is pinned by the parser unit tests.)
+    test("matches the i64 maximum literal in a case pattern") {
+      assert(label_boundary(9223372036854775807) == "max")
+      assert(label_boundary(1) == "other")
+    }
+
+    test("a valid i64 maximum literal is preserved in expression position") {
+      assert(largest() == 9223372036854775807)
+    }
+
+    test("a hex literal round-trips to its decimal value") {
+      assert(hex_mask() == 255)
+    }
+
+    test("an underscored literal round-trips to its value") {
+      assert(million() == 1000000)
+    }
+
+    test("matches a hex literal in a case pattern") {
+      assert(label_hex(255) == "all-ones-byte")
+      assert(label_hex(1) == "other")
+    }
+  }
+
+  fn label_boundary(x :: i64) -> String {
+    case x {
+      9223372036854775807 -> "max"
+      _ -> "other"
+    }
+  }
+
+  fn largest() -> i64 {
+    9223372036854775807
+  }
+
+  fn hex_mask() -> i64 {
+    0xFF
+  }
+
+  fn million() -> i64 {
+    1_000_000
+  }
+
+  fn label_hex(x :: i64) -> String {
+    case x {
+      0xFF -> "all-ones-byte"
+      _ -> "other"
+    }
   }
 
   fn label_number(x :: i64) -> String {
