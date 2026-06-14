@@ -2862,9 +2862,15 @@ pub const TypeChecker = struct {
                 if (unary.op != .negate) return .not_a_literal;
                 if (unary.operand.* != .int_literal) return .not_a_literal;
                 if (expected_type != .int) return .not_a_literal;
-                const negated: i64 = -unary.operand.int_literal.value;
-                if (self.store.intLiteralFitsInType(negated, expected)) return .adopts;
-                return .{ .overflow = .{ .value = negated, .expected = expected } };
+                // Overflow-aware negation: `-INT_MIN` overflows `i64` and a
+                // checked negation would PANIC the type checker. CTFE can reify
+                // an `int_literal{INT_MIN}`, so the panic is reachable on
+                // crafted source. INT_MIN's positive magnitude fits no signed
+                // type, so an overflowing negation is correctly not an adoption.
+                const negated = @subWithOverflow(@as(i64, 0), unary.operand.int_literal.value);
+                if (negated[1] != 0) return .not_a_literal;
+                if (self.store.intLiteralFitsInType(negated[0], expected)) return .adopts;
+                return .{ .overflow = .{ .value = negated[0], .expected = expected } };
             },
             .float_literal => {
                 if (expected_type != .float) return .not_a_literal;
@@ -15861,4 +15867,69 @@ test "alias-applied and inline parametric instantiation share one TypeId (no mon
     const inline_type = fieldTypeIdByName(&checker, parser.interner, "Holder", "inline_form").?;
     try std.testing.expect(checker.store.getType(aliased_type) == .applied);
     try std.testing.expectEqual(inline_type, aliased_type);
+}
+
+// ============================================================
+// Unchecked negation of an untyped integer literal must not
+// panic on INT_MIN during literal adoption — type-checker twin
+// of hir-2--02 / TY-29.
+//
+// `classifyArgLiteralAdoption`'s `.unary_op`/`.negate` arm
+// computed `-unary.operand.int_literal.value`. CTFE can reify
+// an `int_literal{INT_MIN}`, and a checked negation of INT_MIN
+// overflows `i64` → a type-checker PANIC. The fix uses
+// `@subWithOverflow` and treats overflow as `.not_a_literal`.
+// Pre-fix this PANICS (revert-sensitive); post-fix it cleanly
+// classifies as not-an-adoption.
+// ============================================================
+
+test "classifyArgLiteralAdoption: negating an INT_MIN literal does not panic and is not an adoption" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.init(alloc, &interner, &graph);
+    defer checker.deinit();
+
+    const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
+    // The inner positive literal carries the reified INT_MIN magnitude.
+    const operand = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = std.math.minInt(i64) } };
+    const negated = ast.Expr{ .unary_op = .{ .meta = zero_meta, .op = .negate, .operand = &operand } };
+
+    // Pre-fix: `-INT_MIN` traps here. Post-fix: clean `.not_a_literal` for
+    // any signed target — INT_MIN's positive magnitude fits no signed type.
+    switch (checker.classifyArgLiteralAdoption(&negated, TypeStore.I8)) {
+        .not_a_literal => {},
+        else => return error.TestExpectedNotALiteral,
+    }
+    switch (checker.classifyArgLiteralAdoption(&negated, TypeStore.I64)) {
+        .not_a_literal => {},
+        else => return error.TestExpectedNotALiteral,
+    }
+}
+
+test "classifyArgLiteralAdoption: negating an ordinary literal still adopts a fitting signed type" {
+    // Positive control: `-5` against i8 still adopts — the overflow guard does
+    // not regress the common negated-literal path.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.init(alloc, &interner, &graph);
+    defer checker.deinit();
+
+    const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
+    const operand = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 5 } };
+    const negated = ast.Expr{ .unary_op = .{ .meta = zero_meta, .op = .negate, .operand = &operand } };
+
+    switch (checker.classifyArgLiteralAdoption(&negated, TypeStore.I8)) {
+        .adopts => {},
+        else => return error.TestExpectedAdopts,
+    }
 }

@@ -8694,8 +8694,15 @@ pub const HirBuilder = struct {
                 const operand: *const Expr = unary.operand;
                 if (operand.kind != .int_lit) return false;
                 if (operand.type_id != types_mod.TypeStore.I64) return false;
-                const negated: i64 = -operand.kind.int_lit;
-                if (!self.type_store.intLiteralFitsInType(negated, expected_type)) return false;
+                // Overflow-aware negation: `-INT_MIN` overflows `i64` and a
+                // checked negation (`-operand`) would PANIC. CTFE can reify an
+                // `int_lit{INT_MIN}` (`-(0 - 9223372036854775807 - 1)`), so the
+                // panic is reachable on crafted source. INT_MIN's positive
+                // magnitude fits no signed type anyway, so an overflowing
+                // negation is correctly NOT an adoption.
+                const negated = @subWithOverflow(@as(i64, 0), operand.kind.int_lit);
+                if (negated[1] != 0) return false;
+                if (!self.type_store.intLiteralFitsInType(negated[0], expected_type)) return false;
                 expr.type_id = expected_type;
                 return true;
             },
@@ -10826,4 +10833,136 @@ fn typeIdToName(type_id: types_mod.TypeId, type_store: *const types_mod.TypeStor
             return "{type}";
         },
     };
+}
+
+// ============================================================
+// Unchecked negation of an untyped integer literal must not
+// panic on INT_MIN during literal adoption (audit finding
+// hir-2--02 / TY-29).
+//
+// `adoptNumericLiteralType`'s `.unary`/`.negate` arm computed
+// `-operand.kind.int_lit`. CTFE can reify an `int_lit{INT_MIN}`
+// (e.g. `-(0 - 9223372036854775807 - 1)`), and a checked
+// negation of INT_MIN overflows `i64` → a compiler PANIC. The
+// fix uses `@subWithOverflow` and treats the overflow as
+// not-an-adoption (INT_MIN's positive magnitude fits no signed
+// type). This is the unit-test face of the diagnostic/no-crash
+// path: it would PANIC pre-fix (revert-sensitive under a safe
+// build) and now returns `false` cleanly.
+// ============================================================
+
+test "adoptNumericLiteralType: negating an INT_MIN literal does not panic and is not an adoption" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const zero_span = ast.SourceSpan{ .start = 0, .end = 1, .line = 1, .col = 1 };
+    // The inner positive literal carries the reified INT_MIN magnitude.
+    const operand = Expr{
+        .kind = .{ .int_lit = std.math.minInt(i64) },
+        .type_id = types_mod.TypeStore.I64,
+        .span = zero_span,
+    };
+    var negated = Expr{
+        .kind = .{ .unary = .{ .op = .negate, .operand = &operand } },
+        .type_id = types_mod.TypeStore.I64,
+        .span = zero_span,
+    };
+
+    // Pre-fix: `-INT_MIN` traps here. Post-fix: clean `false` (no adoption),
+    // for every signed target — INT_MIN's magnitude (2^63) fits none of them.
+    try std.testing.expect(!builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I8));
+    try std.testing.expect(!builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I64));
+    // The expression type is left untouched when adoption is rejected.
+    try std.testing.expectEqual(types_mod.TypeStore.I64, negated.type_id);
+}
+
+test "adoptNumericLiteralType: negating an ordinary literal still adopts a fitting signed type" {
+    // Positive control: a normal negated literal (`-5`) whose negation does
+    // not overflow still adopts when the value fits — the overflow guard does
+    // not regress the common path.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const zero_span = ast.SourceSpan{ .start = 0, .end = 1, .line = 1, .col = 1 };
+    const operand = Expr{
+        .kind = .{ .int_lit = 5 },
+        .type_id = types_mod.TypeStore.I64,
+        .span = zero_span,
+    };
+    var negated = Expr{
+        .kind = .{ .unary = .{ .op = .negate, .operand = &operand } },
+        .type_id = types_mod.TypeStore.I64,
+        .span = zero_span,
+    };
+
+    try std.testing.expect(builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I8));
+    try std.testing.expectEqual(types_mod.TypeStore.I8, negated.type_id);
+}
+
+// ============================================================
+// An unresolved `var_ref` must record a diagnostic and lower to
+// a poison node, never silently bind to `local_get` of slot 0
+// (audit finding hir-1--04 / TY-08).
+//
+// The old fallback fabricated `local_get(0)` so "downstream code
+// has something" — silently reading an UNRELATED variable's
+// value in the compiled program with no diagnostic. The fix
+// records "I cannot find a variable named ..." and returns a
+// `nil_lit` poison node the pipeline refuses to lower. This
+// HIR-level unit test exercises the path directly (the type
+// checker normally errors on undefined variables first, so an
+// end-to-end source test would not reach this builder fallback);
+// it is revert-sensitive — the pre-fix code returned
+// `.{ .local_get = 0 }` and recorded NO error.
+// ============================================================
+
+test "buildExpr: an unresolved var_ref records a diagnostic and lowers to a poison node, never local_get 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const name = try interner.intern("definitely_not_a_real_variable");
+    const var_ref_expr = ast.Expr{
+        .var_ref = .{
+            .meta = .{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } },
+            .name = name,
+        },
+    };
+
+    const lowered = try builder.buildExpr(&var_ref_expr);
+    // Must be a poison node, NOT a fabricated `local_get` of slot 0.
+    try std.testing.expect(lowered.kind == .nil_lit);
+    try std.testing.expect(lowered.kind != .local_get);
+    // And a clear diagnostic must have been recorded.
+    try std.testing.expect(builder.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "cannot find a variable") != null);
 }
