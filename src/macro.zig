@@ -123,6 +123,16 @@ pub const MacroEngine = struct {
     /// `__with_residual_<n>` name so multiple `with` forms — and multiple
     /// steps within one — never alias a user binding or each other.
     with_residual_counter: u32 = 0,
+    /// Monotonic counter for the fresh left-operand binding names generated
+    /// by the bootstrap `or` short-circuit desugar. The bootstrap fallback
+    /// fires only before `Kernel.or` is available (the Kernel macro takes
+    /// precedence once collected); it must evaluate the left operand
+    /// EXACTLY ONCE, so it binds it to a unique `__or_lhs_<n>` name and
+    /// references that name as both the `case` scrutinee and the truthy-arm
+    /// result instead of re-emitting the operand AST twice. The unique
+    /// suffix keeps multiple `or` forms from aliasing each other or a user
+    /// binding (stdlib-core--01).
+    or_lhs_counter: u32 = 0,
 
     pub const Error = struct {
         message: []const u8,
@@ -145,6 +155,7 @@ pub const MacroEngine = struct {
             .compiled_executor = null,
             .before_compile_fired = std.AutoHashMap(BeforeCompileKey, void).init(allocator),
             .with_residual_counter = 0,
+            .or_lhs_counter = 0,
         };
     }
 
@@ -1194,16 +1205,40 @@ pub const MacroEngine = struct {
                     return .{ .expr = try self.create(ast.Expr, .{ .case_expr = .{ .meta = bo.meta, .scrutinee = lhs_exp, .clauses = clauses } }), .changed = true };
                 }
                 if (bo.op == .or_op) {
+                    // Short-circuit `or` must evaluate the left operand
+                    // EXACTLY ONCE: bind it to a fresh `__or_lhs_<n>` name,
+                    // then reference that binding as both the `case`
+                    // scrutinee AND the truthy-arm result. Emitting the
+                    // operand AST twice (as the prior code did) re-evaluated
+                    // a side-effecting left operand — stdlib-core--01. The
+                    // unique suffix prevents aliasing across nested `or`
+                    // forms and any user binding (mirrors the `with`
+                    // residual-name mechanism).
                     const lhs_exp = lhs_pre.expr;
                     const rhs_exp = rhs_pre.expr;
+
+                    const lhs_name = try std.fmt.allocPrint(self.allocator, "__or_lhs_{d}", .{self.or_lhs_counter});
+                    self.or_lhs_counter += 1;
+                    const lhs_id = try self.interner.intern(lhs_name);
+                    const lhs_bind_pat = try self.create(ast.Pattern, .{ .bind = .{ .meta = bo.meta, .name = lhs_id } });
+                    const lhs_assignment = try self.create(ast.Assignment, .{ .meta = bo.meta, .pattern = lhs_bind_pat, .value = lhs_exp });
+                    const lhs_ref_scrutinee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = bo.meta, .name = lhs_id } });
+                    const lhs_ref_result = try self.create(ast.Expr, .{ .var_ref = .{ .meta = bo.meta, .name = lhs_id } });
+
                     const false_pat = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = bo.meta, .value = false } } });
                     const wild_pat = try self.create(ast.Pattern, .{ .wildcard = .{ .meta = bo.meta } });
                     const rhs_body2 = try self.allocSlice(ast.Stmt, &.{.{ .expr = rhs_exp }});
-                    const lhs_body2 = try self.allocSlice(ast.Stmt, &.{.{ .expr = lhs_exp }});
+                    const lhs_body2 = try self.allocSlice(ast.Stmt, &.{.{ .expr = lhs_ref_result }});
                     const clauses = try self.allocator.alloc(ast.CaseClause, 2);
                     clauses[0] = .{ .meta = bo.meta, .pattern = false_pat, .type_annotation = null, .guard = null, .body = rhs_body2 };
                     clauses[1] = .{ .meta = bo.meta, .pattern = wild_pat, .type_annotation = null, .guard = null, .body = lhs_body2 };
-                    return .{ .expr = try self.create(ast.Expr, .{ .case_expr = .{ .meta = bo.meta, .scrutinee = lhs_exp, .clauses = clauses } }), .changed = true };
+                    const case_expr = try self.create(ast.Expr, .{ .case_expr = .{ .meta = bo.meta, .scrutinee = lhs_ref_scrutinee, .clauses = clauses } });
+
+                    const block_stmts = try self.allocSlice(ast.Stmt, &.{
+                        .{ .assignment = lhs_assignment },
+                        .{ .expr = case_expr },
+                    });
+                    return .{ .expr = try self.create(ast.Expr, .{ .block = .{ .meta = bo.meta, .stmts = block_stmts } }), .changed = true };
                 }
 
                 // Bootstrap fallback: other operators pass through with the
@@ -4636,6 +4671,122 @@ test "macro substitution into case_expr and block" {
     try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
     // Struct should still exist with expanded content
     try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
+}
+
+test "bootstrap `or` fallback binds the left operand once (stdlib-core--01)" {
+    // The bootstrap short-circuit `or` desugar (used when no `Kernel.or`
+    // macro is in scope — here no `or` macro is collected) must evaluate
+    // the left operand EXACTLY ONCE. The prior implementation emitted the
+    // left operand's AST twice: as the `case` scrutinee AND as the truthy
+    // arm's result, so a side-effecting left operand ran twice. The fix
+    // binds the left operand to a fresh `__or_lhs_<n>` name and references
+    // that binding in both positions.
+    //
+    // We force the bootstrap path (not the Kernel macro) by collecting a
+    // program with no `or` macro defined, then assert the expansion shape:
+    // a block of `{ __or_lhs_0 = <lhs>; case __or_lhs_0 { false -> <rhs>;
+    // _ -> __or_lhs_0 } }`, where the original `lhs` call appears exactly
+    // once (in the binding) and both scrutinee and truthy arm are plain
+    // var_refs to the bound temporary.
+    const source =
+        \\pub struct Test {
+        \\  pub fn left() -> Bool {
+        \\    true
+        \\  }
+        \\
+        \\  pub fn right() -> Bool {
+        \\    false
+        \\  }
+        \\
+        \\  pub fn choose() -> Bool {
+        \\    left() or right()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+
+    // Locate `choose`'s expanded body.
+    var choose_fn: ?*const ast.FunctionDecl = null;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            if (item == .function and std.mem.eql(u8, parser.interner.get(item.function.name), "choose")) {
+                choose_fn = item.function;
+            }
+        }
+    }
+    try std.testing.expect(choose_fn != null);
+    const body = choose_fn.?.clauses[0].body orelse return error.TestExpectedABody;
+    try std.testing.expect(body.len >= 1);
+
+    // The terminal statement is the short-circuit block. Drill through any
+    // wrapper blocks the expander may have introduced to the block that
+    // begins with the `__or_lhs_*` assignment.
+    var short_circuit_block: ?ast.BlockExpr = null;
+    var cursor: ?*const ast.Expr = if (body[body.len - 1] == .expr) body[body.len - 1].expr else null;
+    while (cursor) |e| {
+        switch (e.*) {
+            .block => |blk| {
+                if (blk.stmts.len >= 1 and blk.stmts[0] == .assignment) {
+                    short_circuit_block = blk;
+                    break;
+                }
+                cursor = if (blk.stmts.len > 0 and blk.stmts[blk.stmts.len - 1] == .expr)
+                    blk.stmts[blk.stmts.len - 1].expr
+                else
+                    null;
+            },
+            else => cursor = null,
+        }
+    }
+    try std.testing.expect(short_circuit_block != null);
+    const blk = short_circuit_block.?;
+    try std.testing.expectEqual(@as(usize, 2), blk.stmts.len);
+
+    // Stmt 0: `__or_lhs_<n> = left()` — the LHS *call* lives here, once.
+    try std.testing.expect(blk.stmts[0] == .assignment);
+    const assignment = blk.stmts[0].assignment;
+    try std.testing.expect(assignment.pattern.* == .bind);
+    const temp_name = assignment.pattern.bind.name;
+    try std.testing.expect(std.mem.startsWith(u8, parser.interner.get(temp_name), "__or_lhs_"));
+    // The bound value is the original left operand: a call to `left`.
+    try std.testing.expect(assignment.value.* == .call);
+
+    // Stmt 1: `case __or_lhs_<n> { false -> right(); _ -> __or_lhs_<n> }`.
+    try std.testing.expect(blk.stmts[1] == .expr);
+    try std.testing.expect(blk.stmts[1].expr.* == .case_expr);
+    const case_expr = blk.stmts[1].expr.case_expr;
+    // Scrutinee references the temporary, NOT a re-evaluation of `left()`.
+    try std.testing.expect(case_expr.scrutinee.* == .var_ref);
+    try std.testing.expectEqual(temp_name, case_expr.scrutinee.var_ref.name);
+    try std.testing.expectEqual(@as(usize, 2), case_expr.clauses.len);
+
+    // The wildcard (truthy) arm returns the temporary, NOT `left()` again.
+    var wildcard_body: ?*const ast.Expr = null;
+    for (case_expr.clauses) |clause| {
+        if (clause.pattern.* == .wildcard) {
+            try std.testing.expect(clause.body.len == 1 and clause.body[0] == .expr);
+            wildcard_body = clause.body[0].expr;
+        }
+    }
+    try std.testing.expect(wildcard_body != null);
+    try std.testing.expect(wildcard_body.?.* == .var_ref);
+    try std.testing.expectEqual(temp_name, wildcard_body.?.var_ref.name);
 }
 
 test "typed splice: Atom param accepts atom literals" {

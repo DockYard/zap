@@ -133,9 +133,10 @@ pub struct Kernel {
 
   pub macro or(left :: Expr, right :: Expr) -> Expr {
     quote {
-      case unquote(left) {
+      short_circuit_value = unquote(left)
+      case short_circuit_value {
         false -> unquote(right)
-        _ -> unquote(left)
+        _ -> short_circuit_value
       }
     }
   }
