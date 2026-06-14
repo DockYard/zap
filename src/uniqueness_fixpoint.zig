@@ -965,9 +965,14 @@ const FlowWalker = struct {
     ) !void {
         if (dest == arm_result) return;
 
-        // Merge tuple_pending. The arm's pending entry transfers
-        // ownership to the dest; subsequent arms merge into that
-        // shared entry under the per-component meet.
+        // Merge tuple_pending. The merge is a MEET across arms: a
+        // per-component witness survives into `dest` only if EVERY
+        // merged arm contributes a compatible witness for that
+        // component. An arm that omits the pending entry (a witness-
+        // less tuple-returning call, a `field_get`, a parameter, etc.)
+        // contributes "no witness on this path" and MUST demote any
+        // witness a prior arm installed — uniqueness at the join point
+        // requires all arms to agree (audit finding uniqueness--06).
         if (self.tuple_pending.fetchRemove(arm_result)) |kv| {
             const arm_components = kv.value;
             if (self.tuple_pending.getPtr(dest)) |dest_components_ptr| {
@@ -988,16 +993,30 @@ const FlowWalker = struct {
                         dc.slot = null;
                     }
                 }
-                // Components beyond min_len stay as they were on
-                // the dest. A future arm that exhibits a different
-                // shape would conservatively resolve those as null
-                // since their slots are absent in this arm.
+                // Components the dest has but this arm does not cover
+                // (dest arity > arm arity) have no witness on this
+                // arm's path, so the meet demotes them to null. Leaving
+                // them as-is would let a witness from a differently-
+                // shaped arm survive a disagreement (the secondary
+                // arity hole in uniqueness--06).
+                for (dest_components[min_len..]) |*dc| dc.slot = null;
                 self.allocator.free(arm_components);
             } else {
                 // First arm to contribute — install the arm's slice
                 // directly under dest.
                 try self.tuple_pending.put(self.allocator, dest, arm_components);
             }
+        } else if (self.tuple_pending.fetchRemove(dest)) |existing| {
+            // This arm contributes NO pending entry, but a previous arm
+            // installed one on `dest`. The meet drops the witness for
+            // every component: an absent pending entry means "uniqueness
+            // not preserved on this path", which dominates. Remove the
+            // dest's entry entirely and free its slice. Without this
+            // branch a single-arm "preserves-uniqueness" witness would
+            // survive the merge as if every arm agreed, licensing
+            // unsound `*_owned_unchecked` in-place mutation of a cell a
+            // sibling arm leaves shared (audit finding uniqueness--06).
+            self.allocator.free(existing.value);
         }
 
         // Merge carrier_of. The dest inherits the arm's slot when
@@ -2252,6 +2271,160 @@ test "uniqueness_fixpoint: tuple-return mixed components classify each carrier a
     try testing.expectEqual(@as(?u8, 0), sig.return_components[0]);
     try testing.expectEqual(@as(?u8, 1), sig.return_components[1]);
     try testing.expectEqual(@as(?u8, null), sig.return_components[2]);
+}
+
+test "uniqueness_fixpoint: multi-arm merge demotes tuple_pending witness when one arm omits it (uniqueness--06)" {
+    // Regression for audit finding uniqueness--06: a `tuple_pending`
+    // witness present in only ONE arm of a multi-arm construct must NOT
+    // survive the merge. Uniqueness at the join point requires EVERY arm
+    // to agree (meet semantics); an arm that contributes no pending entry
+    // means "no witness on this path", which must demote the dest's entry.
+    //
+    //   fn pick(p :: T, q :: T, fallback :: {T, T}) -> {T, T} {
+    //     if cond { {p, q} } else { fallback }
+    //   }
+    //
+    // The then-arm's tuple_init installs tuple_pending [slot 0, slot 1]
+    // on the if_expr's dest. The else-arm's result is `fallback` (a
+    // tuple-typed parameter with NO pending entry). Correct meet: the
+    // witnesses are demoted, so the ret records NO per-component witness
+    // and neither p nor q is upgraded to preserves_uniqueness. Pre-fix
+    // the missing else-branch in mergeArmResultIntoDest let the then-arm
+    // witnesses survive, recording return_components=[0,1] and upgrading
+    // both params to PU — the spurious witness that drives unsound
+    // `*_owned_unchecked` mutation of a possibly-shared `fallback`
+    // component on the else path.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tuple_elems = try arena.alloc(ir.LocalId, 2);
+    tuple_elems[0] = 0; // param_get(0) -> p
+    tuple_elems[1] = 1; // param_get(1) -> q
+    const then_instrs = try arena.alloc(ir.Instruction, 1);
+    then_instrs[0] = .{ .tuple_init = .{ .dest = 5, .elements = tuple_elems } };
+
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } }, // p
+        .{ .param_get = .{ .dest = 1, .index = 1 } }, // q
+        .{ .param_get = .{ .dest = 2, .index = 2 } }, // fallback (tuple param, no pending)
+        .{ .const_bool = .{ .dest = 3, .value = true } }, // condition
+        .{ .if_expr = .{
+            .dest = 4,
+            .condition = 3,
+            .then_instrs = then_instrs,
+            .then_result = 5,
+            .else_instrs = &.{},
+            .else_result = 2, // else arm yields `fallback` — no witness
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    var function = try buildTestFunction(
+        arena,
+        "pick",
+        &callee_instrs,
+        6,
+        &[_]ir.ParamConvention{ .owned, .owned, .owned },
+        .owned,
+    );
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    // The witness from the then-arm must be demoted by the else-arm's
+    // absence: no component witness survives into the return signature.
+    try testing.expect(sig.return_components.len >= 1);
+    try testing.expectEqual(@as(?u8, null), sig.return_components[0]);
+    // The load-bearing soundness property: because the merge demoted the
+    // single-arm witnesses, neither p nor q is classified
+    // `preserves_uniqueness`, so a caller passing a unique value in
+    // slot 0/1 will NOT be told the returned tuple component preserves
+    // that uniqueness — the spurious witness that would drive an unsound
+    // `*_owned_unchecked` mutation never reaches the signature. Both
+    // slots have no PU/AL flow in the body, so the fixpoint's defensive
+    // cleanup (computeSignaturesWithOwnership step "any slot that
+    // remained unobserved → top") lands them at the conservative `top`,
+    // never `preserves_uniqueness`.
+    try testing.expect(sig.params[0].class != .preserves_uniqueness);
+    try testing.expect(sig.params[1].class != .preserves_uniqueness);
+    try testing.expectEqual(UniquenessClass.top, sig.params[0].class);
+    try testing.expectEqual(UniquenessClass.top, sig.params[1].class);
+}
+
+test "uniqueness_fixpoint: multi-arm merge keeps tuple_pending witness when all arms agree (uniqueness--06 optimization preserved)" {
+    // Companion to the uniqueness--06 demotion test: when EVERY arm of a
+    // multi-arm construct contributes the SAME per-component witness, the
+    // witness must survive the merge (the all-arms-agree optimization is
+    // preserved — the fix must not over-demote).
+    //
+    //   fn pick_both(p :: T, q :: T) -> {T, T} {
+    //     if cond { {p, q} } else { {p, q} }
+    //   }
+    //
+    // Both arms install tuple_pending [slot 0, slot 1]; their per-
+    // component meet keeps both witnesses, so the ret records
+    // return_components=[0,1] and both params classify as PU.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const then_elems = try arena.alloc(ir.LocalId, 2);
+    then_elems[0] = 0;
+    then_elems[1] = 1;
+    const then_instrs = try arena.alloc(ir.Instruction, 1);
+    then_instrs[0] = .{ .tuple_init = .{ .dest = 4, .elements = then_elems } };
+
+    const else_elems = try arena.alloc(ir.LocalId, 2);
+    else_elems[0] = 0;
+    else_elems[1] = 1;
+    const else_instrs = try arena.alloc(ir.Instruction, 1);
+    else_instrs[0] = .{ .tuple_init = .{ .dest = 5, .elements = else_elems } };
+
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } }, // p
+        .{ .param_get = .{ .dest = 1, .index = 1 } }, // q
+        .{ .const_bool = .{ .dest = 2, .value = true } }, // condition
+        .{ .if_expr = .{
+            .dest = 3,
+            .condition = 2,
+            .then_instrs = then_instrs,
+            .then_result = 4,
+            .else_instrs = else_instrs,
+            .else_result = 5,
+        } },
+        .{ .ret = .{ .value = 3 } },
+    };
+    var function = try buildTestFunction(
+        arena,
+        "pick_both",
+        &callee_instrs,
+        6,
+        &[_]ir.ParamConvention{ .owned, .owned },
+        .owned,
+    );
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    // Both arms agree, so both component witnesses survive into the
+    // return signature and both params classify as PU.
+    try testing.expect(sig.return_components.len >= 2);
+    try testing.expectEqual(@as(?u8, 0), sig.return_components[0]);
+    try testing.expectEqual(@as(?u8, 1), sig.return_components[1]);
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[0].class);
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[1].class);
 }
 
 test "uniqueness_fixpoint: tuple stored in list still ALs the carrier (Phase 2.1 escape resolution)" {
