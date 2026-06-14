@@ -106,6 +106,24 @@ pub fn build(b: *std.Build) void {
     const run_boundary_guard_tests = b.addRunArtifact(boundary_guard_tests);
     test_step.dependOn(&run_boundary_guard_tests.step);
 
+    // Test-aggregation regression guard. `src/root.zig`'s `test {}` block is
+    // the ONLY thing that pulls a `src/*.zig` module's `test {}` blocks into
+    // `zig build test` (a top-level `pub const x = @import(...)` does not). A
+    // test-bearing module left out of that block is silently dead. This meta-
+    // test walks `src/`, finds every module with `test {}` blocks, and fails
+    // the build if one is neither aggregated in root.zig's block nor on the
+    // DELIBERATE EXCLUSIONS allow-list declared in that block's comment — so
+    // the aggregation can never silently develop a hole again.
+    const test_aggregation_guard_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/test_aggregation_guard_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_test_aggregation_guard_tests = b.addRunArtifact(test_aggregation_guard_tests);
+    test_step.dependOn(&run_test_aggregation_guard_tests.step);
+
     // Cross-check that the byte-keyed slab pool's layout constants in
     // `src/runtime.zig`'s `TestOnlyArcSlabPool` block agree byte-for-
     // byte with the production manager (`src/memory/arc/manager.zig`).
