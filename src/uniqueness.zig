@@ -255,12 +255,14 @@ pub fn analyzeUniquenessFullEx(
         .tuple_pending = .empty,
         .extracted = .empty,
         .next_id = 0,
+        .try_call_success_unique = .empty,
         .result = .{},
     };
     defer {
         analyzer.unique.deinit(allocator);
         analyzer.deinitTuplePending();
         analyzer.deinitExtracted();
+        analyzer.try_call_success_unique.deinit(allocator);
     }
 
     errdefer analyzer.result.deinit(allocator);
@@ -389,6 +391,16 @@ const Analyzer = struct {
     /// must agree on id assignment so the verifier and codegen can
     /// cross-reference their per-instruction queries.
     next_id: arc_liveness.InstructionId,
+    /// uniqueness--04 — per-`try_call_named` success-payload uniqueness,
+    /// keyed by the try_call's InstructionId. Computed in `applyEffect`
+    /// (where the PRE-call arg-uniqueness state is still intact, before
+    /// the receiver is consumed) and consumed in `walkChildren` when
+    /// meeting the success/handler arms into `tcn.dest`. Stashing it here
+    /// is required because `walkChildren` runs AFTER `applyEffect` has
+    /// already cleared the receiver's uniqueness bit, so it can no longer
+    /// reconstruct the receiver's call-site uniqueness for the
+    /// convention-pair freshness gate.
+    try_call_success_unique: std.AutoHashMapUnmanaged(arc_liveness.InstructionId, bool),
     /// Output table — populated during the walk.
     result: Uniqueness,
 
@@ -594,7 +606,7 @@ const Analyzer = struct {
             // We iterate a snapshot of the keys because
             // `promoteExtractedAt` mutates `tuple_pending`.
             try self.promoteAtLastUse(my_id);
-            try self.walkChildren(instr);
+            try self.walkChildren(instr, my_id);
         }
     }
 
@@ -619,6 +631,7 @@ const Analyzer = struct {
     fn walkChildren(
         self: *Analyzer,
         instr: *const ir.Instruction,
+        my_id: arc_liveness.InstructionId,
     ) error{OutOfMemory}!void {
         // The forward dataflow inside a structural arm starts from
         // the parent stream's current `unique` set. Different arms of
@@ -722,7 +735,13 @@ const Analyzer = struct {
                 // success-callee contract (`calleeContractResultUnique`). The
                 // handler-arm value is `handler_result` when present, else
                 // void (never unique).
-                const success_payload_unique = self.calleeContractResultUnique(tcn.name);
+                //
+                // uniqueness--04: the success-payload uniqueness was computed
+                // in `applyEffect` from the PRE-call arg-uniqueness snapshot
+                // (the convention-pair freshness gate needs the receiver's
+                // call-site uniqueness, which `applyEffect` has since cleared).
+                // Read the stashed value rather than recomputing it here.
+                const success_payload_unique = self.try_call_success_unique.get(my_id) orelse false;
 
                 const snap = try self.snapshot();
                 defer snap.deinit(self.allocator);
@@ -1258,6 +1277,19 @@ const Analyzer = struct {
                 // (consume the receiver, dissolve arg pending entries); the
                 // dest meet runs after the arms are walked. The receiver
                 // consumption matches `applyCalleeEffect`'s receiver removal.
+                //
+                // uniqueness--04: the success-payload's uniqueness depends on
+                // the PRE-call per-arg uniqueness (the convention-pair
+                // freshness gate consults the receiver's call-site
+                // uniqueness). We MUST snapshot it here, before consuming the
+                // receiver — `walkChildren` runs after this arm has cleared
+                // the receiver bit and could no longer reconstruct it. Stash
+                // the result keyed by this instruction's id for the meet.
+                const pre = try self.snapshotArgUnique(tcn.args);
+                defer self.allocator.free(pre);
+                const success_payload_unique = self.calleeContractResultUnique(tcn.name, pre);
+                try self.try_call_success_unique.put(self.allocator, my_id, success_payload_unique);
+
                 for (tcn.args) |arg| {
                     self.escapeIfExtractedLocal(arg);
                     self.escapePending(arg);
@@ -1482,19 +1514,114 @@ const Analyzer = struct {
         return null;
     }
 
-    /// uniqueness--03 — whether the SUCCESS-path result of calling `name`
-    /// is unique by the callee's runtime contract. This is the single
+    /// uniqueness--04 — does the callee `function_id`'s signature prove
+    /// that its `slot` parameter's uniqueness flows WHOLE-RETURN through
+    /// to the result? True only when the per-slot signature class is
+    /// `preserves_uniqueness` AND the witness is the whole return value
+    /// (`preserves_to_return_component == null`, i.e. the result is the
+    /// parameter itself or its rc=1 derivative — NOT one component of a
+    /// tuple return). This is the soundness witness the `.owned`/`.owned`
+    /// convention pair lacks: the convention pair establishes only that
+    /// the caller transferred a +1 and receives a +1 back, never that the
+    /// returned cell is fresh/unaliased. A function that returns its
+    /// `.owned` receiver unchanged (an accumulator base case) is PU but
+    /// its result is the SAME cell the caller passed — unique only when
+    /// that cell was unique on entry.
+    ///
+    /// Returns false when no signature table is wired (test scaffolding /
+    /// non-production callers): the safe, conservative default. Returns
+    /// false for absent functions or out-of-range slots.
+    fn signatureWholeReturnPreservesUniqueness(
+        self: *const Analyzer,
+        function_id: ir.FunctionId,
+        slot: usize,
+    ) bool {
+        const sigs = self.signatures orelse return false;
+        const sig = sigs.forFunction(function_id) orelse return false;
+        if (slot >= sig.params.len) return false;
+        const param_sig = sig.params[slot];
+        return param_sig.class == .preserves_uniqueness and
+            param_sig.preserves_to_return_component == null;
+    }
+
+    /// uniqueness--04 — resolve `name` to a FunctionId, then delegate to
+    /// `signatureWholeReturnPreservesUniqueness`. False when the name is
+    /// unresolvable or no signatures are wired.
+    fn signatureWholeReturnPreservesUniquenessByName(
+        self: *const Analyzer,
+        name: []const u8,
+        slot: usize,
+    ) bool {
+        const function_id = self.lookupByName(name) orelse return false;
+        return self.signatureWholeReturnPreservesUniqueness(function_id, slot);
+    }
+
+    /// uniqueness--04 — whether a call whose callee matches the
+    /// `.owned` receiver slot + `.owned` result convention pair (slot
+    /// `slot`) produces a PROVABLY-UNIQUE result. The convention pair
+    /// alone is insufficient (uniqueness--04): a callee can legitimately
+    /// have an `.owned` receiver and `.owned` result yet `return` an
+    /// alias of that receiver (or a captured/shared value) rather than a
+    /// freshly-produced cell. The result is provably unique only when the
+    /// callee's signature proves the slot's uniqueness flows whole-return
+    /// (PU, whole-return witness) AND the receiver was actually unique at
+    /// this call site (`pre_arg_unique[slot]`):
+    ///   * PU whole-return + receiver unique → result inherits the
+    ///     receiver's (proven) uniqueness → unique.
+    ///   * PU whole-return + receiver shared → the result may be the
+    ///     shared cell (alias case) → NOT unique.
+    /// When signatures are absent, falls back to NOT unique (conservative).
+    fn conventionPairResultUnique(
+        self: *const Analyzer,
+        name: []const u8,
+        slot: usize,
+        pre_arg_unique: []const bool,
+    ) bool {
+        if (slot >= pre_arg_unique.len) return false;
+        if (!pre_arg_unique[slot]) return false;
+        return self.signatureWholeReturnPreservesUniquenessByName(name, slot);
+    }
+
+    /// Convention-pair result-unique decision for a `call_direct`
+    /// callee resolved to a concrete function. Mirrors
+    /// `conventionPairResultUnique` but keys the signature lookup on the
+    /// resolved `function.id` directly.
+    fn conventionPairResultUniqueByFunction(
+        self: *const Analyzer,
+        function: *const ir.Function,
+        slot: usize,
+        pre_arg_unique: []const bool,
+    ) bool {
+        if (slot >= pre_arg_unique.len) return false;
+        if (!pre_arg_unique[slot]) return false;
+        return self.signatureWholeReturnPreservesUniqueness(function.id, slot);
+    }
+
+    /// uniqueness--03 / uniqueness--04 — whether the SUCCESS-path result
+    /// of calling `name` is unique by the callee's runtime contract,
+    /// given the pre-call per-arg uniqueness snapshot. This is the single
     /// authority for the success-callee classification, shared by the
-    /// regular `call_named`/`try_call_named` paths so the success-arm
-    /// uniqueness of a `try_call_named` and the dest of a plain call agree
-    /// by construction. The three contract shapes mirror `applyCalleeEffect`:
-    ///   1. owned-mutating builtin (`ownedMutatingBuiltinSlot != null`)
-    ///   2. Zap fn convention pair (`.owned` receiver slot + `.owned` result)
-    ///   3. fresh-allocator wrapper (rc=1 by construction)
-    fn calleeContractResultUnique(self: *const Analyzer, name: []const u8) bool {
+    /// regular `call_named` dest path and the `try_call_named` success-arm
+    /// so they agree by construction. The three contract shapes mirror
+    /// `applyCalleeEffect`:
+    ///   1. owned-mutating builtin (`ownedMutatingBuiltinSlot != null`) —
+    ///      runtime contract guarantees a fresh rc=1 result.
+    ///   2. fresh-allocator wrapper (rc=1 by construction).
+    ///   3. Zap fn convention pair (`.owned` receiver slot + `.owned`
+    ///      result) — uniqueness--04: unique ONLY when the callee's
+    ///      signature proves whole-return PU AND the receiver was unique
+    ///      at the call site (`conventionPairResultUnique`). The
+    ///      convention pair alone does NOT prove result freshness.
+    fn calleeContractResultUnique(
+        self: *const Analyzer,
+        name: []const u8,
+        pre_arg_unique: []const bool,
+    ) bool {
         if (arc_liveness.ownedMutatingBuiltinSlot(name) != null) return true;
-        if (self.calleeOwnedReceiverSlot(name) != null) return true;
         if (self.calleeIsFreshAllocatorWrapper(name)) return true;
+        if (self.calleeOwnedReceiverSlot(name)) |slot| {
+            return self.conventionPairResultUnique(name, slot, pre_arg_unique);
+        }
         return false;
     }
 
@@ -1530,16 +1657,35 @@ const Analyzer = struct {
             try self.synthesizeReturnPendingByName(name, args, dest, pre_arg_unique);
             return;
         }
+        // uniqueness--04: check fresh-allocator wrappers BEFORE the
+        // convention pair. A genuinely fresh-returning callee yields a
+        // unique result on every path regardless of any argument's
+        // uniqueness, so it must not be subjected to the convention-pair
+        // freshness gate below. (A fresh-allocator wrapper never consumes
+        // an `.owned` receiver — its body forwards to exactly one fresh
+        // allocator and no other call — so the two shapes are mutually
+        // exclusive and no receiver-consume is skipped here.)
+        if (self.calleeIsFreshAllocatorWrapper(name)) {
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
         if (self.calleeOwnedReceiverSlot(name)) |slot| {
+            // The receiver is consumed by the call regardless of result
+            // freshness — clear its uniqueness bit unconditionally.
             if (slot < args.len) {
                 _ = self.unique.remove(args[slot]);
             }
-            try self.unique.put(self.allocator, dest, {});
+            // uniqueness--04: the `.owned`/`.owned` convention pair does
+            // NOT prove the result is fresh. Mark dest unique ONLY when
+            // the callee's signature proves whole-return PU AND the
+            // receiver was unique at this call site. Otherwise the result
+            // may alias the (possibly shared) receiver cell — clear it.
+            if (self.conventionPairResultUnique(name, slot, pre_arg_unique)) {
+                try self.unique.put(self.allocator, dest, {});
+            } else {
+                _ = self.unique.remove(dest);
+            }
             try self.synthesizeReturnPendingByName(name, args, dest, pre_arg_unique);
-            return;
-        }
-        if (self.calleeIsFreshAllocatorWrapper(name)) {
-            try self.unique.put(self.allocator, dest, {});
             return;
         }
         // Non-mutating call: result not classified.
@@ -1562,16 +1708,28 @@ const Analyzer = struct {
             try self.synthesizeReturnPendingByFunction(function.id, args, dest, pre_arg_unique);
             return;
         }
+        // uniqueness--04: fresh-allocator wrappers (unique result on every
+        // path) take precedence over the convention-pair gate, mirroring
+        // the by-name path.
+        if (functionIsFreshAllocatorWrapperWithProgram(function, self.program)) {
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
         if (calleeFunctionOwnedReceiverSlot(function)) |slot| {
+            // Receiver consumed regardless of result freshness.
             if (slot < args.len) {
                 _ = self.unique.remove(args[slot]);
             }
-            try self.unique.put(self.allocator, dest, {});
+            // uniqueness--04: gate dest-unique on the whole-return-PU
+            // signature witness AND the receiver's call-site uniqueness,
+            // exactly as the by-name path does. The convention pair alone
+            // is insufficient evidence of result freshness.
+            if (self.conventionPairResultUniqueByFunction(function, slot, pre_arg_unique)) {
+                try self.unique.put(self.allocator, dest, {});
+            } else {
+                _ = self.unique.remove(dest);
+            }
             try self.synthesizeReturnPendingByFunction(function.id, args, dest, pre_arg_unique);
-            return;
-        }
-        if (functionIsFreshAllocatorWrapperWithProgram(function, self.program)) {
-            try self.unique.put(self.allocator, dest, {});
             return;
         }
         _ = self.unique.remove(dest);
@@ -2555,11 +2713,318 @@ test "uniqueness--03: try_call_named dest IS unique when BOTH arms yield unique 
     functions[1] = callee;
     const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
 
-    var u = try analyzeUniqueness(testing.allocator, &caller, &program);
+    // uniqueness--04: the success payload is unique only when the callee's
+    // signature proves whole-return PU AND the receiver was unique at the
+    // call site. Here the receiver (%1, moved from a fresh map_init) IS
+    // unique, and `step_fn`'s real promoted-accumulator signature is
+    // whole-return PU — install it so the success-arm classification
+    // reflects a genuinely-sound case (rather than the bare convention
+    // pair, which uniqueness--04 proved insufficient). This keeps the test
+    // exercising the uniqueness--03 arm-MEET on a valid premise.
+    var signatures = uniqueness_signature.ProgramSignatures.init(testing.allocator);
+    defer signatures.deinit(testing.allocator);
+    try installWholeReturnPuSignature(&signatures, 1);
+
+    var u = try analyzeUniquenessFull(testing.allocator, &caller, &program, null, &signatures, null);
     defer u.deinit(testing.allocator);
 
     // Both arms unique -> dest unique -> Map.put at id 7 is unique.
     try testing.expect(u.isUnique(7));
+}
+
+/// uniqueness--04 — build a callee whose convention pair is the
+/// over-optimistic `.owned` receiver slot + `.owned` result, but whose
+/// body ALIASES its returned value: it returns the receiver parameter
+/// unchanged (e.g. an accumulator's zero-iteration base case
+/// `fn accum(m, n) -> if n == 0 { m } else { ... }`). The signature's
+/// slot 0 is `preserves_uniqueness(null)` (whole-return PU — the param
+/// is returned whole), exactly what the fixpoint records for such a
+/// body. The `.owned`/`.owned` convention pair is identical to a
+/// genuine fresh-returning constructor, which is why the convention
+/// pair alone cannot tell them apart.
+fn buildAliasReturningOwnedCallee(
+    arena: std.mem.Allocator,
+    id: ir.FunctionId,
+    name: []const u8,
+) !ir.Function {
+    const param_conv = try arena.alloc(ir.ParamConvention, 1);
+    param_conv[0] = .owned;
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = &.{} };
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "receiver", .type_expr = .void };
+    return ir.Function{
+        .id = id,
+        .name = name,
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 0,
+        .param_conventions = param_conv,
+        .local_ownership = try arena.alloc(ir.OwnershipClass, 0),
+        .result_convention = .owned,
+    };
+}
+
+/// uniqueness--04 — record a whole-return-PU signature for `callee_id`:
+/// slot 0 `preserves_uniqueness(null)` with no `return_components`
+/// witnesses. This is the signature the fixpoint infers for a callee
+/// that returns its `.owned` receiver parameter unchanged — the result
+/// inherits the receiver's uniqueness rather than being freshly
+/// produced.
+fn installWholeReturnPuSignature(
+    signatures: *uniqueness_signature.ProgramSignatures,
+    callee_id: ir.FunctionId,
+) !void {
+    const arena_alloc = signatures.arena.allocator();
+    const params = try arena_alloc.alloc(uniqueness_signature.ParamSig, 1);
+    params[0] = uniqueness_signature.ParamSig.preservesUniqueness(null);
+    try signatures.by_function.put(testing.allocator, callee_id, .{
+        .params = params,
+        .return_components = &.{},
+    });
+}
+
+test "uniqueness--04: alias-returning owned callee does NOT make dest unique when the receiver was shared at the call site" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // The canonical promoted accumulator pattern that REFUTES the
+    // convention-pair freshness assumption: a self-recursive accumulator
+    // returns its accumulator parameter unchanged in the base case, so
+    // the `.owned`/`.owned` convention pair holds yet the result is the
+    // SAME cell the caller passed in. When the caller has parked an alias
+    // of that cell (rc>=2), the result is NOT unique.
+    //
+    // Caller stream (verifier's concrete reach path, no global escape):
+    //   [0] map_init %0 = {}                       -- the map
+    //   [1] share_value %1 <- %0                   -- park alias; %0 now rc>=2, NOT unique
+    //   [2] list_init %2 = [%1]                     -- xs = [m] (the parked alias)
+    //   [3] call_named "accum_loop" args=[%0] dest=%3
+    //         -- pre_arg_unique[0] = false (%0 is shared)
+    //         -- base path: callee returns %0's rc>=2 cell unchanged
+    //   [4] const_int %4 = 0
+    //   [5] const_int %5 = 0
+    //   [6] move_value %6 <- %3
+    //   [7] call_builtin "Map.put" args=[%6,%4,%5] dest=%7
+    //
+    // PRE-FIX: `calleeOwnedReceiverSlot("accum_loop") != null` marks %3
+    //          unique unconditionally; the move propagates and Map.put at
+    //          id 7 is classified unique -> put_owned_unchecked over the
+    //          rc>=2 cell -> corrupts xs[0] (silent heap corruption).
+    // POST-FIX: dest-unique requires the whole-return-PU signature AND
+    //           pre_arg_unique[slot]; the receiver was shared, so %3 is
+    //           NOT unique and Map.put at id 7 is NOT unique.
+    const callee = try buildAliasReturningOwnedCallee(arena, 1, "accum_loop");
+
+    const call_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{0});
+    const list_elems = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 6;
+    put_args[1] = 4;
+    put_args[2] = 5;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .list_init = .{ .dest = 2, .elements = list_elems } },
+        .{ .call_named = .{
+            .dest = 3,
+            .name = "accum_loop",
+            .args = call_args,
+            .arg_modes = &.{},
+        } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .const_int = .{ .dest = 5, .value = 0 } },
+        .{ .move_value = .{ .dest = 6, .source = 3 } },
+        .{ .call_builtin = .{
+            .dest = 7,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+    };
+    var caller = try buildTestFunction(arena, "caller", &caller_instrs, 8);
+    caller.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = caller;
+    functions[1] = callee;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var signatures = uniqueness_signature.ProgramSignatures.init(testing.allocator);
+    defer signatures.deinit(testing.allocator);
+    try installWholeReturnPuSignature(&signatures, 1);
+
+    var u = try analyzeUniquenessFull(testing.allocator, &caller, &program, null, &signatures, null);
+    defer u.deinit(testing.allocator);
+
+    // The defining assertion: the receiver was shared, the callee aliases
+    // its return, so the dest is NOT unique and the Map.put must NOT be
+    // classified unique.
+    try testing.expect(!u.isUnique(7));
+}
+
+test "uniqueness--04: alias-returning owned callee keeps dest unique when the receiver was unique at the call site (optimization preserved)" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Same alias-returning callee, but the caller passes a FRESH unique
+    // map (no parked alias). With a whole-return-PU signature, the result
+    // inherits the receiver's uniqueness — and the receiver IS unique here
+    // (pre_arg_unique[0] = true), so the dest stays unique and the
+    // downstream Map.put is still rewritten to the unchecked variant. This
+    // proves the signature gate does not pessimize the genuinely-sound
+    // promoted-accumulator case.
+    //
+    // Caller stream:
+    //   [0] map_init %0 = {}                       -- fresh, unique
+    //   [1] move_value %1 <- %0                     -- transfer to the call arg (still unique)
+    //   [2] call_named "accum_loop" args=[%1] dest=%2
+    //         -- pre_arg_unique[0] = true
+    //   [3] const_int %3 = 0
+    //   [4] const_int %4 = 0
+    //   [5] move_value %5 <- %2
+    //   [6] call_builtin "Map.put" args=[%5,%3,%4] dest=%6
+    const callee = try buildAliasReturningOwnedCallee(arena, 1, "accum_loop");
+
+    const call_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{1});
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 5;
+    put_args[1] = 3;
+    put_args[2] = 4;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .map_init = .{ .dest = 0, .entries = &.{} } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "accum_loop",
+            .args = call_args,
+            .arg_modes = &.{},
+        } },
+        .{ .const_int = .{ .dest = 3, .value = 0 } },
+        .{ .const_int = .{ .dest = 4, .value = 0 } },
+        .{ .move_value = .{ .dest = 5, .source = 2 } },
+        .{ .call_builtin = .{
+            .dest = 6,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+    };
+    var caller = try buildTestFunction(arena, "caller", &caller_instrs, 7);
+    caller.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = caller;
+    functions[1] = callee;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var signatures = uniqueness_signature.ProgramSignatures.init(testing.allocator);
+    defer signatures.deinit(testing.allocator);
+    try installWholeReturnPuSignature(&signatures, 1);
+
+    var u = try analyzeUniquenessFull(testing.allocator, &caller, &program, null, &signatures, null);
+    defer u.deinit(testing.allocator);
+
+    // Receiver unique + whole-return PU -> dest unique -> Map.put unique.
+    try testing.expect(u.isUnique(6));
+}
+
+test "uniqueness--04: fresh-allocator wrapper callee keeps dest unique regardless of arg uniqueness (optimization preserved)" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // A genuine fresh-allocator wrapper returns a freshly-allocated cell
+    // (rc=1 by construction) on every path, independent of any argument's
+    // uniqueness. Its dest must stay unique even when an argument is
+    // shared — this is the common constructor / `List.new_filled` wrapper
+    // case the optimization must preserve.
+    //
+    // Callee `make_map() -> Map.new()` — body is exactly one
+    // fresh-allocator builtin call, recognised by
+    // `functionIsFreshAllocatorWrapper`.
+    //
+    // Caller stream:
+    //   [0] call_named "make_map" args=[] dest=%0   -- fresh, unique
+    //   [1] const_int %1 = 0
+    //   [2] const_int %2 = 0
+    //   [3] move_value %3 <- %0
+    //   [4] call_builtin "Map.put" args=[%3,%1,%2] dest=%4
+    const callee_param_conv = try arena.alloc(ir.ParamConvention, 0);
+    const callee_blocks = try arena.alloc(ir.Block, 1);
+    callee_blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+            .{ .call_builtin = .{ .dest = 0, .name = "Map.new", .args = &.{}, .arg_modes = &.{} } },
+            .{ .ret = .{ .value = 0 } },
+        }),
+    };
+    const callee = ir.Function{
+        .id = 1,
+        .name = "make_map",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = callee_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+        .param_conventions = callee_param_conv,
+        .local_ownership = try arena.alloc(ir.OwnershipClass, 1),
+        .result_convention = .owned,
+    };
+
+    const put_args = try arena.alloc(ir.LocalId, 3);
+    put_args[0] = 3;
+    put_args[1] = 1;
+    put_args[2] = 2;
+    const put_modes = try arena.alloc(ir.ValueMode, 3);
+    put_modes[0] = .move;
+    put_modes[1] = .borrow;
+    put_modes[2] = .borrow;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .call_named = .{ .dest = 0, .name = "make_map", .args = &.{}, .arg_modes = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .const_int = .{ .dest = 2, .value = 0 } },
+        .{ .move_value = .{ .dest = 3, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.put",
+            .args = put_args,
+            .arg_modes = put_modes,
+        } },
+    };
+    var caller = try buildTestFunction(arena, "caller", &caller_instrs, 5);
+    caller.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = caller;
+    functions[1] = callee;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    // No signatures table needed — fresh-allocator wrappers are recognised
+    // structurally, independent of the signature lattice.
+    var u = try analyzeUniqueness(testing.allocator, &caller, &program);
+    defer u.deinit(testing.allocator);
+
+    // Fresh allocation -> dest unique -> Map.put unique.
+    try testing.expect(u.isUnique(4));
 }
 
 /// Phase 2.5 — synthesize a minimal `ArcOwnership` for tests that

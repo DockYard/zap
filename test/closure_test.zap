@@ -408,4 +408,93 @@ pub struct ClosureTest {
     Map.has_key?(basin, :stepped)
   }
 
+  # End-to-end runtime soundness complement for audit finding
+  # uniqueness--04. A call's dest was marked definitely-unique purely from
+  # the callee's `.owned`-receiver-slot + `.owned`-result convention pair,
+  # ignoring that the callee BODY can ALIAS its returned value. The
+  # canonical refutation is a self-recursive accumulator: in the base case
+  # it returns its accumulator parameter UNCHANGED (an alias), so the
+  # `.owned`/`.owned` convention pair holds yet the result is the SAME cell
+  # the caller passed in. When the caller has parked an alias of that cell
+  # (rc>=2) and hits the base path, the result is the shared cell; a later
+  # owned-mutating `Map.put` on it, if rewritten to `put_owned_unchecked`,
+  # would corrupt the parked alias in place.
+  #
+  # `accumulate` is a two-clause self-recursive Map accumulator: the
+  # base clause `accumulate(m, 0) -> m` returns the receiver alias; the
+  # recursive clause forwards the receiver into `Map.put` (the owned-sink
+  # consume that promotes the receiver slot toward `.owned`). It is
+  # exercised through BOTH a DIRECT consuming call with iterations
+  # (`direct_accumulate`, the shape that promotes the slot) and the
+  # zero-iteration base path below where the receiver is a parked rc>=2
+  # cell. The parked alias must survive unchanged, under default ARC and
+  # `Memory.Tracking`.
+  #
+  # Honesty note: like the uniqueness--02 / uniqueness--03 corpus guards
+  # above, this case passes both pre- AND post-fix. The convention cascade
+  # keeps the result `Map.put` receiver COW-classified for this
+  # accumulator shape end to end, so the analyzer-level false-uniqueness
+  # does not reach a `*_owned_unchecked` emission in this corpus path. The
+  # authoritative fail-pre/pass-post proof for uniqueness--04 is the
+  # deterministic analyzer unit test
+  # "uniqueness--04: alias-returning owned callee does NOT make dest unique
+  # when the receiver was shared at the call site" in src/uniqueness.zig,
+  # which asserts the dest classification directly (it FAILS pre-fix and
+  # PASSES post-fix). This runtime guard locks in the no-corruption
+  # behavior under both managers; a future change that both re-introduces
+  # the convention-pair false-uniqueness AND removes the cascade masking
+  # would corrupt the parked alias and surface here. The companion test
+  # confirms the multi-iteration path still produces its mutation.
+  describe("convention-pair alias-return soundness (uniqueness--04)") {
+    test("zero-iteration accumulator base path does not corrupt a parked shared alias") {
+      assert(accumulator_base_preserves_parked_alias())
+    }
+
+    test("multi-iteration accumulator still returns its mutation") {
+      assert(accumulator_iterations_have_mutation())
+    }
+  }
+
+  # Base clause: returns the receiver parameter UNCHANGED (alias). This is
+  # the path that makes the `.owned`/`.owned` convention pair lie about
+  # result freshness.
+  fn accumulate(m :: %{Atom => i64}, 0 :: i64) -> %{Atom => i64} {
+    m
+  }
+
+  # Recursive clause: forwards the receiver into `Map.put` (owned sink),
+  # the consume anchor that promotes the receiver slot toward `.owned`.
+  fn accumulate(m :: %{Atom => i64}, n :: i64) -> %{Atom => i64} {
+    stepped = Map.put(m, :count, n)
+    ClosureTest.accumulate(stepped, n - 1)
+  }
+
+  # Direct consuming caller with real iterations: the call shape that
+  # promotes `accumulate`'s receiver slot to `.owned`.
+  fn direct_accumulate() -> Bool {
+    fresh = %{seed: 1}
+    produced = ClosureTest.accumulate(fresh, 3)
+    Map.has_key?(produced, :count)
+  }
+
+  fn accumulator_base_preserves_parked_alias() -> Bool {
+    direct_ok = direct_accumulate()
+    shared_map = %{kept: 7}
+    parked = [shared_map]
+    # Zero iterations -> the base clause returns `shared_map` UNCHANGED
+    # (the rc>=2 parked cell). The owned-mutating `Map.put` on that result
+    # at its last use must COW (it is the rc>=2 shared cell on the base
+    # path), so the parked alias survives unchanged.
+    result = ClosureTest.accumulate(shared_map, 0)
+    _mutated = Map.put(result, :added, 1)
+    observed = List.get(parked, 0)
+    direct_ok and not Map.has_key?(observed, :added) and Map.has_key?(observed, :kept)
+  }
+
+  fn accumulator_iterations_have_mutation() -> Bool {
+    base = %{origin: 1}
+    produced = ClosureTest.accumulate(base, 2)
+    Map.has_key?(produced, :count)
+  }
+
 }

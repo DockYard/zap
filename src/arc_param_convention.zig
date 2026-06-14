@@ -2595,6 +2595,55 @@ const TentativeAnalyzer = struct {
         }
     }
 
+    /// uniqueness--04 (tentative mirror) — does the callee `function_id`'s
+    /// signature prove its `slot` parameter's uniqueness flows WHOLE-RETURN
+    /// through to the result (PU class with a whole-return witness, i.e.
+    /// `preserves_to_return_component == null`)? See the canonical
+    /// `uniqueness.Analyzer.signatureWholeReturnPreservesUniqueness` for
+    /// the soundness rationale. False for absent functions / out-of-range
+    /// slots — the conservative default.
+    fn signatureWholeReturnPreservesUniqueness(
+        self: *const TentativeAnalyzer,
+        function_id: ir.FunctionId,
+        slot: usize,
+    ) bool {
+        const sig = self.signatures.forFunction(function_id) orelse return false;
+        if (slot >= sig.params.len) return false;
+        const param_sig = sig.params[slot];
+        return param_sig.class == .preserves_uniqueness and
+            param_sig.preserves_to_return_component == null;
+    }
+
+    /// uniqueness--04 (tentative mirror) — convention-pair result-unique
+    /// decision keyed by callee name. Unique only when the callee's
+    /// signature proves whole-return PU AND the receiver was unique at the
+    /// call site. The `.owned`/`.owned` convention pair alone is NOT
+    /// sufficient evidence of result freshness.
+    fn conventionPairResultUnique(
+        self: *const TentativeAnalyzer,
+        name: []const u8,
+        slot: usize,
+        pre_arg_unique: []const bool,
+    ) bool {
+        if (slot >= pre_arg_unique.len) return false;
+        if (!pre_arg_unique[slot]) return false;
+        const function_id = self.lookupByName(name) orelse return false;
+        return self.signatureWholeReturnPreservesUniqueness(function_id, slot);
+    }
+
+    /// uniqueness--04 (tentative mirror) — convention-pair result-unique
+    /// decision keyed by a resolved `call_direct` callee.
+    fn conventionPairResultUniqueByFunction(
+        self: *const TentativeAnalyzer,
+        function: *const ir.Function,
+        slot: usize,
+        pre_arg_unique: []const bool,
+    ) bool {
+        if (slot >= pre_arg_unique.len) return false;
+        if (!pre_arg_unique[slot]) return false;
+        return self.signatureWholeReturnPreservesUniqueness(function.id, slot);
+    }
+
     fn applyCalleeEffect(
         self: *TentativeAnalyzer,
         name: []const u8,
@@ -2610,16 +2659,30 @@ const TentativeAnalyzer = struct {
             try self.synthesizeReturnPendingByName(name, args, dest, pre_arg_unique);
             return;
         }
+        // uniqueness--04: fresh-allocator wrappers (unique on every path)
+        // take precedence over the convention-pair gate, mirroring the
+        // canonical `uniqueness.Analyzer`.
+        if (self.calleeIsFreshAllocatorWrapper(name)) {
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
         if (self.calleeOwnedReceiverSlot(name)) |slot| {
+            // Receiver consumed regardless of result freshness.
             if (slot < args.len) {
                 _ = self.unique.remove(args[slot]);
             }
-            try self.unique.put(self.allocator, dest, {});
+            // uniqueness--04: the convention pair does NOT prove the result
+            // is fresh. Mark dest unique ONLY with a whole-return-PU
+            // signature witness AND a unique receiver at this call site,
+            // matching the canonical `uniqueness.Analyzer`. Keeping this
+            // tentative-rewrite dataflow in lockstep prevents it from
+            // promoting a parameter on a false uniqueness assumption.
+            if (self.conventionPairResultUnique(name, slot, pre_arg_unique)) {
+                try self.unique.put(self.allocator, dest, {});
+            } else {
+                _ = self.unique.remove(dest);
+            }
             try self.synthesizeReturnPendingByName(name, args, dest, pre_arg_unique);
-            return;
-        }
-        if (self.calleeIsFreshAllocatorWrapper(name)) {
-            try self.unique.put(self.allocator, dest, {});
             return;
         }
         _ = self.unique.remove(dest);
@@ -2641,16 +2704,25 @@ const TentativeAnalyzer = struct {
             try self.synthesizeReturnPendingFromSig(function.id, args, dest, pre_arg_unique);
             return;
         }
+        // uniqueness--04: fresh-allocator wrappers take precedence over the
+        // convention-pair gate.
+        if (functionIsFreshAllocatorWrapperWithProgram(function, self.program)) {
+            try self.unique.put(self.allocator, dest, {});
+            return;
+        }
         if (calleeFunctionOwnedReceiverSlotByPointer(function)) |slot| {
+            // Receiver consumed regardless of result freshness.
             if (slot < args.len) {
                 _ = self.unique.remove(args[slot]);
             }
-            try self.unique.put(self.allocator, dest, {});
+            // uniqueness--04: gate dest-unique on the whole-return-PU
+            // signature witness AND the receiver's call-site uniqueness.
+            if (self.conventionPairResultUniqueByFunction(function, slot, pre_arg_unique)) {
+                try self.unique.put(self.allocator, dest, {});
+            } else {
+                _ = self.unique.remove(dest);
+            }
             try self.synthesizeReturnPendingFromSig(function.id, args, dest, pre_arg_unique);
-            return;
-        }
-        if (functionIsFreshAllocatorWrapperWithProgram(function, self.program)) {
-            try self.unique.put(self.allocator, dest, {});
             return;
         }
         _ = self.unique.remove(dest);
