@@ -21026,3 +21026,99 @@ test "canUnionDispatch bails when a clause carries a refinement guard" {
     const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
     try std.testing.expect((try builder.canUnionDispatch(group, 0)) == null);
 }
+
+// ============================================================
+// audit ir-3--02 (closed by GAP-P1-09) — local-index reservation walker
+//
+// `maxLocalSetIndexInExpr` / `maxLocalSetIndexInDecision` must recurse into
+// EVERY binding-bearing sub-expression — including a `case` nested inside an
+// aggregate initializer and the `bind`/`success` nodes of a `match`
+// decision tree — so the IR builder reserves `next_local` above any HIR
+// binding index. Missing a binding-bearing sub-expression re-enables the
+// documented local-collision corruption class (a freshly allocated lowering
+// local rebinds a live ARC-managed local mid-function). The walker is now an
+// exhaustive switch with no `else` arm; these tests lock in that it actually
+// visits the nested binding indices (the masked-vs-reachable source shape —
+// a binding-bearing case in tail aggregate position — is awkward to express
+// in surface syntax, so the coverage is asserted directly here).
+// ============================================================
+
+test "maxLocalSetIndexInExpr walks a case nested inside a list_init element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const span: ast.SourceSpan = .{ .start = 0, .end = 0 };
+
+    // The case-arm binding reserves a HIGH local index; the list's other
+    // element is a plain literal. The walker must surface the arm binding's
+    // index+1 by descending list_init -> case -> arm.bindings.
+    const arm_body = try alloc.create(hir_mod.Block);
+    arm_body.* = .{ .stmts = &.{}, .result_type = types_mod.TypeStore.STRING };
+
+    const arm_bindings = try alloc.alloc(hir_mod.CaseBinding, 1);
+    arm_bindings[0] = .{ .name = 0, .local_index = 42, .kind = .scrutinee, .element_index = 0 };
+
+    const arms = try alloc.alloc(hir_mod.CaseArm, 1);
+    arms[0] = .{ .pattern = null, .guard = null, .body = arm_body, .bindings = arm_bindings };
+
+    const case_scrutinee = try alloc.create(hir_mod.Expr);
+    case_scrutinee.* = .{ .kind = .{ .param_get = 0 }, .type_id = types_mod.TypeStore.ATOM, .span = span };
+
+    const case_expr = try alloc.create(hir_mod.Expr);
+    case_expr.* = .{ .kind = .{ .case = .{ .scrutinee = case_scrutinee, .arms = arms } }, .type_id = types_mod.TypeStore.STRING, .span = span };
+
+    const head_elem = try alloc.create(hir_mod.Expr);
+    head_elem.* = .{ .kind = .{ .string_lit = 0 }, .type_id = types_mod.TypeStore.STRING, .span = span };
+
+    const elements = try alloc.alloc(*const hir_mod.Expr, 2);
+    elements[0] = head_elem;
+    elements[1] = case_expr;
+
+    const list_expr: hir_mod.Expr = .{ .kind = .{ .list_init = elements }, .type_id = types_mod.TypeStore.UNKNOWN, .span = span };
+
+    // Pre-GAP-P1-09 the list_init/case arms were swallowed by an `else` arm
+    // and this returned 0; now it must reserve above local 42.
+    try std.testing.expectEqual(@as(LocalId, 43), maxLocalSetIndexInExpr(&list_expr));
+}
+
+test "maxLocalSetIndexInDecision walks bind and success-leaf bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const span: ast.SourceSpan = .{ .start = 0, .end = 0 };
+
+    // success leaf binds local 30; the enclosing bind node binds local 50.
+    const leaf_bindings = try alloc.alloc(hir_mod.Binding, 1);
+    leaf_bindings[0] = .{ .name = 0, .local_index = 30 };
+
+    const success = try alloc.create(hir_mod.Decision);
+    success.* = .{ .success = .{ .bindings = leaf_bindings, .body_index = 0 } };
+
+    const bind_source = try alloc.create(hir_mod.Expr);
+    bind_source.* = .{ .kind = .{ .param_get = 0 }, .type_id = types_mod.TypeStore.I64, .span = span };
+
+    const decision: hir_mod.Decision = .{ .bind = .{
+        .name = 0,
+        .local_index = 50,
+        .source = bind_source,
+        .next = success,
+    } };
+
+    // Must reserve above the larger of the bind index (50) and the nested
+    // success-leaf binding (30) -> 51. A non-recursing walker would miss one.
+    try std.testing.expectEqual(@as(LocalId, 51), maxLocalSetIndexInDecision(&decision));
+
+    // And via a `match` expression wrapping that decision: the walker must
+    // descend match -> decision.
+    const match_scrutinee = try alloc.create(hir_mod.Expr);
+    match_scrutinee.* = .{ .kind = .{ .param_get = 0 }, .type_id = types_mod.TypeStore.I64, .span = span };
+
+    const decision_ptr = try alloc.create(hir_mod.Decision);
+    decision_ptr.* = decision;
+
+    const match_expr: hir_mod.Expr = .{ .kind = .{ .match = .{ .scrutinee = match_scrutinee, .decision = decision_ptr } }, .type_id = types_mod.TypeStore.I64, .span = span };
+
+    try std.testing.expectEqual(@as(LocalId, 51), maxLocalSetIndexInExpr(&match_expr));
+}
