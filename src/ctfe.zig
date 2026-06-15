@@ -557,6 +557,7 @@ pub const CtfeErrorKind = enum {
     type_error,
     use_after_consume,
     division_by_zero,
+    arithmetic_overflow,
     capability_violation,
     match_failure,
     undefined_function,
@@ -669,6 +670,7 @@ pub fn formatCtfeError(alloc: std.mem.Allocator, err: CtfeError) ![]const u8 {
         }),
         .use_after_consume => try w.writeAll("  help: a moved or released value was read again during compile-time evaluation\n"),
         .division_by_zero => try w.writeAll("  help: ensure the divisor is non-zero at compile time\n"),
+        .arithmetic_overflow => try w.writeAll("  help: the computation overflows its integer type (e.g. minInt / -1) — adjust the operands\n"),
         .undefined_function => try w.writeAll("  help: the function may not exist or may not be visible at compile time\n"),
         .match_failure => try w.writeAll("  help: no clause matched the compile-time value — add a catch-all clause\n"),
         .type_error => try w.writeAll("  help: compile-time values must have compatible types\n"),
@@ -2449,11 +2451,23 @@ pub const Interpreter = struct {
             .sub => return self.numericOp(lhs, rhs, .sub),
             .mul => return self.numericOp(lhs, rhs, .mul),
             .div => {
-                // Check division by zero
+                // Check division by zero and the minInt / -1 signed-overflow
+                // corner. Both are illegal behavior for the raw `@divTrunc`
+                // in `numericOp` (a compile-time crash in safe compiler
+                // builds), so they are turned into clean CTFE diagnostics
+                // here, mirroring the runtime `Kernel.divInteger` guard so a
+                // comptime `1 / 0` / `minInt / -1` behaves like its runtime
+                // counterpart (both error) instead of panicking the compiler.
                 switch (rhs) {
-                    .int => |v| if (v == 0) {
-                        try self.emitError(.division_by_zero, "division by zero");
-                        return error.CtfeFailure;
+                    .int => |v| {
+                        if (v == 0) {
+                            try self.emitError(.division_by_zero, "division by zero");
+                            return error.CtfeFailure;
+                        }
+                        if (v == -1 and lhs == .int and lhs.int == std.math.minInt(i64)) {
+                            try self.emitError(.arithmetic_overflow, "integer overflow in division (minInt / -1)");
+                            return error.CtfeFailure;
+                        }
                     },
                     .float => |v| if (v == 0.0) {
                         try self.emitError(.division_by_zero, "division by zero");
@@ -2465,9 +2479,15 @@ pub const Interpreter = struct {
             },
             .rem_op => {
                 switch (rhs) {
-                    .int => |v| if (v == 0) {
-                        try self.emitError(.division_by_zero, "remainder by zero");
-                        return error.CtfeFailure;
+                    .int => |v| {
+                        if (v == 0) {
+                            try self.emitError(.division_by_zero, "remainder by zero");
+                            return error.CtfeFailure;
+                        }
+                        if (v == -1 and lhs == .int and lhs.int == std.math.minInt(i64)) {
+                            try self.emitError(.arithmetic_overflow, "integer overflow in remainder (minInt rem -1)");
+                            return error.CtfeFailure;
+                        }
                     },
                     else => {},
                 }
@@ -2551,14 +2571,30 @@ pub const Interpreter = struct {
     fn numericOp(self: *Interpreter, lhs: CtValue, rhs: CtValue, op: ir.BinaryOp.Op) CtfeInterpretError!CtValue {
         switch (lhs) {
             .int => |a| switch (rhs) {
-                .int => |b| return .{ .int = switch (op) {
-                    .add => a +% b,
-                    .sub => a -% b,
-                    .mul => a *% b,
-                    .div => @divTrunc(a, b),
-                    .rem_op => @rem(a, b),
-                    else => unreachable,
-                } },
+                .int => |b| {
+                    // Guard the integer division/remainder edge cases even
+                    // when reached directly (not only via `evalBinaryOp`):
+                    // raw `@divTrunc`/`@rem` are illegal behavior on a zero
+                    // divisor or `minInt / -1` and would panic the compiler.
+                    if (op == .div or op == .rem_op) {
+                        if (b == 0) {
+                            try self.emitError(.division_by_zero, if (op == .div) "division by zero" else "remainder by zero");
+                            return error.CtfeFailure;
+                        }
+                        if (b == -1 and a == std.math.minInt(i64)) {
+                            try self.emitError(.arithmetic_overflow, "integer overflow");
+                            return error.CtfeFailure;
+                        }
+                    }
+                    return .{ .int = switch (op) {
+                        .add => a +% b,
+                        .sub => a -% b,
+                        .mul => a *% b,
+                        .div => @divTrunc(a, b),
+                        .rem_op => @rem(a, b),
+                        else => unreachable,
+                    } };
+                },
                 else => {},
             },
             .float => |a| switch (rhs) {
@@ -5224,14 +5260,29 @@ fn evaluateConstBinaryOp(
         .div => switch (lhs) {
             .int => |a| switch (rhs) {
                 .int => |b| blk: {
-                    if (b == 0) return error.CtfeFailed;
+                    // A zero divisor and the `minInt / -1` overflow corner are
+                    // illegal behavior for raw `@divTrunc` (a compiler panic in
+                    // safe builds); surface them as clean attribute-folding
+                    // diagnostics instead, matching the IR-interpreter and
+                    // runtime div/rem guards.
+                    if (b == 0) {
+                        try interp.emitError(.division_by_zero, "division by zero");
+                        return error.CtfeFailed;
+                    }
+                    if (b == -1 and a == std.math.minInt(i64)) {
+                        try interp.emitError(.arithmetic_overflow, "integer overflow in division (minInt / -1)");
+                        return error.CtfeFailed;
+                    }
                     break :blk .{ .int = @divTrunc(a, b) };
                 },
                 else => error.NotComputable,
             },
             .float => |a| switch (rhs) {
                 .float => |b| blk: {
-                    if (b == 0.0) return error.CtfeFailed;
+                    if (b == 0.0) {
+                        try interp.emitError(.division_by_zero, "division by zero");
+                        return error.CtfeFailed;
+                    }
                     break :blk .{ .float = a / b };
                 },
                 else => error.NotComputable,
@@ -5241,7 +5292,14 @@ fn evaluateConstBinaryOp(
         .rem_op => switch (lhs) {
             .int => |a| switch (rhs) {
                 .int => |b| blk: {
-                    if (b == 0) return error.CtfeFailed;
+                    if (b == 0) {
+                        try interp.emitError(.division_by_zero, "remainder by zero");
+                        return error.CtfeFailed;
+                    }
+                    if (b == -1 and a == std.math.minInt(i64)) {
+                        try interp.emitError(.arithmetic_overflow, "integer overflow in remainder (minInt rem -1)");
+                        return error.CtfeFailed;
+                    }
                     break :blk .{ .int = @rem(a, b) };
                 },
                 else => error.NotComputable,
@@ -6821,6 +6879,198 @@ test "interpreter: division by zero" {
     const result = interp.evalFunction(0, &.{});
     try testing.expectError(error.CtfeFailure, result);
     try testing.expectEqual(CtfeErrorKind.division_by_zero, interp.errors.items[0].kind);
+}
+
+test "interpreter: remainder by zero" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const func = ir.Function{
+        .id = 0,
+        .name = "rem_zero",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = 10 } },
+                .{ .const_int = .{ .dest = 1, .value = 0 } },
+                .{ .binary_op = .{ .dest = 2, .op = .rem_op, .lhs = 0, .rhs = 1 } },
+                .{ .ret = .{ .value = 2 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const result = interp.evalFunction(0, &.{});
+    try testing.expectError(error.CtfeFailure, result);
+    try testing.expectEqual(CtfeErrorKind.division_by_zero, interp.errors.items[0].kind);
+}
+
+// ctfe-1--05 / CT-02 (IR interpreter): `minInt / -1` is signed-overflow
+// illegal behavior for raw `@divTrunc`; the interpreter must surface a clean
+// `arithmetic_overflow` diagnostic, NOT panic the compiler process. Before the
+// guard this hand-built IR `@divTrunc(minInt, -1)` crashed `numericOp`.
+test "interpreter: minInt / -1 is a clean overflow diagnostic, not a panic" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const func = ir.Function{
+        .id = 0,
+        .name = "div_overflow",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = std.math.minInt(i64) } },
+                .{ .const_int = .{ .dest = 1, .value = -1 } },
+                .{ .binary_op = .{ .dest = 2, .op = .div, .lhs = 0, .rhs = 1 } },
+                .{ .ret = .{ .value = 2 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const result = interp.evalFunction(0, &.{});
+    try testing.expectError(error.CtfeFailure, result);
+    try testing.expectEqual(CtfeErrorKind.arithmetic_overflow, interp.errors.items[0].kind);
+}
+
+test "interpreter: minInt rem -1 is a clean overflow diagnostic, not a panic" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const func = ir.Function{
+        .id = 0,
+        .name = "rem_overflow",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = std.math.minInt(i64) } },
+                .{ .const_int = .{ .dest = 1, .value = -1 } },
+                .{ .binary_op = .{ .dest = 2, .op = .rem_op, .lhs = 0, .rhs = 1 } },
+                .{ .ret = .{ .value = 2 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const result = interp.evalFunction(0, &.{});
+    try testing.expectError(error.CtfeFailure, result);
+    try testing.expectEqual(CtfeErrorKind.arithmetic_overflow, interp.errors.items[0].kind);
+}
+
+// ctfe-2--01 / CT-02 (attribute constant-folder): the same `minInt / -1`
+// (and `minInt rem -1`) overflow corner reached through `evaluateConstBinaryOp`
+// — the path that folds struct/build.zap attribute expressions — must produce a
+// clean `error.CtfeFailed` diagnostic, NOT panic the compiler.
+fn constIntExpr(alloc: std.mem.Allocator, value: i64) !*const ast.Expr {
+    const e = try alloc.create(ast.Expr);
+    e.* = .{ .int_literal = .{ .meta = .{ .span = .{ .start = 0, .end = 0 } }, .value = value } };
+    return e;
+}
+
+fn evalConstBinop(alloc: std.mem.Allocator, op: ast.BinaryOp.Op, lhs: i64, rhs: i64) AttrEvalInternalError!CtValue {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interner = ast.StringInterner.init(alloc);
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.interner = &interner;
+    const binop = ast.BinaryOp{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .op = op,
+        .lhs = try constIntExpr(alloc, lhs),
+        .rhs = try constIntExpr(alloc, rhs),
+    };
+    return evaluateConstBinaryOp(alloc, &interp, binop, null, &interner);
+}
+
+test "attribute folder: division by zero is a clean diagnostic, not a panic" {
+    var arena = testArena();
+    defer arena.deinit();
+    try testing.expectError(error.CtfeFailed, evalConstBinop(arena.allocator(), .div, 10, 0));
+}
+
+test "attribute folder: minInt / -1 is a clean diagnostic, not a panic" {
+    var arena = testArena();
+    defer arena.deinit();
+    try testing.expectError(error.CtfeFailed, evalConstBinop(arena.allocator(), .div, std.math.minInt(i64), -1));
+}
+
+test "attribute folder: minInt rem -1 is a clean diagnostic, not a panic" {
+    var arena = testArena();
+    defer arena.deinit();
+    try testing.expectError(error.CtfeFailed, evalConstBinop(arena.allocator(), .rem_op, std.math.minInt(i64), -1));
+}
+
+test "attribute folder: ordinary minInt / 2 folds to the right value" {
+    var arena = testArena();
+    defer arena.deinit();
+    const result = try evalConstBinop(arena.allocator(), .div, std.math.minInt(i64), 2);
+    try testing.expectEqual(@as(i64, std.math.minInt(i64) / 2), result.int);
+}
+
+// Sanity: an ordinary minInt / 2 still evaluates (the guard is precise to the
+// -1 overflow corner, not all minInt divisions).
+test "interpreter: minInt / 2 evaluates normally" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const func = ir.Function{
+        .id = 0,
+        .name = "div_minint_two",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = std.math.minInt(i64) } },
+                .{ .const_int = .{ .dest = 1, .value = 2 } },
+                .{ .binary_op = .{ .dest = 2, .op = .div, .lhs = 0, .rhs = 1 } },
+                .{ .ret = .{ .value = 2 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const result = try interp.evalFunction(0, &.{});
+    try testing.expectEqual(@as(i64, std.math.minInt(i64) / 2), result.int);
 }
 
 test "interpreter: error records failing instruction index" {
