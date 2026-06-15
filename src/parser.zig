@@ -3467,10 +3467,16 @@ pub const Parser = struct {
         });
     }
 
-    fn parseStringLiteral(self: *Parser) !*const ast.Expr {
-        const tok = self.advance();
-        const raw = tok.slice(self.source);
-
+    /// Normalize a raw string-literal token slice (including its
+    /// surrounding quotes) into its runtime value: strip the quote/heredoc
+    /// envelope, apply heredoc indentation stripping, then process escape
+    /// sequences. This is the single source of truth for string-literal
+    /// value normalization and MUST be used by every string-literal site —
+    /// expression, pattern, binary-segment prefix, and literal type — so a
+    /// `"a\nb"` source token produces the identical 3-byte value in all
+    /// positions (otherwise an escaped string pattern can never match the
+    /// equally-escaped expression value: audit finding parser-2--01 / FE-02).
+    fn normalizeStringLiteralRaw(self: *Parser, raw: []const u8) []const u8 {
         // Heredoc: """content""" — strip 3 quotes each side, then strip indentation
         const is_heredoc = raw.len >= 6 and raw[0] == '"' and raw[1] == '"' and raw[2] == '"';
         const stripped = if (is_heredoc)
@@ -3480,7 +3486,12 @@ pub const Parser = struct {
         else
             raw;
 
-        const value = self.unescapeString(stripped);
+        return self.unescapeString(stripped);
+    }
+
+    fn parseStringLiteral(self: *Parser) !*const ast.Expr {
+        const tok = self.advance();
+        const value = self.normalizeStringLiteralRaw(tok.slice(self.source));
         return self.create(ast.Expr, .{
             .string_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = try self.interner.intern(value) },
         });
@@ -4966,8 +4977,11 @@ pub const Parser = struct {
             },
             .string_literal => {
                 const tok = self.advance();
-                const raw = tok.slice(self.source);
-                const value = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+                // Pattern-position strings MUST receive the same heredoc +
+                // escape normalization as expression-position strings, or an
+                // escaped string pattern (e.g. `"a\nb"`) can never match the
+                // equally-escaped runtime value (audit finding parser-2--01).
+                const value = self.normalizeStringLiteralRaw(tok.slice(self.source));
                 return self.create(ast.Pattern, .{
                     .literal = .{ .string = .{
                         .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
@@ -5453,9 +5467,11 @@ pub const Parser = struct {
         const value: ast.BinarySegmentValue = blk: {
             if (self.check(.string_literal)) {
                 // String literal in binary: <<"GET "::String, rest::String>>
+                // Normalize escapes so a binary-prefix pattern like
+                // <<"\r\n"::String, rest::String>> matches the actual CRLF
+                // bytes, not a literal backslash-r (audit finding parser-2--01).
                 const tok = self.advance();
-                const raw = tok.slice(self.source);
-                const str_val = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+                const str_val = self.normalizeStringLiteralRaw(tok.slice(self.source));
                 break :blk .{ .string_literal = try self.interner.intern(str_val) };
             }
             if (context == .pattern) {
@@ -5887,9 +5903,11 @@ pub const Parser = struct {
                 });
             },
             .string_literal => {
+                // String literal TYPES must normalize escapes too, so a
+                // literal type `"a\nb"` equals the same runtime string value
+                // (audit finding parser-2--01 / FE-02).
                 const tok = self.advance();
-                const raw = tok.slice(self.source);
-                const value = if (raw.len >= 2) raw[1 .. raw.len - 1] else raw;
+                const value = self.normalizeStringLiteralRaw(tok.slice(self.source));
                 return self.create(ast.TypeExpr, .{
                     .literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = .{ .string = try self.interner.intern(value) } },
                 });

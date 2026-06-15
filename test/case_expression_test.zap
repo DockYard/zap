@@ -70,6 +70,44 @@ pub struct CaseExpressionTest {
     }
   }
 
+  # Regression for audit finding parser-2--01 / FE-02: pattern-position
+  # string literals must go through the SAME escape processing and heredoc
+  # stripping as expression-position string literals. Pre-fix, a case-arm
+  # string pattern stored the RAW source slice (e.g. the 4 bytes `a`, `\`,
+  # `n`, `b`), so it could NEVER match the actual 3-byte runtime string
+  # built from the same `"a\nb"` literal — the arm was silently dead.
+  describe("escaped string literals in case patterns") {
+    test("a newline escape in a case pattern matches the real newline string") {
+      assert(label_escaped("a\nb") == "newline")
+    }
+
+    test("a tab escape in a case pattern matches the real tab string") {
+      assert(label_escaped("a\tb") == "tab")
+    }
+
+    test("an escaped quote in a case pattern matches the real quote string") {
+      assert(label_escaped("a\"b") == "quote")
+    }
+
+    test("an escaped backslash in a case pattern matches the real backslash string") {
+      assert(label_escaped("a\\b") == "backslash")
+    }
+
+    test("a non-escaped string still falls through to the default arm") {
+      assert(label_escaped("plain") == "other")
+    }
+
+    test("a carriage-return + newline prefix matches in a case pattern") {
+      assert(label_line_ending("\r\n") == "crlf")
+      assert(label_line_ending("\n") == "lf")
+    }
+
+    test("an escaped string in a function-clause parameter dispatches correctly") {
+      assert(clause_escaped("x\ty") == "clause-tab")
+      assert(clause_escaped("nope") == "clause-other")
+    }
+  }
+
   fn label_boundary(x :: i64) -> String {
     case x {
       9223372036854775807 -> "max"
@@ -94,6 +132,32 @@ pub struct CaseExpressionTest {
       0xFF -> "all-ones-byte"
       _ -> "other"
     }
+  }
+
+  fn label_escaped(s :: String) -> String {
+    case s {
+      "a\nb" -> "newline"
+      "a\tb" -> "tab"
+      "a\"b" -> "quote"
+      "a\\b" -> "backslash"
+      _ -> "other"
+    }
+  }
+
+  fn label_line_ending(s :: String) -> String {
+    case s {
+      "\r\n" -> "crlf"
+      "\n" -> "lf"
+      _ -> "other"
+    }
+  }
+
+  fn clause_escaped("x\ty" :: String) -> String {
+    "clause-tab"
+  }
+
+  fn clause_escaped(_ :: String) -> String {
+    "clause-other"
   }
 
   fn label_number(x :: i64) -> String {
