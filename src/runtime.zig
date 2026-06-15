@@ -16796,23 +16796,19 @@ pub const Integer = struct {
     }
 
     pub fn div_i8(value: i8, divisor: i8) i8 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(i8, value, divisor);
     }
 
     pub fn div_i16(value: i16, divisor: i16) i16 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(i16, value, divisor);
     }
 
     pub fn div_i32(value: i32, divisor: i32) i32 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(i32, value, divisor);
     }
 
     pub fn div_i64(value: i64, divisor: i64) i64 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(i64, value, divisor);
     }
 
     pub fn div_u8(value: u8, divisor: u8) u8 {
@@ -17841,8 +17837,7 @@ pub const Integer = struct {
     }
 
     pub fn div_i128(value: i128, divisor: i128) i128 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(i128, value, divisor);
     }
 
     pub fn div_u128(value: u128, divisor: u128) u128 {
@@ -24042,4 +24037,8 @@ test "Integer.remainder/div helpers return correct values on safe inputs" {
     try std.testing.expectEqual(@as(i64, 1), Integer.rem_i64(10, 3));
     try std.testing.expectEqual(@as(i64, 0), Integer.rem_i64(6, 3));
     try std.testing.expectEqual(@as(u64, 3), Integer.div_u64(10, 3));
+    // Signed div_i* helpers (adjacent to div_u*, same edge-case guard).
+    try std.testing.expectEqual(@as(i64, 5), Integer.div_i64(10, 2));
+    try std.testing.expectEqual(@as(i64, -4), Integer.div_i64(-9, 2));
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64) / 2), Integer.div_i64(std.math.minInt(i64), 2));
 }
