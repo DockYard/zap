@@ -73,6 +73,69 @@ pub struct GuardTest {
     }
   }
 
+  describe("multi-clause dispatch fast paths honor guards and multi-literal patterns (ir-1--05)") {
+    # Regression for audit finding ir-1--05: the integer-literal switch_return
+    # fast path picked the LAST literal param as the sole scrutinee and never
+    # checked earlier literal params, so a clause that should match on BOTH
+    # params was taken on the strength of the second alone.
+    test("two-literal-param clause requires BOTH params to match") {
+      # `combo(9, 1)` must NOT match `combo(0, 1)`; only the second param is 1,
+      # the first is 9. Pre-fix the dispatch switched only on param 1, so this
+      # returned 10 (the [0,1] clause) instead of falling through to 30.
+      assert(combo(9, 1) == 30)
+    }
+
+    test("two-literal-param clause matches when both params match (first clause)") {
+      assert(combo(0, 1) == 10)
+    }
+
+    test("two-literal-param clause matches when both params match (second clause)") {
+      assert(combo(2, 3) == 20)
+    }
+
+    test("a non-matching second param also falls through to the catch-all") {
+      assert(combo(0, 9) == 30)
+    }
+
+    # Guard on the LAST clause of an otherwise switch-eligible group: pre-fix
+    # the guard was DROPPED, so a value failing it silently took that clause.
+    # With the guard honored, the literal-match and guard-satisfied paths
+    # select the right clause; an input that matches neither correctly raises a
+    # match error (an abort, not a catchable raise — see the Zig unit test
+    # `canSwitchDispatch bails for a guarded last clause` for the bail itself).
+    test("guard on the last switch clause is honored when satisfied") {
+      assert(guarded_tail(200) == 2)
+    }
+
+    test("guard on the last switch clause still matches the leading literal") {
+      assert(guarded_tail(0) == 1)
+    }
+  }
+
+  # Two-literal-param clauses: the dispatch must check BOTH params, not just
+  # the last one.
+  fn combo(0 :: i64, 1 :: i64) -> i64 {
+    10
+  }
+
+  fn combo(2 :: i64, 3 :: i64) -> i64 {
+    20
+  }
+
+  fn combo(_ :: i64, _ :: i64) -> i64 {
+    30
+  }
+
+  # A literal clause followed by a GUARDED last clause (no plain catch-all).
+  # `guarded_tail(5)` matches neither and correctly raises a match error.
+  fn guarded_tail(0 :: i64) -> i64 {
+    1
+  }
+
+  fn guarded_tail(n :: i64) -> i64 if n > 100 {
+    2
+  }
+
   fn both_positive(a :: i64, b :: i64) -> String
     if a > 0
     and b > 0 {

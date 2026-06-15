@@ -7719,29 +7719,52 @@ pub const IrBuilder = struct {
             const is_last = clause_idx == group.clauses.len - 1;
 
             if (is_last) {
-                // Last clause must be wildcard/bind fallback (no literal pattern)
+                // audit ir-1--05: the last clause is the switch default. It must
+                // be a pure bind/wildcard fallback with NO refinement guard — a
+                // guard here was previously DROPPED, so a value failing the
+                // guard silently took this clause instead of raising no-match.
+                // Bail to the general decision-tree lowering otherwise.
+                if (clause.refinement != null) return null;
                 for (clause.params) |param| {
                     if (param.pattern) |pat| {
-                        if (pat.* == .literal) return null;
+                        switch (pat.*) {
+                            .bind, .wildcard => {},
+                            else => return null,
+                        }
                     }
                 }
                 break;
             }
 
-            // Non-last clauses must have literal pattern with no refinement
+            // Non-last clauses must have a literal pattern with no refinement.
             if (clause.refinement != null) return null;
 
-            // Find the literal param
+            // audit ir-1--05: a non-last clause must match on EXACTLY ONE
+            // literal param and be bind/wildcard-only on every OTHER param. The
+            // switch_return dispatch checks a SINGLE scrutinee param, so a
+            // second literal param (e.g. `f(0, 1)`) would be silently ignored
+            // at dispatch — the clause taken on the strength of the scrutinee
+            // param alone. Require single-literal clauses and fall back to the
+            // decision tree for anything richer.
             var found_literal_param: ?u32 = null;
             for (clause.params, 0..) |param, i| {
                 if (param.pattern) |pat| {
-                    if (pat.* == .literal) {
-                        // Only integer literals can use switch
-                        switch (pat.literal) {
-                            .int => {},
-                            else => return null,
-                        }
-                        found_literal_param = @intCast(i);
+                    switch (pat.*) {
+                        .literal => {
+                            // Only integer literals can use switch.
+                            switch (pat.literal) {
+                                .int => {},
+                                else => return null,
+                            }
+                            // A second literal param in the same clause cannot
+                            // be represented by a single-scrutinee switch.
+                            if (found_literal_param != null) return null;
+                            found_literal_param = @intCast(i);
+                        },
+                        .bind, .wildcard => {},
+                        // Any other pattern (tuple/struct/list/binary/map) on a
+                        // non-dispatch param is not checked by switch_return.
+                        else => return null,
                     }
                 }
             }
@@ -7797,6 +7820,23 @@ pub const IrBuilder = struct {
             const param = clause.params[param_idx];
             const tid = param.type_id;
 
+            // audit ir-1--05: optional dispatch routes purely on is-null of the
+            // dispatch param and never evaluates a refinement guard, nor matches
+            // patterns/bindings on OTHER params. A guarded clause, or one that
+            // pattern-matches a non-dispatch param, cannot be faithfully
+            // represented — bail to the general decision-tree lowering rather
+            // than silently dropping the guard / non-dispatch pattern.
+            if (clause.refinement != null) return null;
+            for (clause.params, 0..) |other_param, other_idx| {
+                if (other_idx == param_idx) continue;
+                if (other_param.pattern) |other_pat| {
+                    switch (other_pat.*) {
+                        .bind, .wildcard => {},
+                        else => return null,
+                    }
+                }
+            }
+
             // Match nil either by type or by literal pattern. Source
             // code like `pub fn count(nil)` parses with a `literal nil`
             // pattern and a still-unresolved param type_id; the
@@ -7848,6 +7888,24 @@ pub const IrBuilder = struct {
         for (group.clauses) |clause| {
             if (param_idx >= clause.params.len) return null;
             const param = clause.params[param_idx];
+
+            // audit ir-1--05: union dispatch routes purely on the dispatch
+            // param's runtime variant tag and never evaluates a refinement
+            // guard, nor matches patterns/bindings on OTHER params. A guarded
+            // clause, or a clause that pattern-matches a non-dispatch param,
+            // cannot be faithfully represented — bail to the general decision-
+            // tree lowering (which honors guards and all-param patterns) rather
+            // than silently dropping the guard / non-dispatch pattern.
+            if (clause.refinement != null) return null;
+            for (clause.params, 0..) |other_param, other_idx| {
+                if (other_idx == param_idx) continue;
+                if (other_param.pattern) |other_pat| {
+                    switch (other_pat.*) {
+                        .bind, .wildcard => {},
+                        else => return null,
+                    }
+                }
+            }
 
             // Check if this param has a struct_match pattern (struct pattern)
             if (param.pattern) |pat| {
@@ -20816,4 +20874,155 @@ test "findBinaryVarLocal returns null for an unresolved size variable, never loc
     // And with NO bindings at all, an absent name is still null.
     clause.binary_bindings = &.{};
     try std.testing.expectEqual(@as(?LocalId, null), IrBuilder.findBinaryVarLocal(&clause, present));
+}
+
+// ============================================================
+// audit ir-1--05 — multi-clause dispatch fast-path eligibility
+//
+// The integer-literal `switch_return`, union `union_switch_return`, and
+// `optional_dispatch` fast paths must NOT accept a clause whose selection
+// depends on a refinement guard or on a pattern over a non-dispatch
+// parameter — those checks are not represented by the fast path, so the
+// clause would be silently mis-selected. Eligibility must bail (return
+// null) to the general decision-tree lowering for such groups. The
+// guard-drop end-to-end manifestation is a `match_error` ABORT (not a
+// catchable raise), so it is asserted deterministically here at the
+// predicate level; the silent wrong-clause manifestation (multi-literal)
+// is additionally witnessed end-to-end in test/guard_test.zap.
+// ============================================================
+
+/// Parse `source`, lower to HIR, and return the named struct's first
+/// `FunctionGroup` whose name matches `func_name`, plus an `IrBuilder` and
+/// `TypeStore` wired together. Everything is allocated in `arena` (caller
+/// owns it and must keep it alive for the returned pointers' lifetime).
+fn dispatchEligibilityFixture(
+    arena: std.mem.Allocator,
+    source: []const u8,
+    func_name: []const u8,
+    out_builder: *IrBuilder,
+    out_type_store: *types_mod.TypeStore,
+) !*const hir_mod.FunctionGroup {
+    var parser = Parser.init(arena, source);
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(arena, parser.interner, null);
+    try collector.collectProgram(&program);
+
+    out_type_store.* = types_mod.TypeStore.init(arena, parser.interner);
+
+    var hir_builder = hir_mod.HirBuilder.init(arena, parser.interner, &collector.graph, out_type_store);
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    out_builder.* = IrBuilder.init(arena, parser.interner);
+    out_builder.type_store = out_type_store;
+
+    for (hir_program.structs) |s| {
+        for (s.functions) |*group| {
+            if (std.mem.eql(u8, parser.interner.get(group.name), func_name)) {
+                out_builder.current_struct_prefix = parser.interner.get(s.name.parts[0]);
+                return group;
+            }
+        }
+    }
+    return error.FunctionGroupNotFound;
+}
+
+test "canSwitchDispatch selects the param for a valid single-literal switch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub struct Test {
+        \\  fn f(0 :: i64) -> i64 { 1 }
+        \\  fn f(_ :: i64) -> i64 { 2 }
+        \\}
+    ;
+    var builder: IrBuilder = undefined;
+    var type_store: types_mod.TypeStore = undefined;
+    const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
+    try std.testing.expectEqual(@as(?u32, 0), builder.canSwitchDispatch(group));
+}
+
+test "canSwitchDispatch bails for a guarded last clause" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The guarded LAST clause is the switch default; its guard must be
+    // honored, not dropped. Eligibility must bail so the decision tree
+    // (which evaluates the guard) lowers the group.
+    const source =
+        \\pub struct Test {
+        \\  fn f(0 :: i64) -> i64 { 1 }
+        \\  fn f(n :: i64) -> i64 if n > 100 { 2 }
+        \\}
+    ;
+    var builder: IrBuilder = undefined;
+    var type_store: types_mod.TypeStore = undefined;
+    const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
+    try std.testing.expectEqual(@as(?u32, null), builder.canSwitchDispatch(group));
+}
+
+test "canSwitchDispatch bails for a clause with two literal params" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // `f(0, 1)` matches on BOTH params; a single-scrutinee switch cannot
+    // represent that, so eligibility must bail to the decision tree.
+    const source =
+        \\pub struct Test {
+        \\  fn f(0 :: i64, 1 :: i64) -> i64 { 10 }
+        \\  fn f(2 :: i64, 3 :: i64) -> i64 { 20 }
+        \\  fn f(_ :: i64, _ :: i64) -> i64 { 30 }
+        \\}
+    ;
+    var builder: IrBuilder = undefined;
+    var type_store: types_mod.TypeStore = undefined;
+    const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
+    try std.testing.expectEqual(@as(?u32, null), builder.canSwitchDispatch(group));
+}
+
+test "canOptionalDispatch bails when a clause carries a refinement guard" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // `f(nil) / f(b :: Box)` is optional-dispatch shaped, but the Box clause
+    // carries a guard; optional dispatch never evaluates guards, so it must
+    // bail to the decision tree rather than drop the guard.
+    const source =
+        \\pub struct Box { value :: i64 }
+        \\pub struct Test {
+        \\  fn f(nil) -> i64 { 0 }
+        \\  fn f(b :: Box) -> i64 if b.value > 10 { 1 }
+        \\}
+    ;
+    var builder: IrBuilder = undefined;
+    var type_store: types_mod.TypeStore = undefined;
+    const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
+    try std.testing.expect(builder.canOptionalDispatch(group, 0) == null);
+}
+
+test "canUnionDispatch bails when a clause carries a refinement guard" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Two distinct struct types is union-dispatch shaped, but the first
+    // clause carries a guard; union dispatch never evaluates guards, so it
+    // must bail to the decision tree rather than drop the guard.
+    const source =
+        \\pub struct Alpha { value :: i64 }
+        \\pub struct Beta { value :: i64 }
+        \\pub struct Test {
+        \\  fn f(a :: Alpha) -> i64 if a.value > 10 { 1 }
+        \\  fn f(b :: Beta) -> i64 { 2 }
+        \\}
+    ;
+    var builder: IrBuilder = undefined;
+    var type_store: types_mod.TypeStore = undefined;
+    const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
+    try std.testing.expect((try builder.canUnionDispatch(group, 0)) == null);
 }
