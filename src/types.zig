@@ -7126,12 +7126,31 @@ pub const TypeChecker = struct {
     }
 
     /// Persist a resolved `raises` row keyed by the function's stable
-    /// qualified-name key. Copies the row into store-owned memory (freeing
-    /// any prior row for the same key) so it outlives the per-clause
-    /// accumulator and the per-struct TypeChecker that produced it. A
-    /// function with no resolvable key (e.g. a synthetic helper outside the
-    /// scope graph) is skipped — it cannot be a cross-function `raise`
-    /// propagation target.
+    /// qualified-name key, accumulating the UNION across every clause and
+    /// every re-check pass. A logical function's clauses are spread across
+    /// several single-clause `FunctionDecl`s (each `pub fn`/`def` clause
+    /// parses to its own decl) that all map to the same
+    /// `<Struct>.<name>/<arity>` key, and `reconcileRaisesRow` calls this
+    /// once per clause. The stored row MUST be the union of every clause's
+    /// raised errors: the IR backend reads ONE row per merged group to set
+    /// the error-union return ABI for all clauses (`functionRaises`), so a
+    /// per-clause overwrite would drop an earlier clause's error — lowering
+    /// the function without an error union and turning that clause's
+    /// otherwise-catchable `raise` into an uncatchable `do_raise` abort.
+    ///
+    /// Merging (rather than overwrite) also makes the store idempotent across
+    /// the compiler's multi-pass re-check (escape-analysis replay, CTFE
+    /// re-runs): re-storing a clause's row contributes nothing new. The union
+    /// can only grow, never shrink — over-widening the advertised error set is
+    /// the benign direction (callers' rescue wiring is conservatively present);
+    /// dropping an error is the unsound direction the union prevents.
+    ///
+    /// The row is deduped by structural type equality (`store.typeEquals`) so a
+    /// type contributed by several clauses appears once. Copies into store-owned
+    /// memory so it outlives the per-clause accumulator and the per-struct
+    /// TypeChecker that produced it. A function with no resolvable key (e.g. a
+    /// synthetic helper outside the scope graph) is skipped — it cannot be a
+    /// cross-function `raise` propagation target.
     fn storeRaisesRow(
         self: *TypeChecker,
         func: *const ast.FunctionDecl,
@@ -7139,7 +7158,28 @@ pub const TypeChecker = struct {
         row: []const TypeId,
     ) !void {
         const key = self.raisesRowKeyForDecl(func, clause) orelse return;
-        const owned = try self.store.allocator.dupe(TypeId, row);
+
+        var merged: std.ArrayListUnmanaged(TypeId) = .empty;
+        errdefer merged.deinit(self.store.allocator);
+
+        // Seed with the existing row for this key (prior clauses / prior pass).
+        if (self.store.inferred_raises.get(key)) |existing| {
+            try merged.appendSlice(self.store.allocator, existing);
+        }
+
+        // Union in this clause's row, skipping types already present.
+        for (row) |incoming| {
+            var already_present = false;
+            for (merged.items) |existing_type| {
+                if (self.store.typeEquals(existing_type, incoming)) {
+                    already_present = true;
+                    break;
+                }
+            }
+            if (!already_present) try merged.append(self.store.allocator, incoming);
+        }
+
+        const owned = try merged.toOwnedSlice(self.store.allocator);
         if (self.store.inferred_raises.fetchRemove(key)) |prior| {
             self.store.allocator.free(prior.value);
         }
@@ -7226,10 +7266,31 @@ pub const TypeChecker = struct {
         // `a` in `fn foo(x :: a) -> a` refers to the same type variable.
         self.type_var_scope.clearRetainingCapacity();
 
-        // Fresh `raises` accumulator for this clause. Every `raise` in the
-        // body records its raised error type here; the
-        // inferred row is read back after the body is checked (below).
-        self.current_raises.clearRetainingCapacity();
+        // Fresh, ISOLATED `raises` accumulator for this clause. Every `raise`
+        // in the body records its raised error type here; the inferred row is
+        // read back after the body is checked (below).
+        //
+        // `current_raises` is a single shared accumulator, and this function is
+        // RE-ENTRANT: checking a clause body can check a nested function /
+        // closure / macro (the `.anonymous_function` arm, `checkStmt`'s nested
+        // `.function_decl`/`.macro_decl` arms, and `eagerlyCheckClosureStructCall`
+        // all re-enter here mid-body). A bare `clearRetainingCapacity` would
+        // therefore WIPE the enclosing function's already-accumulated raises —
+        // and a caller's `shrinkRetainingCapacity(mark)` cannot recover entries
+        // below a mark captured before the clear. Instead we swap in a fresh
+        // empty list for this clause and restore the enclosing function's exact
+        // prior accumulator on exit, so a nested clause is fully isolated and
+        // the parent's row is preserved byte-for-byte. (A nested closure that is
+        // merely DEFINED must not add to the outer's raises — its effect
+        // propagates only when the closure is INVOKED, which the call-site
+        // discharge folds in deliberately; restoring the parent's slice
+        // unchanged enforces exactly that.)
+        const enclosing_raises = self.current_raises;
+        self.current_raises = .empty;
+        defer {
+            self.current_raises.deinit(self.allocator);
+            self.current_raises = enclosing_raises;
+        }
 
         // Inside an impl block, pre-bind the impl's declared type
         // parameters so subsequent param/return resolution sees them as
@@ -8047,17 +8108,19 @@ pub const TypeChecker = struct {
 
             .anonymous_function => |anon| {
                 // #201 — checking the closure body records ITS `raise`s into
-                // the shared `current_raises` accumulator. A closure value is
-                // a deferred computation, not an effect of the function that
-                // CONSTRUCTS it: returning or storing a raising closure does
-                // not make the enclosing function raise (only INVOKING it
-                // does, which the call-site `recordClosureArgEffectsForFamily`
-                // discharge folds in deliberately). So snapshot the enclosing
-                // accumulator across the nested check and restore it, leaving
-                // only the closure's OWN stored row (keyed by its family).
-                const enclosing_raises_mark = self.current_raises.items.len;
+                // the closure's OWN isolated accumulator (`checkFunctionClause`
+                // swaps in a fresh `current_raises` for every nested clause and
+                // restores the enclosing function's exact accumulator on exit),
+                // leaving only the closure's OWN stored row (keyed by its
+                // family). A closure value is a deferred computation, not an
+                // effect of the function that CONSTRUCTS it: returning or
+                // storing a raising closure does not make the enclosing function
+                // raise (only INVOKING it does, which the call-site
+                // `recordClosureArgEffectsForFamily` discharge folds in
+                // deliberately). The enclosing function's already-accumulated
+                // raises are therefore preserved across this check without any
+                // snapshot/restore here.
                 try self.checkFunctionDecl(anon.decl);
-                self.current_raises.shrinkRetainingCapacity(enclosing_raises_mark);
                 // The closure's body has now been checked, so its
                 // inferred `raises` row is recorded. Carry that
                 // effect on the closure VALUE's function type so a
@@ -8847,16 +8910,20 @@ pub const TypeChecker = struct {
     /// ordered last, so a factory's CALLER may be checked before the closure's
     /// own module). Guarded against re-entry via `eager_helper_in_flight`. The
     /// sole intended side-effect is populating `inferred_raises` for
-    /// `<struct>.call/2`; two pieces of shared state that the body-check would
-    /// otherwise perturb are SNAPSHOTTED and RESTORED so this is otherwise
-    /// transparent:
-    ///   - the closure struct's `StructType` entry (the body-check resolves
-    ///     `self.<capture>` which can re-resolve a still-`any` capture field to
-    ///     UNKNOWN and CLOBBER the construction-site backfill — the Phase-3
-    ///     Edge-1 hazard); and
-    ///   - `current_raises` (the closure's raises must reach the ENCLOSING
-    ///     function only through the recorded boxed row at the value-call, not
-    ///     by leaking into the caller's accumulator here).
+    /// `<struct>.call/2`.
+    ///
+    /// The closure's raises must reach the ENCLOSING function only through the
+    /// recorded boxed row at the value-call, not by leaking into the caller's
+    /// accumulator here — and that isolation is now guaranteed by
+    /// `checkFunctionClause`, which swaps in a fresh `current_raises` for the
+    /// nested clause and restores the caller's exact accumulator on exit, so no
+    /// raises snapshot is needed at this call site.
+    ///
+    /// The closure struct's `StructType` entry IS still snapshotted and
+    /// restored: the body-check resolves `self.<capture>` which can re-resolve a
+    /// still-`any` capture field to UNKNOWN and CLOBBER the construction-site
+    /// backfill (the Phase-3 Edge-1 hazard) — that is independent of the raises
+    /// accumulator.
     /// No-op when the struct/`call` cannot be resolved or is already in flight.
     fn eagerlyCheckClosureStructCall(self: *TypeChecker, struct_name_id: ast.StringId) void {
         if (self.eager_helper_in_flight.contains(struct_name_id)) return;
@@ -8876,8 +8943,8 @@ pub const TypeChecker = struct {
         else
             null;
 
-        // Snapshot the caller's live raises accumulator and scope.
-        const saved_raises_len = self.current_raises.items.len;
+        // Snapshot the caller's scope. The raises accumulator needs no
+        // snapshot here: `checkFunctionClause` isolates and restores it.
         const prev_scope = self.current_scope;
         self.current_scope = struct_scope;
         defer self.current_scope = prev_scope;
@@ -8886,11 +8953,7 @@ pub const TypeChecker = struct {
 
         self.checkFunctionDecl(call_decl) catch {};
 
-        // Restore: trim any raises the closure body appended to the caller's
-        // accumulator, and restore the closure struct's backfilled type.
-        if (self.current_raises.items.len > saved_raises_len) {
-            self.current_raises.shrinkRetainingCapacity(saved_raises_len);
-        }
+        // Restore the closure struct's backfilled type (Edge-1 hazard).
         if (struct_type_id) |tid| {
             if (saved_struct_type) |st| {
                 if (tid < self.store.types.items.len) self.store.types.items[tid] = st;
@@ -15932,4 +15995,271 @@ test "classifyArgLiteralAdoption: negating an ordinary literal still adopts a fi
         .adopts => {},
         else => return error.TestExpectedAdopts,
     }
+}
+
+// ============================================================
+// `raises`-effect accumulation across clauses and nested scopes
+// (audit findings types-2--02 / TY-04 and types-2--03 / TY-05)
+//
+// These are deterministic type-checker-result witnesses. They drive the
+// `raises` machinery directly (the accumulator `current_raises`, the
+// per-clause `storeRaisesRow`, and the nested-clause `checkFunctionClause`
+// entry) with real registered error TypeIds, rather than through the
+// `raise <value>` surface syntax. That surface depends on the macro/desugar
+// pipeline (it rewrites `raise %E{}` into a `Kernel.do_raise(%E{})` call
+// before the type checker records the row), which is masked in this
+// type-checker-only harness — so the direct-drive form is the authoritative
+// witness of the two defects, exactly the logic at fault: the per-clause
+// overwrite in `storeRaisesRow` (TY-04) and the unconditional accumulator
+// clear in `checkFunctionClause` (TY-05).
+// ============================================================
+
+/// Resolve a registered struct/error type by name, interning the name first.
+fn resolveErrorTypeByName(
+    graph: *scope_mod.ScopeGraph,
+    interner: *ast.StringInterner,
+    name: []const u8,
+) ?TypeId {
+    const name_id = interner.intern(name) catch return null;
+    return graph.resolveTypeByName(name_id);
+}
+
+/// Look up the stored inferred `raises` row for `<struct_prefix>.<name>/<arity>`
+/// the same way the IR backend queries it. Returns an empty slice when no row
+/// is stored (a pure function), so callers can assert on `.len` directly.
+fn lookupInferredRaisesRow(
+    checker: *TypeChecker,
+    struct_prefix: []const u8,
+    method_name: []const u8,
+    arity: u32,
+) []const TypeId {
+    const key = checker.store.raisesRowKeyString(struct_prefix, method_name, arity) orelse return &.{};
+    return checker.store.inferred_raises.get(key) orelse &.{};
+}
+
+/// True when `row` contains a TypeId structurally equal to `error_type`.
+fn rowContainsType(checker: *TypeChecker, row: []const TypeId, error_type: TypeId) bool {
+    for (row) |entry| {
+        if (checker.store.typeEquals(entry, error_type)) return true;
+    }
+    return false;
+}
+
+/// Find the `.function` item named `name` across every struct of `program`,
+/// returning its `FunctionDecl` together with the owning `StructDecl`. Used to
+/// obtain a real `func`/`clause` pair (with a resolvable family key) and the
+/// owning struct's scope to drive the `raises`-row store and the nested-clause
+/// entry directly. Returns the FIRST match — for a multi-`pub fn` family use
+/// `collectStructFunctions`, since each `pub fn` declaration parses to its own
+/// single-clause `FunctionDecl` (clauses of one logical function are spread
+/// across multiple `.function` items that share a name and arity).
+fn findStructFunction(
+    interner: *ast.StringInterner,
+    program: *const ast.Program,
+    name: []const u8,
+) ?struct { decl: *const ast.FunctionDecl, owner: *const ast.StructDecl } {
+    for (program.structs) |*mod| {
+        for (mod.items) |item| {
+            switch (item) {
+                .function, .priv_function => |func| {
+                    if (std.mem.eql(u8, interner.get(func.name), name)) {
+                        return .{ .decl = func, .owner = mod };
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
+/// Collect every `.function` item named `name` across all structs into `out`,
+/// in source order, returning the owning `StructDecl` of the first match. Each
+/// `pub fn <name>` declaration is a distinct single-clause `FunctionDecl`; a
+/// multi-`pub fn` function family is exactly this list of decls sharing a name.
+fn collectStructFunctions(
+    interner: *ast.StringInterner,
+    program: *const ast.Program,
+    name: []const u8,
+    out: *std.ArrayListUnmanaged(*const ast.FunctionDecl),
+    allocator: std.mem.Allocator,
+) !?*const ast.StructDecl {
+    var owner: ?*const ast.StructDecl = null;
+    for (program.structs) |*mod| {
+        for (mod.items) |item| {
+            switch (item) {
+                .function, .priv_function => |func| {
+                    if (std.mem.eql(u8, interner.get(func.name), name)) {
+                        if (owner == null) owner = mod;
+                        try out.append(allocator, func);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return owner;
+}
+
+/// Set `checker.current_scope` to the struct's body scope, mirroring how
+/// `checkStruct` establishes it before checking the struct's functions.
+fn enterStructScope(checker: *TypeChecker, owner: *const ast.StructDecl) void {
+    checker.current_scope = checker.graph.node_scope_map.get(
+        scope_mod.ScopeGraph.spanKey(owner.meta.span),
+    ) orelse owner.meta.scope_id;
+}
+
+test "storeRaisesRow unions a function's clauses instead of overwriting (types-2--02 / TY-04)" {
+    // A two-clause function: each clause shares the same `<Struct>.<name>/<arity>`
+    // key. Storing clause A's row {AlphaError} then clause B's row {BetaError}
+    // must leave the UNION {AlphaError, BetaError} — pre-fix the second store
+    // fetchRemove+put OVERWROTE the first, so only BetaError survived and the
+    // earlier clause's error vanished from the error-union ABI.
+    const source =
+        \\pub struct AlphaError {}
+        \\pub struct BetaError {}
+        \\pub struct Risky {
+        \\  pub fn classify(n :: i64) -> i64 { n }
+        \\  pub fn classify(s :: String) -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const alpha = resolveErrorTypeByName(&collector.graph, parser.interner, "AlphaError").?;
+    const beta = resolveErrorTypeByName(&collector.graph, parser.interner, "BetaError").?;
+    try std.testing.expect(alpha != beta);
+
+    var classify_decls: std.ArrayListUnmanaged(*const ast.FunctionDecl) = .empty;
+    defer classify_decls.deinit(alloc);
+    const owner = (try collectStructFunctions(parser.interner, &program, "classify", &classify_decls, alloc)).?;
+    try std.testing.expectEqual(@as(usize, 2), classify_decls.items.len);
+
+    // Resolve the clause scopes so `raisesRowKeyForDecl` can derive the
+    // shared family key, mirroring how `checkFunctionClause` sets it.
+    enterStructScope(&checker, owner);
+
+    // Store clause A's row {AlphaError}, then clause B's row {BetaError}. Both
+    // decls share the `Risky.classify/1` key.
+    try checker.storeRaisesRow(classify_decls.items[0], &classify_decls.items[0].clauses[0], &.{alpha});
+    try checker.storeRaisesRow(classify_decls.items[1], &classify_decls.items[1].clauses[0], &.{beta});
+
+    const row = lookupInferredRaisesRow(&checker, "Risky", "classify", 1);
+    try std.testing.expectEqual(@as(usize, 2), row.len);
+    try std.testing.expect(rowContainsType(&checker, row, alpha));
+    try std.testing.expect(rowContainsType(&checker, row, beta));
+    try std.testing.expect(checker.store.functionRaises("Risky", "classify", 1));
+}
+
+test "storeRaisesRow keeps an earlier clause's raise when a later clause is pure (types-2--02 / TY-04 soundness direction)" {
+    // The unsound ordering: an EARLY clause raises AlphaError, the LAST clause
+    // is pure (empty row). Pre-fix the empty row OVERWROTE AlphaError, so the
+    // function lowered WITHOUT an error union and the earlier clause's raise
+    // took the uncatchable `do_raise` abort path. The union must keep AlphaError
+    // so `functionRaises` stays true and the error-union ABI an enclosing
+    // `rescue` depends on is still emitted.
+    const source =
+        \\pub struct AlphaError {}
+        \\pub struct Risky {
+        \\  pub fn maybe(n :: i64) -> i64 { n }
+        \\  pub fn maybe(s :: String) -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const alpha = resolveErrorTypeByName(&collector.graph, parser.interner, "AlphaError").?;
+    var maybe_decls: std.ArrayListUnmanaged(*const ast.FunctionDecl) = .empty;
+    defer maybe_decls.deinit(alloc);
+    const owner = (try collectStructFunctions(parser.interner, &program, "maybe", &maybe_decls, alloc)).?;
+    try std.testing.expectEqual(@as(usize, 2), maybe_decls.items.len);
+
+    enterStructScope(&checker, owner);
+
+    // Clause A raises AlphaError; clause B (last) is pure — store an empty row.
+    try checker.storeRaisesRow(maybe_decls.items[0], &maybe_decls.items[0].clauses[0], &.{alpha});
+    try checker.storeRaisesRow(maybe_decls.items[1], &maybe_decls.items[1].clauses[0], &.{});
+
+    const row = lookupInferredRaisesRow(&checker, "Risky", "maybe", 1);
+    try std.testing.expect(rowContainsType(&checker, row, alpha));
+    // Authoritative ABI witness: the function MUST lower to an error union.
+    try std.testing.expect(checker.store.functionRaises("Risky", "maybe", 1));
+}
+
+test "checkFunctionClause preserves the enclosing function's current_raises across a nested clause (types-2--03 / TY-05)" {
+    // Seed the enclosing function's live accumulator with AlphaError (as if its
+    // body already recorded a raise), then check a NESTED function clause — the
+    // exact re-entrant path a closure / nested fn / macro takes mid-body. Pre-fix
+    // `checkFunctionClause` unconditionally cleared `current_raises`, wiping the
+    // parent's AlphaError; the `shrinkRetainingCapacity` "restore" at the callers
+    // cannot recover entries below a mark that was captured before the clear. The
+    // fix must leave the parent's AlphaError intact after the nested check.
+    const source =
+        \\pub struct AlphaError {}
+        \\pub struct Outer {
+        \\  pub fn helper(x :: i64) -> i64 { x }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const alpha = resolveErrorTypeByName(&collector.graph, parser.interner, "AlphaError").?;
+    const found = findStructFunction(parser.interner, &program, "helper").?;
+    const helper = found.decl;
+
+    enterStructScope(&checker, found.owner);
+
+    // Simulate the enclosing function having accumulated a raise before a
+    // nested function/closure appears in its body.
+    checker.current_raises.clearRetainingCapacity();
+    try checker.recordRaisedErrorType(alpha, .{ .start = 0, .end = 0, .line = 0, .col = 0 });
+    try std.testing.expect(rowContainsType(&checker, checker.current_raises.items, alpha));
+
+    // Check a nested function clause (the re-entrant path). The enclosing
+    // AlphaError must still be present afterwards.
+    try checker.checkFunctionClause(helper, &helper.clauses[0]);
+
+    try std.testing.expect(rowContainsType(&checker, checker.current_raises.items, alpha));
 }

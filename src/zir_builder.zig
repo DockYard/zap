@@ -10947,19 +10947,28 @@ pub const ZirDriver = struct {
         if (sr.cases.len == 0) {
             // No cases — just emit the default body
             for (sr.default_instrs) |di| try self.emitInstruction(di);
+            // A clause body that already ends in a no-return terminator
+            // (e.g. a propagating `ret_raise` emitted because the function
+            // now lowers to an error union) must NOT get a trailing `ret`
+            // appended after it — that would place a `ret` after a hard exit.
             if (sr.default_result) |dr| {
-                const ref = try self.refForLocal(dr);
-                if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+                if (!self.instructionsEndNoReturnFor(sr.default_instrs)) {
+                    const ref = try self.refForLocal(dr);
+                    if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+                }
             }
             return;
         }
 
-        // Capture the default body (includes the return)
+        // Capture the default body (includes the return). Skip the trailing
+        // `ret` when the body already ends in a no-return terminator.
         self.beginCapture();
         for (sr.default_instrs) |di| try self.emitInstruction(di);
         if (sr.default_result) |dr| {
-            const ref = try self.refForLocal(dr);
-            if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+            if (!self.instructionsEndNoReturnFor(sr.default_instrs)) {
+                const ref = try self.refForLocal(dr);
+                if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
+            }
         }
         var default_len: u32 = 0;
         const default_ptr = self.endCapture(&default_len);
@@ -10995,13 +11004,19 @@ pub const ZirDriver = struct {
                 return error.EmitFailed;
             }
 
-            // Capture case body (includes the return)
+            // Capture case body (includes the return). A clause whose body
+            // already ends in a no-return terminator — e.g. `raise` lowered to
+            // a propagating `ret_raise` now that the function emits an error
+            // union — must NOT get a trailing `ret` appended after the hard
+            // exit, which Sema would reject as a `ret` after a terminator.
             self.beginCapture();
             for (case.body_instrs) |bi| try self.emitInstruction(bi);
             if (case.return_value) |rv| {
-                const ref = try self.refForLocal(rv);
-                if (zir_builder_emit_ret(self.handle, ref) != 0) {
-                    return error.EmitFailed;
+                if (!self.instructionsEndNoReturnFor(case.body_instrs)) {
+                    const ref = try self.refForLocal(rv);
+                    if (zir_builder_emit_ret(self.handle, ref) != 0) {
+                        return error.EmitFailed;
+                    }
                 }
             }
             var case_len: u32 = 0;
@@ -11130,10 +11145,15 @@ pub const ZirDriver = struct {
             }
 
             for (case.body_instrs) |bi| try self.emitInstruction(bi);
+            // A clause whose body already ends in a no-return terminator (e.g.
+            // a propagating `ret_raise` now that the function emits an error
+            // union) must NOT get a trailing `ret` after the hard exit.
             if (case.return_value) |rv| {
-                const ref = try self.refForLocal(rv);
-                if (zir_builder_emit_ret(self.handle, ref) != 0) {
-                    return error.EmitFailed;
+                if (!self.instructionsEndNoReturnFor(case.body_instrs)) {
+                    const ref = try self.refForLocal(rv);
+                    if (zir_builder_emit_ret(self.handle, ref) != 0) {
+                        return error.EmitFailed;
+                    }
                 }
             }
             var case_len: u32 = 0;

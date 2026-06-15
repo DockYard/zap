@@ -83,6 +83,40 @@ pub struct RescueLiteralArmsTest {
     }
   }
 
+  # End-to-end witness for audit finding types-2--02 / TY-04: a logical
+  # function's clauses are spread across several single-clause declarations
+  # sharing a `<Struct>.<name>/<arity>` key. The type checker's inferred
+  # `raises` row for that key must be the UNION of every clause's raised
+  # errors. The defect overwrote the row per-clause, so only the LAST clause's
+  # row survived. When an EARLY clause could raise but the LAST clause was pure
+  # (empty row), the function lowered WITHOUT an error union and the early
+  # clause's `raise` took the uncatchable top-level `do_raise` abort path
+  # instead of `ret_raise`: an enclosing `try ... rescue` silently failed to
+  # catch it and the process aborted. These exercise the rescue surface, which
+  # depends on the corrected error-union ABI flowing from the unioned row.
+  # (The companion type-soundness finding types-2--03 / TY-05 — preserving the
+  # enclosing function's `raises` accumulator across a nested closure check — is
+  # witnessed deterministically in `src/types.zig`'s type-checker unit tests.)
+  describe("multi-clause function raises union (TY-04)") {
+    test("early raising clause stays catchable when the last clause is pure") {
+      # The raising clause (0) is declared BEFORE the pure catch-all clause.
+      # Pre-fix the pure clause's empty row overwrote AlphaError and
+      # `maybe_fail(0)` aborted uncatchably instead of returning through rescue.
+      assert(call_maybe_fail(0) == 1)
+    }
+
+    test("the pure clause still returns its own value") {
+      assert(call_maybe_fail(7) == 7)
+    }
+
+    test("every clause of a many-clause function keeps its own error in the union") {
+      # classify_raise/1 raises a DIFFERENT concrete error per clause; both
+      # must be in the union so both are reachable through rescue.
+      assert(call_classify_raise(0) == 1)
+      assert(call_classify_raise(1) == 2)
+    }
+  }
+
   # Raises one of two/three concrete error types selected at runtime, so
   # the rescue arms exercise genuine runtime type discrimination (not a
   # first-arm-always shortcut).
@@ -202,6 +236,43 @@ pub struct RescueLiteralArmsTest {
         e :: BetaError -> 200
       }
     } rescue {
+      e :: AlphaError -> 1
+      e :: BetaError -> 2
+    }
+  }
+
+  # ---- TY-04 multi-clause raises-union fixtures ----
+
+  # Multi-clause function: the RAISING clause (0) is declared BEFORE the pure
+  # catch-all clause. The pure clause must NOT erase the raising clause's
+  # AlphaError from the function's inferred `raises` row, or `maybe_fail(0)`
+  # would abort uncatchably.
+  fn maybe_fail(0 :: i64) -> i64 {
+    raise %AlphaError{message: "boom"}
+  }
+
+  fn maybe_fail(n :: i64) -> i64 {
+    n
+  }
+
+  fn call_maybe_fail(n :: i64) -> i64 {
+    try { maybe_fail(n) } rescue {
+      e :: AlphaError -> 1
+    }
+  }
+
+  # Two clauses raising two DIFFERENT concrete errors. The union must carry
+  # both so each is reachable from the rescue site.
+  fn classify_raise(0 :: i64) -> i64 {
+    raise %AlphaError{message: "a"}
+  }
+
+  fn classify_raise(n :: i64) -> i64 {
+    raise %BetaError{message: "b"}
+  }
+
+  fn call_classify_raise(n :: i64) -> i64 {
+    try { classify_raise(n) } rescue {
       e :: AlphaError -> 1
       e :: BetaError -> 2
     }
