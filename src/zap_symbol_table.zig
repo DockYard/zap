@@ -364,9 +364,23 @@ pub const Reader = struct {
     }
 
     /// Resolve a packed string reference into a slice of the blob.
+    ///
+    /// os-seam--01 (audit RT-08): the `.zap-symbols` sidecar is fully
+    /// untrusted on-disk input, so the per-entry `(offset, length)` string
+    /// references are attacker-controlled. Validate both against the blob
+    /// bounds BEFORE slicing, computing the end with WIDENED `usize`
+    /// arithmetic so the `offset + length` sum cannot wrap in `u32`. An
+    /// out-of-range reference resolves to an empty string rather than reading
+    /// out of bounds (a bounds-check panic / DoS in safe builds, or an
+    /// adjacent-memory disclosure in ReleaseFast). This body is kept
+    /// byte-identical to the runtime mirror `ZapSymbolReader.stringAt` in
+    /// `src/runtime.zig`; `tools/zap_symbol_abi_drift_test.zig` asserts the two
+    /// stay in lockstep so the hardening cannot drift again.
     fn stringAt(self: Reader, offset: u32, length: u32) []const u8 {
         if (length == 0) return "";
-        return self.string_blob[offset .. offset + length];
+        const end = @as(usize, offset) + @as(usize, length);
+        if (offset > self.string_blob.len or end > self.string_blob.len) return "";
+        return self.string_blob[offset..end];
     }
 
     /// One decoded entry. All slices reference `Reader.string_blob`.
@@ -600,6 +614,119 @@ test "Reader.init rejects truncated blob, bad magic, wrong version" {
     std.mem.writeInt(u32, fake_bad_version[8..][0..4], 0, .little);
     std.mem.writeInt(u32, fake_bad_version[12..][0..4], 0, .little);
     try std.testing.expectError(error.UnsupportedVersion, Reader.init(&fake_bad_version));
+}
+
+// ---------------------------------------------------------------------------
+// os-seam--01 (audit RT-08): the canonical `Reader.stringAt` must validate
+// every per-entry (offset, length) string reference against the string blob
+// bounds BEFORE slicing. The `.zap-symbols` sidecar is fully untrusted on-disk
+// input (a planted sidecar inside a third-party crash bundle symbolized with
+// `zap addr2line`); an out-of-range offset/length must yield a clean empty
+// string, never an out-of-bounds read or a `u32` wrap. This brings the
+// canonical reader to parity with the hardened runtime mirror in
+// `src/runtime.zig` (`ZapSymbolReader.stringAt`), and the
+// `tools/zap_symbol_abi_drift_test.zig` cross-check asserts the two stay in
+// lockstep so the hardening cannot silently drift again.
+// ---------------------------------------------------------------------------
+
+/// Offset within an encoded blob to the first packed entry's start. Mirrors
+/// `Reader.init`'s `header_size + blob_size`.
+fn testEntriesOffset(blob: []const u8) usize {
+    const header_size: usize = magic.len + @sizeOf(u32) * 3;
+    const blob_size = std.mem.readInt(u32, blob[magic.len + 8 ..][0..4], .little);
+    return header_size + blob_size;
+}
+
+test "Reader.stringAt rejects an out-of-range string offset (os-seam--01)" {
+    var builder = Builder.init(std.testing.allocator);
+    defer builder.deinit();
+    try builder.record("IO.puts__1", "IO", "puts", 1);
+
+    const blob = try builder.encode();
+    defer std.testing.allocator.free(blob);
+
+    // Corrupt entry 0's mangled_offset (field 0 of the packed entry) to point
+    // far past the string blob. Pre-fix, `stringAt` slices
+    // `string_blob[offset .. offset+length]` with no bounds check -> OOB read
+    // (bounds-check panic in safe builds, adjacent-memory read in ReleaseFast).
+    const entry0 = testEntriesOffset(blob);
+    std.mem.writeInt(u32, blob[entry0 + 0 ..][0..4], 0xFFFF_0000, .little);
+
+    const reader = try Reader.init(blob);
+    // Must not panic / OOB. The corrupt reference resolves to an empty string.
+    const view = reader.entry(0);
+    try std.testing.expectEqualStrings("", view.mangled);
+    // The intact local name still decodes correctly.
+    try std.testing.expectEqualStrings("puts", view.zap_local);
+}
+
+test "Reader.stringAt rejects an out-of-range string length (os-seam--01)" {
+    var builder = Builder.init(std.testing.allocator);
+    defer builder.deinit();
+    try builder.record("IO.puts__1", "IO", "puts", 1);
+
+    const blob = try builder.encode();
+    defer std.testing.allocator.free(blob);
+
+    // Corrupt entry 0's mangled_length (field 1, byte offset +4) so
+    // offset(valid) + length runs past the blob end.
+    const entry0 = testEntriesOffset(blob);
+    std.mem.writeInt(u32, blob[entry0 + 4 ..][0..4], 0x0010_0000, .little);
+
+    const reader = try Reader.init(blob);
+    const view = reader.entry(0);
+    try std.testing.expectEqualStrings("", view.mangled);
+    try std.testing.expectEqualStrings("puts", view.zap_local);
+}
+
+test "Reader.stringAt does not u32-wrap on offset+length (os-seam--01)" {
+    var builder = Builder.init(std.testing.allocator);
+    defer builder.deinit();
+    try builder.record("IO.puts__1", "IO", "puts", 1);
+
+    const blob = try builder.encode();
+    defer std.testing.allocator.free(blob);
+
+    // offset = 1 (in-range), length = 0xFFFF_FFFF. A naive `offset + length`
+    // computed in u32 wraps to 0 (ReleaseFast) — which would pass a
+    // `offset + length > blob.len` check and slice a backwards/huge range.
+    // Widened `usize` arithmetic must reject this as out of range.
+    const entry0 = testEntriesOffset(blob);
+    std.mem.writeInt(u32, blob[entry0 + 0 ..][0..4], 1, .little);
+    std.mem.writeInt(u32, blob[entry0 + 4 ..][0..4], 0xFFFF_FFFF, .little);
+
+    const reader = try Reader.init(blob);
+    const view = reader.entry(0);
+    try std.testing.expectEqualStrings("", view.mangled);
+}
+
+test "Reader.stringAt rejects an out-of-range struct reference and findByMangled stays safe (os-seam--01)" {
+    var builder = Builder.init(std.testing.allocator);
+    defer builder.deinit();
+    try builder.record("Demo.run__0", "Demo", "run", 0);
+    try builder.record("IO.puts__1", "IO", "puts", 1);
+
+    const blob = try builder.encode();
+    defer std.testing.allocator.free(blob);
+
+    // Corrupt the FIRST sorted entry's zap_struct_offset (field 2, byte +8)
+    // and zap_struct_length (field 3, byte +12) so the struct reference is
+    // out of range while its length is non-zero (so the null short-circuit is
+    // not taken). Entries are sorted by mangled name; "Demo.run__0" sorts
+    // before "IO.puts__1", so entry 0 is Demo.
+    const entry0 = testEntriesOffset(blob);
+    std.mem.writeInt(u32, blob[entry0 + 8 ..][0..4], 0xDEAD_0000, .little);
+    std.mem.writeInt(u32, blob[entry0 + 12 ..][0..4], 4, .little);
+
+    const reader = try Reader.init(blob);
+    // The binary search reads every probed entry's `mangled` via stringAt; the
+    // corrupt struct reference on entry 0 must not OOB during the walk.
+    const view = reader.entry(0);
+    try std.testing.expect(view.zap_struct != null);
+    try std.testing.expectEqualStrings("", view.zap_struct.?);
+    // The intact second entry still resolves end-to-end.
+    const io = reader.findByMangled("IO.puts__1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("IO", io.zap_struct.?);
 }
 
 test "Reader decodes from a byte-aligned buffer regardless of alignment" {

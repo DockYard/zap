@@ -9646,10 +9646,17 @@ const ZapSymbolReader = struct {
         };
     }
 
+    // os-seam--01 (audit RT-08): kept byte-identical to the canonical
+    // `Reader.stringAt` in `src/zap_symbol_table.zig`. The `.zap-symbols`
+    // sidecar is untrusted input; validate the `(offset, length)` reference
+    // against the blob bounds with WIDENED `usize` arithmetic so `offset +
+    // length` cannot wrap in `u32`, returning "" on any out-of-range
+    // reference instead of reading out of bounds.
     fn stringAt(self: ZapSymbolReader, offset: u32, length: u32) []const u8 {
         if (length == 0) return "";
-        if (offset > self.string_blob.len or offset + length > self.string_blob.len) return "";
-        return self.string_blob[offset .. offset + length];
+        const end = @as(usize, offset) + @as(usize, length);
+        if (offset > self.string_blob.len or end > self.string_blob.len) return "";
+        return self.string_blob[offset..end];
     }
 
     fn entry(self: ZapSymbolReader, index: u32) ZapSymbolEntry {
