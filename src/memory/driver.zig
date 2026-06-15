@@ -1755,7 +1755,16 @@ fn wasmSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool 
                         // DATA: always name_len, name; if defined also
                         // index, offset, size.
                         const sym_name_len = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject;
-                        if (sym_name_len > sub_end - sp) return SymbolCheckError.InvalidObject;
+                        // memory-driver--02 (audit RT-02): the `flags` and
+                        // `sym_name_len` ULEB reads above are bounded by
+                        // `bytes.len`, not `sub_end`, so on a crafted object
+                        // `sp` may already have advanced past `sub_end`. Verify
+                        // `sp <= sub_end` BEFORE the subtraction so `sub_end -
+                        // sp` cannot underflow into a huge unsigned bound that
+                        // would bypass the length check and form an
+                        // out-of-bounds slice (matches the sibling guard in
+                        // `section_parser.wasmSegmentIndexByName`).
+                        if (sp > sub_end or sym_name_len > sub_end - sp) return SymbolCheckError.InvalidObject;
                         const sym_name = bytes[sp .. sp + sym_name_len];
                         sp += sym_name_len;
                         if (std.mem.eql(u8, sym_name, want) and !undefined_sym) return true;
@@ -1771,7 +1780,10 @@ fn wasmSymbolPresent(bytes: []const u8, want: []const u8) SymbolCheckError!bool 
                         _ = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject; // index
                         if (!undefined_sym or explicit_name) {
                             const sym_name_len = wasmReadUleb128(bytes, &sp) orelse return SymbolCheckError.InvalidObject;
-                            if (sym_name_len > sub_end - sp) return SymbolCheckError.InvalidObject;
+                            // memory-driver--02 (audit RT-02): same underflow
+                            // guard as the DATA arm — `sp` may have advanced
+                            // past `sub_end` via the index/name-len ULEB reads.
+                            if (sp > sub_end or sym_name_len > sub_end - sp) return SymbolCheckError.InvalidObject;
                             sp += sym_name_len;
                         }
                     },
@@ -4704,4 +4716,194 @@ test "watch-mode rebuild path: Memory.Leak resolves without REFCOUNT_V1 refusal"
 
 test "watch-mode rebuild path: Memory.Tracking resolves without REFCOUNT_V1 refusal" {
     try simulateWatchInitForManager("Memory.Tracking");
+}
+
+// ---------------------------------------------------------------------------
+// memory-driver--02 (audit RT-02): wasm symbol-table walker must not let an
+// intermediate ULEB read advance `sp` past `sub_end` and then underflow the
+// `sub_end - sp` subtraction into a huge unsigned bound, which would bypass
+// the symbol-name length guard and form an out-of-bounds slice of the symbol
+// name from a crafted/poisoned `linking` WASM_SYMBOL_TABLE.
+//
+// These tests synthesize a minimal relocatable wasm object carrying ONLY a
+// `linking` custom section with a WASM_SYMBOL_TABLE subsection (id 8). The
+// driver's `wasmSymbolPresent` is exercised directly with both well-formed
+// (positive control) and malformed (underflow / truncation) inputs.
+// ---------------------------------------------------------------------------
+
+/// Append a value as unsigned LEB128 to `out`. Mirrors the wire encoding the
+/// walker's `wasmReadUleb128` decodes, so the synthesized objects are valid
+/// wasm bytes the walker will actually traverse.
+fn testAppendUleb128(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value_in: u64) !void {
+    var value = value_in;
+    while (true) {
+        var byte: u8 = @intCast(value & 0x7F);
+        value >>= 7;
+        if (value != 0) byte |= 0x80;
+        try out.append(allocator, byte);
+        if (value == 0) break;
+    }
+}
+
+const WASM_LINKING_SYMTAB_SUBSECTION_ID: u8 = 8;
+const WASM_SYMTAB_KIND_DATA: u8 = 1;
+
+/// Build a wasm object whose single `linking` custom section's
+/// WASM_SYMBOL_TABLE subsection has its declared `sub_size` set so that the
+/// payload region ends right after the symbol `kind` byte — i.e. the per-entry
+/// `flags` and `sym_name_len` ULEB fields lie BEYOND `sub_end` (but still
+/// inside the enclosing section and buffer). Parsing one DATA syminfo entry
+/// therefore advances `sp` past `sub_end`, making `sub_end - sp` underflow.
+///
+/// `declared_sym_name_len` is the attacker-chosen name length written on the
+/// wire; with the underflow bug it is compared against a near-`maxInt(usize)`
+/// bound (always passes) and then used to slice `bytes[sp .. sp + len]` out of
+/// bounds. The caller owns the returned slice.
+fn buildWasmUnderflowSymtab(
+    allocator: std.mem.Allocator,
+    declared_sym_name_len: u64,
+    trailing_padding: usize,
+) ![]u8 {
+    // Build the linking-section *body* first (everything after the section's
+    // own id + size prefix): name_len, "linking", version, then the subsection.
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+
+    try testAppendUleb128(&body, allocator, "linking".len);
+    try body.appendSlice(allocator, "linking");
+    try testAppendUleb128(&body, allocator, 2); // linking version
+
+    // Subsection payload that the declared sub_size will UNDER-cover: we
+    // declare sub_size = 2 (count byte + kind byte) but actually write more
+    // bytes (flags, sym_name_len, ...) past sub_end.
+    try body.append(allocator, WASM_LINKING_SYMTAB_SUBSECTION_ID);
+    const declared_sub_size: u64 = 2; // covers count(1) + kind(1) only
+    try testAppendUleb128(&body, allocator, declared_sub_size);
+
+    // ---- bytes counted inside sub_size ----
+    try testAppendUleb128(&body, allocator, 1); // count = 1 entry  (byte 1 of 2)
+    try body.append(allocator, WASM_SYMTAB_KIND_DATA); // kind = DATA (byte 2 of 2)
+    // sub_end is now here. Everything below is OUTSIDE the declared subsection.
+
+    // ---- bytes the walker still reads, advancing sp past sub_end ----
+    try testAppendUleb128(&body, allocator, 0); // flags = 0 (defined) -> sp = sub_end + 1
+    try testAppendUleb128(&body, allocator, declared_sym_name_len); // sp now > sub_end
+
+    // Extra buffer the OOB slice could read into (proves the slice end goes
+    // past the legitimate data). For the bounded post-fix behavior this is
+    // irrelevant; for the pre-fix underflow it is the over-read region.
+    var i: usize = 0;
+    while (i < trailing_padding) : (i += 1) try body.append(allocator, 0xAA);
+
+    // Now wrap `body` in: header + section-id(0) + section_size(ULEB) + body.
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 }); // \0asm v1
+    try out.append(allocator, 0x00); // custom section id
+    try testAppendUleb128(&out, allocator, body.items.len); // section_size
+    try out.appendSlice(allocator, body.items);
+
+    return out.toOwnedSlice(allocator);
+}
+
+test "memory-driver--02: wasm walker rejects sub_end underflow instead of OOB slice (DATA arm)" {
+    const allocator = std.testing.allocator;
+
+    // Declared name length 64 KiB, far beyond the few padding bytes present,
+    // so the pre-fix `bytes[sp .. sp + sym_name_len]` slice would run well off
+    // the end of the buffer. With the fix, the `sp > sub_end` guard fires and
+    // a clean InvalidObject is returned — no panic, no OOB read.
+    const object = try buildWasmUnderflowSymtab(allocator, 65535, 8);
+    defer allocator.free(object);
+
+    const result = wasmSymbolPresent(object, "zap_memory_section");
+    try std.testing.expectError(SymbolCheckError.InvalidObject, result);
+}
+
+test "memory-driver--02: wasm walker rejects sub_end underflow with in-buffer name length too" {
+    const allocator = std.testing.allocator;
+
+    // Even when the declared name length is small enough that `sp + len` stays
+    // inside the buffer (so the pre-fix code would NOT panic but would instead
+    // silently read a name from past the subsection boundary and could report
+    // a bogus match), the walker must still reject it: the entry's bytes lie
+    // outside the declared subsection, so the object is malformed.
+    const object = try buildWasmUnderflowSymtab(allocator, 4, 16);
+    defer allocator.free(object);
+
+    const result = wasmSymbolPresent(object, "zap_memory_section");
+    try std.testing.expectError(SymbolCheckError.InvalidObject, result);
+}
+
+test "memory-driver--02: wasm walker rejects truncated symbol-name length field" {
+    const allocator = std.testing.allocator;
+
+    // A SYMTAB subsection whose declared sub_size legitimately covers
+    // count+kind+flags but is then truncated mid-entry (no sym_name_len byte)
+    // must be rejected cleanly rather than reading past the buffer.
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    try testAppendUleb128(&body, allocator, "linking".len);
+    try body.appendSlice(allocator, "linking");
+    try testAppendUleb128(&body, allocator, 2); // linking version
+    try body.append(allocator, WASM_LINKING_SYMTAB_SUBSECTION_ID);
+    // sub_size = 3 covers count(1)+kind(1)+flags(1); the sym_name_len read then
+    // runs into end-of-section.
+    try testAppendUleb128(&body, allocator, 3);
+    try testAppendUleb128(&body, allocator, 1); // count = 1
+    try body.append(allocator, WASM_SYMTAB_KIND_DATA); // kind = DATA
+    try testAppendUleb128(&body, allocator, 0); // flags = 0 (defined)
+    // No sym_name_len byte and no trailing bytes: the section ends exactly at
+    // sub_end, so reading sym_name_len hits the section/buffer boundary.
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    try out.append(allocator, 0x00);
+    try testAppendUleb128(&out, allocator, body.items.len);
+    try out.appendSlice(allocator, body.items);
+
+    const result = wasmSymbolPresent(out.items, "zap_memory_section");
+    try std.testing.expectError(SymbolCheckError.InvalidObject, result);
+}
+
+test "memory-driver--02: wasm walker finds a well-formed DATA symbol (positive control)" {
+    const allocator = std.testing.allocator;
+
+    const want = "zap_memory_section";
+
+    // A correctly-sized SYMTAB subsection with one defined DATA symbol named
+    // `want`. sub_size must cover the WHOLE entry (count + kind + flags +
+    // name_len + name + index + offset + size).
+    var entry: std.ArrayListUnmanaged(u8) = .empty;
+    defer entry.deinit(allocator);
+    try testAppendUleb128(&entry, allocator, 1); // count = 1
+    try entry.append(allocator, WASM_SYMTAB_KIND_DATA); // kind = DATA
+    try testAppendUleb128(&entry, allocator, 0); // flags = 0 (defined)
+    try testAppendUleb128(&entry, allocator, want.len);
+    try entry.appendSlice(allocator, want);
+    try testAppendUleb128(&entry, allocator, 0); // index
+    try testAppendUleb128(&entry, allocator, 0); // offset
+    try testAppendUleb128(&entry, allocator, 0); // size
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    try testAppendUleb128(&body, allocator, "linking".len);
+    try body.appendSlice(allocator, "linking");
+    try testAppendUleb128(&body, allocator, 2); // linking version
+    try body.append(allocator, WASM_LINKING_SYMTAB_SUBSECTION_ID);
+    try testAppendUleb128(&body, allocator, entry.items.len); // exact sub_size
+    try body.appendSlice(allocator, entry.items);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    try out.append(allocator, 0x00);
+    try testAppendUleb128(&out, allocator, body.items.len);
+    try out.appendSlice(allocator, body.items);
+
+    try std.testing.expect(try wasmSymbolPresent(out.items, want));
+    // A symbol that is not present returns false, not an error.
+    try std.testing.expect(!try wasmSymbolPresent(out.items, "not_present_symbol"));
 }
