@@ -174,6 +174,21 @@ pub struct Zap.StringTest {
       assert(String.repeat("hi", 0) == "")
     }
 
+    test("repeat negative count yields empty string") {
+      assert(String.repeat("hi", -3) == "")
+    }
+
+    test("repeat empty string stays empty") {
+      assert(String.repeat("", 100) == "")
+    }
+
+    test("repeat a moderate count is correct and complete") {
+      result = String.repeat("ab", 50)
+      assert(String.length(result) == 100)
+      assert(String.starts_with?(result, "ababab"))
+      assert(String.ends_with?(result, "abab"))
+    }
+
     test("to_integer valid") {
       assert(String.to_integer("42") == 42)
     }

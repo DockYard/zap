@@ -9156,7 +9156,17 @@ pub const String = struct {
             }
         }
         if (count == 0) return s;
-        const new_len = s.len - (count * pattern.len) + (count * replacement.len);
+        // Checked size (audit runtime-2--02): `count * pattern.len` is bounded
+        // by `s.len` (each match consumes `pattern.len` bytes of `s`), but
+        // `count * replacement.len` is unbounded — a large `replacement` can
+        // overflow `usize`. Compute the replaced length with checked
+        // multiply/add and abort with the canonical `argument_error` shape on
+        // overflow instead of wrapping and under-sizing the allocation.
+        const replaced_bytes = std.math.mul(usize, count, replacement.len) catch
+            Kernel.raise_with_kind("argument_error", "String.replace: result size overflows usize");
+        const removed_bytes = count * pattern.len; // <= s.len, cannot overflow
+        const new_len = std.math.add(usize, s.len - removed_bytes, replaced_bytes) catch
+            Kernel.raise_with_kind("argument_error", "String.replace: result size overflows usize");
         const result = bumpAllocAt(.string_replace, new_len);
         if (result.len == 0) return s;
         var src: usize = 0;
@@ -9207,11 +9217,36 @@ pub const String = struct {
         return result;
     }
 
-    pub fn repeat_string(s: []const u8, count: i64) []const u8 {
-        if (count <= 0 or s.len == 0) return "";
+    /// Pure size classifier for `repeat_string` (audit runtime-2--02). Computes
+    /// the output byte count for repeating an `s_len`-byte string `count` times,
+    /// using a CHECKED multiply so a product that exceeds `usize` is reported as
+    /// `error.Overflow` rather than wrapping two's-complement (which, before the
+    /// fix, sized the allocation too small and overran the arena in
+    /// ReleaseFast/ReleaseSmall). The empty-result cases — a non-positive
+    /// `count` (including the whole negative range and `0`) or an empty source —
+    /// yield `0`, matching Zap's `String.repeat` semantics (empty result for
+    /// those).
+    /// Isolated as a pure function so the overflow decision is unit-testable
+    /// without driving the diverging `raise_with_kind` abort `repeat_string`
+    /// takes on the error — the same pattern as `Kernel.intDivFault`.
+    pub fn repeatStringSize(s_len: usize, count: i64) error{Overflow}!usize {
+        if (count <= 0 or s_len == 0) return 0;
         const n: usize = @intCast(count);
-        const result = bumpAllocAt(.string_repeat, s.len * n);
+        return std.math.mul(usize, s_len, n);
+    }
+
+    pub fn repeat_string(s: []const u8, count: i64) []const u8 {
+        // Checked size: a `(s.len, count)` whose product overflows `usize`
+        // aborts with the canonical `** (argument_error) ...` shape — the same
+        // observable behavior as `raise %ArgumentError{...}` and as the
+        // arithmetic/bounds safety traps — rather than wrapping the multiply
+        // and overrunning the allocation. Enforced in every optimize mode.
+        const total = repeatStringSize(s.len, count) catch
+            Kernel.raise_with_kind("argument_error", "String.repeat: result size overflows usize");
+        if (total == 0) return "";
+        const result = bumpAllocAt(.string_repeat, total);
         if (result.len == 0) return s;
+        const n: usize = @intCast(count);
         for (0..n) |i| {
             @memcpy(result[i * s.len .. (i + 1) * s.len], s);
         }
@@ -9285,10 +9320,20 @@ pub const String = struct {
         if (count_i64 <= 0) return "";
         const count: usize = @intCast(count_i64);
         var index: usize = 0;
+        // Checked size (audit runtime-2--02): both the running sum of segment
+        // lengths and the `separator.len * (count - 1)` separator term are
+        // computed with checked arithmetic so a degenerate input (many huge
+        // segments, or a huge separator over many segments) aborts with the
+        // canonical `argument_error` shape instead of wrapping `usize` and
+        // under-sizing the join buffer.
         while (index < count) : (index += 1) {
-            total += List([]const u8).get(list, @intCast(index)).len;
+            total = std.math.add(usize, total, List([]const u8).get(list, @intCast(index)).len) catch
+                Kernel.raise_with_kind("argument_error", "String.join: result size overflows usize");
         }
-        total += separator.len * (count - 1);
+        const separator_bytes = std.math.mul(usize, separator.len, count - 1) catch
+            Kernel.raise_with_kind("argument_error", "String.join: result size overflows usize");
+        total = std.math.add(usize, total, separator_bytes) catch
+            Kernel.raise_with_kind("argument_error", "String.join: result size overflows usize");
         const result = bumpAllocAt(.string_join, total);
         if (result.len == 0) return "";
         var dst: usize = 0;
@@ -24108,6 +24153,52 @@ test "Kernel.divide/remainder return correct values on safe inputs" {
     try std.testing.expectEqual(@as(i64, -1), Kernel.remainder_i64(-10, 3)); // sign follows dividend
     try std.testing.expectEqual(@as(u64, 3), Kernel.divide_u64(10, 3));
     try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), Kernel.divide_i64(std.math.maxInt(i64), 1));
+}
+
+// ---------------------------------------------------------------------------
+// String.repeat size-overflow safety (audit runtime-2--02 / RT-16)
+//
+// `String.repeat_string` allocates `s.len * count` bytes and writes that many
+// in a copy loop. Before the fix the multiply was unchecked: a crafted
+// `(s.len, count)` whose product exceeds `usize` wrapped two's-complement in
+// ReleaseFast/ReleaseSmall, allocating a too-small buffer and overrunning the
+// arena (heap corruption), or trapped in Debug/ReleaseSafe. The fix routes the
+// size through the pure `String.repeatStringSize` classifier and aborts via
+// `raise_with_kind("argument_error", ...)` on overflow — the same canonical
+// abort the arithmetic/bounds policies take. That abort path cannot be
+// exercised from an in-process unit test without terminating the runner, so
+// the pure size classifier is asserted directly here: it is the single
+// decision point `repeat_string` consults to size its allocation.
+// ---------------------------------------------------------------------------
+
+test "String.repeatStringSize returns the exact byte count on valid inputs" {
+    try std.testing.expectEqual(@as(usize, 6), try String.repeatStringSize(2, 3)); // "ab" * 3
+    try std.testing.expectEqual(@as(usize, 5), try String.repeatStringSize(1, 5)); // "x" * 5
+    try std.testing.expectEqual(@as(usize, 1), try String.repeatStringSize(1, 1));
+    try std.testing.expectEqual(@as(usize, 300), try String.repeatStringSize(3, 100));
+}
+
+test "String.repeatStringSize yields zero for the empty-result cases" {
+    try std.testing.expectEqual(@as(usize, 0), try String.repeatStringSize(2, 0)); // count == 0
+    try std.testing.expectEqual(@as(usize, 0), try String.repeatStringSize(2, -1)); // negative count
+    try std.testing.expectEqual(@as(usize, 0), try String.repeatStringSize(2, std.math.minInt(i64)));
+    try std.testing.expectEqual(@as(usize, 0), try String.repeatStringSize(0, 5)); // empty string
+    try std.testing.expectEqual(@as(usize, 0), try String.repeatStringSize(0, 0));
+}
+
+test "String.repeatStringSize reports overflow instead of wrapping the multiply" {
+    // s.len = 3, count = i64 max — the product (~2.8e19) overflows a 64-bit
+    // usize. Before the fix this wrapped to a small value in ReleaseFast and
+    // overran the arena; the checked multiply now surfaces it as an error.
+    const huge: i64 = std.math.maxInt(i64); // 9.2e18; * 3 overflows usize
+    try std.testing.expectError(error.Overflow, String.repeatStringSize(3, huge));
+    // Exact boundary for s.len = 3: the largest count whose product fits is
+    // floor(maxInt(usize) / 3); one more overflows. Both are < maxInt(i64), so
+    // they are representable as the i64 `count` parameter.
+    const just_fits: usize = std.math.maxInt(usize) / 3;
+    const overflows: usize = just_fits + 1;
+    try std.testing.expectEqual(just_fits * 3, try String.repeatStringSize(3, @intCast(just_fits)));
+    try std.testing.expectError(error.Overflow, String.repeatStringSize(3, @intCast(overflows)));
 }
 
 test "Integer.pow uses fast exponentiation with correct values" {
