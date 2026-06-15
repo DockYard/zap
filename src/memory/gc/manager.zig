@@ -67,14 +67,18 @@
 //! ### Roots
 //!
 //! The stack bottom (the highest stack address the program will use) is
-//! captured at `init`, which the runtime calls from the entry-point prologue
-//! (`memoryStartupForEntry`) — the highest frame — or, in the lazy-fallback
-//! runtime, at the first allocation. Either is a sound upper bound because the
-//! stack grows toward lower addresses on every supported target, so every later
-//! frame lives below the captured bottom. At collection time the collector
-//! flushes callee-saved registers to a stack-resident buffer and scans: the
-//! flushed registers, the live stack span `[current SP, stack_bottom)`, and the
-//! global `__DATA`/bss segments.
+//! captured at `init` as the **OS thread stack base** — the fixed high end of
+//! the thread's mapped stack region (`pthread_get_stackaddr_np` on darwin;
+//! `pthread_getattr_np` + `pthread_attr_getstack` on linux). This is the
+//! nesting-independent true base: it is identical no matter which frame queries
+//! it, so it covers the program's entry frame (`main`'s body) and the C-runtime
+//! frames below it, even though `init` itself runs several frames BELOW `main`.
+//! Capturing `init`'s own stack pointer instead (the original RT-05 defect)
+//! would place the bottom below `main`'s frame and exclude every entry-frame
+//! root from the scan, freeing still-live objects. At collection time the
+//! collector flushes callee-saved registers to a stack-resident buffer and
+//! scans: the flushed registers, the live stack span `[current SP,
+//! stack_bottom)`, and the global `__DATA`/bss segments.
 //!
 //! ### Mark / sweep
 //!
@@ -616,6 +620,117 @@ inline fn currentStackPointer() usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OS thread stack base (the conservative scan's stack BOTTOM)
+//
+// The collector's stack BOTTOM must be the highest address the program's stack
+// will ever reach, so the collection-time scan span `[current SP, stack_bottom)`
+// covers EVERY mutator frame — including the program's entry frame (`main`'s
+// body), where a Zap `main/1` local can hold the sole live reference to a heap
+// object.
+//
+// `init` is invoked several frames BELOW `main` (`main` →
+// `memoryStartupForEntry` → `zapMemoryStartup` → indirect vtable `core.init` →
+// `gcInit`), and the indirect vtable call prevents inlining in every
+// optimisation mode, so `gcInit`'s own stack pointer is STRICTLY BELOW `main`'s
+// frame. Capturing that nested SP as the bottom (the original defect, RT-05 /
+// memory-managers--01) would exclude every entry-frame root from the scan and
+// free still-live objects.
+//
+// The correct, nesting-independent bottom is the OS thread's stack base — the
+// fixed high end of the thread's mapped stack region, identical no matter which
+// frame queries it. This manager object is compiled `link_libc = false`, but it
+// is linked into a final user binary built with `link_libc = true` (see
+// `src/main.zig`'s `.link_libc = true`), so a libc `extern` declared here
+// resolves at the final link step — exactly as `runtime.zig` declares
+// `extern "c" fn atexit`. The externs and pthread types are redeclared locally
+// per this file's self-contained-manager convention (the same reason the ABI
+// structs above are local).
+//
+// GC selection is gated to ELF (linux) and Mach-O (darwin) by the driver's
+// `enforceManagerTargetSupport`; both expose a reliable thread-stack-base query
+// below. Any other target (and the rare case where the OS query fails) falls
+// back to `currentStackPointer()`, preserving the prior behaviour rather than
+// regressing — but on the GC-supported targets the OS query is authoritative.
+// ---------------------------------------------------------------------------
+
+/// Opaque pthread handle. `pthread_t` is `*opaque {}` on every libc this
+/// manager targets; redeclared locally (self-contained-manager convention).
+const PthreadT = *opaque {};
+
+/// Darwin libc: returns the stack BASE — the highest address of the calling
+/// thread's stack (the stack grows down from here). For the main thread this is
+/// at or above the C runtime frames below `main`, hence above every Zap root.
+extern "c" fn pthread_self() callconv(.c) PthreadT;
+extern "c" fn pthread_get_stackaddr_np(thread: PthreadT) callconv(.c) ?*anyopaque;
+
+/// Linux glibc: `pthread_getattr_np` fills an attribute object describing the
+/// calling thread; `pthread_attr_getstack` reads the LOWEST stack address and
+/// the size, so the base (highest address) is `stackaddr + stacksize`.
+/// `pthread_attr_t` is an opaque blob; we redeclare a layout-compatible local
+/// (56-byte payload + alignment word matches glibc's `sizeof(pthread_attr_t)`
+/// on the LP64 targets GC supports).
+const PthreadAttrT = extern struct {
+    __size: [56]u8,
+    __align: c_long,
+};
+extern "c" fn pthread_getattr_np(thread: PthreadT, attr: *PthreadAttrT) callconv(.c) c_int;
+extern "c" fn pthread_attr_getstack(
+    attr: *const PthreadAttrT,
+    stackaddr: *?*anyopaque,
+    stacksize: *usize,
+) callconv(.c) c_int;
+extern "c" fn pthread_attr_destroy(attr: *PthreadAttrT) callconv(.c) c_int;
+
+/// Capture the conservative scan's stack BOTTOM: the highest address the
+/// thread's stack reaches. Queries the OS thread stack base so the value is
+/// independent of how deeply nested the calling frame is. Falls back to the
+/// current SP only when no OS query is available for the target or the query
+/// fails (never on the GC-supported darwin/linux targets in normal operation).
+///
+/// The returned address is the EXCLUSIVE upper bound of the live stack span:
+/// `pthread_get_stackaddr_np` (darwin) and `stackaddr + stacksize` (linux) both
+/// denote the address one-past the top of the usable stack, so scanning
+/// `[SP, base)` reads only mapped, live stack words and never past the region.
+fn currentStackBase() usize {
+    switch (builtin.target.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            // Darwin returns the base (high end) directly.
+            const base = pthread_get_stackaddr_np(pthread_self());
+            if (base) |ptr| {
+                const base_addr = @intFromPtr(ptr);
+                // Sanity: the base must be at or above this frame's SP (stack
+                // grows down). If a future libc ever returned the low end
+                // instead, fall back rather than scan a backwards range.
+                if (base_addr >= currentStackPointer()) return base_addr;
+            }
+            return currentStackPointer();
+        },
+        .linux => {
+            var attr: PthreadAttrT = undefined;
+            if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+                return currentStackPointer();
+            }
+            defer _ = pthread_attr_destroy(&attr);
+            var stackaddr: ?*anyopaque = null;
+            var stacksize: usize = 0;
+            if (pthread_attr_getstack(&attr, &stackaddr, &stacksize) != 0) {
+                return currentStackPointer();
+            }
+            if (stackaddr) |low| {
+                // glibc reports the LOWEST stack address; the base is the high
+                // end. Use checked addition so a malformed (size, addr) pair
+                // can never wrap to a small bottom that would truncate the scan.
+                const low_addr = @intFromPtr(low);
+                const sum = @addWithOverflow(low_addr, stacksize);
+                if (sum[1] == 0 and sum[0] >= currentStackPointer()) return sum[0];
+            }
+            return currentStackPointer();
+        },
+        else => return currentStackPointer(),
+    }
+}
+
 inline fn flushRegisters(buffer: *RegisterBuffer) void {
     switch (builtin.target.cpu.arch) {
         .aarch64, .aarch64_be => {
@@ -965,17 +1080,21 @@ fn largeObjectAlloc(ctx: *GcContext, size: usize, alignment: u32) ?[*]u8 {
 
 /// Initialise the manager. Allocates a `GcContext` on `page_allocator`,
 /// initialises empty slab chains and the record table, and **captures the
-/// stack bottom** by reading the current stack pointer.
+/// stack bottom** as the OS thread stack base (`currentStackBase`).
 ///
 /// `init` is invoked by the runtime's startup prologue (`memoryStartupForEntry`,
-/// called from the compiler-emitted entry in `main`) before any user allocation,
-/// or — in the lazy-fallback runtime — at the first allocation. Either site is a
-/// frame at a higher (or equal) stack address than every subsequent allocation
-/// frame, so the stack pointer read here (via `currentStackPointer`) is a sound
-/// upper bound for the live stack span scanned at every later collection. Spec
-/// §4.2 forbids a manager from triggering compiler-emitted allocation during
-/// `init`; this manager only uses `page_allocator` here, satisfying the
-/// constraint.
+/// called from the compiler-emitted entry in `main`) before any user
+/// allocation, or — in the lazy-fallback runtime — at the first allocation. In
+/// BOTH cases `init` runs several frames BELOW `main` (through the indirect
+/// `core.init` vtable call, which never inlines), so this frame's stack pointer
+/// is strictly below `main`'s frame. The stack bottom must therefore be the OS
+/// thread stack base — the fixed high end of the thread's stack, at or above
+/// every frame including `main` — not this frame's SP (the original RT-05
+/// defect, which excluded entry-frame roots from the scan). `currentStackBase`
+/// reads the base via the platform pthread query and is independent of init
+/// nesting. Spec §4.2 forbids a manager from triggering compiler-emitted
+/// allocation during `init`; this manager only uses `page_allocator` and a
+/// pthread stack-base query here, satisfying the constraint.
 fn gcInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
     _ = options;
     const backing = std.heap.page_allocator;
@@ -990,12 +1109,21 @@ fn gcInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
         .live_bytes = 0,
         .next_collect_bytes = MIN_HEAP_BYTES,
         // Capture the stack bottom: the highest address the live stack reaches.
-        // `init` runs from the entry-point prologue (or, in the lazy-fallback
-        // runtime, the first allocation), so its stack pointer sits above every
-        // later allocation/collection frame (the stack grows down). The SP is
-        // read directly (not `@frameAddress()`, which is unreliable under
-        // frame-pointer elision), giving a correct upper bound in every mode.
-        .stack_bottom = currentStackPointer(),
+        //
+        // This MUST be the OS thread stack base, NOT this frame's SP. `gcInit`
+        // runs several frames BELOW the program's entry (`main` →
+        // `memoryStartupForEntry` → `zapMemoryStartup` → indirect vtable
+        // `core.init` → `gcInit`), and the indirect vtable call prevents
+        // inlining in every optimisation mode, so this frame's SP is strictly
+        // below `main`'s frame. Capturing the SP here (the original RT-05
+        // defect) excluded every entry-frame root from the scan span
+        // `[current SP, stack_bottom)` and freed still-live objects. The OS
+        // thread base is the fixed high end of the thread's stack — at or above
+        // every frame including `main` — so the scan covers all roots
+        // regardless of init nesting. (`currentStackBase` falls back to the SP
+        // only on targets with no OS query / on query failure, never on the
+        // GC-supported darwin/linux targets in normal operation.)
+        .stack_bottom = currentStackBase(),
         .collecting = false,
     };
     return @ptrCast(ctx);
@@ -1086,7 +1214,11 @@ const ZapMemorySection = extern struct {
     core: ZapMemoryManagerCoreV1,
 };
 
-/// The section payload. Exported so the linker does not dead-strip it.
+/// The section payload. Kept `pub` so the source-registered dispatch path
+/// (`runtime.zig`'s `bindSourceActiveManager`) can read it directly as
+/// `active_manager.zap_memory_section`, and `@export`ed (below) in non-test
+/// builds so the linker symbol the weak-extern/driver path discovers is
+/// present and not dead-stripped.
 ///
 /// **`zap_memory_section` is a MANDATORY exported symbol name for every memory
 /// manager.** The runtime's bootstrap (`src/runtime.zig`'s
@@ -1094,7 +1226,7 @@ const ZapMemorySection = extern struct {
 /// name; the driver enforces the contract at build time
 /// (`assertExportsManagerSymbol`). GC declares the TRACED reclamation model in
 /// both the meta header and the core vtable's `declared_caps`.
-pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) = .{
+pub const zap_memory_section: ZapMemorySection = .{
     .meta = .{
         .magic = ZMEM_MAGIC,
         .abi_major = 1,
@@ -1118,6 +1250,31 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .get_capability_desc = gcGetCapabilityDesc,
     },
 };
+
+// Emit the mandatory `zap_memory_section` LINKER SYMBOL only in non-test
+// builds. (The `pub const` above always stays visible as a Zig decl, so this
+// gates ONLY the exported symbol, not the value.)
+//
+// `zap_memory_section` is a MANDATORY exported symbol (spec §3.2): the
+// runtime's `externalMemorySection` discovers it via a weak `@extern`, and the
+// driver's post-link check (`assertExportsManagerSymbol`) enforces its presence
+// in every standalone-compiled manager object. Production manager objects are
+// built by `zap_fork_compile_zig_to_object`, which is never a test build, so
+// the symbol is always present where the contract requires it.
+//
+// Under `builtin.is_test` the SYMBOL is dead: `runtime.zig`'s
+// `externalMemorySection` early-returns null in test mode, so no test reads the
+// section through the linker. Gating EMISSION on `!builtin.is_test` lets the
+// GC manager be aggregated into the same `zig build test` binary alongside the
+// ARC and Tracking managers (`src/root.zig`) without colliding on the single,
+// strongly-linked `zap_memory_section` symbol — two unconditional `export`s of
+// the same name in one binary is a duplicate-symbol link error. The `.section`
+// reproduces the prior `linksection(SECTION_NAME)` byte-for-byte.
+comptime {
+    if (!builtin.is_test) {
+        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // REFCOUNT_V1 panic stubs.
@@ -1296,4 +1453,102 @@ comptime {
     _ = @as(*const RetainSizedClassFn, retainSizedClass);
     _ = @as(*const ReleaseSizedClassFn, releaseSizedClass);
     _ = @as(*const RefcountSizedClassFn, refcountSizedClass);
+}
+
+// ---------------------------------------------------------------------------
+// Tests — conservative stack-base capture (memory-managers--01 / RT-05)
+//
+// These run host-side under `zig build test`: `src/root.zig` aggregates this
+// manager (its `zap_memory_section` export is gated behind `!builtin.is_test`,
+// so it does not collide with the ARC/Tracking managers in the same binary).
+// They exercise the real `gcInit`/`gcAllocate`/`collect` paths on the host
+// target (darwin/aarch64 and linux/x86_64 are the exercised, GC-supported
+// targets).
+// ---------------------------------------------------------------------------
+
+/// Call `gcInit` through a non-inlined boundary so the manager's init frame is
+/// pushed strictly BELOW the caller's frame on the (downward-growing) stack,
+/// reproducing the real startup nesting (`main` → `memoryStartupForEntry` →
+/// `zapMemoryStartup` → vtable `core.init` → `gcInit`). Without the boundary an
+/// optimiser could inline `gcInit` into the test frame, equalising the two
+/// stack pointers and masking the defect.
+fn initThroughNestedFrame() ?*GcContext {
+    const raw = gcInit(null) orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+test "gcInit captures a stack bottom that covers the caller's entry frame" {
+    // A heap root lives in THIS frame (the stand-in for a `main/1` local that
+    // holds the only live reference to a heap object). The conservative scan
+    // span is `[current SP, stack_bottom)`; for this root to be scanned (and
+    // the object it points at kept alive), the captured `stack_bottom` must be
+    // at an address >= this local's address.
+    var entry_frame_root: usize = 0xA5A5_A5A5_A5A5_A5A5;
+    // Force the local to be a real, address-taken stack slot the optimiser
+    // cannot fold into a register or constant.
+    const entry_frame_root_addr = @intFromPtr(&entry_frame_root);
+    std.mem.doNotOptimizeAway(&entry_frame_root);
+
+    const ctx = initThroughNestedFrame() orelse return error.GcInitReturnedNull;
+    defer gcDeinit(@ptrCast(ctx));
+
+    // The defect (RT-05): `stack_bottom` was captured as `gcInit`'s own SP,
+    // which — because `gcInit` runs in a frame BELOW this one — is a LOWER
+    // address than `entry_frame_root_addr`. That excluded this frame's roots
+    // from `[SP, stack_bottom)`, so an entry-frame-only heap reference was
+    // swept while live (use-after-free). The fix captures the true OS thread
+    // stack base (the highest live address), which is at or above every frame
+    // including this one and the `main` frame above it.
+    try std.testing.expect(ctx.stack_bottom >= entry_frame_root_addr);
+
+    // The captured bottom must also be a plausible stack address: at or above
+    // the current SP (the stack grows down, so the bottom is the high end).
+    try std.testing.expect(ctx.stack_bottom >= currentStackPointer());
+}
+
+test "conservative scan keeps an object referenced only from the caller's frame alive across a forced collection" {
+    // End-to-end witness: allocate a heap object, keep its ONLY live reference
+    // in this (entry-stand-in) frame, force enough allocation to cross the
+    // collection threshold, and assert the object's storage was not reclaimed.
+    //
+    // Pre-fix, with `stack_bottom` below this frame, the reference word here is
+    // outside `[SP, stack_bottom)` and the object is swept; the record table no
+    // longer contains it. Post-fix the scan covers this frame, so the object
+    // survives. (Conservative scanning can also incidentally find the pointer
+    // in a register or a lower frame, so this test is a positive witness that
+    // complements the deterministic base-capture assertion above.)
+    const ctx = initThroughNestedFrame() orelse return error.GcInitReturnedNull;
+    defer gcDeinit(@ptrCast(ctx));
+
+    // Allocate one tracked object and write a recognisable pattern into it. Its
+    // address is the sole live root we keep in this frame.
+    const live = gcAllocate(@ptrCast(ctx), 64, @alignOf(usize)) orelse return error.AllocFailed;
+    const live_words: [*]usize = @ptrCast(@alignCast(live));
+    live_words[0] = 0xC0FFEE_1234_5678;
+    const live_addr = @intFromPtr(live);
+    std.mem.doNotOptimizeAway(live);
+
+    // Lower the threshold so a modest amount of churn forces a real collection
+    // without allocating hundreds of KiB in the test.
+    ctx.next_collect_bytes = 0;
+
+    // Churn: allocate-and-drop many objects whose references do NOT survive,
+    // each crossing the (now-zero) threshold so `gcAllocate` runs `collect`.
+    // The churned objects are unreachable and should be swept; `live` must not.
+    var churn: usize = 0;
+    while (churn < 256) : (churn += 1) {
+        const tmp = gcAllocate(@ptrCast(ctx), 64, @alignOf(usize)) orelse return error.AllocFailed;
+        // Immediately forget `tmp` — no live reference is retained.
+        std.mem.doNotOptimizeAway(tmp);
+        ctx.next_collect_bytes = 0;
+    }
+
+    // Run one final explicit collection for good measure.
+    collect(ctx);
+
+    // The live object's record must still be present (it was kept alive by the
+    // conservative scan finding `live_addr` on this frame's stack) and its
+    // payload intact.
+    try std.testing.expect(findOwningRecord(ctx, live_addr) != null);
+    try std.testing.expectEqual(@as(usize, 0xC0FFEE_1234_5678), live_words[0]);
 }

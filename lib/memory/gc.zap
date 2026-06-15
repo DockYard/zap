@@ -50,10 +50,12 @@
     * **Trigger.** When live-heap bytes cross a growth threshold,
       `allocate` runs a full collection before satisfying the request, so a
       long allocate-and-drop loop stays bounded in resident memory.
-    * **Roots.** The collector captures the stack bottom on first allocation,
-      flushes callee-saved registers to the stack, and scans the live stack
-      span, the flushed registers, and the global segments for pointer-like
-      words.
+    * **Roots.** The collector captures the stack bottom at manager `init`
+      as the OS thread stack base (the fixed high end of the thread's
+      stack, so the scan covers the program's entry frame regardless of how
+      deeply `init` is nested), flushes callee-saved registers to the stack,
+      and scans the live stack span, the flushed registers, and the global
+      segments for pointer-like words.
     * **Mark.** Reachable objects are marked via an explicit worklist
       (never deep native recursion), scanning each marked object's bytes for
       further tracked-heap pointers.

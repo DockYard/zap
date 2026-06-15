@@ -198,13 +198,19 @@ test {
     // pipeline using synthesised objects; these imports drive the managers'
     // actual runtime behaviour.
     //
-    // Both managers declare `zap_memory_section`, but each now gates that
+    // All three managers declare `zap_memory_section`, but each gates that
     // export behind `!builtin.is_test` (see the `comptime { @export(...) }`
     // block in each manager). `runtime.zig`'s `externalMemorySection`
     // early-returns null under `builtin.is_test`, so the symbol is dead in
-    // the test binary — gating it out lets BOTH managers be aggregated here
-    // without a duplicate `zap_memory_section` symbol, while the test-only
-    // ARC fallback continues to drive every test allocation.
+    // the test binary — gating it out lets ALL THREE managers be aggregated
+    // here without a duplicate `zap_memory_section` symbol, while the
+    // test-only ARC fallback continues to drive every test allocation.
+    //
+    // The GC manager carries deterministic unit tests for its conservative
+    // stack-base capture (the `stack_bottom` upper bound must cover the
+    // caller's entry frame, so an entry-frame-only heap root is scanned and
+    // never prematurely swept) and an end-to-end mark-sweep survival witness.
     _ = @import("memory/tracking/manager.zig");
     _ = @import("memory/arc/manager.zig");
+    _ = @import("memory/gc/manager.zig");
 }
