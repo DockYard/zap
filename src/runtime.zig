@@ -19289,26 +19289,83 @@ pub const File = struct {
 
     pub fn read(path: []const u8) []const u8 {
         const io = std.Options.debug_io;
-        // One open + stat-for-size + read + close, mirroring the previous
-        // open/fstat/read/close exactly. `openFile` follows symlinks and
-        // opens read-only by default, matching `std.c.open(.RDONLY)`.
+        // One open + stat-for-size + read + close. `openFile` follows
+        // symlinks and opens read-only by default, matching the prior
+        // `std.c.open(.RDONLY)`.
+        //
+        // Contract (`lib/file.zap`): read the ENTIRE contents of the file
+        // regardless of size, returning the empty string ONLY as the
+        // failure / genuinely-empty signal. There is deliberately NO size
+        // cap: a fixed cap silently truncates large files and corrupts the
+        // `File.read`/`File.read!`/`File.cp` contract. Returned bytes live
+        // in `runtime_arena` for the process lifetime, exactly like every
+        // other stdlib `String` result.
         var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return "";
         defer file.close(io);
         const st = file.stat(io) catch return "";
-        const file_size: usize = @intCast(@min(st.size, std.math.maxInt(usize)));
-        if (file_size == 0) return "";
-        const read_size = @min(file_size, 1024 * 1024);
-        const result = bumpAllocAt(.file_read, read_size);
-        if (result.len == 0) return "";
-        // `readSliceShort` fills the buffer with successive reads until it
-        // is full or EOF/short-read occurs — the same "loop until
-        // `read_size` bytes or a zero-length read" semantics as the prior
-        // `std.posix.read` loop. A read failure degrades to whatever was
-        // read so far (`catch 0` ⇒ the partial slice), matching the prior
-        // `catch break`.
+        const stat_size: usize = @intCast(@min(st.size, std.math.maxInt(usize)));
         var file_reader = file.reader(io, &.{});
-        const total = file_reader.interface.readSliceShort(result[0..read_size]) catch 0;
-        return result[0..total];
+
+        // Fast path: the stat size is a reliable hint for an ordinary
+        // regular file, so allocate it up front and fill it in a single
+        // pass with zero extra copies. `readSliceShort` returns fewer than
+        // `stat_size` bytes only at EOF; an I/O failure surfaces as `""`
+        // (the documented failure signal) rather than as a truncated-but-
+        // non-empty buffer masquerading as a complete read.
+        if (stat_size != 0) {
+            const result = bumpAllocAt(.file_read, stat_size);
+            if (result.len == 0) return "";
+            const head = file_reader.interface.readSliceShort(result[0..stat_size]) catch return "";
+            if (head < stat_size) {
+                // The file shrank (or stat over-reported): EOF reached
+                // inside the buffer. Return exactly what was read.
+                return result[0..head];
+            }
+            // The buffer filled exactly. The file may have grown after the
+            // stat, or `stat_size` may have under-reported (e.g. a /proc
+            // pseudo-file). Drain any remaining bytes and, only if there
+            // are any, assemble one contiguous arena buffer of the full
+            // length. The common stable-file case takes neither branch and
+            // returns `result` with no copy.
+            const tail = readRemainingToEnd(&file_reader) orelse return "";
+            defer std.heap.c_allocator.free(tail);
+            if (tail.len == 0) return result;
+            const total = std.math.add(usize, stat_size, tail.len) catch return "";
+            const combined = bumpAllocAt(.file_read, total);
+            if (combined.len == 0) return "";
+            @memcpy(combined[0..stat_size], result);
+            @memcpy(combined[stat_size..total], tail);
+            return combined;
+        }
+
+        // Zero stat size: either a genuinely empty regular file or a
+        // pseudo-file (e.g. /proc) whose size is reported as 0 but which
+        // still streams real content. Read to EOF either way; a genuinely
+        // empty file yields `""`.
+        const data = readRemainingToEnd(&file_reader) orelse return "";
+        defer std.heap.c_allocator.free(data);
+        if (data.len == 0) return "";
+        const result = bumpAllocAt(.file_read, data.len);
+        if (result.len == 0) return "";
+        @memcpy(result, data);
+        return result;
+    }
+
+    /// Drain `file_reader` from its current position to EOF, returning the
+    /// bytes as a `c_allocator`-owned slice the caller must free. There is
+    /// no size limit: the whole remaining stream is read. Returns `null`
+    /// on an I/O / allocation failure so the caller can surface the
+    /// documented empty-string failure signal instead of partial data.
+    fn readRemainingToEnd(file_reader: *std.Io.File.Reader) ?[]u8 {
+        var buffer: std.ArrayList(u8) = .empty;
+        file_reader.interface.appendRemainingUnlimited(std.heap.c_allocator, &buffer) catch {
+            buffer.deinit(std.heap.c_allocator);
+            return null;
+        };
+        return buffer.toOwnedSlice(std.heap.c_allocator) catch {
+            buffer.deinit(std.heap.c_allocator);
+            return null;
+        };
     }
 
     pub fn write(path: []const u8, content: []const u8) bool {
@@ -19366,9 +19423,20 @@ pub const File = struct {
     }
 
     pub fn cp(src: []const u8, dest: []const u8) bool {
-        const content = read(src);
-        if (content.len == 0) return false;
-        return write(dest, content);
+        const io = std.Options.debug_io;
+        // Stream the ENTIRE source to the destination through the portable
+        // `std.Io.Dir.copyFile` primitive: it opens the source, creates the
+        // destination atomically, and copies every byte via `sendFileAll`
+        // (fd-to-fd when available, otherwise a bounded streaming buffer)
+        // with `.unlimited` — so memory stays bounded even for huge files
+        // and NOTHING is silently truncated. It does NOT route through the
+        // (formerly size-capped) `read()`. Empty sources copy faithfully to
+        // an empty destination; any open/read/write/replace failure is
+        // surfaced as `false`. Default options copy the source's
+        // permissions and replace an existing destination.
+        const cwd = std.Io.Dir.cwd();
+        std.Io.Dir.copyFile(cwd, src, cwd, dest, io, .{}) catch return false;
+        return true;
     }
 
     pub fn is_dir(path: []const u8) bool {

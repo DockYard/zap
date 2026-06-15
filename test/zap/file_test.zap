@@ -49,6 +49,51 @@ pub struct Zap.FileTest {
       File.rm("_test_cp_dst.txt")
     }
 
+    test("read returns entire contents of a file larger than 1 MiB") {
+      # Build 2,000,000 bytes of known content with a distinct tail marker
+      # that lives well past the historical 1 MiB (1,048,576-byte) cap, so
+      # any truncation is detectable by both length and content.
+      body = String.repeat("ab", 1_000_000)
+      content = body <> "ZAP_TAIL_MARKER"
+      assert(File.write("_test_large_read.txt", content))
+      read_back = File.read("_test_large_read.txt")
+      assert(String.length(read_back) == 2_000_015)
+      assert(read_back == content)
+      assert(String.ends_with?(read_back, "ZAP_TAIL_MARKER"))
+      File.rm("_test_large_read.txt")
+    }
+
+    test("cp produces a byte-identical copy of a file larger than 1 MiB") {
+      body = String.repeat("xy", 1_000_000)
+      content = body <> "CP_TAIL_MARKER"
+      assert(File.write("_test_large_cp_src.txt", content))
+      assert(File.cp("_test_large_cp_src.txt", "_test_large_cp_dst.txt"))
+      copy = File.read("_test_large_cp_dst.txt")
+      assert(String.length(copy) == 2_000_014)
+      assert(copy == content)
+      assert(String.ends_with?(copy, "CP_TAIL_MARKER"))
+      File.rm("_test_large_cp_src.txt")
+      File.rm("_test_large_cp_dst.txt")
+    }
+
+    test("read and cp round-trip a small file exactly (control)") {
+      assert(File.write("_test_small_rt.txt", "small control content"))
+      assert(File.read("_test_small_rt.txt") == "small control content")
+      assert(File.cp("_test_small_rt.txt", "_test_small_rt_dst.txt"))
+      assert(File.read("_test_small_rt_dst.txt") == "small control content")
+      File.rm("_test_small_rt.txt")
+      File.rm("_test_small_rt_dst.txt")
+    }
+
+    test("cp of an empty source creates an empty destination and succeeds") {
+      assert(File.write("_test_empty_src.txt", ""))
+      assert(File.cp("_test_empty_src.txt", "_test_empty_dst.txt"))
+      assert(File.exists?("_test_empty_dst.txt"))
+      assert(File.read("_test_empty_dst.txt") == "")
+      File.rm("_test_empty_src.txt")
+      File.rm("_test_empty_dst.txt")
+    }
+
     test("mkdir and rmdir") {
       assert(File.mkdir("_test_dir"))
       assert(File.dir?("_test_dir"))
