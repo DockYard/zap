@@ -49,7 +49,10 @@ pub impl Arithmetic for Integer {
   pub fn *(left :: u128, right :: u128) -> u128 { :zig.Kernel.mul_u128(left, right) }
 
   @doc = """
-    Integer truncating division.
+    Integer truncating division. Raises `ArithmeticError` when the divisor
+    is `0` or when the operation overflows (`minInt / -1`); these are checked
+    in every optimize mode because the underlying machine division is
+    undefined there. See `zap explain Z1003`.
     """
 
   pub fn /(left :: i8, right :: i8) -> i8 { :zig.Kernel.divide_i8(left, right) }
@@ -64,7 +67,9 @@ pub impl Arithmetic for Integer {
   pub fn /(left :: u128, right :: u128) -> u128 { :zig.Kernel.divide_u128(left, right) }
 
   @doc = """
-    Integer remainder.
+    Integer remainder. Raises `ArithmeticError` when the divisor is `0` or
+    when the operation overflows (`minInt rem -1`), checked in every optimize
+    mode for the same reason as `/`. See `zap explain Z1003`.
     """
 
   pub fn rem(left :: i8, right :: i8) -> i8 { :zig.Kernel.remainder_i8(left, right) }

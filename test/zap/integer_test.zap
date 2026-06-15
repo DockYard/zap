@@ -308,6 +308,58 @@ pub struct Zap.IntegerTest {
       assert(accept_u128(Integer.bit_reverse(1 :: u128)) == "u128")
     }
 
+    # Edge-case safety value paths (audit stdlib-core--02/03). The fault
+    # paths (div/rem by zero, minInt/-1, pow negative exponent, abs(minInt))
+    # abort via the canonical `arithmetic_error` path — identical to `+`/`-`/`*`
+    # overflow and `index_error` bounds — so they are proven by the runtime
+    # Zig unit tests on `Kernel.intDivFault`; here we pin the value-returning
+    # behavior that previously regressed (silent wrong results, O(exponent)
+    # pow, truncation sign).
+
+    test("integer division truncates toward zero") {
+      assert(9 / 2 == 4)
+      assert(-9 / 2 == -4)
+      assert(9 / -2 == -4)
+    }
+
+    test("remainder sign follows the dividend") {
+      assert(10 rem 3 == 1)
+      assert(-10 rem 3 == -1)
+      assert(10 rem -3 == 1)
+    }
+
+    test("maxInt divided by -1 is representable and correct") {
+      assert(9223372036854775807 / -1 == -9223372036854775807)
+    }
+
+    test("pow returns the correct value via fast exponentiation") {
+      assert(Integer.pow(2, 10) == 1024)
+      assert(Integer.pow(3, 3) == 27)
+      assert(Integer.pow(2, 62) == 4611686018427387904)
+      assert(Integer.pow(-2, 3) == -8)
+      assert(Integer.pow(-2, 4) == 16)
+    }
+
+    test("pow with base one and a huge exponent returns promptly") {
+      # An O(exponent) loop would spin a million times; fast exponentiation
+      # finishes in ~20 iterations.
+      assert(Integer.pow(1, 1000000) == 1)
+    }
+
+    test("gcd handles zero pairs and negative operands") {
+      assert(Integer.gcd(0, 0) == 0)
+      assert(Integer.gcd(0, 5) == 5)
+      assert(Integer.gcd(5, 0) == 5)
+      assert(Integer.gcd(-12, 18) == 6)
+      assert(Integer.gcd(12, -18) == 6)
+      assert(Integer.gcd(-12, -18) == 6)
+    }
+
+    test("lcm with a zero operand is zero") {
+      assert(Integer.lcm(0, 5) == 0)
+      assert(Integer.lcm(5, 0) == 0)
+    }
+
     test("i128 and u128 helpers return correct values") {
       assert(Integer.to_string((9 :: i128) / (2 :: i128)) == "4")
       assert(Integer.to_string((9 :: u128) rem (4 :: u128)) == "1")

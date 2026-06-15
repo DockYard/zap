@@ -12312,11 +12312,14 @@ pub const Kernel = struct {
     pub fn divide(a: anytype, b: anytype) @TypeOf(a) {
         const T = @TypeOf(a);
         const info = @typeInfo(T);
-        if (comptime info == .int) return @divTrunc(a, b);
+        if (comptime info == .int) return divInteger(T, a, b);
         return a / b;
     }
 
     pub fn remainder(a: anytype, b: anytype) @TypeOf(a) {
+        const T = @TypeOf(a);
+        const info = @typeInfo(T);
+        if (comptime info == .int) return remInteger(T, a, b);
         return @rem(a, b);
     }
 
@@ -12616,7 +12619,7 @@ pub const Kernel = struct {
     /// mode an overflow is detected via `@addWithOverflow` and routed
     /// through `Kernel.raise_with_kind("arithmetic_error", ...)`, the same
     /// canonical-abort path an explicit `raise %ArithmeticError{}` uses.
-    const integer_overflow_traps: bool = switch (builtin.mode) {
+    pub const integer_overflow_traps: bool = switch (builtin.mode) {
         .Debug, .ReleaseSafe => true,
         .ReleaseFast, .ReleaseSmall => false,
     };
@@ -12659,6 +12662,59 @@ pub const Kernel = struct {
             if (wrapped[1] != 0) raise_with_kind("arithmetic_error", "integer overflow");
         }
         return wrapped[0];
+    }
+
+    /// Why a `@divTrunc`/`@rem` on `(left, right)` is illegal, or `.ok`.
+    /// Pure classifier so the trap decision is unit-testable without driving
+    /// the diverging `raise_with_kind` abort path. Unlike `+`/`-`/`*`
+    /// overflow (defined two's-complement wrap in fast modes), BOTH of these
+    /// conditions are genuine undefined behavior for the raw Zig builtins in
+    /// EVERY optimize mode — a zero divisor is UB, and `minInt / -1` has no
+    /// representable quotient — so the guard fires unconditionally rather
+    /// than only in the trapping modes.
+    pub const IntDivFault = enum { ok, division_by_zero, overflow };
+
+    pub fn intDivFault(comptime IntType: type, left: IntType, right: IntType) IntDivFault {
+        if (right == 0) return .division_by_zero;
+        // Signed `minInt / -1` overflows the result type; the unsigned and
+        // single-bit (`i0`/`u0` — not used here) families cannot hit it.
+        if (comptime @typeInfo(IntType).int.signedness == .signed and @typeInfo(IntType).int.bits >= 2) {
+            if (right == -1 and left == std.math.minInt(IntType)) return .overflow;
+        }
+        return .ok;
+    }
+
+    /// Integer truncating division with the edge-case safety guard. A zero
+    /// divisor and the `minInt / -1` signed-overflow corner are undefined
+    /// behavior for raw `@divTrunc` in all optimize modes (silent `0` on
+    /// AArch64 ReleaseFast, SIGFPE/illegal on x86_64, safety panic in
+    /// Debug/ReleaseSafe), so they are intercepted in EVERY mode and routed
+    /// through `raise_with_kind("arithmetic_error", ...)` — the same
+    /// canonical abort path the `+`/`-`/`*` overflow policy and the
+    /// `index_error` bounds policy take. Only a fault-free `(left, right)`
+    /// reaches `@divTrunc`, whose result is then always defined.
+    fn divInteger(comptime IntType: type, left: IntType, right: IntType) IntType {
+        switch (intDivFault(IntType, left, right)) {
+            .ok => {},
+            .division_by_zero => raise_with_kind("arithmetic_error", "division by zero"),
+            .overflow => raise_with_kind("arithmetic_error", "integer overflow"),
+        }
+        return @divTrunc(left, right);
+    }
+
+    /// Integer remainder with the edge-case safety guard. Mirrors
+    /// `divInteger`: a zero divisor is UB for raw `@rem` in all modes, and
+    /// while `@rem(minInt, -1)` is mathematically `0`, the raw builtin is
+    /// still illegal behavior at that corner, so both faults abort via
+    /// `raise_with_kind("arithmetic_error", ...)` for behavior identical to
+    /// `divInteger` (`x / y` and `x rem y` fault on exactly the same inputs).
+    fn remInteger(comptime IntType: type, left: IntType, right: IntType) IntType {
+        switch (intDivFault(IntType, left, right)) {
+            .ok => {},
+            .division_by_zero => raise_with_kind("arithmetic_error", "division by zero"),
+            .overflow => raise_with_kind("arithmetic_error", "integer overflow"),
+        }
+        return @rem(left, right);
     }
 
     pub fn add_i8(a: i8, b: i8) i8 {
@@ -12800,34 +12856,34 @@ pub const Kernel = struct {
     }
 
     pub fn divide_i8(a: i8, b: i8) i8 {
-        return @divTrunc(a, b);
+        return divInteger(i8, a, b);
     }
     pub fn divide_i16(a: i16, b: i16) i16 {
-        return @divTrunc(a, b);
+        return divInteger(i16, a, b);
     }
     pub fn divide_i32(a: i32, b: i32) i32 {
-        return @divTrunc(a, b);
+        return divInteger(i32, a, b);
     }
     pub fn divide_i64(a: i64, b: i64) i64 {
-        return @divTrunc(a, b);
+        return divInteger(i64, a, b);
     }
     pub fn divide_i128(a: i128, b: i128) i128 {
-        return @divTrunc(a, b);
+        return divInteger(i128, a, b);
     }
     pub fn divide_u8(a: u8, b: u8) u8 {
-        return @divTrunc(a, b);
+        return divInteger(u8, a, b);
     }
     pub fn divide_u16(a: u16, b: u16) u16 {
-        return @divTrunc(a, b);
+        return divInteger(u16, a, b);
     }
     pub fn divide_u32(a: u32, b: u32) u32 {
-        return @divTrunc(a, b);
+        return divInteger(u32, a, b);
     }
     pub fn divide_u64(a: u64, b: u64) u64 {
-        return @divTrunc(a, b);
+        return divInteger(u64, a, b);
     }
     pub fn divide_u128(a: u128, b: u128) u128 {
-        return @divTrunc(a, b);
+        return divInteger(u128, a, b);
     }
     pub fn divide_f16(a: f16, b: f16) f16 {
         return a / b;
@@ -12846,34 +12902,34 @@ pub const Kernel = struct {
     }
 
     pub fn remainder_i8(a: i8, b: i8) i8 {
-        return @rem(a, b);
+        return remInteger(i8, a, b);
     }
     pub fn remainder_i16(a: i16, b: i16) i16 {
-        return @rem(a, b);
+        return remInteger(i16, a, b);
     }
     pub fn remainder_i32(a: i32, b: i32) i32 {
-        return @rem(a, b);
+        return remInteger(i32, a, b);
     }
     pub fn remainder_i64(a: i64, b: i64) i64 {
-        return @rem(a, b);
+        return remInteger(i64, a, b);
     }
     pub fn remainder_i128(a: i128, b: i128) i128 {
-        return @rem(a, b);
+        return remInteger(i128, a, b);
     }
     pub fn remainder_u8(a: u8, b: u8) u8 {
-        return @rem(a, b);
+        return remInteger(u8, a, b);
     }
     pub fn remainder_u16(a: u16, b: u16) u16 {
-        return @rem(a, b);
+        return remInteger(u16, a, b);
     }
     pub fn remainder_u32(a: u32, b: u32) u32 {
-        return @rem(a, b);
+        return remInteger(u32, a, b);
     }
     pub fn remainder_u64(a: u64, b: u64) u64 {
-        return @rem(a, b);
+        return remInteger(u64, a, b);
     }
     pub fn remainder_u128(a: u128, b: u128) u128 {
-        return @rem(a, b);
+        return remInteger(u128, a, b);
     }
     pub fn remainder_f16(a: f16, b: f16) f16 {
         return @rem(a, b);
@@ -16451,6 +16507,83 @@ pub const MapHelpers = struct {
 // ============================================================
 
 pub const Integer = struct {
+    /// Absolute value with the signed-boundary guard. `abs(minInt)` has no
+    /// representable magnitude (it would overflow back to `minInt`), so the
+    /// public `Integer.abs/1` raises `arithmetic_error` there instead of the
+    /// previous silent `minInt -% minInt = minInt` wrong (negative) result
+    /// that poisoned `gcd`/`lcm`. Defined for signed types only; the unsigned
+    /// helpers return the value unchanged.
+    fn absChecked(comptime IntType: type, value: IntType) IntType {
+        if (value == std.math.minInt(IntType)) {
+            Kernel.raise_with_kind("arithmetic_error", "integer overflow");
+        }
+        return if (value < 0) -value else value;
+    }
+
+    /// `Integer.remainder/2` backing: a zero divisor raises `arithmetic_error`
+    /// (was a silent `0`), and the `minInt rem -1` corner is guarded for the
+    /// same reason `Kernel.remInteger` guards it (raw `@rem` is illegal there).
+    fn remChecked(comptime IntType: type, value: IntType, divisor: IntType) IntType {
+        switch (Kernel.intDivFault(IntType, value, divisor)) {
+            .ok => {},
+            .division_by_zero => Kernel.raise_with_kind("arithmetic_error", "remainder by zero"),
+            .overflow => Kernel.raise_with_kind("arithmetic_error", "integer overflow"),
+        }
+        return @rem(value, divisor);
+    }
+
+    /// `Integer.div/2`-style truncating division backing for the unsigned
+    /// `div_uN` helpers: a zero divisor raises `arithmetic_error` (was a
+    /// silent `0`). Unsigned division cannot hit the `minInt / -1` corner.
+    fn divChecked(comptime IntType: type, value: IntType, divisor: IntType) IntType {
+        switch (Kernel.intDivFault(IntType, value, divisor)) {
+            .ok => {},
+            .division_by_zero => Kernel.raise_with_kind("arithmetic_error", "division by zero"),
+            .overflow => Kernel.raise_with_kind("arithmetic_error", "integer overflow"),
+        }
+        return @divTrunc(value, divisor);
+    }
+
+    /// `Integer.pow/2` backing by exponentiation-by-squaring — O(log exponent)
+    /// rather than the previous O(exponent) loop that hung for a large
+    /// (attacker-influenced) exponent. A negative exponent has no integer
+    /// result (Elixir's `Integer.pow` raises `ArithmeticError`), so it raises
+    /// here too instead of silently returning `1`. Each multiply honors the
+    /// per-optimize-mode overflow policy via `Kernel.mul_*`-equivalent checked
+    /// multiplication, so an overflowing power traps in safe modes exactly
+    /// like `*` and wraps in fast modes.
+    fn powChecked(comptime IntType: type, base: IntType, exponent: IntType) IntType {
+        if (comptime @typeInfo(IntType).int.signedness == .signed) {
+            if (exponent < 0) {
+                Kernel.raise_with_kind("arithmetic_error", "Integer.pow: negative exponent");
+            }
+        }
+        var result: IntType = 1;
+        var b: IntType = base;
+        var e: IntType = exponent;
+        while (e > 0) {
+            if (@rem(e, 2) == 1) {
+                result = mulPow(IntType, result, b);
+            }
+            e = @divTrunc(e, 2);
+            if (e > 0) {
+                b = mulPow(IntType, b, b);
+            }
+        }
+        return result;
+    }
+
+    /// Checked multiply used by `powChecked`, applying the same per-mode
+    /// overflow policy as `Kernel.add/sub/mul`: trap as `arithmetic_error` in
+    /// Debug/ReleaseSafe, wrap in ReleaseFast/ReleaseSmall.
+    fn mulPow(comptime IntType: type, left: IntType, right: IntType) IntType {
+        const wrapped = @mulWithOverflow(left, right);
+        if (comptime Kernel.integer_overflow_traps) {
+            if (wrapped[1] != 0) Kernel.raise_with_kind("arithmetic_error", "integer overflow");
+        }
+        return wrapped[0];
+    }
+
     fn formatSignedDecimal(value: i128) []const u8 {
         var buf: [128]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return "?";
@@ -16555,19 +16688,19 @@ pub const Integer = struct {
     }
 
     pub fn abs_i8(value: i8) i8 {
-        return if (value < 0) 0 -% value else value;
+        return absChecked(i8, value);
     }
 
     pub fn abs_i16(value: i16) i16 {
-        return if (value < 0) 0 -% value else value;
+        return absChecked(i16, value);
     }
 
     pub fn abs_i32(value: i32) i32 {
-        return if (value < 0) 0 -% value else value;
+        return absChecked(i32, value);
     }
 
     pub fn abs_i64(value: i64) i64 {
-        return if (value < 0) 0 -% value else value;
+        return absChecked(i64, value);
     }
 
     pub fn abs_u8(value: u8) u8 {
@@ -16683,23 +16816,19 @@ pub const Integer = struct {
     }
 
     pub fn div_u8(value: u8, divisor: u8) u8 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(u8, value, divisor);
     }
 
     pub fn div_u16(value: u16, divisor: u16) u16 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(u16, value, divisor);
     }
 
     pub fn div_u32(value: u32, divisor: u32) u32 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(u32, value, divisor);
     }
 
     pub fn div_u64(value: u64, divisor: u64) u64 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(u64, value, divisor);
     }
 
     pub fn rem(value: i64, divisor: i64) i64 {
@@ -16707,99 +16836,67 @@ pub const Integer = struct {
     }
 
     pub fn rem_i8(value: i8, divisor: i8) i8 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(i8, value, divisor);
     }
 
     pub fn rem_i16(value: i16, divisor: i16) i16 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(i16, value, divisor);
     }
 
     pub fn rem_i32(value: i32, divisor: i32) i32 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(i32, value, divisor);
     }
 
     pub fn rem_i64(value: i64, divisor: i64) i64 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(i64, value, divisor);
     }
 
     pub fn rem_u8(value: u8, divisor: u8) u8 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(u8, value, divisor);
     }
 
     pub fn rem_u16(value: u16, divisor: u16) u16 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(u16, value, divisor);
     }
 
     pub fn rem_u32(value: u32, divisor: u32) u32 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(u32, value, divisor);
     }
 
     pub fn rem_u64(value: u64, divisor: u64) u64 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(u64, value, divisor);
     }
 
     pub fn pow_i8(base: i8, exponent: i8) i8 {
-        var result: i8 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(i8, base, exponent);
     }
 
     pub fn pow_i16(base: i16, exponent: i16) i16 {
-        var result: i16 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(i16, base, exponent);
     }
 
     pub fn pow_i32(base: i32, exponent: i32) i32 {
-        var result: i32 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(i32, base, exponent);
     }
 
     pub fn pow_i64(base: i64, exponent: i64) i64 {
-        var result: i64 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(i64, base, exponent);
     }
 
     pub fn pow_u8(base: u8, exponent: u8) u8 {
-        var result: u8 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(u8, base, exponent);
     }
 
     pub fn pow_u16(base: u16, exponent: u16) u16 {
-        var result: u16 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(u16, base, exponent);
     }
 
     pub fn pow_u32(base: u32, exponent: u32) u32 {
-        var result: u32 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(u32, base, exponent);
     }
 
     pub fn pow_u64(base: u64, exponent: u64) u64 {
-        var result: u64 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(u64, base, exponent);
     }
 
     pub fn clamp_i8(value: i8, lower: i8, upper: i8) i8 {
@@ -17720,7 +17817,7 @@ pub const Integer = struct {
     }
 
     pub fn abs_i128(value: i128) i128 {
-        return if (value < 0) 0 -% value else value;
+        return absChecked(i128, value);
     }
 
     pub fn abs_u128(value: u128) u128 {
@@ -17749,32 +17846,23 @@ pub const Integer = struct {
     }
 
     pub fn div_u128(value: u128, divisor: u128) u128 {
-        if (divisor == 0) return 0;
-        return @divTrunc(value, divisor);
+        return divChecked(u128, value, divisor);
     }
 
     pub fn rem_i128(value: i128, divisor: i128) i128 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(i128, value, divisor);
     }
 
     pub fn rem_u128(value: u128, divisor: u128) u128 {
-        if (divisor == 0) return 0;
-        return @rem(value, divisor);
+        return remChecked(u128, value, divisor);
     }
 
     pub fn pow_i128(base: i128, exponent: i128) i128 {
-        var result: i128 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(i128, base, exponent);
     }
 
     pub fn pow_u128(base: u128, exponent: u128) u128 {
-        var result: u128 = 1;
-        var remaining = exponent;
-        while (remaining > 0) : (remaining -= 1) result *%= base;
-        return result;
+        return powChecked(u128, base, exponent);
     }
 
     pub fn clamp_i128(value: i128, lower: i128, upper: i128) i128 {
@@ -23864,4 +23952,94 @@ test "ERT plumbing-symbol suppression includes recoverable_raise" {
     try std.testing.expect(isRaisePlumbingSymbol("Kernel.recoverable_raise__1"));
     // A genuine user frame is NOT suppressed.
     try std.testing.expect(!isRaisePlumbingSymbol("Chain.c__0"));
+}
+
+// ---------------------------------------------------------------------------
+// Integer arithmetic edge-case safety (audit stdlib-core--02 / stdlib-core--03)
+//
+// The actual fault paths abort the process via `raise_with_kind` (the same
+// canonical `arithmetic_error` abort the `+`/`-`/`*` overflow policy and the
+// `index_error` bounds policy take), so they cannot be exercised from an
+// in-process unit test without terminating the runner. Instead the pure fault
+// classifier `Kernel.intDivFault` is asserted directly — it is the single
+// decision point both `divInteger`/`remInteger` consult — together with the
+// value-returning helper paths (`pow`/`abs`/`gcd`/`rem`/`divide` on non-fault
+// inputs) whose previous silent-wrong-result / O(exponent) behavior is the
+// other half of the finding.
+// ---------------------------------------------------------------------------
+
+test "Kernel.intDivFault flags zero divisor across signed and unsigned widths" {
+    try std.testing.expectEqual(Kernel.IntDivFault.division_by_zero, Kernel.intDivFault(i64, 10, 0));
+    try std.testing.expectEqual(Kernel.IntDivFault.division_by_zero, Kernel.intDivFault(i8, -5, 0));
+    try std.testing.expectEqual(Kernel.IntDivFault.division_by_zero, Kernel.intDivFault(u32, 7, 0));
+    try std.testing.expectEqual(Kernel.IntDivFault.division_by_zero, Kernel.intDivFault(u128, 1, 0));
+}
+
+test "Kernel.intDivFault flags minInt / -1 overflow for signed types only" {
+    try std.testing.expectEqual(Kernel.IntDivFault.overflow, Kernel.intDivFault(i8, std.math.minInt(i8), -1));
+    try std.testing.expectEqual(Kernel.IntDivFault.overflow, Kernel.intDivFault(i16, std.math.minInt(i16), -1));
+    try std.testing.expectEqual(Kernel.IntDivFault.overflow, Kernel.intDivFault(i32, std.math.minInt(i32), -1));
+    try std.testing.expectEqual(Kernel.IntDivFault.overflow, Kernel.intDivFault(i64, std.math.minInt(i64), -1));
+    try std.testing.expectEqual(Kernel.IntDivFault.overflow, Kernel.intDivFault(i128, std.math.minInt(i128), -1));
+    // Unsigned has no -1 and no minInt overflow corner.
+    try std.testing.expectEqual(Kernel.IntDivFault.ok, Kernel.intDivFault(u64, 0, 1));
+}
+
+test "Kernel.intDivFault passes ordinary operands and minInt by non-(-1)" {
+    try std.testing.expectEqual(Kernel.IntDivFault.ok, Kernel.intDivFault(i64, 10, 3));
+    try std.testing.expectEqual(Kernel.IntDivFault.ok, Kernel.intDivFault(i64, -10, 3));
+    try std.testing.expectEqual(Kernel.IntDivFault.ok, Kernel.intDivFault(i64, std.math.minInt(i64), 2));
+    // maxInt / -1 is representable (== minInt + 1), so it is NOT a fault.
+    try std.testing.expectEqual(Kernel.IntDivFault.ok, Kernel.intDivFault(i64, std.math.maxInt(i64), -1));
+}
+
+test "Kernel.divide/remainder return correct values on safe inputs" {
+    try std.testing.expectEqual(@as(i64, 5), Kernel.divide_i64(10, 2));
+    try std.testing.expectEqual(@as(i64, -4), Kernel.divide_i64(-9, 2)); // truncating
+    try std.testing.expectEqual(@as(i64, 1), Kernel.remainder_i64(10, 3));
+    try std.testing.expectEqual(@as(i64, -1), Kernel.remainder_i64(-10, 3)); // sign follows dividend
+    try std.testing.expectEqual(@as(u64, 3), Kernel.divide_u64(10, 3));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), Kernel.divide_i64(std.math.maxInt(i64), 1));
+}
+
+test "Integer.pow uses fast exponentiation with correct values" {
+    try std.testing.expectEqual(@as(i64, 1), Integer.pow_i64(7, 0));
+    try std.testing.expectEqual(@as(i64, 7), Integer.pow_i64(7, 1));
+    try std.testing.expectEqual(@as(i64, 1024), Integer.pow_i64(2, 10));
+    try std.testing.expectEqual(@as(i64, 27), Integer.pow_i64(3, 3));
+    try std.testing.expectEqual(@as(i64, 1), Integer.pow_i64(1, 1000000)); // would hang in O(exponent)
+    try std.testing.expectEqual(@as(i64, 4611686018427387904), Integer.pow_i64(2, 62));
+    try std.testing.expectEqual(@as(i64, -8), Integer.pow_i64(-2, 3));
+    try std.testing.expectEqual(@as(i64, 16), Integer.pow_i64(-2, 4));
+    try std.testing.expectEqual(@as(u64, 81), Integer.pow_u64(3, 4));
+}
+
+test "Integer.abs returns magnitude on non-boundary inputs" {
+    try std.testing.expectEqual(@as(i64, 7), Integer.abs_i64(-7));
+    try std.testing.expectEqual(@as(i64, 7), Integer.abs_i64(7));
+    try std.testing.expectEqual(@as(i64, 0), Integer.abs_i64(0));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), Integer.abs_i64(std.math.minInt(i64) + 1));
+}
+
+test "Integer.gcd edge cases: zero pairs and negatives normalize to non-negative" {
+    try std.testing.expectEqual(@as(i64, 6), Integer.gcd_i64(12, 18));
+    try std.testing.expectEqual(@as(i64, 0), Integer.gcd_i64(0, 0));
+    try std.testing.expectEqual(@as(i64, 5), Integer.gcd_i64(0, 5));
+    try std.testing.expectEqual(@as(i64, 5), Integer.gcd_i64(5, 0));
+    try std.testing.expectEqual(@as(i64, 6), Integer.gcd_i64(-12, 18));
+    try std.testing.expectEqual(@as(i64, 6), Integer.gcd_i64(12, -18));
+    try std.testing.expectEqual(@as(i64, 6), Integer.gcd_i64(-12, -18));
+}
+
+test "Integer.lcm edge cases: zero operand yields zero" {
+    try std.testing.expectEqual(@as(i64, 12), Integer.lcm_i64(4, 6));
+    try std.testing.expectEqual(@as(i64, 0), Integer.lcm_i64(0, 5));
+    try std.testing.expectEqual(@as(i64, 0), Integer.lcm_i64(5, 0));
+    try std.testing.expectEqual(@as(i64, 0), Integer.lcm_i64(0, 0));
+}
+
+test "Integer.remainder/div helpers return correct values on safe inputs" {
+    try std.testing.expectEqual(@as(i64, 1), Integer.rem_i64(10, 3));
+    try std.testing.expectEqual(@as(i64, 0), Integer.rem_i64(6, 3));
+    try std.testing.expectEqual(@as(u64, 3), Integer.div_u64(10, 3));
 }

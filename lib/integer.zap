@@ -53,7 +53,8 @@ pub struct Integer {
     Returns the absolute value of an integer.
 
     Unsigned integers are already non-negative, so their absolute
-    value is the original value.
+    value is the original value. For signed integers, `abs(minInt)` has no
+    representable magnitude and raises `ArithmeticError`.
     """
 
   pub fn abs(value :: i8) -> i8 { :zig.Integer.abs_i8(value) }
@@ -107,7 +108,9 @@ pub struct Integer {
   }
 
   @doc = """
-    Computes the remainder of integer division.
+    Computes the remainder of integer division. Raises `ArithmeticError`
+    when the divisor is `0` or when the operation overflows (`minInt` with a
+    `-1` divisor).
     """
 
   pub fn remainder(dividend :: i8, divisor :: i8) -> i8 { :zig.Integer.rem_i8(dividend, divisor) }
@@ -122,7 +125,11 @@ pub struct Integer {
   pub fn remainder(dividend :: u128, divisor :: u128) -> u128 { :zig.Integer.rem_u128(dividend, divisor) }
 
   @doc = """
-    Raises `base` to the power of `exponent`.
+    Raises `base` to the power of `exponent` using exponentiation by
+    squaring (O(log exponent)). A negative `exponent` has no integer result
+    and raises `ArithmeticError`. Overflow follows the per-optimize-mode
+    policy: it traps as `ArithmeticError` in Debug/ReleaseSafe and wraps in
+    ReleaseFast/ReleaseSmall, matching `*`.
     """
 
   pub fn pow(base :: i8, exponent :: i8) -> i8 { :zig.Integer.pow_i8(base, exponent) }
