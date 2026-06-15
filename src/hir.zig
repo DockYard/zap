@@ -8713,6 +8713,29 @@ pub const HirBuilder = struct {
         }
     }
 
+    /// Whether a NON-adopting container element already carries a type that is
+    /// assignable to the expected element type. Used by the `.list_init`/
+    /// `.tuple_init`/`.map_init` arms of `adoptNumericLiteralType` to keep
+    /// container adoption TOTAL (audit findings hir-2--01 / TY-03): the
+    /// container only adopts the expected homogeneous type when every element
+    /// either genuinely adopted as an untyped literal OR already satisfies the
+    /// expected element type. A heterogeneous container with an incompatible
+    /// sibling (e.g. `[5, "hello"]` into `List(u8)`) must NOT be restamped —
+    /// doing so would smuggle the incompatible element through and homogenize a
+    /// container the TypeChecker rightly rejects.
+    ///
+    /// #361 invariants preserved: only literals adopt (this validates, never
+    /// restamps, the sibling), and `callMatchCost`/`wideningCost` are unchanged
+    /// — they are USED here for validation, not loosened, so overload selection
+    /// is byte-identical. An `UNKNOWN`/unresolved element type is treated as
+    /// satisfying (the TypeChecker handles genuine unknowns), so adoption is
+    /// not blocked by an element whose type the HIR could not derive.
+    fn nonAdoptingElementSatisfies(self: *const HirBuilder, element: *const Expr, element_expected: TypeId) bool {
+        if (element.type_id == types_mod.TypeStore.UNKNOWN) return true;
+        if (element_expected == types_mod.TypeStore.UNKNOWN) return true;
+        return self.type_store.callMatchCost(element.type_id, element_expected) != null;
+    }
+
     /// Restamp an untyped numeric literal HIR expression to adopt a concrete
     /// numeric `expected_type`, range-checked (task #361). Returns true when an
     /// adoption was performed (so callers can stop), false otherwise.
@@ -8795,38 +8818,73 @@ pub const HirBuilder = struct {
                 if (expected_kind != .list) return false;
                 const element_expected = expected_kind.list.element;
                 var adopted_any = false;
+                var all_qualify = true;
                 for (elements) |element| {
-                    if (self.adoptNumericLiteralType(@constCast(element), element_expected)) adopted_any = true;
+                    if (self.adoptNumericLiteralType(@constCast(element), element_expected)) {
+                        adopted_any = true;
+                    } else if (!self.nonAdoptingElementSatisfies(element, element_expected)) {
+                        // A non-adopting sibling that does NOT already satisfy
+                        // the expected element type makes the container
+                        // heterogeneous — restamping it to the expected
+                        // homogeneous list type would smuggle the incompatible
+                        // sibling through (audit hir-2--01 / TY-03).
+                        all_qualify = false;
+                    }
                 }
-                if (adopted_any) {
+                // Only adopt the container when EVERY element either adopted or
+                // already satisfies the element type, AND at least one element
+                // genuinely adopted. Otherwise leave the container type
+                // untouched so the TypeChecker's mismatch diagnostic stands.
+                if (adopted_any and all_qualify) {
                     // The element widths changed — adopt the expected list
                     // type so the IR builder lowers `List(u8)` rather than
                     // re-deriving `List(i64)` from the (now restamped) elements.
                     expr.type_id = expected_type;
+                    return true;
                 }
-                return adopted_any;
+                return false;
             },
             .tuple_init => |elements| {
                 if (expected_kind != .tuple) return false;
                 if (elements.len != expected_kind.tuple.elements.len) return false;
                 var adopted_any = false;
+                var all_qualify = true;
                 for (elements, expected_kind.tuple.elements) |element, element_expected| {
-                    if (self.adoptNumericLiteralType(@constCast(element), element_expected)) adopted_any = true;
+                    if (self.adoptNumericLiteralType(@constCast(element), element_expected)) {
+                        adopted_any = true;
+                    } else if (!self.nonAdoptingElementSatisfies(element, element_expected)) {
+                        all_qualify = false;
+                    }
                 }
-                if (adopted_any) expr.type_id = expected_type;
-                return adopted_any;
+                if (adopted_any and all_qualify) {
+                    expr.type_id = expected_type;
+                    return true;
+                }
+                return false;
             },
             .map_init => |entries| {
                 if (expected_kind != .map) return false;
                 const key_expected = expected_kind.map.key;
                 const value_expected = expected_kind.map.value;
                 var adopted_any = false;
+                var all_qualify = true;
                 for (entries) |entry| {
-                    if (self.adoptNumericLiteralType(@constCast(entry.key), key_expected)) adopted_any = true;
-                    if (self.adoptNumericLiteralType(@constCast(entry.value), value_expected)) adopted_any = true;
+                    if (self.adoptNumericLiteralType(@constCast(entry.key), key_expected)) {
+                        adopted_any = true;
+                    } else if (!self.nonAdoptingElementSatisfies(entry.key, key_expected)) {
+                        all_qualify = false;
+                    }
+                    if (self.adoptNumericLiteralType(@constCast(entry.value), value_expected)) {
+                        adopted_any = true;
+                    } else if (!self.nonAdoptingElementSatisfies(entry.value, value_expected)) {
+                        all_qualify = false;
+                    }
                 }
-                if (adopted_any) expr.type_id = expected_type;
-                return adopted_any;
+                if (adopted_any and all_qualify) {
+                    expr.type_id = expected_type;
+                    return true;
+                }
+                return false;
             },
             .branch => |branch| {
                 // An `if`/`else` whose arm tails are untyped literals adopts the
@@ -11002,6 +11060,195 @@ test "adoptNumericLiteralType: negating an ordinary literal still adopts a fitti
 
     try std.testing.expect(builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I8));
     try std.testing.expectEqual(types_mod.TypeStore.I8, negated.type_id);
+}
+
+// ============================================================
+// Container-literal adoption (#361) must NOT restamp the container
+// type when a NON-adopting sibling element is incompatible with the
+// expected element type (audit finding hir-2--01 / TY-03).
+//
+// The defect: the `.list_init`/`.tuple_init`/`.map_init` arms set the
+// CONTAINER `type_id` to the expected type whenever ANY element adopted,
+// without verifying that the non-adopting siblings are assignable. A
+// heterogeneous container like `[5, "hello"]` against `List(u8)` thus had
+// its `type_id` restamped to `List(u8)` while the String sibling stayed
+// `String` — smuggling an incompatible element through and homogenizing
+// the container. (The atom-into-`[u32]` form is the silent-corruption
+// vector this restamp materializes.) The fix makes the restamp total:
+// the container only adopts when EVERY element either adopted as an
+// untyped literal OR already has a type assignable to the expected
+// element type (`callMatchCost(element.type_id, element_expected) !=
+// null`); otherwise it returns false and leaves the container type
+// untouched, so the TypeChecker's mismatch diagnostic stands.
+//
+// #361 invariants preserved: only literals adopt (the non-literal
+// sibling is VALIDATED, never restamped), and `callMatchCost`/
+// `wideningCost` are unchanged (used here for validation only, not for
+// overload selection). Pre-fix these tests FAIL (the container is
+// restamped to the homogeneous type and `adopted_any` is true).
+// ============================================================
+
+test "adoptNumericLiteralType: list_init with adopting int and incompatible String sibling does not restamp" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const zero_span = ast.SourceSpan{ .start = 0, .end = 1, .line = 1, .col = 1 };
+    const hello_id = try interner.intern("hello");
+    // `[5, "hello"]`: element 0 (`5`) adopts `u8`; element 1 is a String.
+    // `int_elem` is `var` because `adoptNumericLiteralType` restamps the
+    // adopting literal through `@constCast` before the sibling check decides.
+    var int_elem = Expr{ .kind = .{ .int_lit = 5 }, .type_id = types_mod.TypeStore.I64, .span = zero_span };
+    var str_elem = Expr{ .kind = .{ .string_lit = hello_id }, .type_id = types_mod.TypeStore.STRING, .span = zero_span };
+    const elements = [_]*const Expr{ &int_elem, &str_elem };
+    var list_expr = Expr{ .kind = .{ .list_init = &elements }, .type_id = types_mod.TypeStore.UNKNOWN, .span = zero_span };
+
+    const u8_list = try store.addType(.{ .list = .{ .element = types_mod.TypeStore.U8 } });
+
+    // The container must NOT adopt: the String sibling is incompatible.
+    try std.testing.expect(!builder.adoptNumericLiteralType(&list_expr, u8_list));
+    // The container type is left untouched (UNKNOWN), so the TypeChecker
+    // mismatch is not masked by a homogenizing restamp.
+    try std.testing.expectEqual(types_mod.TypeStore.UNKNOWN, list_expr.type_id);
+    // The incompatible sibling's type is NOT silently changed.
+    try std.testing.expectEqual(types_mod.TypeStore.STRING, str_elem.type_id);
+}
+
+test "adoptNumericLiteralType: list_init of adopting int literals still restamps to the expected element type" {
+    // Positive control: a genuinely-homogeneous numeric literal list still
+    // adopts the expected list type and restamps each element width.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const zero_span = ast.SourceSpan{ .start = 0, .end = 1, .line = 1, .col = 1 };
+    var e0 = Expr{ .kind = .{ .int_lit = 5 }, .type_id = types_mod.TypeStore.I64, .span = zero_span };
+    var e1 = Expr{ .kind = .{ .int_lit = 200 }, .type_id = types_mod.TypeStore.I64, .span = zero_span };
+    const elements = [_]*const Expr{ &e0, &e1 };
+    var list_expr = Expr{ .kind = .{ .list_init = &elements }, .type_id = types_mod.TypeStore.UNKNOWN, .span = zero_span };
+
+    const u8_list = try store.addType(.{ .list = .{ .element = types_mod.TypeStore.U8 } });
+
+    try std.testing.expect(builder.adoptNumericLiteralType(&list_expr, u8_list));
+    try std.testing.expectEqual(u8_list, list_expr.type_id);
+    try std.testing.expectEqual(types_mod.TypeStore.U8, e0.type_id);
+    try std.testing.expectEqual(types_mod.TypeStore.U8, e1.type_id);
+}
+
+test "adoptNumericLiteralType: tuple_init with adopting int and assignable non-literal sibling still adopts" {
+    // Positive control: a non-literal sibling already assignable to its
+    // expected position type (a `Bool` into a `Bool` slot) does not block
+    // adoption of the numeric sibling.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const zero_span = ast.SourceSpan{ .start = 0, .end = 1, .line = 1, .col = 1 };
+    // `{5, true}` against `{u8, Bool}`.
+    var int_elem = Expr{ .kind = .{ .int_lit = 5 }, .type_id = types_mod.TypeStore.I64, .span = zero_span };
+    const bool_elem = Expr{ .kind = .{ .bool_lit = true }, .type_id = types_mod.TypeStore.BOOL, .span = zero_span };
+    const elements = [_]*const Expr{ &int_elem, &bool_elem };
+    var tuple_expr = Expr{ .kind = .{ .tuple_init = &elements }, .type_id = types_mod.TypeStore.UNKNOWN, .span = zero_span };
+
+    const elem_types = [_]TypeId{ types_mod.TypeStore.U8, types_mod.TypeStore.BOOL };
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = &elem_types } });
+
+    try std.testing.expect(builder.adoptNumericLiteralType(&tuple_expr, tuple_type));
+    try std.testing.expectEqual(tuple_type, tuple_expr.type_id);
+    try std.testing.expectEqual(types_mod.TypeStore.U8, int_elem.type_id);
+}
+
+test "adoptNumericLiteralType: tuple_init with adopting int and incompatible String sibling does not restamp" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const zero_span = ast.SourceSpan{ .start = 0, .end = 1, .line = 1, .col = 1 };
+    const hello_id = try interner.intern("hello");
+    // `{5, "hello"}` against `{u8, Bool}`: the String sibling is incompatible.
+    // `int_elem` is `var` (restamped through `@constCast` before the sibling
+    // check decides).
+    var int_elem = Expr{ .kind = .{ .int_lit = 5 }, .type_id = types_mod.TypeStore.I64, .span = zero_span };
+    var str_elem = Expr{ .kind = .{ .string_lit = hello_id }, .type_id = types_mod.TypeStore.STRING, .span = zero_span };
+    const elements = [_]*const Expr{ &int_elem, &str_elem };
+    var tuple_expr = Expr{ .kind = .{ .tuple_init = &elements }, .type_id = types_mod.TypeStore.UNKNOWN, .span = zero_span };
+
+    const elem_types = [_]TypeId{ types_mod.TypeStore.U8, types_mod.TypeStore.BOOL };
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = &elem_types } });
+
+    try std.testing.expect(!builder.adoptNumericLiteralType(&tuple_expr, tuple_type));
+    try std.testing.expectEqual(types_mod.TypeStore.UNKNOWN, tuple_expr.type_id);
+}
+
+test "adoptNumericLiteralType: map_init with adopting int value and incompatible String value does not restamp" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const zero_span = ast.SourceSpan{ .start = 0, .end = 1, .line = 1, .col = 1 };
+    const hello_id = try interner.intern("hello");
+    // `%{1 => 5, 2 => "hello"}` against `Map(u8, u8)`: the second value is
+    // an incompatible String. The adopting int literals are `var` (restamped
+    // through `@constCast` before the value mismatch decides).
+    var k0 = Expr{ .kind = .{ .int_lit = 1 }, .type_id = types_mod.TypeStore.I64, .span = zero_span };
+    var v0 = Expr{ .kind = .{ .int_lit = 5 }, .type_id = types_mod.TypeStore.I64, .span = zero_span };
+    var k1 = Expr{ .kind = .{ .int_lit = 2 }, .type_id = types_mod.TypeStore.I64, .span = zero_span };
+    var v1 = Expr{ .kind = .{ .string_lit = hello_id }, .type_id = types_mod.TypeStore.STRING, .span = zero_span };
+    const entries = [_]MapEntry{
+        .{ .key = &k0, .value = &v0 },
+        .{ .key = &k1, .value = &v1 },
+    };
+    var map_expr = Expr{ .kind = .{ .map_init = &entries }, .type_id = types_mod.TypeStore.UNKNOWN, .span = zero_span };
+
+    const map_type = try store.addType(.{ .map = .{ .key = types_mod.TypeStore.U8, .value = types_mod.TypeStore.U8 } });
+
+    try std.testing.expect(!builder.adoptNumericLiteralType(&map_expr, map_type));
+    try std.testing.expectEqual(types_mod.TypeStore.UNKNOWN, map_expr.type_id);
 }
 
 // ============================================================

@@ -2794,8 +2794,8 @@ pub const TypeChecker = struct {
     /// mismatch/overflow reporting rather than being silently accepted and
     /// rejected far downstream by Zig Sema. Used for struct-field defaults,
     /// variant-field defaults, and struct-init field values.
-    fn acceptsIntegerLiteralForExpectedType(self: *const TypeChecker, expr: *const ast.Expr, expected: TypeId) bool {
-        return switch (self.classifyArgLiteralAdoption(expr, expected)) {
+    fn acceptsIntegerLiteralForExpectedType(self: *TypeChecker, expr: *const ast.Expr, expected: TypeId) !bool {
+        return switch (try self.classifyArgLiteralAdoption(expr, expected)) {
             .adopts => true,
             .overflow, .not_a_literal => false,
         };
@@ -2842,7 +2842,7 @@ pub const TypeChecker = struct {
     ///
     /// Anything else — a `var_ref`, a `field_access`, a call result, a typed
     /// value — is `not_a_literal`, so typed values never adopt.
-    fn classifyArgLiteralAdoption(self: *const TypeChecker, arg: *const ast.Expr, expected: TypeId) LiteralAdoption {
+    fn classifyArgLiteralAdoption(self: *TypeChecker, arg: *const ast.Expr, expected: TypeId) anyerror!LiteralAdoption {
         if (expected == TypeStore.UNKNOWN or expected >= self.store.types.items.len) return .not_a_literal;
         const expected_type = self.store.getType(expected);
         switch (arg.*) {
@@ -2879,7 +2879,7 @@ pub const TypeChecker = struct {
             .list => |list_expr| {
                 if (expected_type != .list) return .not_a_literal;
                 const element_expected = expected_type.list.element;
-                return self.classifyElementLiteralAdoption(list_expr.elements, element_expected);
+                return try self.classifyElementLiteralAdoption(list_expr.elements, element_expected);
             },
             .tuple => |tuple_expr| {
                 if (expected_type != .tuple) return .not_a_literal;
@@ -2890,10 +2890,16 @@ pub const TypeChecker = struct {
                 if (tuple_expr.elements.len != expected_type.tuple.elements.len) return .not_a_literal;
                 var any_adopts = false;
                 for (tuple_expr.elements, expected_type.tuple.elements) |element, element_expected| {
-                    switch (self.classifyArgLiteralAdoption(element, element_expected)) {
+                    switch (try self.classifyArgLiteralAdoption(element, element_expected)) {
                         .adopts => any_adopts = true,
                         .overflow => |o| return .{ .overflow = o },
-                        .not_a_literal => {},
+                        // A non-literal element must STILL satisfy its expected
+                        // position type — adoption only suppresses the mismatch
+                        // diagnostic for the genuinely-adopting literals, never
+                        // for a typed sibling (#361: only literals adopt). If a
+                        // non-literal sibling does not match, the whole tuple is
+                        // not an adoption, so the caller's mismatch fires.
+                        .not_a_literal => if (!try self.nonLiteralSiblingSatisfies(element, element_expected)) return .not_a_literal,
                     }
                 }
                 return if (any_adopts) .adopts else .not_a_literal;
@@ -2908,16 +2914,19 @@ pub const TypeChecker = struct {
                 var any_adopts = false;
                 for (map_expr.fields) |field| {
                     // Both key and value literals adopt their respective
-                    // expected types (`%{5 => 9}` into `Map(u8, u16)`).
-                    switch (self.classifyArgLiteralAdoption(field.key, key_expected)) {
+                    // expected types (`%{5 => 9}` into `Map(u8, u16)`). A
+                    // non-literal key or value must still satisfy its expected
+                    // type — an adopting literal never vouches for a mismatching
+                    // typed sibling (#361: only literals adopt).
+                    switch (try self.classifyArgLiteralAdoption(field.key, key_expected)) {
                         .adopts => any_adopts = true,
                         .overflow => |o| return .{ .overflow = o },
-                        .not_a_literal => {},
+                        .not_a_literal => if (!try self.nonLiteralSiblingSatisfies(field.key, key_expected)) return .not_a_literal,
                     }
-                    switch (self.classifyArgLiteralAdoption(field.value, value_expected)) {
+                    switch (try self.classifyArgLiteralAdoption(field.value, value_expected)) {
                         .adopts => any_adopts = true,
                         .overflow => |o| return .{ .overflow = o },
-                        .not_a_literal => {},
+                        .not_a_literal => if (!try self.nonLiteralSiblingSatisfies(field.value, value_expected)) return .not_a_literal,
                     }
                 }
                 return if (any_adopts) .adopts else .not_a_literal;
@@ -2931,12 +2940,12 @@ pub const TypeChecker = struct {
                 // is not itself an adopting literal makes the whole expression
                 // `not_a_literal` (we cannot retype a non-literal arm).
                 const else_stmts = if_expr.else_block orelse return .not_a_literal;
-                switch (self.classifyBlockTailAdoption(if_expr.then_block, expected)) {
+                switch (try self.classifyBlockTailAdoption(if_expr.then_block, expected)) {
                     .not_a_literal => return .not_a_literal,
                     .overflow => |o| return .{ .overflow = o },
                     .adopts => {},
                 }
-                switch (self.classifyBlockTailAdoption(else_stmts, expected)) {
+                switch (try self.classifyBlockTailAdoption(else_stmts, expected)) {
                     .not_a_literal => return .not_a_literal,
                     .overflow => |o| return .{ .overflow = o },
                     .adopts => {},
@@ -2948,7 +2957,7 @@ pub const TypeChecker = struct {
                 // adopts the expected type (mirrors the return-position rule).
                 if (case_expr.clauses.len == 0) return .not_a_literal;
                 for (case_expr.clauses) |case_clause| {
-                    switch (self.classifyBlockTailAdoption(case_clause.body, expected)) {
+                    switch (try self.classifyBlockTailAdoption(case_clause.body, expected)) {
                         .not_a_literal => return .not_a_literal,
                         .overflow => |o| return .{ .overflow = o },
                         .adopts => {},
@@ -2957,32 +2966,61 @@ pub const TypeChecker = struct {
                 return .adopts;
             },
             .block => |block_expr| {
-                return self.classifyBlockTailAdoption(block_expr.stmts, expected);
+                return try self.classifyBlockTailAdoption(block_expr.stmts, expected);
             },
             else => return .not_a_literal,
         }
     }
 
+    /// Whether a NON-literal container/argument element already satisfies its
+    /// expected element type, so an adopting literal sibling does not need to
+    /// vouch for it. This is the totality guard for container-literal adoption
+    /// (audit findings hir-2--01 / types-1--01, TY-03 / TY-13): adoption may
+    /// only suppress the argument-type-mismatch diagnostic for the genuinely-
+    /// adopting numeric literals; every other (non-adopting / typed) sibling
+    /// must STILL type-check against the element type. A heterogeneous literal
+    /// with an incompatible typed sibling — e.g. `[5, "hello"]` into `[u8]` or
+    /// `{5, "hello"}` into `{u8, Bool}` — is rejected (the caller's mismatch
+    /// fires) rather than silently homogenized.
+    ///
+    /// #361 invariants preserved: only literals adopt (this validates, never
+    /// restamps, the sibling), and `callMatchCost`/`wideningCost` are unchanged
+    /// — they are USED here for validation, not loosened, so overload selection
+    /// is byte-identical. The sibling's type is obtained via `inferExpr`, whose
+    /// memo cache (scoped to the enclosing top-level inference) makes this a
+    /// hit for siblings already inferred when the container's own type was
+    /// computed at the call site.
+    fn nonLiteralSiblingSatisfies(self: *TypeChecker, element: *const ast.Expr, element_expected: TypeId) !bool {
+        const element_type = try self.inferExpr(element);
+        if (element_type == TypeStore.UNKNOWN or element_type == TypeStore.ERROR) return true;
+        return self.callMatchCost(element_type, element_expected) != null;
+    }
+
     /// Classify the tail expression of a block (the value the block produces)
     /// for untyped-literal adoption against `expected`. An empty block, or a
     /// block whose last statement is not an expression, cannot adopt.
-    fn classifyBlockTailAdoption(self: *const TypeChecker, stmts: []const ast.Stmt, expected: TypeId) LiteralAdoption {
+    fn classifyBlockTailAdoption(self: *TypeChecker, stmts: []const ast.Stmt, expected: TypeId) anyerror!LiteralAdoption {
         if (stmts.len == 0) return .not_a_literal;
         const last = stmts[stmts.len - 1];
         if (last != .expr) return .not_a_literal;
-        return self.classifyArgLiteralAdoption(last.expr, expected);
+        return try self.classifyArgLiteralAdoption(last.expr, expected);
     }
 
     /// Shared element-sequence classifier for list literals (and reused for
     /// the list arm above): adopts when at least one element is an adopting
-    /// untyped numeric literal and no element overflows the element type.
-    fn classifyElementLiteralAdoption(self: *const TypeChecker, elements: []const *const ast.Expr, element_expected: TypeId) LiteralAdoption {
+    /// untyped numeric literal and EVERY non-adopting (typed) sibling already
+    /// satisfies the element type. A `.not_a_literal` element whose static type
+    /// does not match the element type makes the WHOLE container not an
+    /// adoption (audit findings hir-2--01 / types-1--01, TY-03 / TY-13), so the
+    /// caller's argument-type-mismatch diagnostic fires for a heterogeneous
+    /// literal like `[5, "hello"]` into `[u8]` rather than being suppressed.
+    fn classifyElementLiteralAdoption(self: *TypeChecker, elements: []const *const ast.Expr, element_expected: TypeId) anyerror!LiteralAdoption {
         var any_adopts = false;
         for (elements) |element| {
-            switch (self.classifyArgLiteralAdoption(element, element_expected)) {
+            switch (try self.classifyArgLiteralAdoption(element, element_expected)) {
                 .adopts => any_adopts = true,
                 .overflow => |o| return .{ .overflow = o },
-                .not_a_literal => {},
+                .not_a_literal => if (!try self.nonLiteralSiblingSatisfies(element, element_expected)) return .not_a_literal,
             }
         }
         return if (any_adopts) .adopts else .not_a_literal;
@@ -5173,7 +5211,7 @@ pub const TypeChecker = struct {
                 const inferred = self.inferExpr(default_expr) catch TypeStore.UNKNOWN;
                 if (inferred == TypeStore.UNKNOWN) continue;
                 if (self.store.typeEquals(inferred, field_type_id)) continue;
-                if (self.acceptsIntegerLiteralForExpectedType(default_expr, field_type_id)) continue;
+                if (try self.acceptsIntegerLiteralForExpectedType(default_expr, field_type_id)) continue;
                 if (self.store.canWidenTo(inferred, field_type_id)) continue;
 
                 const field_name = self.interner.get(field_decl.name);
@@ -5308,7 +5346,7 @@ pub const TypeChecker = struct {
             const inferred = self.inferExpr(default_expr) catch TypeStore.UNKNOWN;
             if (inferred == TypeStore.UNKNOWN) continue;
             if (self.store.typeEquals(inferred, expected_type)) continue;
-            if (self.acceptsIntegerLiteralForExpectedType(default_expr, expected_type)) continue;
+            if (try self.acceptsIntegerLiteralForExpectedType(default_expr, expected_type)) continue;
             if (self.store.canWidenTo(inferred, expected_type)) continue;
 
             // Resolve the formal type-param name (e.g. `T`) that the
@@ -7520,7 +7558,7 @@ pub const TypeChecker = struct {
             // so this single call covers the plain, if-result, and case-result
             // return positions for both int and float literals.
             const return_matches_declared = self.store.typeEqualsModuloCallable(body_type, declared_return) or
-                if (last_expr) |expr| self.acceptsIntegerLiteralForExpectedType(expr, declared_return) else false;
+                if (last_expr) |expr| try self.acceptsIntegerLiteralForExpectedType(expr, declared_return) else false;
             if (!return_matches_declared) {
                 const expected = self.typeToString(declared_return);
                 const got = self.typeToString(body_type);
@@ -8322,7 +8360,7 @@ pub const TypeChecker = struct {
                                         if (val_type != TypeStore.UNKNOWN and expected_type != TypeStore.UNKNOWN and
                                             !self.store.containsTypeVars(expected_type) and
                                             !self.store.typeEquals(val_type, expected_type) and
-                                            !self.acceptsIntegerLiteralForExpectedType(provided.value, expected_type))
+                                            !try self.acceptsIntegerLiteralForExpectedType(provided.value, expected_type))
                                         {
                                             try self.addRichError(
                                                 try std.fmt.allocPrint(self.allocator, "field `{s}` expects `{s}`, got `{s}`", .{
@@ -8705,7 +8743,7 @@ pub const TypeChecker = struct {
     /// the caller emits its normal argument-type-mismatch (preserving "only
     /// literals adopt" — a typed value/binding always returns true here).
     fn argMismatchSurvivesLiteralAdoption(self: *TypeChecker, arg: *const ast.Expr, arg_index: usize, expected: TypeId) !bool {
-        switch (self.classifyArgLiteralAdoption(arg, expected)) {
+        switch (try self.classifyArgLiteralAdoption(arg, expected)) {
             .adopts => return false,
             .overflow => |o| {
                 try self.reportLiteralArgumentOverflow(arg, arg_index, o.value, o.expected);
@@ -15964,11 +16002,11 @@ test "classifyArgLiteralAdoption: negating an INT_MIN literal does not panic and
 
     // Pre-fix: `-INT_MIN` traps here. Post-fix: clean `.not_a_literal` for
     // any signed target — INT_MIN's positive magnitude fits no signed type.
-    switch (checker.classifyArgLiteralAdoption(&negated, TypeStore.I8)) {
+    switch (try checker.classifyArgLiteralAdoption(&negated, TypeStore.I8)) {
         .not_a_literal => {},
         else => return error.TestExpectedNotALiteral,
     }
-    switch (checker.classifyArgLiteralAdoption(&negated, TypeStore.I64)) {
+    switch (try checker.classifyArgLiteralAdoption(&negated, TypeStore.I64)) {
         .not_a_literal => {},
         else => return error.TestExpectedNotALiteral,
     }
@@ -15991,9 +16029,186 @@ test "classifyArgLiteralAdoption: negating an ordinary literal still adopts a fi
     const operand = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 5 } };
     const negated = ast.Expr{ .unary_op = .{ .meta = zero_meta, .op = .negate, .operand = &operand } };
 
-    switch (checker.classifyArgLiteralAdoption(&negated, TypeStore.I8)) {
+    switch (try checker.classifyArgLiteralAdoption(&negated, TypeStore.I8)) {
         .adopts => {},
         else => return error.TestExpectedAdopts,
+    }
+}
+
+// ============================================================
+// Container-literal adoption (#361) must NOT mask a type mismatch of a
+// NON-adopting sibling element (audit findings hir-2--01 / types-1--01,
+// TY-03 / TY-13).
+//
+// The defect: `classifyElementLiteralAdoption` (list), the `.tuple` arm,
+// and the `.map` arm accumulated `any_adopts` from the adopting numeric
+// literal element and SILENTLY IGNORED any `.not_a_literal` sibling. A
+// heterogeneous container like `[5, "hello"]` against `[u8]` therefore
+// classified as `.adopts`, suppressing the argument-type-mismatch
+// diagnostic and smuggling an incompatible sibling through. The fix makes
+// adoption total: a `.not_a_literal` sibling is type-checked against the
+// element type via `callMatchCost(inferExpr(sibling), element_expected)`,
+// and the WHOLE container is `.not_a_literal` (so the caller's mismatch
+// fires) when any non-literal sibling fails. #361 invariants are
+// preserved: only literals adopt, and `callMatchCost`/`wideningCost`
+// remain byte-identical (the fix USES the cost function for validation,
+// it does not change overload selection).
+//
+// Pre-fix these negative tests FAIL (the classifier returns `.adopts`);
+// post-fix they classify the mismatched container as `.not_a_literal`.
+// ============================================================
+
+test "classifyArgLiteralAdoption: list literal with adopting int and incompatible String sibling is not an adoption" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.init(alloc, &interner, &graph);
+    defer checker.deinit();
+
+    const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
+    const hello_id = try interner.intern("hello");
+    // `[5, "hello"]`: element 0 (`5`) adopts `u8`; element 1 is a String
+    // literal — `.not_a_literal`, and `String` does not match `u8`.
+    const int_elem = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 5 } };
+    const str_elem = ast.Expr{ .string_literal = .{ .meta = zero_meta, .value = hello_id } };
+    const elements = [_]*const ast.Expr{ &int_elem, &str_elem };
+    const list_expr = ast.Expr{ .list = .{ .meta = zero_meta, .elements = &elements } };
+
+    // Build a `List(u8)` expected type.
+    const u8_list = try checker.store.addType(.{ .list = .{ .element = TypeStore.U8 } });
+
+    switch (try checker.classifyArgLiteralAdoption(&list_expr, u8_list)) {
+        .not_a_literal => {},
+        else => return error.TestExpectedNotALiteral,
+    }
+}
+
+test "classifyArgLiteralAdoption: list literal of adopting int literals still adopts" {
+    // Positive control: a genuinely-homogeneous numeric literal list still
+    // adopts the element type — the masking fix does not regress #361.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.init(alloc, &interner, &graph);
+    defer checker.deinit();
+
+    const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
+    // `[5, 9, 200]` against `[u8]`: every element adopts.
+    const e0 = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 5 } };
+    const e1 = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 9 } };
+    const e2 = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 200 } };
+    const elements = [_]*const ast.Expr{ &e0, &e1, &e2 };
+    const list_expr = ast.Expr{ .list = .{ .meta = zero_meta, .elements = &elements } };
+
+    const u8_list = try checker.store.addType(.{ .list = .{ .element = TypeStore.U8 } });
+
+    switch (try checker.classifyArgLiteralAdoption(&list_expr, u8_list)) {
+        .adopts => {},
+        else => return error.TestExpectedAdopts,
+    }
+}
+
+test "classifyArgLiteralAdoption: tuple literal with adopting int and incompatible String sibling is not an adoption" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.init(alloc, &interner, &graph);
+    defer checker.deinit();
+
+    const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
+    const hello_id = try interner.intern("hello");
+    // `{5, "hello"}` against `{u8, Bool}`: position 0 adopts `u8`; position 1
+    // is a String literal — `.not_a_literal`, and `String` does not match
+    // `Bool`.
+    const int_elem = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 5 } };
+    const str_elem = ast.Expr{ .string_literal = .{ .meta = zero_meta, .value = hello_id } };
+    const elements = [_]*const ast.Expr{ &int_elem, &str_elem };
+    const tuple_expr = ast.Expr{ .tuple = .{ .meta = zero_meta, .elements = &elements } };
+
+    const elem_types = [_]TypeId{ TypeStore.U8, TypeStore.BOOL };
+    const tuple_type = try checker.store.addType(.{ .tuple = .{ .elements = &elem_types } });
+
+    switch (try checker.classifyArgLiteralAdoption(&tuple_expr, tuple_type)) {
+        .not_a_literal => {},
+        else => return error.TestExpectedNotALiteral,
+    }
+}
+
+test "classifyArgLiteralAdoption: tuple literal with adopting int and assignable non-literal sibling still adopts" {
+    // Positive control: a non-literal sibling that ALREADY satisfies its
+    // expected element type (a `Bool` literal into a `Bool` slot) must NOT
+    // block the adopting numeric sibling. This proves the fix validates,
+    // rather than rejects, assignable non-adopting siblings.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.init(alloc, &interner, &graph);
+    defer checker.deinit();
+
+    const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
+    // `{5, true}` against `{u8, Bool}`: position 0 adopts `u8`; position 1 is
+    // a Bool literal whose inferred type `Bool` matches the expected `Bool`.
+    const int_elem = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 5 } };
+    const bool_elem = ast.Expr{ .bool_literal = .{ .meta = zero_meta, .value = true } };
+    const elements = [_]*const ast.Expr{ &int_elem, &bool_elem };
+    const tuple_expr = ast.Expr{ .tuple = .{ .meta = zero_meta, .elements = &elements } };
+
+    const elem_types = [_]TypeId{ TypeStore.U8, TypeStore.BOOL };
+    const tuple_type = try checker.store.addType(.{ .tuple = .{ .elements = &elem_types } });
+
+    switch (try checker.classifyArgLiteralAdoption(&tuple_expr, tuple_type)) {
+        .adopts => {},
+        else => return error.TestExpectedAdopts,
+    }
+}
+
+test "classifyArgLiteralAdoption: map literal with adopting int value and incompatible String value is not an adoption" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var graph = scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.init(alloc, &interner, &graph);
+    defer checker.deinit();
+
+    const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
+    const hello_id = try interner.intern("hello");
+    // `%{1 => 5, 2 => "hello"}` against `Map(u8, u8)`: the first entry's
+    // value (`5`) adopts `u8`; the second entry's value is a String literal —
+    // `.not_a_literal`, and `String` does not match `u8`.
+    const k0 = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 1 } };
+    const v0 = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 5 } };
+    const k1 = ast.Expr{ .int_literal = .{ .meta = zero_meta, .value = 2 } };
+    const v1 = ast.Expr{ .string_literal = .{ .meta = zero_meta, .value = hello_id } };
+    const fields = [_]ast.MapField{
+        .{ .key = &k0, .value = &v0 },
+        .{ .key = &k1, .value = &v1 },
+    };
+    const map_expr = ast.Expr{ .map = .{ .meta = zero_meta, .fields = &fields } };
+
+    const map_type = try checker.store.addType(.{ .map = .{ .key = TypeStore.U8, .value = TypeStore.U8 } });
+
+    switch (try checker.classifyArgLiteralAdoption(&map_expr, map_type)) {
+        .not_a_literal => {},
+        else => return error.TestExpectedNotALiteral,
     }
 }
 
