@@ -10206,7 +10206,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForCase(guard_node.failure, case_arms, scrutinee_map, dest);
             },
             .switch_literal => |sw| {
-                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(sw.scrutinee, scrutinee_map);
                 for (sw.cases) |case| {
                     const check_local = try self.emitSubPatternCheck(scrutinee_local, case.value);
                     const saved = self.current_instrs;
@@ -10221,7 +10221,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, dest);
             },
             .switch_tag => |sw| {
-                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(sw.scrutinee, scrutinee_map);
                 for (sw.cases) |case| {
                     const tag_name = self.interner.get(case.tag);
                     const match_local = self.next_local;
@@ -10249,7 +10249,7 @@ pub const IrBuilder = struct {
                 // is active" UB on comptime-known scrutinees whose match bound
                 // payloads on more than one arm. The switch_block analyzes only
                 // the active prong, so inactive payload fields are never read.
-                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(sw.scrutinee, scrutinee_map);
                 const union_switch = try self.buildUnionSwitchFromVariantNode(
                     sw,
                     scrutinee_local,
@@ -10268,7 +10268,7 @@ pub const IrBuilder = struct {
                 // inner guard_blocks (from atom switches) appear as flat siblings
                 // in the case_block's pre_instrs, enabling proper if-else nesting
                 // by emitFlatCaseBlock.
-                const scrutinee_local = self.resolveScrutinee(ct.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(ct.scrutinee, scrutinee_map);
                 // When the scrutinee is a tuple extracted from a heterogeneous
                 // keyword list (param-backed list_get with `via_helper`), the
                 // runtime tuple's components are Term while the declared per-
@@ -10352,18 +10352,18 @@ pub const IrBuilder = struct {
                             }
                         }
                     }
-                    const elem_id = if (i < ct.element_scrutinee_ids.len)
-                        ct.element_scrutinee_ids[i]
-                    else
-                        findParamGetIdInDecision(ct.success, i);
-                    try scrutinee_map.put(elem_id, elem_local);
+                    // audit ir-3--06: the pattern compiler always populates
+                    // `element_scrutinee_ids`; require it rather than fall back
+                    // to the removed `findParamGetIdInDecision` heuristic.
+                    if (i >= ct.element_scrutinee_ids.len) return error.MalformedDecisionTree;
+                    try scrutinee_map.put(ct.element_scrutinee_ids[i], elem_local);
                 }
                 // Lower success subtree at the same level — inner guards become
                 // flat guard_blocks that emitFlatCaseBlock can process
                 try self.lowerDecisionTreeForCase(ct.success, case_arms, scrutinee_map, dest);
             },
             .check_list => |cl| {
-                const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(cl.scrutinee, scrutinee_map);
                 // When the scrutinee comes from a param, the runtime element
                 // type may diverge from the declared one (e.g. heterogeneous
                 // keyword list `[name: "x", age: 42]` passed to a function
@@ -10399,15 +10399,11 @@ pub const IrBuilder = struct {
                     if (dispatch_via_helper and elem_type == .tuple) {
                         try self.term_tuple_locals.put(elem_local, elem_type);
                     }
-                    // Use the explicit element_scrutinee_ids when available
-                    // (always populated by the compiler), falling back to the
-                    // legacy heuristic only for older fixtures that may have
-                    // hand-constructed CheckListNodes without the field.
-                    const elem_id = if (i < cl.element_scrutinee_ids.len)
-                        cl.element_scrutinee_ids[i]
-                    else
-                        findParamGetIdInDecision(cl.success, i);
-                    try scrutinee_map.put(elem_id, elem_local);
+                    // audit ir-3--06: the pattern compiler always populates
+                    // `element_scrutinee_ids`; require it rather than fall back
+                    // to the removed `findParamGetIdInDecision` heuristic.
+                    if (i >= cl.element_scrutinee_ids.len) return error.MalformedDecisionTree;
+                    try scrutinee_map.put(cl.element_scrutinee_ids[i], elem_local);
                 }
                 try self.lowerDecisionTreeForCase(cl.success, case_arms, scrutinee_map, dest);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
@@ -10418,7 +10414,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForCase(cl.failure, case_arms, scrutinee_map, dest);
             },
             .check_list_cons => |clc| {
-                const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(clc.scrutinee, scrutinee_map);
                 const scrutinee_list_type = self.known_local_types.get(scrutinee_local) orelse .any;
                 // Same param-backed dispatch shim as check_list — route
                 // through the type-derived list helpers when the scrutinee
@@ -10475,7 +10471,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForCase(clc.failure, case_arms, scrutinee_map, dest);
             },
             .check_binary => |cb| {
-                const scrutinee_local = self.resolveScrutinee(cb.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(cb.scrutinee, scrutinee_map);
                 const len_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
@@ -10510,7 +10506,7 @@ pub const IrBuilder = struct {
             },
             .bind => |bind_node| {
                 // Emit binding: resolve scrutinee and assign to binding local
-                const scrutinee_local = self.resolveScrutinee(bind_node.source, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(bind_node.source, scrutinee_map);
                 // Find matching CaseBinding by name to get the local_index
                 for (case_arms) |arm| {
                     for (arm.bindings) |binding| {
@@ -10523,7 +10519,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForCase(bind_node.next, case_arms, scrutinee_map, dest);
             },
             .extract_struct => |es| {
-                const scrutinee_local = self.resolveScrutinee(es.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(es.scrutinee, scrutinee_map);
                 const struct_type = self.structTypeForFieldReceiver(scrutinee_local);
                 for (es.fields) |fe| {
                     const field_local = self.next_local;
@@ -10575,7 +10571,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForCase(es.success, case_arms, scrutinee_map, dest);
             },
             .extract_map => |em| {
-                const scrutinee_local = self.resolveScrutinee(em.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(em.scrutinee, scrutinee_map);
                 // Pull the map's K/V from the scrutinee's known type
                 // so the ZIR emitter looks up the right `Map(K, V)`
                 // cell. Falls back to atom→i64 for legacy maps that
@@ -10788,7 +10784,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(guard_node.failure, clauses, scrutinee_map);
             },
             .switch_literal => |sw| {
-                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(sw.scrutinee, scrutinee_map);
                 for (sw.cases) |case| {
                     const skip = self.shouldSkipTypeCheck(scrutinee_local, case.value);
                     const check_local = try self.emitSubPatternCheckWithSkip(scrutinee_local, case.value, skip);
@@ -10804,7 +10800,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(sw.default, clauses, scrutinee_map);
             },
             .switch_tag => |sw| {
-                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(sw.scrutinee, scrutinee_map);
                 for (sw.cases) |case| {
                     const tag_name = self.interner.get(case.tag);
                     const match_local = self.next_local;
@@ -10830,7 +10826,7 @@ pub const IrBuilder = struct {
                 // tag check, then inside the guard body extract the
                 // payload via variant_payload_get and bind it under
                 // the case's payload_scrutinee_id before recursing.
-                const scrutinee_local = self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(sw.scrutinee, scrutinee_map);
                 for (sw.cases) |case| {
                     const variant_name = self.interner.get(case.variant_name);
                     const tag_check_local = self.next_local;
@@ -10866,7 +10862,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(sw.default, clauses, scrutinee_map);
             },
             .check_tuple => |ct| {
-                const scrutinee_local = self.resolveScrutinee(ct.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(ct.scrutinee, scrutinee_map);
                 const type_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
@@ -10881,11 +10877,11 @@ pub const IrBuilder = struct {
                     try self.current_instrs.append(self.allocator, .{
                         .index_get = .{ .dest = elem_local, .object = scrutinee_local, .index = i },
                     });
-                    const elem_id = if (i < ct.element_scrutinee_ids.len)
-                        ct.element_scrutinee_ids[i]
-                    else
-                        findParamGetIdInDecision(ct.success, i);
-                    try scrutinee_map.put(elem_id, elem_local);
+                    // audit ir-3--06: the pattern compiler always populates
+                    // `element_scrutinee_ids`; require it rather than fall back
+                    // to the removed `findParamGetIdInDecision` heuristic.
+                    if (i >= ct.element_scrutinee_ids.len) return error.MalformedDecisionTree;
+                    try scrutinee_map.put(ct.element_scrutinee_ids[i], elem_local);
                 }
                 try self.lowerDecisionTreeForDispatch(ct.success, clauses, scrutinee_map);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
@@ -10896,7 +10892,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(ct.failure, clauses, scrutinee_map);
             },
             .check_list => |cl| {
-                const scrutinee_local = self.resolveScrutinee(cl.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(cl.scrutinee, scrutinee_map);
                 const elem_type = self.listElementTypeForLocal(scrutinee_local) orelse
                     return error.ListElementTypeUnavailable;
                 // Emit: __local_N = scrutinee.len == expected_length
@@ -10917,7 +10913,16 @@ pub const IrBuilder = struct {
                     });
                     try self.known_local_types.put(elem_local, elem_type);
                     try self.recordListChildHirType(scrutinee_local, elem_local, .element);
-                    try scrutinee_map.put(findParamGetIdInDecision(cl.success, i), elem_local);
+                    // audit ir-3--06: use the pattern compiler's authoritative
+                    // per-element scrutinee IDs (the case path already does this
+                    // at the sibling check_list arm). The old
+                    // `findParamGetIdInDecision` heuristic guessed the mapping
+                    // and, with a wildcard early element + a literal/binding on a
+                    // later element, mapped the value under the wrong element's
+                    // ID — comparing/binding against element 0 and silently
+                    // selecting the wrong clause or binding the wrong value.
+                    if (i >= cl.element_scrutinee_ids.len) return error.MalformedDecisionTree;
+                    try scrutinee_map.put(cl.element_scrutinee_ids[i], elem_local);
                 }
                 try self.lowerDecisionTreeForDispatch(cl.success, clauses, scrutinee_map);
                 const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
@@ -10928,7 +10933,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(cl.failure, clauses, scrutinee_map);
             },
             .check_list_cons => |clc| {
-                const scrutinee_local = self.resolveScrutinee(clc.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(clc.scrutinee, scrutinee_map);
                 const elem_type = self.listElementTypeForLocal(scrutinee_local) orelse
                     return error.ListElementTypeUnavailable;
                 const scrutinee_list_type = self.known_local_types.get(scrutinee_local) orelse .any;
@@ -10974,7 +10979,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(clc.failure, clauses, scrutinee_map);
             },
             .check_binary => |cb| {
-                const scrutinee_local = self.resolveScrutinee(cb.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(cb.scrutinee, scrutinee_map);
                 // Emit length check
                 const len_check_local = self.next_local;
                 self.next_local += 1;
@@ -11047,7 +11052,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(cb.failure, clauses, scrutinee_map);
             },
             .bind => |bind_node| {
-                const scrutinee_local = self.resolveScrutinee(bind_node.source, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(bind_node.source, scrutinee_map);
                 for (clauses) |clause| {
                     for (clause.list_bindings) |binding| {
                         if (binding.name == bind_node.name) {
@@ -11065,7 +11070,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(bind_node.next, clauses, scrutinee_map);
             },
             .extract_struct => |es| {
-                const scrutinee_local = self.resolveScrutinee(es.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(es.scrutinee, scrutinee_map);
                 const struct_type = self.structTypeForFieldReceiver(scrutinee_local);
                 for (es.fields) |fe| {
                     const field_local = self.next_local;
@@ -11105,7 +11110,7 @@ pub const IrBuilder = struct {
                 try self.lowerDecisionTreeForDispatch(es.success, clauses, scrutinee_map);
             },
             .extract_map => |em| {
-                const scrutinee_local = self.resolveScrutinee(em.scrutinee, scrutinee_map);
+                const scrutinee_local = try self.resolveScrutinee(em.scrutinee, scrutinee_map);
                 // Pull the map's K/V from the scrutinee's known type
                 // so the ZIR emitter looks up the right `Map(K, V)`
                 // cell. Falls back to atom→i64 for legacy maps that
@@ -11153,14 +11158,23 @@ pub const IrBuilder = struct {
     }
 
     /// Resolve a scrutinee expression from the decision tree to an IR local.
-    fn resolveScrutinee(self: *IrBuilder, expr: *const hir_mod.Expr, scrutinee_map: *std.AutoHashMap(u32, LocalId)) LocalId {
+    /// Resolve a decision-tree scrutinee expression (always a `param_get`
+    /// carrying a SCRUTINEE ID, not a raw parameter index) to the IR local
+    /// holding its value. Every parameter is seeded into `scrutinee_map` at
+    /// the dispatch/case entry, and each check/extract node seeds its child
+    /// element/payload scrutinee IDs before recursing, so a well-formed tree
+    /// always resolves.
+    ///
+    /// audit ir-3--06: this previously returned `LocalId 0` on any miss (a
+    /// non-`param_get` scrutinee, or a scrutinee ID absent from the map),
+    /// silently substituting the FIRST parameter's local for the intended
+    /// value — a silent miscompile. A miss now indicates a malformed decision
+    /// tree (a compiler bug) and is surfaced as an error rather than papered
+    /// over.
+    fn resolveScrutinee(self: *IrBuilder, expr: *const hir_mod.Expr, scrutinee_map: *std.AutoHashMap(u32, LocalId)) !LocalId {
         _ = self;
-        if (expr.kind == .param_get) {
-            if (scrutinee_map.get(expr.kind.param_get)) |local| {
-                return local;
-            }
-        }
-        return 0;
+        if (expr.kind != .param_get) return error.UnresolvedScrutinee;
+        return scrutinee_map.get(expr.kind.param_get) orelse error.UnresolvedScrutinee;
     }
 
     /// Lower a guard expression from the decision tree, resolving param_get
@@ -15901,99 +15915,6 @@ const recoverable_raise_sink_call_name = "Kernel__recoverable_raise__1";
 /// edge rather than a ZIR-noreturn branch.
 fn callNameIsRecoverableRaiseSink(name: []const u8) bool {
     return std.mem.eql(u8, name, recoverable_raise_sink_call_name);
-}
-
-fn findParamGetIdInDecision(decision: *const hir_mod.Decision, target_element: u32) u32 {
-    switch (decision.*) {
-        .check_tuple => |ct| {
-            // This is a nested tuple check. The scrutinee expr tells us the ID.
-            if (ct.scrutinee.kind == .param_get) {
-                return ct.scrutinee.kind.param_get;
-            }
-            return findParamGetIdInDecision(ct.success, target_element);
-        },
-        .switch_literal => |sw| {
-            if (sw.scrutinee.kind == .param_get) {
-                // The first switch_literal we encounter should be for element 0,
-                // second for element 1, etc. But we need to trace the right one.
-                // We track by counting: the decision tree puts elements in order.
-                if (target_element == 0) return sw.scrutinee.kind.param_get;
-                // For other elements, look in default/cases
-                if (sw.cases.len > 0) {
-                    return findParamGetIdInDecision(sw.cases[0].next, target_element - 1);
-                }
-                return findParamGetIdInDecision(sw.default, target_element - 1);
-            }
-            return findParamGetIdInDecision(sw.default, target_element);
-        },
-        .switch_tag => |sw| {
-            if (sw.scrutinee.kind == .param_get) {
-                if (target_element == 0) return sw.scrutinee.kind.param_get;
-                if (sw.cases.len > 0) {
-                    return findParamGetIdInDecision(sw.cases[0].next, target_element - 1);
-                }
-                return findParamGetIdInDecision(sw.default, target_element - 1);
-            }
-            return findParamGetIdInDecision(sw.default, target_element);
-        },
-        .check_list => |cl| {
-            if (cl.scrutinee.kind == .param_get) {
-                return cl.scrutinee.kind.param_get;
-            }
-            return findParamGetIdInDecision(cl.success, target_element);
-        },
-        .check_list_cons => |clc| {
-            if (clc.scrutinee.kind == .param_get) {
-                return clc.scrutinee.kind.param_get;
-            }
-            return findParamGetIdInDecision(clc.success, target_element);
-        },
-        .check_binary => |cb| {
-            if (cb.scrutinee.kind == .param_get) {
-                return cb.scrutinee.kind.param_get;
-            }
-            return findParamGetIdInDecision(cb.success, target_element);
-        },
-        .extract_struct => |es| {
-            if (es.scrutinee.kind == .param_get) {
-                return es.scrutinee.kind.param_get;
-            }
-            return findParamGetIdInDecision(es.success, target_element);
-        },
-        .extract_map => |em| {
-            if (em.scrutinee.kind == .param_get) {
-                return em.scrutinee.kind.param_get;
-            }
-            return findParamGetIdInDecision(em.success, target_element);
-        },
-        .switch_variant => |sw| {
-            if (sw.scrutinee.kind == .param_get) {
-                if (target_element == 0) return sw.scrutinee.kind.param_get;
-                if (sw.cases.len > 0) {
-                    return findParamGetIdInDecision(sw.cases[0].next, target_element - 1);
-                }
-                return findParamGetIdInDecision(sw.default, target_element - 1);
-            }
-            return findParamGetIdInDecision(sw.default, target_element);
-        },
-        .guard => |g| return findParamGetIdInDecision(g.success, target_element),
-        .bind => |b| {
-            if (b.source.kind == .param_get) {
-                if (target_element == 0) return b.source.kind.param_get;
-                return findParamGetIdInDecision(b.next, target_element - 1);
-            }
-            return findParamGetIdInDecision(b.next, target_element);
-        },
-        .success => {
-            // We need to derive the ID from the pattern. The compilePatternMatrix
-            // allocates IDs sequentially starting from a base. The base for tuple
-            // element N of scrutinee S is: the next_id at the time of tuple expansion.
-            // Since we don't store that, use a heuristic: the first referenced param_get
-            // ID + target_element offset.
-            return target_element;
-        },
-        .failure => return target_element,
-    }
 }
 
 /// Map a ZigType to a canonical short name for generic container encoding.

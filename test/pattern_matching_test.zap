@@ -93,6 +93,44 @@ pub struct PatternMatchingTest {
     }
   }
 
+  describe("fixed-length list clause dispatch binds the correct element (ir-3--06)") {
+    # Regression for audit finding ir-3--06: in the multi-clause function-head
+    # dispatch path, fixed-length list element -> scrutinee-ID mapping was
+    # guessed by `findParamGetIdInDecision` instead of using the pattern
+    # compiler's `element_scrutinee_ids`. With a WILDCARD first element and a
+    # LITERAL on a later element, the literal was compared against the wrong
+    # element (element 0), so the wrong clause was silently selected.
+    test("literal on the second element selects the matching clause") {
+      # `pick([_, 5])` must match when the SECOND element is 5, regardless of
+      # the first. Pre-fix, `5` was compared against element 0 (=9), so this
+      # fell through to the catch-all and returned :other.
+      assert(pick([9, 5]) == :second_is_five)
+    }
+
+    test("a non-matching second element falls through to the catch-all") {
+      assert(pick([9, 6]) == :other)
+    }
+
+    test("the literal-second clause does not fire when only the first element is 5") {
+      assert(pick([5, 9]) == :other)
+    }
+
+    # Binding correctness: a wildcard first element and a BOUND second element
+    # must bind the second element's value, not the first's.
+    test("binds the second element value, not the first") {
+      assert(second([7, 8]) == 8)
+    }
+
+    test("binds the third element value with two leading wildcards") {
+      assert(third([1, 2, 3]) == 3)
+    }
+
+    # All three elements bound: each binding must map to its own element.
+    test("three bound elements each map to their own value") {
+      assert(spread([10, 20, 30]) == 102030)
+    }
+  }
+
   fn describe(:ok :: Atom) -> String {
     "success"
   }
@@ -155,5 +193,47 @@ pub struct PatternMatchingTest {
       [_a, _b] -> :pair_exact
       [_h | _t] -> :longer
     }
+  }
+
+  # ---- ir-3--06 fixed-length list clause dispatch fixtures ----
+
+  # Multi-clause function heads with fixed-length list patterns. The first
+  # clause has a WILDCARD first element and a LITERAL (5) second element — the
+  # exact shape where the element->scrutinee-ID heuristic mis-mapped element 0
+  # under element 1's ID and compared the literal against the wrong element.
+  fn pick([_, 5] :: [i64]) -> Atom {
+    :second_is_five
+  }
+
+  fn pick(_ :: [i64]) -> Atom {
+    :other
+  }
+
+  # Wildcard first element, bound second element: must bind the SECOND value.
+  fn second([_, x] :: [i64]) -> i64 {
+    x
+  }
+
+  fn second(_ :: [i64]) -> i64 {
+    -1
+  }
+
+  # Two leading wildcards, bound third element: must bind the THIRD value.
+  fn third([_, _, x] :: [i64]) -> i64 {
+    x
+  }
+
+  fn third(_ :: [i64]) -> i64 {
+    -1
+  }
+
+  # All three elements bound: each must map to its own element value
+  # (10*10000 + 20*100 + 30 = 102030 distinguishes any cross-binding).
+  fn spread([a, b, c] :: [i64]) -> i64 {
+    a * 10000 + b * 100 + c
+  }
+
+  fn spread(_ :: [i64]) -> i64 {
+    -1
   }
 }
