@@ -709,6 +709,50 @@ pub struct Zest.Case {
     }
   }
 
+  @doc = """
+    Asserts that a block triggers no memory FAULTS.
+
+    `assert_no_memory_faults { <block> }` runs `<block>` and asserts that the
+    active memory manager reported no memory fault — a double-free / invalid
+    free, a use-after-free / out-of-bounds write, or a deallocation
+    size/alignment mismatch — while it ran. It samples the manager's fault
+    count immediately before and after the block; a positive delta fails the
+    assertion.
+
+    This is the fault-side companion to `assert_no_leaks`. A double-free or
+    use-after-free nets ZERO on the live-allocation count (the first free is
+    clean and the second frees nothing), so it is invisible to
+    `assert_no_leaks`; `assert_no_memory_faults` is the assertion that catches
+    it. Both are typically used together.
+
+    Requires the test target to select `Memory.Tracking` (the manager that
+    validates every free and reports faults). Under any other manager no fault
+    is ever reported, so the assertion is a documented no-op that passes.
+
+    ## Examples
+
+        case("shared boxed value is not double-freed") {
+          assert_no_memory_faults {
+            handlers = build_handler_map()
+            grown = Map.put(handlers, :id, default_handler())
+            assert(Map.size(grown) == 3)
+          }
+        }
+    """
+
+  pub macro assert_no_memory_faults(block :: Expr) -> Expr {
+    code = source_text(block)
+    location = source_location(block)
+
+    quote {
+      zest_fault_tracking_active = :zig.Memory.fault_tracking_active()
+      zest_fault_before_count = :zig.Memory.memory_fault_count()
+      unquote(block)
+      zest_fault_after_count = :zig.Memory.memory_fault_count()
+      Zest.Assertion.no_memory_faults_result(zest_fault_tracking_active, zest_fault_before_count, zest_fault_after_count, unquote(code), unquote(location))
+    }
+  }
+
   macro comparison_operator?(operator_name :: Expr) -> Expr {
     if operator_name == "==" {
       true

@@ -10451,6 +10451,22 @@ const LeakReportState = struct {
 
 var leak_report_state: LeakReportState = .{};
 
+/// Process-wide count of memory FAULTS the manager has reported at
+/// `core.deallocate` time: invalid free (double-free / foreign pointer),
+/// use-after-free / out-of-bounds canary corruption, and deallocation
+/// size/alignment mismatch. Distinct from the deinit-time survivor LEAK
+/// batch (`leak_report_state.count`): a fault is an isolated, immediate
+/// `core.deallocate` event with NO net effect on the live-allocation count
+/// (a double-free's first free is clean and the second frees nothing), so
+/// it is INVISIBLE to a `live_allocation_count` checkpoint. This counter is
+/// the fault-side mirror of `liveAllocationStats().count`, letting a Zest
+/// `assert_no_memory_faults { <block> }` observe a double-free / UAF that a
+/// leak checkpoint cannot. Bumped by `leakReportSink` for the three
+/// immediate-fault kinds; only ever incremented under a manager whose
+/// `core.deallocate` validates frees (`Memory.Tracking`), so it stays 0
+/// under every non-tracking manager (where the assertion no-ops and passes).
+var memory_fault_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
 /// Resolve the `--error-format` / `--leaks-fatal` knobs once, from the
 /// environment the CLI threads in (`ZAP_ERROR_FORMAT`, `ZAP_LEAKS_FATAL`).
 /// Env-driven (not comptime) because they are per-invocation CI/tooling
@@ -10481,8 +10497,25 @@ fn leakReportSink(sink_ctx: ?*anyopaque, record: *const AbiV1.ZapLeakRecord) cal
         .use_after_free_or_oob,
         .invalid_free,
         .dealloc_mismatch,
-        => renderMemoryFaultImmediate(record),
+        => {
+            // Count the fault BEFORE rendering so a Zest `assert_no_memory_faults`
+            // checkpoint observes it even if the render path is later made fatal.
+            // A double-free / UAF nets zero on the live-allocation count, so this
+            // counter is the only assertion-observable signal for it.
+            _ = memory_fault_count.fetchAdd(1, .monotonic);
+            renderMemoryFaultImmediate(record);
+        },
     }
+}
+
+/// Process-wide count of memory faults (invalid free / use-after-free / OOB /
+/// dealloc mismatch) reported by the active manager at `core.deallocate` time.
+/// Read by Zest's `assert_no_memory_faults { <block> }` before and after a
+/// block; a positive delta is a double-free / UAF the block triggered. Returns
+/// 0 under any manager whose `core.deallocate` does not validate frees (the
+/// counter is never bumped there, so the assertion no-ops and passes).
+pub fn memoryFaultCount() u64 {
+    return memory_fault_count.load(.monotonic);
 }
 
 /// Append a surviving-allocation record to the accumulator, copying the
@@ -15045,6 +15078,18 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // Gated on `eager_individual_free` (INDIVIDUAL_NO_REFCOUNT only):
             // under BULK_OR_NEVER / TRACED there is no individual free, so the
             // whole loop — including the `mut.entriesPtr()` access — is elided.
+            // Box-in-container deep-release under a no-REFCOUNT_V1 manager — the
+            // exact `List.release` analog (FCC residual-4: Map-of-boxes).
+            // Deep-release each populated entry's eagerly-freed K/V children and
+            // POISON the slot so a repeated release of an aliased cell (shared
+            // across owners, each emitting a no-op `release`) frees nothing —
+            // idempotent exactly-once without a refcount. Comptime-elided whole
+            // when neither K nor V has an eagerly-freed child, and skipped under
+            // REFCOUNT_V1 (the deep_walk callback + refcount bumps handle it).
+            //
+            // Gated on `eager_individual_free` (INDIVIDUAL_NO_REFCOUNT only):
+            // under BULK_OR_NEVER / TRACED there is no individual free, so the
+            // whole loop — including the `mut.entriesPtr()` access — is elided.
             if (comptime eager_individual_free and
                 (ArcRuntime.elementHasEagerlyFreedChild(K) or ArcRuntime.elementHasEagerlyFreedChild(V)))
             {
@@ -15086,10 +15131,14 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// `INDIVIDUAL_NO_REFCOUNT` + `CLONE_ON_SHARE` (Tracking) model — the
         /// exact `List.cloneForShare` analog. A persistent second owner gets an
         /// INDEPENDENT deep clone of the buffer (deep-cloning eagerly-freed K/V
-        /// children via `cloneBufferRetainingChildren`'s `retainEntryKey` /
-        /// `retainEntryValue`, which under `clone_on_share_active` clone rather
-        /// than bump) so each owner uniquely owns its buffer: in-place mutation
+        /// children via the per-entry `ownEntryKey` / `ownEntryValue` in the
+        /// loop below, which under `clone_on_share_active` clone rather than
+        /// bump) so each owner uniquely owns its buffer: in-place mutation
         /// stays sound and `Map.release` frees exactly one buffer per owner.
+        /// This is the SHARE case (source AND clone both survive) — distinct
+        /// from `cloneBufferRetainingChildren`, which clones for a CONSUMED
+        /// receiver (`put`/`delete` result) where the source is abandoned, so
+        /// that helper bare-retains (one surviving owner) rather than clones.
         /// Only reached under `clone_on_share_active`.
         pub fn cloneForShare(map: ?*const Self) ?*const Self {
             const m = map orelse return null;
@@ -15137,6 +15186,18 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const new_entries = fresh.entriesPtr();
             for (0..self.len) |i| {
                 new_entries[i] = old_entries[i];
+                // The fresh buffer is the put/delete RESULT and `self` is the
+                // CONSUMED receiver (`Map.put`/`Map.delete` slot 0 is `.owned`),
+                // so this clone is the SOLE surviving owner of each entry — the
+                // original is abandoned, never separately released. A bare
+                // retain (refcount bump under REFCOUNTED, no-op under Tracking)
+                // therefore hands the inners to exactly one owner: no double-
+                // free. This is NOT a value-semantic SHARE (that is
+                // `cloneForShare`, which `ownEntryKey`/`ownEntryValue`-clones
+                // because BOTH the source and the clone survive); conflating the
+                // two and clone-on-share-cloning here would orphan the consumed
+                // receiver's inners (a leak). Keys/values that are themselves
+                // eagerly-freed are moved, not duplicated, into the result.
                 retainEntryKey(new_entries[i].key);
                 retainEntryValue(new_entries[i].value);
             }
@@ -15250,8 +15311,18 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
             }
             const self = map orelse {
-                retainEntryValue(default);
-                return default;
+                // Null map: the result IS the caller-supplied `default`. Give
+                // the new owner an independent copy (clone-on-share under
+                // no-REFCOUNT_V1) exactly as the absent-key and found paths do
+                // — the caller's `default` argument is its own owner that the
+                // caller scope-exit drops, so the returned value must NOT alias
+                // its eagerly-freed inner. A bare `retainEntryValue` here is a
+                // no-op under `Memory.Tracking` and aliases the default's boxed
+                // inner with the returned value; both then deep-free it — a
+                // double-free (`invalid free`) / use-after-free (runtime-3--01).
+                // Under REFCOUNTED `ownEntryValue` folds to the refcount bump,
+                // so this is byte-identical to the prior behaviour there.
+                return ownEntryValue(default);
             };
             const idx = findEntry(self, key) orelse {
                 // Key absent: the result IS the caller-supplied `default`. Give
@@ -15886,8 +15957,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
             var result: ?*const List(K) = null;
             var i: usize = 0;
             while (i < len) : (i += 1) {
-                retainEntryKey(entries[i].key);
-                result = List(K).push(result, entries[i].key);
+                // The pushed key is a NEW owner (the result List) distinct from
+                // the map's own; OWN it (clone-on-share under Tracking, refcount
+                // bump under REFCOUNTED) so the two never double-free a shared
+                // eagerly-freed inner — `List.push` consumes its argument and
+                // does not clone, so a bare retain would alias (runtime-3--01).
+                result = List(K).push(result, ownEntryKey(entries[i].key));
             }
             return result;
         }
@@ -15902,8 +15977,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
             var result: ?*const List(V) = null;
             var i: usize = 0;
             while (i < len) : (i += 1) {
-                retainEntryValue(entries[i].value);
-                result = List(V).push(result, entries[i].value);
+                // The pushed value is a NEW owner (the result List); OWN it so a
+                // boxed-`Callable` value is an INDEPENDENT inner in the List and
+                // the map-drop + List-drop never double-free it (runtime-3--01).
+                result = List(V).push(result, ownEntryValue(entries[i].value));
             }
             return result;
         }
@@ -15967,17 +16044,25 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // cursor IN PLACE on the iter — O(1) work per step and
             // one allocation across the whole walk (versus the
             // always-clone O(N²) fallback from commit 89775b0).
+            //
+            // OWN the yielded K/V (clone-on-share under Tracking, refcount bump
+            // under REFCOUNTED) — the loop body receives a NEW owner while the
+            // map keeps its own, the exact `List.next` `ownElement` analog. A
+            // bare retain is a no-op under Tracking and aliases the yielded
+            // closure with the map's, double-freeing on the joint drop
+            // (runtime-3--01). On the `create` failure path the owned (cloned)
+            // copies are released, freeing exactly the clone.
             const first = self.entryAtConst(0).*;
-            retainEntryKey(first.key);
-            retainEntryValue(first.value);
+            const owned_key = ownEntryKey(first.key);
+            const owned_value = ownEntryValue(first.value);
 
             const iter = MapIter(K, V).create(self) orelse {
-                releaseEntryKey(first.key, std.heap.c_allocator);
-                releaseEntryValue(first.value, std.heap.c_allocator);
+                releaseEntryKey(owned_key, std.heap.c_allocator);
+                releaseEntryValue(owned_value, std.heap.c_allocator);
                 return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             };
             iter.next_idx = 1;
-            return .{ ATOM_CONT, .{ first.key, first.value }, iter.asMapPtr() };
+            return .{ ATOM_CONT, .{ owned_key, owned_value }, iter.asMapPtr() };
         }
 
         inline fn defaultK() K {
@@ -16283,11 +16368,16 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
                 return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             }
             const entry = source.entryAtConst(self.next_idx).*;
-            MapT.retainEntryKey(entry.key);
-            MapT.retainEntryValue(entry.value);
+            // OWN the yielded K/V (clone-on-share under Tracking, refcount bump
+            // under REFCOUNTED): the loop body is a NEW owner while the source
+            // map keeps its own — the `List.next` `ownElement` analog. A bare
+            // retain is a no-op under Tracking and aliases the yielded closure
+            // with the map's, double-freeing on the joint drop (runtime-3--01).
+            const owned_key = MapT.ownEntryKey(entry.key);
+            const owned_value = MapT.ownEntryValue(entry.value);
             incrementRuntimeStatCounter(&dense_map_iter_advance_total);
             self.next_idx += 1;
-            return .{ ATOM_CONT, .{ entry.key, entry.value }, map_ptr };
+            return .{ ATOM_CONT, .{ owned_key, owned_value }, map_ptr };
         }
 
         /// Release path entered from `Map.release` when its argument
@@ -19788,6 +19878,29 @@ pub const Memory = struct {
     /// non-tracking manager.
     pub fn live_allocation_bytes() i64 {
         return @intCast(liveAllocationStats().bytes);
+    }
+
+    /// Whether the active manager validates frees at `core.deallocate` and so
+    /// can REPORT a memory fault (double-free / use-after-free / OOB / dealloc
+    /// mismatch). True only when the leak/fault sink is installed AND the
+    /// manager exposes the live-allocation interface (`Memory.Tracking`); under
+    /// every non-tracking manager no fault is ever reported, so a Zest
+    /// `assert_no_memory_faults` block treats this as "fault checking
+    /// unavailable here" and passes as a documented no-op. Mirrors
+    /// `leak_tracking_active` for the fault side.
+    pub fn fault_tracking_active() bool {
+        return liveAllocationStats().available;
+    }
+
+    /// The active manager's CURRENT count of memory faults reported at
+    /// `core.deallocate` time. A Zest `assert_no_memory_faults { <block> }`
+    /// samples this immediately before and after the block; a positive
+    /// difference is a double-free / use-after-free the block triggered — a
+    /// fault that nets zero on the live-allocation count and is therefore
+    /// invisible to `assert_no_leaks`. Returns 0 under a non-tracking manager
+    /// (paired with `fault_tracking_active() == false`).
+    pub fn memory_fault_count() i64 {
+        return @intCast(memoryFaultCount());
     }
 };
 

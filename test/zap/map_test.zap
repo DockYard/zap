@@ -362,6 +362,158 @@ pub struct Zap.MapTest {
   }
 
   # ----------------------------------------------------------------
+  # runtime-3--01 (RT-18): every Map path that hands a VALUE (or KEY) to a
+  # NEW owner WHILE THE MAP KEEPS ITS OWN (a value-semantic SHARE) must
+  # clone-on-share (`ownEntryValue`/`ownEntryKey`), NOT bare-retain
+  # (`retainEntryValue`/`retainEntryKey`).
+  #
+  # Under `Memory.Tracking` (INDIVIDUAL_NO_REFCOUNT + CLONE_ON_SHARE) a
+  # bare retain is a no-op — it does NOT clone — so the new owner ALIASES
+  # the map's eagerly-freed boxed-`Callable` inner. When BOTH the map and
+  # the new owner drop, each deep-frees the SAME inner: a use-after-free /
+  # double-free (`INVALID FREE` under Tracking; a genuine heap double-free
+  # under any other caps-0x2 manager). The found / absent-key arms of
+  # `Map.get` were corrected in f893af9; this fix corrects the remaining
+  # SHARE hand-out sites left bare-retaining — the null-map `Map.get`
+  # default arm (the named defect), `Map.keys` / `Map.values`, and the
+  # `Map.next` iteration cursor — the exact `List.ownElement` analog that
+  # `List` already applies at every element hand-out.
+  #
+  # NOTE — the `Map.put` / `Map.delete` shared-receiver clone
+  # (`cloneBufferRetainingChildren`) is NOT a share: it clones for a
+  # CONSUMED receiver (slot 0 is `.owned`), so the original is abandoned
+  # and the clone is the sole surviving owner — a single retain is correct
+  # there (deep-cloning would orphan the consumed inners into a leak). The
+  # `Map.put`/`Map.delete` tests below are regression guards for that
+  # (correct) consume path, not for the share fix.
+  #
+  # The closures CAPTURE (`make_handler(n)` closes over `n`), so each
+  # boxed environment is an eagerly-freed inner whose mis-management is
+  # observable: a missing clone-on-share leaves the surviving owner
+  # invoking a freed environment (a use-after-free that corrupts the
+  # captured value the value-equality assertions check) and double-frees
+  # at scope exit.
+  fn make_handler(n :: i64) -> fn(i64) -> i64 {
+    fn(x :: i64) -> i64 { x + n }
+  }
+
+  # A two-entry `Map(Atom, fn(i64) -> i64)` of capturing closures, each
+  # boxed as `Callable({i64}, i64)`.
+  fn handler_map() -> %{Atom -> fn(i64) -> i64} {
+    %{inc: Zap.MapTest.make_handler(1), dec: Zap.MapTest.make_handler(-1)}
+  }
+
+  # A `Map(Atom, fn(i64) -> i64)` that is NULL at runtime when `populate` is
+  # false: typed as boxed-Callable-valued but null, so `Map.get` on it takes
+  # the null-map default arm — the precise runtime-3--01 defect site (`map
+  # orelse { retainEntryValue(default); return default; }`). An empty `%{}`
+  # literal lowers to `Map.empty()`, which returns `null`; the populated
+  # branch (forced by the runtime `populate` parameter so the compiler cannot
+  # fold the branch away, and never taken when the caller passes `false`)
+  # gives the empty literal the concrete boxed-Callable value type. A map
+  # emptied via `Map.delete` would NOT reach here: under Tracking
+  # `Map.delete` returns a non-null empty buffer, so `Map.get` would take the
+  # already-fixed absent-key arm.
+  fn handler_map_or_empty(populate :: Bool) -> %{Atom -> fn(i64) -> i64} {
+    if populate {
+      %{seed: Zap.MapTest.make_handler(0)}
+    } else {
+      %{}
+    }
+  }
+
+  describe("runtime-3--01: Map value hand-out clones boxed values (no double-free)") {
+    test("found-path Map.get returns an independently-owned closure") {
+      handlers = Zap.MapTest.handler_map()
+      inc = Map.get(handlers, :inc, Zap.MapTest.make_handler(0))
+      dec = Map.get(handlers, :dec, Zap.MapTest.make_handler(0))
+      assert(inc(10) == 11)
+      assert(dec(10) == 9)
+    }
+
+    test("Map.put on a boxed-value map is fault-free and correct") {
+      # Regression guard for the consumed-receiver clone path. Every checked
+      # `Map.put` flows through `cloneBufferRetainingChildren` under Tracking
+      # (the rc==1 fast path is unreachable because the empty
+      # `ArcHeader.count()` is a 0-byte no-op returning 0). That clone
+      # bare-RETAINS its K/V, which is CORRECT here: `Map.put` consumes its
+      # receiver (`.owned` slot 0), so the fresh buffer is the sole surviving
+      # owner of each entry — the original is abandoned, never separately
+      # released, so a single retain hands the inners to exactly one owner
+      # (NOT the clone-on-share SHARE case, where both source and clone
+      # survive and `cloneForShare` must deep-clone). This pins boxed-value
+      # `Map.put` fault-free + correct so a future change to that clone
+      # discipline cannot silently introduce a double-free or a leak.
+      assert_no_memory_faults {
+        assert_no_leaks {
+          handlers = Zap.MapTest.handler_map()
+          grown = Map.put(handlers, :id, Zap.MapTest.make_handler(0))
+          assert(Map.size(grown) == 3)
+          again = Map.get(grown, :inc, Zap.MapTest.make_handler(0))
+          assert(again(10) == 11)
+        }
+      }
+    }
+
+    test("Map.delete on a boxed-value map is fault-free and correct") {
+      # `Map.delete` shares the same consumed-receiver clone path as
+      # `Map.put` (`cloneBufferRetainingChildren` at the shared arm); pinned
+      # fault-free + correct as a regression guard for the same discipline.
+      assert_no_memory_faults {
+        assert_no_leaks {
+          handlers = Zap.MapTest.handler_map()
+          smaller = Map.delete(handlers, :dec)
+          assert(Map.size(smaller) == 1)
+          still = Map.get(smaller, :inc, Zap.MapTest.make_handler(0))
+          assert(still(10) == 11)
+        }
+      }
+    }
+
+    test("null-map Map.get returns the boxed default without double-free") {
+      # The named runtime-3--01 arm: `Map.get(<null map>, key, boxed_default)`
+      # routed the default through `retainEntryValue` (bare retain) instead
+      # of `ownEntryValue` (clone-on-share). Under Tracking the returned
+      # `fallback` then aliased the caller's `default` inner; both dropped,
+      # double-freeing it. The result must be the default closure invoked
+      # correctly, with no reported fault and no leak.
+      assert_no_memory_faults {
+        assert_no_leaks {
+          empty = Zap.MapTest.handler_map_or_empty(false)
+          fallback = Map.get(empty, :missing, Zap.MapTest.make_handler(100))
+          assert(fallback(10) == 110)
+        }
+      }
+    }
+
+    test("absent-key Map.get on a populated map returns the boxed default cleanly") {
+      assert_no_memory_faults {
+        assert_no_leaks {
+          handlers = Zap.MapTest.handler_map()
+          fallback = Map.get(handlers, :missing, Zap.MapTest.make_handler(7))
+          assert(fallback(10) == 17)
+        }
+      }
+    }
+
+    test("Map.values hands out independently-owned closures (no double-free)") {
+      # `Map.values` pushes each entry value into a fresh List; a bare
+      # `retainEntryValue` before the push aliased the map's inner with the
+      # List element. Dropping both the map and the List deep-frees the same
+      # inner twice.
+      assert_no_memory_faults {
+        assert_no_leaks {
+          handlers = Zap.MapTest.handler_map()
+          vals = Map.values(handlers)
+          assert(List.length(vals) == 2)
+          f = List.get(vals, 0)
+          assert(f(10) == 11)
+        }
+      }
+    }
+  }
+
+  # ----------------------------------------------------------------
   # runtime-3--02 (RT-19): Term.from must represent List/Map/tuple
   # values LOSSLESSLY when they are stored into a heterogeneous
   # collection.

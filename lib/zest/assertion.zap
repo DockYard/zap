@@ -127,6 +127,50 @@ pub struct Zest.Assertion {
   }
 
   @doc = """
+    Records the result of an `assert_no_memory_faults { <block> }` assertion.
+
+    `before_count`/`after_count` are the manager's memory-fault counts sampled
+    immediately before and after the block. `tracking_active` is whether the
+    active memory manager validates frees and could report a fault at all.
+
+    When `tracking_active` is `false` (the test target does not select
+    `Memory.Tracking`), the assertion PASSES as a documented no-op — no fault
+    can be reported under such a manager. Otherwise the net rise in reported
+    faults (`after_count - before_count`) is the set of double-frees /
+    use-after-frees / mismatches the block triggered: zero passes; a positive
+    delta fails with the fault count rendered as the failure detail.
+    """
+
+  pub fn no_memory_faults_result(tracking_active :: Bool, before_count :: i64, after_count :: i64, code :: String, location :: String) -> String {
+    if not tracking_active {
+      :zig.Zest.pass_assertion()
+      "."
+    } else {
+      fault_count = after_count - before_count
+
+      if would_report_memory_fault?(fault_count) {
+        :zig.Zest.fail_assertion_with_message(format_memory_fault_failure(fault_count, code, location))
+        "F"
+      } else {
+        :zig.Zest.pass_assertion()
+        "."
+      }
+    }
+  }
+
+  @doc = """
+    Pure decision: would an `assert_no_memory_faults` block with the given net
+    fault delta be reported as a failure? `true` for a positive delta (the
+    block triggered at least one memory fault), `false` otherwise. Side-effect-
+    free — `no_memory_faults_result` delegates to this so the polarity is unit-
+    testable without touching the live fault tracker.
+    """
+
+  pub fn would_report_memory_fault?(fault_count :: i64) -> Bool {
+    fault_count > 0
+  }
+
+  @doc = """
     Records the result of an `@expect_leak`-inverted leak assertion.
 
     Used for a test marked `@expect_leak`: the test is EXPECTED to leak, so the
@@ -160,6 +204,10 @@ pub struct Zest.Assertion {
 
   fn format_expected_leak_failure(code :: String, location :: String) -> String {
     "@expect_leak assertion failed" <> location_block(location) <> "\nblock: " <> display_text(code, "block") <> "\nresult: the block did not leak, but it was marked @expect_leak\nexpected: at least one net live allocation to remain"
+  }
+
+  fn format_memory_fault_failure(fault_count :: i64, code :: String, location :: String) -> String {
+    "memory fault assertion failed" <> location_block(location) <> "\nblock: " <> display_text(code, "block") <> "\nfaults: " <> Kernel.to_string(fault_count) <> " memory fault(s) reported (double-free / use-after-free / mismatch)\nexpected: 0 memory faults during the block"
   }
 
   fn format_truthy_failure(kind :: String, code :: String, value :: String, custom_message :: String, location :: String) -> String {
