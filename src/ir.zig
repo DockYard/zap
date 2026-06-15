@@ -6048,6 +6048,25 @@ pub const IrBuilder = struct {
         self.current_param_types = .empty;
         self.current_param_hir_types = .empty;
 
+        // Phase 3.b / audit ir-1--04: a typed-clause entrypoint is reached via
+        // the type-only-overload branch of `buildFunctionGroup`, which returns
+        // BEFORE the regular path's flag initialization. Without setting them
+        // here, `current_function_raises` carries a stale value from the
+        // previously built function and `in_try_body` could leak from an
+        // enclosing nested build, so a `raise` in this clause's body would
+        // lower with the wrong unwrap mode. Initialize both exactly as
+        // `buildFunctionGroup` does: `in_try_body` starts false at every
+        // function entry, and the raise effect is the group's inferred/declared
+        // row (keyed by name+arity, shared across the type-only overload's
+        // clauses) OR an invoked raising closure parameter.
+        self.in_try_body = false;
+        const declared_function_raises = if (self.type_store) |ts|
+            ts.functionRaises(self.current_struct_prefix, self.interner.get(group.name), group.arity)
+        else
+            false;
+        const function_raises = declared_function_raises or self.groupInvokesRaisingClosureParam(group);
+        self.current_function_raises = function_raises;
+
         var captures: std.ArrayList(Capture) = .empty;
         for (group.captures, 0..) |capture, idx| {
             const cap_name = try std.fmt.allocPrint(self.allocator, "__cap_{d}", .{idx});
@@ -6108,6 +6127,10 @@ pub const IrBuilder = struct {
             .params = final_params_typed,
             .return_type = typeIdToZigTypeWithStore(clause.return_type, self.type_store),
             .return_type_id = clause.return_type,
+            // audit ir-1--04: emit the raise effect so the ZIR backend lowers
+            // this clause to an `error{ZapRaise}!T` return when the overload
+            // family raises — matching the regular `buildFunctionGroup` path.
+            .raises = function_raises,
             .body = try self.allocSlice(Block, &.{.{
                 .label = 0,
                 .instructions = entry_instrs,
@@ -6148,6 +6171,20 @@ pub const IrBuilder = struct {
     fn buildNestedFunctionGroup(self: *IrBuilder, group: *const hir_mod.FunctionGroup) !void {
         const saved_instrs = self.current_instrs;
         const saved_next_local = self.next_local;
+        // Phase 3.b / audit ir-1--04: the raise-effect context flags are
+        // per-function lowering state that `buildFunctionGroup` overwrites at
+        // entry (`current_function_raises = function_raises`) and that the
+        // try-body lowering toggles (`in_try_body`). Building a nested closure
+        // mid-body therefore leaves the ENCLOSING function's flags reflecting
+        // the nested closure instead of itself: a subsequent raising call in
+        // the outer body would consult the closure's (often non-raising) flag
+        // and lower as the uncatchable top-level abort instead of `propagate`,
+        // and a closure built inside a `try` body would inherit/strip
+        // `in_try_body` from the outer context. Save and restore both alongside
+        // the other per-function state so raise/error-union lowering is
+        // independent of where the nested closure appears in the body.
+        const saved_current_function_raises = self.current_function_raises;
+        const saved_in_try_body = self.in_try_body;
         const saved_known_local_types = self.known_local_types;
         const saved_local_hir_types = self.local_hir_types;
         const saved_materialized_closure_locals = self.materialized_closure_locals;
@@ -6190,6 +6227,11 @@ pub const IrBuilder = struct {
             self.current_param_types = saved_current_param_types;
             self.current_param_hir_types.deinit(self.allocator);
             self.current_param_hir_types = saved_current_param_hir_types;
+            // Restore the enclosing function's raise-effect context (see the
+            // save above). In the defer so an error inside the nested build
+            // cannot leave the outer context corrupted.
+            self.current_function_raises = saved_current_function_raises;
+            self.in_try_body = saved_in_try_body;
         }
         try self.buildFunctionGroup(group);
         self.current_instrs = saved_instrs;

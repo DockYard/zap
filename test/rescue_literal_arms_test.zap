@@ -117,6 +117,34 @@ pub struct RescueLiteralArmsTest {
     }
   }
 
+  # End-to-end witnesses for audit finding ir-1--04: the IR builder's
+  # raise-effect context flags (`current_function_raises` / `in_try_body`)
+  # were clobbered across nested closure/function-group builds and never
+  # initialized for typed-clause entrypoints. The unwrap-mode selector
+  # (`if in_try_body -> route_to_handler else if current_function_raises ->
+  # propagate else abort_unhandled`) consults these flags at every raising
+  # call site, so a clobbered/uninitialized flag lowered a recoverable raise
+  # as the uncatchable top-level `abort_unhandled` path — an enclosing
+  # `try ... rescue` silently failed to catch it and the process aborted.
+  describe("raise-effect context across closures and typed clauses (ir-1--04)") {
+    test("type-only overload clause that raises stays catchable") {
+      # `typed_overload/1` has two clauses dispatched purely by parameter
+      # type (i64 vs String); the String clause raises. Pre-fix, the
+      # typed-clause entrypoint emitted `Function.raises = false` (it never
+      # initialized the flag from the type store), so the raise took the
+      # uncatchable abort path instead of returning an error union through
+      # this rescue.
+      assert(call_typed_overload_string() == 1)
+    }
+
+    test("the non-raising type-only overload clause still returns its value") {
+      # The i64 clause of the raising overload family returns its value through
+      # the (now uniform) error-union ABI; observed via a `try` so the success
+      # payload flows out cleanly.
+      assert(call_typed_overload_int(42) == 42)
+    }
+  }
+
   # Raises one of two/three concrete error types selected at runtime, so
   # the rescue arms exercise genuine runtime type discrimination (not a
   # first-arm-always shortcut).
@@ -275,6 +303,32 @@ pub struct RescueLiteralArmsTest {
     try { classify_raise(n) } rescue {
       e :: AlphaError -> 1
       e :: BetaError -> 2
+    }
+  }
+
+  # ---- ir-1--04 raise-effect context fixtures ----
+
+  # A type-only overload group: clauses dispatched purely by parameter type
+  # (no guards, bind/wildcard patterns, differing types). The String clause
+  # raises; its typed-clause entrypoint must lower with the raise effect so
+  # the raise is catchable.
+  fn typed_overload(value :: i64) -> i64 {
+    value
+  }
+
+  fn typed_overload(_ :: String) -> i64 {
+    raise %AlphaError{message: "typed overload"}
+  }
+
+  fn call_typed_overload_string() -> i64 {
+    try { typed_overload("boom") } rescue {
+      e :: AlphaError -> 1
+    }
+  }
+
+  fn call_typed_overload_int(n :: i64) -> i64 {
+    try { typed_overload(n) } rescue {
+      e :: AlphaError -> 0
     }
   }
 }
