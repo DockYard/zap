@@ -6591,40 +6591,52 @@ pub const ZirDriver = struct {
                 }
 
                 // Inline default parameter values: emit default ZIR instructions
-                // BEFORE the call (so they don't interfere with addCall's inst prediction)
-                // Match by base name (without arity suffix) since call-site arity
-                // may differ from declared arity when defaults fill the gap.
-                var resolved_call_name: []const u8 = cn.name;
+                // BEFORE the call (so they don't interfere with addCall's inst
+                // prediction).
+                //
+                // audit zirb-2--02: this previously matched candidates by the
+                // arity-STRIPPED base name and filled defaults for the FIRST
+                // defaults-bearing function with that base — with no preference
+                // for the exact resolved name. When an overload family mixes a
+                // no-default `f/1` with a defaults-bearing `f/3`, a cross-struct
+                // call the type checker resolved to `f/1` (arriving here as
+                // `call_named` with `cn.name == "S__f__1"`) was silently
+                // rewritten to call `S__f__3` with defaults appended — running
+                // the wrong overload. `cn.name` already encodes the type
+                // checker's + IR mangler's resolved (name, declared-arity)
+                // decision, so key the fill on the EXACT name: only fill for the
+                // function whose mangled name IS `cn.name`. That honors the
+                // resolved overload (the no-default `f/1` is never rewritten to
+                // `f/3`) while still filling the gap for a genuinely-defaulted
+                // resolved target (e.g. `add(5)` -> `S__add__2`).
+                const resolved_call_name: []const u8 = cn.name;
                 if (self.program) |prog| {
                     for (prog.functions) |func| {
-                        const cn_base = if (std.mem.findLast(u8, cn.name, "__")) |pos| cn.name[0..pos] else cn.name;
-                        const func_base = if (std.mem.findLast(u8, func.name, "__")) |pos| func.name[0..pos] else func.name;
-                        if (std.mem.eql(u8, func_base, cn_base) and func.defaults.len > 0) {
-                            // After inlining, use the function's actual name (with declared arity)
-                            resolved_call_name = func.name;
-                            const full_arity = func.params.len;
-                            if (args.items.len < full_arity) {
-                                const first_default_idx = full_arity - func.defaults.len;
-                                var pi = args.items.len;
-                                while (pi < full_arity) : (pi += 1) {
-                                    if (pi >= first_default_idx) {
-                                        const di = pi - first_default_idx;
-                                        if (di < func.defaults.len) {
-                                            const default_ref: u32 = switch (func.defaults[di]) {
-                                                .int => |v| zir_builder_emit_int(self.handle, v),
-                                                .float => |v| zir_builder_emit_float(self.handle, v),
-                                                .string => |v| zir_builder_emit_str(self.handle, v.ptr, @intCast(v.len)),
-                                                .bool_val => |v| zir_builder_emit_bool(self.handle, v),
-                                                .nil => @intFromEnum(Zir.Inst.Ref.null_value),
-                                            };
-                                            if (default_ref == error_ref) return error.EmitFailed;
-                                            try args.append(self.allocator, default_ref);
-                                        }
-                                    }
-                                }
-                            }
-                            break;
+                        if (func.defaults.len == 0) continue;
+                        if (!std.mem.eql(u8, func.name, cn.name)) continue;
+                        const full_arity = func.params.len;
+                        if (args.items.len >= full_arity) break;
+                        const first_default_idx = full_arity - func.defaults.len;
+                        // Every non-default parameter must be supplied; a call
+                        // arriving with fewer args than the first defaulted
+                        // position is an under-supply the front end should never
+                        // produce. Surface it rather than left-shifting the
+                        // defaults into the wrong parameter slots.
+                        if (args.items.len < first_default_idx) return error.EmitFailed;
+                        var pi = args.items.len;
+                        while (pi < full_arity) : (pi += 1) {
+                            const di = pi - first_default_idx;
+                            const default_ref: u32 = switch (func.defaults[di]) {
+                                .int => |v| zir_builder_emit_int(self.handle, v),
+                                .float => |v| zir_builder_emit_float(self.handle, v),
+                                .string => |v| zir_builder_emit_str(self.handle, v.ptr, @intCast(v.len)),
+                                .bool_val => |v| zir_builder_emit_bool(self.handle, v),
+                                .nil => @intFromEnum(Zir.Inst.Ref.null_value),
+                            };
+                            if (default_ref == error_ref) return error.EmitFailed;
+                            try args.append(self.allocator, default_ref);
                         }
+                        break;
                     }
                 }
 
