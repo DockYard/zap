@@ -2116,6 +2116,49 @@ fn compileListCheck(
     return current_failure;
 }
 
+/// Compile a column that contains at least one `list_cons` pattern.
+///
+/// A column reached here mixes cons patterns (`[h | t]`, `[a, b | t]`),
+/// fixed-length list patterns (`[x]`, `[a, b]`, `[]`), and wildcards/binds.
+/// These shapes are NOT uniform — a cons pattern is open-ended (matches any
+/// list of length >= its head count) while a fixed-length list is closed
+/// (matches exactly its length). The previous implementation mixed them
+/// incorrectly (audit finding hir-1--01 / TY-01): a non-empty fixed-length row
+/// qualified for neither the empty/wildcard failure base nor the cons success
+/// rows (so the arm vanished), and the head count was taken from the FIRST cons
+/// row only, so a later cons row with a different head count was expanded
+/// against a wrongly-sized scrutinee decomposition (so heads/tail misaligned).
+///
+/// The fix peels the MINIMUM cons head count `m` shared by every cons row
+/// (every cons row has at least `m` heads, so the peel never runs short), and
+/// routes each row to the branch it can actually match:
+///
+///   * SUCCESS (`len >= m`): peel `m` heads + a tail into fresh scrutinee
+///     columns. Each row's leading pattern is re-expressed against this
+///     decomposition:
+///       - `[h1..hk | t]` (k >= m) → heads `h1..hm`; tail = `t` when k == m,
+///         else a fresh `list_cons` `[h_{m+1}..hk | t]` (head count k - m);
+///       - `[a1..an]` (n >= m) → heads `a1..am`; tail = a fresh fixed-length
+///         `list` `[a_{m+1}..an]` (the empty list `[]` when n == m, which
+///         constrains the tail to be empty — i.e. the list had exactly n
+///         elements);
+///       - a wildcard → `m` wildcard heads + a wildcard tail;
+///       - a fixed-length `[a1..an]` with n < m cannot match `len >= m`, so it
+///         is EXCLUDED from success.
+///   * FAILURE (`len < m`): the rows that can still match a SHORTER list — the
+///     fixed-length rows with n < m (including `[]`) and the wildcard/bind rows
+///     — kept against the SAME scrutinee with their leading column INTACT, then
+///     re-dispatched (the ordinary matrix dispatcher routes them to
+///     `compileListCheck`/the variable rule). Cons rows need `len >= k >= m`,
+///     so they are EXCLUDED from failure, which also guarantees this branch
+///     never re-enters `compileListConsCheck` (no infinite recursion).
+///
+/// For the common uniform case (every cons row shares one head count and there
+/// are no shorter fixed rows) this emits exactly one `check_list_cons` with `m`
+/// indexed head gets and one suffix slice — the efficient shape. Mixed head
+/// counts and fixed lengths recurse on the peeled tail through the ordinary
+/// dispatcher. Source clause order is preserved (rows keep `body_index` order
+/// in both branches).
 fn compileListConsCheck(
     allocator: std.mem.Allocator,
     matrix: PatternMatrix,
@@ -2126,34 +2169,43 @@ fn compileListConsCheck(
 ) anyerror!*const Decision {
     const remaining_scrutinees = if (scrutinee_ids.len > 1) scrutinee_ids[1..] else @as([]const u32, &.{});
 
-    // Build wildcard/empty failure base (rows with wildcard or [] patterns)
-    var wildcard_rows: std.ArrayList(PatternRow) = .empty;
-    for (matrix.rows) |row| {
-        if (row.patterns.len == 0) continue;
-        const pat = row.patterns[0];
-        if (isWildcardPattern(pat) or (pat != null and pat.?.* == .list and pat.?.list.len == 0)) {
-            const new_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
-            try wildcard_rows.append(allocator, .{ .patterns = new_pats, .body_index = row.body_index, .guard = row.guard });
-        }
-    }
-    const failure = try compilePatternMatrixWithBindings(allocator, .{
-        .rows = try wildcard_rows.toOwnedSlice(allocator),
-        .column_count = if (matrix.column_count > 0) matrix.column_count - 1 else 0,
-    }, remaining_scrutinees, next_id, bound_scrutinees);
-
-    // For cons patterns, extract heads and tail into new scrutinee columns.
-    // Determine head_count from the first cons pattern.
-    var head_count: u32 = 1;
+    // Peel the minimum cons head count shared by every cons row, so every cons
+    // row has enough heads to peel without running short.
+    var head_count: u32 = std.math.maxInt(u32);
     for (matrix.rows) |row| {
         if (row.patterns.len == 0) continue;
         const pat = row.patterns[0];
         if (!isWildcardPattern(pat) and pat.?.* == .list_cons) {
-            head_count = @intCast(pat.?.list_cons.heads.len);
-            break;
+            const k: u32 = @intCast(pat.?.list_cons.heads.len);
+            if (k < head_count) head_count = k;
         }
     }
+    // `compileListConsCheck` is only dispatched when a cons row is present, so a
+    // minimum was found; guard defensively against a degenerate empty-heads
+    // cons (`[| t]`) by clamping to at least 1.
+    if (head_count == std.math.maxInt(u32) or head_count == 0) head_count = 1;
 
-    // Allocate scrutinee IDs for head elements and tail
+    // Failure branch (`len < head_count`): fixed-length rows shorter than the
+    // peel (they can only match a shorter list) and wildcard/bind rows, kept
+    // against the SAME scrutinee with the leading column intact so they are
+    // re-dispatched (e.g. through `compileListCheck`). Cons rows cannot match a
+    // list shorter than `head_count`, so they are excluded here.
+    var failure_rows: std.ArrayList(PatternRow) = .empty;
+    for (matrix.rows) |row| {
+        if (row.patterns.len == 0) continue;
+        const pat = row.patterns[0];
+        if (isWildcardPattern(pat)) {
+            try failure_rows.append(allocator, .{ .patterns = row.patterns, .body_index = row.body_index, .guard = row.guard });
+        } else if (pat.?.* == .list and pat.?.list.len < head_count) {
+            try failure_rows.append(allocator, .{ .patterns = row.patterns, .body_index = row.body_index, .guard = row.guard });
+        }
+    }
+    const failure = try compilePatternMatrixWithBindings(allocator, .{
+        .rows = try failure_rows.toOwnedSlice(allocator),
+        .column_count = matrix.column_count,
+    }, scrutinee_ids, next_id, bound_scrutinees);
+
+    // Allocate scrutinee IDs for the `head_count` peeled heads and one tail.
     var head_ids: std.ArrayList(u32) = .empty;
     for (0..head_count) |_| {
         try head_ids.append(allocator, next_id.*);
@@ -2162,7 +2214,6 @@ fn compileListConsCheck(
     const tail_id = next_id.*;
     next_id.* += 1;
 
-    // Build success rows: expand [h | t] into h, t columns
     var new_scrutinee_list: std.ArrayList(u32) = .empty;
     for (head_ids.items) |hid| try new_scrutinee_list.append(allocator, hid);
     try new_scrutinee_list.append(allocator, tail_id);
@@ -2170,38 +2221,60 @@ fn compileListConsCheck(
 
     const new_col_count = head_count + 1 + (matrix.column_count - 1);
 
+    // Success branch (`len >= head_count`): peel `head_count` heads + tail.
     var success_rows: std.ArrayList(PatternRow) = .empty;
     for (matrix.rows) |row| {
         if (row.patterns.len == 0) continue;
         const pat = row.patterns[0];
         const rest_pats = if (row.patterns.len > 1) row.patterns[1..] else @as([]const ?*const MatchPattern, &.{});
 
-        if (!isWildcardPattern(pat) and pat.?.* == .list_cons) {
-            // Expand [h1, h2, ... | t] into h1, h2, ..., t columns
-            var expanded: std.ArrayList(?*const MatchPattern) = .empty;
-            for (pat.?.list_cons.heads) |head| {
-                try expanded.append(allocator, head);
-            }
-            try expanded.append(allocator, pat.?.list_cons.tail);
-            for (rest_pats) |rp| try expanded.append(allocator, rp);
-            try success_rows.append(allocator, .{
-                .patterns = try expanded.toOwnedSlice(allocator),
-                .body_index = row.body_index,
-                .guard = row.guard,
-            });
-        } else if (isWildcardPattern(pat)) {
-            // Wildcards match cons too — expand as N+1 wildcards
-            var expanded: std.ArrayList(?*const MatchPattern) = .empty;
-            for (0..(head_count + 1)) |_| {
-                try expanded.append(allocator, null);
-            }
-            for (rest_pats) |rp| try expanded.append(allocator, rp);
-            try success_rows.append(allocator, .{
-                .patterns = try expanded.toOwnedSlice(allocator),
-                .body_index = row.body_index,
-                .guard = row.guard,
-            });
+        var expanded: std.ArrayList(?*const MatchPattern) = .empty;
+
+        if (isWildcardPattern(pat)) {
+            // A wildcard matches a list of any length: `head_count` wildcard
+            // heads plus a wildcard tail.
+            for (0..(head_count + 1)) |_| try expanded.append(allocator, null);
+        } else switch (pat.?.*) {
+            .list_cons => |lc| {
+                // `[h1..hk | t]` (k >= head_count): peel the first `head_count`
+                // heads; the remaining heads (if any) plus the original tail
+                // form the tail column.
+                for (lc.heads[0..head_count]) |head| try expanded.append(allocator, head);
+                if (lc.heads.len == head_count) {
+                    try expanded.append(allocator, lc.tail);
+                } else {
+                    const rest_cons = try allocator.create(MatchPattern);
+                    rest_cons.* = .{ .list_cons = .{
+                        .heads = lc.heads[head_count..],
+                        .tail = lc.tail,
+                    } };
+                    try expanded.append(allocator, rest_cons);
+                }
+            },
+            .list => |elems| {
+                // A fixed-length list shorter than the peel cannot match
+                // `len >= head_count` — it only matches in the failure branch.
+                if (elems.len < head_count) continue;
+                // `[a1..an]` (n >= head_count): peel the first `head_count`
+                // elements; the remaining elements form a fixed-length tail
+                // `[a_{head_count+1}..an]` (the empty list `[]` when
+                // n == head_count, constraining the tail to be empty so the
+                // original list had exactly `head_count` elements).
+                for (elems[0..head_count]) |elem| try expanded.append(allocator, elem);
+                const rest_list = try allocator.create(MatchPattern);
+                rest_list.* = .{ .list = elems[head_count..] };
+                try expanded.append(allocator, rest_list);
+            },
+            // Any other leading pattern cannot match a list scrutinee here.
+            else => continue,
         }
+
+        for (rest_pats) |rp| try expanded.append(allocator, rp);
+        try success_rows.append(allocator, .{
+            .patterns = try expanded.toOwnedSlice(allocator),
+            .body_index = row.body_index,
+            .guard = row.guard,
+        });
     }
 
     const success_decision = try compilePatternMatrixWithBindings(allocator, .{

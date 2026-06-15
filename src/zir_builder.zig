@@ -10027,23 +10027,6 @@ pub const ZirDriver = struct {
         const default_start = last_guard_idx + 1;
         const default_instrs = instrs[default_start..];
 
-        // Capture the trailing default body, recursing so any guard_blocks
-        // it contains are themselves flattened.
-        self.beginCapture();
-        try self.emitFlattenedGuardSequence(default_instrs);
-        var default_len: u32 = 0;
-        const default_ptr = self.endCapture(&default_len);
-        const default_result: u32 = if (dest_opt) |d|
-            if (self.local_refs.get(d)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref
-        else if (self.instructionsEndNoReturnFor(default_instrs))
-            @intFromEnum(Zir.Inst.Ref.unreachable_value)
-        else
-            void_ref;
-
-        var current_else_insts = try self.allocator.alloc(u32, default_len);
-        @memcpy(current_else_insts, default_ptr[0..default_len]);
-        var current_else_result: u32 = default_result;
-
         var guards = std.ArrayListUnmanaged(struct {
             setup_start: usize,
             guard_idx: usize,
@@ -10061,12 +10044,54 @@ pub const ZirDriver = struct {
             }
         }
 
+        // Hoist the leading SHARED setup — the extraction instructions before
+        // the first guard's condition is defined (e.g. the `list_get`/
+        // `list_tail` that decompose a list scrutinee). All guards reference
+        // these locals, but the reverse-order if-else construction below emits
+        // the LATER guards' setup first; without hoisting, an inner guard's
+        // condition `list_len_check` would reference a tail/head local whose
+        // defining `list_tail`/`list_get` lives in the FIRST guard's setup
+        // region and has not been emitted yet (the cause of an
+        // `EmitFailed` for a multi-length `check_list` chain nested inside a
+        // `check_list_cons` success body — audit hir-1--01 / TY-01 follow-on).
+        // This mirrors `emitFlatCaseBlock`'s `common_setup_end` hoist.
+        const shared_setup_end = if (guards.items.len > 0) blk: {
+            const first_guard = guards.items[0];
+            const first_gb = instrs[first_guard.guard_idx].guard_block;
+            const condition_idx = findInstructionDefiningLocal(
+                instrs[first_guard.setup_start..first_guard.guard_idx],
+                first_gb.condition,
+            ) orelse 0;
+            break :blk first_guard.setup_start + condition_idx;
+        } else 0;
+
+        for (instrs[0..shared_setup_end]) |si| try self.emitInstruction(si);
+
+        // Capture the trailing default body, recursing so any guard_blocks
+        // it contains are themselves flattened.
+        self.beginCapture();
+        try self.emitFlattenedGuardSequence(default_instrs);
+        var default_len: u32 = 0;
+        const default_ptr = self.endCapture(&default_len);
+        const default_result: u32 = if (dest_opt) |d|
+            if (self.local_refs.get(d)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref
+        else if (self.instructionsEndNoReturnFor(default_instrs))
+            @intFromEnum(Zir.Inst.Ref.unreachable_value)
+        else
+            void_ref;
+
+        var current_else_insts = try self.allocator.alloc(u32, default_len);
+        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_result: u32 = default_result;
+
         var gi = guards.items.len;
         while (gi > 0) {
             gi -= 1;
             const guard = guards.items[gi];
             const gb = instrs[guard.guard_idx].guard_block;
-            const setup_instrs = instrs[guard.setup_start..guard.guard_idx];
+            // Skip the hoisted shared setup; emit only this guard's own setup.
+            const setup_start = @max(guard.setup_start, shared_setup_end);
+            const setup_instrs = instrs[setup_start..guard.guard_idx];
 
             for (setup_instrs) |si| try self.emitInstruction(si);
 
