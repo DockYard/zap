@@ -403,6 +403,27 @@ pub struct Zap.MapTest {
     %{inc: Zap.MapTest.make_handler(1), dec: Zap.MapTest.make_handler(-1)}
   }
 
+  # A second, disjoint-key two-entry `Map(Atom, fn(i64) -> i64)` of
+  # capturing closures, used as the right-hand operand of `Map.merge`
+  # so the merge result owns boxed values drawn from BOTH operands.
+  fn other_handler_map() -> %{Atom -> fn(i64) -> i64} {
+    %{double: Zap.MapTest.make_handler(100), triple: Zap.MapTest.make_handler(200)}
+  }
+
+  # A `Map(Atom, fn(i64) -> i64)` that is NULL at runtime when `populate`
+  # is false (the empty `%{}` literal lowers to `Map.empty()` -> `null`)
+  # but carries the concrete boxed-Callable value type via the populated
+  # branch. Used to drive `Map.merge` with a null/empty operand — the
+  # `merge(null, boxed_b)` and `merge(boxed_a, null)` arms — without the
+  # compiler folding the branch away.
+  fn handler_map_or_empty_double(populate :: Bool) -> %{Atom -> fn(i64) -> i64} {
+    if populate {
+      %{double: Zap.MapTest.make_handler(100), triple: Zap.MapTest.make_handler(200)}
+    } else {
+      %{}
+    }
+  }
+
   # A `Map(Atom, fn(i64) -> i64)` that is NULL at runtime when `populate` is
   # false: typed as boxed-Callable-valued but null, so `Map.get` on it takes
   # the null-map default arm — the precise runtime-3--01 defect site (`map
@@ -508,6 +529,97 @@ pub struct Zap.MapTest {
           assert(List.length(vals) == 2)
           f = List.get(vals, 0)
           assert(f(10) == 11)
+        }
+      }
+    }
+
+    # ----------------------------------------------------------------
+    # FU-31 (audit RT-18 systemic sibling): `Map.merge` folds a BORROWED
+    # right operand into a CONSUMED left operand. Under `Memory.Tracking`
+    # (INDIVIDUAL_NO_REFCOUNT + CLONE_ON_SHARE) the pre-fix merge
+    # `retain`ed `map_a` (a no-op alias, not an independent owner) and
+    # folded each `b` entry via `put` (whose `putInPlaceInsert` bare-
+    # retained the value), so the result ALIASED the boxed inners of `b`
+    # and the intermediate `release` deep-freed the just-cloned-from
+    # buffer mid-fold — an `invalid free` (a SEGFAULT under a non-tracking
+    # caps-0x2 manager). The fix makes merge an owned fold: `map_a`'s
+    # ownership flows into the result (reused/moved when uniquely owned —
+    # which a consumed receiver always is under CLONE_ON_SHARE) and each
+    # borrowed `b` entry is cloned-on-share (`ownEntryKey`/`ownEntryValue`)
+    # into it, deep-releasing a displaced value exactly once on overlap.
+    #
+    # These exercise the merge of FRESH (at-last-use, consumed) boxed-value
+    # operands — the exact A/B from the audit FU-31 finding — asserting the
+    # merged result's closures are invoked correctly with no fault or leak.
+    test("Map.merge of two boxed-value maps is fault-free and correct") {
+      assert_no_memory_faults {
+        assert_no_leaks {
+          merged = Map.merge(Zap.MapTest.handler_map(), Zap.MapTest.other_handler_map())
+          assert(Map.size(merged) == 4)
+          # The merged result owns independent copies of inners drawn from
+          # BOTH operands.
+          merged_inc = Map.get(merged, :inc, Zap.MapTest.make_handler(0))
+          assert(merged_inc(10) == 11)
+          merged_dec = Map.get(merged, :dec, Zap.MapTest.make_handler(0))
+          assert(merged_dec(10) == 9)
+          merged_double = Map.get(merged, :double, Zap.MapTest.make_handler(0))
+          assert(merged_double(10) == 110)
+          merged_triple = Map.get(merged, :triple, Zap.MapTest.make_handler(0))
+          assert(merged_triple(10) == 210)
+        }
+      }
+    }
+
+    test("Map.merge with an empty left operand is fault-free and correct") {
+      # The `merge(null, boxed_b)` arm: pre-fix it returned `retain(map_b)`
+      # (an alias of the borrowed `map_b`), so the caller's `map_b` drop and
+      # the result drop double-freed `map_b`'s boxed inners. The fix returns
+      # an independently-owned clone-on-share copy of `map_b`.
+      assert_no_memory_faults {
+        assert_no_leaks {
+          merged = Map.merge(Zap.MapTest.handler_map_or_empty_double(false), Zap.MapTest.other_handler_map())
+          assert(Map.size(merged) == 2)
+          merged_double = Map.get(merged, :double, Zap.MapTest.make_handler(0))
+          assert(merged_double(10) == 110)
+          merged_triple = Map.get(merged, :triple, Zap.MapTest.make_handler(0))
+          assert(merged_triple(10) == 210)
+        }
+      }
+    }
+
+    test("Map.merge with an empty right operand is fault-free and correct") {
+      # The `merge(boxed_a, null)` arm: the consumed `map_a` flows directly
+      # into the result. Pre-fix the borrowed-operand aliasing class showed
+      # the same double-free; pinned fault-free + leak-free here.
+      assert_no_memory_faults {
+        assert_no_leaks {
+          merged = Map.merge(Zap.MapTest.handler_map(), Zap.MapTest.handler_map_or_empty_double(false))
+          assert(Map.size(merged) == 2)
+          merged_inc = Map.get(merged, :inc, Zap.MapTest.make_handler(0))
+          assert(merged_inc(10) == 11)
+          merged_dec = Map.get(merged, :dec, Zap.MapTest.make_handler(0))
+          assert(merged_dec(10) == 9)
+        }
+      }
+    }
+
+    test("Map.merge with overlapping keys takes the right value, fault-free") {
+      # When a key appears in both operands, `merge` must take `b`'s value
+      # (and own an independent copy of it); the displaced `a` value inner
+      # must be freed exactly once by the result owner, never aliased.
+      assert_no_memory_faults {
+        assert_no_leaks {
+          base = %{inc: Zap.MapTest.make_handler(1), dec: Zap.MapTest.make_handler(-1)}
+          overlay = %{inc: Zap.MapTest.make_handler(5), gain: Zap.MapTest.make_handler(9)}
+          merged = Map.merge(base, overlay)
+          assert(Map.size(merged) == 3)
+          # `:inc` resolves to overlay's (+5), not base's (+1).
+          merged_inc = Map.get(merged, :inc, Zap.MapTest.make_handler(0))
+          assert(merged_inc(10) == 15)
+          merged_dec = Map.get(merged, :dec, Zap.MapTest.make_handler(0))
+          assert(merged_dec(10) == 9)
+          merged_gain = Map.get(merged, :gain, Zap.MapTest.make_handler(0))
+          assert(merged_gain(10) == 19)
         }
       }
     }

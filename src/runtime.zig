@@ -3535,15 +3535,16 @@ pub var dense_map_mut_calls_total: u64 = 0;
 /// skipped the `header.count() == 1` branch entirely. Comparing
 /// against `dense_map_mut_calls_total` gives the uniqueness-coverage ratio.
 pub var dense_map_unchecked_total: u64 = 0;
-/// Total dense-Map `cloneBufferRetainingChildren` calls — every time
-/// we have to deep-retain-clone a Map buffer because a put/delete saw
-/// shared ownership. Each clone is one full c_allocator allocation
+/// Total dense-Map `cloneBufferOwningChildren` calls — every time we
+/// have to deep-clone a Map buffer (owning its children) because a
+/// put/delete saw shared ownership, or a merge folded into a fresh
+/// owned accumulator. Each clone is one full c_allocator allocation
 /// proportional to the Map's capacity, so this counter directly
 /// surfaces leak-shaped allocation pressure that escapes the rc=1
 /// fast path.
 pub var dense_map_retaining_clone_total: u64 = 0;
 /// Total dense-Map clone bytes — sum of buffer sizes for every
-/// `cloneBufferRetainingChildren` call. The difference between this
+/// `cloneBufferOwningChildren` call. The difference between this
 /// and the steady-state Map size shows how much c_allocator traffic
 /// shared-clone shape is producing.
 pub var dense_map_retaining_clone_bytes: u64 = 0;
@@ -15162,6 +15163,24 @@ pub fn Map(comptime K: type, comptime V: type) type {
             ArcRuntime.headerRelease(&mut.header, mapDeepWalk);
         }
 
+        /// Reclaim a `Map.merge` / `merge_owned_unchecked` operand that the
+        /// codegen MOVED into the call (consumed) but does NOT itself drop under
+        /// the `INDIVIDUAL_NO_REFCOUNT` reclamation model. `Map.merge` consumes
+        /// both operands; under REFCOUNTED the codegen emits the matching
+        /// `release` for the moved slot-1 operand (and decrements the slot-0
+        /// receiver's transferred reference), so the runtime must NOT release it
+        /// again — doing so underflows the refcount (an `arcRelease`
+        /// unreachable). Under `INDIVIDUAL_NO_REFCOUNT` there is no refcount and
+        /// the no-refcount drop pass leaves a moved-into-builtin operand
+        /// un-dropped, so the runtime reclaims it here: `release` deep-frees its
+        /// eagerly-freed inners and poisons its slots (the merge already
+        /// clone-on-shared every entry into the result, so those copies are
+        /// independent). Comptime-gated, so it is a no-op under REFCOUNTED /
+        /// BULK_OR_NEVER / TRACED.
+        inline fn releaseConsumedMergeOperand(operand: ?*const Self) void {
+            if (comptime eager_individual_free) release(operand);
+        }
+
         /// Deep-walk callback invoked by the manager's `release` on
         /// the final zero-transition. Performs the cell's full
         /// teardown: instrumentation notification (when compiled in),
@@ -15187,11 +15206,17 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// loop below, which under `clone_on_share_active` clone rather than
         /// bump) so each owner uniquely owns its buffer: in-place mutation
         /// stays sound and `Map.release` frees exactly one buffer per owner.
-        /// This is the SHARE case (source AND clone both survive) — distinct
-        /// from `cloneBufferRetainingChildren`, which clones for a CONSUMED
-        /// receiver (`put`/`delete` result) where the source is abandoned, so
-        /// that helper bare-retains (one surviving owner) rather than clones.
-        /// Only reached under `clone_on_share_active`.
+        ///
+        /// This is the SHARE case (source AND clone BOTH survive and each is
+        /// independently released), shared discipline with
+        /// `cloneBufferOwningChildren` (the borrowed-operand `Map.merge` seed),
+        /// which differs only in copying the bucket array at the source
+        /// capacity verbatim versus at a caller-chosen capacity. It is DISTINCT
+        /// from `cloneBufferRetainingChildren`, which MOVES (bare-retains)
+        /// children for a CONSUMED `put`/`delete` receiver — that receiver is
+        /// abandoned with no scope-exit drop, so owning/deep-cloning there would
+        /// orphan its inners into a leak. Only reached under
+        /// `clone_on_share_active`.
         pub fn cloneForShare(map: ?*const Self) ?*const Self {
             const m = map orelse return null;
             // A `MapIter` cell (`capacity == 0`) is never a persistent owner of
@@ -15238,20 +15263,67 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const new_entries = fresh.entriesPtr();
             for (0..self.len) |i| {
                 new_entries[i] = old_entries[i];
-                // The fresh buffer is the put/delete RESULT and `self` is the
-                // CONSUMED receiver (`Map.put`/`Map.delete` slot 0 is `.owned`),
-                // so this clone is the SOLE surviving owner of each entry — the
-                // original is abandoned, never separately released. A bare
-                // retain (refcount bump under REFCOUNTED, no-op under Tracking)
-                // therefore hands the inners to exactly one owner: no double-
-                // free. This is NOT a value-semantic SHARE (that is
-                // `cloneForShare`, which `ownEntryKey`/`ownEntryValue`-clones
-                // because BOTH the source and the clone survive); conflating the
-                // two and clone-on-share-cloning here would orphan the consumed
-                // receiver's inners (a leak). Keys/values that are themselves
-                // eagerly-freed are moved, not duplicated, into the result.
+                // CONSUMED-RECEIVER MOVE. `self` is the consumed `Map.put` /
+                // `Map.delete` receiver (slot 0 `.owned`); under
+                // `INDIVIDUAL_NO_REFCOUNT` (`Memory.Tracking`) the codegen
+                // emits NO scope-exit drop for a consumed/transferred-onward
+                // local (`arc_drop_insertion`: `dropsForTerminator` excludes
+                // it), so `self`'s buffer is abandoned WITHOUT its inners ever
+                // being deep-released. The clone is therefore the SOLE
+                // surviving owner of each entry, and its children must be MOVED
+                // (aliased), not deep-cloned — deep-cloning would orphan the
+                // abandoned receiver's inners into a leak AND hand the clone a
+                // second, separately-tracked inner. A bare retain
+                // (`retainEntryKey`/`retainEntryValue`) is exactly that move:
+                // a refcount bump under REFCOUNTED (the +1 the consumed
+                // receiver would have dropped transfers to the clone) and a
+                // no-op under Tracking (the inner pointer is simply rehomed
+                // into the clone's slot, freed exactly once when the clone
+                // drops). This is NOT a value-semantic SHARE — that is
+                // `cloneForShare`, where BOTH source and clone survive and so
+                // must `ownEntry*`-clone.
                 retainEntryKey(new_entries[i].key);
                 retainEntryValue(new_entries[i].value);
+            }
+            fresh.len = self.len;
+
+            if (new_capacity == self.capacity) {
+                const old_buckets = self.bucketsPtr();
+                const new_buckets = fresh.bucketsPtr();
+                for (0..self.capacity) |i| {
+                    new_buckets[i] = old_buckets[i];
+                }
+            } else {
+                fresh.rebucketAll();
+            }
+            return fresh;
+        }
+
+        /// Clone `self` into a buffer of `new_capacity` whose K/V children are
+        /// independently OWNED (`ownEntryKey`/`ownEntryValue`) — the SHARE
+        /// discipline of `cloneForShare`, but at a caller-chosen (possibly
+        /// larger) capacity. Used by `Map.merge`/`merge_owned_unchecked` to
+        /// seed the owned result from a BORROWED operand that SURVIVES the
+        /// merge: under `CLONE_ON_SHARE` (`Memory.Tracking`) each child is
+        /// deep-cloned so the result and the borrowed source never double-free
+        /// a shared boxed inner (FU-31); under REFCOUNTED `ownEntry*` folds to a
+        /// refcount bump (an independent owner via +1); under
+        /// BULK_OR_NEVER/TRACED it no-ops. Distinct from
+        /// `cloneBufferRetainingChildren`, which MOVES children for a CONSUMED
+        /// (abandoned, never-released) receiver.
+        fn cloneBufferOwningChildren(self: *const Self, new_capacity: u32, creation_callsite: u64) ?*Self {
+            std.debug.assert(std.math.isPowerOfTwo(new_capacity));
+            std.debug.assert(new_capacity >= self.len);
+            const fresh = bufferAlloc(new_capacity, self.hash_seed, creation_callsite) orelse return null;
+            incrementRuntimeStatCounter(&dense_map_retaining_clone_total);
+            addRuntimeStatCounter(&dense_map_retaining_clone_bytes, bufferSize(new_capacity, new_capacity));
+
+            const old_entries = self.entriesPtr();
+            const new_entries = fresh.entriesPtr();
+            for (0..self.len) |i| {
+                new_entries[i] = old_entries[i];
+                new_entries[i].key = ownEntryKey(new_entries[i].key);
+                new_entries[i].value = ownEntryValue(new_entries[i].value);
             }
             fresh.len = self.len;
 
@@ -15481,9 +15553,19 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (findEntry(target, key)) |existing_idx| {
                 const allocator = std.heap.c_allocator;
                 const entry = target.entryAt(existing_idx);
-                retainEntryValue(value);
+                // Overwrite of an existing key. `value` is BORROWED (see
+                // `putInPlaceInsert`), so OWN an independent copy
+                // (`ownEntryValue`) before deep-releasing the displaced value —
+                // a bare retain would alias the caller's boxed inner under
+                // CLONE_ON_SHARE and double-free it at the caller's drop
+                // (runtime-3--01 / FU-37). Compute the owned copy BEFORE the
+                // release so a `value`-aliases-`entry.value` self-overwrite
+                // (`Map.put(m, k, Map.get(m, k, …))`) cannot free the source out
+                // from under the clone. `ownEntryValue` folds to a refcount bump
+                // under REFCOUNTED (identical to the prior retain).
+                const owned_value = ownEntryValue(value);
                 releaseEntryValue(entry.value, allocator);
-                entry.value = value;
+                entry.value = owned_value;
                 return target;
             }
 
@@ -15517,12 +15599,75 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const new_idx: u32 = dest.len;
             std.debug.assert(new_idx < dest.entry_cap);
             const entries = dest.entriesPtr();
-            retainEntryKey(key);
-            retainEntryValue(value);
+            // The `key`/`value` are BORROWED arguments (`Map.put`'s value slot
+            // and key slot are non-consuming — the caller keeps its own owner
+            // and drops it at scope exit; the literal `%{...}` builder likewise
+            // passes borrowed entries). The map must therefore take an
+            // INDEPENDENT owner via `ownEntryKey`/`ownEntryValue`, NOT a bare
+            // retain: under `INDIVIDUAL_NO_REFCOUNT` + `CLONE_ON_SHARE`
+            // (`Memory.Tracking`) a bare retain is a no-op, so the map's slot
+            // would ALIAS the caller's boxed-`Callable` inner; when the caller
+            // drops its argument the map's slot dangles and the map's later
+            // deep-release double-frees it (`invalid free` — runtime-3--01 /
+            // FU-37). `ownEntry*` deep-clones an eagerly-freed child under
+            // CLONE_ON_SHARE and folds to the existing refcount bump under
+            // REFCOUNTED (byte-identical), and no-ops for a value with no
+            // eagerly-freed child (scalars/`String`/atoms) in every mode.
+            entries[new_idx] = .{ .hash = h, .key = ownEntryKey(key), .value = ownEntryValue(value) };
+            dest.len = new_idx + 1;
+            dest.installBucket(h, new_idx);
+            return dest;
+        }
+
+        /// Insert an ALREADY-OWNED `key`/`value` into `dest` by MOVE — the
+        /// caller has produced independent owners (via `ownEntryKey` /
+        /// `ownEntryValue`), so no retain is taken: the entry slot becomes the
+        /// sole owner. The move counterpart of `putInPlaceInsert` (which
+        /// retains a borrowed key/value). Used by the owned `Map.merge` fold,
+        /// where each entry copied from a BORROWED source operand is first
+        /// clone-on-shared into an independent owner and then moved in here — a
+        /// retain would be a no-op under `CLONE_ON_SHARE` and re-alias the
+        /// borrowed source's boxed inner (FU-31). `dest` must have spare entry
+        /// capacity (the fold reserves it up front).
+        fn putOwnedInPlaceInsert(dest: *Self, key: K, value: V) *Self {
+            const h = dest.hashKey(key);
+            const new_idx: u32 = dest.len;
+            std.debug.assert(new_idx < dest.entry_cap);
+            const entries = dest.entriesPtr();
             entries[new_idx] = .{ .hash = h, .key = key, .value = value };
             dest.len = new_idx + 1;
             dest.installBucket(h, new_idx);
             return dest;
+        }
+
+        /// Fold one entry from a BORROWED source map into the uniquely-owned
+        /// `target` (the owned `Map.merge` accumulator). `key`/`value` are
+        /// BORROWED (they belong to the source operand, which survives the
+        /// merge), so each is clone-on-shared (`ownEntryKey` / `ownEntryValue`)
+        /// into an INDEPENDENT owner before being stored — under
+        /// `CLONE_ON_SHARE` (`Memory.Tracking`) a bare retain is a no-op and
+        /// would alias the borrowed source's boxed inner, so the result and the
+        /// borrowed operand would double-free it (FU-31). On an overwrite (the
+        /// key already exists in `target`) the displaced value is deep-released
+        /// exactly once and replaced by the owned clone. `target` is assumed to
+        /// have spare entry capacity for a fresh insert (the fold reserves
+        /// `a.len + b.len` up front), so this never resizes/reallocs and the
+        /// accumulator pointer is stable across the whole fold. Under REFCOUNTED
+        /// the `ownEntry*` calls fold to a refcount bump and the displaced-value
+        /// release to a refcount drop — semantically identical to the prior
+        /// `put`-based fold.
+        fn foldBorrowedEntry(target: *Self, key: K, value: V) void {
+            if (findEntry(target, key)) |existing_idx| {
+                const allocator = std.heap.c_allocator;
+                const entry = target.entryAt(existing_idx);
+                const owned_value = ownEntryValue(value);
+                releaseEntryValue(entry.value, allocator);
+                entry.value = owned_value;
+                return;
+            }
+            const owned_key = ownEntryKey(key);
+            const owned_value = ownEntryValue(value);
+            _ = putOwnedInPlaceInsert(target, owned_key, owned_value);
         }
 
         // -------------------------------------------------------------------
@@ -15642,31 +15787,100 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 if (map_b) |m| _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
             }
 
+            // `Map.merge` CONSUMES BOTH operands: the codegen transfers
+            // ownership of `map_a` (slot 0, the `arc_liveness.ownedMutatingBuiltinSlot`
+            // receiver) AND `map_b` (slot 1, lowered with a `.move` arg-mode at
+            // last use) into the call and emits NO scope-exit drop for either,
+            // so `merge` itself must reclaim both. `map_a`'s ownership flows into
+            // the result (reused in place / moved when uniquely owned); `map_b`'s
+            // entries are folded in and then `map_b` is released. Each folded
+            // `map_b` entry is CLONE-ON-SHARED (`ownEntry*`) so the subsequent
+            // `release(map_b)` deep-frees `map_b`'s own inners without touching
+            // the result's copies — under `INDIVIDUAL_NO_REFCOUNT` +
+            // `CLONE_ON_SHARE` (`Memory.Tracking`) a bare retain would instead
+            // alias `map_b`'s boxed inner and the `release(map_b)` would free it
+            // out from under the result (`invalid free` / SEGFAULT — FU-31).
+            // Under REFCOUNTED the clone folds to a refcount bump and
+            // `release(map_b)` to the matching decrement.
+            //
+            // The prior implementation (`retain(map_a)` + a `put`-fold +
+            // intermediate `release`) move-cloned the receiver then deep-freed
+            // the just-cloned-from buffer, and bare-retained `map_b`'s values —
+            // both double-free classes under Tracking.
             if (map_a == null and map_b == null) return null;
-            if (map_a == null) return retain(map_b);
-            if (map_b == null) return retain(map_a);
+            // Single-operand arms. The result must UNIQUELY OWN the lone
+            // operand's entries. Under `INDIVIDUAL_NO_REFCOUNT` the codegen
+            // consumed the operand without dropping it, so the result may take
+            // its buffer directly (`map_b`/`map_a` reused) — but `map_b` here is
+            // reclaimed by `releaseConsumedMergeOperand` only after a clone,
+            // since we cannot reuse `map_b`'s buffer (the loop below would have
+            // grown it); for `map_a == null` we own-clone `map_b`. Under
+            // REFCOUNTED both operands are BORROWED (the caller releases them),
+            // so we always own-clone — never alias an operand the caller frees.
+            if (map_b == null) {
+                if (comptime eager_individual_free) return map_a;
+                return cloneBufferOwningChildren(map_a.?, map_a.?.capacity, @returnAddress());
+            }
+            if (map_a == null) {
+                const only = cloneBufferOwningChildren(map_b.?, map_b.?.capacity, @returnAddress()) orelse return null;
+                releaseConsumedMergeOperand(map_b);
+                return only;
+            }
 
-            // Both non-null: fold each entry of `b` into a result whose
-            // initial state is `a` retained. Each `put` either returns
-            // the same handle (rc-1 fast path on a unique-owner clone
-            // we just made) or a fresh clone, in which case we release
-            // the prior intermediate.
-            var result: ?*const Self = retain(map_a);
+            const a = map_a.?;
             const b = map_b.?;
+
+            // Size the accumulator for the worst case (no key overlap) up front
+            // so the `b` fold never resizes and the result pointer stays stable.
+            // Widen the sum so a pathological `a.len + b.len` cannot overflow u32
+            // before `pickCapacity` clamps it.
+            const combined_len: u64 = @as(u64, a.len) + @as(u64, b.len);
+            const target_len: u32 = if (combined_len > std.math.maxInt(u32))
+                std.math.maxInt(u32)
+            else
+                @intCast(combined_len);
+            const target_cap = pickCapacity(a.capacity, target_len);
+
+            // Establish the owned accumulator from `map_a`. The two reclamation
+            // models hand `map_a` to `merge` differently:
+            //   * `INDIVIDUAL_NO_REFCOUNT` (Tracking): the codegen MOVES `map_a`
+            //     into the call and does not drop it, so `merge` CONSUMES it —
+            //     reuse its buffer in place at capacity, else MOVE its entries
+            //     into the grown buffer (uniquely owned, no per-entry clone) and
+            //     free the old shallowly. (A shared map was already split into
+            //     per-owner buffers at its `cloneForShare` site, so a consumed
+            //     handle is sole-owner.)
+            //   * REFCOUNTED / BULK_OR_NEVER / TRACED: `map_a` is BORROWED (the
+            //     caller releases it), so `merge` must NOT reuse or free it —
+            //     OWN-clone its entries into an independent result (a refcount
+            //     bump per entry under REFCOUNTED; the caller's release balances
+            //     `map_a`'s own reference).
+            const result = blk: {
+                if (comptime eager_individual_free) {
+                    if (target_cap == a.capacity) break :blk @constCast(a);
+                    const grown = cloneBufferMovingChildren(a, target_cap, @returnAddress()) orelse return null;
+                    if (comptime instrument_map) mapInstrumentationOnRelease(@intFromPtr(a), a.len);
+                    @constCast(a).bufferFreeShallow();
+                    break :blk grown;
+                }
+                break :blk cloneBufferOwningChildren(a, target_cap, @returnAddress()) orelse return null;
+            };
+
+            // Fold each `map_b` entry: clone-on-share its key/value into the
+            // result (last-writer-wins on overlapping keys, deep-releasing the
+            // displaced value once). Then, under the no-refcount model only,
+            // reclaim the CONSUMED `map_b` (its inners are freed once; the
+            // folded copies are independent). Under REFCOUNTED `map_b` is
+            // borrowed and the caller releases it — `releaseConsumedMergeOperand`
+            // is a comptime no-op there.
             const b_len = b.len;
             const b_entries = b.entriesPtr();
             var i: u32 = 0;
             while (i < b_len) : (i += 1) {
                 const entry = b_entries[i];
-                const next_result = put(result, entry.key, entry.value) orelse {
-                    release(result);
-                    return null;
-                };
-                if (next_result != result) {
-                    release(result);
-                    result = next_result;
-                }
+                foldBorrowedEntry(result, entry.key, entry.value);
             }
+            releaseConsumedMergeOperand(map_b);
             return result;
         }
 
@@ -15738,16 +15952,21 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return mut;
         }
 
-        /// Like `merge`, but skips the rc==1 check on `map_a`. Caller
-        /// must have proven uniqueness of `map_a` via uniqueness. `map_b` is
-        /// BORROWED — its entries' keys and values are deep-retained
-        /// as they're copied into A. See safety contract above.
+        /// Like `merge`, but skips the rc==1 check on `map_a`. Caller must have
+        /// proven uniqueness of `map_a` via uniqueness. CONSUMES BOTH operands
+        /// (the codegen transfers `map_a` AND `map_b` into the call and emits no
+        /// drop for either), exactly like the checked `merge`.
         ///
-        /// Implementation: the unchecked merge folds B's entries into
-        /// A in place via `put_owned_unchecked`. Each `put` either
-        /// keeps the same buffer or grows in place (still A's +1).
-        /// The result is always A's pointer (possibly after a
-        /// transparent resize).
+        /// Implementation: `map_a`'s own entries are MOVED (never re-aliased)
+        /// into a single worst-case-sized buffer up front, staying uniquely
+        /// owned without a double-count; each `map_b` entry is CLONE-ON-SHARED
+        /// (`ownEntryKey`/`ownEntryValue`) into the accumulator and then `map_b`
+        /// is released. A bare retain of `b`'s entries (the prior
+        /// `put_owned_unchecked` fold) is a no-op under `CLONE_ON_SHARE`
+        /// (`Memory.Tracking`) and would alias `map_b`'s boxed inners, so the
+        /// `release(map_b)` would free them out from under the result (FU-31).
+        /// Under REFCOUNTED the clone folds to a refcount bump and
+        /// `release(map_b)` to the matching decrement.
         pub fn merge_owned_unchecked(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
             if (map_a) |m| {
                 if (m.capacity == 0) @panic("Map.merge_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state: map_a");
@@ -15758,30 +15977,53 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (map_a == null and map_b == null) return null;
             if (map_b == null) return map_a;
             if (map_a == null) {
-                // No A to mutate; produce a fresh deep-retain clone
-                // of B with rc=1.
+                // No A to mutate; own an independent clone-on-share copy of the
+                // consumed B (rc=1), then reclaim the consumed `map_b` (no-refcount
+                // model only — see `releaseConsumedMergeOperand`).
                 const callsite = @returnAddress();
-                return cloneBufferRetainingChildren(map_b.?, map_b.?.capacity, callsite);
+                const only = cloneBufferOwningChildren(map_b.?, map_b.?.capacity, callsite) orelse return null;
+                releaseConsumedMergeOperand(map_b);
+                return only;
             }
 
-            var result: ?*const Self = map_a;
+            const a = map_a.?;
             const b = map_b.?;
+
+            // Pre-size the OWNED A to the worst case (no key overlap) with a
+            // single in-place resize, so the `b` fold below never has to resize
+            // and the accumulator pointer is stable. A's own entries are MOVED
+            // verbatim into the grown buffer (no per-entry retain/clone — they
+            // remain uniquely owned, the unchecked contract's `+1` transferring
+            // from the old buffer to the new), then the old buffer is freed
+            // SHALLOWLY (children moved, not released).
+            const combined_len: u64 = @as(u64, a.len) + @as(u64, b.len);
+            const target_len: u32 = if (combined_len > std.math.maxInt(u32))
+                std.math.maxInt(u32)
+            else
+                @intCast(combined_len);
+            const target_cap = pickCapacity(a.capacity, target_len);
+
+            var result: *Self = @constCast(a);
+            if (target_cap != a.capacity) {
+                const grown = cloneBufferMovingChildren(a, target_cap, @returnAddress()) orelse return null;
+                if (comptime instrument_map) {
+                    mapInstrumentationOnRelease(@intFromPtr(a), a.len);
+                }
+                @constCast(a).bufferFreeShallow();
+                result = grown;
+            }
+
+            // Fold each entry of the CONSUMED `map_b` (clone-on-share into the
+            // result), then reclaim `map_b` (no-refcount model only — see
+            // `releaseConsumedMergeOperand`) so its own inners are freed once.
             const b_len = b.len;
             const b_entries = b.entriesPtr();
             var i: u32 = 0;
             while (i < b_len) : (i += 1) {
                 const entry = b_entries[i];
-                const next_result = put_owned_unchecked(result, entry.key, entry.value) orelse {
-                    return null;
-                };
-                // Under uniqueness, put_owned_unchecked either
-                // returns the same pointer (in-place) or a fresh
-                // buffer with the previous A's children moved over.
-                // Either way, no release on the prior result is
-                // needed — the prior buffer was either reused (same
-                // pointer) or freed shallowly inside the resize path.
-                result = next_result;
+                foldBorrowedEntry(result, entry.key, entry.value);
             }
+            releaseConsumedMergeOperand(map_b);
             return result;
         }
 
@@ -22289,6 +22531,8 @@ test "Map(i64,i64) merge_owned_unchecked folds B into A in place" {
         try std.testing.expect(false);
         return;
     };
+    // `merge_owned_unchecked` consumes `map_a` (mutated in place) but BORROWS
+    // `map_b` under the host REFCOUNTED manager (the caller releases `b`).
     defer MapI64.release(b);
 
     const a_ptr = @intFromPtr(a);
@@ -22311,6 +22555,10 @@ test "Map(i64,i64) merge_owned_unchecked semantics match checked merge on rc=1 i
     const keys_b = [_]i64{ 2, 3 };
     const vals_b = [_]i64{ 99, 30 };
 
+    // Under the host REFCOUNTED manager, checked `merge` BORROWS both operands
+    // (caller releases both `a_checked` and `b_checked`); `merge_owned_unchecked`
+    // consumes `a_unchecked` (mutated in place — not released by the caller) but
+    // BORROWS `b_unchecked` (caller releases it).
     const a_checked = MapI64.fromPairs(&keys_a, &vals_a, 2).?;
     const b_checked = MapI64.fromPairs(&keys_b, &vals_b, 2).?;
     defer MapI64.release(b_checked);

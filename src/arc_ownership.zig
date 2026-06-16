@@ -1246,19 +1246,20 @@ fn recordInstructionUses(
         },
         .map_init => |mi| {
             for (mi.entries) |entry| {
+                // `.map_init` is NOT an aggregate-store (consume) position for
+                // EITHER key or value: the `Map.put` substrate takes an
+                // independent owner of each inserted key/value via
+                // `ownEntryKey`/`ownEntryValue` (refcount bump under REFCOUNTED,
+                // clone-on-share under `INDIVIDUAL_NO_REFCOUNT`), so the
+                // construction operands stay the caller's own owners (an
+                // ordinary non-borrow use that keeps its scope-exit drop). A
+                // boxed `Callable` map value uses the SAME clone-on-share path
+                // as every other value type — the prior FCC residual-4
+                // move-into-cell carve-out is subsumed by the runtime owning the
+                // value (runtime-3--01 / FU-37), so it is removed here in lock-
+                // step with the `arc_liveness.applyOwnsEffect` `.map_init` arm.
                 try summary.recordUse(allocator, entry.key, false);
-                // FCC residual-4 (Map-of-boxes): a boxed `Callable` map VALUE
-                // is consumed into the map cell (see the `map_init` consume in
-                // `arc_liveness.applyOwnsEffect`), so it is an aggregate-store
-                // position — a `local_get` whose only use is the map value can
-                // lower as `move_value` (transfer ownership into the cell)
-                // instead of the conservative `copy_value` + retain. A NON-box
-                // value keeps the Map.put-retains contract (`recordUse(false)`).
-                if (mi.value_type == .protocol_box) {
-                    try summary.recordAggregateStoreUse(allocator, entry.value);
-                } else {
-                    try summary.recordUse(allocator, entry.value, false);
-                }
+                try summary.recordUse(allocator, entry.value, false);
             }
         },
         .struct_init => |si| {
