@@ -155,4 +155,59 @@ pub struct PubErrorTest {
       assert(Option.is_some?(holder.cause))
     }
   }
+
+  describe("raising fn called directly outside `try` (GAP-P3-01 / FU-33)") {
+    # Regression for audit finding GAP-P3-01 / FU-33: calling a raising
+    # function DIRECTLY (outside a `try`, from a non-raising caller) on a
+    # path that does NOT raise aborted with "attempt to use null value".
+    # The `abort_unhandled` error-union unwrap emitted the abort call in
+    # straight-line position so it fired on EVERY path — including success —
+    # reading the empty raise side-channel. The SUCCESS case must now unwrap
+    # the error-union payload and yield the value; the abort must fire ONLY
+    # on a genuine raise.
+    test("direct call on the success path returns the unwrapped value") {
+      # `risky_double(5)` does not raise (5 >= 0); the direct call (no `try`)
+      # must return 10. Pre-fix this aborted "attempt to use null value".
+      assert(risky_double(5) == 10)
+    }
+
+    test("direct call on another success input returns its value") {
+      assert(risky_double(21) == 42)
+    }
+
+    test("the boundary success input (zero) returns its value") {
+      assert(risky_double(0) == 0)
+    }
+
+    # The raise path must STILL work: a genuine raise from the same function
+    # propagates and is recoverable via `try`/`rescue` (the abort/propagate
+    # machinery is unchanged — only the success-path unwrap was wrong).
+    test("the raise path still propagates and is recoverable") {
+      assert(catch_risky(-1) == "raised")
+      assert(catch_risky(7) == "ok:14")
+    }
+  }
+
+  # GAP-P3-01 / FU-33 helpers. `risky_double` raises ONLY when n < 0; for
+  # n >= 0 it returns n * 2. The success-path callers below invoke it
+  # DIRECTLY (no enclosing `try`) from a non-raising test body — the exact
+  # shape that aborted pre-fix on the (non-raising) success path.
+  fn risky_double(n :: i64) -> i64 {
+    if n < 0 {
+      raise %NotConnected{message: "negative input"}
+    } else {
+      n * 2
+    }
+  }
+
+  # Observes the raise path: a genuine raise must still propagate and be
+  # recoverable; the success branch flows the unwrapped value out.
+  fn catch_risky(n :: i64) -> String {
+    try {
+      result = risky_double(n)
+      "ok:" <> Integer.to_string(result)
+    } rescue {
+      e :: NotConnected -> "raised"
+    }
+  }
 }

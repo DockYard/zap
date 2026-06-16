@@ -159,6 +159,12 @@ extern "c" fn zir_builder_emit_error_union_type(handle: ?*ZirBuilderHandle, erro
 extern "c" fn zir_builder_emit_ret_error(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_try(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_catch(handle: ?*ZirBuilderHandle, operand: u32, catch_value: u32) u32;
+// `operand catch <else-body>` — the catch-expression's instructions run ONLY
+// on the error branch. Used by the `abort_unhandled` unwrap so a `noreturn`
+// abort never fires on the success path (GAP-P3-01 / FU-33). `else_insts` are
+// captured via begin_capture/end_capture; `else_is_noreturn` skips the
+// synthesized trailing break for a self-terminating body.
+extern "c" fn zir_builder_emit_catch_with_body(handle: ?*ZirBuilderHandle, operand: u32, else_insts_ptr: [*]const u32, else_insts_len: u32, else_result: u32, else_is_noreturn: u32) u32;
 extern "c" fn zir_builder_emit_is_non_err(handle: ?*ZirBuilderHandle, operand: u32) u32;
 extern "c" fn zir_builder_emit_err_union_payload_unsafe(handle: ?*ZirBuilderHandle, operand: u32) u32;
 
@@ -6865,11 +6871,50 @@ pub const ZirDriver = struct {
                     },
                     .abort_unhandled => {
                         // `source catch Kernel.abort_recoverable_raise(...)` —
-                        // top-level terminus: recover the stashed box and abort
-                        // through the Phase 2 crash report. The catch value is
-                        // the `noreturn` abort call's result.
-                        const abort_ref = try self.emitAbortRecoverableRaise(ueu.payload_type);
-                        const unwrapped = zir_builder_emit_catch(self.handle, source_ref, abort_ref);
+                        // top-level terminus for a raise that is neither
+                        // rescued nor propagated: recover the stashed box and
+                        // abort through the Phase 2 crash report.
+                        //
+                        // The abort is `noreturn` and MUST run only on a
+                        // genuine error. Emitting it via `zir_builder_emit_catch`
+                        // (which takes a precomputed catch value) placed the
+                        // abort call in straight-line position BEFORE the
+                        // catch's condbr, so it fired UNCONDITIONALLY — on the
+                        // success path too — reading the empty raise
+                        // side-channel and aborting "attempt to use null value"
+                        // (GAP-P3-01 / FU-33). Capture the abort call into the
+                        // else branch instead, so the success path unwraps and
+                        // yields the payload and the abort fires only on a real
+                        // raise.
+                        self.beginCapture();
+                        const abort_ref = self.emitAbortRecoverableRaise(ueu.payload_type) catch |err| {
+                            // Balance the capture stack before propagating an
+                            // emit failure, so a later capture is not skewed.
+                            var discard_len: u32 = 0;
+                            _ = self.endCapture(&discard_len);
+                            return err;
+                        };
+                        if (abort_ref == error_ref) {
+                            var discard_len: u32 = 0;
+                            _ = self.endCapture(&discard_len);
+                            return error.EmitFailed;
+                        }
+                        var else_len: u32 = 0;
+                        const else_ptr = self.endCapture(&else_len);
+                        const else_insts = try self.allocator.alloc(u32, else_len);
+                        defer self.allocator.free(else_insts);
+                        @memcpy(else_insts, else_ptr[0..else_len]);
+                        // The abort call is `noreturn`, so the else body
+                        // self-terminates — no trailing break, `else_result`
+                        // unused.
+                        const unwrapped = zir_builder_emit_catch_with_body(
+                            self.handle,
+                            source_ref,
+                            else_insts.ptr,
+                            @intCast(else_insts.len),
+                            abort_ref,
+                            1,
+                        );
                         if (unwrapped == error_ref) return error.EmitFailed;
                         try self.setLocal(ueu.dest, unwrapped);
                     },
