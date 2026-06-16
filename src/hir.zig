@@ -1451,6 +1451,40 @@ fn compileStructFields(
     return node;
 }
 
+/// Convert a map-pattern key (`%{a: v}` shorthand → atom literal, or
+/// `%{lit => v}` arrow → any constant literal) from its AST form into a HIR
+/// `Expr` the IR `extract_map` lowering can lower to a runtime `map_get` /
+/// `map_has_key` key operand. Map-pattern keys are compile-time constants;
+/// a non-literal key in pattern position is not a meaningful structural
+/// match and is surfaced as an error rather than silently mis-lowered.
+fn mapPatternKeyToHir(allocator: std.mem.Allocator, key: *const ast.Expr) anyerror!*const Expr {
+    const node = try allocator.create(Expr);
+    node.* = switch (key.*) {
+        .atom_literal => |v| .{
+            .kind = .{ .atom_lit = v.value },
+            .type_id = types_mod.TypeStore.ATOM,
+            .span = v.meta.span,
+        },
+        .int_literal => |v| .{
+            .kind = .{ .int_lit = v.value },
+            .type_id = types_mod.TypeStore.I64,
+            .span = v.meta.span,
+        },
+        .string_literal => |v| .{
+            .kind = .{ .string_lit = v.value },
+            .type_id = types_mod.TypeStore.STRING,
+            .span = v.meta.span,
+        },
+        .bool_literal => |v| .{
+            .kind = .{ .bool_lit = v.value },
+            .type_id = types_mod.TypeStore.BOOL,
+            .span = v.meta.span,
+        },
+        else => return error.UnsupportedMapPatternKey,
+    };
+    return node;
+}
+
 /// Compile a column where the first pattern is `map_match`. The shape mirrors
 /// `compileStructFields` but indexes by key expression rather than field name.
 fn compileMapFields(
@@ -1490,16 +1524,16 @@ fn compileMapFields(
     for (keys.items) |key_expr| {
         const sid = next_id.*;
         next_id.* += 1;
-        // key_expr_hir built lazily — the IR converts the AST key inline;
-        // here we just want a placeholder Expr so the Decision can
-        // reference the key for its own diagnostics.
-        const placeholder = try allocator.create(Expr);
-        placeholder.* = .{
-            .kind = .nil_lit,
-            .type_id = types_mod.TypeStore.UNKNOWN,
-            .span = key_expr.getMeta().span,
-        };
-        try extractions.append(allocator, .{ .key = placeholder, .scrutinee_id = sid });
+        // The looked-up key must be the REAL key expression — the IR's
+        // `extract_map` lowering lowers `key.*` to the runtime `map_get` /
+        // `map_has_key` key operand. A `nil_lit` placeholder (the prior
+        // behaviour) made the IR emit `nil` as the key, which is a type
+        // error against the `Map(K, V)` key parameter and silently broke
+        // every bare map-pattern arm. Map-pattern keys are constant
+        // literals (atom shorthand `%{a: v}` or arrow `%{lit => v}`), so
+        // convert the literal AST key into its HIR literal form.
+        const key_hir = try mapPatternKeyToHir(allocator, key_expr);
+        try extractions.append(allocator, .{ .key = key_hir, .scrutinee_id = sid });
         try key_scrutinee_ids.append(allocator, sid);
     }
 
@@ -4956,9 +4990,46 @@ pub const HirBuilder = struct {
             .pin => |p| try self.create(MatchPattern, .{ .pin = p.name }),
             .paren => |p| self.compilePattern(p.inner),
             .struct_pattern => |sp| {
-                // Get the type name from the struct_name (first part)
-                // When struct_name is empty, the type comes from param annotation (handled in buildClause)
-                const type_name = if (sp.struct_name.parts.len > 0) sp.struct_name.parts[0] else return null;
+                // The parser routes the atom-keyed map shorthand
+                // `%{key: pat, ...}` into `.struct_pattern` with an EMPTY
+                // `struct_name` (the brace syntax is shared with struct
+                // destructure `%Name{...}`). In PARAMETER position
+                // `buildClause` recovers the intended shape from the
+                // parameter's type annotation (struct vs `%{K -> V}` map).
+                // In ARM position (`case`/`with`/`for`/`rescue`) there is no
+                // annotation: an empty `struct_name` can ONLY have come from
+                // the `%{...}` shorthand (a struct destructure always carries
+                // its name), so it is unambiguously a structural MAP pattern.
+                // Lower it to a `map_match` — synthesising an atom-literal key
+                // per field name, exactly as the `buildClause` map branch does
+                // — so the required keys are checked for presence and their
+                // value sub-patterns recursively matched (and variables
+                // bound). Returning `null` here (the prior behaviour) dropped
+                // the pattern from the decision matrix, making the arm match
+                // ANYTHING and silently shadow every later arm (GAP-P3-02 /
+                // FU-34).
+                if (sp.struct_name.parts.len == 0) {
+                    var map_bindings: std.ArrayList(MapFieldBind) = .empty;
+                    for (sp.fields) |field| {
+                        if (try self.compilePattern(field.pattern)) |p| {
+                            const key_ast: *ast.Expr = try self.allocator.create(ast.Expr);
+                            key_ast.* = .{ .atom_literal = .{
+                                .meta = .{ .span = sp.meta.span },
+                                .value = field.name,
+                            } };
+                            try map_bindings.append(self.allocator, .{
+                                .key = key_ast,
+                                .pattern = p,
+                            });
+                        }
+                    }
+                    return try self.create(MatchPattern, .{
+                        .map_match = .{
+                            .field_bindings = try map_bindings.toOwnedSlice(self.allocator),
+                        },
+                    });
+                }
+                const type_name = sp.struct_name.parts[0];
                 var bindings: std.ArrayList(StructFieldBind) = .empty;
                 for (sp.fields) |field| {
                     if (try self.compilePattern(field.pattern)) |p| {

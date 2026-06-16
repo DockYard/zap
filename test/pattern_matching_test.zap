@@ -93,6 +93,46 @@ pub struct PatternMatchingTest {
     }
   }
 
+  describe("bare map pattern in a case arm (GAP-P3-02 / FU-34)") {
+    # Regression for audit finding GAP-P3-02 / FU-34: a bare `%{a: v}` map
+    # pattern in a `case`/`with`/`for` ARM (no type annotation, so it parses
+    # to a `.struct_pattern` with an EMPTY struct_name) was dropped from the
+    # decision matrix by compilePattern (`else return null`), so the arm
+    # matched ANYTHING — silently shadowing every later arm including `_`.
+    # The bare map arm MUST match only maps containing the named key, binding
+    # the value sub-pattern; a non-matching map MUST fall through to `_`.
+    test("bare map arm matches and binds when the key is present") {
+      # `%{a: v}` is declared BEFORE `_`; with key :a present it must match
+      # and bind v to its value (4), not shadow-match everything.
+      assert(classify_map(%{a: 4}) == 4)
+    }
+
+    test("bare map arm falls through to the wildcard when the key is absent") {
+      # `%{b: 9}` has no key :a, so the `%{a: v}` arm must NOT match — pre-fix
+      # the bare arm matched everything and returned the (wrong) bound value.
+      assert(classify_map(%{b: 9}) == -1)
+    }
+
+    test("bare map arm with a literal value matches only that value") {
+      # `%{a: 1}` arm declared before `_`: a map with a == 1 matches, a map
+      # with a == 2 (key present, value differs) must fall through to `_`.
+      assert(match_literal_value(%{a: 1}) == "one")
+      assert(match_literal_value(%{a: 2}) == "other")
+      assert(match_literal_value(%{b: 1}) == "other")
+    }
+
+    # Duplicate-variable unification inside a map arm (fixed in d5bae6b must
+    # still apply through the map-match lowering): `%{a: v, b: v}` matches
+    # only when both values are equal.
+    test("duplicate-var map arm matches only when both values are equal") {
+      assert(equal_pair(%{a: 5, b: 5}) == "equal")
+    }
+
+    test("duplicate-var map arm falls through when the two values differ") {
+      assert(equal_pair(%{a: 5, b: 6}) == "different")
+    }
+  }
+
   describe("fixed-length list clause dispatch binds the correct element (ir-3--06)") {
     # Regression for audit finding ir-3--06: in the multi-clause function-head
     # dispatch path, fixed-length list element -> scrutinee-ID mapping was
@@ -235,5 +275,29 @@ pub struct PatternMatchingTest {
 
   fn spread(_ :: [i64]) -> i64 {
     -1
+  }
+
+  # GAP-P3-02 / FU-34 helpers: bare `%{key: pat}` map patterns in case arms.
+  # `m :: %{Atom => i64}` makes the scrutinee a map (not a struct), so the
+  # arm `%{a: v}` must lower to a structural map-key match.
+  fn classify_map(m :: %{Atom => i64}) -> i64 {
+    case m {
+      %{a: v} -> v
+      _ -> -1
+    }
+  }
+
+  fn match_literal_value(m :: %{Atom => i64}) -> String {
+    case m {
+      %{a: 1} -> "one"
+      _ -> "other"
+    }
+  }
+
+  fn equal_pair(m :: %{Atom => i64}) -> String {
+    case m {
+      %{a: v, b: v} -> "equal"
+      _ -> "different"
+    }
   }
 }

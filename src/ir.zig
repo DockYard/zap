@@ -10650,6 +10650,38 @@ pub const IrBuilder = struct {
                     if (t != .map) break :blk null;
                     break :blk t.map.value;
                 };
+                // Unlike the function-dispatch path (where a typed `%{K -> V}`
+                // PARAMETER is guaranteed by its type to be a map and every
+                // key extraction structurally "matches"), a map pattern in a
+                // case/with/for ARM (`%{a: v} ->`) must match ONLY when the
+                // scrutinee actually contains every named key — otherwise it
+                // would bind defaults and wrongly shadow later arms (GAP-P3-02
+                // / FU-34). Emit a `map_has_key` presence check per key, AND
+                // them together, guard the value extraction + success subtree
+                // on the combined condition, then lower the failure subtree as
+                // the fall-through (mirroring `check_list`).
+                var presence_condition: ?LocalId = null;
+                for (em.keys) |ke| {
+                    const key_local = try self.lowerExpr(ke.key);
+                    const has_key_local = self.next_local;
+                    self.next_local += 1;
+                    try self.current_instrs.append(self.allocator, .{
+                        .map_has_key = .{
+                            .dest = has_key_local,
+                            .map = scrutinee_local,
+                            .key = key_local,
+                            .key_type = key_type,
+                            .value_type = value_type,
+                        },
+                    });
+                    presence_condition = if (presence_condition) |prev|
+                        try self.emitAnd(prev, has_key_local)
+                    else
+                        has_key_local;
+                }
+
+                const saved = self.current_instrs;
+                self.current_instrs = .empty;
                 for (em.keys) |ke| {
                     const key_local = try self.lowerExpr(ke.key);
                     const default_local = try self.emitDefaultValueForType(value_type);
@@ -10673,6 +10705,20 @@ pub const IrBuilder = struct {
                     try scrutinee_map.put(ke.scrutinee_id, value_local);
                 }
                 try self.lowerDecisionTreeForCase(em.success, case_arms, scrutinee_map, dest);
+                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
+                self.current_instrs = saved;
+
+                if (presence_condition) |condition| {
+                    try self.current_instrs.append(self.allocator, .{
+                        .guard_block = .{ .condition = condition, .body = success_body },
+                    });
+                    try self.lowerDecisionTreeForCase(em.failure, case_arms, scrutinee_map, dest);
+                } else {
+                    // No keys to check (an empty `%{}` pattern matches any
+                    // map): the extraction body is unconditional.
+                    try self.current_instrs.appendSlice(self.allocator, success_body);
+                    self.allocator.free(success_body);
+                }
             },
         }
     }
