@@ -915,19 +915,41 @@ fn compilePatternMatrixWithBindings(
         return d;
     }
 
+    // Record EVERY row's column-0 bind name against this column's
+    // scrutinee id BEFORE classifying or stripping the column. A later
+    // pin (`^name`) in any column resolves its comparison target through
+    // `bound_scrutinees`; the bind it references may live in a row that a
+    // constructor column (a literal/atom/tuple switch) strips without
+    // visiting the all-wildcard path, so recording must happen here at the
+    // single choke point every dispatch flows through — not only in the
+    // `.all_wildcard` arm for row 0. Missing this made a pin fall back to
+    // scrutinee 0 (the first parameter), comparing against the wrong value
+    // (audit finding hir-1--03 / TY-02).
+    //
+    // The mapping is keyed by name → scrutinee id, where the scrutinee id
+    // is positional (fixed per column). Columns are processed left-to-right
+    // and a pin always references a bind at an earlier column on its own
+    // decision path; clauses that bind the same name at *different* columns
+    // necessarily differ at an earlier column and so are routed to disjoint
+    // sub-matrices before the differing bind column is reached. Recording
+    // the current column's bind unconditionally therefore always reflects
+    // the correct positional scrutinee along each path.
+    if (scrutinee_ids.len > 0) {
+        for (matrix.rows) |row| {
+            if (row.patterns.len == 0) continue;
+            const pat = row.patterns[0];
+            if (pat != null and pat.?.* == .bind) {
+                try bound_scrutinees.put(pat.?.bind, scrutinee_ids[0]);
+            }
+        }
+    }
+
     // Classify column 0
     const col0_class = classifyColumn(matrix);
 
     switch (col0_class) {
         .all_wildcard => {
             // Variable Rule: strip column 0, recurse.
-            // Record any bind in column 0 so pins in later columns can reference it.
-            if (matrix.rows.len > 0 and matrix.rows[0].patterns.len > 0) {
-                const pat = matrix.rows[0].patterns[0];
-                if (pat != null and pat.?.* == .bind and scrutinee_ids.len > 0) {
-                    bound_scrutinees.put(pat.?.bind, scrutinee_ids[0]) catch {};
-                }
-            }
             return stripColumnAndRecurse(allocator, matrix, scrutinee_ids, next_id, bound_scrutinees);
         },
         .all_constructor, .mixture => {
@@ -1779,10 +1801,16 @@ fn compilePinGuard(
     }
 
     // Build a guard expression: scrutinee == pinned_variable
-    // The pinned variable is a param_get referencing the earlier binding's scrutinee.
-    // We look up the scrutinee ID from bound_scrutinees which was recorded when the
-    // original bind was processed.
-    const bound_id = bound_scrutinees.get(pin_name.?) orelse 0;
+    // The pinned variable is a param_get referencing the earlier binding's
+    // scrutinee, recorded into bound_scrutinees when that bind's column was
+    // processed. The resolver already rejects a pin whose variable is not in
+    // scope ("pinned variable not found in scope"), and TY-02's recording
+    // guarantees every in-scope bind is registered before its column is
+    // stripped — so a missing entry here is a compiler invariant violation,
+    // NOT user error. Surface it loudly rather than silently comparing
+    // against scrutinee 0 (the first parameter), which is never correct and
+    // was the original miscompile (audit finding hir-1--03 / TY-02).
+    const bound_id = bound_scrutinees.get(pin_name.?) orelse return error.UnboundPinScrutinee;
     const pin_var_expr = try allocator.create(Expr);
     pin_var_expr.* = .{
         .kind = .{ .param_get = bound_id },

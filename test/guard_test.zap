@@ -353,4 +353,44 @@ pub struct GuardTest {
   fn classify_str(_ :: String) -> String {
     "empty"
   }
+
+  # Regression for audit finding hir-1--03 / TY-02: an unbound pin
+  # scrutinee must resolve to the CORRECT bound scrutinee local, not
+  # default to local 0 (the first parameter). The binding column here is a
+  # MIXTURE (one clause has a literal `1`, the other binds `y`), so the
+  # bind of `y` is stripped by the literal switch; pre-fix the later pin
+  # `^y` missed `bound_scrutinees` and the `orelse 0` fallback compiled the
+  # guard as `head == arg0` instead of `head == y`. That made
+  # `pin_dispatch(99, 5, [5])` spuriously fail to match (head 5 vs arg0 99)
+  # and `pin_dispatch(7, 5, [7])` spuriously match (head 7 vs arg0 7).
+  describe("pin patterns resolve to the correct scrutinee, not parameter 0") {
+    test("a pin equals the bound parameter when the head matches it") {
+      assert(pin_dispatch(99, 5, [5]) == :pinned)
+    }
+
+    test("a pin does not match parameter 0 by accident") {
+      assert(pin_dispatch(7, 5, [7]) == :fallthrough)
+    }
+
+    test("the literal-clause sibling still dispatches correctly") {
+      assert(pin_dispatch(0, 1, [42]) == :one)
+    }
+
+    test("a pin matches when head equals the pinned value with distinct arg0") {
+      assert(pin_dispatch(3, 8, [8]) == :pinned)
+      assert(pin_dispatch(8, 3, [8]) == :fallthrough)
+    }
+  }
+
+  fn pin_dispatch(_ :: i64, 1 :: i64, _ :: [i64]) -> Atom {
+    :one
+  }
+
+  fn pin_dispatch(_ :: i64, y :: i64, [^y | _] :: [i64]) -> Atom {
+    :pinned
+  }
+
+  fn pin_dispatch(_ :: i64, _ :: i64, _ :: [i64]) -> Atom {
+    :fallthrough
+  }
 }
