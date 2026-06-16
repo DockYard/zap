@@ -4655,9 +4655,11 @@ pub const HirBuilder = struct {
                 .default = default_expr,
             });
 
-            // Record bound names from this parameter so later parameters
-            // can detect variable unification (repeated names → pin patterns).
-            self.collectBoundNames(param.pattern);
+            // Bound names are recorded progressively inside compilePattern
+            // itself (at each `.bind` site, descending every sub-pattern
+            // shape), so a separate post-pass is neither needed nor correct
+            // here — see the `.bind` arm of compilePattern and audit finding
+            // hir-1--02 / TY-07.
         }
 
         const return_type = if (clause.return_type) |rt|
@@ -4873,47 +4875,35 @@ pub const HirBuilder = struct {
     // Pattern compilation (spec §17)
     // ============================================================
 
-    /// Recursively collect all bound variable names from an AST pattern.
-    fn collectBoundNames(self: *HirBuilder, pattern: *const ast.Pattern) void {
-        switch (pattern.*) {
-            .bind => |b| {
-                // Don't track user-discard names (`_x`) — they should
-                // never participate in pin-style variable unification.
-                // Compiler-synthesised `__*` names are unique per
-                // generation site and likewise don't unify, so we treat
-                // them the same here.
-                const name_str = self.interner.get(b.name);
-                if (name_str.len > 0 and name_str[0] != '_') {
-                    self.clause_bound_names.put(b.name, {}) catch {};
-                }
-            },
-            .list_cons => |lc| {
-                for (lc.heads) |h| self.collectBoundNames(h);
-                self.collectBoundNames(lc.tail);
-            },
-            .tuple => |t| {
-                for (t.elements) |e| self.collectBoundNames(e);
-            },
-            .list => |l| {
-                for (l.elements) |e| self.collectBoundNames(e);
-            },
-            .paren => |p| self.collectBoundNames(p.inner),
-            else => {},
-        }
-    }
-
     fn compilePattern(self: *HirBuilder, pattern: *const ast.Pattern) anyerror!?*const MatchPattern {
         return switch (pattern.*) {
             .wildcard => try self.create(MatchPattern, .wildcard),
             .bind => |b| {
-                // Variable unification: if this name was already bound by a
-                // previous parameter, emit a pin (equality check) instead of
-                // a fresh binding. This implements Elixir-style patterns like
-                // `fn foo(x, [x | rest])` where the second `x` must equal the first.
+                // Variable unification: if this name was already bound
+                // anywhere earlier in the SAME clause's patterns — a prior
+                // parameter, an earlier element of this same compound
+                // pattern, or a struct/map/binary sub-pattern — emit a pin
+                // (equality check) instead of a fresh binding. This
+                // implements Elixir-style unification: `fn foo(x, [x | rest])`
+                // and `fn foo({x, x})` and `case p { %{a: v, b: v} -> ... }`
+                // all require the repeated occurrences to be equal.
+                //
+                // We record each fresh bind progressively (here, at the bind
+                // site, as compilePattern descends every sub-pattern shape),
+                // rather than in a separate post-pass over only a subset of
+                // shapes — that post-pass missed duplicates within one
+                // pattern and binds nested in struct/map/binary sub-patterns
+                // (audit finding hir-1--02 / TY-07).
                 const name_str = self.interner.get(b.name);
-                if (name_str.len > 0 and name_str[0] != '_' and self.clause_bound_names.contains(b.name)) {
+                // User-discard names (`_x`) and compiler-synthesised `__*`
+                // names never participate in unification.
+                if (name_str.len == 0 or name_str[0] == '_') {
+                    return try self.create(MatchPattern, .{ .bind = b.name });
+                }
+                if (self.clause_bound_names.contains(b.name)) {
                     return try self.create(MatchPattern, .{ .pin = b.name });
                 }
+                try self.clause_bound_names.put(b.name, {});
                 return try self.create(MatchPattern, .{ .bind = b.name });
             },
             .literal => |lit| try self.create(MatchPattern, .{
@@ -5027,6 +5017,28 @@ pub const HirBuilder = struct {
                 });
             },
         };
+    }
+
+    /// Compile a `case`/`with`/`for`/`rescue` ARM pattern with an isolated
+    /// variable-unification scope. Each arm pattern is an independent
+    /// binding scope: a name repeated WITHIN the arm pattern (e.g.
+    /// `{x, x}` or `%{a: v, b: v}`) unifies into an equality pin, but the
+    /// arm must NOT pin against names bound in the enclosing function
+    /// clause — a case arm rebinding a parameter name shadows it, per
+    /// Elixir semantics. We therefore save, reset, compile, and restore
+    /// `clause_bound_names` around the arm pattern so neither enclosing
+    /// binds leak in (which would mis-emit a pin against an unbound
+    /// scrutinee) nor this arm's binds leak to sibling arms or the
+    /// enclosing clause. (`clause_bound_names` is consulted only by
+    /// compilePattern, so restoring immediately after is sufficient.)
+    fn compileArmPattern(self: *HirBuilder, pattern: *const ast.Pattern) anyerror!?*const MatchPattern {
+        const saved_bound_names = self.clause_bound_names;
+        self.clause_bound_names = std.AutoHashMap(ast.StringId, void).init(self.allocator);
+        defer {
+            self.clause_bound_names.deinit();
+            self.clause_bound_names = saved_bound_names;
+        }
+        return try self.compilePattern(pattern);
     }
 
     fn compileBinarySegments(self: *HirBuilder, segments: []const ast.BinarySegment) ![]const BinaryMatchSegment {
@@ -6141,7 +6153,7 @@ pub const HirBuilder = struct {
                     // bindings unchanged.
                     const start_idx = self.current_case_bindings.items.len;
 
-                    const pattern = try self.compilePattern(clause.pattern);
+                    const pattern = try self.compileArmPattern(clause.pattern);
 
                     // Process bindings from the pattern. Top-level `.bind` is the
                     // whole-scrutinee bind (kind=.scrutinee, set by the success
@@ -6945,7 +6957,7 @@ pub const HirBuilder = struct {
         var has_user_catch_all = false;
         for (tr.rescue_clauses) |clause| {
             const start_idx = self.current_case_bindings.items.len;
-            const pattern = try self.compilePattern(clause.pattern);
+            const pattern = try self.compileArmPattern(clause.pattern);
             if (pattern) |pat| {
                 try self.collectCasePatternBindings(pat, true);
             }
@@ -7669,7 +7681,7 @@ pub const HirBuilder = struct {
                     const saved_case_bindings = self.current_case_bindings;
                     self.current_case_bindings = .empty;
 
-                    const pattern = try self.compilePattern(clause.pattern);
+                    const pattern = try self.compileArmPattern(clause.pattern);
                     if (pattern) |pat| {
                         try self.collectCasePatternBindings(pat, true);
                     }
