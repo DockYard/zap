@@ -171,6 +171,49 @@ pub struct GenericListTest {
       assert(removed == "third")
     }
 
+    test("push keeps the original receiver available after the call") {
+      original = List.new_empty(0) :: List(String)
+      original = List.push(original, "alpha")
+      updated = List.push(original, "beta")
+
+      assert(List.length(original) == 1)
+      assert(List.get(original, 0) == "alpha")
+      assert(List.length(updated) == 2)
+      assert(List.get(updated, 0) == "alpha")
+      assert(List.get(updated, 1) == "beta")
+    }
+
+    test("set keeps the original receiver available after the call") {
+      original = List.new_empty(0) :: List(String)
+      original = List.push(original, "alpha")
+      original = List.push(original, "beta")
+      updated = List.set(original, 0, "omega")
+
+      assert(List.length(original) == 2)
+      assert(List.get(original, 0) == "alpha")
+      assert(List.get(original, 1) == "beta")
+      assert(List.length(updated) == 2)
+      assert(List.get(updated, 0) == "omega")
+      assert(List.get(updated, 1) == "beta")
+    }
+
+    test("append keeps the left receiver available after the call") {
+      left = List.new_empty(0) :: List(String)
+      left = List.push(left, "red")
+      left = List.push(left, "green")
+      right = List.new_empty(0) :: List(String)
+      right = List.push(right, "blue")
+      updated = List.append(left, right)
+
+      assert(List.length(left) == 2)
+      assert(List.get(left, 0) == "red")
+      assert(List.get(left, 1) == "green")
+      assert(List.length(updated) == 3)
+      assert(List.get(updated, 0) == "red")
+      assert(List.get(updated, 1) == "green")
+      assert(List.get(updated, 2) == "blue")
+    }
+
     # NOTE (capability-driven memory model): this test asserts value-semantic
     # copy-on-write — the pre-mutation `original_alias` snapshot must survive a
     # later in-place-looking `List.set`/`List.push` on `values`. It now PASSES

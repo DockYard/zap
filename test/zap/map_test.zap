@@ -141,6 +141,39 @@ pub struct Zap.MapTest {
     }
   }
 
+  describe("FU-38: owned-mutating Map receivers remain usable after calls") {
+    test("Map.put keeps the original receiver available after the call") {
+      original = %{first: "Ada"}
+      updated = Map.put(original, :last, "Lovelace")
+
+      assert(Map.get(original, :first, "") == "Ada")
+      reject(Map.has_key?(original, :last))
+      assert(Map.get(updated, :first, "") == "Ada")
+      assert(Map.get(updated, :last, "") == "Lovelace")
+    }
+
+    test("Map.delete keeps the original receiver available after the call") {
+      original = %{first: "Ada", last: "Lovelace"}
+      updated = Map.delete(original, :last)
+
+      assert(Map.get(original, :last, "") == "Lovelace")
+      assert(Map.has_key?(original, :last))
+      reject(Map.has_key?(updated, :last))
+      assert(Map.get(updated, :first, "") == "Ada")
+    }
+
+    test("Map.merge keeps the left receiver available after the call") {
+      left = %{first: "Ada"}
+      right = %{last: "Lovelace"}
+      merged = Map.merge(left, right)
+
+      assert(Map.get(left, :first, "") == "Ada")
+      reject(Map.has_key?(left, :last))
+      assert(Map.get(merged, :first, "") == "Ada")
+      assert(Map.get(merged, :last, "") == "Lovelace")
+    }
+  }
+
   describe("Float value maps") {
     test("create and access") {
       scores = %{math: 95.5, science: 88.0}

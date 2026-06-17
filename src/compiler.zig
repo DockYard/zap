@@ -9555,17 +9555,30 @@ fn runRequiredArcOwnershipNormalization(
         const fn_ownership = post_builtin_ownership.get(function.id) orelse continue;
         zap.arc_ownership.classifyAndNormalizeWithProgram(alloc, function, fn_ownership, type_store, program) catch return error.OutOfMemory;
     }
+
+    // `classifyAndNormalizeWithProgram` can rewrite alias instructions
+    // into move/copy forms and insert retain instructions, so the
+    // InstructionId space seen by the named-call consume rewriter must
+    // be recomputed against the classified IR before it uses last-use
+    // tables to choose move vs copy-on-write.
+    progressStage(options, "ARC: recomputing ownership after classification", .{});
+    var post_classify_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, program, type_store) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer post_classify_ownership.deinit();
+
     // Phase E.9 step 2: for each function whose param_conventions
     // contains an `.owned` slot (set by Step 1's inference), rewrite
     // every call site targeting it from `share_value`/`release` into
-    // `move_value` (no caller-side retain) and drop the post-call
-    // release. The callee's own scope-exit drop (Phase B's filter
-    // releases `.owned` parameters) becomes the sole decrement,
-    // closing the per-iteration leak that survived Phase E.8.
+    // either a direct `move_value` at last-use or a copy-on-write clone
+    // when the caller still needs the source after the call. The callee's
+    // own scope-exit drop (Phase B's filter releases `.owned` parameters)
+    // consumes the value passed through the owned slot.
     progressStage(options, "ARC: rewriting owned calls", .{});
     for (program.functions, 0..) |_, i| {
         const function: *ir.Function = @constCast(&program.functions[i]);
-        zap.arc_ownership.rewriteOwnedConsumeSites(alloc, function, program) catch return error.OutOfMemory;
+        const fn_ownership = post_classify_ownership.get(function.id) orelse continue;
+        zap.arc_ownership.rewriteOwnedConsumeSites(alloc, function, program, fn_ownership) catch return error.OutOfMemory;
     }
 }
 

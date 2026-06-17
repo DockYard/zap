@@ -3241,6 +3241,7 @@ pub fn builtinArgCanMoveAtLastUse(name: []const u8, slot: usize) bool {
     if (ownedMutatingBuiltinSlot(name)) |owned_slot| {
         if (owned_slot == slot) return true;
     }
+    if (mapMergeConsumesRightOperand(name, slot)) return true;
     if (listElementConsumingBuiltinArg(name, slot)) return true;
     // The recoverable-raise side-channel stash always takes ownership of
     // its boxed-`Error` argument (transferred out to the recovered owner
@@ -3267,6 +3268,8 @@ pub fn alwaysConsumingBuiltinArg(name: []const u8, slot: usize) bool {
     const prefix = name[0..dot_index];
     const method = stripOwnedUncheckedSuffix(method_full);
 
+    if (mapMergeConsumesRightOperandWithParts(prefix, method, slot)) return true;
+
     if (std.mem.eql(u8, method, "cons") and isListBuiltinPrefix(prefix)) {
         return slot == 0 or slot == 1;
     }
@@ -3276,6 +3279,21 @@ pub fn alwaysConsumingBuiltinArg(name: []const u8, slot: usize) bool {
     if (sideChannelStashBuiltinArg(name, slot)) return true;
 
     return false;
+}
+
+/// Does `name`'s argument at `slot` need an independently-owned value
+/// before entering the runtime when the caller still needs the source?
+///
+/// Under `Memory.Tracking`, normal transient shares are aliases. Runtime
+/// calls that mutate or consume an argument therefore need either a
+/// last-use move or a persistent clone-on-share owner. This predicate is
+/// intentionally narrower than `builtinArgCanMoveAtLastUse`: List element
+/// stores have their own always-consuming temporary-retain path.
+pub fn builtinArgRequiresOwnedInput(name: []const u8, slot: usize) bool {
+    if (ownedMutatingBuiltinSlot(name)) |owned_slot| {
+        if (owned_slot == slot) return true;
+    }
+    return mapMergeConsumesRightOperand(name, slot);
 }
 
 /// Returns the argument slot of a `List.cons`-family builtin that is the
@@ -3543,6 +3561,21 @@ fn listElementConsumingBuiltinArgWithParts(prefix: []const u8, method: []const u
     return false;
 }
 
+fn mapMergeConsumesRightOperand(name: []const u8, slot: usize) bool {
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const method = stripOwnedUncheckedSuffix(name[dot_index + 1 ..]);
+    const prefix = name[0..dot_index];
+    return mapMergeConsumesRightOperandWithParts(prefix, method, slot);
+}
+
+fn mapMergeConsumesRightOperandWithParts(prefix: []const u8, method: []const u8, slot: usize) bool {
+    if (slot != 1) return false;
+    if (!std.mem.eql(u8, method, "merge")) return false;
+    return std.mem.eql(u8, prefix, "Map") or
+        std.mem.startsWith(u8, prefix, "Map:") or
+        std.mem.startsWith(u8, prefix, "MapNested:");
+}
+
 /// Phase 3 (uniqueness): is `name` an unchecked owned-mutating builtin?
 ///
 /// Unchecked variants (`Map.put_owned_unchecked`,
@@ -3728,24 +3761,40 @@ test "arc_liveness: List.set and List.push element slots are consumed by builtin
     try std.testing.expect(alwaysConsumingBuiltinArg("ListNested:list.set", 2));
     try std.testing.expect(alwaysConsumingBuiltinArg("List.push_owned_unchecked", 1));
     try std.testing.expect(alwaysConsumingBuiltinArg("List:f64.set_owned_unchecked", 2));
+    try std.testing.expect(alwaysConsumingBuiltinArg("Map.merge", 1));
+    try std.testing.expect(alwaysConsumingBuiltinArg("Map:str:i64.merge_owned_unchecked", 1));
 
     try std.testing.expect(!alwaysConsumingBuiltinArg("List.push", 0));
     try std.testing.expect(!alwaysConsumingBuiltinArg("List.push", 2));
     try std.testing.expect(!alwaysConsumingBuiltinArg("List.set", 1));
     try std.testing.expect(!alwaysConsumingBuiltinArg("List.append", 1));
     try std.testing.expect(!alwaysConsumingBuiltinArg("Map.put", 2));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("Map.merge", 0));
 }
 
 test "arc_liveness: builtinArgCanMoveAtLastUse includes receivers and consumed List elements" {
     try std.testing.expect(builtinArgCanMoveAtLastUse("Map.put", 0));
+    try std.testing.expect(builtinArgCanMoveAtLastUse("Map.merge", 1));
     try std.testing.expect(builtinArgCanMoveAtLastUse("List.push", 0));
     try std.testing.expect(builtinArgCanMoveAtLastUse("List.push", 1));
     try std.testing.expect(builtinArgCanMoveAtLastUse("List.set_owned_unchecked", 2));
 
     try std.testing.expect(!builtinArgCanMoveAtLastUse("Map.put", 2));
+    try std.testing.expect(!builtinArgCanMoveAtLastUse("Map.merge", 2));
     try std.testing.expect(!builtinArgCanMoveAtLastUse("List.append", 1));
     try std.testing.expect(!builtinArgCanMoveAtLastUse("List.cons", 0));
     try std.testing.expect(!builtinArgCanMoveAtLastUse("List.get", 0));
+}
+
+test "arc_liveness: builtinArgRequiresOwnedInput covers mutating receivers and Map.merge right operand" {
+    try std.testing.expect(builtinArgRequiresOwnedInput("Map.put", 0));
+    try std.testing.expect(builtinArgRequiresOwnedInput("Map.merge", 0));
+    try std.testing.expect(builtinArgRequiresOwnedInput("Map.merge", 1));
+    try std.testing.expect(builtinArgRequiresOwnedInput("List.push", 0));
+
+    try std.testing.expect(!builtinArgRequiresOwnedInput("Map.put", 1));
+    try std.testing.expect(!builtinArgRequiresOwnedInput("List.push", 1));
+    try std.testing.expect(!builtinArgRequiresOwnedInput("Map.merge", 2));
 }
 
 test "arc_liveness: List.cons call_builtin clears consumed share owners" {

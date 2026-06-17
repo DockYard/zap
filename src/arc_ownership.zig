@@ -1955,16 +1955,17 @@ const StreamRewriter = struct {
 // `function` and, for each non-tail call whose target's parameter
 // convention has been promoted to `.owned` by
 // `arc_param_convention.inferConventions`, rewrites the call's
-// argument-preparation pair from share_value/release into
-// move_value (no post-call release). The rewrite preserves the
-// call's argument LocalIds — the call still references the
-// `shared` local previously produced by `share_value`. After the
-// rewrite that local is bound by `move_value`, which the ZIR
+// argument-preparation pair from share_value/release into either a
+// direct move (when the source is at last-use) or a copy-on-write clone
+// followed by a move (when the caller still needs the source). The
+// rewrite preserves the call's argument LocalIds — the call still
+// references the `shared` local previously produced by `share_value`.
+// After the rewrite that local is bound by `move_value`, which the ZIR
 // backend lowers as a plain value-ref propagation (no retain). The
-// post-call `release{shared_local}` is dropped because the callee
-// now owns `shared_local`'s cell and is responsible for releasing
-// it at scope exit (Phase B's drop-insertion filter releases
-// `.owned` parameters; only `.borrowed` parameters are skipped).
+// post-call `release{shared_local}` is dropped because the callee now
+// owns `shared_local`'s cell and is responsible for releasing it at
+// scope exit (Phase B's drop-insertion filter releases `.owned`
+// parameters; only `.borrowed` parameters are skipped).
 //
 // Why this rewrite is the load-bearing fix for the k-nucleotide
 // leak signature: under the borrow-by-default ABI the caller emits
@@ -1993,7 +1994,12 @@ pub fn rewriteOwnedConsumeSites(
     allocator: std.mem.Allocator,
     function: *ir.Function,
     program: *const ir.Program,
+    fn_ownership: *const arc_liveness.ArcOwnership,
 ) !void {
+    // The move-vs-copy decision below is keyed by InstructionId, so this
+    // pass must receive ownership computed for the current IR shape.
+    arc_liveness.assertConsumerWalkMatches(fn_ownership, arc_liveness.countInstructionRecords(function));
+
     var index = try ConventionIndex.build(allocator, program);
     defer index.deinit();
 
@@ -2001,11 +2007,13 @@ pub fn rewriteOwnedConsumeSites(
         .allocator = allocator,
         .index = &index,
         .function = function,
+        .ownership = fn_ownership,
     };
 
     for (function.body, 0..) |_, block_index| {
         const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
         const original = block_ptr.instructions;
+        rewriter.next_id = computeStreamStartIdForBlock(function, block_index);
         const rebuilt = try rewriter.rewriteStream(original);
         if (rebuilt) |new_slice| {
             block_ptr.instructions = new_slice;
@@ -2076,6 +2084,9 @@ const ConsumeSiteRewriter = struct {
     /// builtin path. Mutable because the COW rewrite allocates a fresh
     /// owned local for the clone (growing `local_ownership`/`local_count`).
     function: *ir.Function,
+    ownership: *const arc_liveness.ArcOwnership,
+    /// Running InstructionId mirrored from arc_liveness's traversal.
+    next_id: arc_liveness.InstructionId = 0,
 
     /// Allocate a fresh ARC-owned local for a copy-on-write clone,
     /// growing `function.local_ownership` (defaulting new slots to
@@ -2111,8 +2122,15 @@ const ConsumeSiteRewriter = struct {
         defer rebuilt_children.deinit(self.allocator);
         try rebuilt_children.ensureTotalCapacity(self.allocator, stream.len);
 
+        var top_level_ids: std.ArrayListUnmanaged(arc_liveness.InstructionId) = .empty;
+        defer top_level_ids.deinit(self.allocator);
+        try top_level_ids.ensureTotalCapacity(self.allocator, stream.len);
+
         var any_change = false;
         for (stream) |*instr| {
+            const id = self.next_id;
+            self.next_id += 1;
+            try top_level_ids.append(self.allocator, id);
             const child = try self.rewriteChildren(instr);
             if (child) |_| any_change = true;
             try rebuilt_children.append(self.allocator, child);
@@ -2130,11 +2148,12 @@ const ConsumeSiteRewriter = struct {
         // boundaries. They live in the same stream as the call.
         var rewrite_share_to_move: std.AutoHashMapUnmanaged(usize, void) = .empty;
         defer rewrite_share_to_move.deinit(self.allocator);
-        // FU-13: consume sites whose `share_value` source is `.borrowed`
-        // (no `+1` to transfer). The share is cloned into an independent
-        // owner (`copy_value` + persistent `retain`) instead of moved, so
-        // the `.owned` callee consumes the clone's `+1` and the caller's
-        // borrowed cell is never under-released (copy-on-write).
+        // FU-13/FU-38: consume sites that cannot transfer the share's
+        // source directly. A borrowed source owns no `+1` to transfer;
+        // an owned-but-not-last-use source must remain available to the
+        // caller after the call. Both shapes are cloned into an
+        // independent owner (`copy_value` + persistent `retain`) and the
+        // clone is moved into the `.owned` callee slot (copy-on-write).
         var rewrite_share_to_cow: std.AutoHashMapUnmanaged(usize, void) = .empty;
         defer rewrite_share_to_cow.deinit(self.allocator);
         var drop_release: std.AutoHashMapUnmanaged(usize, void) = .empty;
@@ -2161,19 +2180,18 @@ const ConsumeSiteRewriter = struct {
                     j -= 1;
                     const prev = rebuilt_children.items[j] orelse stream[j];
                     if (prev == .share_value and prev.share_value.dest == arg_local) {
-                        // FU-13: choose move vs copy-on-write by whether
-                        // the share's SOURCE actually owns the `+1` the
-                        // `.owned` callee slot consumes. A `.owned`
-                        // source transfers it directly (share -> move);
-                        // a `.borrowed` source (e.g. a parameter the
-                        // value-escape veto demoted, leaving the body's
-                        // owned-consume share with nothing to transfer)
-                        // must clone into an independent owner so the
-                        // caller's shared cell is preserved. Without this
-                        // split the move from a borrowed source violates
-                        // ARC invariant V6 ("move_value source must be
-                        // .owned"), the regression FU-13 reconciles.
-                        if (sourceOwnsForConsumeRewrite(self.function, prev.share_value.source)) {
+                        // FU-13/FU-38: choose move vs copy-on-write by
+                        // BOTH ownership and liveness. A direct move is
+                        // sound only when the share's SOURCE owns the
+                        // `+1` and the share is that source's last use
+                        // on this path. If the source is borrowed, or if
+                        // the caller uses an owned source again after the
+                        // call, clone an independent owner for the
+                        // `.owned` callee slot and leave the caller's
+                        // source intact.
+                        if (sourceOwnsForConsumeRewrite(self.function, prev.share_value.source) and
+                            self.sourceAtLastUse(prev.share_value.source, top_level_ids.items[j]))
+                        {
                             try rewrite_share_to_move.put(self.allocator, j, {});
                         } else {
                             try rewrite_share_to_cow.put(self.allocator, j, {});
@@ -2248,14 +2266,14 @@ const ConsumeSiteRewriter = struct {
                     }
                 }
             } else if (rewrite_share_to_cow.contains(idx)) {
-                // FU-13: the share's source is `.borrowed` — it owns no
-                // `+1` to transfer, so moving it into the `.owned` slot
-                // would violate V6 ("move_value source must be .owned").
-                // But V7 also requires `.owned` slots to be filled by a
-                // `.move_value` (not a share/copy), so we cannot simply
-                // keep the share either. Reconcile BOTH invariants by
-                // cloning the borrowed cell into a fresh independent
-                // owner and moving THAT into the slot:
+                // FU-13/FU-38: the share's source cannot be moved
+                // directly. A borrowed source owns no `+1` to transfer;
+                // an owned source that is not at last-use must survive
+                // for the caller's later reads. But V7 still requires
+                // `.owned` slots to be filled by a `.move_value` (not a
+                // share/copy), so we cannot simply keep the share either.
+                // Reconcile BOTH invariants by cloning the source into a
+                // fresh independent owner and moving THAT into the slot:
                 //
                 //     copy_value{clone <- source}     # +1 independent owner
                 //     retain{clone, .persistent}      # the clone's owning bump
@@ -2265,10 +2283,10 @@ const ConsumeSiteRewriter = struct {
                 // holds (the slot is filled by `.move_value`). The
                 // post-call `release{arg}` is dropped above — the callee
                 // now owns the clone's `+1` and releases it at its own
-                // scope exit. The caller's borrowed cell keeps its
-                // original refcount, so the runtime's owned-mutating sink
-                // sees rc>=2 and copy-on-writes rather than mutating the
-                // caller's shared cell. This is the `call_named`/
+                // scope exit. The caller's original cell keeps its
+                // lifetime, so the runtime's owned-mutating sink consumes
+                // the clone rather than mutating or releasing a value the
+                // caller still observes. This is the `call_named`/
                 // `call_direct` analogue of `planBorrowedConsumeCopy`
                 // (which serves the V7-exempt `call_builtin` path).
                 std.debug.assert(effective == .share_value);
@@ -2312,6 +2330,20 @@ const ConsumeSiteRewriter = struct {
         child: ir.ChildStream,
     ) error{OutOfMemory}!?[]const ir.Instruction {
         return self.rewriteStream(child.stream);
+    }
+
+    fn sourceAtLastUse(
+        self: *const ConsumeSiteRewriter,
+        source: ir.LocalId,
+        share_id: arc_liveness.InstructionId,
+    ) bool {
+        if (self.ownership.last_use_sites.count() != 0) {
+            return self.ownership.isLastUseAt(source, share_id);
+        }
+        if (self.ownership.last_use_map.get(source)) |last_use| {
+            return last_use == share_id;
+        }
+        return false;
     }
 
     /// For a call instruction, return a freshly-allocated slice of
@@ -2519,6 +2551,22 @@ const BuiltinConsumeSiteRewriter = struct {
     /// Running InstructionId mirrored from arc_liveness's traversal.
     next_id: arc_liveness.InstructionId = 0,
 
+    fn allocOwnedLocal(self: *BuiltinConsumeSiteRewriter) error{OutOfMemory}!ir.LocalId {
+        const dest = self.function.local_count;
+        const new_len: usize = @intCast(dest + 1);
+        const old = self.function.local_ownership;
+        const replacement = try self.allocator.alloc(ir.OwnershipClass, new_len);
+        const copy_len = @min(old.len, replacement.len);
+        if (copy_len > 0) @memcpy(replacement[0..copy_len], old[0..copy_len]);
+        if (copy_len < replacement.len) {
+            @memset(replacement[copy_len..], .trivial);
+        }
+        replacement[dest] = .owned;
+        self.function.local_ownership = replacement;
+        self.function.local_count = dest + 1;
+        return dest;
+    }
+
     fn rewriteStream(
         self: *BuiltinConsumeSiteRewriter,
         stream: []const ir.Instruction,
@@ -2553,14 +2601,16 @@ const BuiltinConsumeSiteRewriter = struct {
         // under the analyzer's last-use gate. List element writers
         // (`List.push(value)`, `List.set(index, value)`) always
         // consume the element owner because the runtime stores it
-        // directly into the list buffer. When the source is not at
-        // last-use, keep the share but drop its post-call release so
-        // the list owns that temporary retain. When the argument is a
-        // borrowed alias, rewrite that borrow to a copy so the runtime
-        // receives a real owner to consume. Always-consuming
+        // directly into the list buffer. Runtime-owned inputs
+        // (`Map.merge`'s right operand and owned-mutating receivers
+        // under clone-on-share managers) are cloned when they are not
+        // at last-use, so the runtime consumes/mutates an independent
+        // owner rather than a caller-visible alias. Always-consuming
         // constructors (`List.cons`) follow the same ownership rule.
         var rewrite_share_to_move: std.AutoHashMapUnmanaged(usize, void) = .empty;
         defer rewrite_share_to_move.deinit(self.allocator);
+        var rewrite_share_to_cow: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer rewrite_share_to_cow.deinit(self.allocator);
         var rewrite_borrow_to_copy: std.AutoHashMapUnmanaged(usize, void) = .empty;
         defer rewrite_borrow_to_copy.deinit(self.allocator);
         var drop_release: std.AutoHashMapUnmanaged(usize, void) = .empty;
@@ -2580,6 +2630,7 @@ const BuiltinConsumeSiteRewriter = struct {
             for (cb.args, 0..) |arg_local, slot| {
                 const can_move_at_last_use = arc_liveness.builtinArgCanMoveAtLastUse(cb.name, slot);
                 const always_consumed = arc_liveness.alwaysConsumingBuiltinArg(cb.name, slot);
+                const requires_owned_input = arc_liveness.builtinArgRequiresOwnedInput(cb.name, slot);
                 if (!can_move_at_last_use and !always_consumed) continue;
 
                 const share_site = self.findShareBefore(
@@ -2591,6 +2642,7 @@ const BuiltinConsumeSiteRewriter = struct {
                 );
 
                 var moved = false;
+                var cloned_for_consume = false;
                 if (share_site) |site| {
                     if (can_move_at_last_use) {
                         // Last-use gate: only rewrite when the source
@@ -2598,26 +2650,36 @@ const BuiltinConsumeSiteRewriter = struct {
                         // analyzer records the share_value's instruction
                         // id as the source's last use exactly in that
                         // case.
-                        if (self.ownership.last_use_map.get(site.share.source)) |last_use| {
-                            if (last_use == site.id and
-                                sourceOwnsForConsumeRewrite(self.function, site.share.source))
-                            {
-                                try rewrite_share_to_move.put(self.allocator, site.index, {});
-                                if (findShareRetain(
-                                    stream,
-                                    rebuilt_children.items,
-                                    site.index + 1,
-                                    site.share.dest,
-                                )) |retain_index| {
-                                    try drop_retain.put(self.allocator, retain_index, {});
-                                }
-                                any_change = true;
-                                moved = true;
+                        if (sourceOwnsForConsumeRewrite(self.function, site.share.source) and
+                            self.sourceAtLastUse(site.share.source, site.id))
+                        {
+                            try rewrite_share_to_move.put(self.allocator, site.index, {});
+                            if (findShareRetain(
+                                stream,
+                                rebuilt_children.items,
+                                site.index + 1,
+                                site.share.dest,
+                            )) |retain_index| {
+                                try drop_retain.put(self.allocator, retain_index, {});
                             }
+                            any_change = true;
+                            moved = true;
+                        } else if (requires_owned_input) {
+                            try rewrite_share_to_cow.put(self.allocator, site.index, {});
+                            if (findShareRetain(
+                                stream,
+                                rebuilt_children.items,
+                                site.index + 1,
+                                site.share.dest,
+                            )) |retain_index| {
+                                try drop_retain.put(self.allocator, retain_index, {});
+                            }
+                            any_change = true;
+                            cloned_for_consume = true;
                         }
                     }
 
-                    if (moved or always_consumed) {
+                    if (moved or cloned_for_consume or always_consumed) {
                         if (try self.markPostCallReleaseDrop(
                             stream,
                             rebuilt_children.items,
@@ -2658,7 +2720,7 @@ const BuiltinConsumeSiteRewriter = struct {
 
         var new_instrs: std.ArrayListUnmanaged(ir.Instruction) = .empty;
         errdefer new_instrs.deinit(self.allocator);
-        try new_instrs.ensureTotalCapacity(self.allocator, stream.len + rewrite_borrow_to_copy.count());
+        try new_instrs.ensureTotalCapacity(self.allocator, stream.len + rewrite_borrow_to_copy.count() + (rewrite_share_to_cow.count() * 2));
 
         for (stream, 0..) |_, idx| {
             if (drop_release.contains(idx)) continue;
@@ -2669,6 +2731,14 @@ const BuiltinConsumeSiteRewriter = struct {
                 const sv = effective.share_value;
                 try new_instrs.append(self.allocator, .{
                     .move_value = .{ .dest = sv.dest, .source = sv.source },
+                });
+            } else if (rewrite_share_to_cow.contains(idx)) {
+                std.debug.assert(effective == .share_value);
+                const sv = effective.share_value;
+                const clone = try self.allocOwnedLocal();
+                try appendCopyValueWithPersistentRetain(self.allocator, &new_instrs, clone, sv.source);
+                try new_instrs.append(self.allocator, .{
+                    .move_value = .{ .dest = sv.dest, .source = clone },
                 });
             } else if (rewrite_borrow_to_copy.contains(idx)) {
                 std.debug.assert(effective == .borrow_value);
@@ -2709,6 +2779,20 @@ const BuiltinConsumeSiteRewriter = struct {
             }
         }
         return null;
+    }
+
+    fn sourceAtLastUse(
+        self: *const BuiltinConsumeSiteRewriter,
+        source: ir.LocalId,
+        share_id: arc_liveness.InstructionId,
+    ) bool {
+        if (self.ownership.last_use_sites.count() != 0) {
+            return self.ownership.isLastUseAt(source, share_id);
+        }
+        if (self.ownership.last_use_map.get(source)) |last_use| {
+            return last_use == share_id;
+        }
+        return false;
     }
 
     fn markPostCallReleaseDrop(
@@ -4770,7 +4854,10 @@ test "arc_ownership: rewriteOwnedConsumeSites converts share_value to move_value
     functions[1] = caller_func;
     const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
 
-    try rewriteOwnedConsumeSites(arena, &functions[1], &program);
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    try ownership.last_use_map.put(arena, 0, 1);
+    try rewriteOwnedConsumeSites(arena, &functions[1], &program, &ownership);
 
     const rewritten = functions[1].body[0].instructions;
     var saw_share = false;
@@ -4791,6 +4878,155 @@ test "arc_ownership: rewriteOwnedConsumeSites converts share_value to move_value
     try std.testing.expect(!saw_share);
     try std.testing.expect(!saw_release_of_1);
     try std.testing.expect(saw_move_dest_1);
+}
+
+test "arc_ownership: rewriteOwnedConsumeSites clones owned sources that are not at last-use (FU-38)" {
+    // FU-38 regression: an owned-mutating Zap function call can have an
+    // `.owned` parameter slot while the caller still uses the receiver
+    // after the call. The named-call consume rewrite must not move the
+    // caller's owner into the callee in that shape. It must pass a fresh
+    // clone through the `.owned` slot and leave the original source for
+    // the later read.
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const target_param_conv = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{.owned});
+    const target_params = try arena.alloc(ir.Param, 1);
+    target_params[0] = .{ .name = "x", .type_expr = .void, .type_id = null };
+    const target_blocks = try arena.alloc(ir.Block, 1);
+    target_blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+            .{ .ret = .{ .value = null } },
+        }),
+    };
+    const target_func = ir.Function{
+        .id = 100,
+        .name = "Mod__target__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = target_params,
+        .return_type = .void,
+        .body = target_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+        .param_conventions = target_param_conv,
+        .local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{.owned}),
+        .result_convention = .trivial,
+    };
+
+    const caller_param_conv = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{.owned});
+    const caller_params = try arena.alloc(ir.Param, 1);
+    caller_params[0] = .{ .name = "receiver", .type_expr = .void, .type_id = null };
+    const caller_args = try arena.alloc(ir.LocalId, 1);
+    caller_args[0] = 1;
+    const caller_arg_modes = try arena.alloc(ir.ValueMode, 1);
+    caller_arg_modes[0] = .share;
+    const caller_instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .retain = .{ .value = 1, .kind = .normal } },
+        .{ .call_named = .{
+            .dest = 2,
+            .name = "Mod__target__1",
+            .args = caller_args,
+            .arg_modes = caller_arg_modes,
+        } },
+        .{ .release = .{ .value = 1 } },
+        .{ .local_get = .{ .dest = 3, .source = 0 } },
+        .{ .ret = .{ .value = 3 } },
+    });
+    const caller_blocks = try arena.alloc(ir.Block, 1);
+    caller_blocks[0] = .{ .label = 0, .instructions = caller_instrs };
+    const caller_func = ir.Function{
+        .id = 200,
+        .name = "Mod__caller__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = caller_params,
+        .return_type = .void,
+        .body = caller_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = caller_param_conv,
+        .local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+            .owned, .owned, .trivial, .owned,
+        }),
+        .result_convention = .owned,
+    };
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = target_func;
+    functions[1] = caller_func;
+    const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    // Ids in caller_instrs: param_get=0, share=1, retain=2, call=3,
+    // release=4, later local_get=5, ret=6. The share is not last-use.
+    try ownership.last_use_map.put(arena, 0, 5);
+    try rewriteOwnedConsumeSites(arena, &functions[1], &program, &ownership);
+
+    const rewritten = functions[1].body[0].instructions;
+    var saw_direct_move_from_source = false;
+    var saw_share_of_arg = false;
+    var saw_release_of_arg = false;
+    var saw_later_read_of_source = false;
+    var clone_local: ?ir.LocalId = null;
+    var saw_copy_from_source = false;
+    var saw_persistent_retain_of_clone = false;
+    var saw_move_from_clone = false;
+
+    for (rewritten) |instr| {
+        switch (instr) {
+            .share_value => |sv| if (sv.dest == 1) {
+                saw_share_of_arg = true;
+            },
+            .release => |rel| if (rel.value == 1) {
+                saw_release_of_arg = true;
+            },
+            .local_get => |lg| if (lg.source == 0) {
+                saw_later_read_of_source = true;
+            },
+            .copy_value => |cv| if (cv.source == 0) {
+                saw_copy_from_source = true;
+                clone_local = cv.dest;
+            },
+            .retain => |retain| {
+                if (clone_local) |clone| {
+                    if (retain.value == clone and retain.kind == .persistent) {
+                        saw_persistent_retain_of_clone = true;
+                    }
+                }
+            },
+            .move_value => |mv| {
+                if (mv.dest == 1 and mv.source == 0) {
+                    saw_direct_move_from_source = true;
+                }
+                if (clone_local) |clone| {
+                    if (mv.dest == 1 and mv.source == clone) {
+                        saw_move_from_clone = true;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(!saw_direct_move_from_source);
+    try std.testing.expect(!saw_share_of_arg);
+    try std.testing.expect(!saw_release_of_arg);
+    try std.testing.expect(saw_later_read_of_source);
+    try std.testing.expect(saw_copy_from_source);
+    try std.testing.expect(saw_persistent_retain_of_clone);
+    try std.testing.expect(saw_move_from_clone);
+    try std.testing.expect(clone_local != null);
+    try std.testing.expect(clone_local.? >= 4);
+    try std.testing.expectEqual(@as(u32, clone_local.? + 1), functions[1].local_count);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, functions[1].local_ownership[clone_local.?]);
 }
 
 test "arc_ownership: rewriteOwnedConsumeSites is a no-op when callee param convention stays borrowed" {
@@ -4875,7 +5111,9 @@ test "arc_ownership: rewriteOwnedConsumeSites is a no-op when callee param conve
     functions[1] = caller_func;
     const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
 
-    try rewriteOwnedConsumeSites(arena, &functions[1], &program);
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    try rewriteOwnedConsumeSites(arena, &functions[1], &program, &ownership);
 
     // The stream must be unchanged: share_value still present,
     // release still present, no move_value with dest=1.
@@ -5003,7 +5241,9 @@ test "arc_ownership: rewriteOwnedConsumeSites copies-on-write a borrowed-param s
     functions[1] = caller_func;
     const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
 
-    try rewriteOwnedConsumeSites(arena, &functions[1], &program);
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    try rewriteOwnedConsumeSites(arena, &functions[1], &program, &ownership);
 
     const rewritten = functions[1].body[0].instructions;
 
@@ -6271,7 +6511,7 @@ test "arc_ownership: rewriteOwnedConsumeBuiltinSites converts share to move + dr
     try std.testing.expect(saw_move_dest_1);
 }
 
-test "arc_ownership: rewriteOwnedConsumeBuiltinSites does not move from borrowed parameter" {
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites clones borrowed mutating receivers" {
     var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
@@ -6328,24 +6568,154 @@ test "arc_ownership: rewriteOwnedConsumeBuiltinSites does not move from borrowed
     try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
 
     const rewritten = function.body[0].instructions;
-    var saw_share = false;
-    var saw_release_of_1 = false;
     var saw_move_from_0 = false;
+    var saw_release_of_1 = false;
+    var saw_share_of_1 = false;
+    var clone_local: ?ir.LocalId = null;
+    var saw_copy_from_0 = false;
+    var saw_persistent_retain_of_clone = false;
+    var saw_move_from_clone = false;
     for (rewritten) |instr| {
         switch (instr) {
-            .share_value => saw_share = true,
+            .share_value => |share| if (share.dest == 1) {
+                saw_share_of_1 = true;
+            },
             .release => |release| {
                 if (release.value == 1) saw_release_of_1 = true;
             },
+            .copy_value => |copy| if (copy.source == 0) {
+                saw_copy_from_0 = true;
+                clone_local = copy.dest;
+            },
+            .retain => |retain| {
+                if (clone_local) |clone| {
+                    if (retain.value == clone and retain.kind == .persistent) {
+                        saw_persistent_retain_of_clone = true;
+                    }
+                }
+            },
             .move_value => |move| {
                 if (move.source == 0) saw_move_from_0 = true;
+                if (clone_local) |clone| {
+                    if (move.dest == 1 and move.source == clone) {
+                        saw_move_from_clone = true;
+                    }
+                }
             },
             else => {},
         }
     }
-    try std.testing.expect(saw_share);
-    try std.testing.expect(saw_release_of_1);
     try std.testing.expect(!saw_move_from_0);
+    try std.testing.expect(!saw_release_of_1);
+    try std.testing.expect(!saw_share_of_1);
+    try std.testing.expect(saw_copy_from_0);
+    try std.testing.expect(saw_persistent_retain_of_clone);
+    try std.testing.expect(saw_move_from_clone);
+    try std.testing.expect(clone_local != null);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, function.local_ownership[clone_local.?]);
+}
+
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites clones Map.merge right operand when it is not last-use" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 2);
+    args[0] = 1;
+    args[1] = 3;
+    const arg_modes = try arena.alloc(ir.ValueMode, 2);
+    arg_modes[0] = .share;
+    arg_modes[1] = .share;
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .share_value = .{ .dest = 3, .source = 2 } },
+        .{ .retain = .{ .value = 3, .kind = .normal } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "Map.merge",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .release = .{ .value = 3 } },
+        .{ .local_get = .{ .dest = 5, .source = 2 } },
+        .{ .ret = .{ .value = 4 } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .owned, .owned, .owned, .owned,
+    });
+    var function = ir.Function{
+        .id = 202,
+        .name = "Mod__merge_right_not_last__0",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 6,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    try ownership.last_use_map.put(arena, 2, 5);
+
+    try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
+
+    const rewritten = function.body[0].instructions;
+    var saw_release_of_3 = false;
+    var saw_share_of_3 = false;
+    var saw_later_read_of_2 = false;
+    var clone_local: ?ir.LocalId = null;
+    var saw_copy_from_2 = false;
+    var saw_persistent_retain_of_clone = false;
+    var saw_move_from_clone = false;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .share_value => |share| if (share.dest == 3) {
+                saw_share_of_3 = true;
+            },
+            .release => |release| {
+                if (release.value == 3) saw_release_of_3 = true;
+            },
+            .local_get => |local_get| if (local_get.source == 2) {
+                saw_later_read_of_2 = true;
+            },
+            .copy_value => |copy| if (copy.source == 2) {
+                saw_copy_from_2 = true;
+                clone_local = copy.dest;
+            },
+            .retain => |retain| {
+                if (clone_local) |clone| {
+                    if (retain.value == clone and retain.kind == .persistent) {
+                        saw_persistent_retain_of_clone = true;
+                    }
+                }
+            },
+            .move_value => |move| {
+                if (clone_local) |clone| {
+                    if (move.dest == 3 and move.source == clone) {
+                        saw_move_from_clone = true;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(!saw_release_of_3);
+    try std.testing.expect(!saw_share_of_3);
+    try std.testing.expect(saw_later_read_of_2);
+    try std.testing.expect(saw_copy_from_2);
+    try std.testing.expect(saw_persistent_retain_of_clone);
+    try std.testing.expect(saw_move_from_clone);
+    try std.testing.expect(clone_local != null);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, function.local_ownership[clone_local.?]);
 }
 
 test "arc_ownership: rewriteOwnedConsumeBuiltinSites drops List.cons releases without moving shares" {
@@ -6673,15 +7043,15 @@ test "arc_ownership: rewriteOwnedConsumeBuiltinSites keeps non-last-use List.pus
     try std.testing.expect(!saw_move_value);
 }
 
-test "arc_ownership: rewriteOwnedConsumeBuiltinSites is a no-op when source has additional uses (not last use)" {
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites clones mutating receivers when source has additional uses" {
     var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
 
-    // Same shape as the positive test, but the source local %0 has
-    // a use AFTER the share — `last_use_map[%0]` points at the
-    // trailing local_get (id 4). The rewrite must leave the share /
-    // release pair untouched.
+    // Same shape as the positive test, but the source local %0 has a
+    // use AFTER the share. The rewrite must not move from %0 directly;
+    // it must clone an independent owner for the runtime call and keep
+    // %0 available for the trailing local_get.
     const args = try arena.alloc(ir.LocalId, 3);
     args[0] = 1;
     args[1] = 5;
@@ -6732,24 +7102,57 @@ test "arc_ownership: rewriteOwnedConsumeBuiltinSites is a no-op when source has 
     try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
 
     const rewritten = function.body[0].instructions;
-    var saw_share = false;
-    var saw_release_of_1 = false;
     var saw_move_dest_1 = false;
+    var saw_share_of_1 = false;
+    var saw_release_of_1 = false;
+    var saw_later_read_of_0 = false;
+    var clone_local: ?ir.LocalId = null;
+    var saw_copy_from_0 = false;
+    var saw_persistent_retain_of_clone = false;
+    var saw_move_from_clone = false;
     for (rewritten) |instr| {
         switch (instr) {
-            .share_value => saw_share = true,
+            .share_value => |share| if (share.dest == 1) {
+                saw_share_of_1 = true;
+            },
             .release => |r| if (r.value == 1) {
                 saw_release_of_1 = true;
             },
+            .local_get => |local_get| if (local_get.source == 0) {
+                saw_later_read_of_0 = true;
+            },
+            .copy_value => |copy| if (copy.source == 0) {
+                saw_copy_from_0 = true;
+                clone_local = copy.dest;
+            },
+            .retain => |retain| {
+                if (clone_local) |clone| {
+                    if (retain.value == clone and retain.kind == .persistent) {
+                        saw_persistent_retain_of_clone = true;
+                    }
+                }
+            },
             .move_value => |mv| if (mv.dest == 1 and mv.source == 0) {
                 saw_move_dest_1 = true;
+            } else {
+                if (clone_local) |clone| {
+                    if (mv.dest == 1 and mv.source == clone) {
+                        saw_move_from_clone = true;
+                    }
+                }
             },
             else => {},
         }
     }
-    try std.testing.expect(saw_share);
-    try std.testing.expect(saw_release_of_1);
+    try std.testing.expect(!saw_share_of_1);
+    try std.testing.expect(!saw_release_of_1);
     try std.testing.expect(!saw_move_dest_1);
+    try std.testing.expect(saw_later_read_of_0);
+    try std.testing.expect(saw_copy_from_0);
+    try std.testing.expect(saw_persistent_retain_of_clone);
+    try std.testing.expect(saw_move_from_clone);
+    try std.testing.expect(clone_local != null);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, function.local_ownership[clone_local.?]);
 }
 
 test "arc_ownership: rewriteOwnedConsumeBuiltinSites is a no-op for non-mutating Map builtins (Map.get)" {
