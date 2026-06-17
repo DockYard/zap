@@ -7598,6 +7598,10 @@ pub fn List(comptime T: type) type {
         // Allocation
         // -------------------------------------------------------------------
 
+        fn checkedSlotCount(value: i64) error{OutOfRange}!u32 {
+            return std.math.cast(u32, value) orelse error.OutOfRange;
+        }
+
         /// Allocate a list of exactly `size` elements, each set to
         /// `init`.
         ///
@@ -7606,8 +7610,8 @@ pub fn List(comptime T: type) type {
         /// so we retain `size - 1` additional times. The zero-element
         /// edge case requires the caller's +1 to be dropped.
         pub fn new_filled(size: i64, init: T) ?*const Self {
-            if (size < 0) @panic("List.new_filled: negative size");
-            const slot_count: u32 = @intCast(size);
+            const slot_count = checkedSlotCount(size) catch
+                Kernel.raise_with_kind("argument_error", "List.new_filled: size must be between 0 and 4294967295");
             const fresh = bufferAlloc(slot_count, slot_count) orelse return null;
             const data = fresh.dataPtr();
             // The caller's +1 covers slot 0 (the `init` value moves into it);
@@ -7630,8 +7634,8 @@ pub fn List(comptime T: type) type {
         /// Allocate an empty list with the given reserved capacity.
         /// The buffer is allocated but `len == 0`.
         pub fn new_empty(initial_capacity: i64) ?*const Self {
-            if (initial_capacity < 0) @panic("List.new_empty: negative capacity");
-            const cap_arg: u32 = @intCast(initial_capacity);
+            const cap_arg = checkedSlotCount(initial_capacity) catch
+                Kernel.raise_with_kind("argument_error", "List.new_empty: capacity must be between 0 and 4294967295");
             const cap_final: u32 = if (cap_arg == 0) 4 else cap_arg;
             return bufferAlloc(cap_final, 0);
         }
@@ -21080,6 +21084,22 @@ test "List(i64) new_empty allocates with reserved capacity and zero len" {
 
     try std.testing.expectEqual(@as(i64, 0), ListI64.length(v));
     try std.testing.expect(ListI64.capacity(v) >= 8);
+}
+
+test "List(i64) constructor size classifier accepts u32 range boundaries" {
+    const ListI64 = List(i64);
+
+    try std.testing.expectEqual(@as(u32, 0), try ListI64.checkedSlotCount(0));
+    try std.testing.expectEqual(@as(u32, 1), try ListI64.checkedSlotCount(1));
+    try std.testing.expectEqual(std.math.maxInt(u32), try ListI64.checkedSlotCount(std.math.maxInt(u32)));
+}
+
+test "List(i64) constructor size classifier rejects negative and oversized values" {
+    const ListI64 = List(i64);
+
+    try std.testing.expectError(error.OutOfRange, ListI64.checkedSlotCount(-1));
+    try std.testing.expectError(error.OutOfRange, ListI64.checkedSlotCount(@as(i64, std.math.maxInt(u32)) + 1));
+    try std.testing.expectError(error.OutOfRange, ListI64.checkedSlotCount(std.math.maxInt(i64)));
 }
 
 test "List(i64) get/set roundtrips on rc==1 buffer returns same handle" {
