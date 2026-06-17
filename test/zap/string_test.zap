@@ -190,19 +190,23 @@ pub struct Zap.StringTest {
     }
 
     test("to_integer valid") {
-      assert(String.to_integer("42") == 42)
+      parsed = String.to_integer("42")
+      assert(parsed != nil)
+      assert(parsed == 42)
     }
 
-    test("to_integer invalid") {
-      assert(String.to_integer("hello") == 0)
+    test("to_integer invalid returns nil") {
+      assert(String.to_integer("hello") == nil)
     }
 
     test("to_float valid") {
-      assert(String.to_float("3.14") == 3.14)
+      parsed = String.to_float("3.14")
+      assert(parsed != nil)
+      assert(parsed == 3.14)
     }
 
-    test("to_float invalid") {
-      assert(String.to_float("hello") == 0.0)
+    test("to_float invalid returns nil") {
+      assert(String.to_float("hello") == nil)
     }
 
     # capitalize

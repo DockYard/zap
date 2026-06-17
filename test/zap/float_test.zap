@@ -39,15 +39,19 @@ pub struct Zap.FloatTest {
     }
 
     test("parse valid") {
-      assert(Float.parse("3.14") == 3.14)
+      parsed = Float.parse("3.14")
+      assert(parsed != nil)
+      assert(parsed == 3.14)
     }
 
     test("parse negative") {
-      assert(Float.parse("-0.5") == -0.5)
+      parsed = Float.parse("-0.5")
+      assert(parsed != nil)
+      assert(parsed == -0.5)
     }
 
-    test("parse invalid") {
-      assert(Float.parse("hello") == 0.0)
+    test("parse invalid returns nil") {
+      assert(Float.parse("hello") == nil)
     }
 
     test("round down") {

@@ -877,8 +877,8 @@ fn cloneParams(allocator: std.mem.Allocator, params: []const Param) CloneError![
 }
 
 const OptionalDispatchCandidate = struct {
-    struct_name: []const u8,
-    struct_type_id: types_mod.TypeId,
+    payload_type: ZigType,
+    payload_type_id: types_mod.TypeId,
     optional_type_id: ?types_mod.TypeId,
 };
 
@@ -3890,7 +3890,6 @@ fn markGroupEscaping(
 /// `escape_lattice.ChildSlot`... declared in `escape_lattice` to avoid
 /// a circular import (`escape_lattice` imports `ir`, not vice versa).
 /// See `escape_lattice.ChildSlot.toStreamSlot` for the forward map.
-
 /// Compile-time guarantee that `forEachChildStream` yields every
 /// `Instruction` variant that carries a nested `[]const Instruction`
 /// sub-stream. Walks every union payload type via `@typeInfo`; if a
@@ -6299,7 +6298,8 @@ pub const IrBuilder = struct {
         var params: std.ArrayList(Param) = .empty;
         var union_param_idx: ?u32 = null;
         var optional_param_idx: ?u32 = null;
-        var optional_struct_name: ?[]const u8 = null;
+        var optional_payload_type: ?ZigType = null;
+        var optional_payload_type_id: ?types_mod.TypeId = null;
         var captures: std.ArrayList(Capture) = .empty;
         for (group.captures, 0..) |capture, idx| {
             const cap_name = try std.fmt.allocPrint(self.allocator, "__cap_{d}", .{idx});
@@ -6334,11 +6334,12 @@ pub const IrBuilder = struct {
                                 // param to `?T` and route via
                                 // optional_dispatch IR.
                                 const inner_ptr = try self.allocator.create(ZigType);
-                                inner_ptr.* = .{ .struct_ref = optional_candidate.struct_name };
+                                inner_ptr.* = try cloneZigType(self.allocator, optional_candidate.payload_type);
                                 resolved_type = .{ .optional = inner_ptr };
                                 resolved_type_id = optional_candidate.optional_type_id;
                                 optional_param_idx = @intCast(i);
-                                optional_struct_name = optional_candidate.struct_name;
+                                optional_payload_type = optional_candidate.payload_type;
+                                optional_payload_type_id = optional_candidate.payload_type_id;
                             } else {
                                 resolved_type = .any;
                                 resolved_type_id = null;
@@ -6559,21 +6560,16 @@ pub const IrBuilder = struct {
 
             const payload_local = self.next_local;
             self.next_local += 1;
-            if (optional_struct_name) |sname| {
-                try self.known_local_types.put(payload_local, .{ .struct_ref = sname });
-                // Populate the HIR type so `local_ownership` is computed
-                // correctly for the payload local. Without this, the
-                // ownership table tags `payload_local` as `.trivial` and
-                // every downstream pass that consults `local_ownership`
-                // (drop insertion, in particular) treats the local as if
-                // it weren't ARC-managed — even when the underlying
-                // struct is. This blocks the binarytrees-style fix where
-                // drop insertion appends a `.release { payload_local }`
-                // at the struct branch's end to balance the caller's
-                // `.owned` convention retain.
-                if (self.resolveNominalTypeId(sname)) |type_id| {
-                    try self.local_hir_types.put(payload_local, type_id);
-                }
+            if (optional_payload_type) |payload_type| {
+                try self.known_local_types.put(payload_local, payload_type);
+            }
+            // Populate the HIR type so `local_ownership` and type-driven
+            // lowering are computed correctly for the payload local. Without
+            // this, the ownership table tags optional struct payloads as
+            // `.trivial`, and primitive payloads are re-read as the original
+            // `?T` parameter instead of the unwrapped `T` value.
+            if (optional_payload_type_id) |type_id| {
+                try self.local_hir_types.put(payload_local, type_id);
             }
 
             try self.current_instrs.append(self.allocator, .{
@@ -7792,28 +7788,26 @@ pub const IrBuilder = struct {
 
     /// Detect the multi-clause `f(nil) / f(t :: T)` shape where every
     /// clause for `param_idx` is either the `nil` literal pattern or a
-    /// non-nil pattern (typed bind / struct match) over the same nominal
-    /// struct. The unified parameter type is `?T` so the call site can
-    /// pass either `nil` or a `T` value, and the dispatcher routes on
-    /// is-null. Returns the single struct type on success — caller
-    /// promotes the param's `ZigType` to `optional(struct_ref T)`,
-    /// preserves the optional union TypeId when one already exists in
-    /// the TypeStore, and emits an `optional_dispatch` IR.
+    /// non-nil pattern over the same resolved payload type. The unified
+    /// parameter type is `?T` so the call site can pass either `nil` or a
+    /// `T` value, and the dispatcher routes on is-null. Returns the single
+    /// payload type on success — caller promotes the param's `ZigType` to
+    /// `optional(T)`, preserves the optional union TypeId when one already
+    /// exists in the TypeStore, and emits an `optional_dispatch` IR.
     ///
     /// Reasons to return null:
     ///  - fewer than two clauses
     ///  - no `TypeStore` (unit-test path with raw IR)
-    ///  - any clause has a non-nil / non-struct type for this param
-    ///  - more than one distinct struct type among the non-nil clauses
-    ///  - all clauses are nil (degenerate) or all struct (no optional)
+    ///  - more than one distinct non-nil payload type
+    ///  - all clauses are nil (degenerate) or all payload (no optional)
     fn canOptionalDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup, param_idx: u32) ?OptionalDispatchCandidate {
         if (group.clauses.len < 2) return null;
         const ts = self.type_store orelse return null;
 
-        var struct_name: ?[]const u8 = null;
-        var struct_type_id: ?types_mod.TypeId = null;
+        var payload_type: ?ZigType = null;
+        var payload_type_id: ?types_mod.TypeId = null;
         var saw_nil = false;
-        var saw_struct = false;
+        var saw_payload = false;
 
         for (group.clauses) |clause| {
             if (param_idx >= clause.params.len) return null;
@@ -7853,29 +7847,21 @@ pub const IrBuilder = struct {
                 continue;
             }
 
-            if (tid >= ts.types.items.len) return null;
-            const typ = ts.types.items[tid];
-            switch (typ) {
-                .struct_type => |st| {
-                    const sname = self.interner.get(st.name);
-                    if (struct_name) |existing| {
-                        if (!std.mem.eql(u8, existing, sname)) return null;
-                        if (struct_type_id != tid) return null;
-                    } else {
-                        struct_name = sname;
-                        struct_type_id = tid;
-                    }
-                    saw_struct = true;
-                },
-                else => return null,
+            if (tid == types_mod.TypeStore.UNKNOWN or tid == types_mod.TypeStore.ERROR) return null;
+            if (payload_type_id) |existing| {
+                if (!ts.typeEquals(existing, tid)) return null;
+            } else {
+                payload_type = typeIdToZigTypeWithStore(tid, ts);
+                payload_type_id = tid;
             }
+            saw_payload = true;
         }
 
-        if (!saw_nil or !saw_struct) return null;
+        if (!saw_nil or !saw_payload) return null;
         return .{
-            .struct_name = struct_name.?,
-            .struct_type_id = struct_type_id.?,
-            .optional_type_id = findOptionalUnionTypeId(ts, struct_type_id.?),
+            .payload_type = payload_type.?,
+            .payload_type_id = payload_type_id.?,
+            .optional_type_id = findOptionalUnionTypeId(ts, payload_type_id.?),
         };
     }
 
@@ -21049,6 +21035,25 @@ test "canOptionalDispatch bails when a clause carries a refinement guard" {
     var type_store: types_mod.TypeStore = undefined;
     const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
     try std.testing.expect(builder.canOptionalDispatch(group, 0) == null);
+}
+
+test "canOptionalDispatch accepts primitive optional payloads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub struct Test {
+        \\  fn f(nil) -> i64 { 0 }
+        \\  fn f(n :: i64) -> i64 { n }
+        \\}
+    ;
+    var builder: IrBuilder = undefined;
+    var type_store: types_mod.TypeStore = undefined;
+    const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
+    const candidate = builder.canOptionalDispatch(group, 0) orelse return error.TestExpectedOptionalDispatch;
+    try std.testing.expectEqual(types_mod.TypeStore.I64, candidate.payload_type_id);
+    try std.testing.expect(candidate.payload_type == .i64);
 }
 
 test "canUnionDispatch bails when a clause carries a refinement guard" {

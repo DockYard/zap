@@ -307,34 +307,32 @@ pub struct String {
   }
 
   @doc = """
-    Parses a string into an integer. Returns 0 if the string
-    is not a valid integer.
+    Parses a string into an integer.
 
     Delegates to `Integer.parse/1`.
 
     ## Examples
 
         String.to_integer("42")    # => 42
-        String.to_integer("hello") # => 0
+        String.to_integer("hello") # => nil
     """
 
-  pub fn to_integer(s :: String) -> i64 {
+  pub fn to_integer(s :: String) -> i64 | nil {
     Integer.parse(s)
   }
 
   @doc = """
-    Parses a string into a float. Returns 0.0 if the string
-    is not a valid float.
+    Parses a string into a float.
 
     Delegates to `Float.parse/1`.
 
     ## Examples
 
         String.to_float("3.14")    # => 3.14
-        String.to_float("hello")   # => 0.0
+        String.to_float("hello")   # => nil
     """
 
-  pub fn to_float(s :: String) -> f64 {
+  pub fn to_float(s :: String) -> f64 | nil {
     Float.parse(s)
   }
 

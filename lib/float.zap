@@ -80,12 +80,14 @@ pub struct Float {
   pub fn min(first :: f128, second :: f128) -> f128 { :zig.Float.min_f128(first, second) }
 
   @doc = """
-    Parses a string into a float. Returns 0.0 if the string is not
-    a valid float representation.
+    Parses a string into a float.
+
+    Returns the parsed `f64` when the full string is a valid representation,
+    or `nil` when parsing fails.
     """
 
-  pub fn parse(input :: String) -> f64 {
-    :zig.Float.parse(input)
+  pub fn parse(input :: String) -> f64 | nil {
+    :zig.Float.parse_optional(input)
   }
 
   @doc = """

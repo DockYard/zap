@@ -59,19 +59,29 @@ pub struct Zap.IntegerTest {
     }
 
     test("parse positive") {
-      assert(Integer.parse("42") == 42)
+      parsed = Integer.parse("42")
+      assert(parsed != nil)
+      assert(parsed == 42)
     }
 
     test("parse negative") {
-      assert(Integer.parse("-7") == -7)
+      parsed = Integer.parse("-7")
+      assert(parsed != nil)
+      assert(parsed == -7)
     }
 
-    test("parse invalid") {
-      assert(Integer.parse("hello") == 0)
+    test("parse invalid returns nil") {
+      assert(Integer.parse("hello") == nil)
+    }
+
+    test("parse out-of-range returns nil") {
+      assert(Integer.parse("9223372036854775808") == nil)
     }
 
     test("parse zero") {
-      assert(Integer.parse("0") == 0)
+      parsed = Integer.parse("0")
+      assert(parsed != nil)
+      assert(parsed == 0)
     }
 
     test("remainder basic") {

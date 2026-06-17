@@ -99,12 +99,15 @@ pub struct Integer {
   pub fn min(first :: u128, second :: u128) -> u128 { :zig.Integer.min_u128(first, second) }
 
   @doc = """
-    Parses a string into an integer. Returns 0 if the string is not
-    a valid integer representation.
+    Parses a string into an integer.
+
+    Returns the parsed `i64` when the full string is a valid base-10
+    representation, or `nil` when parsing fails or the value is out of
+    range.
     """
 
-  pub fn parse(input :: String) -> i64 {
-    :zig.Integer.parse(input)
+  pub fn parse(input :: String) -> i64 | nil {
+    :zig.Integer.parse_optional(input)
   }
 
   @doc = """

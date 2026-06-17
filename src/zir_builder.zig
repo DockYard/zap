@@ -735,10 +735,7 @@ fn mapReturnType(zig_type: ir.ZigType) u32 {
         .f80 => @intFromEnum(Zir.Inst.Ref.f80_type),
         .f128 => @intFromEnum(Zir.Inst.Ref.f128_type),
         .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
-        .optional => |inner| if (inner.* == .string)
-            @intFromEnum(Zir.Inst.Ref.slice_const_u8_type)
-        else
-            0,
+        .optional => 0,
         .atom => @intFromEnum(Zir.Inst.Ref.u32_type), // atoms are interned u32 IDs
         .nil => 0, // void
         else => 0, // complex types need emitReturnTypeRef
@@ -5180,12 +5177,24 @@ pub const ZirDriver = struct {
                 }
             },
             .optional => {
-                // Optional wrapping is handled by set_optional_return_type
-                // which is called separately for __try variants. If we reach
-                // here, the inner type wasn't a primitive — this needs the
-                // optional wrapper on top of the resolved inner type.
-                if (zir_builder_set_optional_return_type(self.handle) != 0)
-                    return error.EmitFailed;
+                // Source optional returns (`T | nil`) must name the child
+                // type before wrapping it as `?T`. `set_optional_return_type`
+                // wraps the current function return type, so using it here
+                // before a child type exists collapses primitive optionals to
+                // `?void`. Build the optional type in the ret_ty body instead.
+                var support: std.ArrayListUnmanaged(u32) = .empty;
+                defer support.deinit(self.allocator);
+                const before = zir_builder_get_body_inst_count(self.handle);
+                const type_ref = try self.emitImportedTypeRef(return_type);
+                try self.captureBodyInsts(before, &support);
+                const result_inst = zir_builder_ref_to_inst_index(self.handle, type_ref);
+                if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
+                if (zir_builder_set_custom_return_type(
+                    self.handle,
+                    support.items.ptr,
+                    @intCast(support.items.len),
+                    result_inst,
+                ) != 0) return error.EmitFailed;
                 self.current_ret_type = 1;
             },
             .protocol_box => {
@@ -11555,7 +11564,6 @@ pub const ZirDriver = struct {
 
         return .{ .body_len = body_len, .result_ref = result_ref };
     }
-
 };
 
 // ---------------------------------------------------------------------------
@@ -11752,6 +11760,18 @@ test "mapBinopTag: per-mode integer overflow policy (checked vs wrapping)" {
         @intFromEnum(Zir.Inst.Tag.add),
         mapBinopTag(.add, .f64, false).?,
     );
+}
+
+test "mapReturnType routes optional returns through complex ret_ty emission" {
+    const optional_i64_inner = try std.testing.allocator.create(ir.ZigType);
+    defer std.testing.allocator.destroy(optional_i64_inner);
+    optional_i64_inner.* = .i64;
+    try std.testing.expectEqual(@as(u32, 0), mapReturnType(.{ .optional = optional_i64_inner }));
+
+    const optional_string_inner = try std.testing.allocator.create(ir.ZigType);
+    defer std.testing.allocator.destroy(optional_string_inner);
+    optional_string_inner.* = .string;
+    try std.testing.expectEqual(@as(u32, 0), mapReturnType(.{ .optional = optional_string_inner }));
 }
 
 test "closure lowering helper distinguishes immediate and stack tiers" {

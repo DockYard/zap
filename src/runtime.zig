@@ -17025,9 +17025,9 @@ pub const Integer = struct {
         return @as(u128, @intCast(-(value + 1))) + 1;
     }
 
-    /// Parse a string into i64, returning 0 on failure (non-optional).
+    /// Parse a string into i64, raising `ArgumentError` on failure.
     pub fn parse(s: []const u8) i64 {
-        return std.fmt.parseInt(i64, s, 10) catch 0;
+        return parse_optional(s) orelse Kernel.raise_with_kind("argument_error", "Integer.parse: invalid integer");
     }
 
     /// Parse a string into i64, returning null on failure.
@@ -18503,9 +18503,9 @@ pub const Float = struct {
         return result;
     }
 
-    /// Parse a string into f64, returning 0.0 on failure (non-optional).
+    /// Parse a string into f64, raising `ArgumentError` on failure.
     pub fn parse(s: []const u8) f64 {
-        return std.fmt.parseFloat(f64, s) catch 0.0;
+        return parse_optional(s) orelse Kernel.raise_with_kind("argument_error", "Float.parse: invalid float");
     }
 
     /// Parse a string into f64, returning null on failure.
@@ -24520,4 +24520,17 @@ test "Integer.remainder/div helpers return correct values on safe inputs" {
     try std.testing.expectEqual(@as(i64, 5), Integer.div_i64(10, 2));
     try std.testing.expectEqual(@as(i64, -4), Integer.div_i64(-9, 2));
     try std.testing.expectEqual(@as(i64, std.math.minInt(i64) / 2), Integer.div_i64(std.math.minInt(i64), 2));
+}
+
+test "Integer.parse_optional returns null for invalid or out-of-range input" {
+    try std.testing.expectEqual(@as(?i64, 42), Integer.parse_optional("42"));
+    try std.testing.expectEqual(@as(?i64, -7), Integer.parse_optional("-7"));
+    try std.testing.expectEqual(@as(?i64, null), Integer.parse_optional("hello"));
+    try std.testing.expectEqual(@as(?i64, null), Integer.parse_optional("9223372036854775808"));
+}
+
+test "Float.parse_optional returns null for invalid input" {
+    try std.testing.expectEqual(@as(?f64, 3.14), Float.parse_optional("3.14"));
+    try std.testing.expectEqual(@as(?f64, -0.5), Float.parse_optional("-0.5"));
+    try std.testing.expectEqual(@as(?f64, null), Float.parse_optional("hello"));
 }

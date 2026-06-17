@@ -165,7 +165,7 @@ pub struct Zest.Runner {
     } else {
       if System.arg_at(index) == "--seed" {
         if index + 1 < count {
-          :zig.Zest.set_seed(Integer.parse(System.arg_at(index + 1)))
+          set_seed_from_arg(System.arg_at(index + 1))
           parse_cli_args(index + 2, count)
         } else {
           :ok
@@ -173,7 +173,7 @@ pub struct Zest.Runner {
       } else {
         if System.arg_at(index) == "--timeout" {
           if index + 1 < count {
-            :zig.Zest.set_timeout(Integer.parse(System.arg_at(index + 1)))
+            set_timeout_from_arg(System.arg_at(index + 1))
             parse_cli_args(index + 2, count)
           } else {
             :ok
@@ -185,7 +185,7 @@ pub struct Zest.Runner {
           } else {
             if System.arg_at(index) == "--slowest" {
               if index + 1 < count {
-                :zig.Zest.set_slowest_limit(Integer.parse(System.arg_at(index + 1)))
+                set_slowest_limit_from_arg(System.arg_at(index + 1))
                 parse_cli_args(index + 2, count)
               } else {
                 :ok
@@ -197,6 +197,45 @@ pub struct Zest.Runner {
         }
       }
     }
+  }
+
+  fn set_seed_from_arg(value :: String) -> Atom {
+    set_seed_from_optional(Integer.parse(value))
+  }
+
+  fn set_seed_from_optional(nil) -> Atom {
+    :ok
+  }
+
+  fn set_seed_from_optional(seed :: i64) -> Atom {
+    :zig.Zest.set_seed(seed)
+    :ok
+  }
+
+  fn set_timeout_from_arg(value :: String) -> Atom {
+    set_timeout_from_optional(Integer.parse(value))
+  }
+
+  fn set_timeout_from_optional(nil) -> Atom {
+    :ok
+  }
+
+  fn set_timeout_from_optional(timeout :: i64) -> Atom {
+    :zig.Zest.set_timeout(timeout)
+    :ok
+  }
+
+  fn set_slowest_limit_from_arg(value :: String) -> Atom {
+    set_slowest_limit_from_optional(Integer.parse(value))
+  }
+
+  fn set_slowest_limit_from_optional(nil) -> Atom {
+    :ok
+  }
+
+  fn set_slowest_limit_from_optional(limit :: i64) -> Atom {
+    :zig.Zest.set_slowest_limit(limit)
+    :ok
   }
 
   macro patterns(options :: Expr) -> Expr {
