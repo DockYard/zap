@@ -2441,8 +2441,7 @@ pub const Parser = struct {
                 const name = try self.internToken(name_tok);
                 _ = try self.expect(.colon);
                 const arity_tok = try self.expect(.int_literal);
-                const arity_str = arity_tok.slice(self.source);
-                const arity = std.fmt.parseInt(u32, arity_str, 10) catch 0;
+                const arity = try self.parseFunctionArityLiteral(arity_tok, "import filter");
                 try entries.append(self.allocator, .{ .function = .{ .name = name, .arity = arity } });
             }
             if (!self.match(.comma)) break;
@@ -3325,8 +3324,7 @@ pub const Parser = struct {
 
         _ = try self.expect(.slash);
         const arity_tok = try self.expect(.int_literal);
-        const arity_text = arity_tok.slice(self.source);
-        const arity = std.fmt.parseInt(u32, arity_text, 10) catch 0;
+        const arity = try self.parseFunctionArityLiteral(arity_tok, "function reference");
 
         return self.create(ast.Expr, .{
             .function_ref = .{
@@ -3336,6 +3334,19 @@ pub const Parser = struct {
                 .arity = arity,
             },
         });
+    }
+
+    fn parseFunctionArityLiteral(self: *Parser, arity_tok: Token, context: []const u8) !u32 {
+        const arity_text = arity_tok.slice(self.source);
+        return std.fmt.parseInt(u32, arity_text, 10) catch {
+            try self.addRichError(
+                try std.fmt.allocPrint(self.allocator, "Invalid function arity `{s}` in {s}", .{ arity_text, context }),
+                ast.SourceSpan.from(arity_tok.loc),
+                "arity must fit in an unsigned 32-bit integer",
+                "use a decimal value from 0 through 4294967295",
+            );
+            return error.ParseError;
+        };
     }
 
     fn parseAnonymousFunctionExpr(self: *Parser) !*const ast.Expr {
@@ -8122,6 +8133,82 @@ test "parse &function/arity as local function_ref" {
     try std.testing.expect(expr.function_ref.struct_name == null);
     try std.testing.expectEqualStrings("double", parser.interner.get(expr.function_ref.function));
     try std.testing.expectEqual(@as(u32, 1), expr.function_ref.arity);
+}
+
+test "parse &function/arity rejects out-of-range arity instead of folding to zero" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() {
+        \\    &double/4294967296
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parseProgram());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "Invalid function arity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "4294967296") != null);
+}
+
+test "parse &function/arity rejects non-decimal arity instead of folding to zero" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() {
+        \\    &double/0x1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parseProgram());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "Invalid function arity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "0x1") != null);
+}
+
+test "parse import filter rejects out-of-range arity instead of folding to zero" {
+    const source =
+        \\pub struct Test {
+        \\  import Math, only: [double: 4294967296]
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parseProgram());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "Invalid function arity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "4294967296") != null);
+}
+
+test "parse import filter rejects non-decimal arity instead of folding to zero" {
+    const source =
+        \\pub struct Test {
+        \\  import Math, only: [double: 0x1]
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parseProgram());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "Invalid function arity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "0x1") != null);
 }
 
 test "parse anonymous function expression" {
