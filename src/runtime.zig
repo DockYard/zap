@@ -3548,10 +3548,10 @@ pub var dense_map_retaining_clone_total: u64 = 0;
 /// and the steady-state Map size shows how much c_allocator traffic
 /// shared-clone shape is producing.
 pub var dense_map_retaining_clone_bytes: u64 = 0;
-/// Number of `MapIter` cells allocated. Map iteration through the
-/// Enumerable protocol allocates one iter cell per iteration scope
-/// (e.g. one per Enum.reduce on a Map). Each iter step is O(1) work
-/// against the source map — no per-step allocation, no clones.
+/// Number of `MapIter` cells allocated. Linear Map iteration allocates
+/// one iter cell per iteration scope (e.g. one per Enum.reduce on a Map).
+/// Explicitly shared iterator states may allocate copy-on-write cursor
+/// cells so aliases advance independently.
 pub var dense_map_iter_alloc_total: u64 = 0;
 /// Number of `MapIter` cells freed. Symmetric to
 /// `dense_map_iter_alloc_total` — when iter rc hits zero the cell
@@ -3568,6 +3568,22 @@ pub var dense_map_iter_advance_total: u64 = 0;
 /// Used to diagnose iter-cell ARC discipline; usually matches
 /// `dense_map_iter_free_total + (iter cells with rc>1 across release)`.
 pub var map_release_iter_dispatch_total: u64 = 0;
+/// Number of `ListIter` cells allocated. Linear List iteration allocates
+/// one cursor cell per non-singleton iteration scope. Explicitly shared
+/// iterator states may allocate copy-on-write cursor cells so aliases
+/// advance independently.
+pub var list_iter_alloc_total: u64 = 0;
+/// Number of `ListIter` cells freed. Full iteration frees on the terminal
+/// DONE transition because `List.next` consumes the cursor state; partial
+/// iteration frees when the abandoned next-state is released by ARC drop
+/// insertion.
+pub var list_iter_free_total: u64 = 0;
+/// Total cursor advances after the first List element. This is the
+/// O(1) replacement for the historical per-step tail clone.
+pub var list_iter_advance_total: u64 = 0;
+/// Debug counter for `List.release` dispatching to the iter-cell
+/// release path.
+pub var list_release_iter_dispatch_total: u64 = 0;
 /// Number of `List.set/push/pop/append` calls that took the rc-1
 /// fast path (mutated the receiver in place rather than cloning).
 pub var list_rc1_fast_path_total: u64 = 0;
@@ -3650,6 +3666,14 @@ pub fn dumpArcStats(write_line: *const fn ([]const u8) void) void {
         dense_map_iter_free_total,
         dense_map_iter_advance_total,
         map_release_iter_dispatch_total,
+    })) |line| {
+        write_line(line);
+    } else |_| {}
+    if (std.fmt.bufPrint(&line_buf, "[zap-arc-stats] list_iter_alloc_total={d} list_iter_free_total={d} list_iter_advance_total={d} list_release_iter_dispatch_total={d}\n", .{
+        list_iter_alloc_total,
+        list_iter_free_total,
+        list_iter_advance_total,
+        list_release_iter_dispatch_total,
     })) |line| {
         write_line(line);
     } else |_| {}
@@ -7244,9 +7268,12 @@ fn listSumIntegerSimd(comptime T: type, data: [*]const T, len: u32) T {
 // ============================================================
 
 pub fn List(comptime T: type) type {
-    return struct {
+    return extern struct {
         const Self = @This();
         pub const Element = T;
+
+        const iter_len_discriminator: u32 = std.math.maxInt(u32);
+        const iter_cap_discriminator: u32 = 0;
 
         // Inline buffer header. The cell pointer IS the buffer
         // pointer; `header: ArcHeader` lives at offset 0 so
@@ -7292,6 +7319,74 @@ pub fn List(comptime T: type) type {
             std.debug.assert(idx < self.len);
             return &self.dataPtr()[idx];
         }
+
+        inline fn isIterCell(self: *const Self) bool {
+            return self.len == iter_len_discriminator and self.cap == iter_cap_discriminator;
+        }
+
+        const View = struct {
+            source: ?*const Self,
+            start: u32,
+            len: u32,
+            cap: u32,
+
+            inline fn empty() View {
+                return .{
+                    .source = null,
+                    .start = 0,
+                    .len = 0,
+                    .cap = 0,
+                };
+            }
+
+            inline fn fromRealList(source: *const Self) View {
+                std.debug.assert(!source.isIterCell());
+                return .{
+                    .source = source,
+                    .start = 0,
+                    .len = source.len,
+                    .cap = source.cap,
+                };
+            }
+
+            inline fn fromCursorSource(source: ?*const Self, next_index: u32) View {
+                const real_source = source orelse return View.empty();
+                std.debug.assert(!real_source.isIterCell());
+                if (next_index >= real_source.len) return View.empty();
+                const remaining = real_source.len - next_index;
+                return .{
+                    .source = real_source,
+                    .start = next_index,
+                    .len = remaining,
+                    // A cursor state is a logical suffix, not a buffer owner.
+                    // A materialized suffix uses an exact-fit capacity, so
+                    // expose the same capacity through the public view.
+                    .cap = remaining,
+                };
+            }
+
+            inline fn fromListPtr(list_ptr: *const Self) View {
+                if (list_ptr.isIterCell()) return ListIter(T).viewFromListPtr(list_ptr);
+                return fromRealList(list_ptr);
+            }
+
+            inline fn fromOptional(list_ptr: ?*const Self) View {
+                const source = list_ptr orelse return View.empty();
+                return fromListPtr(source);
+            }
+
+            inline fn slotAtConst(self: View, index: u32) *const T {
+                std.debug.assert(index < self.len);
+                const source = self.source orelse unreachable;
+                return source.slotAtConst(self.start + index);
+            }
+
+            inline fn dataPtr(self: View) [*]const T {
+                std.debug.assert(self.len != 0);
+                const source = self.source orelse unreachable;
+                return source.dataPtr() + @as(usize, self.start);
+            }
+        };
 
         // -------------------------------------------------------------------
         // Buffer alloc / free
@@ -7352,6 +7447,9 @@ pub fn List(comptime T: type) type {
         /// `arc_retains_total` is bumped inside the dispatcher.
         pub fn retain(vec: ?*const Self) ?*const Self {
             if (vec) |v| {
+                if (v.isIterCell()) {
+                    return ListIter(T).retainFromListPtr(v);
+                }
                 const mut: *Self = @constCast(v);
                 ArcRuntime.headerRetain(&mut.header);
             }
@@ -7373,6 +7471,11 @@ pub fn List(comptime T: type) type {
         pub fn release(vec: ?*const Self) void {
             if (vec == null) return;
             const v = vec.?;
+            if (v.isIterCell()) {
+                incrementRuntimeStatCounter(&list_release_iter_dispatch_total);
+                ListIter(T).releaseFromListPtr(v);
+                return;
+            }
             const mut: *Self = @constCast(v);
             // Box-in-container deep-release under a no-REFCOUNT_V1 manager.
             // `headerRelease` below is a comptime no-op in that mode, so the
@@ -7419,6 +7522,14 @@ pub fn List(comptime T: type) type {
             // buffer, which is what the observable COW correctness depends on.
             incrementRuntimeStatCounter(&list_release_kept_alive_total);
             ArcRuntime.headerRelease(&mut.header, listDeepWalk);
+        }
+
+        inline fn releaseConsumedCursorOperand(operand: ?*const Self) void {
+            if (comptime eager_individual_free) {
+                if (operand) |list_ptr| {
+                    if (list_ptr.isIterCell()) release(operand);
+                }
+            }
         }
 
         /// Deep-walk callback invoked by the manager's `release` on
@@ -7492,6 +7603,7 @@ pub fn List(comptime T: type) type {
         /// `cloneFieldChildInPlace` / `ownElement` that dispatch here.
         pub fn cloneForShare(vec: ?*const Self) ?*const Self {
             const v = vec orelse return null;
+            if (v.isIterCell()) return ListIter(T).cloneForShareFromListPtr(v);
             return cloneBufferRetainingChildren(v, if (v.cap == 0) 1 else v.cap);
         }
 
@@ -7508,6 +7620,37 @@ pub fn List(comptime T: type) type {
                 new_data[i] = old_data[i];
             }
             return fresh;
+        }
+
+        fn materializeViewRetainingChildren(view: View, new_capacity: u32) ?*Self {
+            std.debug.assert(new_capacity >= view.len);
+            const fresh = bufferAlloc(new_capacity, view.len) orelse return null;
+            const dest = fresh.dataPtr();
+            var index: u32 = 0;
+            while (index < view.len) : (index += 1) {
+                dest[index] = ownElement(view.slotAtConst(index).*);
+            }
+            return fresh;
+        }
+
+        fn cloneViewRangeRetainingChildren(view: View, start: u32, count: u32) ?*const Self {
+            if (count == 0) return null;
+            std.debug.assert(start <= view.len);
+            std.debug.assert(start + count <= view.len);
+            const fresh = bufferAlloc(count, count) orelse return null;
+            const dest = fresh.dataPtr();
+            var index: u32 = 0;
+            while (index < count) : (index += 1) {
+                dest[index] = ownElement(view.slotAtConst(start + index).*);
+            }
+            return fresh;
+        }
+
+        fn copyViewRetainingChildren(dest: [*]T, dest_start: u32, view: View) void {
+            var index: u32 = 0;
+            while (index < view.len) : (index += 1) {
+                dest[dest_start + index] = ownElement(view.slotAtConst(index).*);
+            }
         }
 
         /// True when a consuming mutation (`push` / `pop` / `set`) may take
@@ -7577,21 +7720,18 @@ pub fn List(comptime T: type) type {
 
         /// Number of populated elements.
         pub fn length(vec: ?*const Self) i64 {
-            const v = vec orelse return 0;
-            return @intCast(v.len);
+            return @intCast(View.fromOptional(vec).len);
         }
 
         /// True when the list contains no elements. Both `null` and
         /// allocated zero-length buffers are empty.
         pub fn isEmpty(vec: ?*const Self) bool {
-            const v = vec orelse return true;
-            return v.len == 0;
+            return View.fromOptional(vec).len == 0;
         }
 
         /// Total capacity (number of element slots in the buffer).
         pub fn capacity(vec: ?*const Self) i64 {
-            const v = vec orelse return 0;
-            return @intCast(v.cap);
+            return @intCast(View.fromOptional(vec).cap);
         }
 
         // -------------------------------------------------------------------
@@ -7648,6 +7788,7 @@ pub fn List(comptime T: type) type {
         /// out-of-range index.
         pub fn get(vec: ?*const Self, index: i64) T {
             const v = vec orelse @panic("List.get: null list");
+            const view = View.fromListPtr(v);
             const slot: u32 = @intCast(index);
             // Phase 1.5 bounds policy: an out-of-range list index aborts
             // with the canonical `** (index_error) ...` shape — the same
@@ -7655,8 +7796,8 @@ pub fn List(comptime T: type) type {
             // compiler-emitted slice-bounds trap. This is a library check
             // (not a compiler-elided one), so it is enforced in every
             // optimize mode.
-            if (slot >= v.len) Kernel.raise_with_kind("index_error", "List.get: index out of bounds");
-            const value = v.slotAtConst(slot).*;
+            if (slot >= view.len) Kernel.raise_with_kind("index_error", "List.get: index out of bounds");
+            const value = view.slotAtConst(slot).*;
             return ownElement(value);
         }
 
@@ -7664,9 +7805,9 @@ pub fn List(comptime T: type) type {
         /// an empty list. The returned value is a fresh owner when `T`
         /// carries ARC-managed children.
         pub fn getHead(vec: ?*const Self) T {
-            const v = vec orelse return defaultElement();
-            if (v.len == 0) return defaultElement();
-            const value = v.slotAtConst(0).*;
+            const view = View.fromOptional(vec);
+            if (view.len == 0) return defaultElement();
+            const value = view.slotAtConst(0).*;
             return ownElement(value);
         }
 
@@ -7680,19 +7821,19 @@ pub fn List(comptime T: type) type {
         /// `start`. The source list remains valid and unchanged.
         pub fn sliceFrom(vec: ?*const Self, start: i64) ?*const Self {
             if (start < 0) @panic("List.sliceFrom: negative start");
-            const v = vec orelse return null;
+            const view = View.fromOptional(vec);
             const first: u32 = @intCast(start);
-            if (first >= v.len) return null;
-            return cloneRangeRetainingChildren(v, first, v.len - first);
+            if (first >= view.len) return null;
+            return cloneViewRangeRetainingChildren(view, first, view.len - first);
         }
 
         /// Return the last element, or the element type's default for
         /// an empty list. The returned value is a fresh owner when `T`
         /// carries ARC-managed children.
         pub fn last(vec: ?*const Self) T {
-            const v = vec orelse return defaultElement();
-            if (v.len == 0) return defaultElement();
-            const value = v.slotAtConst(v.len - 1).*;
+            const view = View.fromOptional(vec);
+            if (view.len == 0) return defaultElement();
+            const value = view.slotAtConst(view.len - 1).*;
             return ownElement(value);
         }
 
@@ -7702,12 +7843,21 @@ pub fn List(comptime T: type) type {
         /// the original observer stays valid.
         pub fn set(vec: ?*const Self, index: i64, value: T) ?*const Self {
             const v = vec orelse @panic("List.set: null list");
+            const view = View.fromListPtr(v);
             const slot: u32 = @intCast(index);
             // Phase 1.5 bounds policy — see `List.get`. Out-of-range
             // index aborts with `** (index_error) ...`.
-            if (slot >= v.len) Kernel.raise_with_kind("index_error", "List.set: index out of bounds");
+            if (slot >= view.len) Kernel.raise_with_kind("index_error", "List.set: index out of bounds");
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
+            if (v.isIterCell()) {
+                const materialized = materializeViewRetainingChildren(view, view.len) orelse return null;
+                releaseConsumedCursorOperand(vec);
+                const existing = materialized.slotAt(slot).*;
+                releaseElement(existing, std.heap.c_allocator);
+                materialized.slotAt(slot).* = value;
+                return materialized;
+            }
             if (v.mutationMayMoveInPlace()) {
                 incrementRuntimeStatCounter(&list_rc1_fast_path_total);
                 const mut: *Self = @constCast(v);
@@ -7750,6 +7900,15 @@ pub fn List(comptime T: type) type {
                 return fresh;
             }
             const v = vec.?;
+            if (v.isIterCell()) {
+                const view = View.fromListPtr(v);
+                const new_cap = pickCapacity(view.cap, view.len + 1);
+                const materialized = materializeViewRetainingChildren(view, new_cap) orelse return null;
+                releaseConsumedCursorOperand(vec);
+                materialized.slotAtPtr(materialized.len).* = value;
+                materialized.len += 1;
+                return materialized;
+            }
 
             if (v.mutationMayMoveInPlace()) {
                 incrementRuntimeStatCounter(&list_rc1_fast_path_total);
@@ -7786,9 +7945,18 @@ pub fn List(comptime T: type) type {
         /// in the dense Map). On an empty list this panics.
         pub fn pop(vec: ?*const Self) ?*const Self {
             const v = vec orelse @panic("List.pop: null list");
-            if (v.len == 0) @panic("List.pop: empty list");
+            const view = View.fromListPtr(v);
+            if (view.len == 0) @panic("List.pop: empty list");
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
+            if (v.isIterCell()) {
+                const materialized = materializeViewRetainingChildren(view, view.len) orelse return null;
+                releaseConsumedCursorOperand(vec);
+                const removed_value = materialized.slotAtPtr(materialized.len - 1).*;
+                releaseElement(removed_value, std.heap.c_allocator);
+                materialized.len -= 1;
+                return materialized;
+            }
             if (v.mutationMayMoveInPlace()) {
                 incrementRuntimeStatCounter(&list_rc1_fast_path_total);
                 const mut: *Self = @constCast(v);
@@ -7818,38 +7986,44 @@ pub fn List(comptime T: type) type {
         /// responsibility, mirroring `Map.merge`'s ABI.
         pub fn append(a: ?*const Self, b: ?*const Self) ?*const Self {
             if (a == null and b == null) return null;
-            if (b == null) return retain(a);
-            if (a == null) return cloneBufferRetainingChildren(b.?, b.?.len);
+            if (b == null) return a;
+            if (a == null) {
+                const bv_only = b.?;
+                const bv_view = View.fromListPtr(bv_only);
+                return cloneViewRangeRetainingChildren(bv_view, 0, bv_view.len);
+            }
             const av = a.?;
             const bv = b.?;
-            const total_len = av.len + bv.len;
+            const av_view = View.fromListPtr(av);
+            const bv_view = View.fromListPtr(bv);
+            const total_len = av_view.len + bv_view.len;
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
-            if (av.header.count() == 1 and av.cap >= total_len) {
+            if (!av.isIterCell() and av.header.count() == 1 and av.cap >= total_len) {
                 incrementRuntimeStatCounter(&list_rc1_fast_path_total);
                 const mut: *Self = @constCast(av);
                 const dst_data = mut.dataPtr();
-                const src_data = bv.dataPtr();
                 var i: u32 = 0;
-                while (i < bv.len) : (i += 1) {
-                    dst_data[mut.len + i] = ownElement(src_data[i]);
+                while (i < bv_view.len) : (i += 1) {
+                    dst_data[mut.len + i] = ownElement(bv_view.slotAtConst(i).*);
                 }
                 mut.len = total_len;
                 return mut;
             }
 
-            if (av.header.count() == 1) {
+            if (!av.isIterCell() and av.header.count() == 1) {
                 incrementRuntimeStatCounter(&list_rc1_fast_path_total);
                 const mut: *Self = @constCast(av);
-                const same_buffer = av == bv;
-                const b_len = bv.len;
+                const same_source = bv_view.source == av;
+                const b_start = bv_view.start;
+                const b_len = bv_view.len;
                 const new_cap = pickCapacity(av.cap, total_len);
                 const grown = cloneBufferMovingChildren(mut, new_cap) orelse return null;
                 mut.bufferFreeShallow();
                 const grown_data = grown.dataPtr();
                 var i: u32 = 0;
                 while (i < b_len) : (i += 1) {
-                    const value = if (same_buffer) grown_data[i] else bv.dataPtr()[i];
+                    const value = if (same_source) grown_data[b_start + i] else bv_view.slotAtConst(i).*;
                     grown_data[grown.len + i] = ownElement(value);
                 }
                 grown.len = total_len;
@@ -7860,18 +8034,12 @@ pub fn List(comptime T: type) type {
             // small (must grow). The unique-growth case was handled
             // above; this branch clones A/B and releases the consumed
             // A owner.
-            const new_cap = pickCapacity(av.cap, total_len);
+            const new_cap = pickCapacity(av_view.cap, total_len);
             const fresh = bufferAlloc(new_cap, total_len) orelse return null;
             const fresh_data = fresh.dataPtr();
-            const a_data = av.dataPtr();
-            const b_data = bv.dataPtr();
-            var i: u32 = 0;
-            while (i < av.len) : (i += 1) {
-                fresh_data[i] = ownElement(a_data[i]);
-            }
-            while (i < total_len) : (i += 1) {
-                fresh_data[i] = ownElement(b_data[i - av.len]);
-            }
+            copyViewRetainingChildren(fresh_data, 0, av_view);
+            copyViewRetainingChildren(fresh_data, av_view.len, bv_view);
+            releaseConsumedCursorOperand(a);
             return fresh;
         }
 
@@ -7922,6 +8090,17 @@ pub fn List(comptime T: type) type {
                 return fresh;
             }
             const t = tail.?;
+            if (t.isIterCell()) {
+                const tail_view = View.fromListPtr(t);
+                const fresh_cap = pickCapacity(0, tail_view.len + 1);
+                const fresh = bufferAlloc(fresh_cap, tail_view.len + 1) orelse return null;
+                addRuntimeStatCounter(&list_cons_alloc_bytes, bufferSize(fresh_cap));
+                const data = fresh.dataPtr();
+                data[0] = head;
+                copyViewRetainingChildren(data, 1, tail_view);
+                release(tail);
+                return fresh;
+            }
             if (t.header.count() == 1) {
                 const mut: *Self = @constCast(t);
                 if (mut.cap > mut.len) {
@@ -7976,14 +8155,13 @@ pub fn List(comptime T: type) type {
 
         /// Return a new list with element order reversed.
         pub fn reverse(vec: ?*const Self) ?*const Self {
-            const v = vec orelse return null;
-            if (v.len == 0) return null;
-            const fresh = bufferAlloc(v.len, v.len) orelse return null;
-            const source = v.dataPtr();
+            const view = View.fromOptional(vec);
+            if (view.len == 0) return null;
+            const fresh = bufferAlloc(view.len, view.len) orelse return null;
             const dest = fresh.dataPtr();
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                dest[i] = ownElement(source[v.len - 1 - i]);
+            while (i < view.len) : (i += 1) {
+                dest[i] = ownElement(view.slotAtConst(view.len - 1 - i).*);
             }
             return fresh;
         }
@@ -7991,29 +8169,28 @@ pub fn List(comptime T: type) type {
         /// Return the first `count` elements as a fresh list.
         pub fn take(vec: ?*const Self, count: i64) ?*const Self {
             if (count <= 0) return null;
-            const v = vec orelse return null;
+            const view = View.fromOptional(vec);
             const requested: u32 = @intCast(count);
-            const take_len = @min(requested, v.len);
+            const take_len = @min(requested, view.len);
             if (take_len == 0) return null;
-            return cloneRangeRetainingChildren(v, 0, take_len);
+            return cloneViewRangeRetainingChildren(view, 0, take_len);
         }
 
         /// Return the list after dropping the first `count` elements.
         pub fn drop(vec: ?*const Self, count: i64) ?*const Self {
-            const v = vec orelse return null;
-            if (count <= 0) return cloneRangeRetainingChildren(v, 0, v.len);
+            const view = View.fromOptional(vec);
+            if (count <= 0) return cloneViewRangeRetainingChildren(view, 0, view.len);
             const requested: u32 = @intCast(count);
-            if (requested >= v.len) return null;
-            return cloneRangeRetainingChildren(v, requested, v.len - requested);
+            if (requested >= view.len) return null;
+            return cloneViewRangeRetainingChildren(view, requested, view.len - requested);
         }
 
         /// True when any element equals `value`.
         pub fn contains(vec: ?*const Self, value: T) bool {
-            const v = vec orelse return false;
-            const data = v.dataPtr();
+            const view = View.fromOptional(vec);
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                if (elementsEqual(data[i], value)) return true;
+            while (i < view.len) : (i += 1) {
+                if (elementsEqual(view.slotAtConst(i).*, value)) return true;
             }
             return false;
         }
@@ -8021,139 +8198,148 @@ pub fn List(comptime T: type) type {
         /// Return a new list with duplicate elements removed,
         /// preserving first-occurrence order.
         pub fn uniq(vec: ?*const Self) ?*const Self {
-            const v = vec orelse return null;
+            const view = View.fromOptional(vec);
             var result: ?*const Self = null;
-            const data = v.dataPtr();
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                if (!contains(result, data[i])) {
-                    result = push(result, ownElement(data[i]));
+            while (i < view.len) : (i += 1) {
+                const value = view.slotAtConst(i).*;
+                if (!contains(result, value)) {
+                    result = push(result, ownElement(value));
                 }
             }
             return result;
         }
 
-        /// Iterator protocol: returns `{tag, value, next_state}` where
-        /// tag is `:cont` for non-empty and `:done` for empty.
+        /// Iterator protocol: consumes `vec` as the current iteration state and
+        /// returns `{tag, value, next_state}` where tag is `:cont` for non-empty
+        /// and `:done` for empty. On CONT, ownership of the iteration state is
+        /// transferred into `next_state`; on DONE, the consumed state is released
+        /// here because there is no next owner to receive it.
         pub fn next(vec: ?*const Self) std.meta.Tuple(&.{ u32, T, ?*const Self }) {
             const v = vec orelse return .{ ATOM_DONE, defaultElement(), null };
-            if (v.len == 0) return .{ ATOM_DONE, defaultElement(), null };
+            if (v.isIterCell()) return ListIter(T).advanceFromListPtr(v);
+            if (v.len == 0) {
+                release(v);
+                return .{ ATOM_DONE, defaultElement(), null };
+            }
             const head = ownElement(v.slotAtConst(0).*);
-            const tail = if (v.len > 1) cloneRangeRetainingChildren(v, 1, v.len - 1) else null;
-            return .{ ATOM_CONT, head, tail };
+            if (v.len == 1) {
+                release(v);
+                return .{ ATOM_CONT, head, null };
+            }
+            const iter = ListIter(T).create(v, 1) orelse {
+                releaseElement(head, std.heap.c_allocator);
+                release(v);
+                return .{ ATOM_DONE, defaultElement(), null };
+            };
+            release(v);
+            return .{ ATOM_CONT, head, iter.asListPtr() };
         }
 
         // Higher-order helpers used by protocol bridges.
         pub fn mapFn(vec: ?*const Self, callback: anytype) ?*const Self {
-            const v = vec orelse return null;
+            const view = View.fromOptional(vec);
             var result: ?*const Self = null;
-            const data = v.dataPtr();
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                result = push(result, call1WithOwnedElement(callback, data[i]));
+            while (i < view.len) : (i += 1) {
+                result = push(result, call1WithOwnedElement(callback, view.slotAtConst(i).*));
             }
             return result;
         }
 
         pub fn filterFn(vec: ?*const Self, predicate: anytype) ?*const Self {
-            const v = vec orelse return null;
+            const view = View.fromOptional(vec);
             var result: ?*const Self = null;
-            const data = v.dataPtr();
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                if (call1WithOwnedElement(predicate, data[i])) {
-                    result = push(result, ownElement(data[i]));
+            while (i < view.len) : (i += 1) {
+                const value = view.slotAtConst(i).*;
+                if (call1WithOwnedElement(predicate, value)) {
+                    result = push(result, ownElement(value));
                 }
             }
             return result;
         }
 
         pub fn rejectFn(vec: ?*const Self, predicate: anytype) ?*const Self {
-            const v = vec orelse return null;
+            const view = View.fromOptional(vec);
             var result: ?*const Self = null;
-            const data = v.dataPtr();
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                if (!call1WithOwnedElement(predicate, data[i])) {
-                    result = push(result, ownElement(data[i]));
+            while (i < view.len) : (i += 1) {
+                const value = view.slotAtConst(i).*;
+                if (!call1WithOwnedElement(predicate, value)) {
+                    result = push(result, ownElement(value));
                 }
             }
             return result;
         }
 
         pub fn enumReduceSimple(vec: ?*const Self, initial: T, callback: anytype) T {
-            const v = vec orelse return initial;
+            const view = View.fromOptional(vec);
             var acc: T = initial;
-            const data = v.dataPtr();
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                acc = call2WithOwnedElement(callback, acc, data[i]);
+            while (i < view.len) : (i += 1) {
+                acc = call2WithOwnedElement(callback, acc, view.slotAtConst(i).*);
             }
             return acc;
         }
 
         pub fn eachFn(vec: ?*const Self, callback: anytype) ?*const Self {
-            const v = vec orelse return null;
-            const data = v.dataPtr();
+            const view = View.fromOptional(vec);
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                const callback_result = call1WithOwnedElement(callback, data[i]);
+            while (i < view.len) : (i += 1) {
+                const callback_result = call1WithOwnedElement(callback, view.slotAtConst(i).*);
                 releaseElementShape(@TypeOf(callback_result), callback_result, std.heap.c_allocator);
             }
             return vec;
         }
 
         pub fn findFn(vec: ?*const Self, default: T, predicate: anytype) T {
-            const v = vec orelse return default;
-            const data = v.dataPtr();
+            const view = View.fromOptional(vec);
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                if (call1WithOwnedElement(predicate, data[i])) {
-                    return ownElement(data[i]);
+            while (i < view.len) : (i += 1) {
+                const value = view.slotAtConst(i).*;
+                if (call1WithOwnedElement(predicate, value)) {
+                    return ownElement(value);
                 }
             }
             return default;
         }
 
         pub fn anyFn(vec: ?*const Self, predicate: anytype) bool {
-            const v = vec orelse return false;
-            const data = v.dataPtr();
+            const view = View.fromOptional(vec);
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                if (call1WithOwnedElement(predicate, data[i])) return true;
+            while (i < view.len) : (i += 1) {
+                if (call1WithOwnedElement(predicate, view.slotAtConst(i).*)) return true;
             }
             return false;
         }
 
         pub fn allFn(vec: ?*const Self, predicate: anytype) bool {
-            const v = vec orelse return true;
-            const data = v.dataPtr();
+            const view = View.fromOptional(vec);
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                if (!call1WithOwnedElement(predicate, data[i])) return false;
+            while (i < view.len) : (i += 1) {
+                if (!call1WithOwnedElement(predicate, view.slotAtConst(i).*)) return false;
             }
             return true;
         }
 
         pub fn countFn(vec: ?*const Self, predicate: anytype) i64 {
-            const v = vec orelse return 0;
+            const view = View.fromOptional(vec);
             var count: i64 = 0;
-            const data = v.dataPtr();
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                if (call1WithOwnedElement(predicate, data[i])) count += 1;
+            while (i < view.len) : (i += 1) {
+                if (call1WithOwnedElement(predicate, view.slotAtConst(i).*)) count += 1;
             }
             return count;
         }
 
         pub fn sortFn(vec: ?*const Self, comparator: anytype) ?*const Self {
-            const v = vec orelse return null;
-            if (v.len <= 1) return cloneRangeRetainingChildren(v, 0, v.len);
-            const len: usize = @intCast(v.len);
+            const view = View.fromOptional(vec);
+            if (view.len <= 1) return cloneViewRangeRetainingChildren(view, 0, view.len);
+            const len: usize = @intCast(view.len);
             const arr = bumpAllocSlice(T, len);
             if (arr.len == 0) return null;
-            const data = v.dataPtr();
-            for (0..len) |i| arr[i] = data[i];
+            for (0..len) |i| arr[i] = view.slotAtConst(@intCast(i)).*;
             const Comparator = @TypeOf(comparator);
             const ComparatorStorage = if (@typeInfo(Comparator) == .@"fn") *const Comparator else Comparator;
             const comparator_storage: ComparatorStorage = if (@typeInfo(Comparator) == .@"fn") &comparator else comparator;
@@ -8172,12 +8358,11 @@ pub fn List(comptime T: type) type {
         }
 
         pub fn flatMapFn(vec: ?*const Self, callback: anytype) ?*const Self {
-            const v = vec orelse return null;
+            const view = View.fromOptional(vec);
             var result: ?*const Self = null;
-            const data = v.dataPtr();
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) {
-                const inner = call1WithOwnedElement(callback, data[i]);
+            while (i < view.len) : (i += 1) {
+                const inner = call1WithOwnedElement(callback, view.slotAtConst(i).*);
                 result = append(result, inner);
                 release(inner);
             }
@@ -8189,47 +8374,47 @@ pub fn List(comptime T: type) type {
                 .int, .float => {},
                 else => @compileError("sum requires numeric element type"),
             }
-            const v = vec orelse return 0;
-            const data = v.dataPtr();
+            const view = View.fromOptional(vec);
+            if (view.len == 0) return 0;
+            const data = view.dataPtr();
             return switch (comptime @typeInfo(T)) {
-                .int => listSumIntegerSimd(T, data, v.len),
-                .float => listSumScalar(T, data, v.len),
+                .int => listSumIntegerSimd(T, data, view.len),
+                .float => listSumScalar(T, data, view.len),
                 else => unreachable,
             };
         }
 
         pub fn product(vec: ?*const Self) T {
             if (comptime @typeInfo(T) != .int) @compileError("product requires integer element type");
-            const v = vec orelse return 1;
+            const view = View.fromOptional(vec);
             var total: T = 1;
-            const data = v.dataPtr();
             var i: u32 = 0;
-            while (i < v.len) : (i += 1) total *= data[i];
+            while (i < view.len) : (i += 1) total *= view.slotAtConst(i).*;
             return total;
         }
 
         pub fn maxVal(vec: ?*const Self) T {
             if (comptime @typeInfo(T) != .int) @compileError("maxVal requires integer element type");
-            const v = vec orelse return 0;
-            if (v.len == 0) return 0;
-            const data = v.dataPtr();
-            var result = data[0];
+            const view = View.fromOptional(vec);
+            if (view.len == 0) return 0;
+            var result = view.slotAtConst(0).*;
             var i: u32 = 1;
-            while (i < v.len) : (i += 1) {
-                if (data[i] > result) result = data[i];
+            while (i < view.len) : (i += 1) {
+                const value = view.slotAtConst(i).*;
+                if (value > result) result = value;
             }
             return result;
         }
 
         pub fn minVal(vec: ?*const Self) T {
             if (comptime @typeInfo(T) != .int) @compileError("minVal requires integer element type");
-            const v = vec orelse return 0;
-            if (v.len == 0) return 0;
-            const data = v.dataPtr();
-            var result = data[0];
+            const view = View.fromOptional(vec);
+            if (view.len == 0) return 0;
+            var result = view.slotAtConst(0).*;
             var i: u32 = 1;
-            while (i < v.len) : (i += 1) {
-                if (data[i] < result) result = data[i];
+            while (i < view.len) : (i += 1) {
+                const value = view.slotAtConst(i).*;
+                if (value < result) result = value;
             }
             return result;
         }
@@ -8268,11 +8453,20 @@ pub fn List(comptime T: type) type {
         /// proven uniqueness via uniqueness. See safety contract above.
         pub fn set_owned_unchecked(vec: ?*const Self, index: i64, value: T) ?*const Self {
             const v = vec orelse @panic("List.set_owned_unchecked: null list");
+            const view = View.fromListPtr(v);
             const slot: u32 = @intCast(index);
-            if (slot >= v.len) @panic("List.set_owned_unchecked: index out of bounds");
+            if (slot >= view.len) @panic("List.set_owned_unchecked: index out of bounds");
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
             incrementRuntimeStatCounter(&list_unchecked_total);
+            if (v.isIterCell()) {
+                const materialized = materializeViewRetainingChildren(view, view.len) orelse return null;
+                release(vec);
+                const existing = materialized.slotAt(slot).*;
+                releaseElement(existing, std.heap.c_allocator);
+                materialized.slotAt(slot).* = value;
+                return materialized;
+            }
             const mut: *Self = @constCast(v);
             const existing = mut.slotAt(slot).*;
             releaseElement(existing, std.heap.c_allocator);
@@ -8286,9 +8480,9 @@ pub fn List(comptime T: type) type {
         /// `slice_owned_unchecked` call can then release the skipped
         /// prefix while the extracted head remains valid.
         pub fn head_owned_unchecked(vec: ?*const Self) T {
-            const v = vec orelse return defaultElement();
-            if (v.len == 0) return defaultElement();
-            const value = v.slotAtConst(0).*;
+            const view = View.fromOptional(vec);
+            if (view.len == 0) return defaultElement();
+            const value = view.slotAtConst(0).*;
             return ownElement(value);
         }
 
@@ -8308,11 +8502,20 @@ pub fn List(comptime T: type) type {
         pub fn slice_owned_unchecked(vec: ?*const Self, start: i64) ?*const Self {
             if (start < 0) @panic("List.slice_owned_unchecked: negative start");
             const v = vec orelse return null;
+            const view = View.fromListPtr(v);
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
             incrementRuntimeStatCounter(&list_unchecked_total);
 
             const first: u32 = @intCast(start);
+            if (v.isIterCell()) {
+                const result = if (first >= view.len)
+                    null
+                else
+                    cloneViewRangeRetainingChildren(view, first, view.len - first);
+                release(vec);
+                return result;
+            }
             const mut: *Self = @constCast(v);
             const data = mut.dataPtr();
 
@@ -8357,6 +8560,15 @@ pub fn List(comptime T: type) type {
                 return fresh;
             }
             const v = vec.?;
+            if (v.isIterCell()) {
+                const view = View.fromListPtr(v);
+                const new_cap = pickCapacity(view.cap, view.len + 1);
+                const materialized = materializeViewRetainingChildren(view, new_cap) orelse return null;
+                release(vec);
+                materialized.slotAtPtr(materialized.len).* = value;
+                materialized.len += 1;
+                return materialized;
+            }
             const mut: *Self = @constCast(v);
             if (mut.len < mut.cap) {
                 mut.slotAtPtr(mut.len).* = value;
@@ -8380,10 +8592,19 @@ pub fn List(comptime T: type) type {
         /// safety contract above.
         pub fn pop_owned_unchecked(vec: ?*const Self) ?*const Self {
             const v = vec orelse @panic("List.pop_owned_unchecked: null list");
-            if (v.len == 0) @panic("List.pop_owned_unchecked: empty list");
+            const view = View.fromListPtr(v);
+            if (view.len == 0) @panic("List.pop_owned_unchecked: empty list");
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
             incrementRuntimeStatCounter(&list_unchecked_total);
+            if (v.isIterCell()) {
+                const materialized = materializeViewRetainingChildren(view, view.len) orelse return null;
+                release(vec);
+                const removed_value = materialized.slotAtPtr(materialized.len - 1).*;
+                releaseElement(removed_value, std.heap.c_allocator);
+                materialized.len -= 1;
+                return materialized;
+            }
             const mut: *Self = @constCast(v);
             const removed_value = mut.slotAtPtr(mut.len - 1).*;
             releaseElement(removed_value, std.heap.c_allocator);
@@ -8403,27 +8624,47 @@ pub fn List(comptime T: type) type {
                 // same buffer (caller's +1 stays in place) — symmetric
                 // with the checked `append`'s `retain(a)` shape but
                 // without bumping the refcount.
+                if (a) |av_only| {
+                    if (av_only.isIterCell()) {
+                        const av_view = View.fromListPtr(av_only);
+                        const materialized = materializeViewRetainingChildren(av_view, av_view.len) orelse return null;
+                        release(a);
+                        return materialized;
+                    }
+                }
                 return a;
             }
             if (a == null) {
                 // No `a` to mutate; produce a fresh deep-retained
                 // copy of `b`. The result has rc=1 by construction.
-                return cloneBufferRetainingChildren(b.?, b.?.len);
+                const bv_only = b.?;
+                const bv_view = View.fromListPtr(bv_only);
+                return cloneViewRangeRetainingChildren(bv_view, 0, bv_view.len);
             }
             const av = a.?;
             const bv = b.?;
-            const total_len = av.len + bv.len;
+            const av_view = View.fromListPtr(av);
+            const bv_view = View.fromListPtr(bv);
+            const total_len = av_view.len + bv_view.len;
 
             incrementRuntimeStatCounter(&list_mut_calls_total);
             incrementRuntimeStatCounter(&list_unchecked_total);
+            if (av.isIterCell()) {
+                const new_cap = pickCapacity(av_view.cap, total_len);
+                const materialized = materializeViewRetainingChildren(av_view, new_cap) orelse return null;
+                release(a);
+                const dest = materialized.dataPtr();
+                copyViewRetainingChildren(dest, materialized.len, bv_view);
+                materialized.len = total_len;
+                return materialized;
+            }
             const mut: *Self = @constCast(av);
 
             if (mut.cap >= total_len) {
                 const dst_data = mut.dataPtr();
-                const src_data = bv.dataPtr();
                 var i: u32 = 0;
-                while (i < bv.len) : (i += 1) {
-                    dst_data[mut.len + i] = ownElement(src_data[i]);
+                while (i < bv_view.len) : (i += 1) {
+                    dst_data[mut.len + i] = ownElement(bv_view.slotAtConst(i).*);
                 }
                 mut.len = total_len;
                 return mut;
@@ -8435,13 +8676,14 @@ pub fn List(comptime T: type) type {
             // they're copied (B's observers retain).
             const new_cap = pickCapacity(av.cap, total_len);
             const grown = cloneBufferMovingChildren(mut, new_cap) orelse return null;
-            const same_buffer = av == bv;
-            const b_len = bv.len;
+            const same_source = bv_view.source == av;
+            const b_start = bv_view.start;
+            const b_len = bv_view.len;
             mut.bufferFreeShallow();
             const grown_data = grown.dataPtr();
             var i: u32 = 0;
             while (i < b_len) : (i += 1) {
-                const value = if (same_buffer) grown_data[i] else bv.dataPtr()[i];
+                const value = if (same_source) grown_data[b_start + i] else bv_view.slotAtConst(i).*;
                 grown_data[grown.len + i] = ownElement(value);
             }
             grown.len = total_len;
@@ -8458,17 +8700,7 @@ pub fn List(comptime T: type) type {
         }
 
         fn cloneRangeRetainingChildren(self: *const Self, start: u32, count: u32) ?*const Self {
-            if (count == 0) return null;
-            std.debug.assert(start <= self.len);
-            std.debug.assert(start + count <= self.len);
-            const fresh = bufferAlloc(count, count) orelse return null;
-            const source = self.dataPtr();
-            const dest = fresh.dataPtr();
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                dest[i] = ownElement(source[start + i]);
-            }
-            return fresh;
+            return cloneViewRangeRetainingChildren(View.fromRealList(self), start, count);
         }
 
         fn defaultElement() T {
@@ -8604,6 +8836,187 @@ pub fn List(comptime T: type) type {
             }
         }
     };
+}
+
+// ============================================================
+// ListIter — cursor-based iterator for `List(T)`.
+//
+// `List.next(real_list)` yields element 0 and, for lists with more
+// than one element, returns a short-lived cursor cell as the next state.
+// `List.next(iter)` advances that cursor in place only when the active
+// memory model proves the cursor is uniquely owned. Shared cursors use
+// copy-on-write and return an independent cursor for the next state, so
+// aliases observe stable iterator-state values. The cursor owns a
+// source-stable list reference: a refcount retain under REFCOUNTED, a
+// source clone under Tracking, and the normal non-eager lifetime under
+// bulk/traced managers. This makes list iteration O(N) total instead
+// of O(N²) tail cloning while keeping the source list immutable for
+// observers.
+//
+// The cursor's first fields are binary-compatible with `List(T)`:
+// `header`, `len`, and `cap`. The impossible pair
+// `len == maxInt(u32)` and `cap == 0` distinguishes a cursor from a
+// real list; real list buffers always satisfy `len <= cap`.
+// ============================================================
+
+pub fn ListIter(comptime T: type) type {
+    return extern struct {
+        const Self = @This();
+        const ListT = List(T);
+
+        header: ArcHeader,
+        len_discriminator: u32,
+        cap_discriminator: u32,
+
+        /// Owned cursor source. Tracking stores a cloned source list
+        /// because no refcount exists to keep escaped cursor states valid
+        /// after the original drops.
+        source_list: ?*const ListT,
+        next_idx: u32,
+
+        comptime {
+            const prefix = @sizeOf(ArcHeader) + @sizeOf(u32) + @sizeOf(u32);
+            const source_offset = std.mem.alignForward(usize, prefix, @alignOf(?*const ListT));
+            const expected = std.mem.alignForward(usize, source_offset + @sizeOf(?*const ListT) + @sizeOf(u32), @alignOf(Self));
+            std.debug.assert(@sizeOf(Self) == expected);
+        }
+
+        pub fn create(source: *const ListT, next_index: u32) ?*Self {
+            std.debug.assert(next_index <= source.len);
+            const cursor_source = retainSourceForCursor(source) orelse return null;
+            incrementRuntimeStatCounter(&list_iter_alloc_total);
+
+            const cell: *Self = ArcRuntime.allocInlineHeaderCell(Self);
+            cell.* = .{
+                .header = ArcHeader.init(),
+                .len_discriminator = ListT.iter_len_discriminator,
+                .cap_discriminator = ListT.iter_cap_discriminator,
+                .source_list = cursor_source,
+                .next_idx = next_index,
+            };
+            return cell;
+        }
+
+        inline fn fromListPtr(list_ptr: *const ListT) *Self {
+            std.debug.assert(list_ptr.len == ListT.iter_len_discriminator);
+            std.debug.assert(list_ptr.cap == ListT.iter_cap_discriminator);
+            return @ptrCast(@alignCast(@constCast(list_ptr)));
+        }
+
+        pub inline fn asListPtr(self: *Self) ?*const ListT {
+            return @ptrCast(self);
+        }
+
+        pub fn viewFromListPtr(list_ptr: *const ListT) ListT.View {
+            const self = fromListPtr(list_ptr);
+            return ListT.View.fromCursorSource(self.source_list, self.next_idx);
+        }
+
+        pub fn retainFromListPtr(list_ptr: *const ListT) ?*const ListT {
+            const self = fromListPtr(list_ptr);
+            if (comptime reclamation_model == .individual_no_refcount) {
+                return cloneForShareFromListPtr(list_ptr);
+            }
+            ArcRuntime.headerRetain(&self.header);
+            return list_ptr;
+        }
+
+        pub fn cloneForShareFromListPtr(list_ptr: *const ListT) ?*const ListT {
+            const self = fromListPtr(list_ptr);
+            const source = self.source_list orelse return null;
+            const clone = create(source, self.next_idx) orelse return null;
+            return clone.asListPtr();
+        }
+
+        pub fn advanceFromListPtr(list_ptr: *const ListT) std.meta.Tuple(&.{ u32, T, ?*const ListT }) {
+            const self = fromListPtr(list_ptr);
+            const source = self.source_list orelse {
+                ListT.release(list_ptr);
+                return .{ ATOM_DONE, defaultElement(), null };
+            };
+            if (self.next_idx >= source.len) {
+                ListT.release(list_ptr);
+                return .{ ATOM_DONE, defaultElement(), null };
+            }
+
+            const value = ListT.ownElement(source.slotAtConst(self.next_idx).*);
+            const next_index = self.next_idx + 1;
+            incrementRuntimeStatCounter(&list_iter_advance_total);
+            if (self.mayAdvanceInPlace()) {
+                self.next_idx = next_index;
+                if (next_index >= source.len) {
+                    ListT.release(list_ptr);
+                    return .{ ATOM_CONT, value, null };
+                }
+                return .{ ATOM_CONT, value, list_ptr };
+            }
+            if (next_index >= source.len) {
+                ListT.release(list_ptr);
+                return .{ ATOM_CONT, value, null };
+            }
+            const next_iter = create(source, next_index) orelse {
+                ListT.releaseElement(value, std.heap.c_allocator);
+                ListT.release(list_ptr);
+                return .{ ATOM_DONE, defaultElement(), null };
+            };
+            ListT.release(list_ptr);
+            return .{ ATOM_CONT, value, next_iter.asListPtr() };
+        }
+
+        pub fn releaseFromListPtr(list_ptr: *const ListT) void {
+            const self = fromListPtr(list_ptr);
+            if (comptime reclamation_model == .individual_no_refcount) {
+                releaseOwnedSourceAndFree(self);
+                return;
+            }
+            ArcRuntime.headerRelease(&self.header, iterDeepWalk);
+        }
+
+        fn retainSourceForCursor(source: *const ListT) ?*const ListT {
+            if (comptime reclamation_model == .individual_no_refcount) {
+                return ListT.cloneForShare(source);
+            }
+            const mut_source: *ListT = @constCast(source);
+            ArcRuntime.headerRetain(&mut_source.header);
+            return source;
+        }
+
+        fn releaseOwnedSourceAndFree(self: *Self) void {
+            const source = self.source_list;
+            self.source_list = null;
+            self.next_idx = 0;
+            incrementRuntimeStatCounter(&list_iter_free_total);
+            ArcRuntime.freeInlineHeaderCell(Self, self);
+            if (source) |src| {
+                ListT.release(src);
+            }
+        }
+
+        fn iterDeepWalk(ptr: *anyopaque) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            releaseOwnedSourceAndFree(self);
+        }
+
+        inline fn mayAdvanceInPlace(self: *const Self) bool {
+            return switch (comptime reclamation_model) {
+                .refcounted => self.header.count() == 1,
+                .individual_no_refcount => true,
+                .bulk_or_never, .traced => false,
+            };
+        }
+
+        inline fn defaultElement() T {
+            return defaultElementOf(T);
+        }
+    };
+}
+
+comptime {
+    const L = List(i64);
+    const I = ListIter(i64);
+    std.debug.assert(@offsetOf(L, "header") == @offsetOf(I, "header"));
+    std.debug.assert(@offsetOf(L, "len") == @offsetOf(I, "len_discriminator"));
+    std.debug.assert(@offsetOf(L, "cap") == @offsetOf(I, "cap_discriminator"));
 }
 
 // ============================================================
@@ -14073,6 +14486,11 @@ pub fn mapIsEmpty(map: anytype) bool {
     return M.isEmpty(map);
 }
 
+pub fn mapRelease(map: anytype) void {
+    const M = MapTypeOf(@TypeOf(map));
+    M.release(map);
+}
+
 pub fn mapNext(map: anytype) std.meta.Tuple(&.{
     u32,
     std.meta.Tuple(&.{ MapKeyOf(@TypeOf(map)), MapValueOf(@TypeOf(map)) }),
@@ -14210,6 +14628,11 @@ pub fn listContains(list: anytype, value: anytype) bool {
 pub fn listTake(list: anytype, count: i64) @TypeOf(list) {
     const L = ListTypeOf(@TypeOf(list));
     return L.take(list, count);
+}
+
+pub fn listRelease(list: anytype) void {
+    const L = ListTypeOf(@TypeOf(list));
+    L.release(list);
 }
 
 pub fn listNext(list: anytype) std.meta.Tuple(&.{ u32, ListElementOf(@TypeOf(list)), @TypeOf(list) }) {
@@ -14990,32 +15413,108 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return &self.entriesPtr()[idx];
         }
 
+        inline fn isIterCell(self: *const Self) bool {
+            return self.capacity == 0;
+        }
+
+        const View = struct {
+            source: ?*const Self,
+            start: u32,
+            len: u32,
+            capacity: u32,
+            hash_seed: u64,
+
+            inline fn empty() View {
+                return .{
+                    .source = null,
+                    .start = 0,
+                    .len = 0,
+                    .capacity = 0,
+                    .hash_seed = 0,
+                };
+            }
+
+            inline fn fromRealMap(source: *const Self) View {
+                std.debug.assert(!source.isIterCell());
+                return .{
+                    .source = source,
+                    .start = 0,
+                    .len = source.len,
+                    .capacity = source.capacity,
+                    .hash_seed = source.hash_seed,
+                };
+            }
+
+            inline fn fromCursorSource(source: ?*const Self, next_index: u32) View {
+                const real_source = source orelse return View.empty();
+                std.debug.assert(!real_source.isIterCell());
+                const start = @min(next_index, real_source.len);
+                const remaining = real_source.len - start;
+                return .{
+                    .source = real_source,
+                    .start = start,
+                    .len = remaining,
+                    // A cursor state is a logical suffix, not a bucket owner.
+                    // When materialized, reserve for the suffix itself rather
+                    // than exposing the source map's whole table capacity.
+                    .capacity = if (remaining == 0) 0 else pickCapacity(0, remaining),
+                    .hash_seed = real_source.hash_seed,
+                };
+            }
+
+            inline fn fromMapPtr(map_ptr: *const Self) View {
+                if (map_ptr.isIterCell()) return MapIter(K, V).viewFromMapPtr(map_ptr);
+                return fromRealMap(map_ptr);
+            }
+
+            inline fn fromOptional(map_ptr: ?*const Self) View {
+                const source = map_ptr orelse return View.empty();
+                return fromMapPtr(source);
+            }
+
+            inline fn entryAtConst(self: View, index: u32) *const MapEntry {
+                std.debug.assert(index < self.len);
+                const source_map = self.source orelse unreachable;
+                return source_map.entryAtConst(self.start + index);
+            }
+
+            fn findEntryConst(self: View, key: K) ?*const MapEntry {
+                const source_map = self.source orelse return null;
+                if (self.len == 0) return null;
+                if (self.start == 0 and self.len == source_map.len) {
+                    const index = findEntry(source_map, key) orelse return null;
+                    return source_map.entryAtConst(index);
+                }
+                var index: u32 = 0;
+                while (index < self.len) : (index += 1) {
+                    const entry = self.entryAtConst(index);
+                    if (keysEqual(entry.key, key)) return entry;
+                }
+                return null;
+            }
+
+            inline fn materializationSeed(self: View) u64 {
+                if (self.source != null) return self.hash_seed;
+                return Wyhash.nextSeed();
+            }
+        };
+
         // -------------------------------------------------------------------
         // Public introspection
         // -------------------------------------------------------------------
 
         pub fn size(map: ?*const Self) i64 {
             if (map) |m| {
-                // Iter-cell guard. A `MapIter` cell aliases `Map.Self`'s
-                // first 24 bytes but its `capacity` field is always 0;
-                // a real Map has `capacity >= DENSE_MAP_INITIAL_CAPACITY`
-                // (8). Reading `m.len` on an iter cell would expose the
-                // iter's zero-initialised `len_unused` field, which is
-                // not the source map's length and would silently mislead
-                // callers. `Map.size` is never meant to receive iter
-                // cells — they are valid only as `Map.next` state.
-                if (m.capacity == 0) @panic("Map.size: received MapIter cell; iter cells are only valid as Map.next state");
-                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
-                return @intCast(m.len);
+                if (comptime instrument_map) {
+                    if (!m.isIterCell()) mapInstrumentationOnGet(@intFromPtr(m));
+                }
+                return @intCast(View.fromMapPtr(m).len);
             }
             return 0;
         }
 
         pub fn isEmpty(map: ?*const Self) bool {
-            if (map) |m| {
-                if (m.capacity == 0) @panic("Map.isEmpty: received MapIter cell; iter cells are only valid as Map.next state");
-            }
-            return map == null;
+            return View.fromOptional(map).len == 0;
         }
 
         pub fn empty() ?*const Self {
@@ -15080,16 +15579,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn retain(map: ?*const Self) ?*const Self {
             if (map) |m| {
-                // Iter-cell guard. `Map.retain` is the public ARC entry
-                // point for real Map cells; iter cells manage their own
-                // refcount via the slab pool's inline header and are
-                // never meant to be retained through this path. Iter
-                // cells are produced by `Map.next` and consumed by
-                // either the next `Map.next` step or `Map.release` (via
-                // the iter-cell dispatch). A retain on an iter cell
-                // would silently bump the iter's rc without any
-                // matching release path here — a leak. Panic instead.
-                if (m.capacity == 0) @panic("Map.retain: received MapIter cell; iter cells are only valid as Map.next state");
+                if (m.capacity == 0) {
+                    return MapIter(K, V).retainFromMapPtr(m);
+                }
                 const mut: *Self = @constCast(m);
                 ArcRuntime.headerRetain(&mut.header);
                 if (comptime instrument_map) {
@@ -15109,7 +15601,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // are binary-compatible with `Map.Self`'s header but its
             // `capacity` field is always 0. Dispatch to the iter
             // release path so we free the iter cell via its own pool
-            // and drop the retained source-map reference.
+            // and drop its owned source reference.
             if (m.capacity == 0) {
                 incrementRuntimeStatCounter(&map_release_iter_dispatch_total);
                 MapIter(K, V).releaseFromMapPtr(m);
@@ -15185,6 +15677,14 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (comptime eager_individual_free) release(operand);
         }
 
+        inline fn releaseConsumedCursorOperand(operand: ?*const Self) void {
+            if (comptime eager_individual_free) {
+                if (operand) |map_ptr| {
+                    if (map_ptr.isIterCell()) release(operand);
+                }
+            }
+        }
+
         /// Deep-walk callback invoked by the manager's `release` on
         /// the final zero-transition. Performs the cell's full
         /// teardown: instrumentation notification (when compiled in),
@@ -15223,10 +15723,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// `clone_on_share_active`.
         pub fn cloneForShare(map: ?*const Self) ?*const Self {
             const m = map orelse return null;
-            // A `MapIter` cell (`capacity == 0`) is never a persistent owner of
-            // a user-visible Map value, so the share path never reaches one;
-            // assert the invariant rather than silently mis-cloning.
-            std.debug.assert(m.capacity != 0);
+            if (m.capacity == 0) return MapIter(K, V).cloneForShareFromMapPtr(m);
             const fresh = bufferAlloc(m.capacity, m.hash_seed, @returnAddress()) orelse return null;
             incrementRuntimeStatCounter(&dense_map_retaining_clone_total);
             addRuntimeStatCounter(&dense_map_retaining_clone_bytes, bufferSize(m.capacity, m.capacity));
@@ -15343,6 +15840,37 @@ pub fn Map(comptime K: type, comptime V: type) type {
             return fresh;
         }
 
+        fn materializeViewOwningEntries(view: View, new_capacity: u32, creation_callsite: u64) ?*Self {
+            if (new_capacity == 0) {
+                std.debug.assert(view.len == 0);
+                return null;
+            }
+            std.debug.assert(std.math.isPowerOfTwo(new_capacity));
+            std.debug.assert(new_capacity >= view.len);
+            const fresh = bufferAlloc(new_capacity, view.materializationSeed(), creation_callsite) orelse return null;
+            incrementRuntimeStatCounter(&dense_map_retaining_clone_total);
+            addRuntimeStatCounter(&dense_map_retaining_clone_bytes, bufferSize(new_capacity, new_capacity));
+
+            const new_entries = fresh.entriesPtr();
+            var index: u32 = 0;
+            while (index < view.len) : (index += 1) {
+                const source_entry = view.entryAtConst(index).*;
+                new_entries[index] = .{
+                    .hash = source_entry.hash,
+                    .key = ownEntryKey(source_entry.key),
+                    .value = ownEntryValue(source_entry.value),
+                };
+            }
+            fresh.len = view.len;
+            fresh.rebucketAll();
+            return fresh;
+        }
+
+        fn materializeViewForTargetLen(view: View, target_len: u32, creation_callsite: u64) ?*Self {
+            if (target_len == 0) return null;
+            return materializeViewOwningEntries(view, pickCapacity(0, target_len), creation_callsite);
+        }
+
         fn cloneBufferMovingChildren(self: *const Self, new_capacity: u32, creation_callsite: u64) ?*Self {
             std.debug.assert(std.math.isPowerOfTwo(new_capacity));
             std.debug.assert(new_capacity >= self.len);
@@ -15427,18 +15955,21 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn hasKey(map: ?*const Self, key: K) bool {
             if (map) |m| {
-                if (m.capacity == 0) @panic("Map.hasKey: received MapIter cell; iter cells are only valid as Map.next state");
-                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
+                if (comptime instrument_map) {
+                    if (!m.isIterCell()) mapInstrumentationOnGet(@intFromPtr(m));
+                }
             }
-            return findEntry(map, key) != null;
+            return View.fromOptional(map).findEntryConst(key) != null;
         }
 
         pub fn get(map: ?*const Self, key: K, default: V) V {
             if (map) |m| {
-                if (m.capacity == 0) @panic("Map.get: received MapIter cell; iter cells are only valid as Map.next state");
-                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
+                if (comptime instrument_map) {
+                    if (!m.isIterCell()) mapInstrumentationOnGet(@intFromPtr(m));
+                }
             }
-            const self = map orelse {
+            const view = View.fromOptional(map);
+            if (view.source == null) {
                 // Null map: the result IS the caller-supplied `default`. Give
                 // the new owner an independent copy (clone-on-share under
                 // no-REFCOUNT_V1) exactly as the absent-key and found paths do
@@ -15451,8 +15982,8 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 // Under REFCOUNTED `ownEntryValue` folds to the refcount bump,
                 // so this is byte-identical to the prior behaviour there.
                 return ownEntryValue(default);
-            };
-            const idx = findEntry(self, key) orelse {
+            }
+            const entry = view.findEntryConst(key) orelse {
                 // Key absent: the result IS the caller-supplied `default`. Give
                 // the new owner an independent copy (clone-on-share under
                 // no-REFCOUNT_V1) exactly as the found path does — the caller's
@@ -15469,8 +16000,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // double-free under `Memory.Tracking`. A scalar/`String`/struct value
             // has no eagerly-freed child, so `ownEntryValue` is the existing
             // refcount-bump there (no behaviour change).
-            const value = self.entryAtConst(idx).value;
-            return ownEntryValue(value);
+            return ownEntryValue(entry.value);
         }
 
         /// Vestigial helper kept for HAMT-era callers that hardcoded a
@@ -15479,8 +16009,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
         pub fn getStr(map: ?*const Self, key: K, default: []const u8) []const u8 {
             _ = key;
             if (map) |m| {
-                if (m.capacity == 0) @panic("Map.getStr: received MapIter cell; iter cells are only valid as Map.next state");
-                if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(m));
+                if (comptime instrument_map) {
+                    if (!m.isIterCell()) mapInstrumentationOnGet(@intFromPtr(m));
+                }
             }
             return default;
         }
@@ -15490,12 +16021,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
         // -------------------------------------------------------------------
 
         pub fn put(map: ?*const Self, key: K, value: V) ?*const Self {
-            if (map) |m| {
-                if (m.capacity == 0) @panic("Map.put: received MapIter cell; iter cells are only valid as Map.next state");
-            }
             const callsite = @returnAddress();
             if (comptime instrument_map) {
                 if (map) |m| {
+                    if (m.isIterCell()) return putInner(map, key, value, callsite);
                     const ctx = mapInstrumentationBumpMutation(@intFromPtr(m), .put);
                     mapInstrumentationSetParent(ctx.lineage_id, ctx.instance_id);
                     defer mapInstrumentationClearParent();
@@ -15520,6 +16049,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 return fresh;
             }
             const self = map.?;
+            if (self.isIterCell()) {
+                const view = View.fromMapPtr(self);
+                const materialized = materializeViewForTargetLen(view, view.len + 1, callsite) orelse return null;
+                releaseConsumedCursorOperand(map);
+                return putInPlace(materialized, key, value, callsite);
+            }
 
             // Phase 4 (dense Map): refcount-aware fast path.
             //
@@ -15674,17 +16209,31 @@ pub fn Map(comptime K: type, comptime V: type) type {
             _ = putOwnedInPlaceInsert(target, owned_key, owned_value);
         }
 
+        fn foldBorrowedViewEntries(target: *Self, view: View) void {
+            var index: u32 = 0;
+            while (index < view.len) : (index += 1) {
+                const entry = view.entryAtConst(index);
+                foldBorrowedEntry(target, entry.key, entry.value);
+            }
+        }
+
+        fn combinedTargetLen(left_len: u32, right_len: u32) u32 {
+            const combined_len: u64 = @as(u64, left_len) + @as(u64, right_len);
+            return if (combined_len > std.math.maxInt(u32))
+                std.math.maxInt(u32)
+            else
+                @intCast(combined_len);
+        }
+
         // -------------------------------------------------------------------
         // Delete (swap-remove + Robin Hood backshift)
         // -------------------------------------------------------------------
 
         pub fn delete(map: ?*const Self, key: K) ?*const Self {
-            if (map) |m| {
-                if (m.capacity == 0) @panic("Map.delete: received MapIter cell; iter cells are only valid as Map.next state");
-            }
             const callsite = @returnAddress();
             if (comptime instrument_map) {
                 if (map) |m| {
+                    if (m.isIterCell()) return deleteInner(map, key, callsite);
                     const ctx = mapInstrumentationBumpMutation(@intFromPtr(m), .delete);
                     mapInstrumentationSetParent(ctx.lineage_id, ctx.instance_id);
                     defer mapInstrumentationClearParent();
@@ -15706,6 +16255,15 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         fn deleteInner(map: ?*const Self, key: K, callsite: u64) ?*const Self {
             const self = map orelse return null;
+            if (self.isIterCell()) {
+                const view = View.fromMapPtr(self);
+                const materialized = materializeViewForTargetLen(view, view.len, callsite) orelse return null;
+                releaseConsumedCursorOperand(map);
+                if (findEntry(materialized, key)) |found_entry_idx| {
+                    deleteFoundInPlace(materialized, found_entry_idx);
+                }
+                return materialized;
+            }
 
             // Phase 4 (dense Map): refcount-aware fast path. On unique
             // ownership we mutate the live buffer in place (with
@@ -15780,15 +16338,13 @@ pub fn Map(comptime K: type, comptime V: type) type {
         // -------------------------------------------------------------------
 
         pub fn merge(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
-            if (map_a) |m| {
-                if (m.capacity == 0) @panic("Map.merge: received MapIter cell; iter cells are only valid as Map.next state: map_a");
-            }
-            if (map_b) |m| {
-                if (m.capacity == 0) @panic("Map.merge: received MapIter cell; iter cells are only valid as Map.next state: map_b");
-            }
             if (comptime instrument_map) {
-                if (map_a) |m| _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
-                if (map_b) |m| _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
+                if (map_a) |m| {
+                    if (!m.isIterCell()) _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
+                }
+                if (map_b) |m| {
+                    if (!m.isIterCell()) _ = mapInstrumentationBumpMutation(@intFromPtr(m), .merge);
+                }
             }
 
             // `Map.merge` CONSUMES BOTH operands: the codegen transfers
@@ -15822,28 +16378,37 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // REFCOUNTED both operands are BORROWED (the caller releases them),
             // so we always own-clone — never alias an operand the caller frees.
             if (map_b == null) {
+                if (map_a.?.isIterCell()) {
+                    const view = View.fromMapPtr(map_a.?);
+                    const result = materializeViewForTargetLen(view, view.len, @returnAddress());
+                    releaseConsumedCursorOperand(map_a);
+                    return result;
+                }
                 if (comptime eager_individual_free) return map_a;
                 return cloneBufferOwningChildren(map_a.?, map_a.?.capacity, @returnAddress());
             }
             if (map_a == null) {
-                const only = cloneBufferOwningChildren(map_b.?, map_b.?.capacity, @returnAddress()) orelse return null;
+                const only = if (map_b.?.isIterCell()) blk: {
+                    const view = View.fromMapPtr(map_b.?);
+                    break :blk materializeViewForTargetLen(view, view.len, @returnAddress());
+                } else blk: {
+                    break :blk cloneBufferOwningChildren(map_b.?, map_b.?.capacity, @returnAddress()) orelse return null;
+                };
                 releaseConsumedMergeOperand(map_b);
                 return only;
             }
 
             const a = map_a.?;
             const b = map_b.?;
+            const a_view = View.fromMapPtr(a);
+            const b_view = View.fromMapPtr(b);
 
             // Size the accumulator for the worst case (no key overlap) up front
             // so the `b` fold never resizes and the result pointer stays stable.
             // Widen the sum so a pathological `a.len + b.len` cannot overflow u32
             // before `pickCapacity` clamps it.
-            const combined_len: u64 = @as(u64, a.len) + @as(u64, b.len);
-            const target_len: u32 = if (combined_len > std.math.maxInt(u32))
-                std.math.maxInt(u32)
-            else
-                @intCast(combined_len);
-            const target_cap = pickCapacity(a.capacity, target_len);
+            const target_len = combinedTargetLen(a_view.len, b_view.len);
+            const target_cap = pickCapacity(if (a.isIterCell()) 0 else a.capacity, target_len);
 
             // Establish the owned accumulator from `map_a`. The two reclamation
             // models hand `map_a` to `merge` differently:
@@ -15860,6 +16425,11 @@ pub fn Map(comptime K: type, comptime V: type) type {
             //     bump per entry under REFCOUNTED; the caller's release balances
             //     `map_a`'s own reference).
             const result = blk: {
+                if (a.isIterCell()) {
+                    const materialized = materializeViewOwningEntries(a_view, target_cap, @returnAddress()) orelse return null;
+                    releaseConsumedCursorOperand(map_a);
+                    break :blk materialized;
+                }
                 if (comptime eager_individual_free) {
                     if (target_cap == a.capacity) break :blk @constCast(a);
                     const grown = cloneBufferMovingChildren(a, target_cap, @returnAddress()) orelse return null;
@@ -15877,13 +16447,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // folded copies are independent). Under REFCOUNTED `map_b` is
             // borrowed and the caller releases it — `releaseConsumedMergeOperand`
             // is a comptime no-op there.
-            const b_len = b.len;
-            const b_entries = b.entriesPtr();
-            var i: u32 = 0;
-            while (i < b_len) : (i += 1) {
-                const entry = b_entries[i];
-                foldBorrowedEntry(result, entry.key, entry.value);
-            }
+            foldBorrowedViewEntries(result, b_view);
             releaseConsumedMergeOperand(map_b);
             return result;
         }
@@ -15917,9 +16481,6 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// Like `put`, but skips the rc==1 check. Caller must have
         /// proven uniqueness via uniqueness. See safety contract above.
         pub fn put_owned_unchecked(map: ?*const Self, key: K, value: V) ?*const Self {
-            if (map) |m| {
-                if (m.capacity == 0) @panic("Map.put_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state");
-            }
             const callsite = @returnAddress();
             incrementRuntimeStatCounter(&dense_map_mut_calls_total);
             incrementRuntimeStatCounter(&dense_map_unchecked_total);
@@ -15936,6 +16497,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 return fresh;
             }
             const self = map.?;
+            if (self.isIterCell()) {
+                const view = View.fromMapPtr(self);
+                const materialized = materializeViewForTargetLen(view, view.len + 1, callsite) orelse return null;
+                release(map);
+                return putInPlace(materialized, key, value, callsite);
+            }
             const mut: *Self = @constCast(self);
             return putInPlace(mut, key, value, callsite);
         }
@@ -15943,12 +16510,19 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// Like `delete`, but skips the rc==1 check. Caller must
         /// have proven uniqueness via uniqueness. See safety contract above.
         pub fn delete_owned_unchecked(map: ?*const Self, key: K) ?*const Self {
-            if (map) |m| {
-                if (m.capacity == 0) @panic("Map.delete_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state");
-            }
             incrementRuntimeStatCounter(&dense_map_mut_calls_total);
             incrementRuntimeStatCounter(&dense_map_unchecked_total);
             const self = map orelse return null;
+            if (self.isIterCell()) {
+                const view = View.fromMapPtr(self);
+                const materialized = materializeViewForTargetLen(view, view.len, @returnAddress());
+                release(map);
+                const result = materialized orelse return null;
+                if (findEntry(result, key)) |found_entry_idx| {
+                    deleteFoundInPlace(result, found_entry_idx);
+                }
+                return result;
+            }
             const mut: *Self = @constCast(self);
             if (findEntry(mut, key)) |found_entry_idx| {
                 deleteFoundInPlace(mut, found_entry_idx);
@@ -15972,26 +16546,37 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// Under REFCOUNTED the clone folds to a refcount bump and
         /// `release(map_b)` to the matching decrement.
         pub fn merge_owned_unchecked(map_a: ?*const Self, map_b: ?*const Self) ?*const Self {
-            if (map_a) |m| {
-                if (m.capacity == 0) @panic("Map.merge_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state: map_a");
-            }
-            if (map_b) |m| {
-                if (m.capacity == 0) @panic("Map.merge_owned_unchecked: received MapIter cell; iter cells are only valid as Map.next state: map_b");
-            }
             if (map_a == null and map_b == null) return null;
-            if (map_b == null) return map_a;
+            if (map_b == null) {
+                if (map_a) |a_only| {
+                    if (a_only.isIterCell()) {
+                        const view = View.fromMapPtr(a_only);
+                        const result = materializeViewForTargetLen(view, view.len, @returnAddress());
+                        release(map_a);
+                        return result;
+                    }
+                }
+                return map_a;
+            }
             if (map_a == null) {
                 // No A to mutate; own an independent clone-on-share copy of the
                 // consumed B (rc=1), then reclaim the consumed `map_b` (no-refcount
                 // model only — see `releaseConsumedMergeOperand`).
                 const callsite = @returnAddress();
-                const only = cloneBufferOwningChildren(map_b.?, map_b.?.capacity, callsite) orelse return null;
+                const only = if (map_b.?.isIterCell()) blk: {
+                    const view = View.fromMapPtr(map_b.?);
+                    break :blk materializeViewForTargetLen(view, view.len, callsite);
+                } else blk: {
+                    break :blk cloneBufferOwningChildren(map_b.?, map_b.?.capacity, callsite) orelse return null;
+                };
                 releaseConsumedMergeOperand(map_b);
                 return only;
             }
 
             const a = map_a.?;
             const b = map_b.?;
+            const a_view = View.fromMapPtr(a);
+            const b_view = View.fromMapPtr(b);
 
             // Pre-size the OWNED A to the worst case (no key overlap) with a
             // single in-place resize, so the `b` fold below never has to resize
@@ -16000,33 +16585,29 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // remain uniquely owned, the unchecked contract's `+1` transferring
             // from the old buffer to the new), then the old buffer is freed
             // SHALLOWLY (children moved, not released).
-            const combined_len: u64 = @as(u64, a.len) + @as(u64, b.len);
-            const target_len: u32 = if (combined_len > std.math.maxInt(u32))
-                std.math.maxInt(u32)
-            else
-                @intCast(combined_len);
-            const target_cap = pickCapacity(a.capacity, target_len);
+            const target_len = combinedTargetLen(a_view.len, b_view.len);
+            const target_cap = pickCapacity(if (a.isIterCell()) 0 else a.capacity, target_len);
 
-            var result: *Self = @constCast(a);
-            if (target_cap != a.capacity) {
-                const grown = cloneBufferMovingChildren(a, target_cap, @returnAddress()) orelse return null;
-                if (comptime instrument_map) {
-                    mapInstrumentationOnRelease(@intFromPtr(a), a.len);
+            var result: *Self = undefined;
+            if (a.isIterCell()) {
+                result = materializeViewOwningEntries(a_view, target_cap, @returnAddress()) orelse return null;
+                release(map_a);
+            } else {
+                result = @constCast(a);
+                if (target_cap != a.capacity) {
+                    const grown = cloneBufferMovingChildren(a, target_cap, @returnAddress()) orelse return null;
+                    if (comptime instrument_map) {
+                        mapInstrumentationOnRelease(@intFromPtr(a), a.len);
+                    }
+                    @constCast(a).bufferFreeShallow();
+                    result = grown;
                 }
-                @constCast(a).bufferFreeShallow();
-                result = grown;
             }
 
             // Fold each entry of the CONSUMED `map_b` (clone-on-share into the
             // result), then reclaim `map_b` (no-refcount model only — see
             // `releaseConsumedMergeOperand`) so its own inners are freed once.
-            const b_len = b.len;
-            const b_entries = b.entriesPtr();
-            var i: u32 = 0;
-            while (i < b_len) : (i += 1) {
-                const entry = b_entries[i];
-                foldBorrowedEntry(result, entry.key, entry.value);
-            }
+            foldBorrowedViewEntries(result, b_view);
             releaseConsumedMergeOperand(map_b);
             return result;
         }
@@ -16247,45 +16828,49 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
         pub fn keys(map: ?*const Self) ?*const List(K) {
             const self = map orelse return null;
-            if (self.capacity == 0) @panic("Map.keys: received MapIter cell; iter cells are only valid as Map.next state");
-            if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(self));
-            const len = self.len;
+            if (comptime instrument_map) {
+                if (!self.isIterCell()) mapInstrumentationOnGet(@intFromPtr(self));
+            }
+            const view = View.fromMapPtr(self);
+            const len = view.len;
             if (len == 0) return null;
-            const entries = self.entriesPtr();
             var result: ?*const List(K) = null;
             var i: usize = 0;
             while (i < len) : (i += 1) {
+                const entry = view.entryAtConst(@intCast(i));
                 // The pushed key is a NEW owner (the result List) distinct from
                 // the map's own; OWN it (clone-on-share under Tracking, refcount
                 // bump under REFCOUNTED) so the two never double-free a shared
                 // eagerly-freed inner — `List.push` consumes its argument and
                 // does not clone, so a bare retain would alias (runtime-3--01).
-                result = List(K).push(result, ownEntryKey(entries[i].key));
+                result = List(K).push(result, ownEntryKey(entry.key));
             }
             return result;
         }
 
         pub fn values(map: ?*const Self) ?*const List(V) {
             const self = map orelse return null;
-            if (self.capacity == 0) @panic("Map.values: received MapIter cell; iter cells are only valid as Map.next state");
-            if (comptime instrument_map) mapInstrumentationOnGet(@intFromPtr(self));
-            const len = self.len;
+            if (comptime instrument_map) {
+                if (!self.isIterCell()) mapInstrumentationOnGet(@intFromPtr(self));
+            }
+            const view = View.fromMapPtr(self);
+            const len = view.len;
             if (len == 0) return null;
-            const entries = self.entriesPtr();
             var result: ?*const List(V) = null;
             var i: usize = 0;
             while (i < len) : (i += 1) {
+                const entry = view.entryAtConst(@intCast(i));
                 // The pushed value is a NEW owner (the result List); OWN it so a
                 // boxed-`Callable` value is an INDEPENDENT inner in the List and
                 // the map-drop + List-drop never double-free it (runtime-3--01).
-                result = List(V).push(result, ownEntryValue(entries[i].value));
+                result = List(V).push(result, ownEntryValue(entry.value));
             }
             return result;
         }
 
-        /// Iteration protocol. Receives the receiver as a BORROWED
-        /// reference — `Map.next` is NOT on the consume list, so
-        /// the input's refcount is unaffected by this call.
+        /// Iteration protocol. Consumes the receiver as the current map
+        /// iteration state; the compiler's builtin ownership metadata moves or
+        /// clone-for-shares the state before calling this primitive.
         ///
         /// Three cases:
         ///
@@ -16293,30 +16878,26 @@ pub fn Map(comptime K: type, comptime V: type) type {
         ///       Source is empty. Return DONE with null state.
         ///
         ///   * map is a real Map (capacity != 0):
-        ///       First step. Allocate a fresh `MapIter` cell that
-        ///       retains the source. Return CONT with the iter as
-        ///       next state. The caller's existing reference to
-        ///       `map` is left untouched; the iter holds its own
-        ///       +1 on `map`.
+        ///       First step. Own the first entry. For singleton maps,
+        ///       release the consumed map state and return CONT with
+        ///       null next state. Otherwise allocate a fresh `MapIter`
+        ///       cell that owns a cursor-stable source reference, release
+        ///       the consumed map state, and return CONT with the iter as
+        ///       next state.
         ///
         ///   * map is an iter cell (capacity == 0):
-        ///       Advance the cursor in place; the iter's rc is
-        ///       unchanged. Return CONT with the iter as next
-        ///       state, OR DONE when the cursor reaches the end —
-        ///       on DONE the iter releases itself before returning
-        ///       so iter cells produced by full iteration are
-        ///       leak-free (see `MapIter.advanceFromMapPtr`).
+        ///       Advance the cursor in place when uniqueness is proven,
+        ///       otherwise return an independent copy-on-write cursor for
+        ///       the next state. Return CONT with that next state, CONT
+        ///       with null after the final yielded entry, or DONE when an
+        ///       already-empty state is consumed.
         ///
-        /// Refcount discipline: iteration to completion is
-        /// leak-free — `advanceFromMapPtr` self-releases the iter
-        /// on the DONE step, which dispatches back through
-        /// `Map.release`'s iter-cell branch to free the slab cell
-        /// and drop the source-map retain. Partial-iteration
-        /// patterns (e.g. `Enum.first`, which only takes one step
-        /// and discards `state`) leak one iter cell + a +1 on the
-        /// source map per call. That leak is bounded by the number
-        /// of partial-iteration call sites and is negligible in
-        /// practice (~40 bytes per call).
+        /// Refcount discipline: `Map.next` consumes its state. The compiler's
+        /// builtin ownership metadata moves/COWs the receiver into this
+        /// primitive, so there is no post-call release of an aliased cursor.
+        /// Full iteration frees the cursor on the final yielded entry or DONE;
+        /// partial iteration frees when the abandoned CONT next-state is
+        /// released through `Map.release`'s iter-cell branch.
         pub fn next(map: ?*const Self) struct {
             u32,
             struct { K, V },
@@ -16335,13 +16916,15 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 return MapIter(K, V).advanceFromMapPtr(self);
             }
             if (self.len == 0) {
+                release(self);
                 return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             }
             // Real-map first step: allocate a fresh `MapIter` cell
-            // that retains `self`. Each subsequent step advances the
-            // cursor IN PLACE on the iter — O(1) work per step and
-            // one allocation across the whole walk (versus the
-            // always-clone O(N²) fallback from commit 89775b0).
+            // that owns a cursor-stable source reference. A linear
+            // walk advances that one cursor in place; explicitly
+            // shared iterator states use copy-on-write next-state
+            // cursors. Both paths avoid the always-clone O(N²)
+            // fallback from commit 89775b0.
             //
             // OWN the yielded K/V (clone-on-share under Tracking, refcount bump
             // under REFCOUNTED) — the loop body receives a NEW owner while the
@@ -16353,13 +16936,19 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const first = self.entryAtConst(0).*;
             const owned_key = ownEntryKey(first.key);
             const owned_value = ownEntryValue(first.value);
+            if (self.len == 1) {
+                release(self);
+                return .{ ATOM_CONT, .{ owned_key, owned_value }, null };
+            }
 
             const iter = MapIter(K, V).create(self) orelse {
                 releaseEntryKey(owned_key, std.heap.c_allocator);
                 releaseEntryValue(owned_value, std.heap.c_allocator);
+                release(self);
                 return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             };
             iter.next_idx = 1;
+            release(self);
             return .{ ATOM_CONT, .{ owned_key, owned_value }, iter.asMapPtr() };
         }
 
@@ -16395,11 +16984,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
         pub fn enumReduceSimple(map: ?*const Self, initial: i64, callback: anytype) i64 {
             if (map == null) return initial;
             const self = map.?;
-            if (self.capacity == 0) @panic("Map.enumReduceSimple: received MapIter cell; iter cells are only valid as Map.next state");
+            const view = View.fromMapPtr(self);
             var acc: i64 = initial;
-            const entries = self.entriesPtr();
-            for (0..self.len) |i| {
-                acc = callback(acc, @as(i64, @intCast(entries[i].key)), entries[i].value);
+            var index: u32 = 0;
+            while (index < view.len) : (index += 1) {
+                const entry = view.entryAtConst(index);
+                acc = callback(acc, @as(i64, @intCast(entry.key)), entry.value);
             }
             return acc;
         }
@@ -16407,11 +16997,12 @@ pub fn Map(comptime K: type, comptime V: type) type {
         pub fn enumReduceValues(map: ?*const Self, initial: i64, callback: anytype) i64 {
             if (map == null) return initial;
             const self = map.?;
-            if (self.capacity == 0) @panic("Map.enumReduceValues: received MapIter cell; iter cells are only valid as Map.next state");
+            const view = View.fromMapPtr(self);
             var acc: i64 = initial;
-            const entries = self.entriesPtr();
-            for (0..self.len) |i| {
-                acc = callback(acc, entries[i].value);
+            var index: u32 = 0;
+            while (index < view.len) : (index += 1) {
+                const entry = view.entryAtConst(index);
+                acc = callback(acc, entry.value);
             }
             return acc;
         }
@@ -16431,11 +17022,15 @@ pub fn Map(comptime K: type, comptime V: type) type {
 //     `Enum.reduce` walks it via the Enumerable protocol.
 //
 // Design:
-//   * `MapIter(K, V)` is its own ARC'd cell that retains a const
-//     pointer to the source map. Each iter step yields the entry
-//     at `next_idx` (with K/V deep-retained for the caller),
-//     advances `next_idx` IN PLACE on the iter, and returns the
-//     iter cell as the next state.
+//   * `MapIter(K, V)` is its own ARC'd cell that owns a
+//     cursor-stable source map reference: a refcount retain under
+//     REFCOUNTED, a source clone under Tracking, and the normal
+//     non-eager lifetime under bulk/traced managers. Each iter step
+//     yields the entry at `next_idx` (with K/V deep-retained for the
+//     caller), advances `next_idx` IN PLACE when the active memory
+//     model proves the iter is uniquely owned, and otherwise returns
+//     an independent cursor for the next state. Each yielded entry is
+//     deep-retained for the caller.
 //   * The iter cell shares its first 24 bytes with `Map(K, V)`
 //     (header + len + capacity + entry_cap + hash_seed) so the
 //     value can be returned typed as `?*const Map(K, V)` — the
@@ -16459,28 +17054,32 @@ pub fn Map(comptime K: type, comptime V: type) type {
 //     overhead is negligible vs. correctness + simplicity.
 //
 // Cursor-mutation soundness:
-//   * `Map.next` is called via the Enumerable protocol's recursive
-//     pattern. Each step's returned iter is immediately consumed
-//     by the next step — there is no aliasing of the iter cell
-//     across a single iteration. So mutating `next_idx` in place
-//     is sound regardless of the iter's refcount.
-//   * The cursor-advance decision does NOT consult the iter's rc.
-//     The bug in `Map.delete` (commit 89775b0) was that
-//     `header.count() == 1` was misread under elided borrow;
-//     MapIter sidesteps that entire failure mode by never reading
-//     its own refcount for behavior selection.
+//   * Linear protocol walks consume each returned iterator state
+//     immediately, so the common REFCOUNTED path observes rc == 1
+//     and advances a single cursor in place.
+//   * User code can still retain or bind iterator states explicitly.
+//     REFCOUNTED cursors therefore mutate in place only while the
+//     iter cell is uniquely owned; shared cursors allocate an
+//     independent next-state cursor and leave the original cell
+//     unchanged so aliases keep value semantics.
+//   * INDIVIDUAL_NO_REFCOUNT (`Memory.Tracking`) advances in place:
+//     persistent shares route through `cloneForShareFromMapPtr`, so
+//     every visible owner has its own cursor cell. BULK_OR_NEVER and
+//     TRACED have no refcount or clone-on-share uniqueness signal, so
+//     they always return an independent cursor for the next state.
 //
 // Refcount discipline:
-//   * `Map.next(real_map)` allocates an iter via `MapIter.create`,
-//     which retains `real_map` (+1). The iter starts at rc=1.
+//   * `Map.next(real_map)` releases the consumed real-map owner after
+//     yielding the first entry. Multi-entry maps allocate an iter via
+//     `MapIter.create`; the iter starts at rc=1 and owns the cursor
+//     source according to the active reclamation model.
 //   * `Map.next(iter)` advances `iter.next_idx` and returns the
-//     same iter pointer — the iter's rc is unchanged.
-//   * On the DONE step, `advanceFromMapPtr` self-releases the
-//     iter (which routes back through `Map.release` ->
-//     `releaseFromMapPtr` via the iter-cell discriminator). On
-//     rc=0 the cell returns to its slab pool and the source
-//     map's +1 is dropped — net rc change across the whole
-//     iteration is zero.
+//     same iter pointer when the cursor is unique. Shared cursors
+//     copy-on-write to preserve value semantics for aliased iterator
+//     state.
+//   * The final yielded entry returns `next_state = null` and frees the
+//     consumed cursor immediately. If an already-empty cursor reaches DONE,
+//     `advanceFromMapPtr` frees that consumed cursor before returning.
 // ============================================================
 
 pub fn MapIter(comptime K: type, comptime V: type) type {
@@ -16499,9 +17098,9 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
         /// ARC refcount. Initialised to 1 by `create`.
         header: ArcHeader,
         /// Unused (zeroed). Matches `Map.Self.len` for layout
-        /// compatibility — Zap callers must NEVER read `Map.size`
-        /// on the third tuple slot of `Map.next`; that field is
-        /// load-bearing only for real Map cells.
+        /// compatibility. Public Map APIs route iter cells through
+        /// `Map.View`; this prefix field remains load-bearing only for
+        /// discriminator-compatible layout.
         len_unused: u32,
         /// Iter discriminator — ALWAYS 0. Real Maps have
         /// `capacity >= DENSE_MAP_INITIAL_CAPACITY` (= 8). See the
@@ -16514,11 +17113,9 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
 
         // Iter-specific fields — beyond the 24-byte Map prefix.
 
-        /// Retained pointer to the source map. NULL only when the
-        /// source was empty (in which case `Map.next` returns DONE
-        /// directly without allocating an iter). The iter owns +1
-        /// on this pointer's refcount; on `release` zero-transition,
-        /// the source is released back.
+        /// Owned cursor source. REFCOUNTED stores the retained source map;
+        /// Tracking stores a cloned source map because no refcount exists
+        /// to keep escaped cursor states valid after the original drops.
         source_map: ?*const MapT,
         /// Next entry slot index to yield. In [0, source_map.len].
         /// `next_idx == source_map.len` ⇒ iteration done.
@@ -16538,12 +17135,12 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
             std.debug.assert(@sizeOf(Self) == expected);
         }
 
-        /// Allocate a fresh iter cell that retains `source`. Returns
-        /// the iter with rc=1, `next_idx = 0`, and `source.rc += 1`.
-        /// The iter owns the +1 on `source` for its entire lifetime;
-        /// on rc=0 the `releaseFromMapPtr` path drops that +1.
+        /// Allocate a fresh iter cell that owns a cursor-stable source
+        /// reference. REFCOUNTED managers retain `source`; Tracking clones
+        /// it because there is no refcount to keep an escaped cursor's
+        /// source alive after the caller drops the original map.
         ///
-        /// Routes the source-map retain through `ArcRuntime.headerRetain`
+        /// Routes the REFCOUNTED source-map retain through `ArcRuntime.headerRetain`
         /// rather than `MapT.retain` so the Map instrumentation hook is
         /// not triggered on iter creation (matches pre-Phase-2 behavior
         /// where the bare `header.retain()` skipped the hook).
@@ -16555,8 +17152,7 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
         /// — Tracking managers see iter cells through the same hook
         /// as every other allocation.
         pub fn create(source: *const MapT) ?*Self {
-            const mut_source: *MapT = @constCast(source);
-            ArcRuntime.headerRetain(&mut_source.header);
+            const cursor_source = retainSourceForCursor(source) orelse return null;
             incrementRuntimeStatCounter(&dense_map_iter_alloc_total);
 
             const cell: *Self = ArcRuntime.allocInlineHeaderCell(Self);
@@ -16566,7 +17162,7 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
                 .capacity = 0,
                 .entry_cap_unused = 0,
                 .hash_seed_unused = 0,
-                .source_map = source,
+                .source_map = cursor_source,
                 .next_idx = 0,
             };
             return cell;
@@ -16587,28 +17183,36 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
             return @ptrCast(self);
         }
 
+        pub fn viewFromMapPtr(map_ptr: *const MapT) MapT.View {
+            const self = fromMapPtr(map_ptr);
+            return MapT.View.fromCursorSource(self.source_map, self.next_idx);
+        }
+
+        pub fn retainFromMapPtr(map_ptr: *const MapT) ?*const MapT {
+            const self = fromMapPtr(map_ptr);
+            if (comptime reclamation_model == .individual_no_refcount) {
+                return cloneForShareFromMapPtr(map_ptr);
+            }
+            ArcRuntime.headerRetain(&self.header);
+            return map_ptr;
+        }
+
+        pub fn cloneForShareFromMapPtr(map_ptr: *const MapT) ?*const MapT {
+            const self = fromMapPtr(map_ptr);
+            const source = self.source_map orelse return null;
+            const clone = create(source) orelse return null;
+            clone.next_idx = self.next_idx;
+            return clone.asMapPtr();
+        }
+
         /// Advance the cursor and yield the next entry, or DONE.
         /// Receives a `?*const MapT` because that's the type
         /// `Map.next`/the Enumerable protocol carries; the
         /// discriminator check has already verified iter-ness.
         ///
-        /// Refcount discipline: the iter is BORROWED — `Map.next`
-        /// is not on the consume list, so the iter's rc is
-        /// unchanged by the borrowed-call ABI. On the CONT path
-        /// the iter is returned as `next_state` for the next
-        /// recursive helper call; on the DONE path the iter is
-        /// RELEASED explicitly here so its slab cell + source-map
-        /// reference are freed even when the caller's drop pass
-        /// can't see state's last-use (because the
-        /// `elideBorrowedPassThroughShares` rewrites at the call
-        /// site swallow the post-call release).
-        ///
-        /// Safety: every Zap iteration pattern (the for-comp
-        /// `__for_N` helper, the `Enum.reduce_next` /
-        /// `Enum.map_next` shape) discards `state` after the
-        /// `{:done, _, _}` arm. The caller does not read `state`
-        /// after Map.next returns DONE, so releasing the iter
-        /// here cannot cause a use-after-free.
+        /// Refcount discipline: the iter is CONSUMED by `Map.next`. On CONT,
+        /// ownership is returned as `next_state` unless this was the final
+        /// entry. On DONE and final-entry CONT, the cursor is freed here.
         pub fn advanceFromMapPtr(map_ptr: *const MapT) struct {
             u32,
             struct { K, V },
@@ -16616,53 +17220,11 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
         } {
             const self = fromMapPtr(map_ptr);
             const source = self.source_map orelse {
+                MapT.release(map_ptr);
                 return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             };
             if (self.next_idx >= source.len) {
-                // Iteration complete — free the iter cell.
-                //
-                // Under REFCOUNTED this routes through `Map.release` ->
-                // `releaseFromMapPtr` -> `headerRelease`; on the rc=0
-                // transition `iterDeepWalk` returns the cell to its pool
-                // and drops the source map's refcount by 1 (balancing the
-                // `headerRetain` `create` did). Byte-identical to the
-                // historical path.
-                //
-                // Under INDIVIDUAL_NO_REFCOUNT (`Memory.Tracking`) there is
-                // no refcount: `create`'s `headerRetain(&source.header)`
-                // was a comptime no-op (the source map was NOT +1'd), and
-                // `headerRelease` is a comptime no-op too — so the
-                // historical `MapT.release(map_ptr)` would NEVER reclaim the
-                // iter cell, leaking the 40-byte `MapIter` for every
-                // completed Map walk (`for`-comprehension / `Enum.reduce`
-                // over a Map). The iter is private, uniquely-owned cursor
-                // state with a single, well-defined last use: this DONE
-                // transition (proven exactly-once — the for-comp/reduce
-                // recursion never reads `state` after `Map.next` returns
-                // DONE, and the borrowed-pass-through release on the iter
-                // is elided under no-REFCOUNT_V1). So free the cell HERE,
-                // exactly once, via the manager's `core.deallocate` —
-                // matching the cell's `core.allocate` in `create`. Do NOT
-                // touch the source map: it was never retained in this mode,
-                // and its lifetime is owned by the iterating binding (the
-                // caller's scope-exit free reclaims it). Freeing it here
-                // would over-free the source. The runtime's
-                // `dense_map_iter_free_total` counter is bumped for parity
-                // with the REFCOUNTED `iterDeepWalk` path.
-                //
-                // BULK_OR_NEVER / TRACED keep the historical no-op
-                // `MapT.release` (Arena bulk-reclaims the cell at exit,
-                // NoOp/Leak intentionally never free, GC collects it) — no
-                // individual free is emitted, matching every other
-                // allocation under those models.
-                if (comptime reclamation_model == .individual_no_refcount) {
-                    self.source_map = null;
-                    self.next_idx = 0;
-                    incrementRuntimeStatCounter(&dense_map_iter_free_total);
-                    ArcRuntime.freeInlineHeaderCell(Self, self);
-                } else {
-                    MapT.release(map_ptr);
-                }
+                MapT.release(map_ptr);
                 return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
             }
             const entry = source.entryAtConst(self.next_idx).*;
@@ -16674,25 +17236,48 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
             const owned_key = MapT.ownEntryKey(entry.key);
             const owned_value = MapT.ownEntryValue(entry.value);
             incrementRuntimeStatCounter(&dense_map_iter_advance_total);
-            self.next_idx += 1;
-            return .{ ATOM_CONT, .{ owned_key, owned_value }, map_ptr };
+            const next_index = self.next_idx + 1;
+            if (self.mayAdvanceInPlace()) {
+                self.next_idx = next_index;
+                if (next_index >= source.len) {
+                    MapT.release(map_ptr);
+                    return .{ ATOM_CONT, .{ owned_key, owned_value }, null };
+                }
+                return .{ ATOM_CONT, .{ owned_key, owned_value }, map_ptr };
+            }
+            if (next_index >= source.len) {
+                MapT.release(map_ptr);
+                return .{ ATOM_CONT, .{ owned_key, owned_value }, null };
+            }
+            const next_iter = create(source) orelse {
+                MapT.releaseEntryKey(owned_key, std.heap.c_allocator);
+                MapT.releaseEntryValue(owned_value, std.heap.c_allocator);
+                MapT.release(map_ptr);
+                return .{ ATOM_DONE, .{ defaultK(), defaultV() }, null };
+            };
+            next_iter.next_idx = next_index;
+            MapT.release(map_ptr);
+            return .{ ATOM_CONT, .{ owned_key, owned_value }, next_iter.asMapPtr() };
         }
 
         /// Release path entered from `Map.release` when its argument
         /// is identified as an iter cell via `capacity == 0`. Dispatches
         /// the refcount drop through `ArcRuntime.headerRelease`; the
         /// `iterDeepWalk` callback performs the cleanup when the
-        /// manager observes the zero-transition (drop the retained
-        /// source-map reference and return the cell to its slab pool).
+        /// manager observes the zero-transition (drop the owned source
+        /// reference and return the cell to its slab pool).
         pub fn releaseFromMapPtr(map_ptr: *const MapT) void {
             const self = fromMapPtr(map_ptr);
+            if (comptime reclamation_model == .individual_no_refcount) {
+                releaseOwnedSourceAndFree(self);
+                return;
+            }
             ArcRuntime.headerRelease(&self.header, iterDeepWalk);
         }
 
         /// Deep-walk callback invoked by the manager's `release` on
-        /// the final zero-transition. Drops the retained source-map
-        /// reference and returns the iter cell to the manager via
-        /// `core.deallocate`.
+        /// the final zero-transition. Drops the owned source reference
+        /// and returns the iter cell to the manager via `core.deallocate`.
         ///
         /// Phase 4.x: the iter cell's slab slot returns through the
         /// active manager's `core.deallocate` slot (via
@@ -16702,6 +17287,19 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
         /// `core.deallocate`.
         fn iterDeepWalk(ptr: *anyopaque) callconv(.c) void {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            releaseOwnedSourceAndFree(self);
+        }
+
+        fn retainSourceForCursor(source: *const MapT) ?*const MapT {
+            if (comptime reclamation_model == .individual_no_refcount) {
+                return MapT.cloneForShare(source);
+            }
+            const mut_source: *MapT = @constCast(source);
+            ArcRuntime.headerRetain(&mut_source.header);
+            return source;
+        }
+
+        fn releaseOwnedSourceAndFree(self: *Self) void {
             const source = self.source_map;
             self.source_map = null;
             self.next_idx = 0;
@@ -16715,6 +17313,14 @@ pub fn MapIter(comptime K: type, comptime V: type) type {
                 // production, or `test_only_arc_*` in test builds.
                 MapT.release(src);
             }
+        }
+
+        inline fn mayAdvanceInPlace(self: *const Self) bool {
+            return switch (comptime reclamation_model) {
+                .refcounted => self.header.count() == 1,
+                .individual_no_refcount => true,
+                .bulk_or_never, .traced => false,
+            };
         }
 
         inline fn defaultK() K {
@@ -21398,6 +22004,355 @@ test "List(i64) repeated cons on rc==1 keeps allocations O(log n)" {
     try std.testing.expect(allocated < 16 * 1024);
 }
 
+test "ListIter: large-list iteration produces zero tail clones" {
+    const ListI64 = List(i64);
+    const N: u32 = 1024;
+    var values: ?*const ListI64 = ListI64.new_empty(N) orelse return error.OutOfMemory;
+    var build_index: u32 = 0;
+    while (build_index < N) : (build_index += 1) {
+        values = ListI64.push(values, @intCast(build_index)) orelse return error.OutOfMemory;
+    }
+    defer ListI64.release(values);
+
+    const iter_allocs_before = list_iter_alloc_total;
+    const iter_frees_before = list_iter_free_total;
+    const iter_advances_before = list_iter_advance_total;
+
+    var state: ?*const ListI64 = ListI64.retain(values);
+    var count: u32 = 0;
+    var saw_pass_through_cursor = false;
+    while (true) {
+        const consumed_state = state;
+        const step = ListI64.next(state);
+        if (step.@"0" == ATOM_DONE) {
+            break;
+        }
+
+        try std.testing.expectEqual(ATOM_CONT, step.@"0");
+        try std.testing.expectEqual(@as(i64, @intCast(count)), step.@"1");
+        count += 1;
+
+        state = step.@"2";
+        if (consumed_state != values and consumed_state == state) {
+            saw_pass_through_cursor = true;
+        }
+    }
+
+    try std.testing.expectEqual(N, count);
+    try std.testing.expectEqual(@as(u32, N), values.?.len);
+    try std.testing.expectEqual(@as(u64, 1), list_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 1), list_iter_free_total - iter_frees_before);
+    try std.testing.expectEqual(@as(u64, N - 1), list_iter_advance_total - iter_advances_before);
+    try std.testing.expect(saw_pass_through_cursor);
+}
+
+test "ListIter: final CONT consumes cursor and returns null next state" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(4) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 10) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 20) orelse return error.OutOfMemory;
+    defer ListI64.release(values);
+
+    const iter_allocs_before = list_iter_alloc_total;
+    const iter_frees_before = list_iter_free_total;
+
+    const first = ListI64.next(ListI64.retain(values));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+
+    const second = ListI64.next(cursor);
+    try std.testing.expectEqual(ATOM_CONT, second.@"0");
+    try std.testing.expectEqual(@as(i64, 20), second.@"1");
+    try std.testing.expectEqual(@as(?*const ListI64, null), second.@"2");
+    try std.testing.expectEqual(@as(u64, 1), list_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 1), list_iter_free_total - iter_frees_before);
+
+    const done = ListI64.next(second.@"2");
+    try std.testing.expectEqual(ATOM_DONE, done.@"0");
+    try std.testing.expectEqual(@as(?*const ListI64, null), done.@"2");
+    try std.testing.expectEqual(@as(u64, 1), list_iter_free_total - iter_frees_before);
+}
+
+test "ListIter: abandoning iteration releases cursor and restores source refcount" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(8) orelse return error.OutOfMemory;
+    var index: i64 = 0;
+    while (index < 5) : (index += 1) {
+        values = ListI64.push(values, index) orelse return error.OutOfMemory;
+    }
+    defer ListI64.release(values);
+
+    const refcount_before = values.?.header.count();
+    const iter_allocs_before = list_iter_alloc_total;
+    const iter_frees_before = list_iter_free_total;
+    const iter_advances_before = list_iter_advance_total;
+
+    const first = ListI64.next(ListI64.retain(values));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    try std.testing.expectEqual(@as(i64, 0), first.@"1");
+    var iter = first.@"2";
+    try std.testing.expect(iter != null);
+    try std.testing.expect(iter != values);
+    try std.testing.expectEqual(refcount_before + 1, values.?.header.count());
+
+    const second = ListI64.next(iter);
+    try std.testing.expectEqual(ATOM_CONT, second.@"0");
+    try std.testing.expectEqual(@as(i64, 1), second.@"1");
+    try std.testing.expectEqual(iter, second.@"2");
+    iter = second.@"2";
+
+    ListI64.release(iter);
+
+    try std.testing.expectEqual(refcount_before, values.?.header.count());
+    try std.testing.expectEqual(@as(u64, 1), list_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 1), list_iter_free_total - iter_frees_before);
+    try std.testing.expectEqual(@as(u64, 1), list_iter_advance_total - iter_advances_before);
+}
+
+test "ListIter: retained cursor releases exactly once after final owner drops" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(4) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 10) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 20) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 30) orelse return error.OutOfMemory;
+    defer ListI64.release(values);
+
+    const refcount_before = values.?.header.count();
+    const iter_allocs_before = list_iter_alloc_total;
+    const iter_frees_before = list_iter_free_total;
+
+    const first = ListI64.next(ListI64.retain(values));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    const iter = first.@"2" orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(refcount_before + 1, values.?.header.count());
+    try std.testing.expectEqual(@as(u32, 1), iter.header.count());
+
+    _ = ListI64.retain(iter);
+    try std.testing.expectEqual(@as(u32, 2), iter.header.count());
+    ListI64.release(iter);
+    try std.testing.expectEqual(@as(u32, 1), iter.header.count());
+    try std.testing.expectEqual(refcount_before + 1, values.?.header.count());
+
+    ListI64.release(iter);
+    try std.testing.expectEqual(refcount_before, values.?.header.count());
+    try std.testing.expectEqual(@as(u64, 1), list_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 1), list_iter_free_total - iter_frees_before);
+}
+
+test "ListIter: retained cursor advances aliases independently" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(4) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 10) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 20) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 30) orelse return error.OutOfMemory;
+    defer ListI64.release(values);
+
+    const refcount_before = values.?.header.count();
+    const iter_allocs_before = list_iter_alloc_total;
+    const iter_frees_before = list_iter_free_total;
+
+    const first = ListI64.next(ListI64.retain(values));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    const iter = first.@"2" orelse return error.TestUnexpectedResult;
+    const alias = ListI64.retain(iter) orelse return error.TestUnexpectedResult;
+
+    const from_iter = ListI64.next(iter);
+    try std.testing.expectEqual(ATOM_CONT, from_iter.@"0");
+    try std.testing.expectEqual(@as(i64, 20), from_iter.@"1");
+    const iter_next = from_iter.@"2" orelse return error.TestUnexpectedResult;
+
+    const from_alias = ListI64.next(alias);
+    try std.testing.expectEqual(ATOM_CONT, from_alias.@"0");
+    try std.testing.expectEqual(@as(i64, 20), from_alias.@"1");
+    const alias_next = from_alias.@"2" orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(iter_next != iter);
+    try std.testing.expectEqual(alias, alias_next);
+    try std.testing.expect(iter_next != alias_next);
+
+    try std.testing.expectEqual(refcount_before + 2, values.?.header.count());
+
+    ListI64.release(iter_next);
+    ListI64.release(alias_next);
+    try std.testing.expectEqual(refcount_before, values.?.header.count());
+    try std.testing.expectEqual(@as(u64, 2), list_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 2), list_iter_free_total - iter_frees_before);
+}
+
+test "ListIter: cursor-backed state satisfies List read API contract" {
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(4) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 2) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 3) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 3) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 7) orelse return error.OutOfMemory;
+    defer ListI64.release(values);
+
+    const first = ListI64.next(ListI64.retain(values));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    try std.testing.expectEqual(@as(i64, 2), first.@"1");
+    const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+    defer ListI64.release(cursor);
+
+    try std.testing.expectEqual(@as(i64, 3), ListI64.length(cursor));
+    try std.testing.expect(!ListI64.isEmpty(cursor));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.capacity(cursor));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(cursor, 0));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.getHead(cursor));
+    try std.testing.expectEqual(@as(i64, 7), ListI64.last(cursor));
+    try std.testing.expect(ListI64.contains(cursor, 3));
+    try std.testing.expect(!ListI64.contains(cursor, 2));
+    try std.testing.expectEqual(@as(i64, 13), ListI64.sum(cursor));
+    try std.testing.expectEqual(@as(i64, 63), ListI64.product(cursor));
+    try std.testing.expectEqual(@as(i64, 7), ListI64.maxVal(cursor));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.minVal(cursor));
+
+    const tail = ListI64.getTail(cursor) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(tail);
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(tail));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(tail, 0));
+    try std.testing.expectEqual(@as(i64, 7), ListI64.get(tail, 1));
+
+    const reversed = ListI64.reverse(cursor) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(reversed);
+    try std.testing.expectEqual(@as(i64, 7), ListI64.get(reversed, 0));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(reversed, 2));
+
+    const taken = ListI64.take(cursor, 2) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(taken);
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(taken));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(taken, 1));
+
+    const dropped = ListI64.drop(cursor, 2) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(dropped);
+    try std.testing.expectEqual(@as(i64, 1), ListI64.length(dropped));
+    try std.testing.expectEqual(@as(i64, 7), ListI64.get(dropped, 0));
+
+    const unique = ListI64.uniq(cursor) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(unique);
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(unique));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(unique, 0));
+    try std.testing.expectEqual(@as(i64, 7), ListI64.get(unique, 1));
+}
+
+test "ListIter: cursor-backed state supports List transforms and materializing mutations" {
+    const ListI64 = List(i64);
+    const Helpers = struct {
+        fn increment(value: i64) i64 {
+            return value + 1;
+        }
+
+        fn isEven(value: i64) bool {
+            return @mod(value, 2) == 0;
+        }
+
+        fn greaterThanTwo(value: i64) bool {
+            return value > 2;
+        }
+
+        fn add(accumulator: i64, value: i64) i64 {
+            return accumulator + value;
+        }
+
+        fn descending(left: i64, right: i64) bool {
+            return left > right;
+        }
+
+        fn duplicate(value: i64) ?*const ListI64 {
+            var result: ?*const ListI64 = ListI64.new_empty(2) orelse @panic("test list allocation failed");
+            result = ListI64.push(result, value) orelse @panic("test list push failed");
+            result = ListI64.push(result, value * 10) orelse @panic("test list push failed");
+            return result;
+        }
+    };
+
+    var values: ?*const ListI64 = ListI64.new_empty(4) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 1) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 2) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 3) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 4) orelse return error.OutOfMemory;
+    defer ListI64.release(values);
+
+    const first = ListI64.next(ListI64.retain(values));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+    defer ListI64.release(cursor);
+
+    const mapped = ListI64.mapFn(cursor, Helpers.increment) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(mapped);
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(mapped, 0));
+    try std.testing.expectEqual(@as(i64, 5), ListI64.get(mapped, 2));
+
+    const filtered = ListI64.filterFn(cursor, Helpers.isEven) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(filtered);
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(filtered));
+    try std.testing.expectEqual(@as(i64, 4), ListI64.get(filtered, 1));
+
+    const rejected = ListI64.rejectFn(cursor, Helpers.isEven) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(rejected);
+    try std.testing.expectEqual(@as(i64, 1), ListI64.length(rejected));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(rejected, 0));
+
+    try std.testing.expectEqual(@as(i64, 19), ListI64.enumReduceSimple(cursor, 10, Helpers.add));
+    try std.testing.expect(ListI64.anyFn(cursor, Helpers.greaterThanTwo));
+    try std.testing.expect(ListI64.allFn(cursor, Helpers.greaterThanTwo) == false);
+    try std.testing.expectEqual(@as(i64, 2), ListI64.countFn(cursor, Helpers.isEven));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.findFn(cursor, 0, Helpers.greaterThanTwo));
+
+    const sorted = ListI64.sortFn(cursor, Helpers.descending) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(sorted);
+    try std.testing.expectEqual(@as(i64, 4), ListI64.get(sorted, 0));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(sorted, 2));
+
+    const flattened = ListI64.flatMapFn(cursor, Helpers.duplicate) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(flattened);
+    try std.testing.expectEqual(@as(i64, 6), ListI64.length(flattened));
+    try std.testing.expectEqual(@as(i64, 20), ListI64.get(flattened, 1));
+    try std.testing.expectEqual(@as(i64, 40), ListI64.get(flattened, 5));
+
+    const set_result = ListI64.set(cursor, 1, 99) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(set_result);
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(set_result, 0));
+    try std.testing.expectEqual(@as(i64, 99), ListI64.get(set_result, 1));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(cursor, 1));
+
+    const pushed = ListI64.push(cursor, 8) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(pushed);
+    try std.testing.expectEqual(@as(i64, 4), ListI64.length(pushed));
+    try std.testing.expectEqual(@as(i64, 8), ListI64.last(pushed));
+
+    const popped = ListI64.pop(cursor) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(popped);
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(popped));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.last(popped));
+
+    const appended = ListI64.append(cursor, filtered) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(appended);
+    try std.testing.expectEqual(@as(i64, 5), ListI64.length(appended));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(appended, 3));
+    try std.testing.expectEqual(@as(i64, 4), ListI64.get(appended, 4));
+
+    const cons_cursor = ListI64.retain(cursor) orelse return error.TestUnexpectedResult;
+    const consed = ListI64.cons(0, cons_cursor) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(consed);
+    try std.testing.expectEqual(@as(i64, 4), ListI64.length(consed));
+    try std.testing.expectEqual(@as(i64, 0), ListI64.get(consed, 0));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(consed, 1));
+
+    const owned_push_cursor = ListI64.retain(cursor) orelse return error.TestUnexpectedResult;
+    const owned_pushed = ListI64.push_owned_unchecked(owned_push_cursor, 9) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(owned_pushed);
+    try std.testing.expectEqual(@as(i64, 4), ListI64.length(owned_pushed));
+    try std.testing.expectEqual(@as(i64, 9), ListI64.last(owned_pushed));
+
+    const owned_slice_cursor = ListI64.retain(cursor) orelse return error.TestUnexpectedResult;
+    const owned_slice = ListI64.slice_owned_unchecked(owned_slice_cursor, 1) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(owned_slice);
+    try std.testing.expectEqual(@as(i64, 2), ListI64.length(owned_slice));
+    try std.testing.expectEqual(@as(i64, 3), ListI64.get(owned_slice, 0));
+    try std.testing.expectEqual(@as(i64, 4), ListI64.get(owned_slice, 1));
+}
+
 test "listSum bridge dispatches to concrete List(i64) sum" {
     const ListI64 = List(i64);
     var values: ?*const ListI64 = ListI64.new_empty(4) orelse return error.OutOfMemory;
@@ -23010,7 +23965,7 @@ test "runtime: IO.gets handles partial-line buffer boundaries" {
 //
 // `Map.next` / `Map.retain` / `Map.release` inspect that field
 // before dispatching: real maps follow the existing paths, iter
-// cells advance their cursor / release their retained source.
+// cells advance their cursor / release their owned source.
 // ============================================================
 
 test "MapIter: empty map returns ATOM_DONE immediately" {
@@ -23020,14 +23975,11 @@ test "MapIter: empty map returns ATOM_DONE immediately" {
     try std.testing.expectEqual(@as(?*const M, null), result.@"2");
 }
 
-// MapIter unit tests drive iteration through `Map.next` directly.
-// `Map.next` borrows its argument and self-releases the iter cell
-// on the DONE step (see `MapIter.advanceFromMapPtr`), so a
-// well-formed iteration that runs to completion does NOT need to
-// manually release the iter — Map.next does it for the caller.
-// Tests that abandon iteration partway through must explicitly
-// release the iter to free the cell + drop the retained source-map
-// reference.
+// MapIter unit tests drive iteration through `Map.next` directly. `Map.next`
+// consumes its argument; tests that also inspect the original source pass a
+// retained iteration owner into the first step. Tests that abandon iteration
+// partway through release the current returned cursor to free the cell + drop
+// the owned source reference.
 
 test "MapIter: walks all entries in stable order with O(1) per-step cost" {
     const M = Map(i64, i64);
@@ -23045,10 +23997,12 @@ test "MapIter: walks all entries in stable order with O(1) per-step cost" {
     var seen: [100]bool = .{false} ** 100;
     var count: u32 = 0;
 
-    var state: ?*const M = src;
+    var state: ?*const M = M.retain(src);
     while (true) {
         const step = M.next(state);
-        if (step.@"0" == ATOM_DONE) break;
+        if (step.@"0" == ATOM_DONE) {
+            break;
+        }
         try std.testing.expectEqual(ATOM_CONT, step.@"0");
         const k = step.@"1".@"0";
         const v = step.@"1".@"1";
@@ -23084,16 +24038,17 @@ test "MapIter: source map refcount preserved across full iteration" {
     const iter_allocs_before = dense_map_iter_alloc_total;
     const iter_frees_before = dense_map_iter_free_total;
 
-    var state: ?*const M = src;
+    var state: ?*const M = M.retain(src);
     while (true) {
         const step = M.next(state);
-        if (step.@"0" == ATOM_DONE) break;
+        if (step.@"0" == ATOM_DONE) {
+            break;
+        }
         state = step.@"2";
     }
 
     // After full iteration: source's refcount returns to its
-    // pre-iteration value (Map.next on DONE self-released the iter,
-    // which dropped its retained source-map reference).
+    // pre-iteration value after `Map.next` consumes the final cursor.
     try std.testing.expectEqual(refcount_before, src.header.count());
 
     // Allocations and frees balance — no iter cell leaks.
@@ -23101,6 +24056,26 @@ test "MapIter: source map refcount preserved across full iteration" {
         dense_map_iter_alloc_total - iter_allocs_before,
         dense_map_iter_free_total - iter_frees_before,
     );
+}
+
+test "MapIter: singleton source is consumed and returns null next state" {
+    const M = Map(i64, i64);
+    const keys = [_]i64{42};
+    const values = [_]i64{420};
+    const src = M.fromPairs(&keys, &values, 1) orelse @panic("map alloc");
+    defer M.release(src);
+
+    const iter_frees_before = dense_map_iter_free_total;
+
+    const first = M.next(M.retain(src));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    try std.testing.expectEqual(@as(i64, 42), first.@"1".@"0");
+    try std.testing.expectEqual(@as(?*const M, null), first.@"2");
+
+    const done = M.next(first.@"2");
+    try std.testing.expectEqual(ATOM_DONE, done.@"0");
+    try std.testing.expectEqual(@as(?*const M, null), done.@"2");
+    try std.testing.expectEqual(@as(u64, 0), dense_map_iter_free_total - iter_frees_before);
 }
 
 test "MapIter: source map unchanged when iteration is abandoned" {
@@ -23117,7 +24092,7 @@ test "MapIter: source map unchanged when iteration is abandoned" {
     const refcount_before = src.header.count();
 
     // Take one step. The iter retains src (+1).
-    const step = M.next(src);
+    const step = M.next(M.retain(src));
     try std.testing.expectEqual(ATOM_CONT, step.@"0");
     const iter = step.@"2";
     try std.testing.expect(iter != null);
@@ -23132,6 +24107,232 @@ test "MapIter: source map unchanged when iteration is abandoned" {
     M.release(iter);
     try std.testing.expectEqual(refcount_before, src.header.count());
     try std.testing.expectEqual(@as(u32, 5), src.len);
+}
+
+test "MapIter: retained cursor releases exactly once after final owner drops" {
+    const M = Map(i64, i64);
+    const keys = [_]i64{ 1, 2, 3 };
+    const values = [_]i64{ 10, 20, 30 };
+    const src = M.fromPairs(&keys, &values, 3) orelse @panic("map alloc");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+    const iter_allocs_before = dense_map_iter_alloc_total;
+    const iter_frees_before = dense_map_iter_free_total;
+
+    const first = M.next(M.retain(src));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    const iter = first.@"2" orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(refcount_before + 1, src.header.count());
+    try std.testing.expectEqual(@as(u32, 1), iter.header.count());
+
+    _ = M.retain(iter);
+    try std.testing.expectEqual(@as(u32, 2), iter.header.count());
+    M.release(iter);
+    try std.testing.expectEqual(@as(u32, 1), iter.header.count());
+    try std.testing.expectEqual(refcount_before + 1, src.header.count());
+
+    M.release(iter);
+    try std.testing.expectEqual(refcount_before, src.header.count());
+    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_free_total - iter_frees_before);
+}
+
+test "MapIter: retained cursor advances aliases independently" {
+    const M = Map(i64, i64);
+    const keys = [_]i64{ 1, 2, 3 };
+    const values = [_]i64{ 10, 20, 30 };
+    const src = M.fromPairs(&keys, &values, 3) orelse @panic("map alloc");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+    const iter_allocs_before = dense_map_iter_alloc_total;
+    const iter_frees_before = dense_map_iter_free_total;
+
+    const first = M.next(M.retain(src));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    const iter = first.@"2" orelse return error.TestUnexpectedResult;
+    const alias = M.retain(iter) orelse return error.TestUnexpectedResult;
+
+    const from_iter = M.next(iter);
+    try std.testing.expectEqual(ATOM_CONT, from_iter.@"0");
+    try std.testing.expectEqual(@as(i64, 2), from_iter.@"1".@"0");
+    try std.testing.expectEqual(@as(i64, 20), from_iter.@"1".@"1");
+    const iter_next = from_iter.@"2" orelse return error.TestUnexpectedResult;
+
+    const from_alias = M.next(alias);
+    try std.testing.expectEqual(ATOM_CONT, from_alias.@"0");
+    try std.testing.expectEqual(@as(i64, 2), from_alias.@"1".@"0");
+    try std.testing.expectEqual(@as(i64, 20), from_alias.@"1".@"1");
+    const alias_next = from_alias.@"2" orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(iter_next != iter);
+    try std.testing.expectEqual(alias, alias_next);
+    try std.testing.expect(iter_next != alias_next);
+
+    try std.testing.expectEqual(refcount_before + 2, src.header.count());
+
+    M.release(iter_next);
+    M.release(alias_next);
+    try std.testing.expectEqual(refcount_before, src.header.count());
+    try std.testing.expectEqual(@as(u64, 2), dense_map_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 2), dense_map_iter_free_total - iter_frees_before);
+}
+
+test "MapIter: cursor-backed state satisfies Map read API contract" {
+    const M = Map(i64, i64);
+    const ListI64 = List(i64);
+    const Helpers = struct {
+        fn addPair(accumulator: i64, key: i64, value: i64) i64 {
+            return accumulator + key * 100 + value;
+        }
+
+        fn addValue(accumulator: i64, value: i64) i64 {
+            return accumulator + value;
+        }
+    };
+
+    const keys = [_]i64{ 1, 2, 3, 4 };
+    const values = [_]i64{ 10, 20, 30, 40 };
+    const src = M.fromPairs(&keys, &values, 4) orelse @panic("map alloc");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+    const first = M.next(M.retain(src));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    try std.testing.expectEqual(@as(i64, 1), first.@"1".@"0");
+    const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(refcount_before + 1, src.header.count());
+
+    try std.testing.expectEqual(@as(i64, 3), M.size(cursor));
+    try std.testing.expect(!M.isEmpty(cursor));
+    try std.testing.expect(!M.hasKey(cursor, 1));
+    try std.testing.expect(M.hasKey(cursor, 2));
+    try std.testing.expect(M.hasKey(cursor, 4));
+    try std.testing.expectEqual(@as(i64, -1), M.get(cursor, 1, -1));
+    try std.testing.expectEqual(@as(i64, 30), M.get(cursor, 3, -1));
+    try std.testing.expectEqualStrings("fallback", M.getStr(cursor, 2, "fallback"));
+
+    const remaining_keys = M.keys(cursor) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(remaining_keys);
+    try std.testing.expectEqual(@as(i64, 3), ListI64.length(remaining_keys));
+    try std.testing.expectEqual(@as(i64, 2), ListI64.get(remaining_keys, 0));
+    try std.testing.expectEqual(@as(i64, 4), ListI64.get(remaining_keys, 2));
+
+    const remaining_values = M.values(cursor) orelse return error.TestUnexpectedResult;
+    defer ListI64.release(remaining_values);
+    try std.testing.expectEqual(@as(i64, 3), ListI64.length(remaining_values));
+    try std.testing.expectEqual(@as(i64, 20), ListI64.get(remaining_values, 0));
+    try std.testing.expectEqual(@as(i64, 40), ListI64.get(remaining_values, 2));
+
+    try std.testing.expectEqual(@as(i64, 995), M.enumReduceSimple(cursor, 5, Helpers.addPair));
+    try std.testing.expectEqual(@as(i64, 90), M.enumReduceValues(cursor, 0, Helpers.addValue));
+
+    M.release(cursor);
+    try std.testing.expectEqual(refcount_before, src.header.count());
+}
+
+test "MapIter: cursor-backed state supports checked materializing mutations" {
+    const M = Map(i64, i64);
+    const keys = [_]i64{ 1, 2, 3, 4 };
+    const values = [_]i64{ 10, 20, 30, 40 };
+    const src = M.fromPairs(&keys, &values, 4) orelse @panic("map alloc");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+    const first = M.next(M.retain(src));
+    try std.testing.expectEqual(ATOM_CONT, first.@"0");
+    const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+    defer M.release(cursor);
+    try std.testing.expectEqual(refcount_before + 1, src.header.count());
+
+    const inserted = M.put(cursor, 5, 50) orelse return error.TestUnexpectedResult;
+    defer M.release(inserted);
+    try std.testing.expectEqual(@as(i64, 4), M.size(inserted));
+    try std.testing.expect(!M.hasKey(inserted, 1));
+    try std.testing.expect(M.hasKey(inserted, 2));
+    try std.testing.expect(M.hasKey(inserted, 5));
+    try std.testing.expectEqual(@as(i64, 50), M.get(inserted, 5, -1));
+
+    const overwritten = M.put(cursor, 2, 200) orelse return error.TestUnexpectedResult;
+    defer M.release(overwritten);
+    try std.testing.expectEqual(@as(i64, 3), M.size(overwritten));
+    try std.testing.expectEqual(@as(i64, 200), M.get(overwritten, 2, -1));
+    try std.testing.expectEqual(@as(i64, 20), M.get(cursor, 2, -1));
+
+    const deleted = M.delete(cursor, 3) orelse return error.TestUnexpectedResult;
+    defer M.release(deleted);
+    try std.testing.expectEqual(@as(i64, 2), M.size(deleted));
+    try std.testing.expect(M.hasKey(deleted, 2));
+    try std.testing.expect(!M.hasKey(deleted, 3));
+    try std.testing.expect(M.hasKey(cursor, 3));
+
+    const other_keys = [_]i64{ 3, 6 };
+    const other_values = [_]i64{ 300, 60 };
+    const other = M.fromPairs(&other_keys, &other_values, 2) orelse @panic("map alloc");
+    defer M.release(other);
+
+    const merged = M.merge(cursor, other) orelse return error.TestUnexpectedResult;
+    defer M.release(merged);
+    try std.testing.expectEqual(@as(i64, 4), M.size(merged));
+    try std.testing.expect(!M.hasKey(merged, 1));
+    try std.testing.expectEqual(@as(i64, 20), M.get(merged, 2, -1));
+    try std.testing.expectEqual(@as(i64, 300), M.get(merged, 3, -1));
+    try std.testing.expectEqual(@as(i64, 40), M.get(merged, 4, -1));
+    try std.testing.expectEqual(@as(i64, 60), M.get(merged, 6, -1));
+
+    try std.testing.expect(M.hasKey(src, 1));
+    try std.testing.expect(!M.hasKey(src, 5));
+}
+
+test "MapIter: owned unchecked cursor mutations release iterator source" {
+    const M = Map(i64, i64);
+    const keys = [_]i64{ 1, 2, 3 };
+    const values = [_]i64{ 10, 20, 30 };
+    const src = M.fromPairs(&keys, &values, 3) orelse @panic("map alloc");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+
+    const put_first = M.next(M.retain(src));
+    try std.testing.expectEqual(ATOM_CONT, put_first.@"0");
+    const put_cursor = put_first.@"2" orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(refcount_before + 1, src.header.count());
+    const put_result = M.put_owned_unchecked(put_cursor, 4, 40) orelse return error.TestUnexpectedResult;
+    defer M.release(put_result);
+    try std.testing.expectEqual(refcount_before, src.header.count());
+    try std.testing.expectEqual(@as(i64, 3), M.size(put_result));
+    try std.testing.expect(!M.hasKey(put_result, 1));
+    try std.testing.expectEqual(@as(i64, 40), M.get(put_result, 4, -1));
+
+    const delete_first = M.next(M.retain(src));
+    try std.testing.expectEqual(ATOM_CONT, delete_first.@"0");
+    const delete_cursor = delete_first.@"2" orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(refcount_before + 1, src.header.count());
+    const delete_result = M.delete_owned_unchecked(delete_cursor, 2) orelse return error.TestUnexpectedResult;
+    defer M.release(delete_result);
+    try std.testing.expectEqual(refcount_before, src.header.count());
+    try std.testing.expectEqual(@as(i64, 1), M.size(delete_result));
+    try std.testing.expect(!M.hasKey(delete_result, 1));
+    try std.testing.expect(!M.hasKey(delete_result, 2));
+    try std.testing.expect(M.hasKey(delete_result, 3));
+
+    const merge_first = M.next(M.retain(src));
+    try std.testing.expectEqual(ATOM_CONT, merge_first.@"0");
+    const merge_cursor = merge_first.@"2" orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(refcount_before + 1, src.header.count());
+    const other_keys = [_]i64{ 3, 5 };
+    const other_values = [_]i64{ 300, 50 };
+    const other = M.fromPairs(&other_keys, &other_values, 2) orelse @panic("map alloc");
+    defer M.release(other);
+    const merge_result = M.merge_owned_unchecked(merge_cursor, other) orelse return error.TestUnexpectedResult;
+    defer M.release(merge_result);
+    try std.testing.expectEqual(refcount_before, src.header.count());
+    try std.testing.expectEqual(@as(i64, 3), M.size(merge_result));
+    try std.testing.expect(!M.hasKey(merge_result, 1));
+    try std.testing.expectEqual(@as(i64, 20), M.get(merge_result, 2, -1));
+    try std.testing.expectEqual(@as(i64, 300), M.get(merge_result, 3, -1));
+    try std.testing.expectEqual(@as(i64, 50), M.get(merge_result, 5, -1));
 }
 
 test "MapIter: yielded keys/values retain correctly for ARC types" {
@@ -23154,10 +24355,12 @@ test "MapIter: yielded keys/values retain correctly for ARC types" {
 
     var saw_inner1 = false;
     var saw_inner2 = false;
-    var state: ?*const M = src;
+    var state: ?*const M = M.retain(src);
     while (true) {
         const step = M.next(state);
-        if (step.@"0" == ATOM_DONE) break;
+        if (step.@"0" == ATOM_DONE) {
+            break;
+        }
         const yielded_value = step.@"1".@"1" orelse @panic("null value");
         if (yielded_value == inner1) saw_inner1 = true;
         if (yielded_value == inner2) saw_inner2 = true;
@@ -23191,10 +24394,12 @@ test "MapIter: large-map iteration produces zero retaining clones" {
     const iter_advances_before = dense_map_iter_advance_total;
 
     var count: u32 = 0;
-    var state: ?*const M = src;
+    var state: ?*const M = M.retain(src);
     while (true) {
         const step = M.next(state);
-        if (step.@"0" == ATOM_DONE) break;
+        if (step.@"0" == ATOM_DONE) {
+            break;
+        }
         count += 1;
         state = step.@"2";
     }
@@ -23203,8 +24408,8 @@ test "MapIter: large-map iteration produces zero retaining clones" {
     // Iteration must NOT trigger any retaining clones.
     try std.testing.expectEqual(clones_before, dense_map_retaining_clone_total);
 
-    // Exactly one iter cell allocated for the whole walk, and
-    // it was freed on the DONE step (no manual release needed).
+    // Exactly one iter cell allocated for the whole walk, and it was freed by
+    // `Map.next` when the final cursor state was consumed.
     try std.testing.expectEqual(@as(u64, 1), dense_map_iter_alloc_total - iter_allocs_before);
     try std.testing.expectEqual(@as(u64, 1), dense_map_iter_free_total - iter_frees_before);
 
@@ -23214,41 +24419,35 @@ test "MapIter: large-map iteration produces zero retaining clones" {
     try std.testing.expectEqual(@as(u64, N - 1), dense_map_iter_advance_total - iter_advances_before);
 }
 
-test "MapIter: single-entry map yields exactly one CONT then DONE" {
+test "MapIter: single-entry map yields one CONT with null next state" {
     // Boundary case for `Map.next`: when the source map has exactly
-    // one entry, the first `Map.next(real_map)` call returns CONT
-    // with that entry and an iter as next state, and the immediately
-    // following `Map.next(iter)` call must return DONE. The iter
-    // self-releases on DONE, so the source map's refcount is
-    // unchanged across the round-trip and the iter cell count
-    // returns to its pre-iteration value.
+    // one entry, the first `Map.next(real_map)` call consumes that state,
+    // returns CONT with the entry, and uses null as the next state. A
+    // following `Map.next(null)` returns DONE.
     const M = Map(i64, i64);
     const keys = [_]i64{42};
     const values = [_]i64{420};
     const src = M.fromPairs(&keys, &values, 1) orelse @panic("alloc failed");
     defer M.release(src);
 
-    const refcount_before = src.header.count();
     const iter_allocs_before = dense_map_iter_alloc_total;
     const iter_frees_before = dense_map_iter_free_total;
 
-    const first = M.next(src);
+    const first = M.next(M.retain(src));
     try std.testing.expectEqual(ATOM_CONT, first.@"0");
     try std.testing.expectEqual(@as(i64, 42), first.@"1".@"0");
     try std.testing.expectEqual(@as(i64, 420), first.@"1".@"1");
     const iter = first.@"2";
-    try std.testing.expect(iter != null);
-    try std.testing.expect(iter != src);
+    try std.testing.expectEqual(@as(?*const M, null), iter);
 
     const second = M.next(iter);
     try std.testing.expectEqual(ATOM_DONE, second.@"0");
     try std.testing.expectEqual(@as(?*const M, null), second.@"2");
 
-    // Source unchanged; iter cell freed; refcount restored.
-    try std.testing.expectEqual(refcount_before, src.header.count());
+    // Source unchanged; no iter cell needed for the singleton path.
     try std.testing.expectEqual(@as(u32, 1), src.len);
-    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_alloc_total - iter_allocs_before);
-    try std.testing.expectEqual(@as(u64, 1), dense_map_iter_free_total - iter_frees_before);
+    try std.testing.expectEqual(@as(u64, 0), dense_map_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 0), dense_map_iter_free_total - iter_frees_before);
 }
 
 test "MapIter: abandoning iteration after 2+ advances releases iter cell cleanly" {
@@ -23276,7 +24475,7 @@ test "MapIter: abandoning iteration after 2+ advances releases iter cell cleanly
     const iter_advances_before = dense_map_iter_advance_total;
 
     // Step 1: first call returns CONT + the first entry + an iter.
-    const step_one = M.next(src);
+    const step_one = M.next(M.retain(src));
     try std.testing.expectEqual(ATOM_CONT, step_one.@"0");
     var iter = step_one.@"2";
     try std.testing.expect(iter != null);
@@ -23305,7 +24504,7 @@ test "MapIter: abandoning iteration after 2+ advances releases iter cell cleanly
 
     // Abandon the iteration mid-cursor-advance. `Map.release` routes
     // through the `capacity == 0` discriminator and frees the iter
-    // cell + drops its retained source reference.
+    // cell + drops its owned source reference.
     M.release(iter);
 
     try std.testing.expectEqual(refcount_before, src.header.count());
@@ -23331,23 +24530,18 @@ test "MapIter: defensive path for null source_map returns DONE" {
     const IterT = MapIter(i64, i64);
     const iter = IterT.create(src) orelse @panic("iter create");
 
-    // Drop the retained source-map reference manually so we don't
-    // leak the +1 the iter took on `create`. We hand-construct the
-    // failure shape after this point so the iter no longer owns
-    // anything on `src`.
-    M.release(src);
+    // Drop the iter's owned source manually so we do not leak the
+    // cursor source when hand-constructing the failure shape below.
+    if (iter.source_map) |owned_source| {
+        M.release(owned_source);
+    }
     iter.source_map = null;
 
-    // advanceFromMapPtr must return DONE on the null-source path.
+    // advanceFromMapPtr must consume the malformed cursor and return DONE on
+    // the null-source path.
     const step = IterT.advanceFromMapPtr(iter.asMapPtr().?);
     try std.testing.expectEqual(ATOM_DONE, step.@"0");
     try std.testing.expectEqual(@as(?*const M, null), step.@"2");
-
-    // The iter cell still has rc=1 (advanceFromMapPtr only self-
-    // releases on the cursor-end DONE path, not the null-source
-    // DONE path). Free it through Map.release so its slab cell
-    // returns to the pool.
-    M.release(iter.asMapPtr());
 }
 
 // ============================================================

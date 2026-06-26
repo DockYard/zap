@@ -26,9 +26,13 @@ const elision = @import("memory/elision.zig");
 //      directly to the caller's return slot.
 //
 // For multi-arm terminators (`switch_return`, `union_switch_return`)
-// the retain is per-arm: a `.retain{value=case.return_value}` is
-// appended at the end of each arm's body when the arm's return value
-// is ARC-managed and not a return source.
+// retain/drop insertion is per-arm. A
+// `.retain{value=case.return_value}` is appended at the end of each
+// fallthrough arm when the arm's return value is ARC-managed and not
+// a return source; releases are appended from the analyzer's
+// arm-local implicit-return owner snapshot. The parent terminator
+// receives no pre-switch drops because such drops would execute
+// before the selected arm can move or return the same owner.
 //
 // Tail calls receive no retain — there is no return value at the IR
 // site (the callee returns directly to the caller's caller).
@@ -223,6 +227,176 @@ pub fn insertTupleComponentReleases(
     }
 }
 
+const explicit_walk_inline_frame_capacity = 64;
+const explicit_walk_inline_child_capacity = 16;
+
+fn ExplicitInlineStack(comptime T: type, comptime inline_capacity: usize) type {
+    return struct {
+        inline_items: [inline_capacity]T = undefined,
+        inline_len: usize = 0,
+        spill: std.ArrayListUnmanaged(T) = .empty,
+
+        const Self = @This();
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.spill.deinit(allocator);
+        }
+
+        fn clearRetainingCapacity(self: *Self) void {
+            self.inline_len = 0;
+            self.spill.clearRetainingCapacity();
+        }
+
+        fn len(self: *const Self) usize {
+            return self.inline_len + self.spill.items.len;
+        }
+
+        fn append(self: *Self, allocator: std.mem.Allocator, item: T) error{OutOfMemory}!void {
+            if (self.spill.items.len == 0 and self.inline_len < inline_capacity) {
+                self.inline_items[self.inline_len] = item;
+                self.inline_len += 1;
+                return;
+            }
+            try self.spill.append(allocator, item);
+        }
+
+        fn get(self: *const Self, index: usize) T {
+            std.debug.assert(index < self.len());
+            if (index < self.inline_len) return self.inline_items[index];
+            return self.spill.items[index - self.inline_len];
+        }
+
+        fn topPtr(self: *Self) *T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) return &self.spill.items[self.spill.items.len - 1];
+            return &self.inline_items[self.inline_len - 1];
+        }
+
+        fn pop(self: *Self) T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) return self.spill.pop().?;
+            self.inline_len -= 1;
+            return self.inline_items[self.inline_len];
+        }
+    };
+}
+
+const ExplicitWalkControl = enum {
+    keep_walking,
+    stop,
+};
+
+const ExplicitInstructionFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+};
+
+const ExplicitInstructionWalker = struct {
+    allocator: std.mem.Allocator,
+    frames: ExplicitInlineStack(ExplicitInstructionFrame, explicit_walk_inline_frame_capacity) = .{},
+    child_streams: ExplicitInlineStack(ir.ChildStream, explicit_walk_inline_child_capacity) = .{},
+
+    fn init(allocator: std.mem.Allocator) ExplicitInstructionWalker {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *ExplicitInstructionWalker) void {
+        self.frames.deinit(self.allocator);
+        self.child_streams.deinit(self.allocator);
+    }
+
+    fn walkStream(
+        self: *ExplicitInstructionWalker,
+        root_stream: []const ir.Instruction,
+        context: anytype,
+        comptime visitFn: fn (
+            ctx: @TypeOf(context),
+            instr: *const ir.Instruction,
+        ) error{OutOfMemory}!ExplicitWalkControl,
+    ) error{OutOfMemory}!ExplicitWalkControl {
+        self.frames.clearRetainingCapacity();
+        self.child_streams.clearRetainingCapacity();
+        if (root_stream.len == 0) return .keep_walking;
+        try self.frames.append(self.allocator, .{ .stream = root_stream });
+        return self.drain(context, visitFn);
+    }
+
+    fn walkInstructionAndChildren(
+        self: *ExplicitInstructionWalker,
+        root_instruction: *const ir.Instruction,
+        context: anytype,
+        comptime visitFn: fn (
+            ctx: @TypeOf(context),
+            instr: *const ir.Instruction,
+        ) error{OutOfMemory}!ExplicitWalkControl,
+    ) error{OutOfMemory}!ExplicitWalkControl {
+        self.frames.clearRetainingCapacity();
+        self.child_streams.clearRetainingCapacity();
+        switch (try visitFn(context, root_instruction)) {
+            .keep_walking => {},
+            .stop => return .stop,
+        }
+        try self.pushInstructionChildren(root_instruction);
+        return self.drain(context, visitFn);
+    }
+
+    fn drain(
+        self: *ExplicitInstructionWalker,
+        context: anytype,
+        comptime visitFn: fn (
+            ctx: @TypeOf(context),
+            instr: *const ir.Instruction,
+        ) error{OutOfMemory}!ExplicitWalkControl,
+    ) error{OutOfMemory}!ExplicitWalkControl {
+        while (self.frames.len() != 0) {
+            const frame = self.frames.topPtr();
+            if (frame.next_index >= frame.stream.len) {
+                _ = self.frames.pop();
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            frame.next_index += 1;
+
+            switch (try visitFn(context, instr)) {
+                .keep_walking => {},
+                .stop => return .stop,
+            }
+            try self.pushInstructionChildren(instr);
+        }
+        return .keep_walking;
+    }
+
+    fn pushInstructionChildren(
+        self: *ExplicitInstructionWalker,
+        instr: *const ir.Instruction,
+    ) error{OutOfMemory}!void {
+        self.child_streams.clearRetainingCapacity();
+
+        const ChildCollector = struct {
+            walker: *ExplicitInstructionWalker,
+            err: ?error{OutOfMemory} = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null or child.stream.len == 0) return;
+                ctx.walker.child_streams.append(ctx.walker.allocator, child) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        var collector = ChildCollector{ .walker = self };
+        ir.forEachChildStream(instr, &collector, ChildCollector.onStream);
+        if (collector.err) |err| return err;
+
+        var child_index = self.child_streams.len();
+        while (child_index > 0) {
+            child_index -= 1;
+            try self.frames.append(self.allocator, .{ .stream = self.child_streams.get(child_index).stream });
+        }
+    }
+};
+
 /// Phase 2.6.3 — collect the metadata `insertTupleComponentReleases`
 /// needs from a forward walk over the function. The walk mirrors
 /// `arc_liveness.flattenInstructions` so the `InstructionId`
@@ -295,54 +469,46 @@ const ComponentReleaseCollector = struct {
         self: *ComponentReleaseCollector,
         stream: []const ir.Instruction,
     ) error{OutOfMemory}!void {
-        for (stream) |*instr| {
-            switch (instr.*) {
-                .index_get => |ig| {
-                    // Non-ARC aggregate `object` with ARC-managed
-                    // extracted `dest` is the canonical destructure-
-                    // then-uniqueness pattern. Record both sides.
-                    if (!self.isArcManagedLocal(ig.object) and self.isArcManagedLocal(ig.dest) and
-                        !self.isOwnedBoxExtraction(ig.dest))
-                    {
-                        try self.non_arc_aggregates.put(self.allocator, ig.object, {});
-                        const gop = try self.extractions_by_aggregate.getOrPut(self.allocator, ig.object);
-                        if (!gop.found_existing) gop.value_ptr.* = .empty;
-                        try gop.value_ptr.append(self.allocator, ig.dest);
-                    }
-                },
-                .field_get => |fg| {
-                    if (!self.isArcManagedLocal(fg.object) and self.isArcManagedLocal(fg.dest) and
-                        !self.isOwnedBoxExtraction(fg.dest))
-                    {
-                        try self.non_arc_aggregates.put(self.allocator, fg.object, {});
-                        const gop = try self.extractions_by_aggregate.getOrPut(self.allocator, fg.object);
-                        if (!gop.found_existing) gop.value_ptr.* = .empty;
-                        try gop.value_ptr.append(self.allocator, fg.dest);
-                    }
-                },
-                else => {},
-            }
-            try self.discoverChildren(instr);
-        }
-    }
-
-    fn discoverChildren(
-        self: *ComponentReleaseCollector,
-        instr: *const ir.Instruction,
-    ) error{OutOfMemory}!void {
         const Ctx = struct {
             collector: *ComponentReleaseCollector,
-            err: ?error{OutOfMemory} = null,
-            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
-                if (ctx.err != null) return;
-                ctx.collector.discoverStream(child.stream) catch |e| {
-                    ctx.err = e;
-                };
+
+            fn visit(ctx: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+                switch (instr.*) {
+                    .index_get => |ig| {
+                        // Non-ARC aggregate `object` with ARC-managed
+                        // extracted `dest` is the canonical destructure-
+                        // then-uniqueness pattern. Record both sides.
+                        if (!ctx.collector.isArcManagedLocal(ig.object) and ctx.collector.isArcManagedLocal(ig.dest)) {
+                            const has_independent_release = try ctx.collector.hasIndependentExtractionRelease(ig.dest);
+                            if (!has_independent_release) {
+                                try ctx.collector.non_arc_aggregates.put(ctx.collector.allocator, ig.object, {});
+                                const gop = try ctx.collector.extractions_by_aggregate.getOrPut(ctx.collector.allocator, ig.object);
+                                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                                try gop.value_ptr.append(ctx.collector.allocator, ig.dest);
+                            }
+                        }
+                    },
+                    .field_get => |fg| {
+                        if (!ctx.collector.isArcManagedLocal(fg.object) and ctx.collector.isArcManagedLocal(fg.dest)) {
+                            const has_independent_release = try ctx.collector.hasIndependentExtractionRelease(fg.dest);
+                            if (!has_independent_release) {
+                                try ctx.collector.non_arc_aggregates.put(ctx.collector.allocator, fg.object, {});
+                                const gop = try ctx.collector.extractions_by_aggregate.getOrPut(ctx.collector.allocator, fg.object);
+                                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                                try gop.value_ptr.append(ctx.collector.allocator, fg.dest);
+                            }
+                        }
+                    },
+                    else => {},
+                }
+                return .keep_walking;
             }
         };
+
+        var walker = ExplicitInstructionWalker.init(self.allocator);
+        defer walker.deinit();
         var ctx = Ctx{ .collector = self };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
+        _ = try walker.walkStream(stream, &ctx, Ctx.visit);
     }
 
     fn computePathSensitiveLastUses(self: *ComponentReleaseCollector) error{OutOfMemory}!void {
@@ -375,39 +541,23 @@ const ComponentReleaseCollector = struct {
         next_id: *arc_liveness.InstructionId,
         pointer_to_id: *std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
     ) error{OutOfMemory}!void {
-        for (stream) |*instr| {
-            const my_id = next_id.*;
-            next_id.* += 1;
-            try pointer_to_id.put(self.allocator, instr, my_id);
-            try self.numberChildren(instr, next_id, pointer_to_id);
-        }
-    }
-
-    /// Mirror `arc_liveness.flattenChildren`'s InstructionId numbering by
-    /// recursing into every child stream via the canonical enumerator —
-    /// including `union_switch.else_instrs`, previously skipped, which had
-    /// shifted every subsequent id below the analyzer's key.
-    fn numberChildren(
-        self: *ComponentReleaseCollector,
-        instr: *const ir.Instruction,
-        next_id: *arc_liveness.InstructionId,
-        pointer_to_id: *std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
-    ) error{OutOfMemory}!void {
         const Ctx = struct {
             collector: *ComponentReleaseCollector,
             next_id: *arc_liveness.InstructionId,
             pointer_to_id: *std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
-            err: ?error{OutOfMemory} = null,
-            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
-                if (ctx.err != null) return;
-                ctx.collector.numberStream(child.stream, ctx.next_id, ctx.pointer_to_id) catch |e| {
-                    ctx.err = e;
-                };
+
+            fn visit(ctx: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+                const my_id = ctx.next_id.*;
+                ctx.next_id.* += 1;
+                try ctx.pointer_to_id.put(ctx.collector.allocator, instr, my_id);
+                return .keep_walking;
             }
         };
+
+        var walker = ExplicitInstructionWalker.init(self.allocator);
+        defer walker.deinit();
         var ctx = Ctx{ .collector = self, .next_id = next_id, .pointer_to_id = pointer_to_id };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
+        _ = try walker.walkStream(stream, &ctx, Ctx.visit);
     }
 
     fn recordLastUse(
@@ -428,20 +578,52 @@ const ComponentReleaseCollector = struct {
         return self.ownership.arc_managed_locals.contains(local);
     }
 
-    /// FCC unified model: a boxed `Callable` HEAD or a `List(Callable)` TAIL
-    /// extracted from a temporary scrutinee tuple (`{:cont, value, next_state}`
-    /// over a `[fn(..) -> ..]`) is recorded in `deep_release_owned_locals`. Each
-    /// is a FRESH owned clone (`List.next`/`ownElement`/
-    /// `cloneRangeRetainingChildren`) MOVED OUT of the tuple, with its OWN
-    /// scope-exit DEEP release (a `.protocol_box_drop` for the head, a deep
-    /// `List` release for the tail) at its real last use. The aggregate-
-    /// component-release pass must therefore NOT also release it when the tuple
-    /// dies — doing both double-frees the box inner under `Memory.Tracking`.
-    /// The classic destructure pattern this pass serves (a plain `.owned`
-    /// String/scalar extracted from a tuple, with no separate deep release) is
-    /// NOT in the set, so it still gets the component release.
-    fn isOwnedBoxExtraction(self: *const ComponentReleaseCollector, dest: ir.LocalId) bool {
-        return self.function.deep_release_owned_locals.contains(dest);
+    /// Extractions recorded in `deep_release_owned_locals` usually have their
+    /// own release path outside tuple component release. Fresh boxed-Callable
+    /// clones returned by iterator `next` are the canonical case: the extracted
+    /// local owns the component outright, so releasing the tuple component too
+    /// would double-release the same owner.
+    ///
+    /// A persistently retained extraction is different. Under clone-on-share
+    /// managers, the retain may rebind the extracted local to an independent
+    /// clone, leaving the original value still owned by the aggregate. That
+    /// original must still be released by the aggregate-component path even if
+    /// the retained clone later moves through a `unique` call.
+    fn hasIndependentExtractionRelease(self: *const ComponentReleaseCollector, dest: ir.LocalId) error{OutOfMemory}!bool {
+        if (!self.function.deep_release_owned_locals.contains(dest)) return false;
+        return !(try self.localHasPersistentRetain(dest));
+    }
+
+    fn localHasPersistentRetain(self: *const ComponentReleaseCollector, local: ir.LocalId) error{OutOfMemory}!bool {
+        for (self.function.body) |block| {
+            if (try streamHasPersistentRetain(self.allocator, block.instructions, local)) return true;
+        }
+        return false;
+    }
+
+    fn streamHasPersistentRetain(
+        allocator: std.mem.Allocator,
+        stream: []const ir.Instruction,
+        local: ir.LocalId,
+    ) error{OutOfMemory}!bool {
+        const Ctx = struct {
+            local: ir.LocalId,
+            found: bool = false,
+
+            fn visit(ctx: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+                if (instr.* == .retain and instr.retain.value == ctx.local and instr.retain.kind == .persistent) {
+                    ctx.found = true;
+                    return .stop;
+                }
+                return .keep_walking;
+            }
+        };
+
+        var walker = ExplicitInstructionWalker.init(allocator);
+        defer walker.deinit();
+        var ctx = Ctx{ .local = local };
+        _ = try walker.walkStream(stream, &ctx, Ctx.visit);
+        return ctx.found;
     }
 
     fn scheduleComponentReleases(
@@ -470,67 +652,14 @@ const ComponentReleaseCollector = struct {
         active: *ActiveExtractions,
         by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
     ) error{OutOfMemory}!void {
-        for (stream) |*instr| {
-            const id = pointer_to_id.get(instr).?;
-            try self.activateExtraction(instr.*, active);
-            try self.scheduleInstructionReleases(instr.*, id, active, by_last_use);
-            try self.scheduleChildren(instr, pointer_to_id, active, by_last_use);
-        }
-    }
-
-    /// Recurse into every nested sub-stream via `ir.forEachChildStream`
-    /// (the canonical enumerator), preserving the existing per-slot
-    /// dataflow: `case_block.pre_instrs` shares the parent's active-
-    /// extraction set (control flows straight through), every other
-    /// sub-stream is branched (cloned active set per arm). Routing through
-    /// the enumerator means `union_switch.else_instrs` — previously
-    /// skipped here — is now scheduled like any other arm.
-    fn scheduleChildren(
-        self: *ComponentReleaseCollector,
-        instr: *const ir.Instruction,
-        pointer_to_id: *const std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
-        active: *ActiveExtractions,
-        by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
-    ) error{OutOfMemory}!void {
-        const Ctx = struct {
-            collector: *ComponentReleaseCollector,
-            pointer_to_id: *const std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
-            active: *ActiveExtractions,
-            by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
-            err: ?error{OutOfMemory} = null,
-            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
-                if (ctx.err != null) return;
-                const result = if (child.kind == .case_pre)
-                    // pre_instrs runs before the arms in the parent scope:
-                    // it shares the active set (no clone).
-                    ctx.collector.scheduleStream(child.stream, ctx.pointer_to_id, ctx.active, ctx.by_last_use)
-                else
-                    ctx.collector.scheduleBranchedStream(child.stream, ctx.pointer_to_id, ctx.active, ctx.by_last_use);
-                result catch |e| {
-                    ctx.err = e;
-                };
-            }
-        };
-        var ctx = Ctx{
+        var walker = ComponentReleaseScheduleWalker{
+            .allocator = self.allocator,
             .collector = self,
             .pointer_to_id = pointer_to_id,
-            .active = active,
             .by_last_use = by_last_use,
         };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
-    }
-
-    fn scheduleBranchedStream(
-        self: *ComponentReleaseCollector,
-        stream: []const ir.Instruction,
-        pointer_to_id: *const std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
-        active: *const ActiveExtractions,
-        by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
-    ) error{OutOfMemory}!void {
-        var branch_active = try active.clone();
-        defer branch_active.deinit();
-        try self.scheduleStream(stream, pointer_to_id, &branch_active, by_last_use);
+        defer walker.deinit();
+        try walker.walk(stream, active);
     }
 
     fn activateExtraction(
@@ -561,8 +690,8 @@ const ComponentReleaseCollector = struct {
         by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
     ) error{OutOfMemory}!void {
         var uses = arc_liveness.UseList{};
-        defer uses.deinit(std.heap.page_allocator);
-        arc_liveness.collectUses(instr, &uses);
+        defer uses.deinit(self.allocator);
+        try arc_liveness.collectUses(self.allocator, instr, &uses);
         for (uses.slice()) |local| {
             const last_use_ids = self.last_use_by_aggregate.get(local) orelse continue;
             if (!containsInstructionId(last_use_ids.items, id)) continue;
@@ -603,6 +732,134 @@ const ActiveExtractions = struct {
         const gop = try self.by_aggregate.getOrPut(self.allocator, aggregate);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try appendUniqueLocal(self.allocator, gop.value_ptr, component);
+    }
+};
+
+const ComponentReleaseScheduleFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+    active: *ActiveExtractions,
+    owns_active: bool = false,
+
+    fn deinit(self: *ComponentReleaseScheduleFrame, allocator: std.mem.Allocator) void {
+        if (!self.owns_active) return;
+        self.active.deinit();
+        allocator.destroy(self.active);
+    }
+};
+
+const ComponentReleaseScheduleWalker = struct {
+    allocator: std.mem.Allocator,
+    collector: *ComponentReleaseCollector,
+    pointer_to_id: *const std.AutoHashMapUnmanaged(*const ir.Instruction, arc_liveness.InstructionId),
+    by_last_use: *std.AutoHashMapUnmanaged(arc_liveness.InstructionId, std.ArrayListUnmanaged(ir.LocalId)),
+    frames: ExplicitInlineStack(ComponentReleaseScheduleFrame, explicit_walk_inline_frame_capacity) = .{},
+    child_streams: ExplicitInlineStack(ir.ChildStream, explicit_walk_inline_child_capacity) = .{},
+
+    fn deinit(self: *ComponentReleaseScheduleWalker) void {
+        while (self.frames.len() != 0) {
+            var frame = self.frames.pop();
+            frame.deinit(self.allocator);
+        }
+        self.frames.deinit(self.allocator);
+        self.child_streams.deinit(self.allocator);
+    }
+
+    fn walk(
+        self: *ComponentReleaseScheduleWalker,
+        root_stream: []const ir.Instruction,
+        root_active: *ActiveExtractions,
+    ) error{OutOfMemory}!void {
+        if (root_stream.len == 0) return;
+        try self.pushFrame(root_stream, root_active, false);
+
+        while (self.frames.len() != 0) {
+            const frame = self.frames.topPtr();
+            if (frame.next_index >= frame.stream.len) {
+                var finished = self.frames.pop();
+                finished.deinit(self.allocator);
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            const active = frame.active;
+            frame.next_index += 1;
+
+            const id = self.pointer_to_id.get(instr).?;
+            try self.collector.activateExtraction(instr.*, active);
+            try self.collector.scheduleInstructionReleases(instr.*, id, active, self.by_last_use);
+            try self.pushInstructionChildren(instr, active);
+        }
+    }
+
+    fn pushInstructionChildren(
+        self: *ComponentReleaseScheduleWalker,
+        instr: *const ir.Instruction,
+        active: *ActiveExtractions,
+    ) error{OutOfMemory}!void {
+        self.child_streams.clearRetainingCapacity();
+
+        const ChildCollector = struct {
+            walker: *ComponentReleaseScheduleWalker,
+            err: ?error{OutOfMemory} = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                ctx.walker.child_streams.append(ctx.walker.allocator, child) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        var collector = ChildCollector{ .walker = self };
+        ir.forEachChildStream(instr, &collector, ChildCollector.onStream);
+        if (collector.err) |err| return err;
+
+        var child_index = self.child_streams.len();
+        while (child_index > 0) {
+            child_index -= 1;
+            const child = self.child_streams.get(child_index);
+
+            if (child.kind == .case_pre) {
+                if (child.stream.len != 0) try self.pushFrame(child.stream, active, false);
+                continue;
+            }
+
+            const branch_active = try self.cloneActive(active);
+            if (child.stream.len == 0) {
+                branch_active.deinit();
+                self.allocator.destroy(branch_active);
+                continue;
+            }
+            try self.pushFrame(child.stream, branch_active, true);
+        }
+    }
+
+    fn cloneActive(
+        self: *ComponentReleaseScheduleWalker,
+        active: *const ActiveExtractions,
+    ) error{OutOfMemory}!*ActiveExtractions {
+        const branch_active = try self.allocator.create(ActiveExtractions);
+        errdefer self.allocator.destroy(branch_active);
+        branch_active.* = try active.clone();
+        return branch_active;
+    }
+
+    fn pushFrame(
+        self: *ComponentReleaseScheduleWalker,
+        stream: []const ir.Instruction,
+        active: *ActiveExtractions,
+        owns_active: bool,
+    ) error{OutOfMemory}!void {
+        errdefer if (owns_active) {
+            active.deinit();
+            self.allocator.destroy(active);
+        };
+        try self.frames.append(self.allocator, .{
+            .stream = stream,
+            .active = active,
+            .owns_active = owns_active,
+        });
     }
 };
 
@@ -673,7 +930,7 @@ const ComponentAggregateLiveness = struct {
 
             var next_live = try instruction_live_after.clone(self.collector.allocator);
             self.applyDefs(instr.*, &next_live);
-            self.applyUses(instr.*, &next_live);
+            try self.applyUses(instr.*, &next_live);
 
             current_live.deinit(self.collector.allocator);
             current_live = next_live;
@@ -774,8 +1031,8 @@ const ComponentAggregateLiveness = struct {
         live_after: *const ComponentLocalSet,
     ) error{OutOfMemory}!void {
         var uses = arc_liveness.UseList{};
-        defer uses.deinit(std.heap.page_allocator);
-        arc_liveness.collectUses(instr, &uses);
+        defer uses.deinit(self.collector.allocator);
+        try arc_liveness.collectUses(self.collector.allocator, instr, &uses);
         for (uses.slice()) |local| {
             const bit_index = self.local_to_index.get(local) orelse continue;
             if (live_after.contains(bit_index)) continue;
@@ -790,10 +1047,10 @@ const ComponentAggregateLiveness = struct {
         }
     }
 
-    fn applyUses(self: *ComponentAggregateLiveness, instr: ir.Instruction, set: *ComponentLocalSet) void {
+    fn applyUses(self: *ComponentAggregateLiveness, instr: ir.Instruction, set: *ComponentLocalSet) error{OutOfMemory}!void {
         var uses = arc_liveness.UseList{};
-        defer uses.deinit(std.heap.page_allocator);
-        arc_liveness.collectUses(instr, &uses);
+        defer uses.deinit(self.collector.allocator);
+        try arc_liveness.collectUses(self.collector.allocator, instr, &uses);
         for (uses.slice()) |local| {
             if (self.local_to_index.get(local)) |bit_index| set.set(bit_index);
         }
@@ -952,7 +1209,10 @@ const ComponentReleaseRebuilder = struct {
             buf[write_idx] = outcome.rebuilt_instr orelse stream[idx];
             write_idx += 1;
             for (outcome.releases_after.items) |comp_local| {
-                buf[write_idx] = ir.Instruction{ .release = .{ .value = comp_local } };
+                buf[write_idx] = ir.Instruction{ .release = .{
+                    .value = comp_local,
+                    .kind = .aggregate_component,
+                } };
                 write_idx += 1;
             }
         }
@@ -1164,8 +1424,8 @@ fn relocateDropsInTopLevelStream(
     // shares clone the inner via `protocol_box_share`), so freeing a box after
     // its OWN last use can never dangle another owner. The one remaining
     // hazard — freeing the box before a LATER use of the box itself inside a
-    // nested arm — is handled by `lastUseInPreDropRegion`, which recurses
-    // through every nested sub-stream (audit arc-drop-verify--02): a use in an
+    // nested arm — is handled by `lastUseInPreDropRegion`, which walks every
+    // nested sub-stream (audit arc-drop-verify--02): a use in an
     // `if`/`case` arm is reported at the enclosing branch's top-level index, so
     // the drop relocates to AFTER the branch and the box stays live across it.
     // This is why the box exemption is sound for branchy regions without the
@@ -1176,16 +1436,16 @@ fn relocateDropsInTopLevelStream(
         const drop_local = drop_instr.release.value;
         const relocatable = drop_instr.release.kind == .protocol_box_drop or
             (region_is_straight_line and
-            !localIsEmbeddedOrShared(stream[0..drop_run_start], drop_local));
+                !localIsEmbeddedOrShared(stream[0..drop_run_start], drop_local));
         if (!relocatable) {
             try kept_drops.append(allocator, drop_instr);
             continue;
         }
-        const last_use = lastUseInPreDropRegion(
+        const last_use = try lastUseInPreDropRegion(
             allocator,
             stream[0..drop_run_start],
             drop_local,
-        ) catch null;
+        );
         if (last_use) |use_index| {
             try relocations.append(allocator, .{ .drop = drop_instr, .after_index = use_index });
         } else {
@@ -1297,8 +1557,8 @@ fn localIsEmbeddedOrShared(region: []const ir.Instruction, local: ir.LocalId) bo
 /// Grow `closure` by one forward alias pass over `instr` and every NESTED
 /// sub-stream it hosts: any ownership-neutral copy
 /// (`copy_value`/`borrow_value`/`local_get`/`move_value`/`share_value`) whose
-/// SOURCE is already in the closure adds its DEST. Recurses through all child
-/// streams via the canonical `ir.forEachChildStream` so an alias created
+/// SOURCE is already in the closure adds its DEST. Walks all child streams via
+/// the canonical child-stream enumerator so an alias created
 /// inside a branch/case arm (e.g. a `copy_value` of the box in an `if`
 /// then-arm) is tracked — closing the gap that made `lastUseInPreDropRegion`
 /// top-level-only (audit arc-drop-verify--02). Sets `changed` true when it
@@ -1309,74 +1569,71 @@ fn growAliasClosureThroughInstruction(
     closure: *std.AutoHashMapUnmanaged(ir.LocalId, void),
     changed: *bool,
 ) error{OutOfMemory}!void {
-    const alias: ?struct { src: ir.LocalId, dest: ir.LocalId } = switch (instr.*) {
-        .copy_value => |x| .{ .src = x.source, .dest = x.dest },
-        .borrow_value => |x| .{ .src = x.source, .dest = x.dest },
-        .local_get => |x| .{ .src = x.source, .dest = x.dest },
-        .move_value => |x| .{ .src = x.source, .dest = x.dest },
-        .share_value => |x| .{ .src = x.source, .dest = x.dest },
-        else => null,
-    };
-    if (alias) |a| {
-        if (closure.contains(a.src) and !closure.contains(a.dest)) {
-            try closure.put(allocator, a.dest, {});
-            changed.* = true;
-        }
-    }
-
     const Ctx = struct {
         allocator: std.mem.Allocator,
         closure: *std.AutoHashMapUnmanaged(ir.LocalId, void),
         changed: *bool,
-        err: ?error{OutOfMemory} = null,
-        fn onStream(ctx: *@This(), child: ir.ChildStream) void {
-            if (ctx.err != null) return;
-            for (child.stream) |*nested| {
-                growAliasClosureThroughInstruction(ctx.allocator, nested, ctx.closure, ctx.changed) catch |e| {
-                    ctx.err = e;
-                    return;
-                };
+
+        fn visit(ctx: *@This(), current: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+            const alias: ?struct { src: ir.LocalId, dest: ir.LocalId } = switch (current.*) {
+                .copy_value => |x| .{ .src = x.source, .dest = x.dest },
+                .borrow_value => |x| .{ .src = x.source, .dest = x.dest },
+                .local_get => |x| .{ .src = x.source, .dest = x.dest },
+                .move_value => |x| .{ .src = x.source, .dest = x.dest },
+                .share_value => |x| .{ .src = x.source, .dest = x.dest },
+                else => null,
+            };
+            if (alias) |a| {
+                if (ctx.closure.contains(a.src) and !ctx.closure.contains(a.dest)) {
+                    try ctx.closure.put(ctx.allocator, a.dest, {});
+                    ctx.changed.* = true;
+                }
             }
+            return .keep_walking;
         }
     };
+
+    var walker = ExplicitInstructionWalker.init(allocator);
+    defer walker.deinit();
     var ctx = Ctx{ .allocator = allocator, .closure = closure, .changed = changed };
-    ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-    if (ctx.err) |e| return e;
+    _ = try walker.walkInstructionAndChildren(instr, &ctx, Ctx.visit);
 }
 
-/// True when `instr`, or ANY instruction in ANY of its nested sub-streams
-/// (recursively, via `ir.forEachChildStream`), reads a local in `closure`.
+/// True when `instr`, or ANY instruction in ANY of its nested sub-streams,
+/// reads a local in `closure`.
 /// Used by `lastUseInPreDropRegion` to anchor a nested use of the dropped box
 /// (e.g. a dispatch inside an `if`/`case` arm) to its enclosing TOP-LEVEL
 /// instruction's index — `arc_liveness.collectUses` itself sees only an
 /// instruction's own immediate operands (for a branch op: the condition and
 /// arm RESULT locals, never the locals consumed inside an arm body).
 fn instructionOrChildrenUseClosure(
+    allocator: std.mem.Allocator,
     instr: *const ir.Instruction,
     closure: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
-) bool {
-    var uses = arc_liveness.UseList{};
-    defer uses.deinit(std.heap.page_allocator);
-    arc_liveness.collectUses(instr.*, &uses);
-    for (uses.slice()) |used_local| {
-        if (closure.contains(used_local)) return true;
-    }
-
+) error{OutOfMemory}!bool {
     const Ctx = struct {
+        allocator: std.mem.Allocator,
         closure: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
         found: bool = false,
-        fn onStream(ctx: *@This(), child: ir.ChildStream) void {
-            if (ctx.found) return;
-            for (child.stream) |*nested| {
-                if (instructionOrChildrenUseClosure(nested, ctx.closure)) {
+
+        fn visit(ctx: *@This(), current: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+            var uses = arc_liveness.UseList{};
+            defer uses.deinit(ctx.allocator);
+            try arc_liveness.collectUses(ctx.allocator, current.*, &uses);
+            for (uses.slice()) |used_local| {
+                if (ctx.closure.contains(used_local)) {
                     ctx.found = true;
-                    return;
+                    return .stop;
                 }
             }
+            return .keep_walking;
         }
     };
-    var ctx = Ctx{ .closure = closure };
-    ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+
+    var walker = ExplicitInstructionWalker.init(allocator);
+    defer walker.deinit();
+    var ctx = Ctx{ .allocator = allocator, .closure = closure };
+    _ = try walker.walkInstructionAndChildren(instr, &ctx, Ctx.visit);
     return ctx.found;
 }
 
@@ -1391,7 +1648,7 @@ fn instructionOrChildrenUseClosure(
 /// box parked in `add5` is read only by a `copy_value` whose result feeds the
 /// dispatch call, so the box's effective extent is that of the copy.
 ///
-/// Both the alias closure and the use scan recurse through nested sub-streams
+/// Both the alias closure and the use scan walk nested sub-streams
 /// (audit arc-drop-verify--02). A use inside a branch/case arm is reported at
 /// the index of its ENCLOSING top-level instruction (the whole `if_expr` /
 /// `case_block`), so the caller relocates the drop to AFTER that branch — the
@@ -1422,7 +1679,7 @@ fn lastUseInPreDropRegion(
     // use sets of every nested sub-stream it hosts — intersects the closure.
     var last_use: ?usize = null;
     for (region, 0..) |*instr, idx| {
-        if (instructionOrChildrenUseClosure(instr, &closure)) {
+        if (try instructionOrChildrenUseClosure(allocator, instr, &closure)) {
             last_use = idx;
         }
     }
@@ -1577,27 +1834,46 @@ const StreamRebuilder = struct {
                 for (sr.cases, 0..) |case, idx| {
                     const new_body_opt = try self.rebuildStream(case.body_instrs);
                     const arm_retain = try self.armRetainForReturnValue(parent_id, case.return_value);
-                    if (new_body_opt == null and arm_retain == null) continue;
+                    const arm_drops = try self.implicitReturnArmDrops(
+                        parent_id,
+                        @intCast(idx),
+                        false,
+                    );
+                    if (new_body_opt == null and arm_retain == null and arm_drops.len == 0) continue;
                     if (new_cases == null) {
                         const buf = try self.allocator.alloc(ir.ReturnCase, sr.cases.len);
                         for (sr.cases, 0..) |orig, j| buf[j] = orig;
                         new_cases = buf;
                     }
                     const base_body: []const ir.Instruction = new_body_opt orelse case.body_instrs;
-                    const final_body: []const ir.Instruction = if (arm_retain) |retain_instr|
-                        try self.appendInstruction(base_body, retain_instr)
-                    else
-                        base_body;
+                    const final_body = try self.appendImplicitReturnOps(base_body, arm_retain, arm_drops);
                     var case_copy = case;
                     case_copy.body_instrs = final_body;
                     new_cases.?[idx] = case_copy;
                     any_case_changed = true;
                 }
                 const new_default = try self.rebuildStream(sr.default_instrs);
-                if (!any_case_changed and new_default == null) return .{ .rebuilt = null };
+                const default_retain = try self.armRetainForReturnValue(parent_id, sr.default_result);
+                const default_drops = try self.implicitReturnArmDrops(
+                    parent_id,
+                    @intCast(sr.cases.len),
+                    true,
+                );
+                if (!any_case_changed and
+                    new_default == null and
+                    default_retain == null and
+                    default_drops.len == 0)
+                {
+                    return .{ .rebuilt = null };
+                }
                 var copy = sr;
                 if (new_cases) |cases| copy.cases = cases;
-                if (new_default) |s| copy.default_instrs = s;
+                const default_base: []const ir.Instruction = new_default orelse sr.default_instrs;
+                copy.default_instrs = try self.appendImplicitReturnOps(
+                    default_base,
+                    default_retain,
+                    default_drops,
+                );
                 return .{ .rebuilt = ir.Instruction{ .switch_return = copy } };
             },
             .union_switch_return => |usr| {
@@ -1606,17 +1882,19 @@ const StreamRebuilder = struct {
                 for (usr.cases, 0..) |case, idx| {
                     const new_body_opt = try self.rebuildStream(case.body_instrs);
                     const arm_retain = try self.armRetainForReturnValue(parent_id, case.return_value);
-                    if (new_body_opt == null and arm_retain == null) continue;
+                    const arm_drops = try self.implicitReturnArmDrops(
+                        parent_id,
+                        @intCast(idx),
+                        false,
+                    );
+                    if (new_body_opt == null and arm_retain == null and arm_drops.len == 0) continue;
                     if (new_cases == null) {
                         const buf = try self.allocator.alloc(ir.UnionCase, usr.cases.len);
                         for (usr.cases, 0..) |orig, j| buf[j] = orig;
                         new_cases = buf;
                     }
                     const base_body: []const ir.Instruction = new_body_opt orelse case.body_instrs;
-                    const final_body: []const ir.Instruction = if (arm_retain) |retain_instr|
-                        try self.appendInstruction(base_body, retain_instr)
-                    else
-                        base_body;
+                    const final_body = try self.appendImplicitReturnOps(base_body, arm_retain, arm_drops);
                     var case_copy = case;
                     case_copy.body_instrs = final_body;
                     new_cases.?[idx] = case_copy;
@@ -1715,6 +1993,12 @@ const StreamRebuilder = struct {
         instr: *const ir.Instruction,
         id: arc_liveness.InstructionId,
     ) error{OutOfMemory}![]ir.Instruction {
+        switch (instr.*) {
+            .switch_return,
+            .union_switch_return,
+            => return &.{},
+            else => {},
+        }
         if (!isReturnEquivalentTerminator(instr.*)) return &.{};
         const maybe_live_set = self.ownership.live_before_ret.get(id);
         const maybe_owned_set = self.ownership.owned_at_ret.get(id);
@@ -1765,39 +2049,7 @@ const StreamRebuilder = struct {
                 try seen.put(self.allocator, local_id, {});
 
                 if (args_view.containsLocal(local_id)) continue;
-                // Return-source locals transfer their existing
-                // ownership unit to the caller's return slot. Emitting
-                // a scope-exit release for one would destroy the value
-                // immediately before `ret`, leaving the caller with a
-                // dangling ARC cell.
-                if (self.ownership.return_source_locals.contains(local_id)) continue;
-                // Phase B (Phase 6 redux plan §3.B): skip LocalIds bound
-                // to a `borrowed` formal parameter. The caller owns the
-                // value across the entire call (caller-side `share_value`
-                // retain + post-call `release` ABI), so the callee must
-                // not emit a scope-exit destroy on the parameter local.
-                // Emitting one would double-free at Phase F when the
-                // .map flag is flipped: the caller's post-call release
-                // would decrement an already-destroyed cell.
-                if (isBorrowedParameterLocal(self.function, local_id)) continue;
-                // Phase C (Phase 6 redux plan §3.C): skip LocalIds whose
-                // ownership class was refined to `.borrowed` by
-                // `arc_ownership.classifyAndNormalize` — these are
-                // produced by `.borrow_value` instructions, which alias
-                // an existing owner without bumping its refcount. A
-                // scope-exit destroy on a borrow would decrement the
-                // source's cell without a matching retain, leading to
-                // premature free. Mirrors the parameter filter above:
-                // both are borrows whose underlying owner outlives the
-                // borrow's scope.
-                if (isBorrowedLocal(self.function, local_id)) continue;
-                // A `param_get` after an `.owned` parameter slot was
-                // consumed is a non-owning refetch of that slot's
-                // storage, not a fresh +1. Backward liveness still
-                // sees the local as used before the terminator; the
-                // ownership side table records the stronger fact so
-                // drop insertion does not synthesize a stale release.
-                if (self.ownership.non_owning_param_refetches.contains(local_id)) continue;
+                if (try self.shouldSkipScopeExitRelease(local_id)) continue;
                 try releases.append(self.allocator, ir.Instruction{
                     .release = .{ .value = local_id },
                 });
@@ -1805,6 +2057,46 @@ const StreamRebuilder = struct {
         }
 
         return try releases.toOwnedSlice(self.allocator);
+    }
+
+    fn implicitReturnArmDrops(
+        self: *StreamRebuilder,
+        parent_id: arc_liveness.InstructionId,
+        arm_index: u32,
+        is_default: bool,
+    ) error{OutOfMemory}![]ir.Instruction {
+        const key = arc_liveness.ArcOwnership.returnArmKey(parent_id, arm_index, is_default);
+        const owned_set = self.ownership.owned_at_return_arm.get(key) orelse return &.{};
+        if (owned_set.count() == 0) return &.{};
+
+        var releases: std.ArrayListUnmanaged(ir.Instruction) = .empty;
+        errdefer releases.deinit(self.allocator);
+        try releases.ensureTotalCapacity(self.allocator, owned_set.count());
+
+        var iter = owned_set.keyIterator();
+        while (iter.next()) |local_ptr| {
+            const local_id = local_ptr.*;
+            if (try self.shouldSkipScopeExitRelease(local_id)) continue;
+            try releases.append(self.allocator, ir.Instruction{
+                .release = .{ .value = local_id },
+            });
+        }
+
+        return try releases.toOwnedSlice(self.allocator);
+    }
+
+    fn shouldSkipScopeExitRelease(self: *const StreamRebuilder, local_id: ir.LocalId) error{OutOfMemory}!bool {
+        // Return-source locals transfer their existing ownership unit
+        // to the caller's return slot. Emitting a scope-exit release
+        // would destroy the value immediately before return.
+        if (self.ownership.return_source_locals.contains(local_id)) return true;
+        // Phase B: borrowed formal parameters are owned by the caller.
+        if (try isBorrowedParameterLocal(self.allocator, self.function, local_id)) return true;
+        // Phase C: borrowed locals alias another owner without a +1.
+        if (isBorrowedLocal(self.function, local_id)) return true;
+        // Owned-param aliases refetched after consume do not own a +1.
+        if (self.ownership.non_owning_param_refetches.contains(local_id)) return true;
+        return false;
     }
 
     fn dropsForCaseBreak(
@@ -1825,7 +2117,7 @@ const StreamRebuilder = struct {
             if (case_result) |result| {
                 if (local_id == result) continue;
             }
-            if (isBorrowedParameterLocal(self.function, local_id)) continue;
+            if (try isBorrowedParameterLocal(self.allocator, self.function, local_id)) continue;
             if (isBorrowedLocal(self.function, local_id)) continue;
             try releases.append(self.allocator, ir.Instruction{
                 .release = .{ .value = local_id },
@@ -1893,6 +2185,36 @@ const StreamRebuilder = struct {
         const return_value = return_value_opt orelse return null;
         if (!self.shouldRetainReturnValue(parent_id, return_value)) return null;
         return ir.Instruction{ .retain = .{ .value = return_value } };
+    }
+
+    fn appendImplicitReturnOps(
+        self: *StreamRebuilder,
+        base: []const ir.Instruction,
+        retain_instr: ?ir.Instruction,
+        drops: []const ir.Instruction,
+    ) error{OutOfMemory}![]const ir.Instruction {
+        const retain_count: usize = if (retain_instr == null) 0 else 1;
+        if (retain_count == 0 and drops.len == 0) return base;
+
+        const buf = try self.allocator.alloc(ir.Instruction, base.len + retain_count + drops.len);
+        for (base, 0..) |item, idx| buf[idx] = item;
+
+        var write_index = base.len;
+        // A multi-arm return's value is materialized by the parent
+        // switch_return, not by a real `.ret` instruction in the arm.
+        // Promote that arm value before releasing incoming owners so
+        // an alias return such as `case 0 -> acc` cannot be freed
+        // before the return-slot retain observes it.
+        if (retain_instr) |instr| {
+            buf[write_index] = instr;
+            write_index += 1;
+        }
+        for (drops) |drop| {
+            buf[write_index] = drop;
+            write_index += 1;
+        }
+        std.debug.assert(write_index == buf.len);
+        return buf;
     }
 
     /// Common predicate: should the pass insert a `.retain{value=L}`
@@ -2051,10 +2373,11 @@ fn isReturnEquivalentTerminator(instr: ir.Instruction) bool {
 /// numbering assumption silently mis-classifies binding locals as
 /// parameters (or vice versa).
 fn isBorrowedParameterLocal(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     local_id: ir.LocalId,
-) bool {
-    const param_index = paramIndexForLocal(function, local_id) orelse return false;
+) error{OutOfMemory}!bool {
+    const param_index = (try paramIndexForLocal(allocator, function, local_id)) orelse return false;
     if (param_index >= function.param_conventions.len) return false;
     return function.param_conventions[param_index] == .borrowed;
 }
@@ -2072,9 +2395,10 @@ fn isBorrowedParameterLocal(
 /// dispatch vs try-variant), so the only reliable mapping is the
 /// one literal `param_get` site.
 fn paramIndexForLocal(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     local_id: ir.LocalId,
-) ?u32 {
+) error{OutOfMemory}!?u32 {
     const Visitor = struct {
         target: ir.LocalId,
         result: ?u32,
@@ -2088,7 +2412,7 @@ fn paramIndexForLocal(
         }
     };
     var visitor = Visitor{ .target = local_id, .result = null };
-    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    try ir.forEachInstruction(allocator, function, &visitor, Visitor.visit);
     return visitor.result;
 }
 
@@ -2159,10 +2483,18 @@ fn isBorrowedLocal(
 /// consumption-site lowering surface (Phase 1.2.5.d) rather than
 /// the analysis-driven drop scheduler.
 ///
+/// `allocator` is the pipeline allocator used by the surrounding ARC
+/// transformation passes. The binding-target pre-scan and explicit traversal
+/// stacks use temporary allocations whose failures must propagate because
+/// retain classification and full nested-stream coverage depend on them.
+///
 /// Idempotent: re-running the pass against an already-rewritten
 /// function is a no-op because the second iteration's
 /// `kind != .release` skip-check fires.
-pub fn rewriteProtocolBoxReleases(function: *ir.Function) void {
+pub fn rewriteProtocolBoxReleases(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+) std.mem.Allocator.Error!void {
     if (function.protocol_box_locals.count() == 0) return;
 
     // FCC Phase 2 clone-on-share: to decide whether a PERSISTENT box retain
@@ -2176,143 +2508,136 @@ pub fn rewriteProtocolBoxReleases(function: *ir.Function) void {
     // in-place and never re-bound. Collect the set of box locals that flow
     // into a `local_set` once, up front, then consult it per retain.
     var binding_targets: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
-    defer binding_targets.deinit(std.heap.page_allocator);
-    collectLocalSetValueLocals(function.body, &binding_targets);
+    defer binding_targets.deinit(allocator);
+    try collectLocalSetValueLocals(allocator, function, &binding_targets);
 
     for (function.body) |*block_const| {
         const block: *ir.Block = @constCast(block_const);
-        rewriteProtocolBoxReleasesInStream(function, @constCast(block.instructions), &binding_targets);
+        try rewriteProtocolBoxReleasesInStream(allocator, function, @constCast(block.instructions), &binding_targets);
     }
 }
 
 /// Collect every local that appears as the `value` operand of a `local_set`
-/// anywhere in the function body (recursing into nested control-flow
+/// anywhere in the function body (walking nested control-flow
 /// streams). Used by `rewriteProtocolBoxReleases` to recognise a box value
 /// that becomes a named binding (a genuine new owner) versus a transient
 /// borrow consumed in place.
 fn collectLocalSetValueLocals(
-    blocks: []const ir.Block,
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
     out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
-) void {
-    for (blocks) |block| {
-        collectLocalSetValueLocalsInStream(block.instructions, out);
-    }
-}
+) std.mem.Allocator.Error!void {
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+        err: ?std.mem.Allocator.Error = null,
 
-fn collectLocalSetValueLocalsInStream(
-    stream: []const ir.Instruction,
-    out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
-) void {
-    // Recurse into every nested sub-stream via the canonical enumerator
-    // (covers union_switch.else_instrs that the old switch skipped) so a
-    // `local_set` buried in any control-flow arm is observed.
-    for (stream) |*instr| {
-        if (instr.* == .local_set) {
-            out.put(std.heap.page_allocator, instr.local_set.value, {}) catch {};
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (self.err != null or instr.* != .local_set) return;
+            self.out.put(self.allocator, instr.local_set.value, {}) catch |err| {
+                self.err = err;
+            };
         }
-        const Ctx = struct {
-            out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
-            fn onStream(self: *@This(), child: ir.ChildStream) void {
-                collectLocalSetValueLocalsInStream(child.stream, self.out);
-            }
-        };
-        var ctx = Ctx{ .out = out };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-    }
+    };
+
+    var ctx = Ctx{ .allocator = allocator, .out = out };
+    try ir.forEachInstruction(allocator, function, &ctx, Ctx.visit);
+    if (ctx.err) |err| return err;
 }
 
 fn rewriteProtocolBoxReleasesInStream(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     stream: []ir.Instruction,
     binding_targets: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
-) void {
-    for (stream) |*instr_ptr| {
-        switch (instr_ptr.*) {
-            .release => |rel| {
-                if (rel.kind == .release) {
-                    if (function.protocol_box_locals.get(rel.value)) |protocol_name| {
-                        instr_ptr.* = .{ .release = .{
-                            .value = rel.value,
-                            .kind = .protocol_box_drop,
-                            .protocol_name = protocol_name,
-                        } };
+) std.mem.Allocator.Error!void {
+    const Ctx = struct {
+        function: *const ir.Function,
+        binding_targets: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+            const instr_ptr: *ir.Instruction = @constCast(instr);
+            switch (instr_ptr.*) {
+                .release => |rel| {
+                    if (rel.kind == .release or rel.kind == .aggregate_component) {
+                        if (self.function.protocol_box_locals.get(rel.value)) |protocol_name| {
+                            instr_ptr.* = .{ .release = .{
+                                .value = rel.value,
+                                .kind = if (rel.kind == .aggregate_component)
+                                    .aggregate_component
+                                else
+                                    .protocol_box_drop,
+                                .protocol_name = protocol_name,
+                            } };
+                        }
                     }
-                }
-            },
-            // Symmetric to the release rewrite: a `.retain` of a known
-            // protocol-box local must route through the synthetic
-            // `<Protocol>VTable.{retain,share}(box)` helpers, not the
-            // generic `retainAny`/`retainAnyPersistent` dispatchers (both
-            // `@compileError` on a 16-byte `ProtocolBox` value — they
-            // accept only single-item pointers).
-            //
-            // FCC Phase 2 distinguishes the two retain PURPOSES that the
-            // generic ARC pipeline records on the box local, because under
-            // a no-REFCOUNT_V1 manager they need different handling:
-            //   * `.normal` — a TRANSIENT borrow (call-argument share)
-            //     balanced by a matching post-call `.release`. Flip to
-            //     `.protocol_box_retain` (a real refcount bump under a
-            //     refcount manager; a no-op under no-REFCOUNT_V1, where the
-            //     paired release is also elided). NO clone.
-            //   * `.persistent` — a genuine SECOND OWNER with its own
-            //     scope-exit `.protocol_box_drop` (a binding alias `g = f`,
-            //     a box stashed into a struct field). Flip to
-            //     `.protocol_box_share`, which under no-REFCOUNT_V1 CLONES
-            //     the inner and rebinds the new owner so each owner frees
-            //     its own inner exactly once (no double-free under
-            //     `Memory.Tracking`). Cloning a transient borrow instead
-            //     would leak (its drop is the borrow site's, not a
-            //     scope-exit owner drop).
-            // Already-rewritten box retains are left alone (idempotent
-            // re-run guard).
-            .retain => |ret| {
+                },
+                // Symmetric to the release rewrite: a `.retain` of a known
+                // protocol-box local must route through the synthetic
+                // `<Protocol>VTable.{retain,share}(box)` helpers, not the
+                // generic `retainAny`/`retainAnyPersistent` dispatchers (both
+                // `@compileError` on a 16-byte `ProtocolBox` value — they
+                // accept only single-item pointers).
+                //
+                // FCC Phase 2 distinguishes the two retain PURPOSES that the
+                // generic ARC pipeline records on the box local, because under
+                // a no-REFCOUNT_V1 manager they need different handling:
+                //   * `.normal` — a TRANSIENT borrow (call-argument share)
+                //     balanced by a matching post-call `.release`. Flip to
+                //     `.protocol_box_retain` (a real refcount bump under a
+                //     refcount manager; a no-op under no-REFCOUNT_V1, where the
+                //     paired release is also elided). NO clone.
+                //   * `.persistent` — a genuine SECOND OWNER with its own
+                //     scope-exit `.protocol_box_drop` (a binding alias `g = f`,
+                //     a box stashed into a struct field). Flip to
+                //     `.protocol_box_share`, which under no-REFCOUNT_V1 CLONES
+                //     the inner and rebinds the new owner so each owner frees
+                //     its own inner exactly once (no double-free under
+                //     `Memory.Tracking`). Cloning a transient borrow instead
+                //     would leak (its drop is the borrow site's, not a
+                //     scope-exit owner drop).
                 // Already-rewritten box retains are left alone (idempotent
-                // re-run guard); a non-box retain is left alone too.
-                if (ret.kind != .protocol_box_retain and ret.kind != .protocol_box_share) {
-                    if (function.protocol_box_locals.get(ret.value)) |protocol_name| {
-                        // A `.persistent` box retain becomes a genuine
-                        // new-owner SHARE (clone under no-REFCOUNT_V1) ONLY
-                        // when its value is bound to a named local — it
-                        // appears as a `local_set.value`. A `.persistent`
-                        // retain on a box consumed in place is NOT a new
-                        // owner: its scope-exit drop is suppressed as a
-                        // transient, so cloning it would leak. Treat such an
-                        // in-place `.persistent` box retain as a plain
-                        // `.protocol_box_retain`.
-                        const box_kind: ir.RetainKind = switch (ret.kind) {
-                            .persistent => if (binding_targets.contains(ret.value))
-                                .protocol_box_share
-                            else
-                                .protocol_box_retain,
-                            .normal => .protocol_box_retain,
-                            .protocol_box_retain, .protocol_box_share => unreachable,
-                        };
-                        instr_ptr.* = .{ .retain = .{
-                            .value = ret.value,
-                            .kind = box_kind,
-                            .protocol_name = protocol_name,
-                        } };
+                // re-run guard).
+                .retain => |ret| {
+                    // Already-rewritten box retains are left alone (idempotent
+                    // re-run guard); a non-box retain is left alone too.
+                    if (ret.kind != .protocol_box_retain and ret.kind != .protocol_box_share) {
+                        if (self.function.protocol_box_locals.get(ret.value)) |protocol_name| {
+                            // A `.persistent` box retain becomes a genuine
+                            // new-owner SHARE (clone under no-REFCOUNT_V1) ONLY
+                            // when its value is bound to a named local — it
+                            // appears as a `local_set.value`. A `.persistent`
+                            // retain on a box consumed in place is NOT a new
+                            // owner: its scope-exit drop is suppressed as a
+                            // transient, so cloning it would leak. Treat such an
+                            // in-place `.persistent` box retain as a plain
+                            // `.protocol_box_retain`.
+                            const box_kind: ir.RetainKind = switch (ret.kind) {
+                                .persistent => if (self.binding_targets.contains(ret.value))
+                                    .protocol_box_share
+                                else
+                                    .protocol_box_retain,
+                                .normal => .protocol_box_retain,
+                                .protocol_box_retain, .protocol_box_share => unreachable,
+                            };
+                            instr_ptr.* = .{ .retain = .{
+                                .value = ret.value,
+                                .kind = box_kind,
+                                .protocol_name = protocol_name,
+                            } };
+                        }
                     }
-                }
-            },
-            else => {},
-        }
-        // Recurse into every nested sub-stream via the canonical
-        // enumerator (covers union_switch.else_instrs that the old
-        // hand-rolled switch skipped). The streams are `[]const` but the
-        // underlying IR was allocated mutably by the IR builder; the
-        // `@constCast` here matches the in-place mutation contract this
-        // pass already relied on for its other sub-stream recursions.
-        const Ctx = struct {
-            function: *const ir.Function,
-            binding_targets: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
-            fn onStream(self: *@This(), child: ir.ChildStream) void {
-                rewriteProtocolBoxReleasesInStream(self.function, @constCast(child.stream), self.binding_targets);
+                },
+                else => {},
             }
-        };
-        var ctx = Ctx{ .function = function, .binding_targets = binding_targets };
-        ir.forEachChildStream(instr_ptr, &ctx, Ctx.onStream);
-    }
+            return .keep_walking;
+        }
+    };
+
+    var walker = ExplicitInstructionWalker.init(allocator);
+    defer walker.deinit();
+    var ctx = Ctx{ .function = function, .binding_targets = binding_targets };
+    _ = try walker.walkStream(stream, &ctx, Ctx.visit);
 }
 
 // ============================================================
@@ -2345,15 +2670,15 @@ const DropTestSuite = struct {
         const alloc = arena_ptr.allocator();
 
         const parser_ptr = try alloc.create(Parser);
-        parser_ptr.* = Parser.init(alloc, source);
+        parser_ptr.* = try Parser.init(alloc, source);
         const program = try parser_ptr.parseProgram();
 
         const collector_ptr = try alloc.create(Collector);
-        collector_ptr.* = Collector.init(alloc, parser_ptr.interner, null);
+        collector_ptr.* = try Collector.init(alloc, parser_ptr.interner, null);
         try collector_ptr.collectProgram(&program);
 
         const checker_ptr = try alloc.create(types_mod.TypeChecker);
-        checker_ptr.* = types_mod.TypeChecker.init(alloc, parser_ptr.interner, &collector_ptr.graph);
+        checker_ptr.* = try types_mod.TypeChecker.init(alloc, parser_ptr.interner, &collector_ptr.graph);
         try checker_ptr.checkProgram(&program);
 
         const hir_ptr = try alloc.create(HirBuilder);
@@ -2403,9 +2728,35 @@ const DropTestSuite = struct {
     }
 };
 
+const DeepGuardChain = struct {
+    root: []ir.Instruction,
+    leaf: []ir.Instruction,
+};
+
+fn buildDeepGuardChain(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    leaf_len: usize,
+) error{OutOfMemory}!DeepGuardChain {
+    const leaf = try allocator.alloc(ir.Instruction, leaf_len);
+    var current = leaf;
+
+    var remaining = depth;
+    while (remaining > 0) : (remaining -= 1) {
+        const wrapper = try allocator.alloc(ir.Instruction, 1);
+        wrapper[0] = .{ .guard_block = .{
+            .condition = 0,
+            .body = current,
+        } };
+        current = wrapper;
+    }
+
+    return .{ .root = current, .leaf = leaf };
+}
+
 /// Count every `release` instruction across the function (including
 /// nested streams). Useful for before/after assertions.
-fn countReleases(function: *const ir.Function) usize {
+fn countReleases(function: *const ir.Function) !usize {
     const Counter = struct {
         count: *usize,
         fn visit(self: *@This(), instr: *const ir.Instruction) void {
@@ -2414,7 +2765,7 @@ fn countReleases(function: *const ir.Function) usize {
     };
     var count: usize = 0;
     var counter = Counter{ .count = &count };
-    ir.forEachInstruction(function, &counter, Counter.visit);
+    try ir.forEachInstruction(std.testing.allocator, function, &counter, Counter.visit);
     return count;
 }
 
@@ -2435,8 +2786,161 @@ fn collectReleaseLocals(
         }
     };
     var walker = Walker{ .result = &result, .allocator = allocator };
-    ir.forEachInstruction(function, &walker, Walker.visit);
+    try ir.forEachInstruction(allocator, function, &walker, Walker.visit);
     return result;
+}
+
+test "rewriteProtocolBoxReleases rewrites protocol-box retain and release kinds" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const stream = try arena.alloc(ir.Instruction, 5);
+    stream[0] = .{ .retain = .{ .value = 0, .kind = .persistent } };
+    stream[1] = .{ .local_set = .{ .dest = 3, .value = 0 } };
+    stream[2] = .{ .retain = .{ .value = 1, .kind = .persistent } };
+    stream[3] = .{ .retain = .{ .value = 2, .kind = .normal } };
+    stream[4] = .{ .release = .{ .value = 0 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "protocol_rewrite",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+    };
+    try function.protocol_box_locals.put(arena, 0, "Callable");
+    try function.protocol_box_locals.put(arena, 1, "Callable");
+    try function.protocol_box_locals.put(arena, 2, "Callable");
+
+    try rewriteProtocolBoxReleases(arena, &function);
+
+    try std.testing.expectEqual(ir.RetainKind.protocol_box_share, stream[0].retain.kind);
+    try std.testing.expectEqualStrings("Callable", stream[0].retain.protocol_name orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(ir.RetainKind.protocol_box_retain, stream[2].retain.kind);
+    try std.testing.expectEqualStrings("Callable", stream[2].retain.protocol_name orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(ir.RetainKind.protocol_box_retain, stream[3].retain.kind);
+    try std.testing.expectEqualStrings("Callable", stream[3].retain.protocol_name orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(ir.ReleaseKind.protocol_box_drop, stream[4].release.kind);
+    try std.testing.expectEqualStrings("Callable", stream[4].release.protocol_name orelse return error.TestUnexpectedResult);
+}
+
+test "rewriteProtocolBoxReleases propagates binding-target map insertion OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const stream = try arena.alloc(ir.Instruction, 3);
+    stream[0] = .{ .retain = .{ .value = 0, .kind = .persistent } };
+    stream[1] = .{ .local_set = .{ .dest = 1, .value = 0 } };
+    stream[2] = .{ .release = .{ .value = 0 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "protocol_rewrite_oom",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 2,
+    };
+    try function.protocol_box_locals.put(arena, 0, "Callable");
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        rewriteProtocolBoxReleases(failing_allocator.allocator(), &function),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+
+    try std.testing.expectEqual(ir.RetainKind.persistent, stream[0].retain.kind);
+    try std.testing.expect(stream[0].retain.protocol_name == null);
+    try std.testing.expectEqual(ir.ReleaseKind.release, stream[2].release.kind);
+    try std.testing.expect(stream[2].release.protocol_name == null);
+}
+
+test "rewriteProtocolBoxReleases walks deep nested child streams iteratively" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const chain = try buildDeepGuardChain(arena, explicit_walk_inline_frame_capacity + 96, 3);
+    chain.leaf[0] = .{ .retain = .{ .value = 0, .kind = .persistent } };
+    chain.leaf[1] = .{ .local_set = .{ .dest = 1, .value = 0 } };
+    chain.leaf[2] = .{ .release = .{ .value = 0 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = chain.root };
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "protocol_rewrite_deep",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 2,
+    };
+    try function.protocol_box_locals.put(arena, 0, "Callable");
+
+    try rewriteProtocolBoxReleases(std.testing.allocator, &function);
+
+    try std.testing.expectEqual(ir.RetainKind.protocol_box_share, chain.leaf[0].retain.kind);
+    try std.testing.expectEqualStrings("Callable", chain.leaf[0].retain.protocol_name orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(ir.ReleaseKind.protocol_box_drop, chain.leaf[2].release.kind);
+    try std.testing.expectEqualStrings("Callable", chain.leaf[2].release.protocol_name orelse return error.TestUnexpectedResult);
+}
+
+test "insertTupleComponentReleases propagates explicit traversal stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const chain = try buildDeepGuardChain(arena, explicit_walk_inline_frame_capacity + 96, 1);
+    chain.leaf[0] = .{ .const_int = .{ .dest = 0, .value = 1 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = chain.root };
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "tuple_component_deep_stack_oom",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(std.testing.allocator);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        insertTupleComponentReleases(failing_allocator.allocator(), &function, &ownership),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
 }
 
 test "arc_drop_insertion: function with no ARC locals is unchanged" {
@@ -2463,13 +2967,13 @@ test "arc_drop_insertion: function with no ARC locals is unchanged" {
     );
     defer ownership.deinit(std.testing.allocator);
 
-    const releases_before = countReleases(run_func);
+    const releases_before = try countReleases(run_func);
     const original_first_block_ptr = run_func.body[0].instructions.ptr;
     const original_first_block_len = run_func.body[0].instructions.len;
 
     try insertScopeExitDrops(suite.irAllocator(), run_func, &ownership);
 
-    try std.testing.expectEqual(releases_before, countReleases(run_func));
+    try std.testing.expectEqual(releases_before, try countReleases(run_func));
     // The slice header is preserved exactly — fast path was taken.
     try std.testing.expectEqual(original_first_block_ptr, run_func.body[0].instructions.ptr);
     try std.testing.expectEqual(original_first_block_len, run_func.body[0].instructions.len);
@@ -2516,11 +3020,11 @@ test "arc_drop_insertion: simple ret(param) does NOT release the param (Phase B)
     }
     try std.testing.expect(saw_non_empty);
 
-    const releases_before = countReleases(id_func);
+    const releases_before = try countReleases(id_func);
 
     try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership);
 
-    const releases_after = countReleases(id_func);
+    const releases_after = try countReleases(id_func);
     // Phase B: parameter locals are skipped. For the identity
     // function, every live-before-ret local IS a parameter, so
     // no releases are inserted. Count parameters in the live sets
@@ -2530,7 +3034,7 @@ test "arc_drop_insertion: simple ret(param) does NOT release the param (Phase B)
     while (live_iter.next()) |set_ptr| {
         var set_iter = set_ptr.keyIterator();
         while (set_iter.next()) |local_ptr| {
-            if (!isBorrowedParameterLocal(id_func, local_ptr.*)) {
+            if (!try isBorrowedParameterLocal(std.testing.allocator, id_func, local_ptr.*)) {
                 expected_releases += 1;
             }
         }
@@ -2574,16 +3078,16 @@ test "arc_drop_insertion: branching borrowed return values are not dropped" {
         while (set_iter.next()) |local_ptr| {
             const local_id = local_ptr.*;
             if (ownership.return_source_locals.contains(local_id)) continue;
-            if (isBorrowedParameterLocal(pick_func, local_id)) continue;
+            if (try isBorrowedParameterLocal(std.testing.allocator, pick_func, local_id)) continue;
             if (isBorrowedLocal(pick_func, local_id)) continue;
             expected_inserts += 1;
         }
     }
     try std.testing.expect(ownership.live_before_ret.count() >= 1);
 
-    const releases_before = countReleases(pick_func);
+    const releases_before = try countReleases(pick_func);
     try insertScopeExitDrops(suite.irAllocator(), pick_func, &ownership);
-    const releases_after = countReleases(pick_func);
+    const releases_after = try countReleases(pick_func);
 
     // A non-tail terminator never subtracts args, so the post-pass
     // release count grows by exactly the filtered live-before-ret
@@ -2665,7 +3169,7 @@ test "arc_drop_insertion: tail-call site does NOT drop its argument locals" {
         .release_locals = &release_locals,
         .seen_tail_call = &seen_tail_call,
     };
-    ir.forEachInstruction(loop_func, &checker, TailArgChecker.visit);
+    try ir.forEachInstruction(std.testing.allocator, loop_func, &checker, TailArgChecker.visit);
 
     // The IR builder MAY rewrite the recursive call to `.tail_call`
     // (depending on which dispatch shape is generated). If it did,
@@ -2722,7 +3226,7 @@ test "arc_drop_insertion: non-owning owned-param refetch is not released" {
     try ownership.non_owning_param_refetches.put(std.testing.allocator, 3, {});
 
     try insertScopeExitDrops(arena, &function, &ownership);
-    try std.testing.expectEqual(@as(usize, 0), countReleases(&function));
+    try std.testing.expectEqual(@as(usize, 0), try countReleases(&function));
 }
 
 test "arc_drop_insertion: identity-function parameter is skipped (Phase B + Phase E.5 Gap 4)" {
@@ -2760,21 +3264,32 @@ test "arc_drop_insertion: identity-function parameter is skipped (Phase B + Phas
     // return source.
     try std.testing.expectEqual(@as(u32, 0), ownership.return_source_locals.count());
 
-    const releases_before = countReleases(id_func);
+    const releases_before = try countReleases(id_func);
     try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership);
-    const releases_after = countReleases(id_func);
+    const releases_after = try countReleases(id_func);
 
-    // Phase B: NO releases inserted on parameter locals. For the
-    // identity function, every live-before-ret local IS the
-    // parameter, so the count is unchanged.
-    try std.testing.expectEqual(releases_before, releases_after);
+    // Phase B: NO releases inserted on parameter locals. Canonical
+    // parameter lowering may return a retained alias of the borrowed
+    // parameter; that alias is a real owner and must still be balanced
+    // at scope exit.
+    var expected_releases: usize = 0;
+    var live_iter = ownership.live_before_ret.valueIterator();
+    while (live_iter.next()) |set_ptr| {
+        var set_iter = set_ptr.keyIterator();
+        while (set_iter.next()) |local_ptr| {
+            if (ownership.return_source_locals.contains(local_ptr.*)) continue;
+            if (try isBorrowedParameterLocal(std.testing.allocator, id_func, local_ptr.*)) continue;
+            expected_releases += 1;
+        }
+    }
+    try std.testing.expectEqual(releases_before + expected_releases, releases_after);
 
     // Specifically: no release targets a parameter local.
     var release_locals = try collectReleaseLocals(std.testing.allocator, id_func);
     defer release_locals.deinit(std.testing.allocator);
     var iter = release_locals.keyIterator();
     while (iter.next()) |local_ptr| {
-        try std.testing.expect(!isBorrowedParameterLocal(id_func, local_ptr.*));
+        try std.testing.expect(!try isBorrowedParameterLocal(std.testing.allocator, id_func, local_ptr.*));
     }
 }
 
@@ -2812,7 +3327,7 @@ test "arc_drop_insertion: idempotent — second run inserts nothing" {
     defer ownership.deinit(std.testing.allocator);
 
     try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership);
-    const releases_after_first = countReleases(id_func);
+    const releases_after_first = try countReleases(id_func);
 
     // Re-run computeArcOwnership against the now-modified IR. The
     // newly-inserted releases use their arg locals so live sets at
@@ -2828,7 +3343,7 @@ test "arc_drop_insertion: idempotent — second run inserts nothing" {
     );
     defer ownership2.deinit(std.testing.allocator);
     try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership2);
-    const releases_after_second = countReleases(id_func);
+    const releases_after_second = try countReleases(id_func);
 
     // Second run is non-decreasing — well-formed IR survived.
     try std.testing.expect(releases_after_second >= releases_after_first);
@@ -2840,7 +3355,7 @@ test "arc_drop_insertion: idempotent — second run inserts nothing" {
 
 /// Count every `retain` instruction across the function (including
 /// nested streams).
-fn countRetains(function: *const ir.Function) usize {
+fn countRetains(function: *const ir.Function) !usize {
     const Counter = struct {
         count: *usize,
         fn visit(self: *@This(), instr: *const ir.Instruction) void {
@@ -2849,7 +3364,7 @@ fn countRetains(function: *const ir.Function) usize {
     };
     var count: usize = 0;
     var counter = Counter{ .count = &count };
-    ir.forEachInstruction(function, &counter, Counter.visit);
+    try ir.forEachInstruction(std.testing.allocator, function, &counter, Counter.visit);
     return count;
 }
 
@@ -2870,7 +3385,7 @@ fn collectRetainLocals(
         }
     };
     var walker = Walker{ .result = &result, .allocator = allocator };
-    ir.forEachInstruction(function, &walker, Walker.visit);
+    try ir.forEachInstruction(allocator, function, &walker, Walker.visit);
     return result;
 }
 
@@ -2909,9 +3424,9 @@ test "arc_drop_insertion: direct return of borrowed param INSERTS retain (Phase 
     // return source. The retain-on-ret discipline fires.
     try std.testing.expectEqual(@as(u32, 0), ownership.return_source_locals.count());
 
-    const retains_before = countRetains(id_func);
+    const retains_before = try countRetains(id_func);
     try insertScopeExitDrops(suite.irAllocator(), id_func, &ownership);
-    const retains_after = countRetains(id_func);
+    const retains_after = try countRetains(id_func);
 
     // Exactly one retain was added at the ret site to promote the
     // borrowed param to a fresh owner for the caller.
@@ -2953,7 +3468,7 @@ test "arc_drop_insertion: returned owned call result is not dropped before ret" 
         }
     };
     var ret_finder = RetFinder{ .returned_local = &returned_local };
-    ir.forEachInstruction(make_func, &ret_finder, RetFinder.visit);
+    try ir.forEachInstruction(std.testing.allocator, make_func, &ret_finder, RetFinder.visit);
     const ret_local = returned_local orelse return error.MissingReturn;
 
     try insertScopeExitDrops(suite.irAllocator(), make_func, &ownership);
@@ -2961,6 +3476,84 @@ test "arc_drop_insertion: returned owned call result is not dropped before ret" 
     var release_locals = try collectReleaseLocals(std.testing.allocator, make_func);
     defer release_locals.deinit(std.testing.allocator);
     try std.testing.expect(!release_locals.contains(ret_local));
+}
+
+test "arc_drop_insertion: switch_return owned fallback drops are arm-local" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const case_body = try arena.alloc(ir.Instruction, 1);
+    case_body[0] = .{ .borrow_value = .{ .dest = 2, .source = 1 } };
+
+    const cases = try arena.alloc(ir.ReturnCase, 1);
+    cases[0] = .{
+        .value = .{ .int = 0 },
+        .body_instrs = case_body,
+        .return_value = 2,
+    };
+
+    const stream = try arena.alloc(ir.Instruction, 1);
+    stream[0] = .{ .switch_return = .{
+        .scrutinee_param = 0,
+        .cases = cases,
+        .default_instrs = &.{},
+        .default_result = null,
+    } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 3);
+    local_ownership[0] = .trivial;
+    local_ownership[1] = .owned;
+    local_ownership[2] = .borrowed;
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "switch_return_arm_local_drop_test",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .string,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(std.testing.allocator);
+
+    var live_set: arc_liveness.ArcLocalSet = .empty;
+    errdefer live_set.deinit(std.testing.allocator);
+    try live_set.put(std.testing.allocator, 2, {});
+    try ownership.live_before_ret.putNoClobber(std.testing.allocator, 0, live_set);
+
+    var parent_owned_set: arc_liveness.ArcLocalSet = .empty;
+    errdefer parent_owned_set.deinit(std.testing.allocator);
+    try parent_owned_set.put(std.testing.allocator, 1, {});
+    try ownership.owned_at_ret.putNoClobber(std.testing.allocator, 0, parent_owned_set);
+
+    var arm_owned_set: arc_liveness.ArcLocalSet = .empty;
+    errdefer arm_owned_set.deinit(std.testing.allocator);
+    try arm_owned_set.put(std.testing.allocator, 1, {});
+    try ownership.owned_at_return_arm.putNoClobber(
+        std.testing.allocator,
+        arc_liveness.ArcOwnership.returnArmKey(0, 0, false),
+        arm_owned_set,
+    );
+
+    try insertScopeExitDrops(arena, &function, &ownership);
+
+    try std.testing.expectEqual(@as(usize, 1), function.body[0].instructions.len);
+    const rewritten_switch = function.body[0].instructions[0].switch_return;
+    try std.testing.expectEqual(@as(usize, 3), rewritten_switch.cases[0].body_instrs.len);
+    try std.testing.expectEqual(ir.Instruction{ .retain = .{ .value = 2 } }, rewritten_switch.cases[0].body_instrs[1]);
+    try std.testing.expectEqual(ir.Instruction{ .release = .{ .value = 1 } }, rewritten_switch.cases[0].body_instrs[2]);
 }
 
 test "arc_drop_insertion: switch_return arm with non-return-source value gets retain appended to arm body" {
@@ -3013,11 +3606,11 @@ test "arc_drop_insertion: switch_return arm with non-return-source value gets re
         }
     };
     var detector = ShapeDetector{ .has_switch_return = false };
-    ir.forEachInstruction(dispatch_func, &detector, ShapeDetector.visit);
+    try ir.forEachInstruction(std.testing.allocator, dispatch_func, &detector, ShapeDetector.visit);
 
-    const retains_before = countRetains(dispatch_func);
+    const retains_before = try countRetains(dispatch_func);
     try insertScopeExitDrops(suite.irAllocator(), dispatch_func, &ownership);
-    const retains_after = countRetains(dispatch_func);
+    const retains_after = try countRetains(dispatch_func);
 
     if (detector.has_switch_return) {
         // For switch_return, per-arm `case.return_value`s are not in
@@ -3051,7 +3644,7 @@ test "arc_drop_insertion: switch_return arm with non-return-source value gets re
             .arm_returns = &arm_returns,
             .allocator = std.testing.allocator,
         };
-        ir.forEachInstruction(dispatch_func, &arm_collector, ArmCollector.visit);
+        try ir.forEachInstruction(std.testing.allocator, dispatch_func, &arm_collector, ArmCollector.visit);
 
         var iter = retain_locals.keyIterator();
         while (iter.next()) |local_ptr| {
@@ -3125,7 +3718,7 @@ test "arc_drop_insertion: tail call gets no retain (no return value at IR site)"
     };
     var ok = true;
     var checker = TailCallNoRetainChecker{ .ok = &ok, .previous_was_retain = false };
-    ir.forEachInstruction(loop_func, &checker, TailCallNoRetainChecker.visit);
+    try ir.forEachInstruction(std.testing.allocator, loop_func, &checker, TailCallNoRetainChecker.visit);
     try std.testing.expect(ok);
 }
 
@@ -3164,9 +3757,9 @@ test "arc_drop_insertion: case_block with arm-result aggregate sees no retain (r
     // the propagation path.
     try std.testing.expect(ownership.return_source_locals.count() >= 1);
 
-    const retains_before = countRetains(pick_func);
+    const retains_before = try countRetains(pick_func);
     try insertScopeExitDrops(suite.irAllocator(), pick_func, &ownership);
-    const retains_after = countRetains(pick_func);
+    const retains_after = try countRetains(pick_func);
 
     try std.testing.expectEqual(retains_before, retains_after);
 }
@@ -3180,7 +3773,7 @@ test "arc_drop_insertion: case_block with arm-result aggregate sees no retain (r
 /// declines to emit `optional_dispatch` (e.g. because the heuristic's
 /// preconditions fail under future lowering changes), the test exits
 /// cleanly rather than masking a regression behind a false negative.
-fn dropFunctionContainsOptionalDispatch(function: *const ir.Function) bool {
+fn dropFunctionContainsOptionalDispatch(function: *const ir.Function) !bool {
     const Detector = struct {
         seen: bool = false,
         fn visit(self: *@This(), instr: *const ir.Instruction) void {
@@ -3188,7 +3781,7 @@ fn dropFunctionContainsOptionalDispatch(function: *const ir.Function) bool {
         }
     };
     var detector = Detector{};
-    ir.forEachInstruction(function, &detector, Detector.visit);
+    try ir.forEachInstruction(std.testing.allocator, function, &detector, Detector.visit);
     return detector.seen;
 }
 
@@ -3233,7 +3826,7 @@ test "arc_drop_insertion: rebuilder traverses optional_dispatch arms (Phase D)" 
     defer suite.deinit();
 
     const process_func = suite.findFunctionByName("process") orelse return error.MissingFunction;
-    if (!dropFunctionContainsOptionalDispatch(process_func)) {
+    if (!try dropFunctionContainsOptionalDispatch(process_func)) {
         // The IR builder declined to emit `optional_dispatch` for
         // this shape. Phase D's recursion is correctness-preserving
         // on every shape, but the load-bearing assertion needs
@@ -3272,7 +3865,7 @@ test "arc_drop_insertion: rebuilder traverses optional_dispatch arms (Phase D)" 
         }
     };
     var counter = SimpleCounter{};
-    ir.forEachInstruction(process_func, &counter, SimpleCounter.visit);
+    try ir.forEachInstruction(std.testing.allocator, process_func, &counter, SimpleCounter.visit);
     try std.testing.expect(counter.n >= 1);
 }
 
@@ -3305,7 +3898,7 @@ test "arc_drop_insertion: optional_dispatch arms with ARC-managed locals run cle
     defer suite.deinit();
 
     const pick_func = suite.findFunctionByName("pick") orelse return error.MissingFunction;
-    if (!dropFunctionContainsOptionalDispatch(pick_func)) return;
+    if (!try dropFunctionContainsOptionalDispatch(pick_func)) return;
 
     var ownership = try arc_liveness.computeArcOwnership(
         std.testing.allocator,
@@ -3386,9 +3979,9 @@ test "Phase E.5 Gap 7: owned binding whose last use is share_value gets scope-ex
     // dest (Gap 5 ensures registration of binding-owned locals).
     try std.testing.expect(ownership.arc_managed_locals.contains(fresh_dest.?));
 
-    const releases_before = countReleases(run_func);
+    const releases_before = try countReleases(run_func);
     try insertScopeExitDrops(suite.irAllocator(), run_func, &ownership);
-    const releases_after = countReleases(run_func);
+    const releases_after = try countReleases(run_func);
 
     // Phase E.5 Gap 7: at least one new release was inserted, and
     // one of them targets the fresh-call dest.
@@ -3549,14 +4142,14 @@ test "Phase E.5 Gap 6: paramIndexForLocal walks body to find param_get dest" {
     try std.testing.expect(param_dest != null);
 
     // The walker resolves the param-bound local to index 0.
-    const idx = paramIndexForLocal(fn_with_binding, param_dest.?);
+    const idx = try paramIndexForLocal(std.testing.allocator, fn_with_binding, param_dest.?);
     try std.testing.expectEqual(@as(?u32, 0), idx);
 
     // A non-param local resolves to null.
     var non_param_local: ir.LocalId = 0;
     while (non_param_local < fn_with_binding.local_count) : (non_param_local += 1) {
         if (non_param_local != param_dest.?) {
-            const result = paramIndexForLocal(fn_with_binding, non_param_local);
+            const result = try paramIndexForLocal(std.testing.allocator, fn_with_binding, non_param_local);
             // Not all non-param locals must be null (a function might
             // have multiple `param_get` dests on the same index due
             // to internal lowering quirks); but at least one must
@@ -3588,9 +4181,9 @@ test "Phase 2.6.3: insertTupleComponentReleases is no-op when no non-ARC tuples 
     );
     defer ownership.deinit(std.testing.allocator);
 
-    const releases_before = countReleases(id_func);
+    const releases_before = try countReleases(id_func);
     try insertTupleComponentReleases(suite.irAllocator(), id_func, &ownership);
-    try std.testing.expectEqual(releases_before, countReleases(id_func));
+    try std.testing.expectEqual(releases_before, try countReleases(id_func));
 }
 
 test "Phase 2.6.3: insertTupleComponentReleases emits release for ARC component at tuple last-use" {
@@ -3634,9 +4227,9 @@ test "Phase 2.6.3: insertTupleComponentReleases emits release for ARC component 
     );
     defer ownership.deinit(std.testing.allocator);
 
-    const releases_before = countReleases(run_func);
+    const releases_before = try countReleases(run_func);
     try insertTupleComponentReleases(suite.irAllocator(), run_func, &ownership);
-    const releases_after = countReleases(run_func);
+    const releases_after = try countReleases(run_func);
 
     // Exactly ONE release was emitted: the destructured ARC handle
     // local. The Bool component is NOT ARC-managed, so no release
@@ -3650,7 +4243,7 @@ test "Phase 2.6.3: insertTupleComponentReleases emits release for ARC component 
     var saw_release_for_extracted = false;
     for (run_func.body) |block| {
         for (block.instructions, 0..) |instr, i| {
-            if (instr != .release) continue;
+            if (instr != .release or instr.release.kind != .aggregate_component) continue;
             // Walk backward to find the closest preceding
             // index_get whose dest matches this release's value.
             var j: usize = i;
@@ -3721,9 +4314,9 @@ test "Phase 2.7: insertTupleComponentReleases uses ArcOwnership classification f
     try std.testing.expectEqual(ir.OwnershipClass.borrowed, function.local_ownership[2]);
     try std.testing.expect(ownership.arc_managed_locals.contains(2));
 
-    const releases_before = countReleases(&function);
+    const releases_before = try countReleases(&function);
     try insertTupleComponentReleases(arena, &function, &ownership);
-    const releases_after = countReleases(&function);
+    const releases_after = try countReleases(&function);
     try std.testing.expectEqual(releases_before + 1, releases_after);
 
     var saw_release_after_retain = false;
@@ -3731,12 +4324,82 @@ test "Phase 2.7: insertTupleComponentReleases uses ArcOwnership classification f
         if (instr != .retain or instr.retain.value != 2) continue;
         if (idx + 1 < function.body[0].instructions.len and
             function.body[0].instructions[idx + 1] == .release and
-            function.body[0].instructions[idx + 1].release.value == 2)
+            function.body[0].instructions[idx + 1].release.value == 2 and
+            function.body[0].instructions[idx + 1].release.kind == .aggregate_component)
         {
             saw_release_after_retain = true;
         }
     }
     try std.testing.expect(saw_release_after_retain);
+}
+
+test "Phase 2.7: persistent retained ownership-transfer extraction still releases aggregate component" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const tuple_elements = try arena.alloc(ir.LocalId, 1);
+    tuple_elements[0] = 0;
+
+    const stream = try arena.alloc(ir.Instruction, 6);
+    stream[0] = .{ .const_string = .{ .dest = 0, .value = "component" } };
+    stream[1] = .{ .tuple_init = .{ .dest = 1, .elements = tuple_elements } };
+    stream[2] = .{ .index_get = .{ .dest = 2, .object = 1, .index = 0 } };
+    stream[3] = .{ .retain = .{ .value = 2, .kind = .persistent } };
+    stream[4] = .{ .move_value = .{ .dest = 3, .source = 2 } };
+    stream[5] = .{ .ret = .{ .value = 3 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 4);
+    local_ownership[0] = .owned;
+    local_ownership[1] = .trivial;
+    local_ownership[2] = .owned;
+    local_ownership[3] = .owned;
+
+    var function = ir.Function{
+        .id = 0,
+        .name = "tuple_component_release_persistent_transfer",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .string,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+    try function.deep_release_owned_locals.put(arena, 2, {});
+
+    var dummy_type_store: types_mod.TypeStore = undefined;
+    var ownership = try arc_liveness.computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        &dummy_type_store,
+        arc_liveness.defaultArcManagedTypeId,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    const releases_before = try countReleases(&function);
+    try insertTupleComponentReleases(arena, &function, &ownership);
+    const releases_after = try countReleases(&function);
+    try std.testing.expectEqual(releases_before + 1, releases_after);
+
+    var saw_component_release = false;
+    for (function.body[0].instructions) |instr| {
+        if (instr == .release and
+            instr.release.value == 2 and
+            instr.release.kind == .aggregate_component)
+        {
+            saw_component_release = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_component_release);
 }
 
 test "Phase 2.7: insertTupleComponentReleases releases aggregate components on every branch last-use" {
@@ -3806,13 +4469,19 @@ test "Phase 2.7: insertTupleComponentReleases releases aggregate components on e
     try std.testing.expect(ownership.isLastUseAt(1, 4));
     try std.testing.expect(ownership.isLastUseAt(1, 6));
 
-    const releases_before = countReleases(&function);
+    const releases_before = try countReleases(&function);
     try insertTupleComponentReleases(arena, &function, &ownership);
-    try std.testing.expectEqual(releases_before + 2, countReleases(&function));
+    try std.testing.expectEqual(releases_before + 2, try countReleases(&function));
 
     const rewritten_if = function.body[0].instructions[3].if_expr;
-    try std.testing.expectEqual(ir.Instruction{ .release = .{ .value = 3 } }, rewritten_if.then_instrs[2]);
-    try std.testing.expectEqual(ir.Instruction{ .release = .{ .value = 4 } }, rewritten_if.else_instrs[2]);
+    try std.testing.expectEqual(
+        ir.Instruction{ .release = .{ .value = 3, .kind = .aggregate_component } },
+        rewritten_if.then_instrs[2],
+    );
+    try std.testing.expectEqual(
+        ir.Instruction{ .release = .{ .value = 4, .kind = .aggregate_component } },
+        rewritten_if.else_instrs[2],
+    );
 }
 
 test "Phase E.5 Gap 6: isBorrowedParameterLocal works when param_get is allocated above binding range" {
@@ -3852,7 +4521,7 @@ test "Phase E.5 Gap 6: isBorrowedParameterLocal works when param_get is allocate
     // The Phase B + Phase E.5 Gap 6 filter classifies the param-
     // bound local as a borrowed parameter regardless of its
     // numerical LocalId.
-    try std.testing.expect(isBorrowedParameterLocal(fn_with_binding, param_dest.?));
+    try std.testing.expect(try isBorrowedParameterLocal(std.testing.allocator, fn_with_binding, param_dest.?));
 }
 
 test "arc-drop-verify--02: protocol_box_drop is NOT relocated above an if_expr that uses the box in an arm" {

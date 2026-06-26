@@ -285,7 +285,7 @@ pub fn analyzeUniquenessFullEx(
     // so the assertion now guards the path. No-op in release; no-op for
     // synthetic unit-test tables whose `record_count` is null.
     if (ownership) |owned| {
-        arc_liveness.assertConsumerWalkMatches(owned, arc_liveness.countInstructionRecords(function));
+        arc_liveness.assertConsumerWalkMatches(owned, try arc_liveness.countInstructionRecords(allocator, function));
     }
 
     for (function.body) |block| {
@@ -1285,7 +1285,7 @@ const Analyzer = struct {
                 // the result keyed by this instruction's id for the meet.
                 const pre = try self.snapshotArgUnique(tcn.args);
                 defer self.allocator.free(pre);
-                const success_payload_unique = self.calleeContractResultUnique(tcn.name, pre);
+                const success_payload_unique = try self.calleeContractResultUnique(tcn.name, pre);
                 try self.try_call_success_unique.put(self.allocator, my_id, success_payload_unique);
 
                 for (tcn.args) |arg| {
@@ -1554,15 +1554,17 @@ const Analyzer = struct {
     /// canonical Analyzer and the TentativeAnalyzer agree by construction
     /// (the recurring FU-15 drift class). Returns false (conservative)
     /// when no signature table or program reference is wired; the
-    /// owned-mutating-builtin shape is still recognized name-only.
+    /// owned-mutating-builtin shape is still recognized name-only. Propagates
+    /// `error.OutOfMemory` from fresh-wrapper recognition instead of
+    /// demoting it to "not unique."
     fn calleeContractResultUnique(
         self: *const Analyzer,
         name: []const u8,
         pre_arg_unique: []const bool,
-    ) bool {
+    ) std.mem.Allocator.Error!bool {
         if (arc_liveness.ownedMutatingBuiltinSlot(name) != null) return true;
         const program = self.program orelse return false;
-        return uniqueness_decision.calleeContractResultUnique(self.signatures, program, name, pre_arg_unique);
+        return try uniqueness_decision.calleeContractResultUnique(self.allocator, self.signatures, program, name, pre_arg_unique);
     }
 
     /// Apply the per-callee dataflow effect. Recognises three shapes:
@@ -1605,7 +1607,7 @@ const Analyzer = struct {
         // an `.owned` receiver — its body forwards to exactly one fresh
         // allocator and no other call — so the two shapes are mutually
         // exclusive and no receiver-consume is skipped here.)
-        if (self.calleeIsFreshAllocatorWrapper(name)) {
+        if (try self.calleeIsFreshAllocatorWrapper(name)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
@@ -1651,7 +1653,7 @@ const Analyzer = struct {
         // uniqueness--04: fresh-allocator wrappers (unique result on every
         // path) take precedence over the convention-pair gate, mirroring
         // the by-name path.
-        if (uniqueness_decision.isFreshAllocatorWrapper(function, self.program)) {
+        if (try uniqueness_decision.isFreshAllocatorWrapper(self.allocator, function, self.program)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
@@ -1762,10 +1764,11 @@ const Analyzer = struct {
     /// Look up the callee by name and decide whether it is a thin
     /// fresh-allocator wrapper. Returns false when the program
     /// reference is absent (test scaffolding) or the name doesn't
-    /// match. Delegates to the shared `uniqueness_decision` authority.
-    fn calleeIsFreshAllocatorWrapper(self: *const Analyzer, name: []const u8) bool {
+    /// match. Propagates recognition OOM through the dataflow walk.
+    /// Delegates to the shared `uniqueness_decision` authority.
+    fn calleeIsFreshAllocatorWrapper(self: *const Analyzer, name: []const u8) std.mem.Allocator.Error!bool {
         const program = self.program orelse return false;
-        return uniqueness_decision.isFreshAllocatorWrapperByName(program, name);
+        return try uniqueness_decision.isFreshAllocatorWrapperByName(self.allocator, program, name);
     }
 };
 

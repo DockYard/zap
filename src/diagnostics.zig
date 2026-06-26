@@ -293,7 +293,9 @@ var diagnostic_stderr_capture: ?StderrCapture = null;
 /// default to `true` and keep the user-facing diagnostic behavior unchanged.
 var diagnostic_stderr_enabled: bool = !builtin.is_test;
 
-/// Emit already-rendered diagnostic text to the embedder's error stream.
+/// Emit already-rendered diagnostic text to the embedder's error stream,
+/// preserving capture-sink allocation failures for callers that must not hide
+/// infrastructure errors.
 ///
 /// Precedence: an installed capture sink wins (tests asserting on text); else,
 /// when real-stderr emission is enabled, write to the process stderr; else
@@ -301,9 +303,9 @@ var diagnostic_stderr_enabled: bool = !builtin.is_test;
 /// emitter (`compiler.emitDiagnostics`, the stdlib-dir resolver, the memory-
 /// manager-adapter resolver) routes through so none of them hardwire
 /// `std.debug.print` to the global stderr.
-pub fn emitStderr(bytes: []const u8) void {
+pub fn emitStderrChecked(bytes: []const u8) std.mem.Allocator.Error!void {
     if (diagnostic_stderr_capture) |capture| {
-        capture.list.appendSlice(capture.allocator, bytes) catch {};
+        try capture.list.appendSlice(capture.allocator, bytes);
         return;
     }
     if (diagnostic_stderr_enabled) {
@@ -311,18 +313,31 @@ pub fn emitStderr(bytes: []const u8) void {
     }
 }
 
-/// `std.fmt`-style convenience over `emitStderr` so call sites that previously
-/// did `std.debug.print(fmt, args)` for a user-facing diagnostic can route
-/// through the sink with the same ergonomics. Renders into a stack buffer and
-/// falls back to the unformatted format string only if rendering overflows
-/// (which cannot happen for the fixed diagnostic templates that use it).
-pub fn emitStderrFmt(comptime fmt: []const u8, args: anytype) void {
+/// Emit diagnostic text through `emitStderrChecked`, discarding capture-sink
+/// allocation failures for legacy fire-and-forget diagnostic call sites.
+pub fn emitStderr(bytes: []const u8) void {
+    emitStderrChecked(bytes) catch {};
+}
+
+/// `std.fmt`-style convenience over `emitStderrChecked` for diagnostic paths
+/// that must propagate capture-sink allocation failures. Renders into a stack
+/// buffer and falls back to the unformatted format string only if rendering
+/// overflows (which cannot happen for the fixed diagnostic templates that use
+/// it).
+pub fn emitStderrFmtChecked(comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!void {
     var buffer: [4096]u8 = undefined;
     const rendered = std.fmt.bufPrint(&buffer, fmt, args) catch {
-        emitStderr(fmt);
+        try emitStderrChecked(fmt);
         return;
     };
-    emitStderr(rendered);
+    try emitStderrChecked(rendered);
+}
+
+/// `std.fmt`-style convenience over `emitStderr` so call sites that previously
+/// did `std.debug.print(fmt, args)` for a user-facing diagnostic can route
+/// through the sink with the same fire-and-forget ergonomics.
+pub fn emitStderrFmt(comptime fmt: []const u8, args: anytype) void {
+    emitStderrFmtChecked(fmt, args) catch {};
 }
 
 /// Enable or disable real-stderr emission for the current process. Production
@@ -398,16 +413,18 @@ pub const DiagnosticEngine = struct {
         self.sources.deinit(self.allocator);
     }
 
-    pub fn setSource(self: *DiagnosticEngine, source: []const u8, file_path: []const u8) void {
+    pub fn setSource(self: *DiagnosticEngine, source: []const u8, file_path: []const u8) std.mem.Allocator.Error!void {
+        try self.sources.ensureTotalCapacity(self.allocator, 1);
+        self.sources.clearRetainingCapacity();
+        self.sources.appendAssumeCapacity(.{ .source = source, .file_path = file_path });
         self.source = source;
         self.file_path = file_path;
-        self.sources.clearRetainingCapacity();
-        self.sources.append(self.allocator, .{ .source = source, .file_path = file_path }) catch {};
     }
 
-    pub fn setSources(self: *DiagnosticEngine, sources: []const SourceFile) void {
+    pub fn setSources(self: *DiagnosticEngine, sources: []const SourceFile) std.mem.Allocator.Error!void {
+        try self.sources.ensureTotalCapacity(self.allocator, sources.len);
         self.sources.clearRetainingCapacity();
-        self.sources.appendSlice(self.allocator, sources) catch {};
+        self.sources.appendSliceAssumeCapacity(sources);
         if (sources.len > 0) {
             self.source = sources[0].source;
             self.file_path = sources[0].file_path;
@@ -1172,7 +1189,7 @@ test "diagnostic engine basic error" {
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
 
-    engine.setSource("pub fn foo() {\n  bar()\n}\n", "test.zip");
+    try engine.setSource("pub fn foo() {\n  bar()\n}\n", "test.zip");
 
     try engine.undefinedFunction("bar", 0, .{ .start = 2, .end = 7, .line = 2 });
 
@@ -1242,7 +1259,7 @@ test "rich format with caret underlines" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("pub fn foo() {\n  bar()\n}\n", "test.zap");
+    try engine.setSource("pub fn foo() {\n  bar()\n}\n", "test.zap");
 
     try engine.reportDiagnostic(.{
         .severity = .@"error",
@@ -1269,7 +1286,7 @@ test "rich format with help text" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("def main()\n  1\nend\n", "test.zap");
+    try engine.setSource("def main()\n  1\nend\n", "test.zap");
 
     try engine.reportDiagnostic(.{
         .severity = .@"error",
@@ -1333,7 +1350,7 @@ test "box drawing characters present" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("x = 1\ny = 2\n", "test.zap");
+    try engine.setSource("x = 1\ny = 2\n", "test.zap");
 
     try engine.err("something wrong", .{ .start = 0, .end = 1, .line = 1, .col = 1 });
 
@@ -1361,7 +1378,7 @@ test "secondary spans with tildes" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("name = get_input()\nnaem + 1\n", "test.zap");
+    try engine.setSource("name = get_input()\nnaem + 1\n", "test.zap");
 
     try engine.reportDiagnostic(.{
         .severity = .@"error",
@@ -1390,7 +1407,7 @@ test "diagnostic engine selects source by span source_id" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSources(&.{
+    try engine.setSources(&.{
         .{ .source = "first\n", .file_path = "first.zap" },
         .{ .source = "second\nthird\n", .file_path = "second.zap" },
     });
@@ -1406,6 +1423,46 @@ test "diagnostic engine selects source by span source_id" {
     try std.testing.expect(std.mem.find(u8, output, "third") != null);
 }
 
+test "diagnostic source registration propagates OOM without partial context" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing_allocator.allocator();
+
+    var engine = DiagnosticEngine.init(failing_alloc);
+    defer engine.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, engine.setSource("x = 1\n", "oom.zap"));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expect(engine.source == null);
+    try std.testing.expect(engine.file_path == null);
+    try std.testing.expectEqual(@as(usize, 0), engine.sources.items.len);
+}
+
+test "diagnostic source replacement preserves previous context on OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var engine = DiagnosticEngine.init(failing_alloc);
+    defer engine.deinit();
+
+    try engine.setSource("old\n", "old.zap");
+    const replacement_sources = try std.testing.allocator.alloc(DiagnosticEngine.SourceFile, engine.sources.capacity + 1);
+    defer std.testing.allocator.free(replacement_sources);
+    for (replacement_sources) |*replacement_source| {
+        replacement_source.* = .{ .source = "new\n", .file_path = "new.zap" };
+    }
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    failing_allocator.resize_fail_index = failing_allocator.resize_index;
+
+    try std.testing.expectError(error.OutOfMemory, engine.setSources(replacement_sources));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), engine.sources.items.len);
+    try std.testing.expectEqualStrings("old\n", engine.source.?);
+    try std.testing.expectEqualStrings("old.zap", engine.file_path.?);
+    try std.testing.expectEqualStrings("old\n", engine.sources.items[0].source);
+    try std.testing.expectEqualStrings("old.zap", engine.sources.items[0].file_path);
+}
+
 // ============================================================
 // Phase 4.a — canonical Error IR / unified renderer tests
 // ============================================================
@@ -1417,7 +1474,7 @@ test "deterministic ordering: same diagnostics render identically across runs" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("a\nb\nc\nd\ne\n", "ord.zap");
+    try engine.setSource("a\nb\nc\nd\ne\n", "ord.zap");
 
     // Insert in a deliberately scrambled order.
     try engine.err("on line three", .{ .start = 4, .end = 5, .line = 3, .col = 1 });
@@ -1446,7 +1503,7 @@ test "deterministic dedup: byte-identical diagnostics collapse to one" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("x = 1\n", "dup.zap");
+    try engine.setSource("x = 1\n", "dup.zap");
 
     // The same error reported three times by three passes.
     var i: u32 = 0;
@@ -1482,7 +1539,7 @@ test "security tier user_safe strips absolute path to basename" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("x = 1\n", "/Users/dev/project/src/secret_path.zap");
+    try engine.setSource("x = 1\n", "/Users/dev/project/src/secret_path.zap");
 
     try engine.err("boom", .{ .start = 0, .end = 1, .line = 1, .col = 1 });
 
@@ -1505,7 +1562,7 @@ test "cause chain renders caused-by lines with codes" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("call_thing()\n", "c.zap");
+    try engine.setSource("call_thing()\n", "c.zap");
 
     try engine.reportDiagnostic(.{
         .severity = .@"error",
@@ -1531,7 +1588,7 @@ test "fixit renders help line plus replacement block and hedges non-machine-appl
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("naem + 1\n", "fx.zap");
+    try engine.setSource("naem + 1\n", "fx.zap");
 
     try engine.reportDiagnostic(.{
         .severity = .@"error",
@@ -1562,7 +1619,7 @@ test "unified renderer: a runtime panic uses the SAME visual language as a compi
     // A compile error.
     var compile_engine = DiagnosticEngine.init(alloc);
     defer compile_engine.deinit();
-    compile_engine.setSource("pub fn foo() {\n  bar()\n}\n", "app.zap");
+    try compile_engine.setSource("pub fn foo() {\n  bar()\n}\n", "app.zap");
     try compile_engine.reportDiagnostic(.{
         .severity = .@"error",
         .domain = .name,
@@ -1576,7 +1633,7 @@ test "unified renderer: a runtime panic uses the SAME visual language as a compi
     // A runtime panic lowered into the SAME canonical IR + SAME renderer.
     var runtime_engine = DiagnosticEngine.init(alloc);
     defer runtime_engine.deinit();
-    runtime_engine.setSource("def main() do\n  raise \"boom\"\nend\n", "app.zap");
+    try runtime_engine.setSource("def main() do\n  raise \"boom\"\nend\n", "app.zap");
     try runtime_engine.reportDiagnostic(.{
         .severity = .@"error",
         .domain = .runtime,
@@ -1607,7 +1664,7 @@ test "unified renderer: a synthetic leak report uses the SAME visual language" {
     // already render it with the one visual language).
     var leak_engine = DiagnosticEngine.init(alloc);
     defer leak_engine.deinit();
-    leak_engine.setSource("def build() do\n  alloc_thing()\nend\n", "leaky.zap");
+    try leak_engine.setSource("def build() do\n  alloc_thing()\nend\n", "leaky.zap");
     try leak_engine.reportDiagnostic(.{
         .severity = .warning,
         .domain = .leak,
@@ -1636,7 +1693,7 @@ test "related spans render as note lines with location" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("let x: i64 = get()\nx = \"hello\"\n", "prov.zap");
+    try engine.setSource("let x: i64 = get()\nx = \"hello\"\n", "prov.zap");
 
     // Two-sided type error (the shape 4.b's TypeProvenance produces).
     try engine.reportDiagnostic(.{
@@ -1686,7 +1743,7 @@ test "macro-expansion backtrace renders the expansion chain as frame lines" {
 
     var engine = DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("pub fn run() {\n  unless cond { go() }\n}\n", "m.zap");
+    try engine.setSource("pub fn run() {\n  unless cond { go() }\n}\n", "m.zap");
 
     // Interned macro name id is opaque to the renderer; it resolves names via
     // the engine's interner. Build a one-level expansion frame.

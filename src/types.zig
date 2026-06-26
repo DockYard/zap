@@ -236,6 +236,45 @@ const ProtocolDispatchResolution = union(enum) {
     invalid,
 };
 
+pub const TypeGraphError = std.mem.Allocator.Error || error{
+    TypeGraphDepthLimitExceeded,
+    TypeGraphNodeLimitExceeded,
+};
+
+const TypeGraphLimits = struct {
+    max_depth: usize = 1024,
+    max_nodes: usize = 1_000_000,
+};
+
+const default_type_graph_limits = TypeGraphLimits{};
+const diagnostic_type_format_limits = TypeGraphLimits{
+    .max_depth = 128,
+    .max_nodes = 4096,
+};
+
+const TypeGraphBudget = struct {
+    max_depth: usize,
+    remaining_nodes: usize,
+
+    fn init(limits: TypeGraphLimits) TypeGraphBudget {
+        return .{
+            .max_depth = limits.max_depth,
+            .remaining_nodes = limits.max_nodes,
+        };
+    }
+
+    fn enter(self: *TypeGraphBudget, depth: usize) TypeGraphError!void {
+        if (depth > self.max_depth) return error.TypeGraphDepthLimitExceeded;
+        if (self.remaining_nodes == 0) return error.TypeGraphNodeLimitExceeded;
+        self.remaining_nodes -= 1;
+    }
+
+    fn childDepth(self: *const TypeGraphBudget, depth: usize) TypeGraphError!usize {
+        if (depth >= self.max_depth) return error.TypeGraphDepthLimitExceeded;
+        return depth + 1;
+    }
+};
+
 // ============================================================
 // Type store
 // ============================================================
@@ -298,6 +337,11 @@ pub const TypeStore = struct {
     /// pipeline reruns and the per-struct CTFE checker all share a
     /// single TypeStore-scoped set.
     revalidated_default_applied_ids: std.AutoHashMap(TypeId, void),
+    /// Field slices allocated only by closure capture backfill. Most
+    /// `StructType.fields` slices are owned by the surrounding program/checker
+    /// arena; backfill mutates a registered struct in place, so its replacement
+    /// slices are explicitly TypeStore-owned and released when superseded.
+    owned_closure_backfill_fields: std.AutoHashMap(TypeId, []const Type.StructField),
 
     // Well-known type IDs
     pub const BOOL: TypeId = 0;
@@ -327,7 +371,7 @@ pub const TypeStore = struct {
     pub const F128: TypeId = 24;
     pub const VOID: TypeId = NIL;
 
-    pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) TypeStore {
+    pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) !TypeStore {
         var store = TypeStore{
             .allocator = allocator,
             .types = .empty,
@@ -338,8 +382,10 @@ pub const TypeStore = struct {
             .inferred_raises = std.AutoHashMap(ast.StringId, []const TypeId).init(allocator),
             .validated_default_struct_ids = std.AutoHashMap(TypeId, void).init(allocator),
             .revalidated_default_applied_ids = std.AutoHashMap(TypeId, void).init(allocator),
+            .owned_closure_backfill_fields = std.AutoHashMap(TypeId, []const Type.StructField).init(allocator),
         };
-        store.registerBuiltins() catch {};
+        errdefer store.deinit();
+        try store.registerBuiltins();
         return store;
     }
 
@@ -352,6 +398,25 @@ pub const TypeStore = struct {
         self.inferred_raises.deinit();
         self.validated_default_struct_ids.deinit();
         self.revalidated_default_applied_ids.deinit();
+        var backfill_fields_it = self.owned_closure_backfill_fields.valueIterator();
+        while (backfill_fields_it.next()) |fields| self.allocator.free(fields.*);
+        self.owned_closure_backfill_fields.deinit();
+    }
+
+    fn releaseClosureBackfillFields(self: *TypeStore, struct_type_id: TypeId) void {
+        if (self.owned_closure_backfill_fields.fetchRemove(struct_type_id)) |entry| {
+            self.allocator.free(entry.value);
+        }
+    }
+
+    fn installClosureBackfillFields(
+        self: *TypeStore,
+        struct_type_id: TypeId,
+        fields: []const Type.StructField,
+    ) !void {
+        const gop = try self.owned_closure_backfill_fields.getOrPut(struct_type_id);
+        if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
+        gop.value_ptr.* = fields;
     }
 
     fn registerBuiltins(self: *TypeStore) !void {
@@ -545,20 +610,21 @@ pub const TypeStore = struct {
     /// `"<Struct>.<method>/<arity>"` (or `"<method>/<arity>"` when no
     /// struct). Interned to a `StringId`. SINGLE source of truth for the
     /// key format so the type checker (which stores the row) and the IR
-    /// backend (which queries it) cannot drift. Returns null only on OOM.
+    /// backend (which queries it) cannot drift. Returns `OutOfMemory` when
+    /// key text formatting or interning fails.
     pub fn raisesRowKeyString(
         self: *const TypeStore,
         struct_prefix: ?[]const u8,
         method_name: []const u8,
         arity: u32,
-    ) ?ast.StringId {
+    ) !ast.StringId {
         const key_text = if (struct_prefix) |prefix|
-            std.fmt.allocPrint(self.allocator, "{s}.{s}/{d}", .{ prefix, method_name, arity }) catch return null
+            try std.fmt.allocPrint(self.allocator, "{s}.{s}/{d}", .{ prefix, method_name, arity })
         else
-            std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ method_name, arity }) catch return null;
+            try std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ method_name, arity });
         defer self.allocator.free(key_text);
         const interner_mut: *ast.StringInterner = @constCast(self.interner);
-        return interner_mut.intern(key_text) catch null;
+        return try interner_mut.intern(key_text);
     }
 
     /// Phase 3.b — true when the function identified by `struct_prefix` /
@@ -571,7 +637,7 @@ pub const TypeStore = struct {
         struct_prefix: ?[]const u8,
         method_name: []const u8,
         arity: u32,
-    ) bool {
+    ) !bool {
         // The program/script entry point (`main/1`) can never lower to an
         // error-union return — Zig's entry ABI requires `void`/`u8`. A
         // `raise` that reaches `main` unhandled is the top-level abort
@@ -579,7 +645,7 @@ pub const TypeStore = struct {
         // not by `main` returning `error.ZapRaise`. So `main` never carries
         // the error-union effect regardless of its inferred row.
         if (arity == 1 and std.mem.eql(u8, method_name, "main")) return false;
-        const key = self.raisesRowKeyString(struct_prefix, method_name, arity) orelse return false;
+        const key = try self.raisesRowKeyString(struct_prefix, method_name, arity);
         const row = self.inferred_raises.get(key) orelse return false;
         return row.len > 0;
     }
@@ -979,17 +1045,17 @@ pub const TypeStore = struct {
     /// Score a call argument against an expected parameter type.
     /// Exact compatibility is 0; widening fallback is 1 + bit delta; null
     /// means the argument cannot satisfy the parameter.
-    pub fn callMatchCost(self: *const TypeStore, actual: TypeId, expected: TypeId) ?u32 {
+    pub fn callMatchCost(self: *const TypeStore, actual: TypeId, expected: TypeId) TypeGraphError!?u32 {
         if (expected == UNKNOWN or actual == UNKNOWN or actual == ERROR) return 0;
         if (self.typeEquals(actual, expected)) return 0;
         // FCC unified model: a `fn(A) -> R` value and a `Callable({A}, R)`
         // existential are the same type in two representations. Accept the
         // argument when the function/`Callable` shapes are equivalent.
         if (self.functionCallableEquiv(actual, expected)) return 0;
-        if (self.containsTypeVars(expected) or self.containsTypeVars(actual)) {
+        if ((try self.containsTypeVars(expected)) or (try self.containsTypeVars(actual))) {
             var subs = SubstitutionMap.init(self.allocator);
             defer subs.deinit();
-            if (self.unify(expected, actual, &subs) catch false) return 0;
+            if (try self.unify(expected, actual, &subs)) return 0;
             return null;
         }
         if (self.wideningCost(actual, expected)) |cost| return cost + 1;
@@ -1002,45 +1068,60 @@ pub const TypeStore = struct {
 
     /// Check whether `type_id` contains any type variables (`.type_var`) in its structure.
     /// Used to determine whether a function signature is generic and requires unification.
-    pub fn containsTypeVars(self: *const TypeStore, type_id: TypeId) bool {
+    pub fn containsTypeVars(self: *const TypeStore, type_id: TypeId) TypeGraphError!bool {
+        return self.containsTypeVarsWithLimits(type_id, default_type_graph_limits);
+    }
+
+    fn containsTypeVarsWithLimits(self: *const TypeStore, type_id: TypeId, limits: TypeGraphLimits) TypeGraphError!bool {
+        var budget = TypeGraphBudget.init(limits);
+        return self.containsTypeVarsBudgeted(type_id, 0, &budget);
+    }
+
+    fn containsTypeVarsBudgeted(
+        self: *const TypeStore,
+        type_id: TypeId,
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!bool {
+        try budget.enter(depth);
         const typ = self.getType(type_id);
         return switch (typ) {
             .type_var => true,
-            .list => |list_type| self.containsTypeVars(list_type.element),
+            .list => |list_type| try self.containsTypeVarsBudgeted(list_type.element, try budget.childDepth(depth), budget),
             .tuple => |tuple_type| {
                 for (tuple_type.elements) |element| {
-                    if (self.containsTypeVars(element)) return true;
+                    if (try self.containsTypeVarsBudgeted(element, try budget.childDepth(depth), budget)) return true;
                 }
                 return false;
             },
             .function => |function_type| {
                 for (function_type.params) |param| {
-                    if (self.containsTypeVars(param)) return true;
+                    if (try self.containsTypeVarsBudgeted(param, try budget.childDepth(depth), budget)) return true;
                 }
-                if (self.containsTypeVars(function_type.return_type)) return true;
+                if (try self.containsTypeVarsBudgeted(function_type.return_type, try budget.childDepth(depth), budget)) return true;
                 // A polymorphic effect marker (#201) is a free type
                 // variable — its presence makes the function type
                 // generic so the monomorphizer specializes per
                 // closure-argument effect.
                 if (function_type.effect_var) |ev| {
-                    if (self.containsTypeVars(ev)) return true;
+                    if (try self.containsTypeVarsBudgeted(ev, try budget.childDepth(depth), budget)) return true;
                 }
                 return false;
             },
             .map => |map_type| {
-                return self.containsTypeVars(map_type.key) or
-                    self.containsTypeVars(map_type.value);
+                return (try self.containsTypeVarsBudgeted(map_type.key, try budget.childDepth(depth), budget)) or
+                    (try self.containsTypeVarsBudgeted(map_type.value, try budget.childDepth(depth), budget));
             },
             .applied => |applied_type| {
-                if (self.containsTypeVars(applied_type.base)) return true;
+                if (try self.containsTypeVarsBudgeted(applied_type.base, try budget.childDepth(depth), budget)) return true;
                 for (applied_type.args) |arg| {
-                    if (self.containsTypeVars(arg)) return true;
+                    if (try self.containsTypeVarsBudgeted(arg, try budget.childDepth(depth), budget)) return true;
                 }
                 return false;
             },
             .protocol_constraint => |pc| {
                 for (pc.type_params) |tp| {
-                    if (self.containsTypeVars(tp)) return true;
+                    if (try self.containsTypeVarsBudgeted(tp, try budget.childDepth(depth), budget)) return true;
                 }
                 return false;
             },
@@ -1052,48 +1133,71 @@ pub const TypeStore = struct {
 
     /// Check whether `var_id` occurs anywhere inside the type referenced by `type_id`.
     /// Used as an occurs check to prevent constructing infinite types during unification.
-    pub fn occursIn(self: *const TypeStore, var_id: TypeVarId, type_id: TypeId, subs: *const SubstitutionMap) bool {
+    pub fn occursIn(self: *const TypeStore, var_id: TypeVarId, type_id: TypeId, subs: *const SubstitutionMap) TypeGraphError!bool {
+        return self.occursInWithLimits(var_id, type_id, subs, default_type_graph_limits);
+    }
+
+    fn occursInWithLimits(
+        self: *const TypeStore,
+        var_id: TypeVarId,
+        type_id: TypeId,
+        subs: *const SubstitutionMap,
+        limits: TypeGraphLimits,
+    ) TypeGraphError!bool {
+        var budget = TypeGraphBudget.init(limits);
+        return self.occursInBudgeted(var_id, type_id, subs, 0, &budget);
+    }
+
+    fn occursInBudgeted(
+        self: *const TypeStore,
+        var_id: TypeVarId,
+        type_id: TypeId,
+        subs: *const SubstitutionMap,
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!bool {
+        try budget.enter(depth);
         const typ = self.getType(type_id);
         return switch (typ) {
             .type_var => |other_var_id| {
                 if (other_var_id == var_id) return true;
                 // If this var is already bound, check what it's bound to
                 if (subs.resolve(other_var_id)) |resolved| {
-                    return self.occursIn(var_id, resolved, subs);
+                    return self.occursInBudgeted(var_id, resolved, subs, try budget.childDepth(depth), budget);
                 }
                 return false;
             },
-            .list => |list_type| self.occursIn(var_id, list_type.element, subs),
+            .list => |list_type| try self.occursInBudgeted(var_id, list_type.element, subs, try budget.childDepth(depth), budget),
             .tuple => |tuple_type| {
                 for (tuple_type.elements) |element| {
-                    if (self.occursIn(var_id, element, subs)) return true;
+                    if (try self.occursInBudgeted(var_id, element, subs, try budget.childDepth(depth), budget)) return true;
                 }
                 return false;
             },
             .function => |function_type| {
                 for (function_type.params) |param| {
-                    if (self.occursIn(var_id, param, subs)) return true;
+                    if (try self.occursInBudgeted(var_id, param, subs, try budget.childDepth(depth), budget)) return true;
                 }
-                if (self.occursIn(var_id, function_type.return_type, subs)) return true;
+                if (try self.occursInBudgeted(var_id, function_type.return_type, subs, try budget.childDepth(depth), budget)) return true;
                 if (function_type.effect_var) |ev| {
-                    if (self.occursIn(var_id, ev, subs)) return true;
+                    if (try self.occursInBudgeted(var_id, ev, subs, try budget.childDepth(depth), budget)) return true;
                 }
                 return false;
             },
             .map => |map_type| {
-                return self.occursIn(var_id, map_type.key, subs) or
-                    self.occursIn(var_id, map_type.value, subs);
+                return (try self.occursInBudgeted(var_id, map_type.key, subs, try budget.childDepth(depth), budget)) or
+                    (try self.occursInBudgeted(var_id, map_type.value, subs, try budget.childDepth(depth), budget));
             },
             .applied => |applied_type| {
-                if (self.occursIn(var_id, applied_type.base, subs)) return true;
+                if (try self.occursInBudgeted(var_id, applied_type.base, subs, try budget.childDepth(depth), budget)) return true;
                 for (applied_type.args) |arg| {
-                    if (self.occursIn(var_id, arg, subs)) return true;
+                    if (try self.occursInBudgeted(var_id, arg, subs, try budget.childDepth(depth), budget)) return true;
                 }
                 return false;
             },
             .protocol_constraint => |pc| {
                 for (pc.type_params) |tp| {
-                    if (self.occursIn(var_id, tp, subs)) return true;
+                    if (try self.occursInBudgeted(var_id, tp, subs, try budget.childDepth(depth), budget)) return true;
                 }
                 return false;
             },
@@ -1105,11 +1209,32 @@ pub const TypeStore = struct {
 
     /// Resolve a type_id through existing substitutions to its current representative.
     /// If the type is a type variable that is bound, follow the chain.
-    fn resolveTypeVar(self: *const TypeStore, type_id: TypeId, subs: *const SubstitutionMap) TypeId {
+    fn resolveTypeVar(self: *const TypeStore, type_id: TypeId, subs: *const SubstitutionMap) TypeGraphError!TypeId {
+        return self.resolveTypeVarWithLimits(type_id, subs, default_type_graph_limits);
+    }
+
+    fn resolveTypeVarWithLimits(
+        self: *const TypeStore,
+        type_id: TypeId,
+        subs: *const SubstitutionMap,
+        limits: TypeGraphLimits,
+    ) TypeGraphError!TypeId {
+        var budget = TypeGraphBudget.init(limits);
+        return self.resolveTypeVarBudgeted(type_id, subs, 0, &budget);
+    }
+
+    fn resolveTypeVarBudgeted(
+        self: *const TypeStore,
+        type_id: TypeId,
+        subs: *const SubstitutionMap,
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!TypeId {
+        try budget.enter(depth);
         const typ = self.getType(type_id);
         if (typ == .type_var) {
             if (subs.resolve(typ.type_var)) |resolved| {
-                return self.resolveTypeVar(resolved, subs);
+                return self.resolveTypeVarBudgeted(resolved, subs, try budget.childDepth(depth), budget);
             }
         }
         return type_id;
@@ -1124,10 +1249,23 @@ pub const TypeStore = struct {
     /// - A type variable binds to the other type (with occurs check).
     /// - Compound types (list, tuple, function, map) unify structurally.
     /// - Primitives must match exactly.
-    pub fn unify(self: *const TypeStore, a: TypeId, b: TypeId, subs: *SubstitutionMap) !bool {
+    pub fn unify(self: *const TypeStore, a: TypeId, b: TypeId, subs: *SubstitutionMap) TypeGraphError!bool {
+        var budget = TypeGraphBudget.init(default_type_graph_limits);
+        return self.unifyBudgeted(a, b, subs, 0, &budget);
+    }
+
+    fn unifyBudgeted(
+        self: *const TypeStore,
+        a: TypeId,
+        b: TypeId,
+        subs: *SubstitutionMap,
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!bool {
+        try budget.enter(depth);
         // Resolve both sides through any existing substitutions
-        const resolved_a = self.resolveTypeVar(a, subs);
-        const resolved_b = self.resolveTypeVar(b, subs);
+        const resolved_a = try self.resolveTypeVarBudgeted(a, subs, depth, budget);
+        const resolved_b = try self.resolveTypeVarBudgeted(b, subs, depth, budget);
 
         // Identical type IDs always unify
         if (resolved_a == resolved_b) return true;
@@ -1157,22 +1295,22 @@ pub const TypeStore = struct {
         // return type would collapse to `%{Atom=>String}` instead of
         // remaining `%{Atom=>Term}`.
         if (type_a == .term_type or type_b == .term_type) {
-            if (type_a == .type_var) subs.markTermConstrained(type_a.type_var);
-            if (type_b == .type_var) subs.markTermConstrained(type_b.type_var);
+            if (type_a == .type_var) try subs.markTermConstrained(type_a.type_var);
+            if (type_b == .type_var) try subs.markTermConstrained(type_b.type_var);
             return true;
         }
 
         // If a is a type variable, bind it to b (with occurs check)
         if (type_a == .type_var) {
-            if (self.occursIn(type_a.type_var, resolved_b, subs)) return false;
-            subs.bind(type_a.type_var, resolved_b);
+            if (try self.occursInBudgeted(type_a.type_var, resolved_b, subs, try budget.childDepth(depth), budget)) return false;
+            try subs.bind(type_a.type_var, resolved_b);
             return true;
         }
 
         // If b is a type variable, bind it to a (with occurs check)
         if (type_b == .type_var) {
-            if (self.occursIn(type_b.type_var, resolved_a, subs)) return false;
-            subs.bind(type_b.type_var, resolved_a);
+            if (try self.occursInBudgeted(type_b.type_var, resolved_a, subs, try budget.childDepth(depth), budget)) return false;
+            try subs.bind(type_b.type_var, resolved_a);
             return true;
         }
 
@@ -1189,10 +1327,10 @@ pub const TypeStore = struct {
         // (so the call site references a dropped generic group). Must run
         // BEFORE the generic protocol-constraint accept.
         if (type_a == .function and type_b == .protocol_constraint) {
-            if (try self.unifyFunctionWithCallable(type_a.function, b, subs)) |ok| return ok;
+            if (try self.unifyFunctionWithCallable(type_a.function, b, subs, depth, budget)) |ok| return ok;
         }
         if (type_b == .function and type_a == .protocol_constraint) {
-            if (try self.unifyFunctionWithCallable(type_b.function, a, subs)) |ok| return ok;
+            if (try self.unifyFunctionWithCallable(type_b.function, a, subs, depth, budget)) |ok| return ok;
         }
 
         // Protocol constraints accept any type — dispatch verified at monomorphization
@@ -1200,14 +1338,14 @@ pub const TypeStore = struct {
 
         // Both are list types: unify element types
         if (type_a == .list and type_b == .list) {
-            return self.unify(type_a.list.element, type_b.list.element, subs);
+            return self.unifyBudgeted(type_a.list.element, type_b.list.element, subs, try budget.childDepth(depth), budget);
         }
 
         // Both are tuple types: must have same length, unify pairwise
         if (type_a == .tuple and type_b == .tuple) {
             if (type_a.tuple.elements.len != type_b.tuple.elements.len) return false;
             for (type_a.tuple.elements, type_b.tuple.elements) |elem_a, elem_b| {
-                if (!try self.unify(elem_a, elem_b, subs)) return false;
+                if (!(try self.unifyBudgeted(elem_a, elem_b, subs, try budget.childDepth(depth), budget))) return false;
             }
             return true;
         }
@@ -1216,9 +1354,9 @@ pub const TypeStore = struct {
         if (type_a == .function and type_b == .function) {
             if (type_a.function.params.len != type_b.function.params.len) return false;
             for (type_a.function.params, type_b.function.params) |param_a, param_b| {
-                if (!try self.unify(param_a, param_b, subs)) return false;
+                if (!(try self.unifyBudgeted(param_a, param_b, subs, try budget.childDepth(depth), budget))) return false;
             }
-            if (!try self.unify(type_a.function.return_type, type_b.function.return_type, subs)) return false;
+            if (!(try self.unifyBudgeted(type_a.function.return_type, type_b.function.return_type, subs, try budget.childDepth(depth), budget))) return false;
             // Effect unification (#201). A higher-order parameter's
             // declared closure type carries a polymorphic
             // `effect_var` (a fresh `type_var`); the closure value
@@ -1232,12 +1370,12 @@ pub const TypeStore = struct {
             // the effects must simply agree.
             if (type_a.function.effect_var) |ev_a| {
                 if (type_b.function.effect_var == null) {
-                    return self.unify(ev_a, resolved_b, subs);
+                    return self.unifyBudgeted(ev_a, resolved_b, subs, try budget.childDepth(depth), budget);
                 }
             }
             if (type_b.function.effect_var) |ev_b| {
                 if (type_a.function.effect_var == null) {
-                    return self.unify(ev_b, resolved_a, subs);
+                    return self.unifyBudgeted(ev_b, resolved_a, subs, try budget.childDepth(depth), budget);
                 }
             }
             return true;
@@ -1245,8 +1383,8 @@ pub const TypeStore = struct {
 
         // Both are map types: unify key and value types
         if (type_a == .map and type_b == .map) {
-            if (!try self.unify(type_a.map.key, type_b.map.key, subs)) return false;
-            return self.unify(type_a.map.value, type_b.map.value, subs);
+            if (!(try self.unifyBudgeted(type_a.map.key, type_b.map.key, subs, try budget.childDepth(depth), budget))) return false;
+            return self.unifyBudgeted(type_a.map.value, type_b.map.value, subs, try budget.childDepth(depth), budget);
         }
 
         // Both are parametric instantiations: the bases must agree
@@ -1265,7 +1403,7 @@ pub const TypeStore = struct {
             // unification opportunities.
             if (type_a.applied.base != type_b.applied.base) return false;
             for (type_a.applied.args, type_b.applied.args) |arg_a, arg_b| {
-                if (!try self.unify(arg_a, arg_b, subs)) return false;
+                if (!(try self.unifyBudgeted(arg_a, arg_b, subs, try budget.childDepth(depth), budget))) return false;
             }
             return true;
         }
@@ -1317,7 +1455,9 @@ pub const TypeStore = struct {
         fn_type: Type.FunctionType,
         callable_id: TypeId,
         subs: *SubstitutionMap,
-    ) error{OutOfMemory}!?bool {
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!?bool {
         const callable = self.callableArgsAndResult(callable_id) orelse return null;
         const args_tuple = self.getType(callable.args_tuple);
         if (args_tuple != .tuple) return false;
@@ -1326,9 +1466,9 @@ pub const TypeStore = struct {
         // elements and the return against the `Callable` `result`, threading
         // the caller's subs so any type variables on the function side bind.
         for (fn_type.params, args_tuple.tuple.elements) |fn_param, tuple_element| {
-            if (!try self.unify(fn_param, tuple_element, subs)) return false;
+            if (!(try self.unifyBudgeted(fn_param, tuple_element, subs, try budget.childDepth(depth), budget))) return false;
         }
-        if (!try self.unify(fn_type.return_type, callable.result, subs)) return false;
+        if (!(try self.unifyBudgeted(fn_type.return_type, callable.result, subs, try budget.childDepth(depth), budget))) return false;
         // Bind the higher-order parameter's polymorphic `effect_var` (#201)
         // to the `Callable` constraint TypeId. The `Callable` side has no
         // effect_var (it is a concrete existential value), so this mirrors the
@@ -1337,7 +1477,7 @@ pub const TypeStore = struct {
         // specialization key for the boxed-closure argument instead of leaving
         // the callee unspecialized.
         if (fn_type.effect_var) |ev| {
-            return try self.unify(ev, callable_id, subs);
+            return try self.unifyBudgeted(ev, callable_id, subs, try budget.childDepth(depth), budget);
         }
         return true;
     }
@@ -1380,8 +1520,8 @@ pub const SubstitutionMap = struct {
     }
 
     /// Bind a type variable to a concrete type.
-    pub fn bind(self: *SubstitutionMap, var_id: TypeVarId, type_id: TypeId) void {
-        self.bindings.put(var_id, type_id) catch {};
+    pub fn bind(self: *SubstitutionMap, var_id: TypeVarId, type_id: TypeId) std.mem.Allocator.Error!void {
+        try self.bindings.put(var_id, type_id);
     }
 
     /// Mark a type variable as Term-constrained — i.e. it appeared at
@@ -1389,8 +1529,8 @@ pub const SubstitutionMap = struct {
     /// `applyToReturnType` can promote container-position
     /// occurrences back to `Term` even when the var also acquired a
     /// concrete binding from a scalar argument.
-    pub fn markTermConstrained(self: *SubstitutionMap, var_id: TypeVarId) void {
-        self.term_constrained.put(var_id, {}) catch {};
+    pub fn markTermConstrained(self: *SubstitutionMap, var_id: TypeVarId) std.mem.Allocator.Error!void {
+        try self.term_constrained.put(var_id, {});
     }
 
     pub fn isTermConstrained(self: *const SubstitutionMap, var_id: TypeVarId) bool {
@@ -1403,48 +1543,98 @@ pub const SubstitutionMap = struct {
         return self.bindings.get(var_id);
     }
 
+    fn putChangedTypeId(
+        store: *TypeStore,
+        maybe_new_items: *?[]TypeId,
+        original_items: []const TypeId,
+        index: usize,
+        new_type_id: TypeId,
+    ) TypeGraphError!void {
+        if (maybe_new_items.* == null) {
+            const new_items = try store.allocator.alloc(TypeId, original_items.len);
+            @memcpy(new_items[0..index], original_items[0..index]);
+            maybe_new_items.* = new_items;
+        }
+        maybe_new_items.*.?[index] = new_type_id;
+    }
+
+    fn addTypeWithOwnedTypeIds(store: *TypeStore, typ: Type, owned_type_ids: ?[]TypeId) TypeGraphError!TypeId {
+        errdefer if (owned_type_ids) |items| store.allocator.free(items);
+        const previous_type_count = store.types.items.len;
+        const new_type_id = try store.addType(typ);
+        if (owned_type_ids) |items| {
+            if (new_type_id < previous_type_count) {
+                store.allocator.free(items);
+            }
+        }
+        return new_type_id;
+    }
+
     /// Apply all substitutions to a type, recursively replacing type variables
     /// with their bound types. Returns a new TypeId for compound types where
     /// substitutions occurred; returns the original TypeId for primitives or
     /// unbound variables.
-    pub fn applyToType(self: *const SubstitutionMap, store: *TypeStore, type_id: TypeId) TypeId {
+    pub fn applyToType(self: *const SubstitutionMap, store: *TypeStore, type_id: TypeId) TypeGraphError!TypeId {
+        return self.applyToTypeWithLimits(store, type_id, default_type_graph_limits);
+    }
+
+    fn applyToTypeWithLimits(
+        self: *const SubstitutionMap,
+        store: *TypeStore,
+        type_id: TypeId,
+        limits: TypeGraphLimits,
+    ) TypeGraphError!TypeId {
+        var budget = TypeGraphBudget.init(limits);
+        return self.applyToTypeBudgeted(store, type_id, 0, &budget);
+    }
+
+    fn applyToTypeBudgeted(
+        self: *const SubstitutionMap,
+        store: *TypeStore,
+        type_id: TypeId,
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!TypeId {
+        try budget.enter(depth);
         const typ = store.getType(type_id);
         return switch (typ) {
             .type_var => |var_id| {
                 if (self.resolve(var_id)) |bound_type| {
-                    // Recursively apply in case the bound type also contains vars
-                    return self.applyToType(store, bound_type);
+                    // Recursively apply in case the bound type also contains vars.
+                    return self.applyToTypeBudgeted(store, bound_type, try budget.childDepth(depth), budget);
                 }
                 return type_id;
             },
             .list => |list_type| {
-                const new_element = self.applyToType(store, list_type.element);
+                const new_element = try self.applyToTypeBudgeted(store, list_type.element, try budget.childDepth(depth), budget);
                 if (new_element == list_type.element) return type_id;
-                return store.addType(.{ .list = .{ .element = new_element } }) catch type_id;
+                return try store.addType(.{ .list = .{ .element = new_element } });
             },
             .tuple => |tuple_type| {
-                var changed = false;
-                const new_elements = store.allocator.alloc(TypeId, tuple_type.elements.len) catch return type_id;
+                var new_elements: ?[]TypeId = null;
+                errdefer if (new_elements) |items| store.allocator.free(items);
                 for (tuple_type.elements, 0..) |element, index| {
-                    const new_element = self.applyToType(store, element);
-                    new_elements[index] = new_element;
-                    if (new_element != element) changed = true;
+                    const new_element = try self.applyToTypeBudgeted(store, element, try budget.childDepth(depth), budget);
+                    if (new_element != element or new_elements != null) {
+                        try putChangedTypeId(store, &new_elements, tuple_type.elements, index, new_element);
+                    }
                 }
-                if (!changed) {
-                    store.allocator.free(new_elements);
-                    return type_id;
-                }
-                return store.addType(.{ .tuple = .{ .elements = new_elements } }) catch type_id;
+                const elements = new_elements orelse return type_id;
+                new_elements = null;
+                return try addTypeWithOwnedTypeIds(store, .{ .tuple = .{ .elements = elements } }, elements);
             },
             .function => |function_type| {
                 var changed = false;
-                const new_params = store.allocator.alloc(TypeId, function_type.params.len) catch return type_id;
+                var new_params: ?[]TypeId = null;
+                errdefer if (new_params) |items| store.allocator.free(items);
                 for (function_type.params, 0..) |param, index| {
-                    const new_param = self.applyToType(store, param);
-                    new_params[index] = new_param;
-                    if (new_param != param) changed = true;
+                    const new_param = try self.applyToTypeBudgeted(store, param, try budget.childDepth(depth), budget);
+                    if (new_param != param or new_params != null) {
+                        try putChangedTypeId(store, &new_params, function_type.params, index, new_param);
+                        changed = true;
+                    }
                 }
-                const new_return = self.applyToType(store, function_type.return_type);
+                const new_return = try self.applyToTypeBudgeted(store, function_type.return_type, try budget.childDepth(depth), budget);
                 if (new_return != function_type.return_type) changed = true;
                 // Resolve a polymorphic effect (#201). When this
                 // function type's `effect_var` is now bound to a
@@ -1454,7 +1644,7 @@ pub const SubstitutionMap = struct {
                 var new_raises = function_type.raises;
                 var new_effect_var = function_type.effect_var;
                 if (function_type.effect_var) |ev| {
-                    const resolved_effect = self.applyToType(store, ev);
+                    const resolved_effect = try self.applyToTypeBudgeted(store, ev, try budget.childDepth(depth), budget);
                     if (resolved_effect != ev) {
                         const resolved_typ = store.getType(resolved_effect);
                         if (resolved_typ == .function) {
@@ -1464,13 +1654,13 @@ pub const SubstitutionMap = struct {
                         }
                     }
                 }
-                if (!changed) {
-                    store.allocator.free(new_params);
-                    return type_id;
-                }
-                return store.addType(.{
+                if (!changed) return type_id;
+                const owned_params = new_params;
+                const params = owned_params orelse function_type.params;
+                new_params = null;
+                return try addTypeWithOwnedTypeIds(store, .{
                     .function = .{
-                        .params = new_params,
+                        .params = params,
                         .return_type = new_return,
                         .param_ownerships = function_type.param_ownerships,
                         .return_ownership = function_type.return_ownership,
@@ -1481,33 +1671,32 @@ pub const SubstitutionMap = struct {
                         // across substitution.
                         .raises_row = function_type.raises_row,
                     },
-                }) catch type_id;
+                }, owned_params);
             },
             .map => |map_type| {
-                const new_key = self.applyToType(store, map_type.key);
-                const new_value = self.applyToType(store, map_type.value);
+                const new_key = try self.applyToTypeBudgeted(store, map_type.key, try budget.childDepth(depth), budget);
+                const new_value = try self.applyToTypeBudgeted(store, map_type.value, try budget.childDepth(depth), budget);
                 if (new_key == map_type.key and new_value == map_type.value) return type_id;
-                return store.addType(.{ .map = .{
+                return try store.addType(.{ .map = .{
                     .key = new_key,
                     .value = new_value,
-                } }) catch type_id;
+                } });
             },
             .protocol_constraint => |pc| {
-                var changed = false;
-                const new_params = store.allocator.alloc(TypeId, pc.type_params.len) catch return type_id;
-                for (pc.type_params, 0..) |tp, index| {
-                    const new_tp = self.applyToType(store, tp);
-                    new_params[index] = new_tp;
-                    if (new_tp != tp) changed = true;
+                var new_params: ?[]TypeId = null;
+                errdefer if (new_params) |items| store.allocator.free(items);
+                for (pc.type_params, 0..) |type_param, index| {
+                    const new_type_param = try self.applyToTypeBudgeted(store, type_param, try budget.childDepth(depth), budget);
+                    if (new_type_param != type_param or new_params != null) {
+                        try putChangedTypeId(store, &new_params, pc.type_params, index, new_type_param);
+                    }
                 }
-                if (!changed) {
-                    store.allocator.free(new_params);
-                    return type_id;
-                }
-                return store.addType(.{ .protocol_constraint = .{
+                const params = new_params orelse return type_id;
+                new_params = null;
+                return try addTypeWithOwnedTypeIds(store, .{ .protocol_constraint = .{
                     .protocol_name = pc.protocol_name,
-                    .type_params = new_params,
-                } }) catch type_id;
+                    .type_params = params,
+                } }, params);
             },
             .applied => |applied_type| {
                 // A parametric type instantiation `Box(T)` -> `Box(i64)`:
@@ -1517,21 +1706,20 @@ pub const SubstitutionMap = struct {
                 // points at a declaration's StructType / TaggedUnionType
                 // — those declarations are immutable; only the
                 // instantiation's argument tuple changes.
-                var changed = false;
-                const new_args = store.allocator.alloc(TypeId, applied_type.args.len) catch return type_id;
+                var new_args: ?[]TypeId = null;
+                errdefer if (new_args) |items| store.allocator.free(items);
                 for (applied_type.args, 0..) |arg, index| {
-                    const new_arg = self.applyToType(store, arg);
-                    new_args[index] = new_arg;
-                    if (new_arg != arg) changed = true;
+                    const new_arg = try self.applyToTypeBudgeted(store, arg, try budget.childDepth(depth), budget);
+                    if (new_arg != arg or new_args != null) {
+                        try putChangedTypeId(store, &new_args, applied_type.args, index, new_arg);
+                    }
                 }
-                if (!changed) {
-                    store.allocator.free(new_args);
-                    return type_id;
-                }
-                return store.addType(.{ .applied = .{
+                const args = new_args orelse return type_id;
+                new_args = null;
+                return try addTypeWithOwnedTypeIds(store, .{ .applied = .{
                     .base = applied_type.base,
-                    .args = new_args,
-                } }) catch type_id;
+                    .args = args,
+                } }, args);
             },
             // Primitives and other types pass through unchanged
             .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
@@ -1557,11 +1745,29 @@ pub const SubstitutionMap = struct {
     /// Mirrors `monomorphize.promoteContainerVarsExceptScalarReturn`
     /// at the type-checker layer so call-site argument validation
     /// agrees with the eventual specialised signature.
-    pub fn applyToReturnType(self: *const SubstitutionMap, store: *TypeStore, type_id: TypeId) TypeId {
-        return self.applyToReturnTypeImpl(store, type_id, true);
+    pub fn applyToReturnType(self: *const SubstitutionMap, store: *TypeStore, type_id: TypeId) TypeGraphError!TypeId {
+        return self.applyToReturnTypeWithLimits(store, type_id, default_type_graph_limits);
     }
 
-    fn applyToReturnTypeImpl(self: *const SubstitutionMap, store: *TypeStore, type_id: TypeId, scalar_position: bool) TypeId {
+    fn applyToReturnTypeWithLimits(
+        self: *const SubstitutionMap,
+        store: *TypeStore,
+        type_id: TypeId,
+        limits: TypeGraphLimits,
+    ) TypeGraphError!TypeId {
+        var budget = TypeGraphBudget.init(limits);
+        return self.applyToReturnTypeImpl(store, type_id, true, 0, &budget);
+    }
+
+    fn applyToReturnTypeImpl(
+        self: *const SubstitutionMap,
+        store: *TypeStore,
+        type_id: TypeId,
+        scalar_position: bool,
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!TypeId {
+        try budget.enter(depth);
         const typ = store.getType(type_id);
         return switch (typ) {
             .type_var => |var_id| {
@@ -1572,44 +1778,46 @@ pub const SubstitutionMap = struct {
                     return TypeStore.TERM;
                 }
                 if (self.resolve(var_id)) |bound_type| {
-                    return self.applyToReturnTypeImpl(store, bound_type, scalar_position);
+                    return self.applyToReturnTypeImpl(store, bound_type, scalar_position, try budget.childDepth(depth), budget);
                 }
                 return type_id;
             },
             .list => |list_type| {
-                const new_element = self.applyToReturnTypeImpl(store, list_type.element, false);
+                const new_element = try self.applyToReturnTypeImpl(store, list_type.element, false, try budget.childDepth(depth), budget);
                 if (new_element == list_type.element) return type_id;
-                return store.addType(.{ .list = .{ .element = new_element } }) catch type_id;
+                return try store.addType(.{ .list = .{ .element = new_element } });
             },
             .tuple => |tuple_type| {
-                var changed = false;
-                const new_elements = store.allocator.alloc(TypeId, tuple_type.elements.len) catch return type_id;
+                var new_elements: ?[]TypeId = null;
+                errdefer if (new_elements) |items| store.allocator.free(items);
                 for (tuple_type.elements, 0..) |element, index| {
-                    const new_element = self.applyToReturnTypeImpl(store, element, false);
-                    new_elements[index] = new_element;
-                    if (new_element != element) changed = true;
+                    const new_element = try self.applyToReturnTypeImpl(store, element, false, try budget.childDepth(depth), budget);
+                    if (new_element != element or new_elements != null) {
+                        try putChangedTypeId(store, &new_elements, tuple_type.elements, index, new_element);
+                    }
                 }
-                if (!changed) {
-                    store.allocator.free(new_elements);
-                    return type_id;
-                }
-                return store.addType(.{ .tuple = .{ .elements = new_elements } }) catch type_id;
+                const elements = new_elements orelse return type_id;
+                new_elements = null;
+                return try addTypeWithOwnedTypeIds(store, .{ .tuple = .{ .elements = elements } }, elements);
             },
             .function => |function_type| {
                 var changed = false;
-                const new_params = store.allocator.alloc(TypeId, function_type.params.len) catch return type_id;
+                var new_params: ?[]TypeId = null;
+                errdefer if (new_params) |items| store.allocator.free(items);
                 for (function_type.params, 0..) |param, index| {
-                    const new_param = self.applyToReturnTypeImpl(store, param, false);
-                    new_params[index] = new_param;
-                    if (new_param != param) changed = true;
+                    const new_param = try self.applyToReturnTypeImpl(store, param, false, try budget.childDepth(depth), budget);
+                    if (new_param != param or new_params != null) {
+                        try putChangedTypeId(store, &new_params, function_type.params, index, new_param);
+                        changed = true;
+                    }
                 }
-                const new_return = self.applyToReturnTypeImpl(store, function_type.return_type, scalar_position);
+                const new_return = try self.applyToReturnTypeImpl(store, function_type.return_type, scalar_position, try budget.childDepth(depth), budget);
                 if (new_return != function_type.return_type) changed = true;
                 // Resolve a polymorphic effect, mirroring `applyToType` (#201).
                 var new_raises = function_type.raises;
                 var new_effect_var = function_type.effect_var;
                 if (function_type.effect_var) |ev| {
-                    const resolved_effect = self.applyToReturnTypeImpl(store, ev, false);
+                    const resolved_effect = try self.applyToReturnTypeImpl(store, ev, false, try budget.childDepth(depth), budget);
                     if (resolved_effect != ev) {
                         const resolved_typ = store.getType(resolved_effect);
                         if (resolved_typ == .function) {
@@ -1619,65 +1827,63 @@ pub const SubstitutionMap = struct {
                         }
                     }
                 }
-                if (!changed) {
-                    store.allocator.free(new_params);
-                    return type_id;
-                }
-                return store.addType(.{ .function = .{
-                    .params = new_params,
+                if (!changed) return type_id;
+                const owned_params = new_params;
+                const params = owned_params orelse function_type.params;
+                new_params = null;
+                return try addTypeWithOwnedTypeIds(store, .{ .function = .{
+                    .params = params,
                     .return_type = new_return,
                     .param_ownerships = function_type.param_ownerships,
                     .return_ownership = function_type.return_ownership,
                     .raises = new_raises,
                     .effect_var = new_effect_var,
                     .raises_row = function_type.raises_row,
-                } }) catch type_id;
+                } }, owned_params);
             },
             .map => |map_type| {
-                const new_key = self.applyToReturnTypeImpl(store, map_type.key, false);
-                const new_value = self.applyToReturnTypeImpl(store, map_type.value, false);
+                const new_key = try self.applyToReturnTypeImpl(store, map_type.key, false, try budget.childDepth(depth), budget);
+                const new_value = try self.applyToReturnTypeImpl(store, map_type.value, false, try budget.childDepth(depth), budget);
                 if (new_key == map_type.key and new_value == map_type.value) return type_id;
-                return store.addType(.{ .map = .{
+                return try store.addType(.{ .map = .{
                     .key = new_key,
                     .value = new_value,
-                } }) catch type_id;
+                } });
             },
             .protocol_constraint => |pc| {
-                var changed = false;
-                const new_params = store.allocator.alloc(TypeId, pc.type_params.len) catch return type_id;
-                for (pc.type_params, 0..) |tp, index| {
-                    const new_tp = self.applyToReturnTypeImpl(store, tp, false);
-                    new_params[index] = new_tp;
-                    if (new_tp != tp) changed = true;
+                var new_params: ?[]TypeId = null;
+                errdefer if (new_params) |items| store.allocator.free(items);
+                for (pc.type_params, 0..) |type_param, index| {
+                    const new_type_param = try self.applyToReturnTypeImpl(store, type_param, false, try budget.childDepth(depth), budget);
+                    if (new_type_param != type_param or new_params != null) {
+                        try putChangedTypeId(store, &new_params, pc.type_params, index, new_type_param);
+                    }
                 }
-                if (!changed) {
-                    store.allocator.free(new_params);
-                    return type_id;
-                }
-                return store.addType(.{ .protocol_constraint = .{
+                const params = new_params orelse return type_id;
+                new_params = null;
+                return try addTypeWithOwnedTypeIds(store, .{ .protocol_constraint = .{
                     .protocol_name = pc.protocol_name,
-                    .type_params = new_params,
-                } }) catch type_id;
+                    .type_params = params,
+                } }, params);
             },
             .applied => |applied_type| {
                 // Generic instantiation arguments are *container*
                 // positions for Term-promotion purposes — mirrors how
                 // a list element or map value is treated.
-                var changed = false;
-                const new_args = store.allocator.alloc(TypeId, applied_type.args.len) catch return type_id;
+                var new_args: ?[]TypeId = null;
+                errdefer if (new_args) |items| store.allocator.free(items);
                 for (applied_type.args, 0..) |arg, index| {
-                    const new_arg = self.applyToReturnTypeImpl(store, arg, false);
-                    new_args[index] = new_arg;
-                    if (new_arg != arg) changed = true;
+                    const new_arg = try self.applyToReturnTypeImpl(store, arg, false, try budget.childDepth(depth), budget);
+                    if (new_arg != arg or new_args != null) {
+                        try putChangedTypeId(store, &new_args, applied_type.args, index, new_arg);
+                    }
                 }
-                if (!changed) {
-                    store.allocator.free(new_args);
-                    return type_id;
-                }
-                return store.addType(.{ .applied = .{
+                const args = new_args orelse return type_id;
+                new_args = null;
+                return try addTypeWithOwnedTypeIds(store, .{ .applied = .{
                     .base = applied_type.base,
-                    .args = new_args,
-                } }) catch type_id;
+                    .args = args,
+                } }, args);
             },
             .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .unknown, .error_type, .term_type => type_id,
             // Nominal-type declarations pass through; instantiations
@@ -1693,8 +1899,8 @@ pub const SubstitutionMap = struct {
 /// Kept here (rather than imported) to avoid cyclic dep between types.zig
 /// and ir.zig — the type checker queries the analysis IR by name, so it
 /// needs to reproduce the same mangling at lookup time.
-fn mangleNameForIr(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-    if (name.len == 0) return allocator.dupe(u8, name) catch null;
+fn mangleNameForIr(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    if (name.len == 0) return try allocator.dupe(u8, name);
     var needs_mangle = false;
     for (name) |c| {
         switch (c) {
@@ -1705,7 +1911,7 @@ fn mangleNameForIr(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
             },
         }
     }
-    if (!needs_mangle) return allocator.dupe(u8, name) catch null;
+    if (!needs_mangle) return try allocator.dupe(u8, name);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
@@ -1731,16 +1937,16 @@ fn mangleNameForIr(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
             ':' => "_colon",
             else => "_x",
         };
-        buf.appendSlice(allocator, piece) catch return null;
+        try buf.appendSlice(allocator, piece);
     }
-    return buf.toOwnedSlice(allocator) catch null;
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Join a multi-segment struct name with `_` (single underscore), matching
-/// `IrBuilder.structNameToPrefix`. Returns `null` only on allocation failure.
-fn joinStructNameWithUnderscore(allocator: std.mem.Allocator, interner: *const ast.StringInterner, name: ast.StructName) ?[]u8 {
+/// `IrBuilder.structNameToPrefix`.
+fn joinStructNameWithUnderscore(allocator: std.mem.Allocator, interner: *const ast.StringInterner, name: ast.StructName) !?[]u8 {
     if (name.parts.len == 0) return null;
-    const joined = name.joinedWith(allocator, interner, "_") catch return null;
+    const joined = try name.joinedWith(allocator, interner, "_");
     return @constCast(joined);
 }
 
@@ -1757,77 +1963,117 @@ fn osAtomFromTargetLabel(label: []const u8) []const u8 {
     return iter.next() orelse label; // os
 }
 
+pub const TypeMangleError = std.mem.Allocator.Error || error{
+    TypeMangleDepthLimitExceeded,
+    TypeMangleNodeLimitExceeded,
+};
+
+const TypeMangleLimits = struct {
+    max_depth: usize = 512,
+    max_nodes: usize = 65_536,
+};
+
+const default_type_mangle_limits = TypeMangleLimits{};
+
+const TypeMangleBudget = struct {
+    max_depth: usize,
+    remaining_nodes: usize,
+
+    fn init(limits: TypeMangleLimits) TypeMangleBudget {
+        return .{
+            .max_depth = limits.max_depth,
+            .remaining_nodes = limits.max_nodes,
+        };
+    }
+
+    fn enter(self: *TypeMangleBudget) TypeMangleError!void {
+        if (self.remaining_nodes == 0) return error.TypeMangleNodeLimitExceeded;
+        self.remaining_nodes -= 1;
+    }
+
+    fn childDepth(self: *const TypeMangleBudget, depth: usize) TypeMangleError!usize {
+        if (depth >= self.max_depth) return error.TypeMangleDepthLimitExceeded;
+        return depth + 1;
+    }
+};
+
 /// Canonical mangled name for any `TypeId`. Public so the IR builder,
 /// ZIR backend, and symbol-table emitter share one identity convention
 /// with the monomorphizer's per-specialization naming
 /// (`monomorphize.mangleName` composes function specialization names on
 /// top of this).
 ///
-/// Concrete primitives return interned static strings owned by the
-/// program text — callers must not free them. `.applied { base, args }`
-/// allocates a fresh composed name (`Box_i64`, `Pair_i64_String`,
-/// `Box_Box_i64`) from `allocator` so two distinct instantiations of
-/// the same parametric struct/union get distinct identifiers. Caller
-/// owns the returned slice when it was composed (i.e. when the input
-/// is `.applied` or recursively contains one), and must free it via
-/// `allocator`; ownership transfer is uniform because callers cannot
-/// otherwise tell whether the result was composed or borrowed.
-///
-/// To paper over that ambiguity, every primitive arm copies into the
-/// allocator too, so the contract is "always free via `allocator`."
-/// This matches how the IR builder consumes the result: it stuffs the
-/// mangled name into a `TypeDef.name` slice owned by the IR arena.
+/// The returned slice is always allocated from `allocator`; callers own
+/// it and must free it with the same allocator. Structural type graphs
+/// are traversed with explicit depth and node budgets, so pathological
+/// names fail with `TypeMangleDepthLimitExceeded` or
+/// `TypeMangleNodeLimitExceeded` instead of risking native stack
+/// exhaustion. Every current `Type` tag has an explicit component
+/// spelling; new tags must be added here rather than silently falling
+/// back to a placeholder.
 pub fn typeIdMangledName(
     allocator: std.mem.Allocator,
     store: *const TypeStore,
     type_id: TypeId,
-) std.mem.Allocator.Error![]u8 {
-    const borrowed = try typeIdMangledNameBorrowed(allocator, store, type_id);
-    // `typeIdMangledNameBorrowed` returns either a fresh allocation
-    // (for `.applied`) or a borrowed slice into the interner /
-    // static string table. Always duplicate so the caller's free
-    // contract is uniform.
-    return allocator.dupe(u8, borrowed);
+) TypeMangleError![]u8 {
+    return typeIdMangledNameWithLimits(allocator, store, type_id, default_type_mangle_limits);
 }
 
-/// Internal variant of `typeIdMangledName` that returns the borrowed
-/// slice when the result is a static name (primitives, bare nominal
-/// types) and a freshly-allocated slice when the result is composed
-/// (`.applied`). The caller cannot in general tell which case it
-/// received, so the public `typeIdMangledName` always copies — this
-/// helper exists for the internal recursive arm where the composed
-/// case appends into a buffer (no copy needed).
-fn typeIdMangledNameBorrowed(
+fn typeIdMangledNameWithLimits(
     allocator: std.mem.Allocator,
     store: *const TypeStore,
     type_id: TypeId,
-) std.mem.Allocator.Error![]const u8 {
+    limits: TypeMangleLimits,
+) TypeMangleError![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    var budget = TypeMangleBudget.init(limits);
+    try appendTypeIdMangledName(allocator, store, type_id, 0, &budget, &buf);
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn appendTypeIdMangledName(
+    allocator: std.mem.Allocator,
+    store: *const TypeStore,
+    type_id: TypeId,
+    depth: usize,
+    budget: *TypeMangleBudget,
+    buf: *std.ArrayListUnmanaged(u8),
+) TypeMangleError!void {
+    try budget.enter();
     const typ = store.getType(type_id);
-    return switch (typ) {
-        .int => |it| switch (it.bits) {
-            8 => if (it.signedness == .signed) @as([]const u8, "i8") else @as([]const u8, "u8"),
-            16 => if (it.signedness == .signed) @as([]const u8, "i16") else @as([]const u8, "u16"),
-            32 => if (it.signedness == .signed) @as([]const u8, "i32") else @as([]const u8, "u32"),
-            64 => if (it.signedness == .signed) @as([]const u8, "i64") else @as([]const u8, "u64"),
-            128 => if (it.signedness == .signed) @as([]const u8, "i128") else @as([]const u8, "u128"),
-            else => @as([]const u8, "int"),
+    switch (typ) {
+        .int => |int_type| {
+            const name = switch (int_type.bits) {
+                8 => if (int_type.signedness == .signed) @as([]const u8, "i8") else @as([]const u8, "u8"),
+                16 => if (int_type.signedness == .signed) @as([]const u8, "i16") else @as([]const u8, "u16"),
+                32 => if (int_type.signedness == .signed) @as([]const u8, "i32") else @as([]const u8, "u32"),
+                64 => if (int_type.signedness == .signed) @as([]const u8, "i64") else @as([]const u8, "u64"),
+                128 => if (int_type.signedness == .signed) @as([]const u8, "i128") else @as([]const u8, "u128"),
+                else => @as([]const u8, "int"),
+            };
+            try buf.appendSlice(allocator, name);
         },
-        .float => |ft| switch (ft.bits) {
-            16 => @as([]const u8, "f16"),
-            32 => @as([]const u8, "f32"),
-            64 => @as([]const u8, "f64"),
-            80 => @as([]const u8, "f80"),
-            128 => @as([]const u8, "f128"),
-            else => @as([]const u8, "float"),
+        .float => |float_type| {
+            const name = switch (float_type.bits) {
+                16 => @as([]const u8, "f16"),
+                32 => @as([]const u8, "f32"),
+                64 => @as([]const u8, "f64"),
+                80 => @as([]const u8, "f80"),
+                128 => @as([]const u8, "f128"),
+                else => @as([]const u8, "float"),
+            };
+            try buf.appendSlice(allocator, name);
         },
-        .bool_type => @as([]const u8, "Bool"),
-        .string_type => @as([]const u8, "String"),
-        .atom_type => @as([]const u8, "Atom"),
-        .nil_type => @as([]const u8, "Nil"),
-        .never => @as([]const u8, "Never"),
-        .term_type => @as([]const u8, "Term"),
-        .list => @as([]const u8, "List"),
-        .map => @as([]const u8, "Map"),
+        .bool_type => try buf.appendSlice(allocator, "Bool"),
+        .string_type => try buf.appendSlice(allocator, "String"),
+        .atom_type => try buf.appendSlice(allocator, "Atom"),
+        .nil_type => try buf.appendSlice(allocator, "Nil"),
+        .never => try buf.appendSlice(allocator, "Never"),
+        .term_type => try buf.appendSlice(allocator, "Term"),
+        .list => try buf.appendSlice(allocator, "List"),
+        .map => try buf.appendSlice(allocator, "Map"),
         .tuple => |tup| blk: {
             // Encode tuple element types so two tuples that differ only
             // by element type mangle to DISTINCT names. This is what lets
@@ -1837,15 +2083,19 @@ fn typeIdMangledNameBorrowed(
             // protocol's first type argument. Shape: `Tuple[_<elem>…]`;
             // the empty tuple `{}` (zero-arg closure) mangles to bare
             // `Tuple`, distinct from any non-empty tuple.
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer buf.deinit(allocator);
             try buf.appendSlice(allocator, "Tuple");
             for (tup.elements) |elem| {
                 try buf.append(allocator, '_');
-                const elem_name = try typeIdMangledNameBorrowed(allocator, store, elem);
-                try buf.appendSlice(allocator, elem_name);
+                try appendTypeIdMangledName(
+                    allocator,
+                    store,
+                    elem,
+                    try budget.childDepth(depth),
+                    budget,
+                    buf,
+                );
             }
-            break :blk try buf.toOwnedSlice(allocator);
+            break :blk;
         },
         .function => |ft| blk: {
             // #201 — encode the function type's effect AND signature so
@@ -1856,24 +2106,34 @@ fn typeIdMangledNameBorrowed(
             // per-effect `apply` instances emit under the same Zig
             // symbol — a name collision that cross-binds the pure and
             // raising call sites. Shape: `Fn[Raises]_<param…>_ret_<ret>`.
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer buf.deinit(allocator);
             try buf.appendSlice(allocator, if (ft.raises) @as([]const u8, "FnRaises") else @as([]const u8, "Fn"));
             for (ft.params) |param| {
                 try buf.append(allocator, '_');
-                const param_name = try typeIdMangledNameBorrowed(allocator, store, param);
-                try buf.appendSlice(allocator, param_name);
+                try appendTypeIdMangledName(
+                    allocator,
+                    store,
+                    param,
+                    try budget.childDepth(depth),
+                    budget,
+                    buf,
+                );
             }
             try buf.appendSlice(allocator, "_ret_");
-            const ret_name = try typeIdMangledNameBorrowed(allocator, store, ft.return_type);
-            try buf.appendSlice(allocator, ret_name);
-            break :blk try buf.toOwnedSlice(allocator);
+            try appendTypeIdMangledName(
+                allocator,
+                store,
+                ft.return_type,
+                try budget.childDepth(depth),
+                budget,
+                buf,
+            );
+            break :blk;
         },
-        .unknown => @as([]const u8, "Any"),
-        .error_type => @as([]const u8, "Error"),
-        .struct_type => |st| @constCast(store).interner.get(st.name),
-        .tagged_union => |tu| @constCast(store).interner.get(tu.name),
-        .opaque_type => |ot| @constCast(store).interner.get(ot.name),
+        .unknown => try buf.appendSlice(allocator, "Any"),
+        .error_type => try buf.appendSlice(allocator, "Error"),
+        .struct_type => |st| try buf.appendSlice(allocator, @constCast(store).interner.get(st.name)),
+        .tagged_union => |tu| try buf.appendSlice(allocator, @constCast(store).interner.get(tu.name)),
+        .opaque_type => |ot| try buf.appendSlice(allocator, @constCast(store).interner.get(ot.name)),
         // A protocol existential mangles to the protocol's bare name —
         // so `Option(Error)` joins to `Option_Error`, matching the
         // per-instantiation TypeDef the IR emits for it (Phase 1.2.5.b).
@@ -1890,35 +2150,77 @@ fn typeIdMangledNameBorrowed(
         // (FCC Phase 1 — parameterized protocol as a boxed existential).
         .protocol_constraint => |pc| blk: {
             const proto_name = @constCast(store).interner.get(pc.protocol_name);
-            if (pc.type_params.len == 0) break :blk proto_name;
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer buf.deinit(allocator);
+            if (pc.type_params.len == 0) {
+                try buf.appendSlice(allocator, proto_name);
+                break :blk;
+            }
             try buf.appendSlice(allocator, proto_name);
             for (pc.type_params) |arg| {
                 try buf.append(allocator, '_');
-                const arg_name = try typeIdMangledNameBorrowed(allocator, store, arg);
-                try buf.appendSlice(allocator, arg_name);
+                try appendTypeIdMangledName(
+                    allocator,
+                    store,
+                    arg,
+                    try budget.childDepth(depth),
+                    budget,
+                    buf,
+                );
             }
-            break :blk try buf.toOwnedSlice(allocator);
+            break :blk;
         },
         .applied => |ap| blk: {
             // Compose `<Base>_<Arg0>_<Arg1>...` so two distinct
             // instantiations of the same parametric base produce
             // distinct names. Nested parametrics flatten the same
             // way: `Box(Box(i64))` -> `Box_Box_i64`.
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer buf.deinit(allocator);
-            const base_name = try typeIdMangledNameBorrowed(allocator, store, ap.base);
-            try buf.appendSlice(allocator, base_name);
+            try appendTypeIdMangledName(
+                allocator,
+                store,
+                ap.base,
+                try budget.childDepth(depth),
+                budget,
+                buf,
+            );
             for (ap.args) |arg| {
                 try buf.append(allocator, '_');
-                const arg_name = try typeIdMangledNameBorrowed(allocator, store, arg);
-                try buf.appendSlice(allocator, arg_name);
+                try appendTypeIdMangledName(
+                    allocator,
+                    store,
+                    arg,
+                    try budget.childDepth(depth),
+                    budget,
+                    buf,
+                );
             }
-            break :blk try buf.toOwnedSlice(allocator);
+            break :blk;
         },
-        else => @as([]const u8, "T"),
-    };
+        .union_type => |ut| blk: {
+            // Anonymous union annotations (`A | B`) can appear inside
+            // otherwise concrete type graphs, including stdlib manifest
+            // declarations loaded during build.zap CTFE. They lower to a
+            // concrete ABI shape (`?T` for nullable unions, `anytype` for
+            // general unions today), so they need a stable structural name
+            // when used as a parametric/protocol identity component.
+            try buf.appendSlice(allocator, "Union");
+            for (ut.members) |member| {
+                try buf.append(allocator, '_');
+                try appendTypeIdMangledName(
+                    allocator,
+                    store,
+                    member,
+                    try budget.childDepth(depth),
+                    budget,
+                    buf,
+                );
+            }
+            break :blk;
+        },
+        .type_var => |var_id| {
+            const var_name = try std.fmt.allocPrint(allocator, "TypeVar{d}", .{var_id});
+            defer allocator.free(var_name);
+            try buf.appendSlice(allocator, var_name);
+        },
+    }
 }
 
 // ============================================================
@@ -2084,15 +2386,97 @@ pub const TypeChecker = struct {
         declared_arity: u32,
     };
 
+    const DiagnosticName = union(enum) {
+        borrowed: []const u8,
+        owned: []const u8,
+
+        fn slice(self: DiagnosticName) []const u8 {
+            return switch (self) {
+                .borrowed => |text| text,
+                .owned => |text| text,
+            };
+        }
+
+        fn deinit(self: DiagnosticName, allocator: std.mem.Allocator) void {
+            switch (self) {
+                .borrowed => {},
+                .owned => |text| allocator.free(text),
+            }
+        }
+    };
+
     const StaticFunctionValue = struct {
         struct_name: ast.StructName,
         function_name: ast.StringId,
         arity: u32,
     };
 
-    pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, graph: *scope_mod.ScopeGraph) TypeChecker {
-        const store = allocator.create(TypeStore) catch @panic("OOM");
-        store.* = TypeStore.init(allocator, interner);
+    const MAX_COLLECTION_TYPE_NODES: usize = 1_000_000;
+    const MAX_COLLECTION_TYPE_DEPTH: usize = 1024;
+    const MAX_ANALYSIS_WALKER_NODES: usize = 1_000_000;
+    const MAX_ANALYSIS_WALKER_DEPTH: usize = 1024;
+
+    const CollectionTypeError = std.mem.Allocator.Error || error{
+        TypeCheckerCollectionTypeDepthExceeded,
+        TypeCheckerCollectionTypeNodeLimitExceeded,
+    };
+
+    const AnalysisWalkerError = std.mem.Allocator.Error || error{
+        TypeCheckerAnalysisDepthExceeded,
+        TypeCheckerAnalysisNodeLimitExceeded,
+    };
+
+    const CollectionTypeBudget = struct {
+        nodes: usize = 0,
+        depth: usize = 0,
+        max_nodes: usize = MAX_COLLECTION_TYPE_NODES,
+        max_depth: usize = MAX_COLLECTION_TYPE_DEPTH,
+
+        fn enter(self: *CollectionTypeBudget) CollectionTypeError!void {
+            if (self.depth >= self.max_depth) {
+                return error.TypeCheckerCollectionTypeDepthExceeded;
+            }
+            if (self.nodes >= self.max_nodes) {
+                return error.TypeCheckerCollectionTypeNodeLimitExceeded;
+            }
+            self.nodes += 1;
+            self.depth += 1;
+        }
+
+        fn leave(self: *CollectionTypeBudget) void {
+            std.debug.assert(self.depth != 0);
+            self.depth -= 1;
+        }
+    };
+
+    const AnalysisWalkerBudget = struct {
+        nodes: usize = 0,
+        depth: usize = 0,
+        max_nodes: usize = MAX_ANALYSIS_WALKER_NODES,
+        max_depth: usize = MAX_ANALYSIS_WALKER_DEPTH,
+
+        fn enter(self: *AnalysisWalkerBudget) AnalysisWalkerError!void {
+            if (self.depth >= self.max_depth) {
+                return error.TypeCheckerAnalysisDepthExceeded;
+            }
+            if (self.nodes >= self.max_nodes) {
+                return error.TypeCheckerAnalysisNodeLimitExceeded;
+            }
+            self.nodes += 1;
+            self.depth += 1;
+        }
+
+        fn leave(self: *AnalysisWalkerBudget) void {
+            std.debug.assert(self.depth != 0);
+            self.depth -= 1;
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, graph: *scope_mod.ScopeGraph) !TypeChecker {
+        const store = try allocator.create(TypeStore);
+        errdefer allocator.destroy(store);
+        store.* = try TypeStore.init(allocator, interner);
+        errdefer store.deinit();
         return .{
             .allocator = allocator,
             .store = store,
@@ -2205,6 +2589,21 @@ pub const TypeChecker = struct {
         try self.recordBindingOwnership(binding_id, type_id, self.defaultOwnershipForType(type_id));
     }
 
+    fn exprResultOwnership(self: *TypeChecker, expr: *const ast.Expr, type_id: TypeId) Ownership {
+        return switch (expr.*) {
+            .var_ref => |vr| blk: {
+                const scope_id = self.current_scope orelse break :blk self.defaultOwnershipForType(type_id);
+                const binding_id = self.graph.resolveBindingHygienic(scope_id, vr.name, vr.meta.scopes) orelse
+                    break :blk self.defaultOwnershipForType(type_id);
+                const info = self.ownership_bindings.get(binding_id) orelse
+                    break :blk self.defaultOwnershipForType(type_id);
+                break :blk info.qualified_type.ownership;
+            },
+            .type_annotated => |annotated| self.exprResultOwnership(annotated.expr, type_id),
+            else => .unique,
+        };
+    }
+
     /// Walk a compound parameter pattern and record each inner bind's
     /// type by indexing into the annotation. Wraps
     /// `recordAssignmentBindingTypes` with a `containsTypeVars` guard
@@ -2216,11 +2615,12 @@ pub const TypeChecker = struct {
         self: *TypeChecker,
         pat: *const ast.Pattern,
         parent_type: TypeId,
+        parent_ownership: Ownership,
         source_span: ast.SourceSpan,
     ) !void {
         if (parent_type == TypeStore.UNKNOWN or parent_type == TypeStore.ERROR) return;
-        if (self.store.containsTypeVars(parent_type)) return;
-        try self.recordAssignmentBindingTypes(pat, parent_type, source_span);
+        if (try self.store.containsTypeVars(parent_type)) return;
+        try self.recordAssignmentBindingTypesWithOwnership(pat, parent_type, parent_ownership, source_span);
     }
 
     /// Walk an assignment LHS pattern and record each inner bind's type
@@ -2234,13 +2634,32 @@ pub const TypeChecker = struct {
         parent_type: TypeId,
         source_span: ast.SourceSpan,
     ) !void {
+        try self.recordAssignmentBindingTypesWithOwnership(
+            pat,
+            parent_type,
+            self.defaultOwnershipForType(parent_type),
+            source_span,
+        );
+    }
+
+    fn recordAssignmentBindingTypesWithOwnership(
+        self: *TypeChecker,
+        pat: *const ast.Pattern,
+        parent_type: TypeId,
+        parent_ownership: Ownership,
+        source_span: ast.SourceSpan,
+    ) !void {
         switch (pat.*) {
             .wildcard, .literal, .pin => {},
-            .paren => |inner| try self.recordAssignmentBindingTypes(inner.inner, parent_type, source_span),
+            .paren => |inner| try self.recordAssignmentBindingTypesWithOwnership(inner.inner, parent_type, parent_ownership, source_span),
             .bind => |b| {
                 if (self.current_scope) |scope_id| {
                     if (self.graph.resolveBindingHygienic(scope_id, b.name, b.meta.scopes)) |bid| {
-                        try self.recordBindingType(bid, parent_type, source_span);
+                        try self.recordBindingQualifiedType(
+                            bid,
+                            QualifiedType.init(parent_type, parent_ownership),
+                            source_span,
+                        );
                     }
                 }
             },
@@ -2251,23 +2670,23 @@ pub const TypeChecker = struct {
                         parent_typ.tuple.elements[idx]
                     else
                         TypeStore.UNKNOWN;
-                    try self.recordAssignmentBindingTypes(sub_pat, elem_type, source_span);
+                    try self.recordAssignmentBindingTypesWithOwnership(sub_pat, elem_type, parent_ownership, source_span);
                 }
             },
             .list => |lp| {
                 const parent_typ = self.store.getType(parent_type);
                 const elem_type = if (parent_typ == .list) parent_typ.list.element else TypeStore.UNKNOWN;
                 for (lp.elements) |sub_pat| {
-                    try self.recordAssignmentBindingTypes(sub_pat, elem_type, source_span);
+                    try self.recordAssignmentBindingTypesWithOwnership(sub_pat, elem_type, parent_ownership, source_span);
                 }
             },
             .list_cons => |lc| {
                 const parent_typ = self.store.getType(parent_type);
                 const elem_type = if (parent_typ == .list) parent_typ.list.element else TypeStore.UNKNOWN;
                 for (lc.heads) |head_pat| {
-                    try self.recordAssignmentBindingTypes(head_pat, elem_type, source_span);
+                    try self.recordAssignmentBindingTypesWithOwnership(head_pat, elem_type, parent_ownership, source_span);
                 }
-                try self.recordAssignmentBindingTypes(lc.tail, parent_type, source_span);
+                try self.recordAssignmentBindingTypesWithOwnership(lc.tail, parent_type, parent_ownership, source_span);
             },
             .struct_pattern => |sp| {
                 const parent_typ = self.store.getType(parent_type);
@@ -2280,7 +2699,7 @@ pub const TypeChecker = struct {
                 if (parent_typ == .map and sp.struct_name.parts.len == 0) {
                     const value_type = parent_typ.map.value;
                     for (sp.fields) |field| {
-                        try self.recordAssignmentBindingTypes(field.pattern, value_type, source_span);
+                        try self.recordAssignmentBindingTypesWithOwnership(field.pattern, value_type, parent_ownership, source_span);
                     }
                     return;
                 }
@@ -2294,14 +2713,14 @@ pub const TypeChecker = struct {
                             }
                         }
                     }
-                    try self.recordAssignmentBindingTypes(field.pattern, field_type, source_span);
+                    try self.recordAssignmentBindingTypesWithOwnership(field.pattern, field_type, parent_ownership, source_span);
                 }
             },
             .map => |mp| {
                 const parent_typ = self.store.getType(parent_type);
                 const value_type = if (parent_typ == .map) parent_typ.map.value else TypeStore.UNKNOWN;
                 for (mp.fields) |field| {
-                    try self.recordAssignmentBindingTypes(field.value, value_type, source_span);
+                    try self.recordAssignmentBindingTypesWithOwnership(field.value, value_type, parent_ownership, source_span);
                 }
             },
             .binary => {},
@@ -2331,15 +2750,34 @@ pub const TypeChecker = struct {
         parent_type: TypeId,
         source_span: ast.SourceSpan,
     ) !void {
+        try self.recordCasePatternBindingTypesWithOwnership(
+            pat,
+            parent_type,
+            self.defaultOwnershipForType(parent_type),
+            source_span,
+        );
+    }
+
+    fn recordCasePatternBindingTypesWithOwnership(
+        self: *TypeChecker,
+        pat: *const ast.Pattern,
+        parent_type: TypeId,
+        parent_ownership: Ownership,
+        source_span: ast.SourceSpan,
+    ) !void {
         if (parent_type == TypeStore.UNKNOWN or parent_type == TypeStore.ERROR) return;
-        if (self.store.containsTypeVars(parent_type)) return;
+        if (try self.store.containsTypeVars(parent_type)) return;
         switch (pat.*) {
             .wildcard, .literal, .pin => {},
-            .paren => |inner| try self.recordCasePatternBindingTypes(inner.inner, parent_type, source_span),
+            .paren => |inner| try self.recordCasePatternBindingTypesWithOwnership(inner.inner, parent_type, parent_ownership, source_span),
             .bind => |b| {
                 if (self.current_scope) |scope_id| {
                     if (self.graph.resolveBindingHygienic(scope_id, b.name, b.meta.scopes)) |bid| {
-                        try self.recordBindingType(bid, parent_type, source_span);
+                        try self.recordBindingQualifiedType(
+                            bid,
+                            QualifiedType.init(parent_type, parent_ownership),
+                            source_span,
+                        );
                     }
                 }
             },
@@ -2350,23 +2788,23 @@ pub const TypeChecker = struct {
                         parent_typ.tuple.elements[idx]
                     else
                         TypeStore.UNKNOWN;
-                    try self.recordCasePatternBindingTypes(sub_pat, elem_type, source_span);
+                    try self.recordCasePatternBindingTypesWithOwnership(sub_pat, elem_type, parent_ownership, source_span);
                 }
             },
             .list => |lp| {
                 const parent_typ = self.store.getType(parent_type);
                 const elem_type = if (parent_typ == .list) parent_typ.list.element else TypeStore.UNKNOWN;
                 for (lp.elements) |sub_pat| {
-                    try self.recordCasePatternBindingTypes(sub_pat, elem_type, source_span);
+                    try self.recordCasePatternBindingTypesWithOwnership(sub_pat, elem_type, parent_ownership, source_span);
                 }
             },
             .list_cons => |lc| {
                 const parent_typ = self.store.getType(parent_type);
                 const elem_type = if (parent_typ == .list) parent_typ.list.element else TypeStore.UNKNOWN;
                 for (lc.heads) |head_pat| {
-                    try self.recordCasePatternBindingTypes(head_pat, elem_type, source_span);
+                    try self.recordCasePatternBindingTypesWithOwnership(head_pat, elem_type, parent_ownership, source_span);
                 }
-                try self.recordCasePatternBindingTypes(lc.tail, parent_type, source_span);
+                try self.recordCasePatternBindingTypesWithOwnership(lc.tail, parent_type, parent_ownership, source_span);
             },
             .struct_pattern => |sp| {
                 const parent_typ = self.store.getType(parent_type);
@@ -2377,7 +2815,7 @@ pub const TypeChecker = struct {
                 if (parent_typ == .map and sp.struct_name.parts.len == 0) {
                     const value_type = parent_typ.map.value;
                     for (sp.fields) |field| {
-                        try self.recordCasePatternBindingTypes(field.pattern, value_type, source_span);
+                        try self.recordCasePatternBindingTypesWithOwnership(field.pattern, value_type, parent_ownership, source_span);
                     }
                     return;
                 }
@@ -2405,7 +2843,7 @@ pub const TypeChecker = struct {
                         for (decl_struct.type_params[0..pair_count], parent_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
                             const formal_typ = self.store.getType(formal_id);
                             if (formal_typ != .type_var) continue;
-                            subs.bind(formal_typ.type_var, arg_id);
+                            try subs.bind(formal_typ.type_var, arg_id);
                         }
                         break :blk .{ decl_struct, @as(?SubstitutionMap, subs) };
                     }
@@ -2423,17 +2861,17 @@ pub const TypeChecker = struct {
                     }
                     if (subs_mut) |*subs| {
                         if (field_type != TypeStore.UNKNOWN) {
-                            field_type = subs.applyToType(self.store, field_type);
+                            field_type = try subs.applyToType(self.store, field_type);
                         }
                     }
-                    try self.recordCasePatternBindingTypes(field.pattern, field_type, source_span);
+                    try self.recordCasePatternBindingTypesWithOwnership(field.pattern, field_type, parent_ownership, source_span);
                 }
             },
             .map => |mp| {
                 const parent_typ = self.store.getType(parent_type);
                 const value_type = if (parent_typ == .map) parent_typ.map.value else TypeStore.UNKNOWN;
                 for (mp.fields) |field| {
-                    try self.recordCasePatternBindingTypes(field.value, value_type, source_span);
+                    try self.recordCasePatternBindingTypesWithOwnership(field.value, value_type, parent_ownership, source_span);
                 }
             },
             .binary => {},
@@ -2477,7 +2915,7 @@ pub const TypeChecker = struct {
                         for (decl_union.type_params[0..pair_count], parent_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
                             const formal_typ = self.store.getType(formal_id);
                             if (formal_typ != .type_var) continue;
-                            subs.bind(formal_typ.type_var, arg_id);
+                            try subs.bind(formal_typ.type_var, arg_id);
                         }
                         break :blk .{ decl_union, @as(?SubstitutionMap, subs) };
                     }
@@ -2497,10 +2935,10 @@ pub const TypeChecker = struct {
                 }
                 if (subs_mut) |*subs| {
                     if (payload_type != TypeStore.UNKNOWN) {
-                        payload_type = subs.applyToType(self.store, payload_type);
+                        payload_type = try subs.applyToType(self.store, payload_type);
                     }
                 }
-                try self.recordCasePatternBindingTypes(payload_pat, payload_type, source_span);
+                try self.recordCasePatternBindingTypesWithOwnership(payload_pat, payload_type, parent_ownership, source_span);
             },
         }
     }
@@ -2514,6 +2952,7 @@ pub const TypeChecker = struct {
         self: *TypeChecker,
         clause: ast.CaseClause,
         scrutinee_type: TypeId,
+        scrutinee_ownership: Ownership,
     ) !TypeId {
         const prev_scope = self.current_scope;
         defer self.current_scope = prev_scope;
@@ -2521,7 +2960,7 @@ pub const TypeChecker = struct {
             self.current_scope = clause_scope;
         }
 
-        try self.recordCasePatternBindingTypes(clause.pattern, scrutinee_type, clause.meta.span);
+        try self.recordCasePatternBindingTypesWithOwnership(clause.pattern, scrutinee_type, scrutinee_ownership, clause.meta.span);
 
         var clause_type: TypeId = TypeStore.NIL;
         for (clause.body) |stmt| {
@@ -2550,39 +2989,39 @@ pub const TypeChecker = struct {
         const arg_type = try self.inferExpr(first_arg);
         if (arg_type == TypeStore.UNKNOWN or arg_type == TypeStore.ERROR) return .invalid;
 
-        if (self.protocolConstraintMatches(arg_type, protocol_name)) {
+        if (try self.protocolConstraintMatches(arg_type, protocol_name)) {
             return .constrained;
         }
 
-        if (self.implTargetForProtocolArgument(protocol_name, arg_type)) |target| {
+        if (try self.implTargetForProtocolArgument(protocol_name, arg_type)) |target| {
             return .{ .concrete = target };
         }
 
         return .invalid;
     }
 
-    fn protocolConstraintMatches(self: *const TypeChecker, type_id: TypeId, protocol_name: ast.StructName) bool {
+    fn protocolConstraintMatches(self: *const TypeChecker, type_id: TypeId, protocol_name: ast.StructName) std.mem.Allocator.Error!bool {
         if (protocol_name.parts.len == 0) return false;
         const typ = self.store.getType(type_id);
         if (typ != .protocol_constraint) return false;
-        return self.structNameMatchesTypeName(protocol_name, self.interner.get(typ.protocol_constraint.protocol_name));
+        return try self.structNameMatchesTypeName(protocol_name, self.interner.get(typ.protocol_constraint.protocol_name));
     }
 
-    fn implTargetForProtocolArgument(self: *const TypeChecker, protocol_name: ast.StructName, arg_type: TypeId) ?ast.StructName {
+    fn implTargetForProtocolArgument(self: *const TypeChecker, protocol_name: ast.StructName, arg_type: TypeId) std.mem.Allocator.Error!?ast.StructName {
         const target_type_name = self.store.typeToStructName(arg_type, self.interner) orelse return null;
         for (self.graph.impls.items) |entry| {
             if (!self.structNamesEqual(entry.protocol_name, protocol_name)) continue;
-            if (self.structNameMatchesTypeName(entry.target_type, target_type_name)) return entry.target_type;
+            if (try self.structNameMatchesTypeName(entry.target_type, target_type_name)) return entry.target_type;
         }
         return null;
     }
 
-    fn implTargetForProtocolId(self: *const TypeChecker, protocol_name: ast.StringId, arg_type: TypeId) ?ast.StructName {
+    fn implTargetForProtocolId(self: *const TypeChecker, protocol_name: ast.StringId, arg_type: TypeId) std.mem.Allocator.Error!?ast.StructName {
         const target_type_name = self.store.typeToStructName(arg_type, self.interner) orelse return null;
         const protocol_type_name = self.interner.get(protocol_name);
         for (self.graph.impls.items) |entry| {
-            if (!self.structNameMatchesTypeName(entry.protocol_name, protocol_type_name)) continue;
-            if (self.structNameMatchesTypeName(entry.target_type, target_type_name)) return entry.target_type;
+            if (!(try self.structNameMatchesTypeName(entry.protocol_name, protocol_type_name))) continue;
+            if (try self.structNameMatchesTypeName(entry.target_type, target_type_name)) return entry.target_type;
         }
         return null;
     }
@@ -2688,7 +3127,8 @@ pub const TypeChecker = struct {
     }
 
     fn reportUnknownTypeReference(self: *TypeChecker, struct_name: ast.StructName, span: ast.SourceSpan) !void {
-        const type_text = struct_name.joinedWith(self.allocator, self.interner, ".") catch "{type}";
+        const type_text = try struct_name.joinedWith(self.allocator, self.interner, ".");
+        defer self.allocator.free(type_text);
         try self.addHardError(
             try std.fmt.allocPrint(self.allocator, "I cannot find a type named `{s}`", .{type_text}),
             span,
@@ -2734,12 +3174,14 @@ pub const TypeChecker = struct {
 
         const resolved = self.graph.resolveFamilyAllowingDefaults(target_scope, function_name, lookup_arity) orelse {
             const function_text = self.interner.get(function_name);
-            const target_text = if (struct_name) |name|
-                name.joinedWith(self.allocator, self.interner, ".") catch "{struct}"
+            const target_name: ?DiagnosticName = if (struct_name) |name|
+                try self.diagnosticStructName(name)
             else
                 null;
-            const message = if (target_text) |struct_text|
-                try std.fmt.allocPrint(self.allocator, "I cannot find a function named `{s}.{s}/{d}`", .{ struct_text, function_text, lookup_arity })
+            defer if (target_name) |name| name.deinit(self.allocator);
+
+            const message = if (target_name) |name|
+                try std.fmt.allocPrint(self.allocator, "I cannot find a function named `{s}.{s}/{d}`", .{ name.slice(), function_text, lookup_arity })
             else
                 try std.fmt.allocPrint(self.allocator, "I cannot find a function named `{s}/{d}`", .{ function_text, lookup_arity });
             try self.addRichError(
@@ -2754,12 +3196,14 @@ pub const TypeChecker = struct {
         const family = self.graph.getFamily(resolved.family_id);
         if (require_public_cross_struct and family.visibility != .public and self.isCrossStructReference(family.scope_id)) {
             const function_text = self.interner.get(function_name);
-            const target_text = if (struct_name) |name|
-                name.joinedWith(self.allocator, self.interner, ".") catch "{struct}"
+            const target_name: DiagnosticName = if (struct_name) |name|
+                try self.diagnosticStructName(name)
             else
-                self.currentStructNameText() orelse "{struct}";
+                (try self.diagnosticStructNameForScope(family.scope_id)) orelse return error.TypeCheckerMissingStructScopeName;
+            defer target_name.deinit(self.allocator);
+
             try self.addHardError(
-                try std.fmt.allocPrint(self.allocator, "`{s}.{s}/{d}` is private", .{ target_text, function_text, lookup_arity }),
+                try std.fmt.allocPrint(self.allocator, "`{s}.{s}/{d}` is private", .{ target_name.slice(), function_text, lookup_arity }),
                 span,
                 "private function",
                 "cross-struct function references can only target public functions",
@@ -2774,11 +3218,16 @@ pub const TypeChecker = struct {
         };
     }
 
-    fn currentStructNameText(self: *const TypeChecker) ?[]const u8 {
-        const scope_id = self.currentStructScope() orelse return null;
+    fn diagnosticStructName(self: *const TypeChecker, struct_name: ast.StructName) std.mem.Allocator.Error!DiagnosticName {
+        if (struct_name.parts.len == 0) return .{ .borrowed = "" };
+        if (struct_name.parts.len == 1) return .{ .borrowed = self.interner.get(struct_name.parts[0]) };
+        return .{ .owned = try struct_name.joinedWith(self.allocator, self.interner, ".") };
+    }
+
+    fn diagnosticStructNameForScope(self: *const TypeChecker, scope_id: scope_mod.ScopeId) std.mem.Allocator.Error!?DiagnosticName {
         for (self.graph.structs.items) |entry| {
             if (entry.scope_id != scope_id) continue;
-            return entry.name.joinedWith(self.allocator, self.interner, ".") catch null;
+            return try self.diagnosticStructName(entry.name);
         }
         return null;
     }
@@ -2899,7 +3348,7 @@ pub const TypeChecker = struct {
                         // for a typed sibling (#361: only literals adopt). If a
                         // non-literal sibling does not match, the whole tuple is
                         // not an adoption, so the caller's mismatch fires.
-                        .not_a_literal => if (!try self.nonLiteralSiblingSatisfies(element, element_expected)) return .not_a_literal,
+                        .not_a_literal => if (!(try self.nonLiteralSiblingSatisfies(element, element_expected))) return .not_a_literal,
                     }
                 }
                 return if (any_adopts) .adopts else .not_a_literal;
@@ -2921,12 +3370,12 @@ pub const TypeChecker = struct {
                     switch (try self.classifyArgLiteralAdoption(field.key, key_expected)) {
                         .adopts => any_adopts = true,
                         .overflow => |o| return .{ .overflow = o },
-                        .not_a_literal => if (!try self.nonLiteralSiblingSatisfies(field.key, key_expected)) return .not_a_literal,
+                        .not_a_literal => if (!(try self.nonLiteralSiblingSatisfies(field.key, key_expected))) return .not_a_literal,
                     }
                     switch (try self.classifyArgLiteralAdoption(field.value, value_expected)) {
                         .adopts => any_adopts = true,
                         .overflow => |o| return .{ .overflow = o },
-                        .not_a_literal => if (!try self.nonLiteralSiblingSatisfies(field.value, value_expected)) return .not_a_literal,
+                        .not_a_literal => if (!(try self.nonLiteralSiblingSatisfies(field.value, value_expected))) return .not_a_literal,
                     }
                 }
                 return if (any_adopts) .adopts else .not_a_literal;
@@ -2993,7 +3442,7 @@ pub const TypeChecker = struct {
     fn nonLiteralSiblingSatisfies(self: *TypeChecker, element: *const ast.Expr, element_expected: TypeId) !bool {
         const element_type = try self.inferExpr(element);
         if (element_type == TypeStore.UNKNOWN or element_type == TypeStore.ERROR) return true;
-        return self.callMatchCost(element_type, element_expected) != null;
+        return (try self.callMatchCost(element_type, element_expected)) != null;
     }
 
     /// Classify the tail expression of a block (the value the block produces)
@@ -3020,7 +3469,7 @@ pub const TypeChecker = struct {
             switch (try self.classifyArgLiteralAdoption(element, element_expected)) {
                 .adopts => any_adopts = true,
                 .overflow => |o| return .{ .overflow = o },
-                .not_a_literal => if (!try self.nonLiteralSiblingSatisfies(element, element_expected)) return .not_a_literal,
+                .not_a_literal => if (!(try self.nonLiteralSiblingSatisfies(element, element_expected))) return .not_a_literal,
             }
         }
         return if (any_adopts) .adopts else .not_a_literal;
@@ -3033,7 +3482,7 @@ pub const TypeChecker = struct {
     /// peer-adoption range error, so an out-of-range literal is a clear
     /// compile error rather than a silent default.
     fn reportLiteralArgumentOverflow(self: *TypeChecker, arg: *const ast.Expr, arg_index: usize, value: i64, expected: TypeId) !void {
-        const expected_str = self.typeToString(expected);
+        const expected_str = try self.typeToString(expected);
         try self.errors.append(self.allocator, .{
             .message = try std.fmt.allocPrint(
                 self.allocator,
@@ -3134,13 +3583,13 @@ pub const TypeChecker = struct {
         return typ == .struct_type and typ.struct_type.fields.len == 0;
     }
 
-    fn structNameMatchesTypeName(self: *const TypeChecker, struct_name: ast.StructName, type_name: []const u8) bool {
+    fn structNameMatchesTypeName(self: *const TypeChecker, struct_name: ast.StructName, type_name: []const u8) std.mem.Allocator.Error!bool {
         if (struct_name.parts.len == 0) return false;
         if (struct_name.parts.len == 1) {
             return std.mem.eql(u8, self.interner.get(struct_name.parts[0]), type_name);
         }
 
-        const dotted_name = struct_name.joinedWith(self.allocator, self.interner, ".") catch return false;
+        const dotted_name = try struct_name.joinedWith(self.allocator, self.interner, ".");
         defer self.allocator.free(dotted_name);
         return std.mem.eql(u8, dotted_name, type_name);
     }
@@ -3226,12 +3675,26 @@ pub const TypeChecker = struct {
     }
 
     fn reportInvalidProtocolDispatch(self: *TypeChecker, protocol_name: ast.StructName, arg: *const ast.Expr) !void {
-        const protocol_text = protocol_name.joinedWith(self.allocator, self.interner, ".") catch self.interner.get(protocol_name.parts[protocol_name.parts.len - 1]);
+        const protocol_text = try protocol_name.joinedWith(self.allocator, self.interner, ".");
+        defer self.allocator.free(protocol_text);
+
+        const message = try std.fmt.allocPrint(self.allocator, "first argument to protocol `{s}` does not satisfy `{s}`", .{
+            protocol_text,
+            protocol_text,
+        });
+        errdefer self.allocator.free(message);
+
+        const help = try std.fmt.allocPrint(self.allocator, "annotate the value with `{s}` or pass a type that implements `{s}`", .{
+            protocol_text,
+            protocol_text,
+        });
+        errdefer self.allocator.free(help);
+
         try self.addHardError(
-            try std.fmt.allocPrint(self.allocator, "first argument to protocol `{s}` does not satisfy `{s}`", .{ protocol_text, protocol_text }),
+            message,
             arg.getMeta().span,
             "protocol dispatch requires an exact protocol constraint or a concrete impl",
-            try std.fmt.allocPrint(self.allocator, "annotate the value with `{s}` or pass a type that implements `{s}`", .{ protocol_text, protocol_text }),
+            help,
         );
     }
 
@@ -3252,6 +3715,43 @@ pub const TypeChecker = struct {
         if (self.ownership_bindings.getPtr(binding_id)) |info| {
             info.state = .moved;
             info.active_borrows = 0;
+        }
+    }
+
+    fn cloneOwnershipBindings(self: *TypeChecker) !std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo) {
+        var snapshot = std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo).init(self.allocator);
+        var iterator = self.ownership_bindings.iterator();
+        while (iterator.next()) |entry| {
+            try snapshot.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        return snapshot;
+    }
+
+    fn restoreOwnershipBindings(self: *TypeChecker, snapshot: *const std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo)) !void {
+        self.ownership_bindings.clearRetainingCapacity();
+        var iterator = snapshot.iterator();
+        while (iterator.next()) |entry| {
+            try self.ownership_bindings.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+
+    fn mergeMovedOwnershipFromBranch(self: *TypeChecker, branch: *const std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo)) !void {
+        var iterator = branch.iterator();
+        while (iterator.next()) |entry| {
+            const branch_info = entry.value_ptr.*;
+            if (branch_info.state != .moved and branch_info.state != .borrowed) continue;
+            const result = try self.ownership_bindings.getOrPut(entry.key_ptr.*);
+            if (!result.found_existing) {
+                result.value_ptr.* = branch_info;
+                continue;
+            }
+            if (branch_info.state == .moved) {
+                result.value_ptr.state = .moved;
+                result.value_ptr.active_borrows = 0;
+            } else if (result.value_ptr.state != .moved) {
+                result.value_ptr.state = .borrowed;
+                result.value_ptr.active_borrows = @max(result.value_ptr.active_borrows, branch_info.active_borrows);
+            }
         }
     }
 
@@ -3289,7 +3789,7 @@ pub const TypeChecker = struct {
 
     fn ensureBindingMovable(self: *TypeChecker, binding_id: scope_mod.BindingId, span: ast.SourceSpan) !bool {
         const info = self.ownership_bindings.get(binding_id) orelse return true;
-        if (!try self.ensureBindingAvailable(binding_id, span)) return false;
+        if (!(try self.ensureBindingAvailable(binding_id, span))) return false;
         if (info.active_borrows > 0) {
             const binding = self.graph.bindings.items[binding_id];
             const name = self.interner.get(binding.name);
@@ -3308,6 +3808,24 @@ pub const TypeChecker = struct {
         return self.applyCallOwnershipWithSafeParams(args, fn_type, null);
     }
 
+    fn applyProtocolCallOwnership(self: *TypeChecker, args: []const *const ast.Expr, function_sig: ast.ProtocolFunctionSig) ![]const scope_mod.BindingId {
+        const param_ownerships = try self.allocator.alloc(Ownership, function_sig.params.len);
+        defer self.allocator.free(param_ownerships);
+        for (function_sig.params, 0..) |param, index| {
+            param_ownerships[index] = switch (param.ownership) {
+                .shared => .shared,
+                .unique => .unique,
+                .borrowed => .borrowed,
+            };
+        }
+        return self.applyCallOwnershipWithSafeParams(args, .{
+            .params = &.{},
+            .return_type = TypeStore.UNKNOWN,
+            .param_ownerships = param_ownerships,
+            .return_ownership = .shared,
+        }, null);
+    }
+
     fn applyCallOwnershipWithSafeParams(self: *TypeChecker, args: []const *const ast.Expr, fn_type: Type.FunctionType, safe_closure_params: ?[]const bool) ![]const scope_mod.BindingId {
         const param_ownerships = fn_type.param_ownerships orelse return &[_]scope_mod.BindingId{};
         if (self.current_scope == null) return &[_]scope_mod.BindingId{};
@@ -3318,7 +3836,7 @@ pub const TypeChecker = struct {
         for (args[0..count], param_ownerships[0..count], 0..) |arg, ownership, idx| {
             if (arg.* == .var_ref) {
                 if (self.resolveFunctionValueDecl(self.current_scope.?, arg.var_ref.name)) |decl| {
-                    if (self.analysis_context != null and self.functionDeclCapturesBorrowed(decl)) {
+                    if (self.analysis_context != null and try self.functionDeclCapturesBorrowed(decl)) {
                         const callee_allows = if (safe_closure_params) |flags|
                             idx < flags.len and flags[idx]
                         else
@@ -3434,8 +3952,8 @@ pub const TypeChecker = struct {
             self.type_var_scope.clearRetainingCapacity();
             for (impl_d.type_params) |tp_name_id| {
                 const tp_name = self.interner.get(tp_name_id);
-                const fresh = self.store.freshVar() catch continue;
-                self.type_var_scope.put(tp_name, fresh) catch {};
+                const fresh = try self.store.freshVar();
+                try self.type_var_scope.put(tp_name, fresh);
             }
         }
 
@@ -3449,14 +3967,7 @@ pub const TypeChecker = struct {
                 // bool, nil patterns carry their type implicitly, just like
                 // Elixir's `def foo("w")` or `def foo(0)`.
                 if (param.pattern.* == .literal) {
-                    break :blk switch (param.pattern.literal) {
-                        .string => self.store.addType(.string_type) catch TypeStore.UNKNOWN,
-                        .int => self.store.addType(.{ .int = .{ .signedness = .signed, .bits = 64 } }) catch TypeStore.UNKNOWN,
-                        .float => self.store.addType(.{ .float = .{ .bits = 64 } }) catch TypeStore.UNKNOWN,
-                        .atom => self.store.addType(.atom_type) catch TypeStore.UNKNOWN,
-                        .bool_lit => self.store.addType(.bool_type) catch TypeStore.UNKNOWN,
-                        .nil => self.store.addType(.nil_type) catch TypeStore.UNKNOWN,
-                    };
+                    break :blk literalPatternType(param.pattern.literal);
                 }
                 // Generated functions (e.g., __for_N) may lack type annotations.
                 // Skip error for generated code (name starts with __ or zero span).
@@ -3540,7 +4051,7 @@ pub const TypeChecker = struct {
 
         for (family.clauses.items, 0..) |clause_ref, family_clause_index| {
             const signature = (try self.resolveClauseSignature(name, arity, resolved.declared_arity, clause_ref)) orelse continue;
-            const cost = self.signatureCallMatchCost(signature, arg_types) orelse continue;
+            const cost = (try self.signatureCallMatchCost(signature, arg_types)) orelse continue;
             if (best_signature == null or cost < best_cost) {
                 best_signature = signature;
                 best_clause_index = @intCast(family_clause_index);
@@ -3572,11 +4083,11 @@ pub const TypeChecker = struct {
         };
     }
 
-    fn signatureCallMatchCost(self: *const TypeChecker, signature: FunctionSignature, arg_types: []const TypeId) ?u32 {
+    fn signatureCallMatchCost(self: *const TypeChecker, signature: FunctionSignature, arg_types: []const TypeId) TypeGraphError!?u32 {
         var total: u32 = 0;
         const count = @min(signature.params.len, arg_types.len);
         for (arg_types[0..count], signature.params[0..count]) |arg_type, expected| {
-            const cost = self.callMatchCost(arg_type, expected) orelse return null;
+            const cost = (try self.callMatchCost(arg_type, expected)) orelse return null;
             total +|= cost;
         }
         return total;
@@ -3610,7 +4121,7 @@ pub const TypeChecker = struct {
         };
     }
 
-    fn callMatchCost(self: *const TypeChecker, actual: TypeId, expected: TypeId) ?u32 {
+    fn callMatchCost(self: *const TypeChecker, actual: TypeId, expected: TypeId) TypeGraphError!?u32 {
         if (expected == TypeStore.UNKNOWN or actual == TypeStore.UNKNOWN or actual == TypeStore.ERROR) return 0;
 
         const expected_type = self.store.getType(expected);
@@ -3627,7 +4138,7 @@ pub const TypeChecker = struct {
             // the same type; accept when the shapes are equivalent.
             if (self.store.functionCallableEquiv(actual, expected)) return 0;
 
-            if (self.implTargetForProtocolId(expected_type.protocol_constraint.protocol_name, actual) != null) return 0;
+            if ((try self.implTargetForProtocolId(expected_type.protocol_constraint.protocol_name, actual)) != null) return 0;
             return null;
         }
 
@@ -3643,7 +4154,7 @@ pub const TypeChecker = struct {
             return null;
         }
 
-        return self.store.callMatchCost(actual, expected);
+        return try self.store.callMatchCost(actual, expected);
     }
 
     fn isTypeVar(self: *const TypeChecker, type_id: TypeId) bool {
@@ -3696,6 +4207,35 @@ pub const TypeChecker = struct {
         return family.clauses.items[0].decl;
     }
 
+    /// Type-check a synthetic helper immediately when its call-site-inferred
+    /// return type is still UNKNOWN, then read back the refreshed inferred
+    /// signature. This keeps generated helper calls from recording stale
+    /// UNKNOWN types at the caller while still propagating infrastructure and
+    /// nested type-check failures from the helper body.
+    fn eagerlyResolveSyntheticHelperReturn(
+        self: *TypeChecker,
+        scope_id: scope_mod.ScopeId,
+        name: ast.StringId,
+        arity: u32,
+        has_concrete: bool,
+        inferred_return: TypeId,
+    ) !TypeId {
+        var resolved_return = inferred_return;
+        if (has_concrete and inferred_return == TypeStore.UNKNOWN and self.isSyntheticHelperName(name)) {
+            if (!self.eager_helper_in_flight.contains(name)) {
+                if (self.lookupFunctionDecl(scope_id, name, arity)) |helper_decl| {
+                    try self.eager_helper_in_flight.put(name, {});
+                    defer _ = self.eager_helper_in_flight.remove(name);
+                    try self.checkFunctionDecl(helper_decl);
+                    if (self.store.inferred_signatures.get(name)) |refreshed| {
+                        resolved_return = refreshed.return_type;
+                    }
+                }
+            }
+        }
+        return resolved_return;
+    }
+
     fn resolveFunctionRefSignature(self: *TypeChecker, fr: ast.FunctionRefExpr) !?FunctionSignature {
         if (self.allow_external_static_references) {
             if (fr.struct_name) |struct_name| {
@@ -3743,13 +4283,14 @@ pub const TypeChecker = struct {
         return false;
     }
 
-    fn functionDeclCapturesBorrowed(self: *TypeChecker, func: *const ast.FunctionDecl) bool {
-        if (self.analysisFunctionByDecl(func)) |ir_func| {
+    fn functionDeclCapturesBorrowed(self: *TypeChecker, func: *const ast.FunctionDecl) !bool {
+        if (try self.analysisFunctionByDecl(func)) |ir_func| {
             for (ir_func.captures) |capture| {
                 if (capture.ownership == .borrowed) return true;
             }
         }
-        const captured = self.capturedBindingsForFunctionDecl(func) catch return false;
+        const captured = try self.capturedBindingsForFunctionDecl(func);
+        defer self.allocator.free(captured);
         for (captured) |binding_id| {
             const binding = self.graph.bindings.items[binding_id];
             if (binding.type_id) |prov| if (prov.ownership == .borrowed) return true;
@@ -3763,17 +4304,17 @@ pub const TypeChecker = struct {
     /// suffix `{name}__{arity}`. We always require an arity match — the
     /// previous heuristic matched any `__{name}` regardless of arity, which
     /// silently picked the wrong overload (e.g. `f/1` vs `f/2`).
-    fn analysisFunctionIdByName(self: *const TypeChecker, bare_name: []const u8, arity: u32) ?ir.FunctionId {
+    fn analysisFunctionIdByName(self: *const TypeChecker, bare_name: []const u8, arity: u32) !?ir.FunctionId {
         const program = self.analysis_program orelse return null;
-        const mangled = mangleNameForIr(self.allocator, bare_name) orelse return null;
+        const mangled = try mangleNameForIr(self.allocator, bare_name);
         defer self.allocator.free(mangled);
-        const arity_suffix = std.fmt.allocPrint(self.allocator, "__{s}__{d}", .{ mangled, arity }) catch return null;
+        const arity_suffix = try std.fmt.allocPrint(self.allocator, "__{s}__{d}", .{ mangled, arity });
         defer self.allocator.free(arity_suffix);
 
         if (self.current_scope) |scope_id| {
-            if (self.enclosingStructIrPrefix(scope_id)) |prefix| {
+            if (try self.enclosingStructIrPrefix(scope_id)) |prefix| {
                 defer self.allocator.free(prefix);
-                const full = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, arity_suffix }) catch return null;
+                const full = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, arity_suffix });
                 defer self.allocator.free(full);
                 for (program.functions) |func| {
                     if (std.mem.eql(u8, func.name, full)) return func.id;
@@ -3781,7 +4322,7 @@ pub const TypeChecker = struct {
             }
         }
 
-        const top_level = std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled, arity }) catch return null;
+        const top_level = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled, arity });
         defer self.allocator.free(top_level);
         for (program.functions) |func| {
             if (std.mem.eql(u8, func.name, top_level)) return func.id;
@@ -3793,22 +4334,22 @@ pub const TypeChecker = struct {
     /// Multi-segment struct names join with `_` (single underscore) to match
     /// IR's `structNameToPrefix` — distinct from `enclosingStructQualifiedName`
     /// which joins with `__` for type-system display.
-    fn enclosingStructIrPrefix(self: *const TypeChecker, scope_id: scope_mod.ScopeId) ?[]u8 {
+    fn enclosingStructIrPrefix(self: *const TypeChecker, scope_id: scope_mod.ScopeId) !?[]u8 {
         var current: ?scope_mod.ScopeId = scope_id;
         while (current) |sid| {
             for (self.graph.structs.items) |struct_decl| {
                 if (struct_decl.scope_id != sid) continue;
-                return joinStructNameWithUnderscore(self.allocator, self.interner, struct_decl.name);
+                return try joinStructNameWithUnderscore(self.allocator, self.interner, struct_decl.name);
             }
             current = self.graph.getScope(sid).parent;
         }
         return null;
     }
 
-    fn analysisFunctionByDecl(self: *const TypeChecker, decl: *const ast.FunctionDecl) ?ir.Function {
+    fn analysisFunctionByDecl(self: *const TypeChecker, decl: *const ast.FunctionDecl) !?ir.Function {
         const name = self.interner.get(decl.name);
         const arity = if (decl.clauses.len > 0) @as(u32, @intCast(decl.clauses[0].params.len)) else 0;
-        const function_id = self.analysisFunctionIdByName(name, arity) orelse return null;
+        const function_id = (try self.analysisFunctionIdByName(name, arity)) orelse return null;
         const program = self.analysis_program orelse return null;
         for (program.functions) |func| {
             if (func.id == function_id) return func;
@@ -3816,45 +4357,34 @@ pub const TypeChecker = struct {
         return null;
     }
 
-    fn closureEscapeForDecl(self: *const TypeChecker, decl: *const ast.FunctionDecl) ?escape_lattice.EscapeState {
+    fn closureEscapeForDecl(self: *const TypeChecker, decl: *const ast.FunctionDecl) AnalysisWalkerError!?escape_lattice.EscapeState {
         const arity = if (decl.clauses.len > 0) @as(u32, @intCast(decl.clauses[0].params.len)) else 0;
-        const function_id = self.analysisFunctionIdByName(self.interner.get(decl.name), arity) orelse return null;
+        const function_id = (try self.analysisFunctionIdByName(self.interner.get(decl.name), arity)) orelse return null;
         const ctx = self.analysis_context orelse return null;
         const program = self.analysis_program orelse return null;
         return findClosureEscape(ctx, program, function_id);
     }
 
-    fn findClosureEscape(ctx: *const escape_lattice.AnalysisContext, program: *const ir.Program, closure_func_id: ir.FunctionId) ?escape_lattice.EscapeState {
+    fn findClosureEscape(ctx: *const escape_lattice.AnalysisContext, program: *const ir.Program, closure_func_id: ir.FunctionId) AnalysisWalkerError!?escape_lattice.EscapeState {
+        var budget = AnalysisWalkerBudget{};
         for (program.functions) |func| {
             for (func.body) |block| {
-                for (block.instructions) |instr| {
-                    switch (instr) {
-                        .make_closure => |mc| {
-                            if (mc.function == closure_func_id) {
-                                return ctx.getEscape(.{ .function = func.id, .local = mc.dest });
-                            }
-                        },
-                        .if_expr => |ie| {
-                            if (findClosureEscapeInInstrs(ctx, func.id, ie.then_instrs, closure_func_id)) |escape| return escape;
-                            if (findClosureEscapeInInstrs(ctx, func.id, ie.else_instrs, closure_func_id)) |escape| return escape;
-                        },
-                        .case_block => |cb| {
-                            if (findClosureEscapeInInstrs(ctx, func.id, cb.pre_instrs, closure_func_id)) |escape| return escape;
-                            for (cb.arms) |arm| {
-                                if (findClosureEscapeInInstrs(ctx, func.id, arm.cond_instrs, closure_func_id)) |escape| return escape;
-                                if (findClosureEscapeInInstrs(ctx, func.id, arm.body_instrs, closure_func_id)) |escape| return escape;
-                            }
-                            if (findClosureEscapeInInstrs(ctx, func.id, cb.default_instrs, closure_func_id)) |escape| return escape;
-                        },
-                        else => {},
-                    }
-                }
+                if (try findClosureEscapeInInstrs(ctx, func.id, block.instructions, closure_func_id, &budget)) |escape| return escape;
             }
         }
         return .no_escape;
     }
 
-    fn findClosureEscapeInInstrs(ctx: *const escape_lattice.AnalysisContext, func_id: ir.FunctionId, instrs: []const ir.Instruction, closure_func_id: ir.FunctionId) ?escape_lattice.EscapeState {
+    fn findClosureEscapeInInstrs(
+        ctx: *const escape_lattice.AnalysisContext,
+        func_id: ir.FunctionId,
+        instrs: []const ir.Instruction,
+        closure_func_id: ir.FunctionId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!?escape_lattice.EscapeState {
+        try budget.enter();
+        defer budget.leave();
+
         for (instrs) |instr| {
             switch (instr) {
                 .make_closure => |mc| {
@@ -3863,16 +4393,16 @@ pub const TypeChecker = struct {
                     }
                 },
                 .if_expr => |ie| {
-                    if (findClosureEscapeInInstrs(ctx, func_id, ie.then_instrs, closure_func_id)) |escape| return escape;
-                    if (findClosureEscapeInInstrs(ctx, func_id, ie.else_instrs, closure_func_id)) |escape| return escape;
+                    if (try findClosureEscapeInInstrs(ctx, func_id, ie.then_instrs, closure_func_id, budget)) |escape| return escape;
+                    if (try findClosureEscapeInInstrs(ctx, func_id, ie.else_instrs, closure_func_id, budget)) |escape| return escape;
                 },
                 .case_block => |cb| {
-                    if (findClosureEscapeInInstrs(ctx, func_id, cb.pre_instrs, closure_func_id)) |escape| return escape;
+                    if (try findClosureEscapeInInstrs(ctx, func_id, cb.pre_instrs, closure_func_id, budget)) |escape| return escape;
                     for (cb.arms) |arm| {
-                        if (findClosureEscapeInInstrs(ctx, func_id, arm.cond_instrs, closure_func_id)) |escape| return escape;
-                        if (findClosureEscapeInInstrs(ctx, func_id, arm.body_instrs, closure_func_id)) |escape| return escape;
+                        if (try findClosureEscapeInInstrs(ctx, func_id, arm.cond_instrs, closure_func_id, budget)) |escape| return escape;
+                        if (try findClosureEscapeInInstrs(ctx, func_id, arm.body_instrs, closure_func_id, budget)) |escape| return escape;
                     }
-                    if (findClosureEscapeInInstrs(ctx, func_id, cb.default_instrs, closure_func_id)) |escape| return escape;
+                    if (try findClosureEscapeInInstrs(ctx, func_id, cb.default_instrs, closure_func_id, budget)) |escape| return escape;
                 },
                 else => {},
             }
@@ -3908,18 +4438,18 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn safeClosureParamsForCurrentCallee(self: *const TypeChecker, callee_name: ast.StringId, arity: u32) ?[]const bool {
+    fn safeClosureParamsForCurrentCallee(self: *const TypeChecker, callee_name: ast.StringId, arity: u32) AnalysisWalkerError!?[]const bool {
         if (self.current_scope) |scope_id| {
             if (self.graph.resolveFamily(scope_id, callee_name, arity)) |family_id| {
-                return self.safeClosureParamsForFamily(family_id);
+                return try self.safeClosureParamsForFamily(family_id);
             }
         }
 
         const bare_name = self.interner.get(callee_name);
-        const function_id = self.analysisFunctionIdByName(bare_name, arity) orelse return null;
+        const function_id = (try self.analysisFunctionIdByName(bare_name, arity)) orelse return null;
         const ctx = self.analysis_context orelse return null;
         const summary = ctx.function_summaries.get(function_id) orelse return null;
-        const safe = self.allocator.alloc(bool, summary.param_summaries.len) catch return null;
+        const safe = try self.allocator.alloc(bool, summary.param_summaries.len);
         for (summary.param_summaries, 0..) |param_summary, i| {
             var returned = false;
             for (summary.return_summary.param_sources) |src_idx| {
@@ -3933,14 +4463,15 @@ pub const TypeChecker = struct {
         return safe;
     }
 
-    fn safeClosureParamsForFamily(self: *const TypeChecker, family_id: scope_mod.FunctionFamilyId) ?[]const bool {
+    fn safeClosureParamsForFamily(self: *const TypeChecker, family_id: scope_mod.FunctionFamilyId) AnalysisWalkerError!?[]const bool {
         const family = self.graph.getFamily(family_id);
         if (family.clauses.items.len == 0) return null;
 
         const first_clause = family.clauses.items[0];
         if (first_clause.clause_index >= first_clause.decl.clauses.len) return null;
         const params = first_clause.decl.clauses[first_clause.clause_index].params;
-        const safe = self.allocator.alloc(bool, params.len) catch return null;
+        const safe = try self.allocator.alloc(bool, params.len);
+        errdefer self.allocator.free(safe);
         @memset(safe, true);
 
         for (family.clauses.items) |clause_ref| {
@@ -3951,7 +4482,7 @@ pub const TypeChecker = struct {
                     .bind => |b| b.name,
                     else => continue,
                 };
-                if (!self.isClosureParamUsedLocally(clause.body orelse &.{}, param_name)) {
+                if (!(try self.isClosureParamUsedLocally(clause.body orelse &.{}, param_name))) {
                     safe[idx] = false;
                 }
             }
@@ -3975,16 +4506,16 @@ pub const TypeChecker = struct {
     /// only as a direct callee): here we positively detect the callee
     /// position so the call-site effect-instantiation knows which argument
     /// closures contribute their effect. Returns `null` when the family has
-    /// no clauses or on OOM (callers then skip instantiation, falling back
-    /// to the pre-#201 behaviour of propagating only the callee's own row).
-    fn closureInvokedParamsForFamily(self: *const TypeChecker, family_id: scope_mod.FunctionFamilyId) ?[]const bool {
+    /// no clauses.
+    fn closureInvokedParamsForFamily(self: *const TypeChecker, family_id: scope_mod.FunctionFamilyId) AnalysisWalkerError!?[]const bool {
         const family = self.graph.getFamily(family_id);
         if (family.clauses.items.len == 0) return null;
 
         const first_clause = family.clauses.items[0];
         if (first_clause.clause_index >= first_clause.decl.clauses.len) return null;
         const params = first_clause.decl.clauses[first_clause.clause_index].params;
-        const invoked = self.allocator.alloc(bool, params.len) catch return null;
+        const invoked = try self.allocator.alloc(bool, params.len);
+        errdefer self.allocator.free(invoked);
         @memset(invoked, false);
 
         // A parameter is closure-invoked if ANY clause of the family calls
@@ -4000,7 +4531,7 @@ pub const TypeChecker = struct {
                     .bind => |b| b.name,
                     else => continue,
                 };
-                if (self.closureParamInvokedInBody(clause.body orelse &.{}, param_name)) {
+                if (try self.closureParamInvokedInBody(clause.body orelse &.{}, param_name)) {
                     invoked[idx] = true;
                 }
             }
@@ -4013,18 +4544,31 @@ pub const TypeChecker = struct {
     /// `body` (`param_name(...)`). Recurses through the same statement and
     /// expression shapes as `isClosureParamUsedLocally` so nested blocks,
     /// `if`/`case`/`cond` arms, and pipes are all covered.
-    fn closureParamInvokedInBody(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
+    fn closureParamInvokedInBody(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) AnalysisWalkerError!bool {
+        var budget = AnalysisWalkerBudget{};
+        return try self.closureParamInvokedInBodyWithBudget(body, param_name, &budget);
+    }
+
+    fn closureParamInvokedInBodyWithBudget(
+        self: *const TypeChecker,
+        body: []const ast.Stmt,
+        param_name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         for (body) |stmt| {
             switch (stmt) {
                 .expr => |expr| {
-                    if (self.exprInvokesClosureParam(expr, param_name)) return true;
+                    if (try self.exprInvokesClosureParam(expr, param_name, budget)) return true;
                 },
                 .assignment => |assign| {
-                    if (self.exprInvokesClosureParam(assign.value, param_name)) return true;
+                    if (try self.exprInvokesClosureParam(assign.value, param_name, budget)) return true;
                 },
                 .attribute => |attr| {
                     if (attr.value) |value| {
-                        if (self.exprInvokesClosureParam(value, param_name)) return true;
+                        if (try self.exprInvokesClosureParam(value, param_name, budget)) return true;
                     }
                 },
                 .function_decl, .macro_decl, .import_decl => {},
@@ -4037,68 +4581,76 @@ pub const TypeChecker = struct {
     /// reachable from `expr` (`param_name(args...)`). A reference to
     /// `param_name` in any non-callee position does NOT count — only the
     /// invocation establishes the effect dependency.
-    fn exprInvokesClosureParam(self: *const TypeChecker, expr: *const ast.Expr, param_name: ast.StringId) bool {
+    fn exprInvokesClosureParam(
+        self: *const TypeChecker,
+        expr: *const ast.Expr,
+        param_name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         switch (expr.*) {
             .call => |call| {
                 if (call.callee.* == .var_ref and call.callee.var_ref.name == param_name) return true;
-                if (self.exprInvokesClosureParam(call.callee, param_name)) return true;
+                if (try self.exprInvokesClosureParam(call.callee, param_name, budget)) return true;
                 for (call.args) |arg| {
-                    if (self.exprInvokesClosureParam(arg, param_name)) return true;
+                    if (try self.exprInvokesClosureParam(arg, param_name, budget)) return true;
                 }
                 return false;
             },
             .tuple => |tuple_expr| {
                 for (tuple_expr.elements) |elem| {
-                    if (self.exprInvokesClosureParam(elem, param_name)) return true;
+                    if (try self.exprInvokesClosureParam(elem, param_name, budget)) return true;
                 }
                 return false;
             },
             .list => |list_expr| {
                 for (list_expr.elements) |elem| {
-                    if (self.exprInvokesClosureParam(elem, param_name)) return true;
+                    if (try self.exprInvokesClosureParam(elem, param_name, budget)) return true;
                 }
                 return false;
             },
             .map => |map_expr| {
                 for (map_expr.fields) |field| {
-                    if (self.exprInvokesClosureParam(field.key, param_name)) return true;
-                    if (self.exprInvokesClosureParam(field.value, param_name)) return true;
+                    if (try self.exprInvokesClosureParam(field.key, param_name, budget)) return true;
+                    if (try self.exprInvokesClosureParam(field.value, param_name, budget)) return true;
                 }
                 return false;
             },
             .struct_expr => |struct_expr| {
                 if (struct_expr.update_source) |source| {
-                    if (self.exprInvokesClosureParam(source, param_name)) return true;
+                    if (try self.exprInvokesClosureParam(source, param_name, budget)) return true;
                 }
                 for (struct_expr.fields) |field| {
-                    if (self.exprInvokesClosureParam(field.value, param_name)) return true;
+                    if (try self.exprInvokesClosureParam(field.value, param_name, budget)) return true;
                 }
                 return false;
             },
-            .binary_op => |bo| return self.exprInvokesClosureParam(bo.lhs, param_name) or self.exprInvokesClosureParam(bo.rhs, param_name),
-            .unary_op => |uo| return self.exprInvokesClosureParam(uo.operand, param_name),
-            .field_access => |fa| return self.exprInvokesClosureParam(fa.object, param_name),
-            .pipe => |pipe| return self.exprInvokesClosureParam(pipe.lhs, param_name) or self.exprInvokesClosureParam(pipe.rhs, param_name),
-            .unwrap => |uw| return self.exprInvokesClosureParam(uw.expr, param_name),
-            .type_annotated => |ta| return self.exprInvokesClosureParam(ta.expr, param_name),
+            .binary_op => |bo| return (try self.exprInvokesClosureParam(bo.lhs, param_name, budget)) or (try self.exprInvokesClosureParam(bo.rhs, param_name, budget)),
+            .unary_op => |uo| return try self.exprInvokesClosureParam(uo.operand, param_name, budget),
+            .field_access => |fa| return try self.exprInvokesClosureParam(fa.object, param_name, budget),
+            .pipe => |pipe| return (try self.exprInvokesClosureParam(pipe.lhs, param_name, budget)) or (try self.exprInvokesClosureParam(pipe.rhs, param_name, budget)),
+            .unwrap => |uw| return try self.exprInvokesClosureParam(uw.expr, param_name, budget),
+            .type_annotated => |ta| return try self.exprInvokesClosureParam(ta.expr, param_name, budget),
             .if_expr => |ie| {
-                if (self.exprInvokesClosureParam(ie.condition, param_name)) return true;
-                if (self.closureParamInvokedInBody(ie.then_block, param_name)) return true;
-                if (ie.else_block) |else_block| if (self.closureParamInvokedInBody(else_block, param_name)) return true;
+                if (try self.exprInvokesClosureParam(ie.condition, param_name, budget)) return true;
+                if (try self.closureParamInvokedInBodyWithBudget(ie.then_block, param_name, budget)) return true;
+                if (ie.else_block) |else_block| if (try self.closureParamInvokedInBodyWithBudget(else_block, param_name, budget)) return true;
                 return false;
             },
-            .block => |block| return self.closureParamInvokedInBody(block.stmts, param_name),
+            .block => |block| return try self.closureParamInvokedInBodyWithBudget(block.stmts, param_name, budget),
             .cond_expr => |cond_expr| {
                 for (cond_expr.clauses) |clause| {
-                    if (self.exprInvokesClosureParam(clause.condition, param_name)) return true;
-                    if (self.closureParamInvokedInBody(clause.body, param_name)) return true;
+                    if (try self.exprInvokesClosureParam(clause.condition, param_name, budget)) return true;
+                    if (try self.closureParamInvokedInBodyWithBudget(clause.body, param_name, budget)) return true;
                 }
                 return false;
             },
             .case_expr => |case_expr| {
-                if (self.exprInvokesClosureParam(case_expr.scrutinee, param_name)) return true;
+                if (try self.exprInvokesClosureParam(case_expr.scrutinee, param_name, budget)) return true;
                 for (case_expr.clauses) |clause| {
-                    if (self.closureParamInvokedInBody(clause.body, param_name)) return true;
+                    if (try self.closureParamInvokedInBodyWithBudget(clause.body, param_name, budget)) return true;
                 }
                 return false;
             },
@@ -4121,7 +4673,7 @@ pub const TypeChecker = struct {
     /// is polymorphic, not blanket-assumed.
     fn recordClosureArgRaisesRow(self: *TypeChecker, arg: *const ast.Expr, span: ast.SourceSpan) !void {
         const decl = self.closureDeclFromExpr(arg) orelse return;
-        const key = self.raisesRowKeyForClosureDecl(decl) orelse return;
+        const key = (try self.raisesRowKeyForClosureDecl(decl)) orelse return;
         const row = self.store.inferred_raises.get(key) orelse return;
         for (row) |error_type| {
             try self.recordRaisedErrorType(error_type, span);
@@ -4133,10 +4685,10 @@ pub const TypeChecker = struct {
     /// (closures are registered as anonymous function families) and deriving
     /// the qualified-name key the body-check stored its row under. Returns
     /// null when the declaration has no resolvable family.
-    fn raisesRowKeyForClosureDecl(self: *TypeChecker, decl: *const ast.FunctionDecl) ?ast.StringId {
+    fn raisesRowKeyForClosureDecl(self: *TypeChecker, decl: *const ast.FunctionDecl) !?ast.StringId {
         if (decl.clauses.len == 0) return null;
         const clause = &decl.clauses[0];
-        return self.raisesRowKeyForDecl(decl, clause);
+        return try self.raisesRowKeyForDecl(decl, clause);
     }
 
     /// True when a closure/anonymous-function declaration's inferred
@@ -4144,8 +4696,8 @@ pub const TypeChecker = struct {
     /// raise. Used to stamp the closure VALUE's function type with
     /// its concrete effect (#201). A closure with no resolvable
     /// family (or an empty row) is pure.
-    fn closureDeclRaises(self: *TypeChecker, decl: *const ast.FunctionDecl) bool {
-        const key = self.raisesRowKeyForClosureDecl(decl) orelse return false;
+    fn closureDeclRaises(self: *TypeChecker, decl: *const ast.FunctionDecl) !bool {
+        const key = (try self.raisesRowKeyForClosureDecl(decl)) orelse return false;
         const row = self.store.inferred_raises.get(key) orelse return false;
         return row.len > 0;
     }
@@ -4191,7 +4743,7 @@ pub const TypeChecker = struct {
         // `Error` types it raises) so the widened return type carries it for
         // the use-site discharge check. An empty/missing row means a pure
         // closure — leave the declared return untouched.
-        const row_key = self.raisesRowKeyForClosureDecl(tail_decl) orelse return declared_return_type;
+        const row_key = (try self.raisesRowKeyForClosureDecl(tail_decl)) orelse return declared_return_type;
         const closure_row = self.store.inferred_raises.get(row_key) orelse return declared_return_type;
         if (closure_row.len == 0) return declared_return_type;
 
@@ -4247,10 +4799,16 @@ pub const TypeChecker = struct {
         // under a no-refcount manager. `groupInvokesRaisingClosureParam` is
         // still gated on actual invocation, so a captured-but-not-invoked
         // closure adds no spurious `raises` to THIS function.
-        if (!self.closureParamInvokedInBody(body, param_name) and
-            !self.closureParamCapturedIntoNestedClosure(body, param_name) and
-            !self.closureParamStoredIntoAggregate(body, param_name))
-        {
+        const invokes_param = try self.closureParamInvokedInBody(body, param_name);
+        const captures_param = if (!invokes_param)
+            try self.closureParamCapturedIntoNestedClosure(body, param_name)
+        else
+            false;
+        const stores_param = if (!invokes_param and !captures_param)
+            try self.closureParamStoredIntoAggregate(body, param_name)
+        else
+            false;
+        if (!invokes_param and !captures_param and !stores_param) {
             return param_type;
         }
         const effect_var = try self.store.freshVar();
@@ -4275,14 +4833,27 @@ pub const TypeChecker = struct {
     /// `makeClosureParamEffectPolymorphic` to make a capturing higher-order
     /// function representation-polymorphic so a boxed-`Callable` argument is
     /// captured with correct ARC ownership.
-    fn closureParamCapturedIntoNestedClosure(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
+    fn closureParamCapturedIntoNestedClosure(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) AnalysisWalkerError!bool {
+        var budget = AnalysisWalkerBudget{};
+        return try self.closureParamCapturedIntoNestedClosureWithBudget(body, param_name, &budget);
+    }
+
+    fn closureParamCapturedIntoNestedClosureWithBudget(
+        self: *const TypeChecker,
+        body: []const ast.Stmt,
+        param_name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         for (body) |stmt| {
             switch (stmt) {
-                .expr => |expr| if (self.exprCapturesParamIntoNestedClosure(expr, param_name)) return true,
-                .assignment => |assign| if (self.exprCapturesParamIntoNestedClosure(assign.value, param_name)) return true,
+                .expr => |expr| if (try self.exprCapturesParamIntoNestedClosure(expr, param_name, budget)) return true,
+                .assignment => |assign| if (try self.exprCapturesParamIntoNestedClosure(assign.value, param_name, budget)) return true,
                 .attribute => |attr| {
                     if (attr.value) |value| {
-                        if (self.exprCapturesParamIntoNestedClosure(value, param_name)) return true;
+                        if (try self.exprCapturesParamIntoNestedClosure(value, param_name, budget)) return true;
                     }
                 },
                 .function_decl, .macro_decl, .import_decl => {},
@@ -4308,21 +4879,34 @@ pub const TypeChecker = struct {
     /// as the function's value (`return f` / `f` as the last statement) is
     /// also an escape — the caller receives the boxed closure — detected via
     /// the return-tail check.
-    fn closureParamStoredIntoAggregate(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
+    fn closureParamStoredIntoAggregate(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) AnalysisWalkerError!bool {
+        var budget = AnalysisWalkerBudget{};
+        return try self.closureParamStoredIntoAggregateWithBudget(body, param_name, &budget);
+    }
+
+    fn closureParamStoredIntoAggregateWithBudget(
+        self: *const TypeChecker,
+        body: []const ast.Stmt,
+        param_name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         for (body, 0..) |stmt, stmt_index| {
             switch (stmt) {
                 .expr => |expr| {
-                    if (self.exprStoresParamIntoAggregate(expr, param_name)) return true;
+                    if (try self.exprStoresParamIntoAggregate(expr, param_name, budget)) return true;
                     // Return-tail escape: a bare `param_name` reference as the
                     // function's trailing expression returns the boxed closure
                     // to the caller — the same boxed representation a returned
                     // closure literal takes.
-                    if (stmt_index == body.len - 1 and self.exprIsBareVarRef(expr, param_name)) return true;
+                    if (stmt_index == body.len - 1 and (try self.exprIsBareVarRef(expr, param_name, budget))) return true;
                 },
-                .assignment => |assign| if (self.exprStoresParamIntoAggregate(assign.value, param_name)) return true,
+                .assignment => |assign| if (try self.exprStoresParamIntoAggregate(assign.value, param_name, budget)) return true,
                 .attribute => |attr| {
                     if (attr.value) |value| {
-                        if (self.exprStoresParamIntoAggregate(value, param_name)) return true;
+                        if (try self.exprStoresParamIntoAggregate(value, param_name, budget)) return true;
                     }
                 },
                 .function_decl, .macro_decl, .import_decl => {},
@@ -4333,10 +4917,18 @@ pub const TypeChecker = struct {
 
     /// True iff `expr` is exactly a bare `var_ref` to `name` (after peeling a
     /// `paren`/`type_annotated` wrapper). Used for the return-tail escape.
-    fn exprIsBareVarRef(self: *const TypeChecker, expr: *const ast.Expr, name: ast.StringId) bool {
+    fn exprIsBareVarRef(
+        self: *const TypeChecker,
+        expr: *const ast.Expr,
+        name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         return switch (expr.*) {
             .var_ref => |vr| vr.name == name,
-            .type_annotated => |ta| self.exprIsBareVarRef(ta.expr, name),
+            .type_annotated => |ta| try self.exprIsBareVarRef(ta.expr, name, budget),
             else => false,
         };
     }
@@ -4345,67 +4937,83 @@ pub const TypeChecker = struct {
     /// `list`, `map`, `tuple`) that has `param_name` as a DIRECT field/element
     /// value. Recurses through ordinary sub-expression structure to reach
     /// nested aggregates.
-    fn exprStoresParamIntoAggregate(self: *const TypeChecker, expr: *const ast.Expr, param_name: ast.StringId) bool {
+    fn exprStoresParamIntoAggregate(
+        self: *const TypeChecker,
+        expr: *const ast.Expr,
+        param_name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         switch (expr.*) {
             .struct_expr => |se| {
                 const is_closure_env = se.struct_name.parts.len > 0 and
                     self.isClosureStructName(se.struct_name.parts[se.struct_name.parts.len - 1]);
                 if (!is_closure_env) {
-                    for (se.fields) |field| if (self.exprIsBareVarRef(field.value, param_name)) return true;
+                    for (se.fields) |field| if (try self.exprIsBareVarRef(field.value, param_name, budget)) return true;
                 }
-                if (se.update_source) |source| if (self.exprStoresParamIntoAggregate(source, param_name)) return true;
-                for (se.fields) |field| if (self.exprStoresParamIntoAggregate(field.value, param_name)) return true;
+                if (se.update_source) |source| if (try self.exprStoresParamIntoAggregate(source, param_name, budget)) return true;
+                for (se.fields) |field| if (try self.exprStoresParamIntoAggregate(field.value, param_name, budget)) return true;
                 return false;
             },
             .list => |l| {
-                for (l.elements) |elem| if (self.exprIsBareVarRef(elem, param_name)) return true;
-                for (l.elements) |elem| if (self.exprStoresParamIntoAggregate(elem, param_name)) return true;
+                for (l.elements) |elem| if (try self.exprIsBareVarRef(elem, param_name, budget)) return true;
+                for (l.elements) |elem| if (try self.exprStoresParamIntoAggregate(elem, param_name, budget)) return true;
                 return false;
             },
             .list_cons_expr => |lce| {
-                if (self.exprIsBareVarRef(lce.head, param_name)) return true;
-                return self.exprStoresParamIntoAggregate(lce.head, param_name) or
-                    self.exprStoresParamIntoAggregate(lce.tail, param_name);
+                if (try self.exprIsBareVarRef(lce.head, param_name, budget)) return true;
+                return (try self.exprStoresParamIntoAggregate(lce.head, param_name, budget)) or
+                    (try self.exprStoresParamIntoAggregate(lce.tail, param_name, budget));
             },
             .tuple => |t| {
-                for (t.elements) |elem| if (self.exprIsBareVarRef(elem, param_name)) return true;
-                for (t.elements) |elem| if (self.exprStoresParamIntoAggregate(elem, param_name)) return true;
+                for (t.elements) |elem| if (try self.exprIsBareVarRef(elem, param_name, budget)) return true;
+                for (t.elements) |elem| if (try self.exprStoresParamIntoAggregate(elem, param_name, budget)) return true;
                 return false;
             },
             .map => |m| {
-                for (m.fields) |field| if (self.exprIsBareVarRef(field.value, param_name)) return true;
+                for (m.fields) |field| if (try self.exprIsBareVarRef(field.value, param_name, budget)) return true;
                 for (m.fields) |field| {
-                    if (self.exprStoresParamIntoAggregate(field.key, param_name)) return true;
-                    if (self.exprStoresParamIntoAggregate(field.value, param_name)) return true;
+                    if (try self.exprStoresParamIntoAggregate(field.key, param_name, budget)) return true;
+                    if (try self.exprStoresParamIntoAggregate(field.value, param_name, budget)) return true;
                 }
                 return false;
             },
             .call => |call| {
-                if (self.exprStoresParamIntoAggregate(call.callee, param_name)) return true;
-                for (call.args) |arg| if (self.exprStoresParamIntoAggregate(arg, param_name)) return true;
+                if (try self.exprStoresParamIntoAggregate(call.callee, param_name, budget)) return true;
+                for (call.args) |arg| if (try self.exprStoresParamIntoAggregate(arg, param_name, budget)) return true;
                 return false;
             },
-            .binary_op => |bo| return self.exprStoresParamIntoAggregate(bo.lhs, param_name) or self.exprStoresParamIntoAggregate(bo.rhs, param_name),
-            .unary_op => |uo| return self.exprStoresParamIntoAggregate(uo.operand, param_name),
-            .field_access => |fa| return self.exprStoresParamIntoAggregate(fa.object, param_name),
-            .pipe => |pipe| return self.exprStoresParamIntoAggregate(pipe.lhs, param_name) or self.exprStoresParamIntoAggregate(pipe.rhs, param_name),
-            .unwrap => |uw| return self.exprStoresParamIntoAggregate(uw.expr, param_name),
-            .type_annotated => |ta| return self.exprStoresParamIntoAggregate(ta.expr, param_name),
+            .binary_op => |bo| return (try self.exprStoresParamIntoAggregate(bo.lhs, param_name, budget)) or (try self.exprStoresParamIntoAggregate(bo.rhs, param_name, budget)),
+            .unary_op => |uo| return try self.exprStoresParamIntoAggregate(uo.operand, param_name, budget),
+            .field_access => |fa| return try self.exprStoresParamIntoAggregate(fa.object, param_name, budget),
+            .pipe => |pipe| return (try self.exprStoresParamIntoAggregate(pipe.lhs, param_name, budget)) or (try self.exprStoresParamIntoAggregate(pipe.rhs, param_name, budget)),
+            .unwrap => |uw| return try self.exprStoresParamIntoAggregate(uw.expr, param_name, budget),
+            .type_annotated => |ta| return try self.exprStoresParamIntoAggregate(ta.expr, param_name, budget),
             .if_expr => |ie| {
-                if (self.exprStoresParamIntoAggregate(ie.condition, param_name)) return true;
-                for (ie.then_block) |stmt| if (self.stmtStoresParamIntoAggregate(stmt, param_name)) return true;
-                if (ie.else_block) |eb| for (eb) |stmt| if (self.stmtStoresParamIntoAggregate(stmt, param_name)) return true;
+                if (try self.exprStoresParamIntoAggregate(ie.condition, param_name, budget)) return true;
+                for (ie.then_block) |stmt| if (try self.stmtStoresParamIntoAggregate(stmt, param_name, budget)) return true;
+                if (ie.else_block) |eb| for (eb) |stmt| if (try self.stmtStoresParamIntoAggregate(stmt, param_name, budget)) return true;
                 return false;
             },
             else => return false,
         }
     }
 
-    fn stmtStoresParamIntoAggregate(self: *const TypeChecker, stmt: ast.Stmt, param_name: ast.StringId) bool {
+    fn stmtStoresParamIntoAggregate(
+        self: *const TypeChecker,
+        stmt: ast.Stmt,
+        param_name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         return switch (stmt) {
-            .expr => |expr| self.exprStoresParamIntoAggregate(expr, param_name),
-            .assignment => |assign| self.exprStoresParamIntoAggregate(assign.value, param_name),
-            .attribute => |attr| if (attr.value) |value| self.exprStoresParamIntoAggregate(value, param_name) else false,
+            .expr => |expr| try self.exprStoresParamIntoAggregate(expr, param_name, budget),
+            .assignment => |assign| try self.exprStoresParamIntoAggregate(assign.value, param_name, budget),
+            .attribute => |attr| if (attr.value) |value| try self.exprStoresParamIntoAggregate(value, param_name, budget) else false,
             .function_decl, .macro_decl, .import_decl => false,
         };
     }
@@ -4414,30 +5022,38 @@ pub const TypeChecker = struct {
     /// `param_name`. Recurses through the ordinary sub-expression structure
     /// to reach nested closures; once inside a closure body, any mention of
     /// `param_name` counts as a capture (`exprMentionsVar`).
-    fn exprCapturesParamIntoNestedClosure(self: *const TypeChecker, expr: *const ast.Expr, param_name: ast.StringId) bool {
+    fn exprCapturesParamIntoNestedClosure(
+        self: *const TypeChecker,
+        expr: *const ast.Expr,
+        param_name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         switch (expr.*) {
             .anonymous_function => |anon| {
                 for (anon.decl.clauses) |anon_clause| {
                     const anon_body = anon_clause.body orelse continue;
                     for (anon_body) |stmt| {
-                        if (self.stmtMentionsVar(stmt, param_name)) return true;
+                        if (try self.stmtMentionsVar(stmt, param_name, budget)) return true;
                     }
                 }
                 return false;
             },
             .call => |call| {
-                if (self.exprCapturesParamIntoNestedClosure(call.callee, param_name)) return true;
+                if (try self.exprCapturesParamIntoNestedClosure(call.callee, param_name, budget)) return true;
                 for (call.args) |arg| {
-                    if (self.exprCapturesParamIntoNestedClosure(arg, param_name)) return true;
+                    if (try self.exprCapturesParamIntoNestedClosure(arg, param_name, budget)) return true;
                 }
                 return false;
             },
             .tuple => |t| {
-                for (t.elements) |elem| if (self.exprCapturesParamIntoNestedClosure(elem, param_name)) return true;
+                for (t.elements) |elem| if (try self.exprCapturesParamIntoNestedClosure(elem, param_name, budget)) return true;
                 return false;
             },
             .list => |l| {
-                for (l.elements) |elem| if (self.exprCapturesParamIntoNestedClosure(elem, param_name)) return true;
+                for (l.elements) |elem| if (try self.exprCapturesParamIntoNestedClosure(elem, param_name, budget)) return true;
                 return false;
             },
             .struct_expr => |se| {
@@ -4449,32 +5065,40 @@ pub const TypeChecker = struct {
                 if (se.struct_name.parts.len > 0 and
                     self.isClosureStructName(se.struct_name.parts[se.struct_name.parts.len - 1]))
                 {
-                    for (se.fields) |field| if (self.exprMentionsVar(field.value, param_name)) return true;
+                    for (se.fields) |field| if (try self.exprMentionsVar(field.value, param_name, budget)) return true;
                 }
-                for (se.fields) |field| if (self.exprCapturesParamIntoNestedClosure(field.value, param_name)) return true;
+                for (se.fields) |field| if (try self.exprCapturesParamIntoNestedClosure(field.value, param_name, budget)) return true;
                 return false;
             },
-            .binary_op => |bo| return self.exprCapturesParamIntoNestedClosure(bo.lhs, param_name) or self.exprCapturesParamIntoNestedClosure(bo.rhs, param_name),
-            .unary_op => |uo| return self.exprCapturesParamIntoNestedClosure(uo.operand, param_name),
-            .field_access => |fa| return self.exprCapturesParamIntoNestedClosure(fa.object, param_name),
-            .pipe => |pipe| return self.exprCapturesParamIntoNestedClosure(pipe.lhs, param_name) or self.exprCapturesParamIntoNestedClosure(pipe.rhs, param_name),
-            .unwrap => |uw| return self.exprCapturesParamIntoNestedClosure(uw.expr, param_name),
-            .type_annotated => |ta| return self.exprCapturesParamIntoNestedClosure(ta.expr, param_name),
+            .binary_op => |bo| return (try self.exprCapturesParamIntoNestedClosure(bo.lhs, param_name, budget)) or (try self.exprCapturesParamIntoNestedClosure(bo.rhs, param_name, budget)),
+            .unary_op => |uo| return try self.exprCapturesParamIntoNestedClosure(uo.operand, param_name, budget),
+            .field_access => |fa| return try self.exprCapturesParamIntoNestedClosure(fa.object, param_name, budget),
+            .pipe => |pipe| return (try self.exprCapturesParamIntoNestedClosure(pipe.lhs, param_name, budget)) or (try self.exprCapturesParamIntoNestedClosure(pipe.rhs, param_name, budget)),
+            .unwrap => |uw| return try self.exprCapturesParamIntoNestedClosure(uw.expr, param_name, budget),
+            .type_annotated => |ta| return try self.exprCapturesParamIntoNestedClosure(ta.expr, param_name, budget),
             .if_expr => |ie| {
-                if (self.exprCapturesParamIntoNestedClosure(ie.condition, param_name)) return true;
-                for (ie.then_block) |stmt| if (self.stmtCapturesParamIntoNestedClosure(stmt, param_name)) return true;
-                if (ie.else_block) |eb| for (eb) |stmt| if (self.stmtCapturesParamIntoNestedClosure(stmt, param_name)) return true;
+                if (try self.exprCapturesParamIntoNestedClosure(ie.condition, param_name, budget)) return true;
+                for (ie.then_block) |stmt| if (try self.stmtCapturesParamIntoNestedClosure(stmt, param_name, budget)) return true;
+                if (ie.else_block) |eb| for (eb) |stmt| if (try self.stmtCapturesParamIntoNestedClosure(stmt, param_name, budget)) return true;
                 return false;
             },
             else => return false,
         }
     }
 
-    fn stmtCapturesParamIntoNestedClosure(self: *const TypeChecker, stmt: ast.Stmt, param_name: ast.StringId) bool {
+    fn stmtCapturesParamIntoNestedClosure(
+        self: *const TypeChecker,
+        stmt: ast.Stmt,
+        param_name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         return switch (stmt) {
-            .expr => |expr| self.exprCapturesParamIntoNestedClosure(expr, param_name),
-            .assignment => |assign| self.exprCapturesParamIntoNestedClosure(assign.value, param_name),
-            .attribute => |attr| if (attr.value) |value| self.exprCapturesParamIntoNestedClosure(value, param_name) else false,
+            .expr => |expr| try self.exprCapturesParamIntoNestedClosure(expr, param_name, budget),
+            .assignment => |assign| try self.exprCapturesParamIntoNestedClosure(assign.value, param_name, budget),
+            .attribute => |attr| if (attr.value) |value| try self.exprCapturesParamIntoNestedClosure(value, param_name, budget) else false,
             .function_decl, .macro_decl, .import_decl => false,
         };
     }
@@ -4482,11 +5106,19 @@ pub const TypeChecker = struct {
     /// Conservative "does this statement reference `name` anywhere" check,
     /// used once execution is already inside a nested closure body (so any
     /// reference is a capture of the enclosing scope).
-    fn stmtMentionsVar(self: *const TypeChecker, stmt: ast.Stmt, name: ast.StringId) bool {
+    fn stmtMentionsVar(
+        self: *const TypeChecker,
+        stmt: ast.Stmt,
+        name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         return switch (stmt) {
-            .expr => |expr| self.exprMentionsVar(expr, name),
-            .assignment => |assign| self.exprMentionsVar(assign.value, name),
-            .attribute => |attr| if (attr.value) |value| self.exprMentionsVar(value, name) else false,
+            .expr => |expr| try self.exprMentionsVar(expr, name, budget),
+            .assignment => |assign| try self.exprMentionsVar(assign.value, name, budget),
+            .attribute => |attr| if (attr.value) |value| try self.exprMentionsVar(value, name, budget) else false,
             .function_decl, .macro_decl, .import_decl => false,
         };
     }
@@ -4494,69 +5126,90 @@ pub const TypeChecker = struct {
     /// Conservative recursive "does `expr` mention the variable `name`"
     /// check. Used inside a nested-closure body to detect a captured
     /// reference to an enclosing closure parameter.
-    fn exprMentionsVar(self: *const TypeChecker, expr: *const ast.Expr, name: ast.StringId) bool {
+    fn exprMentionsVar(
+        self: *const TypeChecker,
+        expr: *const ast.Expr,
+        name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         switch (expr.*) {
             .var_ref => |vr| return vr.name == name,
             .call => |call| {
-                if (self.exprMentionsVar(call.callee, name)) return true;
-                for (call.args) |arg| if (self.exprMentionsVar(arg, name)) return true;
+                if (try self.exprMentionsVar(call.callee, name, budget)) return true;
+                for (call.args) |arg| if (try self.exprMentionsVar(arg, name, budget)) return true;
                 return false;
             },
             .tuple => |t| {
-                for (t.elements) |elem| if (self.exprMentionsVar(elem, name)) return true;
+                for (t.elements) |elem| if (try self.exprMentionsVar(elem, name, budget)) return true;
                 return false;
             },
             .list => |l| {
-                for (l.elements) |elem| if (self.exprMentionsVar(elem, name)) return true;
+                for (l.elements) |elem| if (try self.exprMentionsVar(elem, name, budget)) return true;
                 return false;
             },
             .map => |m| {
                 for (m.fields) |field| {
-                    if (self.exprMentionsVar(field.key, name)) return true;
-                    if (self.exprMentionsVar(field.value, name)) return true;
+                    if (try self.exprMentionsVar(field.key, name, budget)) return true;
+                    if (try self.exprMentionsVar(field.value, name, budget)) return true;
                 }
                 return false;
             },
             .struct_expr => |se| {
-                if (se.update_source) |source| if (self.exprMentionsVar(source, name)) return true;
-                for (se.fields) |field| if (self.exprMentionsVar(field.value, name)) return true;
+                if (se.update_source) |source| if (try self.exprMentionsVar(source, name, budget)) return true;
+                for (se.fields) |field| if (try self.exprMentionsVar(field.value, name, budget)) return true;
                 return false;
             },
-            .binary_op => |bo| return self.exprMentionsVar(bo.lhs, name) or self.exprMentionsVar(bo.rhs, name),
-            .unary_op => |uo| return self.exprMentionsVar(uo.operand, name),
-            .field_access => |fa| return self.exprMentionsVar(fa.object, name),
-            .pipe => |pipe| return self.exprMentionsVar(pipe.lhs, name) or self.exprMentionsVar(pipe.rhs, name),
-            .unwrap => |uw| return self.exprMentionsVar(uw.expr, name),
-            .type_annotated => |ta| return self.exprMentionsVar(ta.expr, name),
+            .binary_op => |bo| return (try self.exprMentionsVar(bo.lhs, name, budget)) or (try self.exprMentionsVar(bo.rhs, name, budget)),
+            .unary_op => |uo| return try self.exprMentionsVar(uo.operand, name, budget),
+            .field_access => |fa| return try self.exprMentionsVar(fa.object, name, budget),
+            .pipe => |pipe| return (try self.exprMentionsVar(pipe.lhs, name, budget)) or (try self.exprMentionsVar(pipe.rhs, name, budget)),
+            .unwrap => |uw| return try self.exprMentionsVar(uw.expr, name, budget),
+            .type_annotated => |ta| return try self.exprMentionsVar(ta.expr, name, budget),
             .anonymous_function => |anon| {
                 for (anon.decl.clauses) |anon_clause| {
                     const anon_body = anon_clause.body orelse continue;
-                    for (anon_body) |stmt| if (self.stmtMentionsVar(stmt, name)) return true;
+                    for (anon_body) |stmt| if (try self.stmtMentionsVar(stmt, name, budget)) return true;
                 }
                 return false;
             },
             .if_expr => |ie| {
-                if (self.exprMentionsVar(ie.condition, name)) return true;
-                for (ie.then_block) |stmt| if (self.stmtMentionsVar(stmt, name)) return true;
-                if (ie.else_block) |eb| for (eb) |stmt| if (self.stmtMentionsVar(stmt, name)) return true;
+                if (try self.exprMentionsVar(ie.condition, name, budget)) return true;
+                for (ie.then_block) |stmt| if (try self.stmtMentionsVar(stmt, name, budget)) return true;
+                if (ie.else_block) |eb| for (eb) |stmt| if (try self.stmtMentionsVar(stmt, name, budget)) return true;
                 return false;
             },
             else => return false,
         }
     }
 
-    fn isClosureParamUsedLocally(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) bool {
+    fn isClosureParamUsedLocally(self: *const TypeChecker, body: []const ast.Stmt, param_name: ast.StringId) AnalysisWalkerError!bool {
+        var budget = AnalysisWalkerBudget{};
+        return try self.isClosureParamUsedLocallyWithBudget(body, param_name, &budget);
+    }
+
+    fn isClosureParamUsedLocallyWithBudget(
+        self: *const TypeChecker,
+        body: []const ast.Stmt,
+        param_name: ast.StringId,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         for (body) |stmt| {
             switch (stmt) {
                 .expr => |expr| {
-                    if (self.exprUsesClosureParamUnsafely(expr, param_name, false)) return false;
+                    if (try self.exprUsesClosureParamUnsafely(expr, param_name, false, budget)) return false;
                 },
                 .assignment => |assign| {
-                    if (self.exprUsesClosureParamUnsafely(assign.value, param_name, false)) return false;
+                    if (try self.exprUsesClosureParamUnsafely(assign.value, param_name, false, budget)) return false;
                 },
                 .attribute => |attr| {
                     if (attr.value) |value| {
-                        if (self.exprUsesClosureParamUnsafely(value, param_name, false)) return false;
+                        if (try self.exprUsesClosureParamUnsafely(value, param_name, false, budget)) return false;
                     }
                 },
                 .function_decl, .macro_decl, .import_decl => {},
@@ -4565,61 +5218,70 @@ pub const TypeChecker = struct {
         return true;
     }
 
-    fn exprUsesClosureParamUnsafely(self: *const TypeChecker, expr: *const ast.Expr, param_name: ast.StringId, allow_direct_callee: bool) bool {
+    fn exprUsesClosureParamUnsafely(
+        self: *const TypeChecker,
+        expr: *const ast.Expr,
+        param_name: ast.StringId,
+        allow_direct_callee: bool,
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!bool {
+        try budget.enter();
+        defer budget.leave();
+
         switch (expr.*) {
             .var_ref => |vr| return vr.name == param_name and !allow_direct_callee,
             .call => |call| {
-                if (self.exprUsesClosureParamUnsafely(call.callee, param_name, true)) return true;
+                if (try self.exprUsesClosureParamUnsafely(call.callee, param_name, true, budget)) return true;
                 for (call.args) |arg| {
-                    if (self.exprUsesClosureParamUnsafely(arg, param_name, false)) return true;
+                    if (try self.exprUsesClosureParamUnsafely(arg, param_name, false, budget)) return true;
                 }
                 return false;
             },
             .tuple => |tuple_expr| {
                 for (tuple_expr.elements) |elem| {
-                    if (self.exprUsesClosureParamUnsafely(elem, param_name, false)) return true;
+                    if (try self.exprUsesClosureParamUnsafely(elem, param_name, false, budget)) return true;
                 }
                 return false;
             },
             .list => |list_expr| {
                 for (list_expr.elements) |elem| {
-                    if (self.exprUsesClosureParamUnsafely(elem, param_name, false)) return true;
+                    if (try self.exprUsesClosureParamUnsafely(elem, param_name, false, budget)) return true;
                 }
                 return false;
             },
             .map => |map_expr| {
                 for (map_expr.fields) |field| {
-                    if (self.exprUsesClosureParamUnsafely(field.key, param_name, false)) return true;
-                    if (self.exprUsesClosureParamUnsafely(field.value, param_name, false)) return true;
+                    if (try self.exprUsesClosureParamUnsafely(field.key, param_name, false, budget)) return true;
+                    if (try self.exprUsesClosureParamUnsafely(field.value, param_name, false, budget)) return true;
                 }
                 return false;
             },
             .struct_expr => |struct_expr| {
                 if (struct_expr.update_source) |source| {
-                    if (self.exprUsesClosureParamUnsafely(source, param_name, false)) return true;
+                    if (try self.exprUsesClosureParamUnsafely(source, param_name, false, budget)) return true;
                 }
                 for (struct_expr.fields) |field| {
-                    if (self.exprUsesClosureParamUnsafely(field.value, param_name, false)) return true;
+                    if (try self.exprUsesClosureParamUnsafely(field.value, param_name, false, budget)) return true;
                 }
                 return false;
             },
-            .binary_op => |bo| return self.exprUsesClosureParamUnsafely(bo.lhs, param_name, false) or self.exprUsesClosureParamUnsafely(bo.rhs, param_name, false),
-            .unary_op => |uo| return self.exprUsesClosureParamUnsafely(uo.operand, param_name, false),
-            .field_access => |fa| return self.exprUsesClosureParamUnsafely(fa.object, param_name, false),
-            .pipe => |pipe| return self.exprUsesClosureParamUnsafely(pipe.lhs, param_name, false) or self.exprUsesClosureParamUnsafely(pipe.rhs, param_name, false),
-            .unwrap => |uw| return self.exprUsesClosureParamUnsafely(uw.expr, param_name, false),
-            .type_annotated => |ta| return self.exprUsesClosureParamUnsafely(ta.expr, param_name, false),
+            .binary_op => |bo| return (try self.exprUsesClosureParamUnsafely(bo.lhs, param_name, false, budget)) or (try self.exprUsesClosureParamUnsafely(bo.rhs, param_name, false, budget)),
+            .unary_op => |uo| return try self.exprUsesClosureParamUnsafely(uo.operand, param_name, false, budget),
+            .field_access => |fa| return try self.exprUsesClosureParamUnsafely(fa.object, param_name, false, budget),
+            .pipe => |pipe| return (try self.exprUsesClosureParamUnsafely(pipe.lhs, param_name, false, budget)) or (try self.exprUsesClosureParamUnsafely(pipe.rhs, param_name, false, budget)),
+            .unwrap => |uw| return try self.exprUsesClosureParamUnsafely(uw.expr, param_name, false, budget),
+            .type_annotated => |ta| return try self.exprUsesClosureParamUnsafely(ta.expr, param_name, false, budget),
             .if_expr => |ie| {
-                if (self.exprUsesClosureParamUnsafely(ie.condition, param_name, false)) return true;
-                if (!self.isClosureParamUsedLocally(ie.then_block, param_name)) return true;
-                if (ie.else_block) |else_block| if (!self.isClosureParamUsedLocally(else_block, param_name)) return true;
+                if (try self.exprUsesClosureParamUnsafely(ie.condition, param_name, false, budget)) return true;
+                if (!(try self.isClosureParamUsedLocallyWithBudget(ie.then_block, param_name, budget))) return true;
+                if (ie.else_block) |else_block| if (!(try self.isClosureParamUsedLocallyWithBudget(else_block, param_name, budget))) return true;
                 return false;
             },
-            .block => |block| return !self.isClosureParamUsedLocally(block.stmts, param_name),
+            .block => |block| return !(try self.isClosureParamUsedLocallyWithBudget(block.stmts, param_name, budget)),
             .cond_expr => |cond_expr| {
                 for (cond_expr.clauses) |clause| {
-                    if (self.exprUsesClosureParamUnsafely(clause.condition, param_name, false)) return true;
-                    if (!self.isClosureParamUsedLocally(clause.body, param_name)) return true;
+                    if (try self.exprUsesClosureParamUnsafely(clause.condition, param_name, false, budget)) return true;
+                    if (!(try self.isClosureParamUsedLocallyWithBudget(clause.body, param_name, budget))) return true;
                 }
                 return false;
             },
@@ -4633,41 +5295,58 @@ pub const TypeChecker = struct {
     /// collection. Disagreeing scalars collapse to `TERM`; tuples of
     /// equal arity unify component-wise; lists/maps unify recursively.
     /// Mirrors `hir.unifyForCollection`.
-    fn unifyForCollection(self: *TypeChecker, a: TypeId, b: TypeId) TypeId {
+    fn unifyForCollection(self: *TypeChecker, a: TypeId, b: TypeId, budget: *CollectionTypeBudget) CollectionTypeError!TypeId {
         if (a == b) return a;
         if (a == TypeStore.UNKNOWN) return b;
         if (b == TypeStore.UNKNOWN) return a;
         if (a == TypeStore.TERM or b == TypeStore.TERM) return TypeStore.TERM;
+
+        try budget.enter();
+        defer budget.leave();
+
         const ta = self.store.getType(a);
         const tb = self.store.getType(b);
         if (ta == .tuple and tb == .tuple and ta.tuple.elements.len == tb.tuple.elements.len) {
             var any_changed = false;
-            const unified = self.allocator.alloc(TypeId, ta.tuple.elements.len) catch return TypeStore.TERM;
+            const unified = try self.store.allocator.alloc(TypeId, ta.tuple.elements.len);
+            errdefer self.store.allocator.free(unified);
             for (ta.tuple.elements, tb.tuple.elements, 0..) |ea, eb, i| {
-                const u = self.unifyForCollection(ea, eb);
+                const u = try self.unifyForCollection(ea, eb, budget);
                 if (u != ea) any_changed = true;
                 unified[i] = u;
             }
-            if (!any_changed) return a;
-            return self.store.addType(.{ .tuple = .{ .elements = unified } }) catch TypeStore.TERM;
+            if (!any_changed) {
+                self.store.allocator.free(unified);
+                return a;
+            }
+            return try self.addTupleTypeWithOwnedElements(unified);
         }
         if (ta == .list and tb == .list) {
-            const u = self.unifyForCollection(ta.list.element, tb.list.element);
+            const u = try self.unifyForCollection(ta.list.element, tb.list.element, budget);
             if (u == ta.list.element) return a;
-            return self.store.addType(.{ .list = .{ .element = u } }) catch TypeStore.TERM;
+            return try self.store.addType(.{ .list = .{ .element = u } });
         }
         if (ta == .map and tb == .map) {
-            const uk = self.unifyForCollection(ta.map.key, tb.map.key);
-            const uv = self.unifyForCollection(ta.map.value, tb.map.value);
+            const uk = try self.unifyForCollection(ta.map.key, tb.map.key, budget);
+            const uv = try self.unifyForCollection(ta.map.value, tb.map.value, budget);
             if (uk == ta.map.key and uv == ta.map.value) return a;
-            return self.store.addType(.{ .map = .{ .key = uk, .value = uv } }) catch TypeStore.TERM;
+            return try self.store.addType(.{ .map = .{ .key = uk, .value = uv } });
         }
         return TypeStore.TERM;
     }
 
+    fn addTupleTypeWithOwnedElements(self: *TypeChecker, elements: []const TypeId) CollectionTypeError!TypeId {
+        const previous_type_count = self.store.types.items.len;
+        const tuple_type = try self.store.addType(.{ .tuple = .{ .elements = elements } });
+        if (tuple_type < previous_type_count) {
+            self.store.allocator.free(elements);
+        }
+        return tuple_type;
+    }
+
     fn ensureClosureValueCanEscape(self: *TypeChecker, expr: *const ast.Expr, context: []const u8) !void {
         const decl = self.closureDeclFromExpr(expr) orelse return;
-        if (!self.functionDeclCapturesBorrowed(decl)) return;
+        if (!(try self.functionDeclCapturesBorrowed(decl))) return;
         try self.addHardError(
             try std.fmt.allocPrint(self.allocator, "closure with borrowed captures cannot escape via {s}", .{context}),
             expr.getMeta().span,
@@ -4676,7 +5355,16 @@ pub const TypeChecker = struct {
         );
     }
 
-    fn collectCapturedBindingsFromExpr(self: *TypeChecker, expr: *const ast.Expr, function_scope: scope_mod.ScopeId, captured: *std.AutoHashMap(scope_mod.BindingId, void)) anyerror!void {
+    fn collectCapturedBindingsFromExpr(
+        self: *TypeChecker,
+        expr: *const ast.Expr,
+        function_scope: scope_mod.ScopeId,
+        captured: *std.AutoHashMap(scope_mod.BindingId, void),
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!void {
+        try budget.enter();
+        defer budget.leave();
+
         switch (expr.*) {
             .var_ref => |vr| {
                 const binding_id = self.graph.resolveBindingHygienic(function_scope, vr.name, vr.meta.scopes) orelse return;
@@ -4686,25 +5374,25 @@ pub const TypeChecker = struct {
                 }
             },
             .binary_op => |bo| {
-                try self.collectCapturedBindingsFromExpr(bo.lhs, function_scope, captured);
-                try self.collectCapturedBindingsFromExpr(bo.rhs, function_scope, captured);
+                try self.collectCapturedBindingsFromExpr(bo.lhs, function_scope, captured, budget);
+                try self.collectCapturedBindingsFromExpr(bo.rhs, function_scope, captured, budget);
             },
-            .unary_op => |uo| try self.collectCapturedBindingsFromExpr(uo.operand, function_scope, captured),
+            .unary_op => |uo| try self.collectCapturedBindingsFromExpr(uo.operand, function_scope, captured, budget),
             .call => |call| {
-                try self.collectCapturedBindingsFromExpr(call.callee, function_scope, captured);
-                for (call.args) |arg| try self.collectCapturedBindingsFromExpr(arg, function_scope, captured);
+                try self.collectCapturedBindingsFromExpr(call.callee, function_scope, captured, budget);
+                for (call.args) |arg| try self.collectCapturedBindingsFromExpr(arg, function_scope, captured, budget);
             },
-            .field_access => |fa| try self.collectCapturedBindingsFromExpr(fa.object, function_scope, captured),
+            .field_access => |fa| try self.collectCapturedBindingsFromExpr(fa.object, function_scope, captured, budget),
             .if_expr => |ie| {
-                try self.collectCapturedBindingsFromExpr(ie.condition, function_scope, captured);
-                for (ie.then_block) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
-                if (ie.else_block) |eb| for (eb) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
+                try self.collectCapturedBindingsFromExpr(ie.condition, function_scope, captured, budget);
+                for (ie.then_block) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured, budget);
+                if (ie.else_block) |eb| for (eb) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured, budget);
             },
             .case_expr => |ce| {
-                try self.collectCapturedBindingsFromExpr(ce.scrutinee, function_scope, captured);
+                try self.collectCapturedBindingsFromExpr(ce.scrutinee, function_scope, captured, budget);
                 for (ce.clauses) |clause| {
-                    if (clause.guard) |g| try self.collectCapturedBindingsFromExpr(g, function_scope, captured);
-                    for (clause.body) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
+                    if (clause.guard) |g| try self.collectCapturedBindingsFromExpr(g, function_scope, captured, budget);
+                    for (clause.body) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured, budget);
                 }
             },
             .anonymous_function => |anon| {
@@ -4714,40 +5402,50 @@ pub const TypeChecker = struct {
                 // Without this, a closure-of-closure that leaks a borrowed
                 // capture through its inner body bypasses borrow validation.
                 for (anon.decl.clauses) |clause| {
-                    if (clause.refinement) |r| try self.collectCapturedBindingsFromExpr(r, function_scope, captured);
+                    if (clause.refinement) |r| try self.collectCapturedBindingsFromExpr(r, function_scope, captured, budget);
                     if (clause.body) |body| {
-                        for (body) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured);
+                        for (body) |stmt| try self.collectCapturedBindingsFromStmt(stmt, function_scope, captured, budget);
                     }
                 }
             },
-            .tuple => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured),
-            .list => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured),
+            .tuple => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured, budget),
+            .list => |items| for (items.elements) |item| try self.collectCapturedBindingsFromExpr(item, function_scope, captured, budget),
             .map => |items| for (items.fields) |item| {
-                try self.collectCapturedBindingsFromExpr(item.key, function_scope, captured);
-                try self.collectCapturedBindingsFromExpr(item.value, function_scope, captured);
+                try self.collectCapturedBindingsFromExpr(item.key, function_scope, captured, budget);
+                try self.collectCapturedBindingsFromExpr(item.value, function_scope, captured, budget);
             },
-            .struct_expr => |sl| for (sl.fields) |field| try self.collectCapturedBindingsFromExpr(field.value, function_scope, captured),
+            .struct_expr => |sl| for (sl.fields) |field| try self.collectCapturedBindingsFromExpr(field.value, function_scope, captured, budget),
             else => {},
         }
     }
 
-    fn collectCapturedBindingsFromStmt(self: *TypeChecker, stmt: ast.Stmt, function_scope: scope_mod.ScopeId, captured: *std.AutoHashMap(scope_mod.BindingId, void)) anyerror!void {
+    fn collectCapturedBindingsFromStmt(
+        self: *TypeChecker,
+        stmt: ast.Stmt,
+        function_scope: scope_mod.ScopeId,
+        captured: *std.AutoHashMap(scope_mod.BindingId, void),
+        budget: *AnalysisWalkerBudget,
+    ) AnalysisWalkerError!void {
+        try budget.enter();
+        defer budget.leave();
+
         switch (stmt) {
-            .expr => |e| try self.collectCapturedBindingsFromExpr(e, function_scope, captured),
-            .assignment => |a| try self.collectCapturedBindingsFromExpr(a.value, function_scope, captured),
+            .expr => |e| try self.collectCapturedBindingsFromExpr(e, function_scope, captured, budget),
+            .assignment => |a| try self.collectCapturedBindingsFromExpr(a.value, function_scope, captured, budget),
             .function_decl => {},
             else => {},
         }
     }
 
-    fn capturedBindingsForFunctionDecl(self: *TypeChecker, func: *const ast.FunctionDecl) ![]scope_mod.BindingId {
+    fn capturedBindingsForFunctionDecl(self: *TypeChecker, func: *const ast.FunctionDecl) AnalysisWalkerError![]scope_mod.BindingId {
         var captured = std.AutoHashMap(scope_mod.BindingId, void).init(self.allocator);
         defer captured.deinit();
+        var budget = AnalysisWalkerBudget{};
         for (func.clauses) |clause| {
             const function_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(clause.meta.span)) orelse clause.meta.scope_id;
             if (clause.body) |body| {
                 for (body) |stmt| {
-                    try self.collectCapturedBindingsFromStmt(stmt, function_scope, &captured);
+                    try self.collectCapturedBindingsFromStmt(stmt, function_scope, &captured, &budget);
                 }
             }
         }
@@ -4868,9 +5566,81 @@ pub const TypeChecker = struct {
         });
     }
 
+    fn caseClausesContainTaggedUnionVariant(clauses: []const ast.CaseClause, variant_name: ast.StringId) bool {
+        for (clauses) |clause| {
+            if (clause.pattern.* != .literal) continue;
+            if (clause.pattern.literal != .atom) continue;
+            if (clause.pattern.literal.atom.value == variant_name) return true;
+        }
+        return false;
+    }
+
+    fn addNonExhaustiveTaggedUnionMatchError(
+        self: *TypeChecker,
+        span: ast.SourceSpan,
+        tagged_union_type: Type.TaggedUnionType,
+        clauses: []const ast.CaseClause,
+    ) !void {
+        var label_buffer: std.ArrayList(u8) = .empty;
+        errdefer label_buffer.deinit(self.allocator);
+
+        try label_buffer.appendSlice(self.allocator, "missing: ");
+        var missing_count: usize = 0;
+        for (tagged_union_type.variants) |variant| {
+            if (caseClausesContainTaggedUnionVariant(clauses, variant.name)) continue;
+
+            if (missing_count != 0) {
+                try label_buffer.appendSlice(self.allocator, ", ");
+            }
+            try label_buffer.appendSlice(self.allocator, self.interner.get(variant.name));
+            missing_count += 1;
+        }
+
+        if (missing_count == 0) return;
+
+        const label_text = try label_buffer.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(label_text);
+
+        const message = try std.fmt.allocPrint(self.allocator, "non-exhaustive match on enum `{s}`", .{
+            self.interner.get(tagged_union_type.name),
+        });
+        errdefer self.allocator.free(message);
+
+        try self.addHardError(
+            message,
+            span,
+            label_text,
+            "add the missing variants or a wildcard `_` pattern",
+        );
+    }
+
     fn addFormattedError(self: *TypeChecker, span: ast.SourceSpan, comptime fmt: []const u8, args: anytype) !void {
         const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
         try self.addError(msg, span);
+    }
+
+    fn reportCollectionTypeError(self: *TypeChecker, err: CollectionTypeError, span: ast.SourceSpan) CollectionTypeError!void {
+        switch (err) {
+            error.OutOfMemory => return err,
+            error.TypeCheckerCollectionTypeDepthExceeded => {
+                try self.addHardError(
+                    try self.allocator.dupe(u8, "type-checker collection type traversal depth exceeded while unifying nested collection literals"),
+                    span,
+                    "collection type nesting exceeds the type-checker budget",
+                    "reduce the nesting produced by this macro or split the generated collection into smaller expressions",
+                );
+                return err;
+            },
+            error.TypeCheckerCollectionTypeNodeLimitExceeded => {
+                try self.addHardError(
+                    try self.allocator.dupe(u8, "type-checker collection type traversal node budget exceeded while unifying nested collection literals"),
+                    span,
+                    "collection type graph exceeds the type-checker budget",
+                    "reduce the number of nested collection type nodes produced here",
+                );
+                return err;
+            },
+        }
     }
 
     /// The target-capability gate that applies to a resolved function family:
@@ -4944,32 +5714,7 @@ pub const TypeChecker = struct {
         });
     }
 
-    /// Render a function/closure type in the CURRENT surface syntax
-    /// `fn(P0, P1) -> R` (and `fn(P...) -> R raises` for a raising closure
-    /// type). Shared by the bare-`function` and boxed-`Callable` arms of
-    /// `typeToString` so a `fn`-typed value and its boxed `Callable`
-    /// existential render identically — diagnostics must never expose the
-    /// internal `(P -> R)` or `Callable({P}, R)` forms.
-    fn renderFunctionTypeSurface(
-        self: *const TypeChecker,
-        params: []const TypeId,
-        return_type: TypeId,
-        raises: bool,
-    ) []const u8 {
-        var buf: std.ArrayList(u8) = .empty;
-        buf.appendSlice(self.allocator, "fn(") catch return "{type}";
-        for (params, 0..) |param, idx| {
-            if (idx > 0) buf.appendSlice(self.allocator, ", ") catch return "{type}";
-            buf.appendSlice(self.allocator, self.typeToString(param)) catch return "{type}";
-        }
-        buf.appendSlice(self.allocator, ") -> ") catch return "{type}";
-        buf.appendSlice(self.allocator, self.typeToString(return_type)) catch return "{type}";
-        if (raises) buf.appendSlice(self.allocator, " raises") catch return "{type}";
-        return buf.toOwnedSlice(self.allocator) catch return "{type}";
-    }
-
-    /// Convert a TypeId to a human-readable string
-    pub fn typeToString(self: *const TypeChecker, type_id: TypeId) []const u8 {
+    fn builtinDiagnosticTypeName(type_id: TypeId) ?[]const u8 {
         if (type_id == TypeStore.BOOL) return "Bool";
         if (type_id == TypeStore.STRING) return "String";
         if (type_id == TypeStore.ATOM) return "Atom";
@@ -4995,74 +5740,135 @@ pub const TypeChecker = struct {
         if (type_id == TypeStore.UNKNOWN) return "{unknown}";
         if (type_id == TypeStore.ERROR) return "{error}";
         if (type_id == TypeStore.TERM) return "Term";
-        // Look up user-defined and compound types
-        if (type_id < self.store.types.items.len) {
-            const typ = self.store.types.items[type_id];
-            switch (typ) {
-                .struct_type => |st| return self.interner.get(st.name),
-                .tagged_union => |tu| return self.interner.get(tu.name),
-                .list => |lt| {
-                    return std.fmt.allocPrint(self.allocator, "[{s}]", .{self.typeToString(lt.element)}) catch "{type}";
-                },
-                .map => |mt| {
-                    return std.fmt.allocPrint(self.allocator, "%{{{s} => {s}}}", .{ self.typeToString(mt.key), self.typeToString(mt.value) }) catch "{type}";
-                },
-                .tuple => |tt| {
-                    var buf: std.ArrayList(u8) = .empty;
-                    buf.appendSlice(self.allocator, "{") catch return "{type}";
-                    for (tt.elements, 0..) |element, idx| {
-                        if (idx > 0) buf.appendSlice(self.allocator, ", ") catch return "{type}";
-                        buf.appendSlice(self.allocator, self.typeToString(element)) catch return "{type}";
-                    }
-                    buf.appendSlice(self.allocator, "}") catch return "{type}";
-                    return buf.toOwnedSlice(self.allocator) catch return "{type}";
-                },
-                .function => |ft| {
-                    // Render in the CURRENT surface syntax `fn(P...) -> R`
-                    // (a raising closure type carries `raises`, surfaced as
-                    // the `fn(P...) -> R raises` form the parser accepts).
-                    return self.renderFunctionTypeSurface(ft.params, ft.return_type, ft.raises);
-                },
-                .protocol_constraint => |pc| {
-                    // A `Callable({P...}, R)` constraint is the boxed
-                    // representation of a `fn(P...) -> R` value (FCC unified
-                    // model). Display the SURFACE function syntax rather than
-                    // the internal protocol name so diagnostics never leak the
-                    // `Callable(...)` desugaring — a `fn`-typed slot and its
-                    // boxed `Callable` form must read identically to the user.
-                    if (self.store.callableArgsAndResult(type_id)) |callable| {
-                        const args_tuple = self.store.getType(callable.args_tuple);
-                        if (args_tuple == .tuple) {
-                            return self.renderFunctionTypeSurface(args_tuple.tuple.elements, callable.result, false);
-                        }
-                    }
-                    return self.interner.get(pc.protocol_name);
-                },
-                .union_type => |ut| {
-                    var buf: std.ArrayList(u8) = .empty;
-                    for (ut.members, 0..) |member, i| {
-                        if (i > 0) buf.appendSlice(self.allocator, " | ") catch return "{type}";
-                        buf.appendSlice(self.allocator, self.typeToString(member)) catch return "{type}";
-                    }
-                    return buf.toOwnedSlice(self.allocator) catch return "{type}";
-                },
-                .applied => |ap| {
-                    var buf: std.ArrayList(u8) = .empty;
-                    const base_text = self.typeToString(ap.base);
-                    buf.appendSlice(self.allocator, base_text) catch return "{type}";
-                    buf.append(self.allocator, '(') catch return "{type}";
-                    for (ap.args, 0..) |arg, idx| {
-                        if (idx > 0) buf.appendSlice(self.allocator, ", ") catch return "{type}";
-                        buf.appendSlice(self.allocator, self.typeToString(arg)) catch return "{type}";
-                    }
-                    buf.append(self.allocator, ')') catch return "{type}";
-                    return buf.toOwnedSlice(self.allocator) catch return "{type}";
-                },
-                .type_var => return "{type_var}",
-                else => {},
-            }
+        return null;
+    }
+
+    fn directDiagnosticTypeName(self: *const TypeChecker, type_id: TypeId) ?[]const u8 {
+        if (builtinDiagnosticTypeName(type_id)) |name| return name;
+        if (type_id >= self.store.types.items.len) return "{type}";
+        return switch (self.store.types.items[type_id]) {
+            .struct_type => |st| self.interner.get(st.name),
+            .tagged_union => |tu| self.interner.get(tu.name),
+            .protocol_constraint => |pc| if (self.store.callableArgsAndResult(type_id) == null)
+                self.interner.get(pc.protocol_name)
+            else
+                null,
+            .type_var => "{type_var}",
+            else => null,
+        };
+    }
+
+    /// Convert a TypeId to a human-readable diagnostic string.
+    pub fn typeToString(self: *const TypeChecker, type_id: TypeId) TypeGraphError![]const u8 {
+        return try self.typeToStringWithLimits(type_id, diagnostic_type_format_limits);
+    }
+
+    fn typeToStringWithLimits(
+        self: *const TypeChecker,
+        type_id: TypeId,
+        limits: TypeGraphLimits,
+    ) TypeGraphError![]const u8 {
+        if (self.directDiagnosticTypeName(type_id)) |name| return name;
+
+        var budget = TypeGraphBudget.init(limits);
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+
+        try self.appendDiagnosticType(&buf, type_id, 0, &budget);
+        return try buf.toOwnedSlice(self.allocator);
+    }
+
+    fn appendFunctionTypeSurface(
+        self: *const TypeChecker,
+        buf: *std.ArrayList(u8),
+        params: []const TypeId,
+        return_type: TypeId,
+        raises: bool,
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!void {
+        const child_depth = try budget.childDepth(depth);
+        try buf.appendSlice(self.allocator, "fn(");
+        for (params, 0..) |param, idx| {
+            if (idx > 0) try buf.appendSlice(self.allocator, ", ");
+            try self.appendDiagnosticType(buf, param, child_depth, budget);
         }
-        return "{type}";
+        try buf.appendSlice(self.allocator, ") -> ");
+        try self.appendDiagnosticType(buf, return_type, child_depth, budget);
+        if (raises) try buf.appendSlice(self.allocator, " raises");
+    }
+
+    fn appendDiagnosticType(
+        self: *const TypeChecker,
+        buf: *std.ArrayList(u8),
+        type_id: TypeId,
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!void {
+        try budget.enter(depth);
+
+        if (self.directDiagnosticTypeName(type_id)) |name| {
+            try buf.appendSlice(self.allocator, name);
+            return;
+        }
+
+        const typ = self.store.types.items[type_id];
+        const child_depth = try budget.childDepth(depth);
+        switch (typ) {
+            .list => |lt| {
+                try buf.append(self.allocator, '[');
+                try self.appendDiagnosticType(buf, lt.element, child_depth, budget);
+                try buf.append(self.allocator, ']');
+            },
+            .map => |mt| {
+                try buf.appendSlice(self.allocator, "%{");
+                try self.appendDiagnosticType(buf, mt.key, child_depth, budget);
+                try buf.appendSlice(self.allocator, " => ");
+                try self.appendDiagnosticType(buf, mt.value, child_depth, budget);
+                try buf.append(self.allocator, '}');
+            },
+            .tuple => |tt| {
+                try buf.append(self.allocator, '{');
+                for (tt.elements, 0..) |element, idx| {
+                    if (idx > 0) try buf.appendSlice(self.allocator, ", ");
+                    try self.appendDiagnosticType(buf, element, child_depth, budget);
+                }
+                try buf.append(self.allocator, '}');
+            },
+            .function => |ft| {
+                // Render in the CURRENT surface syntax `fn(P...) -> R`.
+                try self.appendFunctionTypeSurface(buf, ft.params, ft.return_type, ft.raises, depth, budget);
+            },
+            .protocol_constraint => {
+                // `Callable({P...}, R)` is the boxed representation of a
+                // `fn(P...) -> R` value. Display the surface function syntax
+                // rather than the internal protocol name.
+                if (self.store.callableArgsAndResult(type_id)) |callable| {
+                    const args_tuple = self.store.getType(callable.args_tuple);
+                    if (args_tuple == .tuple) {
+                        try self.appendFunctionTypeSurface(buf, args_tuple.tuple.elements, callable.result, false, depth, budget);
+                        return;
+                    }
+                }
+                try buf.appendSlice(self.allocator, "{type}");
+            },
+            .union_type => |ut| {
+                for (ut.members, 0..) |member, idx| {
+                    if (idx > 0) try buf.appendSlice(self.allocator, " | ");
+                    try self.appendDiagnosticType(buf, member, child_depth, budget);
+                }
+            },
+            .applied => |ap| {
+                try self.appendDiagnosticType(buf, ap.base, child_depth, budget);
+                try buf.append(self.allocator, '(');
+                for (ap.args, 0..) |arg, idx| {
+                    if (idx > 0) try buf.appendSlice(self.allocator, ", ");
+                    try self.appendDiagnosticType(buf, arg, child_depth, budget);
+                }
+                try buf.append(self.allocator, ')');
+            },
+            else => try buf.appendSlice(self.allocator, "{type}"),
+        }
     }
 
     // ============================================================
@@ -5206,9 +6012,9 @@ pub const TypeChecker = struct {
                 // checking against the formal type_var here would
                 // false-positive on every literal default. Per-
                 // instantiation re-validation is Phase 1.1.5.e.
-                if (self.store.containsTypeVars(field_type_id)) continue;
+                if (try self.store.containsTypeVars(field_type_id)) continue;
 
-                const inferred = self.inferExpr(default_expr) catch TypeStore.UNKNOWN;
+                const inferred = try self.inferExpr(default_expr);
                 if (inferred == TypeStore.UNKNOWN) continue;
                 if (self.store.typeEquals(inferred, field_type_id)) continue;
                 if (try self.acceptsIntegerLiteralForExpectedType(default_expr, field_type_id)) continue;
@@ -5220,8 +6026,8 @@ pub const TypeChecker = struct {
                 // compound types). Either way the TypeChecker's
                 // allocator owns the result — we do not free here,
                 // matching every other diagnostic site in this file.
-                const declared_name = self.typeToString(field_type_id);
-                const provided_name = self.typeToString(inferred);
+                const declared_name = try self.typeToString(field_type_id);
+                const provided_name = try self.typeToString(inferred);
 
                 try self.addRichError(
                     try std.fmt.allocPrint(
@@ -5334,16 +6140,16 @@ pub const TypeChecker = struct {
             // unconditionally because the validator's "already done"
             // state lives on the declaration TypeId; rerunning here
             // would double-emit.
-            if (!self.store.containsTypeVars(field_type_id)) continue;
-            const expected_type = substitution.applyToType(self.store, field_type_id);
+            if (!(try self.store.containsTypeVars(field_type_id))) continue;
+            const expected_type = try substitution.applyToType(self.store, field_type_id);
             if (expected_type == TypeStore.UNKNOWN) continue;
             // After substitution the expected type should be concrete.
             // If it still bears a type-var (e.g. caller provided fewer
             // args than the formals), skip — the arity diagnostic
             // already fired on the literal.
-            if (self.store.containsTypeVars(expected_type)) continue;
+            if (try self.store.containsTypeVars(expected_type)) continue;
 
-            const inferred = self.inferExpr(default_expr) catch TypeStore.UNKNOWN;
+            const inferred = try self.inferExpr(default_expr);
             if (inferred == TypeStore.UNKNOWN) continue;
             if (self.store.typeEquals(inferred, expected_type)) continue;
             if (try self.acceptsIntegerLiteralForExpectedType(default_expr, expected_type)) continue;
@@ -5353,8 +6159,8 @@ pub const TypeChecker = struct {
             // declared field type referenced so the diagnostic can
             // name both the formal slot and the concrete argument.
             const formal_name = self.findTypeVarNameInFieldType(field_type_id, type_params, decl.type_params);
-            const provided_name = self.typeToString(inferred);
-            const expected_name = self.typeToString(expected_type);
+            const provided_name = try self.typeToString(inferred);
+            const expected_name = try self.typeToString(expected_type);
             const field_name = self.interner.get(field_decl.name);
             const decl_name = self.interner.get(type_name_id);
 
@@ -5529,9 +6335,8 @@ pub const TypeChecker = struct {
 
         // Install the alias's formals in a fresh overlay so the body sees
         // only its own parameters (not the caller's), then resolve.
-        const saved_type_var_scope = try self.snapshotTypeVarScope();
-        defer self.restoreTypeVarScope(saved_type_var_scope);
-        self.type_var_scope.clearRetainingCapacity();
+        var type_var_scope_guard = self.enterTypeVarScope();
+        defer type_var_scope_guard.restore();
         for (0..bind_count) |index| {
             const formal_name = self.interner.get(formal_params[index].name);
             try self.type_var_scope.put(formal_name, resolved_args[index]);
@@ -5674,7 +6479,7 @@ pub const TypeChecker = struct {
                 const formal_type_id = struct_type.type_params[idx];
                 const formal_typ = self.store.getType(formal_type_id);
                 if (formal_typ == .type_var) {
-                    instantiation.substitution.bind(formal_typ.type_var, resolved_arg);
+                    try instantiation.substitution.bind(formal_typ.type_var, resolved_arg);
                 }
             }
         }
@@ -5722,37 +6527,32 @@ pub const TypeChecker = struct {
         );
     }
 
-    /// Snapshot of an entry list captured from `type_var_scope` so a
-    /// nested pass can install its own bindings and restore the
-    /// caller's bindings on exit.
-    const TypeVarScopeEntry = struct {
-        name: []const u8,
-        type_id: TypeId,
+    /// Saved `type_var_scope` owner used while a nested pass installs
+    /// an isolated overlay. Restoring deinitializes the overlay map and
+    /// moves the original map back, so restoration cannot allocate or
+    /// silently drop bindings under allocator failure.
+    const TypeVarScopeGuard = struct {
+        checker: *TypeChecker,
+        saved_scope: std.StringHashMap(TypeId),
+        restored: bool = false,
+
+        fn restore(self: *TypeVarScopeGuard) void {
+            if (self.restored) return;
+            self.checker.type_var_scope.deinit();
+            self.checker.type_var_scope = self.saved_scope;
+            self.restored = true;
+        }
     };
 
-    /// Copy every (name -> TypeId) pair currently in `type_var_scope`
-    /// into a fresh slice. The returned slice borrows from the
-    /// existing interner strings (no allocation per entry beyond the
-    /// outer slice), so it stays valid as long as the interner does.
-    fn snapshotTypeVarScope(self: *TypeChecker) ![]TypeVarScopeEntry {
-        const count = self.type_var_scope.count();
-        const entries = try self.allocator.alloc(TypeVarScopeEntry, count);
-        var iterator = self.type_var_scope.iterator();
-        var index: usize = 0;
-        while (iterator.next()) |entry| : (index += 1) {
-            entries[index] = .{ .name = entry.key_ptr.*, .type_id = entry.value_ptr.* };
-        }
-        return entries;
-    }
-
-    /// Restore a previously snapshotted scope: clears the live scope,
-    /// re-installs every entry, and frees the snapshot slice.
-    fn restoreTypeVarScope(self: *TypeChecker, entries: []TypeVarScopeEntry) void {
-        self.type_var_scope.clearRetainingCapacity();
-        for (entries) |entry| {
-            self.type_var_scope.put(entry.name, entry.type_id) catch {};
-        }
-        self.allocator.free(entries);
+    /// Replace the active `type_var_scope` with a fresh overlay and
+    /// return a guard that restores the previous map by ownership move.
+    fn enterTypeVarScope(self: *TypeChecker) TypeVarScopeGuard {
+        const saved_scope = self.type_var_scope;
+        self.type_var_scope = std.StringHashMap(TypeId).init(self.allocator);
+        return .{
+            .checker = self,
+            .saved_scope = saved_scope,
+        };
     }
 
     fn registerUserTypes(self: *TypeChecker) !void {
@@ -5935,9 +6735,8 @@ pub const TypeChecker = struct {
                     // type_var_scope so per-decl bindings don't leak
                     // into sibling declarations or function clauses.
                     var formal_type_params: std.ArrayList(TypeId) = .empty;
-                    const saved_type_var_scope = try self.snapshotTypeVarScope();
-                    defer self.restoreTypeVarScope(saved_type_var_scope);
-                    self.type_var_scope.clearRetainingCapacity();
+                    var type_var_scope_guard = self.enterTypeVarScope();
+                    defer type_var_scope_guard.restore();
                     for (sd.type_params) |formal_name_id| {
                         const formal_name = self.interner.get(formal_name_id);
                         const fresh_type_id = try self.store.freshVar();
@@ -5955,7 +6754,7 @@ pub const TypeChecker = struct {
                             if (parent_entry.kind == .struct_type) {
                                 const parent_sd = parent_entry.kind.struct_type;
                                 for (parent_sd.fields) |field| {
-                                    const field_type = self.resolveFieldTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
+                                    const field_type = try self.resolveFieldTypeExpr(field.type_expr);
                                     try fields.append(self.allocator, .{
                                         .name = field.name,
                                         .type_id = field_type,
@@ -5989,7 +6788,7 @@ pub const TypeChecker = struct {
                         break :blk if (existing == .struct_type) existing.struct_type else null;
                     } else null;
                     for (sd.fields) |field| {
-                        var field_type = self.resolveFieldTypeExpr(field.type_expr) catch TypeStore.UNKNOWN;
+                        var field_type = try self.resolveFieldTypeExpr(field.type_expr);
                         if (field_type == TypeStore.UNKNOWN) {
                             if (prior_struct) |ps| {
                                 for (ps.fields) |prior_field| {
@@ -6024,11 +6823,18 @@ pub const TypeChecker = struct {
                             });
                         }
                     }
+                    var resolved_fields: ?[]Type.StructField = try fields.toOwnedSlice(self.allocator);
+                    errdefer if (resolved_fields) |items| self.allocator.free(items);
+                    var resolved_type_params: ?[]TypeId = try formal_type_params.toOwnedSlice(self.allocator);
+                    errdefer if (resolved_type_params) |items| self.allocator.free(items);
+                    self.store.releaseClosureBackfillFields(type_id);
                     self.store.types.items[type_id] = .{ .struct_type = .{
                         .name = name,
-                        .fields = try fields.toOwnedSlice(self.allocator),
-                        .type_params = try formal_type_params.toOwnedSlice(self.allocator),
+                        .fields = resolved_fields.?,
+                        .type_params = resolved_type_params.?,
                     } };
+                    resolved_fields = null;
+                    resolved_type_params = null;
                 },
                 .union_type => |ud| {
                     const enum_name_str = self.interner.get(ud.name);
@@ -6052,9 +6858,8 @@ pub const TypeChecker = struct {
                     // field-type resolution that already happened on a
                     // co-named struct during this pass.
                     const preseeded_type_params = self.store.getType(type_id).tagged_union.type_params;
-                    const saved_type_var_scope = try self.snapshotTypeVarScope();
-                    defer self.restoreTypeVarScope(saved_type_var_scope);
-                    self.type_var_scope.clearRetainingCapacity();
+                    var type_var_scope_guard = self.enterTypeVarScope();
+                    defer type_var_scope_guard.restore();
                     for (ud.type_params, 0..) |formal_name_id, idx| {
                         const formal_name = self.interner.get(formal_name_id);
                         try self.type_var_scope.put(formal_name, preseeded_type_params[idx]);
@@ -6063,7 +6868,7 @@ pub const TypeChecker = struct {
                     var variant_entries: std.ArrayList(Type.TaggedUnionVariant) = .empty;
                     for (ud.variants) |v| {
                         const vtype = if (v.type_expr) |te|
-                            self.resolveTypeExpr(te) catch null
+                            try self.resolveTypeExpr(te)
                         else
                             null;
                         try variant_entries.append(self.allocator, .{
@@ -6647,7 +7452,7 @@ pub const TypeChecker = struct {
     fn checkAttributeDecl(self: *TypeChecker, attr: *const ast.AttributeDecl) !void {
         // For typed attributes (@name :: Type = value), validate the value against the type
         if (attr.type_expr != null and attr.value != null) {
-            const declared_type = self.resolveTypeExpr(attr.type_expr.?) catch return;
+            const declared_type = try self.resolveTypeExpr(attr.type_expr.?);
             const attr_name = self.interner.get(attr.name);
 
             // Infer the type of the value from its literal form
@@ -6655,11 +7460,13 @@ pub const TypeChecker = struct {
 
             if (declared_type != TypeStore.UNKNOWN and value_type != TypeStore.UNKNOWN) {
                 if (declared_type != value_type) {
+                    const declared_type_name = try self.typeToString(declared_type);
+                    const value_type_name = try self.typeToString(value_type);
                     try self.addHardError(
                         try std.fmt.allocPrint(
                             self.allocator,
                             "@{s} declared as {s}, but value has type {s}",
-                            .{ attr_name, self.typeToString(declared_type), self.typeToString(value_type) },
+                            .{ attr_name, declared_type_name, value_type_name },
                         ),
                         attr.meta.span,
                         "type mismatch in attribute value",
@@ -6756,6 +7563,17 @@ pub const TypeChecker = struct {
         };
     }
 
+    fn literalPatternType(literal: ast.LiteralPattern) TypeId {
+        return switch (literal) {
+            .int => TypeStore.I64,
+            .float => TypeStore.F64,
+            .string => TypeStore.STRING,
+            .atom => TypeStore.ATOM,
+            .bool_lit => TypeStore.BOOL,
+            .nil => TypeStore.NIL,
+        };
+    }
+
     fn checkStructExtendsSignatures(self: *TypeChecker, mod: *const ast.StructDecl, parent_name: ast.StringId) !void {
         // Find parent struct
         var parent_mod: ?*const ast.StructDecl = null;
@@ -6775,7 +7593,7 @@ pub const TypeChecker = struct {
             };
             for (p_func.clauses) |p_clause| {
                 const p_return = if (p_clause.return_type) |rt|
-                    self.resolveTypeExpr(rt) catch TypeStore.UNKNOWN
+                    try self.resolveTypeExpr(rt)
                 else
                     TypeStore.UNKNOWN;
                 if (p_return == TypeStore.UNKNOWN) continue;
@@ -6790,18 +7608,20 @@ pub const TypeChecker = struct {
                     for (c_func.clauses) |c_clause| {
                         if (c_clause.params.len != p_clause.params.len) continue;
                         const c_return = if (c_clause.return_type) |rt|
-                            self.resolveTypeExpr(rt) catch TypeStore.UNKNOWN
+                            try self.resolveTypeExpr(rt)
                         else
                             TypeStore.UNKNOWN;
                         if (c_return == TypeStore.UNKNOWN) continue;
                         if (!self.store.typeEquals(p_return, c_return)) {
                             const p_name = self.interner.get(p_func.name);
+                            const parent_return_name = try self.typeToString(p_return);
+                            const child_return_name = try self.typeToString(c_return);
                             try self.addHardError(
                                 try std.fmt.allocPrint(self.allocator, "`{s}/{d}` returns `{s}` in parent, cannot return `{s}`", .{
                                     p_name,
                                     p_clause.params.len,
-                                    self.typeToString(p_return),
-                                    self.typeToString(c_return),
+                                    parent_return_name,
+                                    child_return_name,
                                 }),
                                 c_clause.meta.span,
                                 "return type mismatch",
@@ -6845,16 +7665,16 @@ pub const TypeChecker = struct {
     /// Recursively traverse statements to infer and record binding types.
     /// Handles nested blocks, case expressions, and if expressions that
     /// may contain assignments in macro-generated test function bodies.
-    fn inferBodyBindings(self: *TypeChecker, stmts: []const ast.Stmt) void {
+    fn inferBodyBindings(self: *TypeChecker, stmts: []const ast.Stmt) anyerror!void {
         for (stmts) |stmt| {
             switch (stmt) {
                 .assignment => |assign| {
-                    const value_type = self.inferExpr(assign.value) catch TypeStore.UNKNOWN;
+                    const value_type = try self.inferExpr(assign.value);
                     if (value_type != TypeStore.UNKNOWN and value_type != TypeStore.ERROR) {
                         if (assign.pattern.* == .bind) {
                             if (self.current_scope) |scope_id| {
                                 if (self.graph.resolveBindingHygienic(scope_id, assign.pattern.bind.name, assign.pattern.bind.meta.scopes)) |bid| {
-                                    self.recordBindingType(bid, value_type, assign.value.getMeta().span) catch {};
+                                    try self.recordBindingType(bid, value_type, assign.value.getMeta().span);
                                 }
                             }
                         }
@@ -6862,7 +7682,7 @@ pub const TypeChecker = struct {
                 },
                 .expr => |expr| {
                     // Recursively traverse blocks and compound expressions
-                    self.inferExprBindings(expr);
+                    try self.inferExprBindings(expr);
                 },
                 else => {},
             }
@@ -6870,33 +7690,33 @@ pub const TypeChecker = struct {
     }
 
     /// Recursively traverse an expression to find nested assignments in blocks.
-    fn inferExprBindings(self: *TypeChecker, expr: *const ast.Expr) void {
+    fn inferExprBindings(self: *TypeChecker, expr: *const ast.Expr) anyerror!void {
         switch (expr.*) {
             .block => |blk| {
                 // Enter the block's scope so bindings created inside are visible
                 const prev_scope = self.current_scope;
+                defer self.current_scope = prev_scope;
                 const block_scope = self.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(blk.meta.span));
                 if (block_scope) |bs| {
                     self.current_scope = bs;
                 }
-                self.inferBodyBindings(blk.stmts);
-                self.current_scope = prev_scope;
+                try self.inferBodyBindings(blk.stmts);
             },
             .case_expr => |ce| {
-                _ = self.inferExpr(ce.scrutinee) catch {};
+                _ = try self.inferExpr(ce.scrutinee);
                 for (ce.clauses) |clause| {
-                    self.inferBodyBindings(clause.body);
+                    try self.inferBodyBindings(clause.body);
                 }
             },
             .if_expr => |ie| {
-                _ = self.inferExpr(ie.condition) catch {};
-                self.inferBodyBindings(ie.then_block);
+                _ = try self.inferExpr(ie.condition);
+                try self.inferBodyBindings(ie.then_block);
                 if (ie.else_block) |else_block| {
-                    self.inferBodyBindings(else_block);
+                    try self.inferBodyBindings(else_block);
                 }
             },
             .call => {
-                _ = self.inferExpr(expr) catch {};
+                _ = try self.inferExpr(expr);
             },
             else => {},
         }
@@ -6924,7 +7744,7 @@ pub const TypeChecker = struct {
             return;
         }
 
-        const got = self.typeToString(declared_return);
+        const got = try self.typeToString(declared_return);
         try self.addHardError(
             try std.fmt.allocPrint(self.allocator, "executable main/1 must return `u8`, got `{s}`", .{got}),
             clause.meta.span,
@@ -6975,7 +7795,7 @@ pub const TypeChecker = struct {
                     .name = last_part,
                     .args = &.{},
                 } };
-                const resolved = self.resolveTypeExpr(&name_expr) catch return null;
+                const resolved = try self.resolveTypeExpr(&name_expr);
                 if (resolved == TypeStore.UNKNOWN or resolved == TypeStore.ERROR) return null;
                 return resolved;
             },
@@ -7007,8 +7827,10 @@ pub const TypeChecker = struct {
     fn checkRescuePatternVisibility(self: *TypeChecker, error_type: TypeId, span: ast.SourceSpan) !void {
         const struct_name = self.store.typeToStructName(error_type, self.interner) orelse return;
         for (self.graph.structs.items) |entry| {
-            const entry_name = entry.name.joinedWith(self.allocator, self.interner, ".") catch continue;
-            if (!std.mem.eql(u8, entry_name, struct_name)) continue;
+            const entry_name = try entry.name.joinedWith(self.allocator, self.interner, ".");
+            const matches_struct_name = std.mem.eql(u8, entry_name, struct_name);
+            self.allocator.free(entry_name);
+            if (!matches_struct_name) continue;
             if (entry.decl.is_private and self.isCrossStructReference(entry.scope_id)) {
                 try self.addRichError(
                     try std.fmt.allocPrint(
@@ -7065,7 +7887,7 @@ pub const TypeChecker = struct {
                 }
                 if (!covered) {
                     const declared_names = try self.formatRaisesRow(declared_row.items);
-                    const offending = self.typeToString(inferred_error);
+                    const offending = try self.typeToString(inferred_error);
                     try self.addRichError(
                         try std.fmt.allocPrint(
                             self.allocator,
@@ -7109,7 +7931,7 @@ pub const TypeChecker = struct {
     /// The owning struct name is found by walking up parent scopes from the
     /// family's scope until a registered struct scope is hit (a top-level
     /// `main` has no struct and yields the bare `"<name>/<arity>"`).
-    fn raisesRowKey(self: *TypeChecker, family_id: scope_mod.FunctionFamilyId) ?ast.StringId {
+    fn raisesRowKey(self: *TypeChecker, family_id: scope_mod.FunctionFamilyId) !?ast.StringId {
         const family = self.graph.getFamily(family_id);
         const method_name = self.interner.get(family.name);
 
@@ -7119,7 +7941,7 @@ pub const TypeChecker = struct {
         var scope_cursor: ?scope_mod.ScopeId = family.scope_id;
         while (scope_cursor) |sid| {
             if (self.graph.findStructByScope(sid)) |entry| {
-                const joined = entry.name.joinedWith(self.allocator, self.interner, ".") catch break;
+                const joined = try entry.name.joinedWith(self.allocator, self.interner, ".");
                 struct_prefix_buf = joined;
                 struct_prefix = joined;
                 break;
@@ -7133,7 +7955,7 @@ pub const TypeChecker = struct {
             // here so producer (this key) and consumer (`functionRaises`,
             // queried with `current_struct_prefix`) agree.
             if (self.graph.findImplByScope(sid)) |impl_entry| {
-                const joined = impl_entry.target_type.joinedWith(self.allocator, self.interner, ".") catch break;
+                const joined = try impl_entry.target_type.joinedWith(self.allocator, self.interner, ".");
                 struct_prefix_buf = joined;
                 struct_prefix = joined;
                 break;
@@ -7143,7 +7965,7 @@ pub const TypeChecker = struct {
 
         // Delegate the final string format to the TypeStore so producer and
         // the IR-backend consumer share one definition of the key.
-        return self.store.raisesRowKeyString(struct_prefix, method_name, family.arity);
+        return try self.store.raisesRowKeyString(struct_prefix, method_name, family.arity);
     }
 
     /// Resolve the stable `inferred_raises` key for `func`/`clause` by first
@@ -7154,13 +7976,13 @@ pub const TypeChecker = struct {
         self: *TypeChecker,
         func: *const ast.FunctionDecl,
         clause: *const ast.FunctionClause,
-    ) ?ast.StringId {
+    ) !?ast.StringId {
         const clause_scope = self.graph.resolveClauseScope(clause.meta) orelse
             (if (clause.meta.scope_id != 0) clause.meta.scope_id else self.current_scope) orelse
             return null;
         const arity: u32 = @intCast(clause.params.len);
         const family_id = self.graph.resolveFamily(clause_scope, func.name, arity) orelse return null;
-        return self.raisesRowKey(family_id);
+        return try self.raisesRowKey(family_id);
     }
 
     /// Persist a resolved `raises` row keyed by the function's stable
@@ -7195,7 +8017,7 @@ pub const TypeChecker = struct {
         clause: *const ast.FunctionClause,
         row: []const TypeId,
     ) !void {
-        const key = self.raisesRowKeyForDecl(func, clause) orelse return;
+        const key = (try self.raisesRowKeyForDecl(func, clause)) orelse return;
 
         var merged: std.ArrayListUnmanaged(TypeId) = .empty;
         errdefer merged.deinit(self.store.allocator);
@@ -7235,7 +8057,7 @@ pub const TypeChecker = struct {
     /// family (from the call-site resolver); a callee with no stored row (a
     /// pure function, or one not yet checked) contributes nothing.
     fn recordCalleeRaisesRow(self: *TypeChecker, family_id: scope_mod.FunctionFamilyId, span: ast.SourceSpan) !void {
-        const key = self.raisesRowKey(family_id) orelse return;
+        const key = (try self.raisesRowKey(family_id)) orelse return;
         const row = self.store.inferred_raises.get(key) orelse return;
         for (row) |error_type| {
             try self.recordRaisedErrorType(error_type, span);
@@ -7271,7 +8093,7 @@ pub const TypeChecker = struct {
         args: []const *const ast.Expr,
         span: ast.SourceSpan,
     ) !void {
-        const invoked = self.closureInvokedParamsForFamily(family_id) orelse return;
+        const invoked = (try self.closureInvokedParamsForFamily(family_id)) orelse return;
         defer self.allocator.free(invoked);
         for (args, 0..) |arg, idx| {
             if (idx >= invoked.len) break;
@@ -7284,12 +8106,14 @@ pub const TypeChecker = struct {
     /// diagnostics. A single-element row renders without parentheses.
     fn formatRaisesRow(self: *TypeChecker, row: []const TypeId) ![]const u8 {
         if (row.len == 0) return "()";
-        if (row.len == 1) return self.typeToString(row[0]);
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        if (row.len == 1) return try self.typeToString(row[0]);
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var budget = TypeGraphBudget.init(diagnostic_type_format_limits);
         try buf.append(self.allocator, '(');
         for (row, 0..) |type_id, index| {
             if (index > 0) try buf.appendSlice(self.allocator, " | ");
-            try buf.appendSlice(self.allocator, self.typeToString(type_id));
+            try self.appendDiagnosticType(&buf, type_id, 0, &budget);
         }
         try buf.append(self.allocator, ')');
         return buf.toOwnedSlice(self.allocator);
@@ -7340,8 +8164,8 @@ pub const TypeChecker = struct {
             for (impl_d.type_params) |tp_name_id| {
                 const tp_name = self.interner.get(tp_name_id);
                 if (!self.type_var_scope.contains(tp_name)) {
-                    const fresh = self.store.freshVar() catch continue;
-                    self.type_var_scope.put(tp_name, fresh) catch {};
+                    const fresh = try self.store.freshVar();
+                    try self.type_var_scope.put(tp_name, fresh);
                 }
             }
         }
@@ -7392,7 +8216,7 @@ pub const TypeChecker = struct {
                     // impl-method params with `[element]`) so generic
                     // monomorphisation isn't pinned to a concrete
                     // specialisation here.
-                    try self.recordParamBindingTypes(param.pattern, param_type, ta.getMeta().span);
+                    try self.recordParamBindingTypes(param.pattern, param_type, qualified.ownership, ta.getMeta().span);
                 }
             } else if (inferred_sig) |sig| {
                 if (param_idx < sig.param_types.len and sig.param_types[param_idx] != TypeStore.UNKNOWN) {
@@ -7406,19 +8230,12 @@ pub const TypeChecker = struct {
                             }
                         }
                     } else {
-                        try self.recordParamBindingTypes(param.pattern, param_type, param.pattern.getMeta().span);
+                        try self.recordParamBindingTypes(param.pattern, param_type, qualified.ownership, param.pattern.getMeta().span);
                     }
                 }
             } else if (param.pattern.* == .literal) {
                 // Infer type from literal pattern — no annotation needed
-                const param_type = switch (param.pattern.literal) {
-                    .string => self.store.addType(.string_type) catch TypeStore.UNKNOWN,
-                    .int => self.store.addType(.{ .int = .{ .signedness = .signed, .bits = 64 } }) catch TypeStore.UNKNOWN,
-                    .float => self.store.addType(.{ .float = .{ .bits = 64 } }) catch TypeStore.UNKNOWN,
-                    .atom => self.store.addType(.atom_type) catch TypeStore.UNKNOWN,
-                    .bool_lit => self.store.addType(.bool_type) catch TypeStore.UNKNOWN,
-                    .nil => self.store.addType(.nil_type) catch TypeStore.UNKNOWN,
-                };
+                const param_type = literalPatternType(param.pattern.literal);
                 _ = QualifiedType.init(param_type, self.resolveParamOwnership(param, param_type));
             } else {
                 // Generated functions (span 0:0) may lack type annotations.
@@ -7473,10 +8290,11 @@ pub const TypeChecker = struct {
         if (clause.refinement) |ref| {
             const ref_type = try self.inferExpr(ref);
             if (ref_type != TypeStore.BOOL and ref_type != TypeStore.UNKNOWN and ref_type != TypeStore.ERROR) {
+                const ref_type_name = try self.typeToString(ref_type);
                 try self.addRichError(
                     "refinement predicate must be Bool",
                     ref.getMeta().span,
-                    try std.fmt.allocPrint(self.allocator, "this is a `{s}`, not a `Bool`", .{self.typeToString(ref_type)}),
+                    try std.fmt.allocPrint(self.allocator, "this is a `{s}`, not a `Bool`", .{ref_type_name}),
                     "guard clauses must evaluate to `true` or `false`",
                 );
             }
@@ -7504,7 +8322,7 @@ pub const TypeChecker = struct {
                 );
             }
             if (self.closureDeclFromExpr(expr)) |decl| {
-                if (self.functionDeclCapturesBorrowed(decl)) {
+                if (try self.functionDeclCapturesBorrowed(decl)) {
                     try self.addHardError(
                         "closure with borrowed captures cannot escape through return",
                         expr.getMeta().span,
@@ -7560,8 +8378,8 @@ pub const TypeChecker = struct {
             const return_matches_declared = self.store.typeEqualsModuloCallable(body_type, declared_return) or
                 if (last_expr) |expr| try self.acceptsIntegerLiteralForExpectedType(expr, declared_return) else false;
             if (!return_matches_declared) {
-                const expected = self.typeToString(declared_return);
-                const got = self.typeToString(body_type);
+                const expected = try self.typeToString(declared_return);
+                const got = try self.typeToString(body_type);
 
                 // Build the secondary span pointing to the return type
                 // annotation (inline `~~~` underline). This is the legacy
@@ -7610,7 +8428,13 @@ pub const TypeChecker = struct {
             .assignment => |assign| {
                 try self.ensureClosureValueCanEscape(assign.value, "assignment");
                 const value_type = try self.inferExpr(assign.value);
-                try self.recordAssignmentBindingTypes(assign.pattern, value_type, assign.value.getMeta().span);
+                const value_ownership = self.exprResultOwnership(assign.value, value_type);
+                try self.recordAssignmentBindingTypesWithOwnership(
+                    assign.pattern,
+                    value_type,
+                    value_ownership,
+                    assign.value.getMeta().span,
+                );
                 return value_type;
             },
             .function_decl => |func| {
@@ -7654,14 +8478,12 @@ pub const TypeChecker = struct {
         // a fresh cache.
         if (self.expr_types.get(@intFromPtr(expr))) |cached| return cached;
         self.infer_depth += 1;
-        const result = self.inferExprUncached(expr) catch |err| {
+        defer {
             self.infer_depth -= 1;
             if (self.infer_depth == 0) self.expr_types.clearRetainingCapacity();
-            return err;
-        };
-        self.expr_types.put(@intFromPtr(expr), result) catch {};
-        self.infer_depth -= 1;
-        if (self.infer_depth == 0) self.expr_types.clearRetainingCapacity();
+        }
+        const result = try self.inferExprUncached(expr);
+        try self.expr_types.put(@intFromPtr(expr), result);
         return result;
     }
 
@@ -7711,7 +8533,7 @@ pub const TypeChecker = struct {
                         // pattern and never reaches this branch.
                         try self.rejectUnderscoreVarRead(vr.name, vr.meta.span);
                         _ = try self.ensureBindingAvailable(bid, vr.meta.span);
-                        self.referenced_bindings.put(bid, {}) catch {};
+                        try self.referenced_bindings.put(bid, {});
                         const binding = self.graph.bindings.items[bid];
                         if (binding.type_id) |prov| {
                             return prov.type_id;
@@ -7720,11 +8542,13 @@ pub const TypeChecker = struct {
                     }
                     // Variable not found — try "did you mean?"
                     const var_name = self.interner.get(vr.name);
-                    const visible_ids = self.graph.collectVisibleBindingNames(scope_id, self.allocator) catch return TypeStore.UNKNOWN;
+                    const visible_ids = try self.graph.collectVisibleBindingNames(scope_id, self.allocator);
+                    defer self.allocator.free(visible_ids);
                     // Build string candidates from IDs
                     var candidates: std.ArrayList([]const u8) = .empty;
+                    defer candidates.deinit(self.allocator);
                     for (visible_ids) |sid| {
-                        candidates.append(self.allocator, self.interner.get(sid)) catch {};
+                        try candidates.append(self.allocator, self.interner.get(sid));
                     }
                     const candidate_slice = candidates.items;
                     if (similarity.findBestMatch(var_name, candidate_slice, similarity.SUGGESTION_THRESHOLD)) |suggestion| {
@@ -7741,6 +8565,7 @@ pub const TypeChecker = struct {
                     if (try self.resolveFunctionValueSignature(scope_id, vr.name)) |signature| {
                         if (self.resolveFunctionValueDecl(scope_id, vr.name)) |decl| {
                             const captured = try self.capturedBindingsForFunctionDecl(decl);
+                            defer self.allocator.free(captured);
                             for (captured) |binding_id| {
                                 const binding = self.graph.bindings.items[binding_id];
                                 if (binding.type_id) |prov| {
@@ -7795,9 +8620,13 @@ pub const TypeChecker = struct {
                 // to `Term` and tuple-shaped element disagreements unify
                 // component-wise. Mirrors `HirBuilder.unifyForCollection`.
                 var elem_type = try self.inferExpr(l.elements[0]);
+                var collection_budget = CollectionTypeBudget{};
                 for (l.elements[1..]) |e| {
                     const t = try self.inferExpr(e);
-                    elem_type = self.unifyForCollection(elem_type, t);
+                    elem_type = self.unifyForCollection(elem_type, t, &collection_budget) catch |err| {
+                        try self.reportCollectionTypeError(err, l.meta.span);
+                        return err;
+                    };
                 }
                 return try self.store.addType(.{
                     .list = .{ .element = elem_type },
@@ -7837,25 +8666,37 @@ pub const TypeChecker = struct {
                 }
                 const cond_type = try self.inferExpr(ie.condition);
                 if (cond_type != TypeStore.BOOL and cond_type != TypeStore.UNKNOWN and cond_type != TypeStore.ERROR) {
+                    const condition_type_name = try self.typeToString(cond_type);
                     try self.addRichError(
-                        try std.fmt.allocPrint(self.allocator, "this condition is a `{s}`, but `if` requires a `Bool`", .{self.typeToString(cond_type)}),
+                        try std.fmt.allocPrint(self.allocator, "this condition is a `{s}`, but `if` requires a `Bool`", .{condition_type_name}),
                         ie.meta.span,
-                        try std.fmt.allocPrint(self.allocator, "this is a `{s}`", .{self.typeToString(cond_type)}),
+                        try std.fmt.allocPrint(self.allocator, "this is a `{s}`", .{condition_type_name}),
                         "try comparing it: `if x > 0 do ...`",
                     );
                 }
                 var then_type: TypeId = TypeStore.NIL;
+                var ownership_before_then = try self.cloneOwnershipBindings();
+                defer ownership_before_then.deinit();
                 for (ie.then_block) |stmt| {
                     then_type = try self.checkStmt(stmt);
                 }
+                var then_ownership = try self.cloneOwnershipBindings();
+                defer then_ownership.deinit();
+                try self.restoreOwnershipBindings(&ownership_before_then);
                 if (ie.else_block) |else_block| {
                     var else_type: TypeId = TypeStore.NIL;
                     for (else_block) |stmt| {
                         else_type = try self.checkStmt(stmt);
                     }
+                    var else_ownership = try self.cloneOwnershipBindings();
+                    defer else_ownership.deinit();
+                    try self.restoreOwnershipBindings(&ownership_before_then);
+                    try self.mergeMovedOwnershipFromBranch(&then_ownership);
+                    try self.mergeMovedOwnershipFromBranch(&else_ownership);
                     if (self.store.typeEquals(then_type, else_type)) return then_type;
                     return TypeStore.UNKNOWN;
                 }
+                try self.mergeMovedOwnershipFromBranch(&then_ownership);
                 return then_type;
             },
 
@@ -7880,22 +8721,36 @@ pub const TypeChecker = struct {
                         // access or Bool comparison); only the DEAD clause
                         // bodies are skipped.
                         _ = try self.inferExpr(ce.scrutinee);
-                        return try self.checkCaseClause(ce.clauses[live_idx], TypeStore.UNKNOWN);
+                        return try self.checkCaseClause(ce.clauses[live_idx], TypeStore.UNKNOWN, .shared);
                     }
                 }
                 const scrutinee_type = try self.inferExpr(ce.scrutinee);
+                const scrutinee_ownership = self.exprResultOwnership(ce.scrutinee, scrutinee_type);
+                var ownership_before_clauses = try self.cloneOwnershipBindings();
+                defer ownership_before_clauses.deinit();
+                var clause_ownerships: std.ArrayList(std.AutoHashMap(scope_mod.BindingId, BindingOwnershipInfo)) = .empty;
+                defer {
+                    for (clause_ownerships.items) |*snapshot| snapshot.deinit();
+                    clause_ownerships.deinit(self.allocator);
+                }
                 var result_type: TypeId = TypeStore.UNKNOWN;
                 var has_wildcard = false;
                 for (ce.clauses) |clause| {
+                    try self.restoreOwnershipBindings(&ownership_before_clauses);
                     // Check for wildcard/catch-all pattern
                     if (clause.pattern.* == .wildcard or clause.pattern.* == .bind) {
                         has_wildcard = true;
                     }
 
-                    const clause_type = try self.checkCaseClause(clause, scrutinee_type);
+                    const clause_type = try self.checkCaseClause(clause, scrutinee_type, scrutinee_ownership);
+                    try clause_ownerships.append(self.allocator, try self.cloneOwnershipBindings());
                     if (result_type == TypeStore.UNKNOWN) {
                         result_type = clause_type;
                     }
+                }
+                try self.restoreOwnershipBindings(&ownership_before_clauses);
+                for (clause_ownerships.items) |*snapshot| {
+                    try self.mergeMovedOwnershipFromBranch(snapshot);
                 }
                 // Enum exhaustiveness check
                 if (!has_wildcard and scrutinee_type != TypeStore.UNKNOWN) {
@@ -7905,51 +8760,10 @@ pub const TypeChecker = struct {
                         // Collect matched variants from case patterns
                         var matched_count: usize = 0;
                         for (tu.variants) |variant| {
-                            var variant_matched = false;
-                            for (ce.clauses) |clause| {
-                                // Check for struct_ref pattern matching enum variant
-                                // e.g. Color.Red → literal atom pattern or struct_ref pattern
-                                if (clause.pattern.* == .literal) {
-                                    if (clause.pattern.literal == .atom) {
-                                        if (clause.pattern.literal.atom.value == variant.name) {
-                                            variant_matched = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if (variant_matched) matched_count += 1;
+                            if (caseClausesContainTaggedUnionVariant(ce.clauses, variant.name)) matched_count += 1;
                         }
                         if (matched_count < tu.variants.len) {
-                            // Find missing variants
-                            var missing: std.ArrayList([]const u8) = .empty;
-                            for (tu.variants) |variant| {
-                                var found = false;
-                                for (ce.clauses) |clause| {
-                                    if (clause.pattern.* == .literal) {
-                                        if (clause.pattern.literal == .atom) {
-                                            if (clause.pattern.literal.atom.value == variant.name) {
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if (!found) {
-                                    missing.append(self.allocator, self.interner.get(variant.name)) catch {};
-                                }
-                            }
-                            if (missing.items.len > 0) {
-                                const missing_str = std.mem.join(self.allocator, ", ", missing.items) catch "...";
-                                try self.addHardError(
-                                    try std.fmt.allocPrint(self.allocator, "non-exhaustive match on enum `{s}`", .{
-                                        self.interner.get(tu.name),
-                                    }),
-                                    ce.meta.span,
-                                    try std.fmt.allocPrint(self.allocator, "missing: {s}", .{missing_str}),
-                                    "add the missing variants or a wildcard `_` pattern",
-                                );
-                            }
+                            try self.addNonExhaustiveTaggedUnionMatchError(ce.meta.span, tu, ce.clauses);
                         }
                     }
                 }
@@ -8166,7 +8980,7 @@ pub const TypeChecker = struct {
                 // (#201): this is what drives per-instance
                 // specialization of any higher-order callee invoked
                 // with this closure.
-                const closure_raises = self.closureDeclRaises(anon.decl);
+                const closure_raises = try self.closureDeclRaises(anon.decl);
                 if (self.current_scope) |scope_id| {
                     if (try self.resolveFunctionValueSignature(scope_id, anon.decl.name)) |signature| {
                         return try self.store.addFunctionTypeWithEffect(
@@ -8267,11 +9081,18 @@ pub const TypeChecker = struct {
                     }
                     var key_t = try self.inferExpr(m.fields[0].key);
                     var value_t = try self.inferExpr(m.fields[0].value);
+                    var collection_budget = CollectionTypeBudget{};
                     for (m.fields[1..]) |field| {
                         const k = try self.inferExpr(field.key);
                         const v = try self.inferExpr(field.value);
-                        key_t = self.unifyForCollection(key_t, k);
-                        value_t = self.unifyForCollection(value_t, v);
+                        key_t = self.unifyForCollection(key_t, k, &collection_budget) catch |err| {
+                            try self.reportCollectionTypeError(err, m.meta.span);
+                            return err;
+                        };
+                        value_t = self.unifyForCollection(value_t, v, &collection_budget) catch |err| {
+                            try self.reportCollectionTypeError(err, m.meta.span);
+                            return err;
+                        };
                     }
                     return try self.store.addType(.{ .map = .{ .key = key_t, .value = value_t } });
                 }
@@ -8339,9 +9160,9 @@ pub const TypeChecker = struct {
                                         if (req_field.type_id == TypeStore.UNKNOWN and val_type != TypeStore.UNKNOWN and
                                             self.isClosureStructName(type_name_id))
                                         {
-                                            self.backfillClosureFieldType(tid, req_field.name, val_type);
+                                            try self.backfillClosureFieldType(tid, req_field.name, val_type);
                                         }
-                                        const expected_type = instantiation.substitution.applyToType(self.store, req_field.type_id);
+                                        const expected_type = try instantiation.substitution.applyToType(self.store, req_field.type_id);
                                         // A parametric struct literal that omits its
                                         // type-args (`%Box{value: 99}` for `Box(t)`)
                                         // leaves each formal type-var unbound: the
@@ -8358,15 +9179,17 @@ pub const TypeChecker = struct {
                                         // rule the call-match cost already applies
                                         // (`callMatchCost`: type-var expected ⇒ cost 0).
                                         if (val_type != TypeStore.UNKNOWN and expected_type != TypeStore.UNKNOWN and
-                                            !self.store.containsTypeVars(expected_type) and
+                                            !(try self.store.containsTypeVars(expected_type)) and
                                             !self.store.typeEquals(val_type, expected_type) and
-                                            !try self.acceptsIntegerLiteralForExpectedType(provided.value, expected_type))
+                                            !(try self.acceptsIntegerLiteralForExpectedType(provided.value, expected_type)))
                                         {
+                                            const expected_type_name = try self.typeToString(expected_type);
+                                            const value_type_name = try self.typeToString(val_type);
                                             try self.addRichError(
                                                 try std.fmt.allocPrint(self.allocator, "field `{s}` expects `{s}`, got `{s}`", .{
                                                     self.interner.get(req_field.name),
-                                                    self.typeToString(expected_type),
-                                                    self.typeToString(val_type),
+                                                    expected_type_name,
+                                                    value_type_name,
                                                 }),
                                                 provided.value.getMeta().span,
                                                 "type mismatch",
@@ -8489,7 +9312,7 @@ pub const TypeChecker = struct {
                             // map value, return). The capture-field backfill
                             // above still ran against the struct TypeId, so
                             // the env layout is intact.
-                            if (self.closureStructCallableConstraint(type_name_id)) |callable_constraint| {
+                            if (try self.closureStructCallableConstraint(type_name_id)) |callable_constraint| {
                                 return callable_constraint;
                             }
                             // For a parametric instantiation
@@ -8646,7 +9469,7 @@ pub const TypeChecker = struct {
                     const ct = self.store.types.items[chain_type];
                     if (ct == .tagged_union) {
                         const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                        const ok_name = interner_mut.intern("Ok") catch return chain_type;
+                        const ok_name = try interner_mut.intern("Ok");
                         for (ct.tagged_union.variants) |v| {
                             if (v.name == ok_name) {
                                 return v.type_id orelse TypeStore.UNKNOWN;
@@ -8684,8 +9507,8 @@ pub const TypeChecker = struct {
                 if (lhs == TypeStore.UNKNOWN or rhs == TypeStore.UNKNOWN) return if (lhs != TypeStore.UNKNOWN) lhs else rhs;
                 if (self.arithmeticResultForTypeVarOperand(lhs, rhs)) |resolved| return resolved;
                 if (!self.store.typeEquals(lhs, rhs)) {
-                    const lhs_name = self.typeToString(lhs);
-                    const rhs_name = self.typeToString(rhs);
+                    const lhs_name = try self.typeToString(lhs);
+                    const rhs_name = try self.typeToString(rhs);
                     try self.addRichError(
                         try std.fmt.allocPrint(self.allocator, "cannot perform arithmetic on `{s}` and `{s}`", .{ lhs_name, rhs_name }),
                         bo.meta.span,
@@ -8695,7 +9518,7 @@ pub const TypeChecker = struct {
                     return TypeStore.ERROR;
                 }
                 if (!self.isNumericScalarType(lhs)) {
-                    const lhs_name = self.typeToString(lhs);
+                    const lhs_name = try self.typeToString(lhs);
                     try self.addRichError(
                         try std.fmt.allocPrint(self.allocator, "cannot perform arithmetic on `{s}`", .{lhs_name}),
                         bo.meta.span,
@@ -8775,8 +9598,8 @@ pub const TypeChecker = struct {
     ) !void {
         const expected_type = self.store.getType(expected);
         const got_type = self.store.getType(got);
-        const expected_str = self.typeToString(expected);
-        const got_str = self.typeToString(got);
+        const expected_str = try self.typeToString(expected);
+        const got_str = try self.typeToString(got);
 
         const two_sided = try self.twoSidedTypeData(
             expected_str,
@@ -8899,7 +9722,7 @@ pub const TypeChecker = struct {
             const arg_type = try self.inferExpr(arg);
             if (idx < signature.params.len) {
                 const expected = signature.params[idx];
-                if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
+                if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and (try self.callMatchCost(arg_type, expected)) == null) {
                     // task #361: an untyped numeric literal argument adopts the
                     // parameter's concrete numeric type (range-checked); only a
                     // genuine non-literal mismatch is reported.
@@ -8963,14 +9786,14 @@ pub const TypeChecker = struct {
     /// backfill (the Phase-3 Edge-1 hazard) — that is independent of the raises
     /// accumulator.
     /// No-op when the struct/`call` cannot be resolved or is already in flight.
-    fn eagerlyCheckClosureStructCall(self: *TypeChecker, struct_name_id: ast.StringId) void {
+    fn eagerlyCheckClosureStructCall(self: *TypeChecker, struct_name_id: ast.StringId) !void {
         if (self.eager_helper_in_flight.contains(struct_name_id)) return;
         const struct_scope = self.graph.findStructScope(.{
             .parts = &.{struct_name_id},
             .span = .{ .start = 0, .end = 0 },
         }) orelse return;
         const interner_mut: *ast.StringInterner = @constCast(self.interner);
-        const call_name = interner_mut.intern("call") catch return;
+        const call_name = try interner_mut.intern("call");
         const call_decl = self.lookupFunctionDecl(struct_scope, call_name, 2) orelse return;
 
         // Snapshot the closure struct's StructType so a re-resolution of an
@@ -8980,23 +9803,24 @@ pub const TypeChecker = struct {
             (if (tid < self.store.types.items.len) self.store.types.items[tid] else null)
         else
             null;
+        defer {
+            // Restore the closure struct's backfilled type (Edge-1 hazard).
+            if (struct_type_id) |tid| {
+                if (saved_struct_type) |st| {
+                    if (tid < self.store.types.items.len) self.store.types.items[tid] = st;
+                }
+            }
+        }
 
         // Snapshot the caller's scope. The raises accumulator needs no
         // snapshot here: `checkFunctionClause` isolates and restores it.
         const prev_scope = self.current_scope;
         self.current_scope = struct_scope;
         defer self.current_scope = prev_scope;
-        self.eager_helper_in_flight.put(struct_name_id, {}) catch return;
+        try self.eager_helper_in_flight.put(struct_name_id, {});
         defer _ = self.eager_helper_in_flight.remove(struct_name_id);
 
-        self.checkFunctionDecl(call_decl) catch {};
-
-        // Restore the closure struct's backfilled type (Edge-1 hazard).
-        if (struct_type_id) |tid| {
-            if (saved_struct_type) |st| {
-                if (tid < self.store.types.items.len) self.store.types.items[tid] = st;
-            }
-        }
+        try self.checkFunctionDecl(call_decl);
     }
 
     /// If `expr` is a `%__closure_N{...}` construction synthesized by the
@@ -9016,9 +9840,9 @@ pub const TypeChecker = struct {
     /// `call(self, arguments)` lowers to a 2-arity method, so the row is keyed
     /// `"<struct>.call/2"` — the same key the IR backend reads. Returns null
     /// when the struct has no recorded row (a pure closure).
-    fn closureStructCallRaisesRow(self: *const TypeChecker, struct_name_id: ast.StringId) ?[]const TypeId {
+    fn closureStructCallRaisesRow(self: *const TypeChecker, struct_name_id: ast.StringId) !?[]const TypeId {
         const struct_text = self.interner.get(struct_name_id);
-        const key = self.store.raisesRowKeyString(struct_text, "call", 2) orelse return null;
+        const key = try self.store.raisesRowKeyString(struct_text, "call", 2);
         return self.store.inferred_raises.get(key);
     }
 
@@ -9050,7 +9874,7 @@ pub const TypeChecker = struct {
             if (self.current_scope) |scope_id| {
                 // First check if it's a variable holding a function
                 if (self.graph.resolveBindingHygienic(scope_id, vr.name, vr.meta.scopes)) |bid| {
-                    self.referenced_bindings.put(bid, {}) catch {};
+                    try self.referenced_bindings.put(bid, {});
                     const binding = self.graph.bindings.items[bid];
                     if (binding.type_id) |prov| {
                         const t = self.store.getType(prov.type_id);
@@ -9143,11 +9967,12 @@ pub const TypeChecker = struct {
                     // type-checked via `inferCallArgTypes` above, so a raising
                     // closure argument has stored its inferred row.
                     try self.recordClosureArgEffectsForFamily(resolved_call.family_id, call.args, call.meta.span);
-                    const safe_params = self.safeClosureParamsForCurrentCallee(vr.name, arity);
+                    const safe_params = try self.safeClosureParamsForCurrentCallee(vr.name, arity);
+                    defer if (safe_params) |flags| self.allocator.free(flags);
                     for (call.args, 0..) |arg, idx| {
                         if (arg.* != .var_ref) continue;
                         if (self.resolveFunctionValueDecl(scope_id, arg.var_ref.name)) |decl| {
-                            if (self.analysis_context != null and self.functionDeclCapturesBorrowed(decl)) {
+                            if (self.analysis_context != null and try self.functionDeclCapturesBorrowed(decl)) {
                                 const callee_allows = if (safe_params) |flags|
                                     idx < flags.len and flags[idx]
                                 else
@@ -9242,19 +10067,13 @@ pub const TypeChecker = struct {
                         // `inferred_signatures.return_type` to the body's
                         // type. We then read the refreshed signature back
                         // out and propagate that to the caller.
-                        var resolved_return = inferred_return;
-                        if (has_concrete and inferred_return == TypeStore.UNKNOWN and self.isSyntheticHelperName(vr.name)) {
-                            if (!self.eager_helper_in_flight.contains(vr.name)) {
-                                if (self.lookupFunctionDecl(scope_id, vr.name, arity)) |helper_decl| {
-                                    try self.eager_helper_in_flight.put(vr.name, {});
-                                    defer _ = self.eager_helper_in_flight.remove(vr.name);
-                                    self.checkFunctionDecl(helper_decl) catch {};
-                                    if (self.store.inferred_signatures.get(vr.name)) |refreshed| {
-                                        resolved_return = refreshed.return_type;
-                                    }
-                                }
-                            }
-                        }
+                        const resolved_return = try self.eagerlyResolveSyntheticHelperReturn(
+                            scope_id,
+                            vr.name,
+                            arity,
+                            has_concrete,
+                            inferred_return,
+                        );
 
                         const borrowed = try self.applyCallOwnershipWithSafeParams(call.args, signature.toFunctionType(), safe_params);
                         defer self.endBorrowedBindings(borrowed) catch {};
@@ -9264,12 +10083,12 @@ pub const TypeChecker = struct {
                     // Check if the signature is generic (contains type variables)
                     var signature_is_generic = false;
                     for (signature.params) |param_type| {
-                        if (self.store.containsTypeVars(param_type)) {
+                        if (try self.store.containsTypeVars(param_type)) {
                             signature_is_generic = true;
                             break;
                         }
                     }
-                    if (!signature_is_generic and self.store.containsTypeVars(signature.return_type)) {
+                    if (!signature_is_generic and (try self.store.containsTypeVars(signature.return_type))) {
                         signature_is_generic = true;
                     }
 
@@ -9283,7 +10102,7 @@ pub const TypeChecker = struct {
                             if (idx < signature.params.len) {
                                 const expected = signature.params[idx];
                                 if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
-                                    if (self.callMatchCost(arg_type, expected) == null) {
+                                    if ((try self.callMatchCost(arg_type, expected)) == null) {
                                         // task #361: an untyped numeric literal
                                         // adopts a concrete numeric parameter
                                         // type (range-checked). On adoption the
@@ -9296,7 +10115,7 @@ pub const TypeChecker = struct {
                                         }
                                         continue;
                                     }
-                                    const unified = self.store.unify(expected, arg_type, &subs) catch false;
+                                    const unified = try self.store.unify(expected, arg_type, &subs);
                                     if (!unified) {
                                         try self.reportArgumentTypeMismatch(arg, idx, expected, arg_type);
                                         unification_failed = true;
@@ -9312,7 +10131,7 @@ pub const TypeChecker = struct {
                         // they also picked up a concrete binding from a
                         // scalar argument (see `applyToReturnType` doc).
                         const resolved_return = if (!unification_failed)
-                            subs.applyToReturnType(self.store, signature.return_type)
+                            try subs.applyToReturnType(self.store, signature.return_type)
                         else
                             signature.return_type;
 
@@ -9329,7 +10148,7 @@ pub const TypeChecker = struct {
                         const arg_type = try self.inferExpr(arg);
                         if (idx < signature.params.len) {
                             const expected = signature.params[idx];
-                            if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
+                            if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and (try self.callMatchCost(arg_type, expected)) == null) {
                                 // task #361: untyped numeric literal adopts the
                                 // parameter's concrete numeric type (range-checked).
                                 if (try self.argMismatchSurvivesLiteralAdoption(arg, idx, expected)) {
@@ -9344,15 +10163,17 @@ pub const TypeChecker = struct {
                 }
 
                 // Function not found — suggest alternatives
-                const visible = self.graph.collectVisibleFunctionNames(
+                const visible = try self.graph.collectVisibleFunctionNames(
                     scope_id,
                     self.allocator,
-                ) catch &[_]scope_mod.FamilyKey{};
+                );
+                defer self.allocator.free(visible);
 
                 var candidates: std.ArrayList([]const u8) = .empty;
+                defer candidates.deinit(self.allocator);
                 for (visible) |fk| {
                     if (fk.arity == arity) {
-                        candidates.append(self.allocator, self.interner.get(fk.name)) catch {};
+                        try candidates.append(self.allocator, self.interner.get(fk.name));
                     }
                 }
 
@@ -9397,7 +10218,7 @@ pub const TypeChecker = struct {
                     if (arg.* == .var_ref) {
                         if (self.current_scope) |scope_id| {
                             if (self.graph.resolveBindingHygienic(scope_id, arg.var_ref.name, arg.var_ref.meta.scopes)) |bid| {
-                                self.referenced_bindings.put(bid, {}) catch {};
+                                try self.referenced_bindings.put(bid, {});
                             }
                         }
                     }
@@ -9481,12 +10302,12 @@ pub const TypeChecker = struct {
                                 // Check if the signature is generic (contains type variables)
                                 var mod_sig_is_generic = false;
                                 for (signature.params) |param_type| {
-                                    if (self.store.containsTypeVars(param_type)) {
+                                    if (try self.store.containsTypeVars(param_type)) {
                                         mod_sig_is_generic = true;
                                         break;
                                     }
                                 }
-                                if (!mod_sig_is_generic and self.store.containsTypeVars(signature.return_type)) {
+                                if (!mod_sig_is_generic and (try self.store.containsTypeVars(signature.return_type))) {
                                     mod_sig_is_generic = true;
                                 }
 
@@ -9496,26 +10317,26 @@ pub const TypeChecker = struct {
                                     var mod_unification_failed = false;
 
                                     for (call.args, 0..) |arg, idx| {
-                                        const arg_type = self.inferExpr(arg) catch TypeStore.UNKNOWN;
+                                        const arg_type = try self.inferExpr(arg);
                                         if (idx < signature.params.len) {
                                             const expected = signature.params[idx];
                                             if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR) {
                                                 const origin = self.familyParamOriginSpan(resolved_call.family_id, resolved_call.clause_index, idx);
-                                                if (self.callMatchCost(arg_type, expected) == null) {
+                                                if ((try self.callMatchCost(arg_type, expected)) == null) {
                                                     // task #361: untyped numeric literal
                                                     // adopts the concrete numeric param
                                                     // type (range-checked); on adoption it
                                                     // already satisfies `expected`, so skip
                                                     // the unify binding.
-                                                    if (self.argMismatchSurvivesLiteralAdoption(arg, idx, expected) catch true) {
-                                                        self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
+                                                    if (try self.argMismatchSurvivesLiteralAdoption(arg, idx, expected)) {
+                                                        try self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin);
                                                         mod_unification_failed = true;
                                                     }
                                                     continue;
                                                 }
-                                                const unified = self.store.unify(expected, arg_type, &mod_subs) catch false;
+                                                const unified = try self.store.unify(expected, arg_type, &mod_subs);
                                                 if (!unified) {
-                                                    self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
+                                                    try self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin);
                                                     mod_unification_failed = true;
                                                 }
                                             }
@@ -9527,31 +10348,32 @@ pub const TypeChecker = struct {
                                     // the position-aware variant rather than
                                     // plain `applyToType`.
                                     const mod_resolved_return = if (!mod_unification_failed)
-                                        mod_subs.applyToReturnType(self.store, signature.return_type)
+                                        try mod_subs.applyToReturnType(self.store, signature.return_type)
                                     else
                                         signature.return_type;
 
                                     return mod_resolved_return;
                                 }
 
-                                // Monomorphic call: check arguments but always return the
-                                // declared return type. Per-argument inference errors must
-                                // not prevent return type resolution — the return type is
-                                // known from the function signature independently of whether
-                                // all argument types can be fully inferred.
+                                // Monomorphic call: report semantic argument
+                                // mismatches but still return the declared
+                                // return type. Infrastructure failures from
+                                // argument inference or diagnostic construction
+                                // must propagate; only explicit UNKNOWN/ERROR
+                                // argument types suppress mismatch cascades.
                                 for (call.args, 0..) |arg, idx| {
-                                    const arg_type = self.inferExpr(arg) catch TypeStore.UNKNOWN;
+                                    const arg_type = try self.inferExpr(arg);
                                     if (idx < signature.params.len) {
                                         const expected = signature.params[idx];
-                                        if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and self.callMatchCost(arg_type, expected) == null) {
+                                        if (expected != TypeStore.UNKNOWN and arg_type != TypeStore.UNKNOWN and arg_type != TypeStore.ERROR and (try self.callMatchCost(arg_type, expected)) == null) {
                                             // task #361: untyped numeric literal adopts the
                                             // parameter's concrete numeric type (range-checked).
-                                            if (self.argMismatchSurvivesLiteralAdoption(arg, idx, expected) catch true) {
+                                            if (try self.argMismatchSurvivesLiteralAdoption(arg, idx, expected)) {
                                                 // Phase 4.b two-sided: point at the
                                                 // resolved callee parameter's declared
                                                 // type as the expected-type origin.
                                                 const origin = self.familyParamOriginSpan(resolved_call.family_id, resolved_call.clause_index, idx);
-                                                self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin) catch {};
+                                                try self.reportArgumentTypeMismatchProvenance(arg, idx, expected, arg_type, origin);
                                             }
                                         }
                                     }
@@ -9599,6 +10421,8 @@ pub const TypeChecker = struct {
                         const fn_name_text = self.interner.get(fn_sig.name);
                         if (!std.mem.eql(u8, fn_name_text, field_name_text)) continue;
                         if (fn_sig.params.len != arity) continue;
+                        const borrowed = try self.applyProtocolCallOwnership(call.args, fn_sig);
+                        defer self.endBorrowedBindings(borrowed) catch {};
                         const ret_expr = fn_sig.return_type orelse return TypeStore.VOID;
                         // Parametric protocol existential (`Callable(args,
                         // result)`, `Enumerable(element)`): the method's
@@ -9613,7 +10437,7 @@ pub const TypeChecker = struct {
                         // takes the empty-binding fast path — identical to
                         // the prior behavior.
                         try self.bindProtocolFormalsFromReceiver(proto_entry.decl.type_params, receiver_type_id);
-                        return self.resolveTypeExpr(ret_expr) catch TypeStore.UNKNOWN;
+                        return try self.resolveTypeExpr(ret_expr);
                     }
                     return TypeStore.UNKNOWN;
                 }
@@ -9681,7 +10505,7 @@ pub const TypeChecker = struct {
     /// or a closure struct whose `impl Callable` (or its type args) cannot be
     /// resolved. The protocol type args are resolved through `resolveTypeExpr`
     /// so the `{P...}` arguments tuple and `R` result render concretely.
-    fn closureStructCallableConstraint(self: *TypeChecker, struct_type_name_id: ast.StringId) ?TypeId {
+    fn closureStructCallableConstraint(self: *TypeChecker, struct_type_name_id: ast.StringId) !?TypeId {
         if (!self.isClosureStructName(struct_type_name_id)) return null;
         const struct_name_text = self.interner.get(struct_type_name_id);
         for (self.graph.impls.items) |entry| {
@@ -9690,26 +10514,30 @@ pub const TypeChecker = struct {
             if (entry.protocol_name.parts.len != 1) continue;
             if (!std.mem.eql(u8, self.interner.get(entry.protocol_name.parts[0]), "Callable")) continue;
             if (entry.decl.protocol_type_args.len != 2) continue;
-            const args_tuple = self.resolveTypeExpr(entry.decl.protocol_type_args[0]) catch return null;
-            const result = self.resolveTypeExpr(entry.decl.protocol_type_args[1]) catch return null;
+            const args_tuple = try self.resolveTypeExpr(entry.decl.protocol_type_args[0]);
+            const result = try self.resolveTypeExpr(entry.decl.protocol_type_args[1]);
             if (args_tuple == TypeStore.UNKNOWN or result == TypeStore.UNKNOWN) return null;
-            const type_params = self.allocator.alloc(TypeId, 2) catch return null;
-            type_params[0] = args_tuple;
-            type_params[1] = result;
+            var type_params: ?[]TypeId = try self.allocator.alloc(TypeId, 2);
+            errdefer if (type_params) |items| self.allocator.free(items);
+            type_params.?[0] = args_tuple;
+            type_params.?[1] = result;
             const protocol_name_id = entry.protocol_name.parts[0];
-            const constraint = self.store.addType(.{ .protocol_constraint = .{
+            const previous_type_count = self.store.types.items.len;
+            const constraint = try self.store.addType(.{ .protocol_constraint = .{
                 .protocol_name = protocol_name_id,
-                .type_params = type_params,
-            } }) catch null;
+                .type_params = type_params.?,
+            } });
+            if (constraint < previous_type_count) {
+                self.allocator.free(type_params.?);
+            }
+            type_params = null;
             // Phase 5 (effect precision): record this closure's `call` `raises`
             // row keyed by the boxed constraint TypeId so a later value-call
             // of a binding holding this `Callable` can fold the row for the
             // undischarged-flag check. The synthesized `__closure_N` module is
             // ordered last, so eagerly check its `call` body first to populate
             // the row order-independently.
-            if (constraint) |constraint_id| {
-                self.recordBoxedCallableRaisesRow(constraint_id, struct_type_name_id);
-            }
+            try self.recordBoxedCallableRaisesRow(constraint, struct_type_name_id);
             return constraint;
         }
         return null;
@@ -9720,17 +10548,17 @@ pub const TypeChecker = struct {
     /// (union) with any row already recorded for that shared instantiation. A
     /// pure closure (empty row) records nothing. The row is duplicated into a
     /// TypeChecker-owned slice (freed at teardown).
-    fn recordBoxedCallableRaisesRow(self: *TypeChecker, constraint_id: TypeId, struct_name_id: ast.StringId) void {
+    fn recordBoxedCallableRaisesRow(self: *TypeChecker, constraint_id: TypeId, struct_name_id: ast.StringId) !void {
         // The synthesized `__closure_N` module is ordered last, so its `call`
         // row may not yet be in `inferred_raises` when a factory's caller is
         // checked. Eagerly populate it (snapshot/restore-guarded so the closure
         // struct's backfill and the caller's raises accumulator are untouched).
-        if (self.closureStructCallRaisesRow(struct_name_id) == null or
-            (self.closureStructCallRaisesRow(struct_name_id).?.len == 0))
-        {
-            self.eagerlyCheckClosureStructCall(struct_name_id);
+        if (try self.closureStructCallRaisesRow(struct_name_id)) |existing_row| {
+            if (existing_row.len == 0) try self.eagerlyCheckClosureStructCall(struct_name_id);
+        } else {
+            try self.eagerlyCheckClosureStructCall(struct_name_id);
         }
-        const row = self.closureStructCallRaisesRow(struct_name_id) orelse return;
+        const row = (try self.closureStructCallRaisesRow(struct_name_id)) orelse return;
         if (row.len == 0) return;
 
         // Union with any existing row for this shared instantiation (distinct
@@ -9738,7 +10566,7 @@ pub const TypeChecker = struct {
         var merged: std.ArrayListUnmanaged(TypeId) = .empty;
         defer merged.deinit(self.allocator);
         if (self.boxed_callable_raises_row.get(constraint_id)) |existing| {
-            merged.appendSlice(self.allocator, existing) catch return;
+            try merged.appendSlice(self.allocator, existing);
         }
         for (row) |error_type| {
             var already = false;
@@ -9748,13 +10576,11 @@ pub const TypeChecker = struct {
                     break;
                 }
             }
-            if (!already) merged.append(self.allocator, error_type) catch return;
+            if (!already) try merged.append(self.allocator, error_type);
         }
-        const owned = self.allocator.dupe(TypeId, merged.items) catch return;
-        const gop = self.boxed_callable_raises_row.getOrPut(self.allocator, constraint_id) catch {
-            self.allocator.free(owned);
-            return;
-        };
+        const owned = try self.allocator.dupe(TypeId, merged.items);
+        errdefer self.allocator.free(owned);
+        const gop = try self.boxed_callable_raises_row.getOrPut(self.allocator, constraint_id);
         if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
         gop.value_ptr.* = owned;
     }
@@ -9763,25 +10589,35 @@ pub const TypeChecker = struct {
     /// declared type is still `any` (UNKNOWN). Rebuilds the StructType's
     /// field slice with the field's `type_id` replaced and stores it back
     /// at `struct_type_id`, so downstream field/layout resolution sees a
-    /// concrete capture type. No-op if the type isn't a struct or the
-    /// field is absent.
+    /// concrete capture type. The replacement field slice is TypeStore-owned
+    /// and tracked separately from ordinary registration slices so later
+    /// replacements can release it without double-freeing arena-owned fields.
+    /// No-op if the type isn't a struct, the field is absent, or the field
+    /// has already been backfilled.
     fn backfillClosureFieldType(
         self: *TypeChecker,
         struct_type_id: TypeId,
         field_name: ast.StringId,
         concrete_type: TypeId,
-    ) void {
+    ) !void {
         if (struct_type_id >= self.store.types.items.len) return;
         const existing = self.store.getType(struct_type_id);
         if (existing != .struct_type) return;
         const st = existing.struct_type;
-        const new_fields = self.allocator.alloc(Type.StructField, st.fields.len) catch return;
-        for (st.fields, 0..) |f, idx| {
-            new_fields[idx] = if (f.name == field_name and f.type_id == TypeStore.UNKNOWN)
-                .{ .name = f.name, .type_id = concrete_type, .default_expr = f.default_expr }
-            else
-                f;
-        }
+        const field_index = for (st.fields, 0..) |f, idx| {
+            if (f.name == field_name) {
+                if (f.type_id != TypeStore.UNKNOWN) return;
+                break idx;
+            }
+        } else return;
+        const new_fields = try self.store.allocator.dupe(Type.StructField, st.fields);
+        errdefer self.store.allocator.free(new_fields);
+        new_fields[field_index] = .{
+            .name = new_fields[field_index].name,
+            .type_id = concrete_type,
+            .default_expr = new_fields[field_index].default_expr,
+        };
+        try self.store.installClosureBackfillFields(struct_type_id, new_fields);
         self.store.types.items[struct_type_id] = .{ .struct_type = .{
             .name = st.name,
             .fields = new_fields,
@@ -10047,16 +10883,19 @@ pub const TypeChecker = struct {
 
                 // Check if this is a protocol name
                 for (self.graph.protocols.items) |proto| {
-                    if (proto.name.parts.len > 0 and self.structNameMatchesTypeName(proto.name, name)) {
+                    if (proto.name.parts.len > 0 and (try self.structNameMatchesTypeName(proto.name, name))) {
                         // Protocol constraint — resolve type params and create constraint type
                         var type_params: std.ArrayList(TypeId) = .empty;
+                        errdefer type_params.deinit(self.allocator);
                         for (tn.args) |arg| {
-                            type_params.append(self.allocator, try self.resolveTypeExpr(arg)) catch {};
+                            try type_params.append(self.allocator, try self.resolveTypeExpr(arg));
                         }
+                        const owned_type_params = try type_params.toOwnedSlice(self.allocator);
+                        errdefer self.allocator.free(owned_type_params);
                         return try self.store.addType(.{
                             .protocol_constraint = .{
                                 .protocol_name = tn.name,
-                                .type_params = type_params.toOwnedSlice(self.allocator) catch &.{},
+                                .type_params = owned_type_params,
                             },
                         });
                     }
@@ -10064,6 +10903,7 @@ pub const TypeChecker = struct {
 
                 // Unknown type — report error with suggestions
                 var candidates: std.ArrayList([]const u8) = .empty;
+                defer candidates.deinit(self.allocator);
                 // Collect builtin type names
                 const builtins = [_][]const u8{
                     "Bool",  "String", "Atom", "Nil", "Never",
@@ -10073,11 +10913,11 @@ pub const TypeChecker = struct {
                     "usize", "isize",
                 };
                 for (&builtins) |b| {
-                    candidates.append(self.allocator, b) catch {};
+                    try candidates.append(self.allocator, b);
                 }
                 // Collect user-defined type names
                 for (self.graph.types.items) |type_entry| {
-                    candidates.append(self.allocator, self.interner.get(type_entry.name)) catch {};
+                    try candidates.append(self.allocator, self.interner.get(type_entry.name));
                 }
 
                 const help_text = if (similarity.findBestMatch(
@@ -10236,10 +11076,986 @@ pub const TypeChecker = struct {
 // Tests
 // ============================================================
 
+fn testNodeMeta() ast.NodeMeta {
+    return .{ .span = .{ .start = 0, .end = 0 } };
+}
+
+fn createBindingInferenceTestScope(
+    graph: *scope_mod.ScopeGraph,
+    binding_name: ast.StringId,
+) !struct {
+    scope_id: scope_mod.ScopeId,
+    binding_id: scope_mod.BindingId,
+} {
+    const scope_id = try graph.createScope(graph.prelude_scope, .function);
+    const binding_id = try graph.createBinding(binding_name, scope_id, .variable, testNodeMeta().span);
+    return .{ .scope_id = scope_id, .binding_id = binding_id };
+}
+
+test "literal pattern parameter types use builtin ids under store allocator failure" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const function_name = try interner.intern("literal");
+    const literal_value = try interner.intern("value");
+
+    var failing_store_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = try TypeStore.init(failing_store_allocator.allocator(), &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const literal_pattern = ast.Pattern{ .literal = .{ .string = .{
+        .meta = testNodeMeta(),
+        .value = literal_value,
+    } } };
+    const param = ast.Param{
+        .meta = testNodeMeta(),
+        .pattern = &literal_pattern,
+        .type_annotation = null,
+    };
+    const params = [_]ast.Param{param};
+    const clause = ast.FunctionClause{
+        .meta = testNodeMeta(),
+        .params = &params,
+        .return_type = null,
+        .refinement = null,
+        .body = &.{},
+    };
+    const clauses = [_]ast.FunctionClause{clause};
+    const function_decl = ast.FunctionDecl{
+        .meta = testNodeMeta(),
+        .name = function_name,
+        .clauses = &clauses,
+        .visibility = .public,
+    };
+
+    failing_store_allocator.fail_index = failing_store_allocator.alloc_index;
+    const signature = (try checker.resolveClauseSignature(function_name, 1, 1, .{
+        .decl = &function_decl,
+        .clause_index = 0,
+    })).?;
+    defer {
+        checker.allocator.free(signature.params);
+        checker.allocator.free(signature.param_ownerships);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), signature.params.len);
+    try std.testing.expectEqual(TypeStore.STRING, signature.params[0]);
+}
+
+test "inferExpr propagates memo insertion OutOfMemory and clears scoped cache" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    var failing_cache_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    checker.expr_types.deinit();
+    checker.expr_types = std.AutoHashMap(usize, TypeId).init(failing_cache_allocator.allocator());
+
+    const expr = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 42,
+    } };
+
+    try std.testing.expectError(error.OutOfMemory, checker.inferExpr(&expr));
+    try std.testing.expectEqual(@as(u32, 0), checker.infer_depth);
+    try std.testing.expectEqual(@as(usize, 0), checker.expr_types.count());
+}
+
+test "var_ref inference propagates referenced binding OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const value_name = try interner.intern("value");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    const binding_scope = try createBindingInferenceTestScope(&graph, value_name);
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+    checker.current_scope = binding_scope.scope_id;
+
+    var failing_referenced_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    checker.referenced_bindings.deinit();
+    checker.referenced_bindings = std.AutoHashMap(scope_mod.BindingId, void).init(failing_referenced_allocator.allocator());
+
+    const expr = ast.Expr{ .var_ref = .{
+        .meta = testNodeMeta(),
+        .name = value_name,
+    } };
+
+    try std.testing.expectError(error.OutOfMemory, checker.inferExpr(&expr));
+    try std.testing.expectEqual(@as(u32, 0), checker.infer_depth);
+    try std.testing.expect(!checker.referenced_bindings.contains(binding_scope.binding_id));
+}
+
+test "undefined variable diagnostic propagates visible binding collection OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const visible_name = try interner.intern("visible");
+    const missing_name = try interner.intern("visibl");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    const binding_scope = try createBindingInferenceTestScope(&graph, visible_name);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+    checker.current_scope = binding_scope.scope_id;
+
+    const expr = ast.Expr{ .var_ref = .{
+        .meta = testNodeMeta(),
+        .name = missing_name,
+    } };
+
+    try std.testing.expectError(error.OutOfMemory, checker.inferExpr(&expr));
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+    try std.testing.expectEqual(@as(u32, 0), checker.infer_depth);
+}
+
+test "undefined function diagnostic propagates visible function collection OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const visible_name = try interner.intern("known");
+    const missing_name = try interner.intern("knwon");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    const scope_id = try graph.createScope(graph.prelude_scope, .function);
+    _ = try graph.createFamily(scope_id, visible_name, 0, .public);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+    checker.current_scope = scope_id;
+
+    const callee = ast.Expr{ .var_ref = .{
+        .meta = testNodeMeta(),
+        .name = missing_name,
+    } };
+    const call = ast.Expr{ .call = .{
+        .meta = testNodeMeta(),
+        .callee = &callee,
+        .args = &.{},
+    } };
+
+    try std.testing.expectError(error.OutOfMemory, checker.inferExpr(&call));
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+    try std.testing.expectEqual(@as(u32, 0), checker.infer_depth);
+}
+
+test "unknown type diagnostic propagates candidate append OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const missing_name = try interner.intern("Strng");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const type_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = missing_name,
+        .args = &.{},
+    } };
+
+    try std.testing.expectError(error.OutOfMemory, checker.resolveTypeExpr(&type_expr));
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "inferBodyBindings records assignment binding type" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const value_name = try interner.intern("value");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    const binding_scope = try createBindingInferenceTestScope(&graph, value_name);
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+    checker.current_scope = binding_scope.scope_id;
+
+    const value_expr = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 42,
+    } };
+    const pattern = ast.Pattern{ .bind = .{
+        .meta = testNodeMeta(),
+        .name = value_name,
+    } };
+    const assignment = ast.Assignment{
+        .meta = testNodeMeta(),
+        .pattern = &pattern,
+        .value = &value_expr,
+    };
+    const statements = [_]ast.Stmt{.{ .assignment = &assignment }};
+
+    try checker.inferBodyBindings(statements[0..]);
+
+    const provenance = graph.bindings.items[binding_scope.binding_id].type_id orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(TypeStore.I64, provenance.type_id);
+
+    const ownership = checker.bindingOwnershipInfo(binding_scope.binding_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(TypeStore.I64, ownership.qualified_type.type_id);
+    try std.testing.expectEqual(Ownership.shared, ownership.qualified_type.ownership);
+}
+
+test "inferBodyBindings propagates inferExpr OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const value_name = try interner.intern("value");
+    const i64_name = try interner.intern("i64");
+    const string_name = try interner.intern("String");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    const binding_scope = try createBindingInferenceTestScope(&graph, value_name);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+    checker.current_scope = binding_scope.scope_id;
+
+    const inner_expr = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 42,
+    } };
+    try std.testing.expectEqual(TypeStore.I64, try checker.inferExpr(&inner_expr));
+
+    const i64_type = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = i64_name,
+        .args = &.{},
+    } };
+    const string_type = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const tuple_elements = [_]*const ast.TypeExpr{ &i64_type, &string_type };
+    const tuple_type = ast.TypeExpr{ .tuple = .{
+        .meta = testNodeMeta(),
+        .elements = &tuple_elements,
+    } };
+    const value_expr = ast.Expr{ .type_annotated = .{
+        .meta = testNodeMeta(),
+        .expr = &inner_expr,
+        .type_expr = &tuple_type,
+    } };
+    const pattern = ast.Pattern{ .bind = .{
+        .meta = testNodeMeta(),
+        .name = value_name,
+    } };
+    const assignment = ast.Assignment{
+        .meta = testNodeMeta(),
+        .pattern = &pattern,
+        .value = &value_expr,
+    };
+    const statements = [_]ast.Stmt{.{ .assignment = &assignment }};
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.inferBodyBindings(statements[0..]));
+}
+
+test "inferExprBindings propagates condition inferExpr OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const i64_name = try interner.intern("i64");
+    const string_name = try interner.intern("String");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const inner_expr = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 42,
+    } };
+    try std.testing.expectEqual(TypeStore.I64, try checker.inferExpr(&inner_expr));
+
+    const i64_type = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = i64_name,
+        .args = &.{},
+    } };
+    const string_type = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const tuple_elements = [_]*const ast.TypeExpr{ &i64_type, &string_type };
+    const tuple_type = ast.TypeExpr{ .tuple = .{
+        .meta = testNodeMeta(),
+        .elements = &tuple_elements,
+    } };
+    const condition = ast.Expr{ .type_annotated = .{
+        .meta = testNodeMeta(),
+        .expr = &inner_expr,
+        .type_expr = &tuple_type,
+    } };
+    const if_expr = ast.Expr{ .if_expr = .{
+        .meta = testNodeMeta(),
+        .condition = &condition,
+        .then_block = &.{},
+        .else_block = null,
+    } };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.inferExprBindings(&if_expr));
+}
+
+test "inferBodyBindings propagates recordBindingType OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const value_name = try interner.intern("value");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    const binding_scope = try createBindingInferenceTestScope(&graph, value_name);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+    checker.current_scope = binding_scope.scope_id;
+
+    const value_expr = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 42,
+    } };
+    try std.testing.expectEqual(TypeStore.I64, try checker.inferExpr(&value_expr));
+
+    const pattern = ast.Pattern{ .bind = .{
+        .meta = testNodeMeta(),
+        .name = value_name,
+    } };
+    const assignment = ast.Assignment{
+        .meta = testNodeMeta(),
+        .pattern = &pattern,
+        .value = &value_expr,
+    };
+    const statements = [_]ast.Stmt{.{ .assignment = &assignment }};
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.inferBodyBindings(statements[0..]));
+}
+
+test "error_pipe returns tagged union Ok payload type" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const result_name = try interner.intern("Result");
+    const ok_name = try interner.intern("Ok");
+    const err_name = try interner.intern("Err");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const variants = [_]Type.TaggedUnionVariant{
+        .{ .name = ok_name, .type_id = TypeStore.I64 },
+        .{ .name = err_name, .type_id = TypeStore.STRING },
+    };
+    const result_type = try store.addType(.{ .tagged_union = .{
+        .name = result_name,
+        .variants = &variants,
+    } });
+    try store.name_to_type.put(result_name, result_type);
+
+    const literal = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 42,
+    } };
+    const result_type_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = result_name,
+        .args = &.{},
+    } };
+    const chain = ast.Expr{ .type_annotated = .{
+        .meta = testNodeMeta(),
+        .expr = &literal,
+        .type_expr = &result_type_expr,
+    } };
+    const error_pipe = ast.Expr{ .error_pipe = .{
+        .meta = testNodeMeta(),
+        .chain = &chain,
+        .handler = .{ .block = &.{} },
+    } };
+
+    try std.testing.expectEqual(TypeStore.I64, try checker.inferExpr(&error_pipe));
+}
+
+test "error_pipe propagates OutOfMemory while interning Ok variant name" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var interner = ast.StringInterner.init(failing_allocator.allocator());
+    defer interner.deinit();
+    const result_name = try interner.intern("Result");
+    const success_name = try interner.intern("Success");
+    const err_name = try interner.intern("Err");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const variants = [_]Type.TaggedUnionVariant{
+        .{ .name = success_name, .type_id = TypeStore.I64 },
+        .{ .name = err_name, .type_id = TypeStore.STRING },
+    };
+    const result_type = try store.addType(.{ .tagged_union = .{
+        .name = result_name,
+        .variants = &variants,
+    } });
+    try store.name_to_type.put(result_name, result_type);
+
+    const literal = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 42,
+    } };
+    const result_type_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = result_name,
+        .args = &.{},
+    } };
+    const chain = ast.Expr{ .type_annotated = .{
+        .meta = testNodeMeta(),
+        .expr = &literal,
+        .type_expr = &result_type_expr,
+    } };
+    const error_pipe = ast.Expr{ .error_pipe = .{
+        .meta = testNodeMeta(),
+        .chain = &chain,
+        .handler = .{ .block = &.{} },
+    } };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.inferExpr(&error_pipe));
+}
+
+fn addTypeCheckerTestStructScope(
+    graph: *scope_mod.ScopeGraph,
+    struct_name: ast.StructName,
+    decl: *const ast.StructDecl,
+) !scope_mod.ScopeId {
+    const scope_id: scope_mod.ScopeId = @intCast(graph.scopes.items.len);
+    try graph.scopes.append(graph.allocator, scope_mod.Scope.init(graph.allocator, scope_id, graph.prelude_scope, .struct_scope));
+    try graph.structs.append(graph.allocator, .{
+        .name = struct_name,
+        .scope_id = scope_id,
+        .decl = decl,
+    });
+    return scope_id;
+}
+
+test "registerUserTypes propagates OutOfMemory from struct field type resolution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    const struct_name = try interner.intern("NeedsTuple");
+    const field_name = try interner.intern("value");
+    const i64_name = try interner.intern("i64");
+    const string_name = try interner.intern("String");
+
+    const i64_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = i64_name,
+        .args = &.{},
+    } };
+    const string_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const tuple_members = [_]*const ast.TypeExpr{ &i64_expr, &string_expr };
+    const tuple_expr = ast.TypeExpr{ .tuple = .{
+        .meta = testNodeMeta(),
+        .elements = &tuple_members,
+    } };
+
+    const fields = [_]ast.StructFieldDecl{.{
+        .meta = testNodeMeta(),
+        .name = field_name,
+        .type_expr = &tuple_expr,
+        .default = null,
+    }};
+    const struct_name_parts = [_]ast.StringId{struct_name};
+    const struct_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &struct_name_parts, .span = testNodeMeta().span },
+        .fields = &fields,
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    try graph.types.append(alloc, .{
+        .id = 0,
+        .name = struct_name,
+        .scope_id = 0,
+        .kind = .{ .struct_type = &struct_decl },
+        .params = &.{},
+    });
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, checker.registerUserTypes());
+}
+
+test "registerUserTypes propagates OutOfMemory from inherited struct field type resolution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    const child_name = try interner.intern("Child");
+    const parent_name = try interner.intern("Parent");
+    const field_name = try interner.intern("value");
+    const i64_name = try interner.intern("i64");
+    const string_name = try interner.intern("String");
+
+    const i64_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = i64_name,
+        .args = &.{},
+    } };
+    const string_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const tuple_members = [_]*const ast.TypeExpr{ &i64_expr, &string_expr };
+    const tuple_expr = ast.TypeExpr{ .tuple = .{
+        .meta = testNodeMeta(),
+        .elements = &tuple_members,
+    } };
+
+    const parent_fields = [_]ast.StructFieldDecl{.{
+        .meta = testNodeMeta(),
+        .name = field_name,
+        .type_expr = &tuple_expr,
+        .default = null,
+    }};
+    const child_name_parts = [_]ast.StringId{child_name};
+    const parent_name_parts = [_]ast.StringId{parent_name};
+    const child_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &child_name_parts, .span = testNodeMeta().span },
+        .parent = parent_name,
+        .fields = &.{},
+    };
+    const parent_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &parent_name_parts, .span = testNodeMeta().span },
+        .fields = &parent_fields,
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    try graph.types.append(alloc, .{
+        .id = 0,
+        .name = child_name,
+        .scope_id = 0,
+        .kind = .{ .struct_type = &child_decl },
+        .params = &.{},
+    });
+    try graph.types.append(alloc, .{
+        .id = 1,
+        .name = parent_name,
+        .scope_id = 0,
+        .kind = .{ .struct_type = &parent_decl },
+        .params = &.{},
+    });
+    try graph.type_name_to_id.put(parent_name, 1);
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, checker.registerUserTypes());
+}
+
+test "registerUserTypes propagates OutOfMemory from tagged-union variant type resolution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    const union_name = try interner.intern("Payload");
+    const variant_name = try interner.intern("Pair");
+    const i64_name = try interner.intern("i64");
+    const string_name = try interner.intern("String");
+
+    const i64_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = i64_name,
+        .args = &.{},
+    } };
+    const string_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const tuple_members = [_]*const ast.TypeExpr{ &i64_expr, &string_expr };
+    const tuple_expr = ast.TypeExpr{ .tuple = .{
+        .meta = testNodeMeta(),
+        .elements = &tuple_members,
+    } };
+
+    const variants = [_]ast.UnionVariant{.{
+        .meta = testNodeMeta(),
+        .name = variant_name,
+        .type_expr = &tuple_expr,
+    }};
+    const union_decl = ast.UnionDecl{
+        .meta = testNodeMeta(),
+        .name = union_name,
+        .variants = &variants,
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    try graph.types.append(alloc, .{
+        .id = 0,
+        .name = union_name,
+        .scope_id = 0,
+        .kind = .{ .union_type = &union_decl },
+        .params = &.{},
+    });
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, checker.registerUserTypes());
+}
+
+test "registerUserTypes preserves semantic UNKNOWN placeholders for any field and variant types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    const any_name = try interner.intern("any");
+    const struct_name = try interner.intern("Box");
+    const field_name = try interner.intern("value");
+    const union_name = try interner.intern("Maybe");
+    const variant_name = try interner.intern("Some");
+
+    const any_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = any_name,
+        .args = &.{},
+    } };
+
+    const fields = [_]ast.StructFieldDecl{.{
+        .meta = testNodeMeta(),
+        .name = field_name,
+        .type_expr = &any_expr,
+        .default = null,
+    }};
+    const struct_name_parts = [_]ast.StringId{struct_name};
+    const struct_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &struct_name_parts, .span = testNodeMeta().span },
+        .fields = &fields,
+    };
+    const variants = [_]ast.UnionVariant{.{
+        .meta = testNodeMeta(),
+        .name = variant_name,
+        .type_expr = &any_expr,
+    }};
+    const union_decl = ast.UnionDecl{
+        .meta = testNodeMeta(),
+        .name = union_name,
+        .variants = &variants,
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    try graph.types.append(alloc, .{
+        .id = 0,
+        .name = union_name,
+        .scope_id = 0,
+        .kind = .{ .union_type = &union_decl },
+        .params = &.{},
+    });
+    try graph.types.append(alloc, .{
+        .id = 1,
+        .name = struct_name,
+        .scope_id = 0,
+        .kind = .{ .struct_type = &struct_decl },
+        .params = &.{},
+    });
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var checker = TypeChecker.initWithSharedStore(alloc, &store, &interner, &graph);
+    defer checker.deinit();
+
+    try checker.registerUserTypes();
+
+    const struct_type_id = store.name_to_type.get(struct_name).?;
+    const struct_type = store.getType(struct_type_id).struct_type;
+    try std.testing.expectEqual(@as(usize, 1), struct_type.fields.len);
+    try std.testing.expectEqual(TypeStore.UNKNOWN, struct_type.fields[0].type_id);
+
+    const union_type_id = store.name_to_type.get(union_name).?;
+    const union_type = store.getType(union_type_id).tagged_union;
+    try std.testing.expectEqual(@as(usize, 1), union_type.variants.len);
+    try std.testing.expectEqual(TypeStore.UNKNOWN, union_type.variants[0].type_id.?);
+}
+
+test "structNameMatchesTypeName propagates OutOfMemory for dotted struct names" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const struct_name = try interner.intern("Thing");
+    const name_parts = [_]ast.StringId{ namespace_name, struct_name };
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.structNameMatchesTypeName(.{ .parts = &name_parts, .span = testNodeMeta().span }, "Zap.Thing"),
+    );
+}
+
+test "function reference diagnostic preserves dotted missing target name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const struct_name = try interner.intern("Thing");
+    const function_name = try interner.intern("missing");
+    const name_parts = [_]ast.StringId{ namespace_name, struct_name };
+    const dotted_name = ast.StructName{ .parts = &name_parts, .span = testNodeMeta().span };
+    const struct_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = dotted_name,
+        .fields = &.{},
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    _ = try addTypeCheckerTestStructScope(&graph, dotted_name, &struct_decl);
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var checker = TypeChecker.initWithSharedStore(alloc, &store, &interner, &graph);
+    defer checker.deinit();
+
+    try std.testing.expect((try checker.resolveFunctionReferenceTarget(
+        dotted_name,
+        function_name,
+        1,
+        testNodeMeta().span,
+        true,
+    )) == null);
+
+    try std.testing.expectEqual(@as(usize, 1), checker.errors.items.len);
+    try std.testing.expectEqualStrings(
+        "I cannot find a function named `Zap.Thing.missing/1`",
+        checker.errors.items[0].message,
+    );
+}
+
+test "function reference diagnostic propagates OutOfMemory while joining dotted missing target name" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const struct_name = try interner.intern("Thing");
+    const function_name = try interner.intern("missing");
+    const name_parts = [_]ast.StringId{ namespace_name, struct_name };
+    const dotted_name = ast.StructName{ .parts = &name_parts, .span = testNodeMeta().span };
+    const struct_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = dotted_name,
+        .fields = &.{},
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    _ = try addTypeCheckerTestStructScope(&graph, dotted_name, &struct_decl);
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.resolveFunctionReferenceTarget(
+            dotted_name,
+            function_name,
+            1,
+            testNodeMeta().span,
+            true,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "private function reference diagnostic preserves dotted target name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const struct_name = try interner.intern("Other");
+    const function_name = try interner.intern("hidden");
+    const name_parts = [_]ast.StringId{ namespace_name, struct_name };
+    const dotted_name = ast.StructName{ .parts = &name_parts, .span = testNodeMeta().span };
+    const struct_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = dotted_name,
+        .fields = &.{},
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    const target_scope = try addTypeCheckerTestStructScope(&graph, dotted_name, &struct_decl);
+    _ = try graph.createFamily(target_scope, function_name, 1, .private);
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var checker = TypeChecker.initWithSharedStore(alloc, &store, &interner, &graph);
+    defer checker.deinit();
+
+    try std.testing.expect((try checker.resolveFunctionReferenceTarget(
+        dotted_name,
+        function_name,
+        1,
+        testNodeMeta().span,
+        true,
+    )) == null);
+
+    try std.testing.expectEqual(@as(usize, 1), checker.errors.items.len);
+    try std.testing.expectEqualStrings(
+        "`Zap.Other.hidden/1` is private",
+        checker.errors.items[0].message,
+    );
+}
+
+test "private function reference diagnostic propagates OutOfMemory while joining dotted target name" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const struct_name = try interner.intern("Other");
+    const function_name = try interner.intern("hidden");
+    const name_parts = [_]ast.StringId{ namespace_name, struct_name };
+    const dotted_name = ast.StructName{ .parts = &name_parts, .span = testNodeMeta().span };
+    const struct_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = dotted_name,
+        .fields = &.{},
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    const target_scope = try addTypeCheckerTestStructScope(&graph, dotted_name, &struct_decl);
+    _ = try graph.createFamily(target_scope, function_name, 1, .private);
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.resolveFunctionReferenceTarget(
+            dotted_name,
+            function_name,
+            1,
+            testNodeMeta().span,
+            true,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+fn fillTypeStoreCapacityForTest(store: *TypeStore) !void {
+    while (store.types.items.len < store.types.capacity) {
+        _ = try store.freshVar();
+    }
+}
+
 test "type store builtin types" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     try std.testing.expect(store.getType(TypeStore.BOOL) == .bool_type);
@@ -10256,7 +12072,7 @@ test "type store builtin types" {
 test "type store builtin types stop before removed nominal aliases" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     try std.testing.expectEqual(TypeStore.F128 + 1, store.types.items.len);
@@ -10265,7 +12081,7 @@ test "type store builtin types stop before removed nominal aliases" {
 test "type store resolve builtin names" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     try std.testing.expectEqual(TypeStore.I64, store.resolveTypeName("i64").?);
@@ -10276,6 +12092,465 @@ test "type store resolve builtin names" {
     try std.testing.expectEqual(TypeStore.BOOL, store.resolveTypeName("Bool").?);
     try std.testing.expectEqual(TypeStore.STRING, store.resolveTypeName("String").?);
     try std.testing.expect(store.resolveTypeName("Nonexistent") == null);
+}
+
+test "TypeStore.init preserves OutOfMemory from builtin registration" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        TypeStore.init(failing_allocator.allocator(), &interner),
+    );
+}
+
+test "resolveClauseSignature preserves OutOfMemory when impl type variable allocation fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const type_param_name = try interner.intern("T");
+    const function_name = try interner.intern("value");
+    const protocol_name = try interner.intern("Protocol");
+    const target_name = try interner.intern("Thing");
+
+    var store = try TypeStore.init(failing_alloc, &interner);
+    defer store.deinit();
+    try fillTypeStoreCapacityForTest(&store);
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const clause = ast.FunctionClause{
+        .meta = testNodeMeta(),
+        .params = &.{},
+        .return_type = null,
+        .refinement = null,
+        .body = &.{},
+    };
+    const clauses = [_]ast.FunctionClause{clause};
+    const function_decl = ast.FunctionDecl{
+        .meta = testNodeMeta(),
+        .name = function_name,
+        .clauses = &clauses,
+        .visibility = .public,
+    };
+    const protocol_parts = [_]ast.StringId{protocol_name};
+    const target_parts = [_]ast.StringId{target_name};
+    const type_params = [_]ast.StringId{type_param_name};
+    const functions = [_]*const ast.FunctionDecl{&function_decl};
+    const impl_decl = ast.ImplDecl{
+        .meta = testNodeMeta(),
+        .protocol_name = .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+        .target_type = .{ .parts = &target_parts, .span = testNodeMeta().span },
+        .type_params = &type_params,
+        .functions = &functions,
+    };
+    checker.current_impl = &impl_decl;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.resolveClauseSignature(function_name, 0, 0, .{
+            .decl = &function_decl,
+            .clause_index = 0,
+        }),
+    );
+}
+
+test "checkFunctionClause preserves OutOfMemory when impl type variable scope binding fails" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const type_param_name = try interner.intern("T");
+    const function_name = try interner.intern("value");
+    const protocol_name = try interner.intern("Protocol");
+    const target_name = try interner.intern("Thing");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const clause = ast.FunctionClause{
+        .meta = testNodeMeta(),
+        .params = &.{},
+        .return_type = null,
+        .refinement = null,
+        .body = &.{},
+    };
+    const clauses = [_]ast.FunctionClause{clause};
+    const function_decl = ast.FunctionDecl{
+        .meta = testNodeMeta(),
+        .name = function_name,
+        .clauses = &clauses,
+        .visibility = .public,
+    };
+    const protocol_parts = [_]ast.StringId{protocol_name};
+    const target_parts = [_]ast.StringId{target_name};
+    const type_params = [_]ast.StringId{type_param_name};
+    const functions = [_]*const ast.FunctionDecl{&function_decl};
+    const impl_decl = ast.ImplDecl{
+        .meta = testNodeMeta(),
+        .protocol_name = .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+        .target_type = .{ .parts = &target_parts, .span = testNodeMeta().span },
+        .type_params = &type_params,
+        .functions = &functions,
+    };
+    checker.current_impl = &impl_decl;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.checkFunctionClause(&function_decl, &clause));
+}
+
+test "resolveTypeExpr preserves OutOfMemory when protocol constraint param append fails" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const protocol_name = try interner.intern("Enumerable");
+    const string_name = try interner.intern("String");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const protocol_parts = [_]ast.StringId{protocol_name};
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+        .functions = &.{},
+    };
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_decl.name,
+        .scope_id = 0,
+        .decl = &protocol_decl,
+    });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const arg_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const args = [_]*const ast.TypeExpr{&arg_expr};
+    const constraint_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = protocol_name,
+        .args = &args,
+    } };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.resolveTypeExpr(&constraint_expr));
+}
+
+test "resolveTypeExpr preserves OutOfMemory when protocol constraint params cannot become owned slice" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const protocol_name = try interner.intern("Enumerable");
+    const string_name = try interner.intern("String");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const protocol_parts = [_]ast.StringId{protocol_name};
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+        .functions = &.{},
+    };
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_decl.name,
+        .scope_id = 0,
+        .decl = &protocol_decl,
+    });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const arg_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const args = [_]*const ast.TypeExpr{&arg_expr};
+    const constraint_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = protocol_name,
+        .args = &args,
+    } };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, checker.resolveTypeExpr(&constraint_expr));
+}
+
+test "checkAttributeDecl propagates OutOfMemory from declared type resolution" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const attr_name = try interner.intern("example");
+    const protocol_name = try interner.intern("Enumerable");
+    const string_name = try interner.intern("String");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const protocol_parts = [_]ast.StringId{protocol_name};
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+        .functions = &.{},
+    };
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_decl.name,
+        .scope_id = 0,
+        .decl = &protocol_decl,
+    });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const arg_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const args = [_]*const ast.TypeExpr{&arg_expr};
+    const declared_type = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = protocol_name,
+        .args = &args,
+    } };
+    const value = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 1,
+    } };
+    const attr = ast.AttributeDecl{
+        .meta = testNodeMeta(),
+        .name = attr_name,
+        .type_expr = &declared_type,
+        .value = &value,
+    };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.checkAttributeDecl(&attr));
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "checkStructExtendsSignatures propagates OutOfMemory from parent return type resolution" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const parent_name = try interner.intern("Parent");
+    const child_name = try interner.intern("Child");
+    const function_name = try interner.intern("value");
+    const protocol_name = try interner.intern("Enumerable");
+    const string_name = try interner.intern("String");
+    const i64_name = try interner.intern("i64");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const protocol_parts = [_]ast.StringId{protocol_name};
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+        .functions = &.{},
+    };
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_decl.name,
+        .scope_id = 0,
+        .decl = &protocol_decl,
+    });
+
+    const arg_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const args = [_]*const ast.TypeExpr{&arg_expr};
+    const parent_return_type = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = protocol_name,
+        .args = &args,
+    } };
+    const child_return_type = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = i64_name,
+        .args = &.{},
+    } };
+    const parent_clause = ast.FunctionClause{
+        .meta = testNodeMeta(),
+        .params = &.{},
+        .return_type = &parent_return_type,
+        .refinement = null,
+        .body = null,
+    };
+    const child_clause = ast.FunctionClause{
+        .meta = testNodeMeta(),
+        .params = &.{},
+        .return_type = &child_return_type,
+        .refinement = null,
+        .body = null,
+    };
+    const parent_clauses = [_]ast.FunctionClause{parent_clause};
+    const child_clauses = [_]ast.FunctionClause{child_clause};
+    const parent_function = ast.FunctionDecl{
+        .meta = testNodeMeta(),
+        .name = function_name,
+        .clauses = &parent_clauses,
+        .visibility = .public,
+    };
+    const child_function = ast.FunctionDecl{
+        .meta = testNodeMeta(),
+        .name = function_name,
+        .clauses = &child_clauses,
+        .visibility = .public,
+    };
+    const parent_items = [_]ast.StructItem{.{ .function = &parent_function }};
+    const child_items = [_]ast.StructItem{.{ .function = &child_function }};
+    const parent_parts = [_]ast.StringId{parent_name};
+    const child_parts = [_]ast.StringId{child_name};
+    const parent_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &parent_parts, .span = testNodeMeta().span },
+        .items = &parent_items,
+    };
+    const child_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &child_parts, .span = testNodeMeta().span },
+        .parent = parent_name,
+        .items = &child_items,
+    };
+    try graph.structs.append(std.testing.allocator, .{
+        .name = parent_decl.name,
+        .scope_id = 0,
+        .decl = &parent_decl,
+    });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.checkStructExtendsSignatures(&child_decl, parent_name));
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "checkStructExtendsSignatures propagates OutOfMemory from child return type resolution" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const parent_name = try interner.intern("Parent");
+    const child_name = try interner.intern("Child");
+    const function_name = try interner.intern("value");
+    const protocol_name = try interner.intern("Enumerable");
+    const string_name = try interner.intern("String");
+    const i64_name = try interner.intern("i64");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const protocol_parts = [_]ast.StringId{protocol_name};
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+        .functions = &.{},
+    };
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_decl.name,
+        .scope_id = 0,
+        .decl = &protocol_decl,
+    });
+
+    const parent_return_type = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = i64_name,
+        .args = &.{},
+    } };
+    const arg_expr = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = string_name,
+        .args = &.{},
+    } };
+    const args = [_]*const ast.TypeExpr{&arg_expr};
+    const child_return_type = ast.TypeExpr{ .name = .{
+        .meta = testNodeMeta(),
+        .name = protocol_name,
+        .args = &args,
+    } };
+    const parent_clause = ast.FunctionClause{
+        .meta = testNodeMeta(),
+        .params = &.{},
+        .return_type = &parent_return_type,
+        .refinement = null,
+        .body = null,
+    };
+    const child_clause = ast.FunctionClause{
+        .meta = testNodeMeta(),
+        .params = &.{},
+        .return_type = &child_return_type,
+        .refinement = null,
+        .body = null,
+    };
+    const parent_clauses = [_]ast.FunctionClause{parent_clause};
+    const child_clauses = [_]ast.FunctionClause{child_clause};
+    const parent_function = ast.FunctionDecl{
+        .meta = testNodeMeta(),
+        .name = function_name,
+        .clauses = &parent_clauses,
+        .visibility = .public,
+    };
+    const child_function = ast.FunctionDecl{
+        .meta = testNodeMeta(),
+        .name = function_name,
+        .clauses = &child_clauses,
+        .visibility = .public,
+    };
+    const parent_items = [_]ast.StructItem{.{ .function = &parent_function }};
+    const child_items = [_]ast.StructItem{.{ .function = &child_function }};
+    const parent_parts = [_]ast.StringId{parent_name};
+    const child_parts = [_]ast.StringId{child_name};
+    const parent_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &parent_parts, .span = testNodeMeta().span },
+        .items = &parent_items,
+    };
+    const child_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &child_parts, .span = testNodeMeta().span },
+        .parent = parent_name,
+        .items = &child_items,
+    };
+    try graph.structs.append(std.testing.allocator, .{
+        .name = parent_decl.name,
+        .scope_id = 0,
+        .decl = &parent_decl,
+    });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.checkStructExtendsSignatures(&child_decl, parent_name));
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
 }
 
 test "typeIdMangledName composes applied parametric struct names" {
@@ -10293,7 +12568,7 @@ test "typeIdMangledName composes applied parametric struct names" {
     const box_name = try interner.intern("Box");
     const pair_name = try interner.intern("Pair");
 
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     const box_decl = try store.addType(.{ .struct_type = .{
@@ -10345,10 +12620,415 @@ test "typeIdMangledName composes applied parametric struct names" {
     try std.testing.expectEqualStrings("Box", box_decl_name);
 }
 
+fn addMangledNameStressLayer(
+    allocator: std.mem.Allocator,
+    store: *TypeStore,
+    base: TypeId,
+    protocol_name: ast.StringId,
+    inner: TypeId,
+) !TypeId {
+    const function_type = try store.addType(.{ .function = .{
+        .params = &.{},
+        .return_type = inner,
+    } });
+
+    const tuple_elements = try allocator.alloc(TypeId, 1);
+    tuple_elements[0] = function_type;
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = tuple_elements } });
+
+    const protocol_args = try allocator.alloc(TypeId, 1);
+    protocol_args[0] = tuple_type;
+    const protocol_type = try store.addType(.{ .protocol_constraint = .{
+        .protocol_name = protocol_name,
+        .type_params = protocol_args,
+    } });
+
+    const applied_args = try allocator.alloc(TypeId, 1);
+    applied_args[0] = protocol_type;
+    return try store.addType(.{ .applied = .{
+        .base = base,
+        .args = applied_args,
+    } });
+}
+
+test "typeIdMangledName preserves mixed structural graph output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const box_name = try interner.intern("Box");
+    const callable_name = try interner.intern("Callable");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const box_decl = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+
+    const mixed_type = try addMangledNameStressLayer(alloc, &store, box_decl, callable_name, TypeStore.I64);
+    const mixed_name = try typeIdMangledName(alloc, &store, mixed_type);
+    try std.testing.expectEqualStrings("Box_Callable_Tuple_Fn_ret_i64", mixed_name);
+}
+
+test "typeIdMangledName includes anonymous union member identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const union_members = [_]TypeId{ TypeStore.I64, TypeStore.STRING };
+    const union_type = try store.addType(.{ .union_type = .{ .members = &union_members } });
+    const union_name = try typeIdMangledName(alloc, &store, union_type);
+    try std.testing.expectEqualStrings("Union_i64_String", union_name);
+
+    const nullable_members = [_]TypeId{ TypeStore.STRING, TypeStore.NIL };
+    const nullable_type = try store.addType(.{ .union_type = .{ .members = &nullable_members } });
+    const nullable_name = try typeIdMangledName(alloc, &store, nullable_type);
+    try std.testing.expectEqualStrings("Union_String_Nil", nullable_name);
+}
+
+test "typeIdMangledName composes applied names with anonymous union arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const box_name = try interner.intern("Box");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const box_decl = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+    const union_members = [_]TypeId{ TypeStore.I64, TypeStore.STRING };
+    const union_type = try store.addType(.{ .union_type = .{ .members = &union_members } });
+    const applied_args = try alloc.alloc(TypeId, 1);
+    applied_args[0] = union_type;
+    const box_union = try store.addType(.{ .applied = .{ .base = box_decl, .args = applied_args } });
+
+    const box_union_name = try typeIdMangledName(alloc, &store, box_union);
+    try std.testing.expectEqualStrings("Box_Union_i64_String", box_union_name);
+}
+
+test "typeIdMangledName composes applied names with type variable arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const box_name = try interner.intern("Box");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const box_decl = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+    const type_var = try store.freshVar();
+    const applied_args = try alloc.alloc(TypeId, 1);
+    applied_args[0] = type_var;
+    const box_type_var = try store.addType(.{ .applied = .{ .base = box_decl, .args = applied_args } });
+
+    const type_var_name = try typeIdMangledName(alloc, &store, type_var);
+    try std.testing.expectEqualStrings("TypeVar0", type_var_name);
+
+    const box_type_var_name = try typeIdMangledName(alloc, &store, box_type_var);
+    try std.testing.expectEqualStrings("Box_TypeVar0", box_type_var_name);
+}
+
+test "typeIdMangledName handles deeply nested mixed structural graphs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const box_name = try interner.intern("Box");
+    const callable_name = try interner.intern("Callable");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const box_decl = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+
+    var current_type = TypeStore.I64;
+    for (0..96) |_| {
+        current_type = try addMangledNameStressLayer(alloc, &store, box_decl, callable_name, current_type);
+    }
+
+    const mixed_name = try typeIdMangledName(alloc, &store, current_type);
+    try std.testing.expect(std.mem.startsWith(u8, mixed_name, "Box_Callable_Tuple_Fn_ret_"));
+    try std.testing.expect(std.mem.endsWith(u8, mixed_name, "i64"));
+    try std.testing.expect(mixed_name.len > 2_000);
+}
+
+test "typeIdMangledName reports depth budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const box_name = try interner.intern("Box");
+    const callable_name = try interner.intern("Callable");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const box_decl = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+
+    const mixed_type = try addMangledNameStressLayer(alloc, &store, box_decl, callable_name, TypeStore.I64);
+    try std.testing.expectError(
+        error.TypeMangleDepthLimitExceeded,
+        typeIdMangledNameWithLimits(alloc, &store, mixed_type, .{ .max_depth = 3, .max_nodes = 64 }),
+    );
+}
+
+test "typeIdMangledName reports node budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const tuple_elements = try alloc.alloc(TypeId, 3);
+    tuple_elements[0] = TypeStore.I64;
+    tuple_elements[1] = TypeStore.STRING;
+    tuple_elements[2] = TypeStore.BOOL;
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = tuple_elements } });
+
+    try std.testing.expectError(
+        error.TypeMangleNodeLimitExceeded,
+        typeIdMangledNameWithLimits(alloc, &store, tuple_type, .{ .max_depth = 8, .max_nodes = 2 }),
+    );
+}
+
+test "typeIdMangledName preserves OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        typeIdMangledName(failing_allocator.allocator(), &store, TypeStore.I64),
+    );
+}
+
+fn testNestedTypeCheckerCollectionType(
+    allocator: std.mem.Allocator,
+    store: *TypeStore,
+    depth: usize,
+    leaf_type: TypeId,
+) !TypeId {
+    var current = leaf_type;
+    for (0..depth) |_| {
+        const tuple_elements = try allocator.alloc(TypeId, 2);
+        tuple_elements[0] = TypeStore.ATOM;
+        tuple_elements[1] = current;
+        const tuple_type = try store.addType(.{ .tuple = .{ .elements = tuple_elements } });
+        const list_type = try store.addType(.{ .list = .{ .element = tuple_type } });
+        current = try store.addType(.{ .map = .{ .key = TypeStore.STRING, .value = list_type } });
+    }
+    return current;
+}
+
+fn expectNestedTypeCheckerCollectionLeaf(
+    store: *const TypeStore,
+    type_id: TypeId,
+    depth: usize,
+    expected_leaf_type: TypeId,
+) !void {
+    var current = type_id;
+    var remaining = depth;
+    while (remaining > 0) : (remaining -= 1) {
+        const map_type = store.getType(current);
+        try std.testing.expect(map_type == .map);
+        try std.testing.expectEqual(TypeStore.STRING, map_type.map.key);
+
+        const list_type = store.getType(map_type.map.value);
+        try std.testing.expect(list_type == .list);
+
+        const tuple_type = store.getType(list_type.list.element);
+        try std.testing.expect(tuple_type == .tuple);
+        try std.testing.expectEqual(@as(usize, 2), tuple_type.tuple.elements.len);
+        try std.testing.expectEqual(TypeStore.ATOM, tuple_type.tuple.elements[0]);
+        current = tuple_type.tuple.elements[1];
+    }
+    try std.testing.expectEqual(expected_leaf_type, current);
+}
+
+fn testNestedTypeCheckerListType(store: *TypeStore, depth: usize, leaf_type: TypeId) !TypeId {
+    var current = leaf_type;
+    for (0..depth) |_| {
+        current = try store.addType(.{ .list = .{ .element = current } });
+    }
+    return current;
+}
+
+test "type checker collection unifier preserves deep nested tuple list map precision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(alloc, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const depth: usize = 96;
+    const left_type = try testNestedTypeCheckerCollectionType(alloc, &store, depth, TypeStore.I64);
+    const right_type = try testNestedTypeCheckerCollectionType(alloc, &store, depth, TypeStore.STRING);
+
+    var budget = TypeChecker.CollectionTypeBudget{};
+    const unified = try checker.unifyForCollection(left_type, right_type, &budget);
+
+    try std.testing.expect(unified != TypeStore.TERM);
+    try expectNestedTypeCheckerCollectionLeaf(&store, unified, depth, TypeStore.TERM);
+}
+
+test "type checker collection unifier returns depth error before native stack exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(alloc, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const depth = TypeChecker.MAX_COLLECTION_TYPE_DEPTH + 1;
+    const left_type = try testNestedTypeCheckerListType(&store, depth, TypeStore.I64);
+    const right_type = try testNestedTypeCheckerListType(&store, depth, TypeStore.STRING);
+
+    var budget = TypeChecker.CollectionTypeBudget{};
+    try std.testing.expectError(
+        error.TypeCheckerCollectionTypeDepthExceeded,
+        checker.unifyForCollection(left_type, right_type, &budget),
+    );
+}
+
+test "type checker collection unifier preserves OutOfMemory on tuple element allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(failing_alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const left_elements = [_]TypeId{TypeStore.I64};
+    const right_elements = [_]TypeId{TypeStore.STRING};
+    const left_type = try store.addType(.{ .tuple = .{ .elements = &left_elements } });
+    const right_type = try store.addType(.{ .tuple = .{ .elements = &right_elements } });
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    var budget = TypeChecker.CollectionTypeBudget{};
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.unifyForCollection(left_type, right_type, &budget),
+    );
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "type checker collection unifier preserves OutOfMemory on type-store insertion failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(failing_alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const left_type = try store.addType(.{ .list = .{ .element = TypeStore.I64 } });
+    const right_type = try store.addType(.{ .list = .{ .element = TypeStore.STRING } });
+    while (store.types.items.len < store.types.capacity) {
+        _ = try store.freshVar();
+    }
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    var budget = TypeChecker.CollectionTypeBudget{};
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.unifyForCollection(left_type, right_type, &budget),
+    );
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "type checker collection unifier records span-bearing diagnostic for budget errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(alloc, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const span = ast.SourceSpan{ .start = 10, .end = 20, .line = 2, .col = 5 };
+    try std.testing.expectError(
+        error.TypeCheckerCollectionTypeNodeLimitExceeded,
+        checker.reportCollectionTypeError(error.TypeCheckerCollectionTypeNodeLimitExceeded, span),
+    );
+    try std.testing.expectEqual(@as(usize, 1), checker.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, checker.errors.items[0].message, "collection type") != null);
+    try std.testing.expectEqual(span, checker.errors.items[0].span);
+}
+
 test "type store represents numeric lists structurally" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     const i64_list = try store.addType(.{ .list = .{ .element = TypeStore.I64 } });
@@ -10363,10 +13043,10 @@ test "type store represents numeric lists structurally" {
 test "typeToString renders tuple element types" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
-    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
     var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
@@ -10376,18 +13056,84 @@ test "typeToString renders tuple element types" {
     defer std.testing.allocator.free(elements);
     const tuple_type = try store.addType(.{ .tuple = .{ .elements = elements } });
 
-    const rendered = checker.typeToString(tuple_type);
+    const rendered = try checker.typeToString(tuple_type);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("{i64, String, Bool}", rendered);
+}
+
+test "typeToString reports a structural budget error for deeply nested diagnostics" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    var nested_type = TypeStore.I64;
+    for (0..8) |_| {
+        nested_type = try store.addType(.{ .list = .{ .element = nested_type } });
+    }
+
+    try std.testing.expectError(
+        error.TypeGraphDepthLimitExceeded,
+        checker.typeToStringWithLimits(nested_type, .{ .max_depth = 3, .max_nodes = 100 }),
+    );
+}
+
+test "typeToString propagates OutOfMemory instead of falling back to generic text" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const list_type = try store.addType(.{ .list = .{ .element = TypeStore.I64 } });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.typeToString(list_type));
+}
+
+test "typeToString preserves normal compound diagnostic formatting" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const list_type = try store.addType(.{ .list = .{ .element = TypeStore.I64 } });
+    const map_type = try store.addType(.{ .map = .{ .key = TypeStore.ATOM, .value = list_type } });
+
+    const rendered = try checker.typeToString(map_type);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("%{Atom => [i64]}", rendered);
 }
 
 test "typeToString renders a function type in current surface syntax fn(P) -> R" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
-    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
     var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
@@ -10397,7 +13143,7 @@ test "typeToString renders a function type in current surface syntax fn(P) -> R"
     defer std.testing.allocator.free(params);
     const fn_type = try store.addType(.{ .function = .{ .params = params, .return_type = TypeStore.I64 } });
 
-    const rendered = checker.typeToString(fn_type);
+    const rendered = try checker.typeToString(fn_type);
     defer std.testing.allocator.free(rendered);
     // NOT the legacy `(i64 -> i64)`.
     try std.testing.expectEqualStrings("fn(i64) -> i64", rendered);
@@ -10406,10 +13152,10 @@ test "typeToString renders a function type in current surface syntax fn(P) -> R"
 test "typeToString renders a raising function type with the raises suffix" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
-    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
     var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
@@ -10417,7 +13163,7 @@ test "typeToString renders a raising function type with the raises suffix" {
 
     const fn_type = try store.addType(.{ .function = .{ .params = &.{}, .return_type = TypeStore.I64, .raises = true } });
 
-    const rendered = checker.typeToString(fn_type);
+    const rendered = try checker.typeToString(fn_type);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("fn() -> i64 raises", rendered);
 }
@@ -10425,10 +13171,10 @@ test "typeToString renders a raising function type with the raises suffix" {
 test "typeToString renders a boxed Callable as the surface fn(P) -> R syntax" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
-    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
     var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
@@ -10446,7 +13192,7 @@ test "typeToString renders a boxed Callable as the surface fn(P) -> R syntax" {
         .type_params = type_params,
     } });
 
-    const rendered = checker.typeToString(callable);
+    const rendered = try checker.typeToString(callable);
     defer std.testing.allocator.free(rendered);
     // The internal `Callable({i64}, i64)` form must display as the surface syntax.
     try std.testing.expectEqualStrings("fn(i64) -> i64", rendered);
@@ -10512,7 +13258,7 @@ test "binding ownership info starts available" {
 test "type store qualify attaches ownership metadata" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     const qualified = store.qualify(TypeStore.I64, .borrowed);
@@ -10524,7 +13270,7 @@ test "type store qualify attaches ownership metadata" {
 test "type store addFunctionType preserves ownership metadata" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     const param_ownerships = [_]Ownership{ .shared, .unique };
@@ -10550,15 +13296,15 @@ test "type checker registers opaque types" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10570,7 +13316,7 @@ test "type checker registers opaque types" {
 test "function type equality includes ownership metadata" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     const shared_param_ownerships = [_]Ownership{.shared};
@@ -10589,7 +13335,7 @@ test "function type equality includes ownership metadata" {
 test "function subtyping respects ownership metadata" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     const shared_param_ownerships = [_]Ownership{.shared};
@@ -10606,10 +13352,10 @@ test "function subtyping respects ownership metadata" {
 test "borrow state returns to available when borrow ends" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
-    var checker = TypeChecker.init(std.testing.allocator, &interner, &graph);
+    var checker = try TypeChecker.init(std.testing.allocator, &interner, &graph);
     defer checker.deinit();
 
     try checker.recordBindingOwnership(0, TypeStore.STRING, .unique);
@@ -10674,11 +13420,11 @@ test "macro-generated block scopes are attached to block metadata" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -10687,11 +13433,11 @@ test "macro-generated block scopes are attached to block metadata" {
     const expanded = try macro_engine.expandProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), macro_engine.errors.items.len);
 
-    var expanded_collector = Collector.init(alloc, parser.interner, null);
+    var expanded_collector = try Collector.init(alloc, parser.interner, null);
     defer expanded_collector.deinit();
     try expanded_collector.collectProgram(&expanded);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &expanded_collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &expanded_collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&expanded);
 
@@ -10714,15 +13460,15 @@ test "type check simple function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     var hir_builder = @import("hir.zig").HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
@@ -10760,15 +13506,15 @@ test "uninhabited recursive type emits friendly diagnostic" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10800,15 +13546,15 @@ test "habitable recursive type compiles cleanly" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10839,15 +13585,15 @@ test "mutual recursion with no escape diagnoses both structs" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10875,15 +13621,15 @@ test "type check literals" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10906,19 +13652,159 @@ test "type check case expression" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "non-exhaustive tagged-union diagnostic preserves missing variant details" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const enum_name = try interner.intern("Color");
+    const red_name = try interner.intern("Red");
+    const green_name = try interner.intern("Green");
+    const blue_name = try interner.intern("Blue");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(alloc, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const variants = [_]Type.TaggedUnionVariant{
+        .{ .name = red_name },
+        .{ .name = green_name },
+        .{ .name = blue_name },
+    };
+    const tagged_union_type = Type.TaggedUnionType{
+        .name = enum_name,
+        .variants = &variants,
+    };
+    const red_pattern = ast.Pattern{ .literal = .{ .atom = .{
+        .meta = testNodeMeta(),
+        .value = red_name,
+    } } };
+    const clauses = [_]ast.CaseClause{.{
+        .meta = testNodeMeta(),
+        .pattern = &red_pattern,
+        .type_annotation = null,
+        .guard = null,
+        .body = &.{},
+    }};
+
+    try checker.addNonExhaustiveTaggedUnionMatchError(testNodeMeta().span, tagged_union_type, &clauses);
+
+    try std.testing.expectEqual(@as(usize, 1), checker.errors.items.len);
+    try std.testing.expectEqualStrings("non-exhaustive match on enum `Color`", checker.errors.items[0].message);
+    try std.testing.expectEqualStrings("missing: Green, Blue", checker.errors.items[0].label.?);
+    try std.testing.expectEqualStrings("add the missing variants or a wildcard `_` pattern", checker.errors.items[0].help.?);
+}
+
+test "non-exhaustive tagged-union diagnostic propagates OOM while starting missing label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const enum_name = try interner.intern("Color");
+    const red_name = try interner.intern("Red");
+    const green_name = try interner.intern("Green");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const variants = [_]Type.TaggedUnionVariant{
+        .{ .name = red_name },
+        .{ .name = green_name },
+    };
+    const tagged_union_type = Type.TaggedUnionType{
+        .name = enum_name,
+        .variants = &variants,
+    };
+    const red_pattern = ast.Pattern{ .literal = .{ .atom = .{
+        .meta = testNodeMeta(),
+        .value = red_name,
+    } } };
+    const clauses = [_]ast.CaseClause{.{
+        .meta = testNodeMeta(),
+        .pattern = &red_pattern,
+        .type_annotation = null,
+        .guard = null,
+        .body = &.{},
+    }};
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.addNonExhaustiveTaggedUnionMatchError(testNodeMeta().span, tagged_union_type, &clauses),
+    );
+}
+
+test "non-exhaustive tagged-union diagnostic propagates OOM while appending variant name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const enum_name = try interner.intern("Color");
+    const red_name = try interner.intern("Red");
+    const long_missing_name = try interner.intern("MissingVariantNameThatForcesDiagnosticLabelBufferGrowthBeyondThePrefixAllocation");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const variants = [_]Type.TaggedUnionVariant{
+        .{ .name = red_name },
+        .{ .name = long_missing_name },
+    };
+    const tagged_union_type = Type.TaggedUnionType{
+        .name = enum_name,
+        .variants = &variants,
+    };
+    const red_pattern = ast.Pattern{ .literal = .{ .atom = .{
+        .meta = testNodeMeta(),
+        .value = red_name,
+    } } };
+    const clauses = [_]ast.CaseClause{.{
+        .meta = testNodeMeta(),
+        .pattern = &red_pattern,
+        .type_annotation = null,
+        .guard = null,
+        .body = &.{},
+    }};
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.addNonExhaustiveTaggedUnionMatchError(testNodeMeta().span, tagged_union_type, &clauses),
+    );
 }
 
 test "type check arithmetic mismatch reported" {
@@ -10935,15 +13821,15 @@ test "type check arithmetic mismatch reported" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10956,17 +13842,17 @@ test "type check arithmetic mismatch reported" {
 test "typeToString returns human-readable names" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var graph = scope_mod.ScopeGraph.init(std.testing.allocator);
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
-    var checker = TypeChecker.init(std.testing.allocator, &interner, &graph);
+    var checker = try TypeChecker.init(std.testing.allocator, &interner, &graph);
     defer checker.deinit();
 
-    try std.testing.expectEqualStrings("i64", checker.typeToString(TypeStore.I64));
-    try std.testing.expectEqualStrings("Bool", checker.typeToString(TypeStore.BOOL));
-    try std.testing.expectEqualStrings("String", checker.typeToString(TypeStore.STRING));
-    try std.testing.expectEqualStrings("{unknown}", checker.typeToString(TypeStore.UNKNOWN));
-    try std.testing.expectEqualStrings("f64", checker.typeToString(TypeStore.F64));
+    try std.testing.expectEqualStrings("i64", try checker.typeToString(TypeStore.I64));
+    try std.testing.expectEqualStrings("Bool", try checker.typeToString(TypeStore.BOOL));
+    try std.testing.expectEqualStrings("String", try checker.typeToString(TypeStore.STRING));
+    try std.testing.expectEqualStrings("{unknown}", try checker.typeToString(TypeStore.UNKNOWN));
+    try std.testing.expectEqualStrings("f64", try checker.typeToString(TypeStore.F64));
 }
 
 test "type check var_ref resolves to parameter type" {
@@ -10983,15 +13869,15 @@ test "type check var_ref resolves to parameter type" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11015,15 +13901,15 @@ test "type check if condition must be Bool" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11054,15 +13940,15 @@ test "type check generic impl resolves Map(K, V) to map type" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11093,15 +13979,15 @@ test "protocol dispatch rejects unconstrained type variable receiver" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11113,6 +13999,77 @@ test "protocol dispatch rejects unconstrained type variable receiver" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "protocol dispatch diagnostic preserves dotted protocol display name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const protocol_name = try interner.intern("Enumerable");
+    const argument_name = try interner.intern("collection");
+    const protocol_parts = [_]ast.StringId{ namespace_name, protocol_name };
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var checker = TypeChecker.initWithSharedStore(alloc, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const arg_expr = ast.Expr{ .var_ref = .{
+        .meta = testNodeMeta(),
+        .name = argument_name,
+    } };
+    try checker.reportInvalidProtocolDispatch(
+        .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+        &arg_expr,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), checker.errors.items.len);
+    try std.testing.expectEqualStrings(
+        "first argument to protocol `Zap.Enumerable` does not satisfy `Zap.Enumerable`",
+        checker.errors.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "annotate the value with `Zap.Enumerable` or pass a type that implements `Zap.Enumerable`",
+        checker.errors.items[0].help.?,
+    );
+}
+
+test "protocol dispatch diagnostic propagates OutOfMemory while joining dotted protocol name" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const protocol_name = try interner.intern("Enumerable");
+    const argument_name = try interner.intern("collection");
+    const protocol_parts = [_]ast.StringId{ namespace_name, protocol_name };
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const arg_expr = ast.Expr{ .var_ref = .{
+        .meta = testNodeMeta(),
+        .name = argument_name,
+    } };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.reportInvalidProtocolDispatch(
+            .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+            &arg_expr,
+        ),
+    );
 }
 
 test "protocol dispatch accepts exact protocol constraint receiver" {
@@ -11135,19 +14092,64 @@ test "protocol dispatch accepts exact protocol constraint receiver" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "protocol existential dispatch propagates resolver OOM from return type" {
+    const source =
+        \\pub protocol Stream(element) {
+        \\  fn next(state :: Stream(element)) -> Stream(element)
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn step(collection :: Stream(String)) -> Stream(String) {
+        \\    Stream.next(collection)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+
+    const step_found = findStructFunction(parser.interner, &program, "step").?;
+    const step_clause = &step_found.decl.clauses[0];
+    checker.current_scope = checker.graph.resolveClauseScope(step_clause.meta) orelse step_clause.meta.scope_id;
+    checker.type_var_scope.clearRetainingCapacity();
+
+    const call_expr = step_clause.body.?[0].expr;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, checker.inferExpr(call_expr));
 }
 
 test "protocol parameter rejects unconstrained type variable argument" {
@@ -11173,15 +14175,15 @@ test "protocol parameter rejects unconstrained type variable argument" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11208,15 +14210,15 @@ test "type check return type mismatch" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11240,15 +14242,15 @@ test "type check top-level main rejects non-exit-code return type" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.initScript(alloc, source);
+    var parser = try Parser.initScript(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11276,15 +14278,15 @@ test "type check top-level main rejects non-u8 integer return type" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.initScript(alloc, source);
+    var parser = try Parser.initScript(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11312,15 +14314,15 @@ test "type check top-level main rejects Nil return type" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.initScript(alloc, source);
+    var parser = try Parser.initScript(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11348,15 +14350,15 @@ test "type check top-level main accepts unannotated integer literal return for u
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.initScript(alloc, source);
+    var parser = try Parser.initScript(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11381,15 +14383,15 @@ test "type check top-level main accepts if branches with unannotated u8 literals
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.initScript(alloc, source);
+    var parser = try Parser.initScript(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11411,15 +14413,15 @@ test "type provenance tracks source span on typed parameter" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11451,15 +14453,15 @@ test "typed parameter records shared ownership metadata" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11501,15 +14503,15 @@ test "function ref inference returns first-class Function value" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11541,15 +14543,15 @@ test "direct local function ref call resolves function scope before struct scope
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11576,15 +14578,15 @@ test "bare struct reference infers first-class Type value" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11619,15 +14621,15 @@ test "dotted bare struct reference infers first-class Type value" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11665,15 +14667,15 @@ test "dotted tagged union variant infers union value before type reference fallb
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11697,15 +14699,15 @@ test "dotted tagged union variant validates final segment as variant" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11736,15 +14738,15 @@ test "unknown bare struct reference is a type error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11787,15 +14789,15 @@ test "cross-struct function references require public target" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11838,15 +14840,15 @@ test "function reference arity narrows to u8 before validation" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11887,15 +14889,15 @@ test "static manual Function struct validates target and accepts narrowed arity 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11929,15 +14931,15 @@ test "static manual Function struct rejects an out-of-range arity field literal"
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -11984,15 +14986,15 @@ test "calling Function stored in a variable is rejected as dynamic dispatch" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12022,20 +15024,20 @@ test "anonymous closure with borrowed capture cannot escape via assignment" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
     const decl = program.structs[0].items[0].function.clauses[0].body.?[0].assignment.value.anonymous_function.decl;
-    try std.testing.expect(checker.functionDeclCapturesBorrowed(decl));
+    try std.testing.expect(try checker.functionDeclCapturesBorrowed(decl));
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -12062,20 +15064,20 @@ test "anonymous closure with borrowed capture cannot escape through return" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
     const expr = program.structs[0].items[0].function.clauses[0].body.?[0].expr;
-    try std.testing.expect(checker.functionDeclCapturesBorrowed(expr.anonymous_function.decl));
+    try std.testing.expect(try checker.functionDeclCapturesBorrowed(expr.anonymous_function.decl));
 
     var found = false;
     for (checker.errors.items) |err| {
@@ -12102,15 +15104,15 @@ test "anonymous closure missing parameter annotation has closure-specific diagno
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12139,15 +15141,15 @@ test "anonymous closure missing return annotation has closure-specific diagnosti
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12180,15 +15182,15 @@ test "higher-order call reports callable signature mismatch for anonymous closur
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12237,15 +15239,15 @@ test "higher-order call reports callable signature mismatch for function ref" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12272,15 +15274,15 @@ test "moved binding use reports ownership error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12319,15 +15321,15 @@ test "unique function parameter ownership moves var_ref argument" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12374,15 +15376,15 @@ test "shared binding cannot satisfy unique parameter ownership" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12413,6 +15415,68 @@ test "shared binding cannot satisfy unique parameter ownership" {
     try std.testing.expect(found);
 }
 
+test "case and assignment pattern bindings preserve owned expression ownership" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn take(values :: unique List(i64)) -> Nil {
+        \\    nil
+        \\  }
+        \\
+        \\  pub fn make() -> {Atom, List(i64)} {
+        \\    {:ok, [1, 2]}
+        \\  }
+        \\
+        \\  pub fn run_case() -> Nil {
+        \\    case make() {
+        \\      {:ok, values} -> take(values)
+        \\      _ -> nil
+        \\    }
+        \\  }
+        \\
+        \\  pub fn run_alias(values :: unique List(i64)) -> Nil {
+        \\    copy = values
+        \\    take(values)
+        \\    take(copy)
+        \\  }
+        \\
+        \\  pub fn run_if(values :: unique List(i64), flag :: Bool) -> Nil {
+        \\    if flag {
+        \\      take(values)
+        \\    } else {
+        \\      take(values)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn run_case_branch(values :: unique List(i64), flag :: Bool) -> Nil {
+        \\    case flag {
+        \\      true -> take(values)
+        \\      false -> take(values)
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    for (checker.errors.items) |err| {
+        try std.testing.expect(std.mem.find(u8, err.message, "cannot pass shared value") == null);
+    }
+}
+
 test "named call with unique parameter moves opaque binding" {
     const source =
         \\pub struct Test {
@@ -12433,15 +15497,15 @@ test "named call with unique parameter moves opaque binding" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
@@ -12476,15 +15540,15 @@ test "borrowed param annotation keeps binding usable after call" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12506,15 +15570,15 @@ test "borrowed value cannot escape through return" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
@@ -12548,15 +15612,15 @@ test "closure with borrowed capture cannot be returned" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
@@ -12591,15 +15655,15 @@ test "unique capture moves outer binding" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
@@ -12637,15 +15701,15 @@ test "closure with borrowed capture cannot be passed as argument" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
@@ -12680,15 +15744,15 @@ test "closure with borrowed capture cannot be assigned" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
@@ -12722,15 +15786,15 @@ test "closure with borrowed capture cannot be stored in tuple" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try rerunWithEscapeAnalysis(alloc, parser.interner, &collector.graph, &checker, &program);
@@ -12764,15 +15828,15 @@ test "closure with borrowed capture may be locally invoked" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12802,15 +15866,15 @@ test "closure with borrowed capture may be passed to known-safe callee" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12831,15 +15895,15 @@ test "borrowed parameter does not move binding" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12881,15 +15945,15 @@ test "return type mismatch has secondary span" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12932,15 +15996,15 @@ test "did-you-mean suggestion is a MachineApplicable fixit" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12974,15 +16038,15 @@ test "two-sided argument type mismatch points at the parameter declaration" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -12997,6 +16061,146 @@ test "two-sided argument type mismatch points at the parameter declaration" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "struct-qualified argument mismatch still returns declared return type" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn takes_int(x :: i64) -> i64 {
+        \\    x
+        \\  }
+        \\  pub fn caller() -> i64 {
+        \\    Test.takes_int("hello")
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+
+    const caller = findStructFunction(parser.interner, &program, "caller").?;
+    enterStructScope(&checker, caller.owner);
+    const call_expr = caller.decl.clauses[0].body.?[0].expr;
+
+    try std.testing.expectEqual(TypeStore.I64, try checker.inferExpr(call_expr));
+    try std.testing.expectEqual(@as(usize, 1), checker.errors.items.len);
+    try std.testing.expect(std.mem.find(u8, checker.errors.items[0].message, "argument 1 expects `i64`, got `String`") != null);
+}
+
+test "struct-qualified argument mismatch diagnostic propagates OutOfMemory" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn takes_int(x :: i64) -> i64 {
+        \\    x
+        \\  }
+        \\  pub fn caller() -> i64 {
+        \\    Test.takes_int("hello")
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    const caller = findStructFunction(parser.interner, &program, "caller").?;
+    const call_expr = caller.decl.clauses[0].body.?[0].expr;
+
+    var saw_induced_failure = false;
+    for (0..12) |fail_index| {
+        var store = try TypeStore.init(alloc, parser.interner);
+        defer store.deinit();
+
+        var failing_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer failing_arena.deinit();
+        var failing_allocator = std.testing.FailingAllocator.init(failing_arena.allocator(), .{ .fail_index = fail_index });
+
+        var checker = TypeChecker.initWithSharedStore(alloc, &store, parser.interner, &collector.graph);
+        checker.allocator = failing_allocator.allocator();
+        defer checker.deinit();
+
+        enterStructScope(&checker, caller.owner);
+        const result = checker.inferExpr(call_expr);
+        if (failing_allocator.has_induced_failure) {
+            saw_induced_failure = true;
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else {
+            try std.testing.expectEqual(TypeStore.I64, try result);
+        }
+    }
+    try std.testing.expect(saw_induced_failure);
+}
+
+test "struct-qualified argument inference propagates OutOfMemory" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn takes_tuple(value :: {i64}) -> i64 {
+        \\    1
+        \\  }
+        \\  pub fn caller() -> i64 {
+        \\    Test.takes_tuple({1})
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    const caller = findStructFunction(parser.interner, &program, "caller").?;
+    const call_expr = caller.decl.clauses[0].body.?[0].expr;
+
+    var saw_induced_failure = false;
+    for (0..20) |fail_index| {
+        var store = try TypeStore.init(alloc, parser.interner);
+        defer store.deinit();
+
+        var failing_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer failing_arena.deinit();
+        var failing_allocator = std.testing.FailingAllocator.init(failing_arena.allocator(), .{ .fail_index = fail_index });
+
+        var checker = TypeChecker.initWithSharedStore(alloc, &store, parser.interner, &collector.graph);
+        checker.allocator = failing_allocator.allocator();
+        defer checker.deinit();
+
+        enterStructScope(&checker, caller.owner);
+        const result = checker.inferExpr(call_expr);
+        if (failing_allocator.has_induced_failure) {
+            saw_induced_failure = true;
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else {
+            try std.testing.expectEqual(TypeStore.I64, try result);
+        }
+    }
+    try std.testing.expect(saw_induced_failure);
 }
 
 test "undefined function suggests similar name" {
@@ -13015,15 +16219,15 @@ test "undefined function suggests similar name" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -13057,15 +16261,15 @@ test "undefined function no suggestion for unrelated name" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -13096,15 +16300,15 @@ test "valid function call produces no error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -13128,15 +16332,15 @@ test "unused variable produces warning" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -13166,15 +16370,15 @@ test "underscore-prefixed variable no unused warning" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -13201,15 +16405,15 @@ test "direct call to underscore-prefixed bare function is rejected" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -13239,15 +16443,15 @@ test "direct source call to compiler helper-shaped underscore function is reject
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -13279,15 +16483,15 @@ test "direct call to underscore-prefixed qualified function is rejected" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -13313,15 +16517,15 @@ test "direct call to underscore-prefixed function inside macro body is rejected"
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -13347,15 +16551,15 @@ test "direct call to underscore-prefixed qualified function inside macro body is
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -13382,15 +16586,15 @@ test "used variable no unused warning" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -13413,18 +16617,18 @@ test "variable used in zig intrinsic call is not unused" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
     var desugarer = @import("desugar.zig").Desugarer.init(alloc, parser.interner, null);
     const desugared = try desugarer.desugarProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&desugared);
     try checker.checkUnusedBindings();
@@ -13447,15 +16651,15 @@ test "unknown type name produces error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -13481,15 +16685,15 @@ test "unused function parameter produces warning" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -13520,15 +16724,15 @@ test "zig bridge call parameters not flagged as unused" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -13556,15 +16760,15 @@ test "nested zig bridge call parameters not flagged as unused" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -13602,15 +16806,15 @@ test "macro body let-binding referenced via unquote is not unused" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -13648,15 +16852,15 @@ test "macro body nested-block let-binding referenced via unquote is not unused" 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try checker.checkUnusedBindings();
@@ -13673,6 +16877,14 @@ test "macro body nested-block let-binding referenced via unquote is not unused" 
 // Type unification tests
 // ============================================================
 
+fn testNestedTypeGraphListType(store: *TypeStore, depth: usize, leaf_type: TypeId) !TypeId {
+    var current = leaf_type;
+    for (0..depth) |_| {
+        current = try store.addType(.{ .list = .{ .element = current } });
+    }
+    return current;
+}
+
 test "unify identical primitives succeeds with empty subs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -13680,7 +16892,7 @@ test "unify identical primitives succeeds with empty subs" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13699,7 +16911,7 @@ test "unify type_var with i64 succeeds and binds var" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13722,7 +16934,7 @@ test "unify list of type_var with list of i64 binds var" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13748,7 +16960,7 @@ test "unify function type_vars with concrete types binds both" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13787,7 +16999,7 @@ test "unify incompatible primitives fails" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13805,7 +17017,7 @@ test "unify list of i64 with list of String fails" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13825,7 +17037,7 @@ test "applyToType substitutes type_var in list" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13836,10 +17048,10 @@ test "applyToType substitutes type_var in list" {
     const list_of_var = try store.addType(.{ .list = .{ .element = var_type } });
 
     // Bind var 0 -> i64
-    subs.bind(0, TypeStore.I64);
+    try subs.bind(0, TypeStore.I64);
 
     // Apply substitution: [type_var(0)] should become [i64]
-    const result_type_id = subs.applyToType(&store, list_of_var);
+    const result_type_id = try subs.applyToType(&store, list_of_var);
     const result_type = store.getType(result_type_id);
     try std.testing.expect(result_type == .list);
     try std.testing.expectEqual(TypeStore.I64, result_type.list.element);
@@ -13852,7 +17064,7 @@ test "applyToType substitutes type_vars in tuple" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13867,11 +17079,11 @@ test "applyToType substitutes type_vars in tuple" {
     const tuple_type = try store.addType(.{ .tuple = .{ .elements = elements } });
 
     // Bind var 0 -> i64, var 1 -> String
-    subs.bind(0, TypeStore.I64);
-    subs.bind(1, TypeStore.STRING);
+    try subs.bind(0, TypeStore.I64);
+    try subs.bind(1, TypeStore.STRING);
 
     // Apply substitution
-    const result_type_id = subs.applyToType(&store, tuple_type);
+    const result_type_id = try subs.applyToType(&store, tuple_type);
     const result_type = store.getType(result_type_id);
     try std.testing.expect(result_type == .tuple);
     try std.testing.expectEqual(@as(usize, 2), result_type.tuple.elements.len);
@@ -13886,7 +17098,7 @@ test "applyToType substitutes type_vars in function" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13903,11 +17115,11 @@ test "applyToType substitutes type_vars in function" {
     } });
 
     // Bind var 0 -> i64, var 1 -> Bool
-    subs.bind(0, TypeStore.I64);
-    subs.bind(1, TypeStore.BOOL);
+    try subs.bind(0, TypeStore.I64);
+    try subs.bind(1, TypeStore.BOOL);
 
     // Apply substitution
-    const result_type_id = subs.applyToType(&store, fn_type);
+    const result_type_id = try subs.applyToType(&store, fn_type);
     const result_type = store.getType(result_type_id);
     try std.testing.expect(result_type == .function);
     try std.testing.expectEqual(@as(usize, 1), result_type.function.params.len);
@@ -13922,7 +17134,7 @@ test "applyToType substitutes type_vars in map" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13934,11 +17146,11 @@ test "applyToType substitutes type_vars in map" {
     const map_type = try store.addType(.{ .map = .{ .key = var0, .value = var1 } });
 
     // Bind var 0 -> String, var 1 -> i64
-    subs.bind(0, TypeStore.STRING);
-    subs.bind(1, TypeStore.I64);
+    try subs.bind(0, TypeStore.STRING);
+    try subs.bind(1, TypeStore.I64);
 
     // Apply substitution
-    const result_type_id = subs.applyToType(&store, map_type);
+    const result_type_id = try subs.applyToType(&store, map_type);
     const result_type = store.getType(result_type_id);
     try std.testing.expect(result_type == .map);
     try std.testing.expectEqual(TypeStore.STRING, result_type.map.key);
@@ -13952,7 +17164,7 @@ test "occurs check prevents infinite types" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13974,7 +17186,7 @@ test "unify with UNKNOWN always succeeds" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -13993,7 +17205,7 @@ test "unify tuples of different lengths fails" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -14021,7 +17233,7 @@ test "unify functions of different arity fails" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -14053,7 +17265,7 @@ test "unify map type_vars with concrete types" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -14080,7 +17292,7 @@ test "transitive type variable resolution through substitutions" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -14096,7 +17308,7 @@ test "transitive type variable resolution through substitutions" {
     try std.testing.expect(try store.unify(var1, TypeStore.I64, &subs));
 
     // applyToType on var0 should resolve through var1 to i64
-    const result = subs.applyToType(&store, var0);
+    const result = try subs.applyToType(&store, var0);
     try std.testing.expectEqual(TypeStore.I64, result);
 }
 
@@ -14107,7 +17319,7 @@ test "applyToType leaves unbound type_var unchanged" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -14117,7 +17329,7 @@ test "applyToType leaves unbound type_var unchanged" {
     const var_type = try store.freshVar();
 
     // applyToType should return the original type_var
-    const result = subs.applyToType(&store, var_type);
+    const result = try subs.applyToType(&store, var_type);
     try std.testing.expectEqual(var_type, result);
 }
 
@@ -14128,17 +17340,159 @@ test "applyToType leaves primitives unchanged" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
     defer subs.deinit();
 
     // Applying to a primitive should return the same TypeId
-    try std.testing.expectEqual(TypeStore.I64, subs.applyToType(&store, TypeStore.I64));
-    try std.testing.expectEqual(TypeStore.STRING, subs.applyToType(&store, TypeStore.STRING));
-    try std.testing.expectEqual(TypeStore.BOOL, subs.applyToType(&store, TypeStore.BOOL));
-    try std.testing.expectEqual(TypeStore.NIL, subs.applyToType(&store, TypeStore.NIL));
+    try std.testing.expectEqual(TypeStore.I64, try subs.applyToType(&store, TypeStore.I64));
+    try std.testing.expectEqual(TypeStore.STRING, try subs.applyToType(&store, TypeStore.STRING));
+    try std.testing.expectEqual(TypeStore.BOOL, try subs.applyToType(&store, TypeStore.BOOL));
+    try std.testing.expectEqual(TypeStore.NIL, try subs.applyToType(&store, TypeStore.NIL));
+}
+
+test "SubstitutionMap bind preserves OutOfMemory" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var subs = SubstitutionMap.init(failing_allocator.allocator());
+    defer subs.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, subs.bind(0, TypeStore.I64));
+}
+
+test "SubstitutionMap markTermConstrained preserves OutOfMemory" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var subs = SubstitutionMap.init(failing_allocator.allocator());
+    defer subs.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, subs.markTermConstrained(0));
+}
+
+test "type graph walkers report depth budget errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    const var0 = try store.freshVar();
+    const var1 = try store.freshVar();
+    const var2 = try store.freshVar();
+    const var0_id = store.getType(var0).type_var;
+    const var1_id = store.getType(var1).type_var;
+    try subs.bind(var0_id, var1);
+    try subs.bind(var1_id, var2);
+
+    const nested_var = try testNestedTypeGraphListType(&store, 3, var0);
+    const shallow_limits = TypeGraphLimits{ .max_depth = 1, .max_nodes = 64 };
+
+    try std.testing.expectError(
+        error.TypeGraphDepthLimitExceeded,
+        store.containsTypeVarsWithLimits(nested_var, shallow_limits),
+    );
+    try std.testing.expectError(
+        error.TypeGraphDepthLimitExceeded,
+        store.occursInWithLimits(var0_id, nested_var, &subs, shallow_limits),
+    );
+    try std.testing.expectError(
+        error.TypeGraphDepthLimitExceeded,
+        store.resolveTypeVarWithLimits(var0, &subs, shallow_limits),
+    );
+    try std.testing.expectError(
+        error.TypeGraphDepthLimitExceeded,
+        subs.applyToTypeWithLimits(&store, nested_var, shallow_limits),
+    );
+    try std.testing.expectError(
+        error.TypeGraphDepthLimitExceeded,
+        subs.applyToReturnTypeWithLimits(&store, nested_var, shallow_limits),
+    );
+}
+
+test "type graph walkers report node budget errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    const var_type = try store.freshVar();
+    const var_id = store.getType(var_type).type_var;
+    try subs.bind(var_id, TypeStore.I64);
+
+    const nested_var = try testNestedTypeGraphListType(&store, 2, var_type);
+    const node_limits = TypeGraphLimits{ .max_depth = 64, .max_nodes = 1 };
+
+    try std.testing.expectError(
+        error.TypeGraphNodeLimitExceeded,
+        store.containsTypeVarsWithLimits(nested_var, node_limits),
+    );
+    try std.testing.expectError(
+        error.TypeGraphNodeLimitExceeded,
+        subs.applyToTypeWithLimits(&store, nested_var, node_limits),
+    );
+}
+
+test "applyToType preserves OutOfMemory on rewritten tuple allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(failing_alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(failing_alloc);
+    defer subs.deinit();
+
+    const var_type = try store.freshVar();
+    const var_id = store.getType(var_type).type_var;
+    const tuple_elements = [_]TypeId{var_type};
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = &tuple_elements } });
+    try subs.bind(var_id, TypeStore.I64);
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try std.testing.expectError(error.OutOfMemory, subs.applyToType(&store, tuple_type));
+}
+
+test "applyToType preserves OutOfMemory on type-store insertion failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(failing_alloc, &interner);
+    defer store.deinit();
+
+    var subs = SubstitutionMap.init(failing_alloc);
+    defer subs.deinit();
+
+    const var_type = try store.freshVar();
+    const var_id = store.getType(var_type).type_var;
+    const tuple_elements = [_]TypeId{var_type};
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = &tuple_elements } });
+    try subs.bind(var_id, TypeStore.I64);
+
+    while (store.types.items.len < store.types.capacity) {
+        _ = try store.freshVar();
+    }
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 1;
+
+    try std.testing.expectError(error.OutOfMemory, subs.applyToType(&store, tuple_type));
 }
 
 test "unify records Term constraint when typevar meets Term without binding" {
@@ -14157,7 +17511,7 @@ test "unify records Term constraint when typevar meets Term without binding" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -14191,7 +17545,7 @@ test "applyToReturnType promotes Term-constrained var at container position to T
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -14207,18 +17561,18 @@ test "applyToReturnType promotes Term-constrained var at container position to T
     try std.testing.expect(try store.unify(value_var, TypeStore.STRING, &subs));
 
     // Plain applyToType resolves V to its scalar binding (String) — used for scalar return positions.
-    const scalar_apply = subs.applyToType(&store, value_var);
+    const scalar_apply = try subs.applyToType(&store, value_var);
     try std.testing.expectEqual(TypeStore.STRING, scalar_apply);
 
     // applyToReturnType against `%{K=>V}` keeps V at container position → Term.
-    const return_resolved = subs.applyToReturnType(&store, generic_map);
+    const return_resolved = try subs.applyToReturnType(&store, generic_map);
     const return_typ = store.getType(return_resolved);
     try std.testing.expect(return_typ == .map);
     try std.testing.expectEqual(TypeStore.ATOM, return_typ.map.key);
     try std.testing.expectEqual(TypeStore.TERM, return_typ.map.value);
 
     // applyToReturnType for a bare `V` (scalar position) keeps the concrete binding.
-    try std.testing.expectEqual(TypeStore.STRING, subs.applyToReturnType(&store, value_var));
+    try std.testing.expectEqual(TypeStore.STRING, try subs.applyToReturnType(&store, value_var));
 }
 
 test "typeEquals accepts Term against any concrete type" {
@@ -14236,7 +17590,7 @@ test "typeEquals accepts Term against any concrete type" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     // Term unifies with concrete primitive types in either order.
@@ -14272,7 +17626,7 @@ test "resolveFamilyAllowingDefaults accepts shorter call when tail params have d
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     const root_scope = graph.prelude_scope;
@@ -14368,11 +17722,11 @@ test "pipe inside error_pipe resolves rhs at the piped arity" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -14382,7 +17736,7 @@ test "pipe inside error_pipe resolves rhs at the piped arity" {
     // inner pipe intact even when expansion runs. Skipping macros
     // keeps the test self-contained while reproducing the same AST
     // the type checker sees in production.
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14418,11 +17772,11 @@ test "bare pipe lhs |> f() resolves rhs at arity 1" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     var program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -14488,7 +17842,7 @@ test "bare pipe lhs |> f() resolves rhs at arity 1" {
         .top_items = program.top_items,
     };
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&new_program);
 
@@ -14500,17 +17854,17 @@ test "bare pipe lhs |> f() resolves rhs at arity 1" {
 test "numeric call matching prefers exact type over widening" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
-    try std.testing.expectEqual(@as(?u32, 0), store.callMatchCost(TypeStore.I32, TypeStore.I32));
-    try std.testing.expectEqual(@as(?u32, 33), store.callMatchCost(TypeStore.I32, TypeStore.I64));
-    try std.testing.expectEqual(@as(?u32, 33), store.callMatchCost(TypeStore.U32, TypeStore.U64));
-    try std.testing.expectEqual(@as(?u32, 33), store.callMatchCost(TypeStore.F32, TypeStore.F64));
-    try std.testing.expectEqual(@as(?u32, 65), store.callMatchCost(TypeStore.I64, TypeStore.I128));
-    try std.testing.expectEqual(@as(?u32, 65), store.callMatchCost(TypeStore.U64, TypeStore.U128));
-    try std.testing.expectEqual(@as(?u32, 17), store.callMatchCost(TypeStore.F64, TypeStore.F80));
-    try std.testing.expectEqual(@as(?u32, 49), store.callMatchCost(TypeStore.F80, TypeStore.F128));
+    try std.testing.expectEqual(@as(?u32, 0), try store.callMatchCost(TypeStore.I32, TypeStore.I32));
+    try std.testing.expectEqual(@as(?u32, 33), try store.callMatchCost(TypeStore.I32, TypeStore.I64));
+    try std.testing.expectEqual(@as(?u32, 33), try store.callMatchCost(TypeStore.U32, TypeStore.U64));
+    try std.testing.expectEqual(@as(?u32, 33), try store.callMatchCost(TypeStore.F32, TypeStore.F64));
+    try std.testing.expectEqual(@as(?u32, 65), try store.callMatchCost(TypeStore.I64, TypeStore.I128));
+    try std.testing.expectEqual(@as(?u32, 65), try store.callMatchCost(TypeStore.U64, TypeStore.U128));
+    try std.testing.expectEqual(@as(?u32, 17), try store.callMatchCost(TypeStore.F64, TypeStore.F80));
+    try std.testing.expectEqual(@as(?u32, 49), try store.callMatchCost(TypeStore.F80, TypeStore.F128));
 }
 
 test "generic tuple call matching requires structural arity and repeated lane consistency" {
@@ -14520,7 +17874,7 @@ test "generic tuple call matching requires structural arity and repeated lane co
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     const two_lane_var = try store.freshVar();
@@ -14540,15 +17894,15 @@ test "generic tuple call matching requires structural arity and repeated lane co
         .elements = try alloc.dupe(TypeId, &[_]TypeId{ TypeStore.I32, TypeStore.I64, TypeStore.I32, TypeStore.I32 }),
     } });
 
-    try std.testing.expectEqual(@as(?u32, null), store.callMatchCost(four_i32_actual, two_lane_expected));
-    try std.testing.expectEqual(@as(?u32, 0), store.callMatchCost(four_i32_actual, four_lane_expected));
-    try std.testing.expectEqual(@as(?u32, null), store.callMatchCost(mixed_four_lane_actual, four_lane_expected));
+    try std.testing.expectEqual(@as(?u32, null), try store.callMatchCost(four_i32_actual, two_lane_expected));
+    try std.testing.expectEqual(@as(?u32, 0), try store.callMatchCost(four_i32_actual, four_lane_expected));
+    try std.testing.expectEqual(@as(?u32, null), try store.callMatchCost(mixed_four_lane_actual, four_lane_expected));
 }
 
 test "numeric widening is value-preserving across the integer and float families" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     // Same-signedness widening to any strictly-wider target.
@@ -14588,7 +17942,7 @@ test "numeric widening is value-preserving across the integer and float families
 test "untyped integer-literal range check against adopted peer type" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var store = TypeStore.init(std.testing.allocator, &interner);
+    var store = try TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     // Values that fit the peer's range may adopt it.
@@ -14639,15 +17993,15 @@ test "field default with matching integer literal accepted" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14668,15 +18022,15 @@ test "field default with matching string literal accepted" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14702,15 +18056,15 @@ test "field default with empty list literal accepted on list field" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14734,15 +18088,15 @@ test "field default with mismatched type produces a clear Zap diagnostic" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14772,15 +18126,15 @@ test "field default error points at the default expression span" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14815,15 +18169,15 @@ test "field default integer literal narrowing to u16 accepted" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14851,15 +18205,15 @@ test "field default with nested struct expression accepted" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14867,6 +18221,38 @@ test "field default with nested struct expression accepted" {
         std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
     }
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "field default validation propagates OutOfMemory from default inference" {
+    const source =
+        \\pub struct PairBox {
+        \\  value :: {i64, i64} = {1, 2}
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.registerUserTypes();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.validateStructFieldDefaults());
 }
 
 // ============================================================
@@ -14878,6 +18264,37 @@ test "field default with nested struct expression accepted" {
 // arguments at instantiation sites. `Type.AppliedType` carries the
 // `(base, args)` pair, structurally deduped by `addType`.
 // ============================================================
+
+test "type_var_scope restore preserves outer bindings under allocator failure" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    try checker.type_var_scope.put("outer_t", TypeStore.I64);
+    try checker.type_var_scope.put("outer_u", TypeStore.STRING);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    var type_var_scope_guard = checker.enterTypeVarScope();
+    defer type_var_scope_guard.restore();
+    try std.testing.expectEqual(@as(usize, 0), checker.type_var_scope.count());
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    type_var_scope_guard.restore();
+
+    try std.testing.expectEqual(@as(usize, 2), checker.type_var_scope.count());
+    try std.testing.expectEqual(TypeStore.I64, checker.type_var_scope.get("outer_t").?);
+    try std.testing.expectEqual(TypeStore.STRING, checker.type_var_scope.get("outer_u").?);
+}
 
 test "parametric struct registration records type_params as fresh type_vars" {
     // `pub struct Box(T) { value :: T }` registers a StructType whose
@@ -14894,15 +18311,15 @@ test "parametric struct registration records type_params as fresh type_vars" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14935,15 +18352,15 @@ test "parametric union registration records type_params as fresh type_vars" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -14978,15 +18395,15 @@ test "concrete struct registers with empty type_params" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15006,7 +18423,7 @@ test "applyToType substitutes through nested applied type args" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     var subs = SubstitutionMap.init(alloc);
@@ -15038,9 +18455,9 @@ test "applyToType substitutes through nested applied type args" {
     outer_args[0] = option_of_t;
     const box_of_option_t = try store.addType(.{ .applied = .{ .base = box_base, .args = outer_args } });
 
-    subs.bind(t_var_id, TypeStore.I64);
+    try subs.bind(t_var_id, TypeStore.I64);
 
-    const substituted = subs.applyToType(&store, box_of_option_t);
+    const substituted = try subs.applyToType(&store, box_of_option_t);
     const outer = store.getType(substituted);
     try std.testing.expect(outer == .applied);
     try std.testing.expectEqual(box_base, outer.applied.base);
@@ -15072,15 +18489,15 @@ test "parametric struct literal type-checks field expr against substituted type"
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15109,15 +18526,15 @@ test "parametric struct literal rejects field expr of the wrong substituted type
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15152,15 +18569,15 @@ test "parametric struct literal substituted-type diagnostic points at the value 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15205,15 +18622,15 @@ test "parametric type expression with wrong arity emits diagnostic" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15245,15 +18662,15 @@ test "parametric struct field default referencing a type-var is skipped at decla
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15283,15 +18700,15 @@ test "applyToType rewrites tagged-union variant payload type via substitution" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15307,9 +18724,9 @@ test "applyToType rewrites tagged-union variant payload type via substitution" {
 
     var subs = SubstitutionMap.init(alloc);
     defer subs.deinit();
-    subs.bind(formal_var_id, TypeStore.I64);
+    try subs.bind(formal_var_id, TypeStore.I64);
 
-    const substituted = subs.applyToType(checker.store, some_payload_type_id);
+    const substituted = try subs.applyToType(checker.store, some_payload_type_id);
     try std.testing.expectEqual(TypeStore.I64, substituted);
 }
 
@@ -15327,15 +18744,15 @@ test "applying type arguments to a non-parametric struct emits diagnostic" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15373,15 +18790,15 @@ test "case struct pattern on parametric receiver substitutes field binding types
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15409,7 +18826,7 @@ test "applied type instantiations dedupe by base and args" {
 
     var interner = ast.StringInterner.init(alloc);
     defer interner.deinit();
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     const box_name = try interner.intern("Box");
@@ -15457,15 +18874,15 @@ test "parametric struct default re-validates against substituted field type — 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15498,15 +18915,15 @@ test "parametric struct default re-validates against substituted field type — 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15514,6 +18931,71 @@ test "parametric struct default re-validates against substituted field type — 
         std.debug.print("Unexpected type error: {s}\n", .{type_err.message});
     }
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "parametric struct default re-validation propagates OutOfMemory from default inference" {
+    const source =
+        \\pub struct Box(t) {
+        \\  value :: t = {1, 2}
+        \\}
+        \\pub struct Demo {
+        \\  pub fn build() -> Box {
+        \\    %Box(i64){}
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.registerUserTypes();
+
+    const box_name = parser.interner.lookupExisting("Box") orelse return error.TestExpectedBoxName;
+    const box_type_id = checker.store.name_to_type.get(box_name) orelse return error.TestExpectedBoxTypeId;
+    const box_type = checker.store.getType(box_type_id);
+    try std.testing.expect(box_type == .struct_type);
+
+    var struct_expr: ?ast.StructExpr = null;
+    const demo = program.structs[1];
+    for (demo.items) |item| {
+        if (item != .function) continue;
+        const body = item.function.clauses[0].body orelse continue;
+        if (body.len == 0) continue;
+        if (body[0].expr.* != .struct_expr) continue;
+        struct_expr = body[0].expr.struct_expr;
+        break;
+    }
+    const literal = struct_expr orelse return error.TestExpectedStructLiteral;
+
+    var instantiation = try checker.buildStructLiteralInstantiation(literal, box_type.struct_type, box_name);
+    defer instantiation.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.revalidateAppliedStructFieldDefaults(
+            instantiation.literal_type_id,
+            instantiation.substitution,
+            box_name,
+            literal,
+        ),
+    );
 }
 
 test "parametric struct default re-validation dedupes per applied TypeId" {
@@ -15541,15 +19023,15 @@ test "parametric struct default re-validation dedupes per applied TypeId" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15582,15 +19064,15 @@ test "parametric struct literal with zero args when one expected emits arity dia
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15632,15 +19114,15 @@ test "parametric tagged-union variant construction infers applied receiver type"
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15676,15 +19158,15 @@ test "parametric tagged-union with multiple type parameters constructs cleanly" 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15736,15 +19218,15 @@ test "type alias of a builtin resolves to the builtin TypeId" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15785,15 +19267,15 @@ test "function-type alias resolves to the same TypeId as the inline form" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15828,15 +19310,15 @@ test "parameterized type alias substitutes its formal parameter" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15870,15 +19352,15 @@ test "alias of an alias resolves transitively to the underlying TypeId" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15907,15 +19389,15 @@ test "cyclic type alias produces a clean diagnostic instead of looping" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15947,15 +19429,15 @@ test "alias-applied and inline parametric instantiation share one TypeId (no mon
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -15990,9 +19472,9 @@ test "classifyArgLiteralAdoption: negating an INT_MIN literal does not panic and
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
-    var checker = TypeChecker.init(alloc, &interner, &graph);
+    var checker = try TypeChecker.init(alloc, &interner, &graph);
     defer checker.deinit();
 
     const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
@@ -16020,9 +19502,9 @@ test "classifyArgLiteralAdoption: negating an ordinary literal still adopts a fi
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
-    var checker = TypeChecker.init(alloc, &interner, &graph);
+    var checker = try TypeChecker.init(alloc, &interner, &graph);
     defer checker.deinit();
 
     const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
@@ -16064,9 +19546,9 @@ test "classifyArgLiteralAdoption: list literal with adopting int and incompatibl
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
-    var checker = TypeChecker.init(alloc, &interner, &graph);
+    var checker = try TypeChecker.init(alloc, &interner, &graph);
     defer checker.deinit();
 
     const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
@@ -16095,9 +19577,9 @@ test "classifyArgLiteralAdoption: list literal of adopting int literals still ad
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
-    var checker = TypeChecker.init(alloc, &interner, &graph);
+    var checker = try TypeChecker.init(alloc, &interner, &graph);
     defer checker.deinit();
 
     const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
@@ -16122,9 +19604,9 @@ test "classifyArgLiteralAdoption: tuple literal with adopting int and incompatib
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
-    var checker = TypeChecker.init(alloc, &interner, &graph);
+    var checker = try TypeChecker.init(alloc, &interner, &graph);
     defer checker.deinit();
 
     const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
@@ -16156,9 +19638,9 @@ test "classifyArgLiteralAdoption: tuple literal with adopting int and assignable
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
-    var checker = TypeChecker.init(alloc, &interner, &graph);
+    var checker = try TypeChecker.init(alloc, &interner, &graph);
     defer checker.deinit();
 
     const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
@@ -16184,9 +19666,9 @@ test "classifyArgLiteralAdoption: map literal with adopting int value and incomp
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
-    var checker = TypeChecker.init(alloc, &interner, &graph);
+    var checker = try TypeChecker.init(alloc, &interner, &graph);
     defer checker.deinit();
 
     const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 1, .line = 1, .col = 1 } };
@@ -16247,8 +19729,8 @@ fn lookupInferredRaisesRow(
     struct_prefix: []const u8,
     method_name: []const u8,
     arity: u32,
-) []const TypeId {
-    const key = checker.store.raisesRowKeyString(struct_prefix, method_name, arity) orelse return &.{};
+) ![]const TypeId {
+    const key = try checker.store.raisesRowKeyString(struct_prefix, method_name, arity);
     return checker.store.inferred_raises.get(key) orelse &.{};
 }
 
@@ -16324,6 +19806,711 @@ fn enterStructScope(checker: *TypeChecker, owner: *const ast.StructDecl) void {
     ) orelse owner.meta.scope_id;
 }
 
+fn markFunctionDeclSyntheticForTest(graph: *const scope_mod.ScopeGraph, decl: *const ast.FunctionDecl) void {
+    const synthetic_span = testNodeMeta().span;
+    const mutable_decl = @constCast(decl);
+    mutable_decl.meta.span = synthetic_span;
+    for (mutable_decl.clauses) |*const_clause| {
+        const clause_scope = graph.resolveClauseScope(const_clause.meta);
+        const mutable_clause = @constCast(const_clause);
+        if (clause_scope) |scope_id| mutable_clause.meta.scope_id = scope_id;
+        mutable_clause.meta.span = synthetic_span;
+        for (mutable_clause.params) |*const_param| {
+            const mutable_param = @constCast(const_param);
+            mutable_param.meta.span = synthetic_span;
+            const mutable_pattern = @constCast(mutable_param.pattern);
+            if (mutable_pattern.* == .bind) {
+                mutable_pattern.bind.meta.span = synthetic_span;
+            }
+        }
+    }
+}
+
+test "eager synthetic helper return resolution populates unknown return type" {
+    const source =
+        \\pub struct Helper {
+        \\  fn __for_0(value) {
+        \\    value
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+
+    const helper_found = findStructFunction(parser.interner, &program, "__for_0").?;
+    markFunctionDeclSyntheticForTest(&collector.graph, helper_found.decl);
+    enterStructScope(&checker, helper_found.owner);
+
+    const synthetic_meta = testNodeMeta();
+    const helper_name = parser.interner.lookupExisting("__for_0").?;
+    var callee_expr = ast.Expr{ .var_ref = .{ .meta = synthetic_meta, .name = helper_name } };
+    var argument_expr = ast.Expr{ .int_literal = .{ .meta = synthetic_meta, .value = 42 } };
+    const args = [_]*const ast.Expr{&argument_expr};
+    var call_expr = ast.Expr{ .call = .{
+        .meta = synthetic_meta,
+        .callee = &callee_expr,
+        .args = args[0..],
+    } };
+
+    try std.testing.expectEqual(TypeStore.I64, try checker.inferExpr(&call_expr));
+    const inferred_signature = checker.store.inferred_signatures.get(helper_name).?;
+    try std.testing.expectEqual(TypeStore.I64, inferred_signature.return_type);
+    try std.testing.expect(!checker.eager_helper_in_flight.contains(helper_name));
+}
+
+test "eager synthetic helper return resolution propagates checkFunctionDecl failure" {
+    const source =
+        \\pub struct Helper {
+        \\  fn __for_0(value) {
+        \\    missing(value)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+
+    const helper_found = findStructFunction(parser.interner, &program, "__for_0").?;
+    markFunctionDeclSyntheticForTest(&collector.graph, helper_found.decl);
+    enterStructScope(&checker, helper_found.owner);
+    const helper_scope = checker.current_scope.?;
+
+    const helper_name = parser.interner.lookupExisting("__for_0").?;
+    const inferred_params = try alloc.alloc(TypeId, 1);
+    inferred_params[0] = TypeStore.I64;
+    try checker.store.inferred_signatures.put(helper_name, .{
+        .param_types = inferred_params,
+        .return_type = TypeStore.UNKNOWN,
+    });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.eagerlyResolveSyntheticHelperReturn(helper_scope, helper_name, 1, true, TypeStore.UNKNOWN),
+    );
+    try std.testing.expectEqual(@as(?scope_mod.ScopeId, helper_scope), checker.current_scope);
+    try std.testing.expect(!checker.eager_helper_in_flight.contains(helper_name));
+}
+
+test "closureInvokedParamsForFamily propagates allocation failure" {
+    const source =
+        \\pub struct Higher {
+        \\  pub fn apply(f :: fn() -> i64) -> i64 {
+        \\    f()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const found = findStructFunction(parser.interner, &program, "apply").?;
+    enterStructScope(&checker, found.owner);
+    const apply_name = parser.interner.lookupExisting("apply").?;
+    const family_id = checker.graph.resolveFamily(checker.current_scope.?, apply_name, 1).?;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.closureInvokedParamsForFamily(family_id),
+    );
+}
+
+test "recordClosureArgEffectsForFamily propagates invoked-parameter allocation failure" {
+    const source =
+        \\pub struct Higher {
+        \\  pub fn apply(f :: fn() -> i64) -> i64 {
+        \\    f()
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    apply(fn() -> i64 { 42 })
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const apply_found = findStructFunction(parser.interner, &program, "apply").?;
+    enterStructScope(&checker, apply_found.owner);
+    const apply_name = parser.interner.lookupExisting("apply").?;
+    const family_id = checker.graph.resolveFamily(checker.current_scope.?, apply_name, 1).?;
+    const run_found = findStructFunction(parser.interner, &program, "run").?;
+    const call = run_found.decl.clauses[0].body.?[0].expr.call;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.recordClosureArgEffectsForFamily(family_id, call.args, call.meta.span),
+    );
+}
+
+test "recordClosureArgEffectsForFamily preserves closure-argument effect propagation" {
+    const source =
+        \\pub struct BoomError {}
+        \\pub struct Higher {
+        \\  pub fn apply(f :: fn() -> i64) -> i64 {
+        \\    f()
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    apply(fn() -> i64 { 42 })
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const apply_found = findStructFunction(parser.interner, &program, "apply").?;
+    enterStructScope(&checker, apply_found.owner);
+    const apply_name = parser.interner.lookupExisting("apply").?;
+    const family_id = checker.graph.resolveFamily(checker.current_scope.?, apply_name, 1).?;
+
+    const invoked = (try checker.closureInvokedParamsForFamily(family_id)).?;
+    defer checker.allocator.free(invoked);
+    try std.testing.expectEqual(@as(usize, 1), invoked.len);
+    try std.testing.expect(invoked[0]);
+
+    const run_found = findStructFunction(parser.interner, &program, "run").?;
+    const call = run_found.decl.clauses[0].body.?[0].expr.call;
+    const closure_decl = call.args[0].anonymous_function.decl;
+    const boom = resolveErrorTypeByName(&collector.graph, parser.interner, "BoomError").?;
+
+    try checker.storeRaisesRow(closure_decl, &closure_decl.clauses[0], &.{boom});
+    checker.current_raises.clearRetainingCapacity();
+    try checker.recordClosureArgEffectsForFamily(family_id, call.args, call.meta.span);
+
+    try std.testing.expect(rowContainsType(&checker, checker.current_raises.items, boom));
+}
+
+test "closure analysis walkers propagate traversal budget failure" {
+    const source =
+        \\pub struct Higher {
+        \\  pub fn apply(f :: fn() -> i64) -> i64 {
+        \\    if true {
+        \\      f()
+        \\    } else {
+        \\      0
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const apply_found = findStructFunction(parser.interner, &program, "apply").?;
+    const clause = &apply_found.decl.clauses[0];
+    const param_name = clause.params[0].pattern.bind.name;
+
+    var budget = TypeChecker.AnalysisWalkerBudget{
+        .max_depth = 0,
+        .max_nodes = 64,
+    };
+    try std.testing.expectError(
+        error.TypeCheckerAnalysisDepthExceeded,
+        checker.closureParamInvokedInBodyWithBudget(clause.body.?, param_name, &budget),
+    );
+}
+
+test "eagerlyCheckClosureStructCall propagates in-flight guard allocation failure" {
+    const source =
+        \\pub struct ClosureBox {
+        \\  pub fn call(self :: ClosureBox, argument :: i64) -> i64 {
+        \\    argument
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var store = try TypeStore.init(alloc, parser.interner);
+    defer store.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, parser.interner, &collector.graph);
+    defer checker.deinit();
+
+    const closure_name = parser.interner.lookupExisting("ClosureBox").?;
+    const call_name = parser.interner.lookupExisting("call").?;
+    const closure_scope = collector.graph.findStructScope(.{
+        .parts = &.{closure_name},
+        .span = testNodeMeta().span,
+    }).?;
+    try std.testing.expect(checker.lookupFunctionDecl(closure_scope, call_name, 2) != null);
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.eagerlyCheckClosureStructCall(closure_name));
+    try std.testing.expectEqual(@as(?scope_mod.ScopeId, null), checker.current_scope);
+    try std.testing.expect(!checker.eager_helper_in_flight.contains(closure_name));
+}
+
+test "closure struct literal backfills any capture field type" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const closure_name = try interner.intern("__closure_0");
+    const capture_name = try interner.intern("captured");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const capture_fields = [_]Type.StructField{.{
+        .name = capture_name,
+        .type_id = TypeStore.UNKNOWN,
+    }};
+    const closure_type_id = try store.addType(.{ .struct_type = .{
+        .name = closure_name,
+        .fields = &capture_fields,
+    } });
+    try store.name_to_type.put(closure_name, closure_type_id);
+
+    const name_parts = [_]ast.StringId{closure_name};
+    var value_expr = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 42,
+    } };
+    const literal_fields = [_]ast.StructField{.{
+        .name = capture_name,
+        .value = &value_expr,
+    }};
+    var literal_expr = ast.Expr{ .struct_expr = .{
+        .meta = testNodeMeta(),
+        .struct_name = .{ .parts = &name_parts, .span = testNodeMeta().span },
+        .update_source = null,
+        .fields = &literal_fields,
+    } };
+
+    try std.testing.expectEqual(closure_type_id, try checker.inferExpr(&literal_expr));
+    const backfilled_struct = store.getType(closure_type_id).struct_type;
+    try std.testing.expectEqual(TypeStore.I64, backfilled_struct.fields[0].type_id);
+}
+
+test "closure struct literal propagates backfill allocation failure" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const closure_name = try interner.intern("__closure_0");
+    const capture_name = try interner.intern("captured");
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = try TypeStore.init(failing_allocator.allocator(), &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const capture_fields = [_]Type.StructField{.{
+        .name = capture_name,
+        .type_id = TypeStore.UNKNOWN,
+    }};
+    const closure_type_id = try store.addType(.{ .struct_type = .{
+        .name = closure_name,
+        .fields = &capture_fields,
+    } });
+    try store.name_to_type.put(closure_name, closure_type_id);
+
+    const name_parts = [_]ast.StringId{closure_name};
+    var value_expr = ast.Expr{ .int_literal = .{
+        .meta = testNodeMeta(),
+        .value = 42,
+    } };
+    const literal_fields = [_]ast.StructField{.{
+        .name = capture_name,
+        .value = &value_expr,
+    }};
+    var literal_expr = ast.Expr{ .struct_expr = .{
+        .meta = testNodeMeta(),
+        .struct_name = .{ .parts = &name_parts, .span = testNodeMeta().span },
+        .update_source = null,
+        .fields = &literal_fields,
+    } };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.inferExpr(&literal_expr));
+    const unchanged_struct = store.getType(closure_type_id).struct_type;
+    try std.testing.expectEqual(TypeStore.UNKNOWN, unchanged_struct.fields[0].type_id);
+}
+
+test "recordBoxedCallableRaisesRow eagerly populates closure call raises row" {
+    const source =
+        \\pub struct BoomError {
+        \\  message :: String
+        \\}
+        \\
+        \\pub struct Helper {
+        \\  pub fn explode(value :: i64) -> i64 {
+        \\    value
+        \\  }
+        \\}
+        \\
+        \\pub struct ClosureBox {
+        \\  pub fn call(self :: ClosureBox, argument :: i64) -> i64 {
+        \\    Helper.explode(argument)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.registerUserTypes();
+
+    const boom = resolveErrorTypeByName(&collector.graph, parser.interner, "BoomError").?;
+    const helper_found = findStructFunction(parser.interner, &program, "explode").?;
+    enterStructScope(&checker, helper_found.owner);
+    try checker.storeRaisesRow(helper_found.decl, &helper_found.decl.clauses[0], &.{boom});
+
+    const callable_name = try parser.interner.intern("Callable");
+    const args_tuple_elements = try alloc.alloc(TypeId, 1);
+    args_tuple_elements[0] = TypeStore.I64;
+    const args_tuple = try checker.store.addType(.{ .tuple = .{ .elements = args_tuple_elements } });
+    const callable_type_params = try alloc.alloc(TypeId, 2);
+    callable_type_params[0] = args_tuple;
+    callable_type_params[1] = TypeStore.I64;
+    const callable_constraint = try checker.store.addType(.{ .protocol_constraint = .{
+        .protocol_name = callable_name,
+        .type_params = callable_type_params,
+    } });
+
+    const closure_name = parser.interner.lookupExisting("ClosureBox").?;
+    checker.current_scope = null;
+    try checker.recordBoxedCallableRaisesRow(callable_constraint, closure_name);
+
+    const closure_row = (try checker.closureStructCallRaisesRow(closure_name)).?;
+    try std.testing.expect(rowContainsType(&checker, closure_row, boom));
+    const boxed_row = checker.boxed_callable_raises_row.get(callable_constraint).?;
+    try std.testing.expect(rowContainsType(&checker, boxed_row, boom));
+    try std.testing.expectEqual(@as(?scope_mod.ScopeId, null), checker.current_scope);
+}
+
+test "rescueClauseErrorType propagates resolver OOM from struct-pattern name resolution" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const error_name = try interner.intern("MissingError");
+    const protocol_parts = [_]ast.StringId{ namespace_name, error_name };
+    const pattern_parts = [_]ast.StringId{error_name};
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &protocol_parts, .span = testNodeMeta().span },
+        .functions = &.{},
+    };
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_decl.name,
+        .scope_id = 0,
+        .decl = &protocol_decl,
+    });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checker = TypeChecker.initWithSharedStore(failing_allocator.allocator(), &store, &interner, &graph);
+    defer checker.deinit();
+
+    const pattern = ast.Pattern{ .struct_pattern = .{
+        .meta = testNodeMeta(),
+        .struct_name = .{ .parts = &pattern_parts, .span = testNodeMeta().span },
+        .fields = &.{},
+    } };
+    const clause = ast.CaseClause{
+        .meta = testNodeMeta(),
+        .pattern = &pattern,
+        .type_annotation = null,
+        .guard = null,
+        .body = &.{},
+    };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, checker.rescueClauseErrorType(clause));
+}
+
+test "rescueClauseErrorType preserves semantic UNKNOWN as null for struct-pattern names" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const error_name = try interner.intern("ForwardError");
+    const pattern_parts = [_]ast.StringId{error_name};
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const struct_decl = ast.StructDecl{
+        .meta = testNodeMeta(),
+        .name = .{ .parts = &pattern_parts, .span = testNodeMeta().span },
+        .fields = &.{},
+    };
+    try graph.types.append(std.testing.allocator, .{
+        .id = 0,
+        .name = error_name,
+        .scope_id = 0,
+        .kind = .{ .struct_type = &struct_decl },
+        .params = &.{},
+    });
+
+    var checker = TypeChecker.initWithSharedStore(std.testing.allocator, &store, &interner, &graph);
+    defer checker.deinit();
+
+    const pattern = ast.Pattern{ .struct_pattern = .{
+        .meta = testNodeMeta(),
+        .struct_name = .{ .parts = &pattern_parts, .span = testNodeMeta().span },
+        .fields = &.{},
+    } };
+    const clause = ast.CaseClause{
+        .meta = testNodeMeta(),
+        .pattern = &pattern,
+        .type_annotation = null,
+        .guard = null,
+        .body = &.{},
+    };
+
+    try std.testing.expectEqual(@as(?TypeId, null), try checker.rescueClauseErrorType(clause));
+    try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
+}
+
+test "checkRescuePatternVisibility propagates joined-name OOM for private error visibility" {
+    const source =
+        \\struct SecretError {}
+        \\pub struct Caller {
+        \\  pub fn run() -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const secret_error = resolveErrorTypeByName(&collector.graph, parser.interner, "SecretError").?;
+    const caller = findStructFunction(parser.interner, &program, "run").?;
+    enterStructScope(&checker, caller.owner);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.checkRescuePatternVisibility(secret_error, .{ .start = 0, .end = 0 }),
+    );
+}
+
+test "storeRaisesRow propagates OOM from raises-row struct prefix construction" {
+    const source =
+        \\pub struct AlphaError {}
+        \\pub struct Zap.Risky {
+        \\  pub fn maybe(n :: i64) -> i64 { n }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const alpha = resolveErrorTypeByName(&collector.graph, parser.interner, "AlphaError").?;
+    const found = findStructFunction(parser.interner, &program, "maybe").?;
+    enterStructScope(&checker, found.owner);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_allocator = checker.allocator;
+    checker.allocator = failing_allocator.allocator();
+    defer checker.allocator = original_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.storeRaisesRow(found.decl, &found.decl.clauses[0], &.{alpha}),
+    );
+}
+
+test "storeRaisesRow propagates OOM from raises-row key formatting" {
+    const source =
+        \\pub struct AlphaError {}
+        \\pub struct Risky {
+        \\  pub fn maybe(n :: i64) -> i64 { n }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    const alpha = resolveErrorTypeByName(&collector.graph, parser.interner, "AlphaError").?;
+    const found = findStructFunction(parser.interner, &program, "maybe").?;
+    enterStructScope(&checker, found.owner);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const original_store_allocator = checker.store.allocator;
+    checker.store.allocator = failing_allocator.allocator();
+    defer checker.store.allocator = original_store_allocator;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        checker.storeRaisesRow(found.decl, &found.decl.clauses[0], &.{alpha}),
+    );
+}
+
 test "storeRaisesRow unions a function's clauses instead of overwriting (types-2--02 / TY-04)" {
     // A two-clause function: each clause shares the same `<Struct>.<name>/<arity>`
     // key. Storing clause A's row {AlphaError} then clause B's row {BetaError}
@@ -16343,15 +20530,15 @@ test "storeRaisesRow unions a function's clauses instead of overwriting (types-2
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -16373,11 +20560,11 @@ test "storeRaisesRow unions a function's clauses instead of overwriting (types-2
     try checker.storeRaisesRow(classify_decls.items[0], &classify_decls.items[0].clauses[0], &.{alpha});
     try checker.storeRaisesRow(classify_decls.items[1], &classify_decls.items[1].clauses[0], &.{beta});
 
-    const row = lookupInferredRaisesRow(&checker, "Risky", "classify", 1);
+    const row = try lookupInferredRaisesRow(&checker, "Risky", "classify", 1);
     try std.testing.expectEqual(@as(usize, 2), row.len);
     try std.testing.expect(rowContainsType(&checker, row, alpha));
     try std.testing.expect(rowContainsType(&checker, row, beta));
-    try std.testing.expect(checker.store.functionRaises("Risky", "classify", 1));
+    try std.testing.expect(try checker.store.functionRaises("Risky", "classify", 1));
 }
 
 test "storeRaisesRow keeps an earlier clause's raise when a later clause is pure (types-2--02 / TY-04 soundness direction)" {
@@ -16399,15 +20586,15 @@ test "storeRaisesRow keeps an earlier clause's raise when a later clause is pure
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -16423,10 +20610,10 @@ test "storeRaisesRow keeps an earlier clause's raise when a later clause is pure
     try checker.storeRaisesRow(maybe_decls.items[0], &maybe_decls.items[0].clauses[0], &.{alpha});
     try checker.storeRaisesRow(maybe_decls.items[1], &maybe_decls.items[1].clauses[0], &.{});
 
-    const row = lookupInferredRaisesRow(&checker, "Risky", "maybe", 1);
+    const row = try lookupInferredRaisesRow(&checker, "Risky", "maybe", 1);
     try std.testing.expect(rowContainsType(&checker, row, alpha));
     // Authoritative ABI witness: the function MUST lower to an error union.
-    try std.testing.expect(checker.store.functionRaises("Risky", "maybe", 1));
+    try std.testing.expect(try checker.store.functionRaises("Risky", "maybe", 1));
 }
 
 test "checkFunctionClause preserves the enclosing function's current_raises across a nested clause (types-2--03 / TY-05)" {
@@ -16448,15 +20635,15 @@ test "checkFunctionClause preserves the enclosing function's current_raises acro
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 

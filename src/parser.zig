@@ -48,6 +48,7 @@ pub const Parser = struct {
     /// Wrapped into the synthetic struct after the parse loop. Never
     /// populated when `script_mode == false`.
     hoisted_script_functions: std.ArrayList(*const ast.FunctionDecl) = .empty,
+    nesting_depth: u32 = 0,
 
     /// Reserved name of the synthetic wrapper struct that holds a
     /// script's hoisted top-level `main/1`. It CANNOT collide with any
@@ -71,8 +72,12 @@ pub const Parser = struct {
         help: ?[]const u8 = null,
     };
 
-    pub fn init(allocator: std.mem.Allocator, source: []const u8) Parser {
-        return initWithScriptMode(allocator, source, false);
+    /// Bounds recursive-descent parser nesting before compiler stack exhaustion
+    /// while still allowing practical source-level expression/pattern/type depth.
+    pub const MAX_NESTING_DEPTH: u32 = 1024;
+
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) !Parser {
+        return try initWithScriptMode(allocator, source, false);
     }
 
     /// Construct a parser with the single-file script carve-out
@@ -80,14 +85,15 @@ pub const Parser = struct {
     /// a literal top-level `fn`/`pub fn` is hoisted into the reserved
     /// synthetic wrapper struct instead of being rejected. Used by the
     /// `zap run <script.zap>` path; never reached by the manifest path.
-    pub fn initScript(allocator: std.mem.Allocator, source: []const u8) Parser {
-        return initWithScriptMode(allocator, source, true);
+    pub fn initScript(allocator: std.mem.Allocator, source: []const u8) !Parser {
+        return try initWithScriptMode(allocator, source, true);
     }
 
-    fn initWithScriptMode(allocator: std.mem.Allocator, source: []const u8, script_mode: bool) Parser {
+    fn initWithScriptMode(allocator: std.mem.Allocator, source: []const u8, script_mode: bool) !Parser {
         var lexer = Lexer.init(source);
         const first = lexer.next();
-        const interner = allocator.create(ast.StringInterner) catch unreachable;
+        const interner = try allocator.create(ast.StringInterner);
+        errdefer allocator.destroy(interner);
         interner.* = ast.StringInterner.init(allocator);
         return .{
             .allocator = allocator,
@@ -134,6 +140,24 @@ pub const Parser = struct {
             .anon_function_counter = 0,
             .script_mode = script_mode,
         };
+    }
+
+    fn enterNesting(self: *Parser, span: ast.SourceSpan) !void {
+        if (self.nesting_depth >= MAX_NESTING_DEPTH) {
+            try self.addRichError(
+                "code is nested too deeply",
+                span,
+                "this expression/pattern/type exceeds the parser nesting budget",
+                "split the code into smaller named pieces or reduce the nesting depth",
+            );
+            return error.ParseError;
+        }
+        self.nesting_depth += 1;
+    }
+
+    fn leaveNesting(self: *Parser) void {
+        std.debug.assert(self.nesting_depth > 0);
+        self.nesting_depth -= 1;
     }
 
     pub fn deinit(self: *Parser) void {
@@ -209,11 +233,12 @@ pub const Parser = struct {
         if (self.check(tag)) {
             return self.advance();
         }
-        try self.addError(
-            std.fmt.allocPrint(self.allocator, "I was expecting {s} but found {s}", .{
+        try self.addErrorFmt(
+            "I was expecting {s} but found {s}",
+            .{
                 tokenHumanName(tag),
                 tokenHumanName(self.current.tag),
-            }) catch "parse error",
+            },
             ast.SourceSpan.from(self.current.loc),
         );
         return error.ParseError;
@@ -225,61 +250,64 @@ pub const Parser = struct {
         if (self.check(tag)) {
             return self.advance();
         }
-        try self.addError(
-            std.fmt.allocPrint(self.allocator, "I was expecting {s} but found {s}", .{
+        try self.addErrorFmt(
+            "I was expecting {s} but found {s}",
+            .{
                 tokenHumanName(tag),
                 tokenHumanName(self.current.tag),
-            }) catch "parse error",
+            },
             context_span,
         );
         return error.ParseError;
     }
 
     /// Strip underscores from a numeric literal string (e.g., "1_000_000" → "1000000")
-    fn stripNumericUnderscores(self: *Parser, text: []const u8) []const u8 {
+    fn stripNumericUnderscores(self: *Parser, text: []const u8) ![]const u8 {
         if (std.mem.findScalar(u8, text, '_') == null) return text;
         var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
         for (text) |c| {
-            if (c != '_') buf.append(self.allocator, c) catch return text;
+            if (c != '_') try buf.append(self.allocator, c);
         }
-        return buf.toOwnedSlice(self.allocator) catch text;
+        return try buf.toOwnedSlice(self.allocator);
     }
 
     /// Process escape sequences in a string: \n, \t, \r, \\, \", \0
-    fn unescapeString(self: *Parser, text: []const u8) []const u8 {
+    fn unescapeString(self: *Parser, text: []const u8) ![]const u8 {
         if (std.mem.findScalar(u8, text, '\\') == null) return text;
         var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
         var i: usize = 0;
         while (i < text.len) {
             if (text[i] == '\\' and i + 1 < text.len) {
                 switch (text[i + 1]) {
-                    'n' => buf.append(self.allocator, '\n') catch return text,
-                    't' => buf.append(self.allocator, '\t') catch return text,
-                    'r' => buf.append(self.allocator, '\r') catch return text,
-                    '\\' => buf.append(self.allocator, '\\') catch return text,
-                    '"' => buf.append(self.allocator, '"') catch return text,
-                    '0' => buf.append(self.allocator, 0) catch return text,
+                    'n' => try buf.append(self.allocator, '\n'),
+                    't' => try buf.append(self.allocator, '\t'),
+                    'r' => try buf.append(self.allocator, '\r'),
+                    '\\' => try buf.append(self.allocator, '\\'),
+                    '"' => try buf.append(self.allocator, '"'),
+                    '0' => try buf.append(self.allocator, 0),
                     'x' => {
                         // Hex escape: \xNN
                         if (i + 3 < text.len) {
                             const hi = std.fmt.charToDigit(text[i + 2], 16) catch {
-                                buf.append(self.allocator, '\\') catch return text;
-                                buf.append(self.allocator, 'x') catch return text;
+                                try buf.append(self.allocator, '\\');
+                                try buf.append(self.allocator, 'x');
                                 i += 2;
                                 continue;
                             };
                             const lo = std.fmt.charToDigit(text[i + 3], 16) catch {
-                                buf.append(self.allocator, '\\') catch return text;
-                                buf.append(self.allocator, 'x') catch return text;
+                                try buf.append(self.allocator, '\\');
+                                try buf.append(self.allocator, 'x');
                                 i += 2;
                                 continue;
                             };
-                            buf.append(self.allocator, hi * 16 + lo) catch return text;
+                            try buf.append(self.allocator, hi * 16 + lo);
                             i += 4;
                             continue;
                         } else {
-                            buf.append(self.allocator, '\\') catch return text;
-                            buf.append(self.allocator, 'x') catch return text;
+                            try buf.append(self.allocator, '\\');
+                            try buf.append(self.allocator, 'x');
                         }
                     },
                     'u' => {
@@ -302,35 +330,35 @@ pub const Parser = struct {
                                 if (ok and codepoint <= 0x10FFFF) {
                                     var utf8_buf: [4]u8 = undefined;
                                     const n = std.unicode.utf8Encode(@as(u21, @intCast(codepoint)), &utf8_buf) catch {
-                                        buf.append(self.allocator, '\\') catch return text;
-                                        buf.append(self.allocator, 'u') catch return text;
+                                        try buf.append(self.allocator, '\\');
+                                        try buf.append(self.allocator, 'u');
                                         i += 2;
                                         continue;
                                     };
-                                    buf.appendSlice(self.allocator, utf8_buf[0..n]) catch return text;
+                                    try buf.appendSlice(self.allocator, utf8_buf[0..n]);
                                     i = hex_end + 1;
                                     continue;
                                 }
                             }
                         }
-                        buf.append(self.allocator, '\\') catch return text;
-                        buf.append(self.allocator, 'u') catch return text;
+                        try buf.append(self.allocator, '\\');
+                        try buf.append(self.allocator, 'u');
                         i += 2;
                         continue;
                     },
                     else => {
                         // Unknown escape — keep as-is
-                        buf.append(self.allocator, '\\') catch return text;
-                        buf.append(self.allocator, text[i + 1]) catch return text;
+                        try buf.append(self.allocator, '\\');
+                        try buf.append(self.allocator, text[i + 1]);
                     },
                 }
                 i += 2;
             } else {
-                buf.append(self.allocator, text[i]) catch return text;
+                try buf.append(self.allocator, text[i]);
                 i += 1;
             }
         }
-        return buf.toOwnedSlice(self.allocator) catch text;
+        return try buf.toOwnedSlice(self.allocator);
     }
 
     fn skipNewlines(self: *Parser) void {
@@ -370,6 +398,12 @@ pub const Parser = struct {
         try self.errors.append(self.allocator, .{ .message = message, .span = span });
     }
 
+    fn addErrorFmt(self: *Parser, comptime message_fmt: []const u8, message_args: anytype, span: ast.SourceSpan) !void {
+        const message = try std.fmt.allocPrint(self.allocator, message_fmt, message_args);
+        errdefer self.allocator.free(message);
+        try self.addError(message, span);
+    }
+
     fn addRichError(self: *Parser, message: []const u8, span: ast.SourceSpan, label_text: ?[]const u8, help_text: ?[]const u8) !void {
         try self.errors.append(self.allocator, .{
             .message = message,
@@ -377,6 +411,19 @@ pub const Parser = struct {
             .label = label_text,
             .help = help_text,
         });
+    }
+
+    fn addRichErrorFmt(
+        self: *Parser,
+        comptime message_fmt: []const u8,
+        message_args: anytype,
+        span: ast.SourceSpan,
+        label_text: ?[]const u8,
+        help_text: ?[]const u8,
+    ) !void {
+        const message = try std.fmt.allocPrint(self.allocator, message_fmt, message_args);
+        errdefer self.allocator.free(message);
+        try self.addRichError(message, span, label_text, help_text);
     }
 
     /// Skip tokens until a statement/definition boundary is found.
@@ -409,6 +456,13 @@ pub const Parser = struct {
                 },
                 else => _ = self.advance(),
             }
+        }
+    }
+
+    fn recoverParseError(self: *Parser, err: anyerror) !void {
+        switch (err) {
+            error.ParseError => self.synchronize(),
+            else => return err,
         }
     }
 
@@ -456,8 +510,8 @@ pub const Parser = struct {
                             if (self.parseStructDecl(false)) |mod| {
                                 try structs.append(self.allocator, mod);
                                 try top_items.append(self.allocator, .{ .struct_decl = try self.create(ast.StructDecl, mod) });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         .keyword_fn => {
@@ -470,8 +524,8 @@ pub const Parser = struct {
                                 // source-text rewriting.
                                 if (self.parseFunctionDecl(.public)) |func| {
                                     try self.hoisted_script_functions.append(self.allocator, func);
-                                } else |_| {
-                                    self.synchronize();
+                                } else |err| {
+                                    try self.recoverParseError(err);
                                 }
                             } else {
                                 try self.addRichError(
@@ -489,32 +543,32 @@ pub const Parser = struct {
                             self.restoreLexerState(saved);
                             if (self.parseMacroDecl(.public)) |mac| {
                                 try top_items.append(self.allocator, .{ .macro = mac });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         .keyword_union => {
                             self.restoreLexerState(saved);
                             if (self.parseUnionDecl(false)) |ed| {
                                 try top_items.append(self.allocator, .{ .union_decl = ed });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         .keyword_protocol => {
                             self.restoreLexerState(saved);
                             if (self.parseProtocolDecl(false)) |proto| {
                                 try top_items.append(self.allocator, .{ .protocol = try self.create(ast.ProtocolDecl, proto) });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         .keyword_impl => {
                             self.restoreLexerState(saved);
                             if (self.parseImplDecl(false)) |impl_d| {
                                 try top_items.append(self.allocator, .{ .impl_decl = try self.create(ast.ImplDecl, impl_d) });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         .identifier => {
@@ -527,8 +581,8 @@ pub const Parser = struct {
                                 self.restoreLexerState(saved);
                                 if (self.parseErrorDecl(false)) |err_decl| {
                                     try top_items.append(self.allocator, .{ .error_decl = try self.create(ast.ErrorDecl, err_decl) });
-                                } else |_| {
-                                    self.synchronize();
+                                } else |err| {
+                                    try self.recoverParseError(err);
                                 }
                             } else {
                                 self.restoreLexerState(saved);
@@ -565,8 +619,8 @@ pub const Parser = struct {
                         // runs post-parse in the script path, not here.
                         if (self.parseFunctionDecl(.private)) |func| {
                             try self.hoisted_script_functions.append(self.allocator, func);
-                        } else |_| {
-                            self.synchronize();
+                        } else |err| {
+                            try self.recoverParseError(err);
                         }
                     } else {
                         try self.addRichError(
@@ -583,23 +637,23 @@ pub const Parser = struct {
                 .keyword_type => {
                     if (self.parseTypeDecl()) |td| {
                         try top_items.append(self.allocator, .{ .type_decl = td });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_opaque => {
                     if (self.parseOpaqueDecl()) |od| {
                         try top_items.append(self.allocator, .{ .opaque_decl = od });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_macro => {
                     // bare macro at top level = private
                     if (self.parseMacroDecl(.private)) |mac| {
                         try top_items.append(self.allocator, .{ .priv_macro = mac });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_struct => {
@@ -607,29 +661,29 @@ pub const Parser = struct {
                     if (self.parseStructDecl(true)) |mod| {
                         try structs.append(self.allocator, mod);
                         try top_items.append(self.allocator, .{ .priv_struct_decl = try self.create(ast.StructDecl, mod) });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_union => {
                     if (self.parseUnionDecl(true)) |ed| {
                         try top_items.append(self.allocator, .{ .union_decl = ed });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_protocol => {
                     if (self.parseProtocolDecl(true)) |proto| {
                         try top_items.append(self.allocator, .{ .priv_protocol = try self.create(ast.ProtocolDecl, proto) });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_impl => {
                     if (self.parseImplDecl(true)) |impl_d| {
                         try top_items.append(self.allocator, .{ .priv_impl_decl = try self.create(ast.ImplDecl, impl_d) });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 // Bare `error Name { ... }` — private renderable-only error.
@@ -640,8 +694,8 @@ pub const Parser = struct {
                     if (self.checkIdentifier("error")) {
                         if (self.parseErrorDecl(true)) |err_decl| {
                             try top_items.append(self.allocator, .{ .priv_error_decl = try self.create(ast.ErrorDecl, err_decl) });
-                        } else |_| {
-                            self.synchronize();
+                        } else |err| {
+                            try self.recoverParseError(err);
                         }
                     } else {
                         try self.addRichError(
@@ -658,8 +712,8 @@ pub const Parser = struct {
                     // Top-level @doc attribute — applies to the next definition
                     if (self.parseAttributeDecl()) |attr| {
                         try top_items.append(self.allocator, .{ .attribute = attr });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .newline => {
@@ -671,20 +725,25 @@ pub const Parser = struct {
                         const text = self.current.slice(self.source);
                         const keywords = [_][]const u8{ "pub", "fn", "macro", "struct", "enum", "type", "opaque", "protocol", "impl" };
                         if (similarity.findBestMatch(text, &keywords, 0.75)) |suggestion| {
+                            const message = try std.fmt.allocPrint(self.allocator, "I was not expecting `{s}` at the top level", .{text});
+                            errdefer self.allocator.free(message);
+                            const help = try std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion});
+                            errdefer self.allocator.free(help);
                             try self.addRichError(
-                                std.fmt.allocPrint(self.allocator, "I was not expecting `{s}` at the top level", .{text}) catch "unexpected identifier at top level",
+                                message,
                                 self.currentSpan(),
                                 null,
-                                std.fmt.allocPrint(self.allocator, "did you mean `{s}`?", .{suggestion}) catch "check for typos",
+                                help,
                             );
                             _ = self.advance();
                             continue;
                         }
                     }
-                    try self.addRichError(
-                        std.fmt.allocPrint(self.allocator, "I was not expecting {s} at the top level", .{
+                    try self.addRichErrorFmt(
+                        "I was not expecting {s} at the top level",
+                        .{
                             tokenHumanName(self.current.tag),
-                        }) catch "unexpected token at top level",
+                        },
                         self.currentSpan(),
                         null,
                         "the top level can contain `pub struct`, `struct`, `pub enum`, `type`, and `opaque` declarations",
@@ -843,32 +902,32 @@ pub const Parser = struct {
                             self.restoreLexerState(saved);
                             if (self.parseFunctionDecl(.public)) |func| {
                                 try items.append(self.allocator, .{ .function = func });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         .keyword_macro => {
                             self.restoreLexerState(saved);
                             if (self.parseMacroDecl(.public)) |mac| {
                                 try items.append(self.allocator, .{ .macro = mac });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         .keyword_struct => {
                             self.restoreLexerState(saved);
                             if (self.parseNestedStructDecl()) |sd| {
                                 try items.append(self.allocator, .{ .struct_decl = sd });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         .keyword_union => {
                             self.restoreLexerState(saved);
                             if (self.parseUnionDecl(false)) |ed| {
                                 try items.append(self.allocator, .{ .union_decl = ed });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         else => {
@@ -886,15 +945,15 @@ pub const Parser = struct {
                 .keyword_fn => {
                     if (self.parseFunctionDecl(.private)) |func| {
                         try items.append(self.allocator, .{ .priv_function = func });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_macro => {
                     if (self.parseMacroDecl(.private)) |mac| {
                         try items.append(self.allocator, .{ .priv_macro = mac });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_struct => {
@@ -904,45 +963,45 @@ pub const Parser = struct {
                     } else {
                         if (self.parseNestedStructDecl()) |sd| {
                             try items.append(self.allocator, .{ .struct_decl = sd });
-                        } else |_| {
-                            self.synchronize();
+                        } else |err| {
+                            try self.recoverParseError(err);
                         }
                     }
                 },
                 .keyword_union => {
                     if (self.parseUnionDecl(true)) |ed| {
                         try items.append(self.allocator, .{ .union_decl = ed });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 // (legacy keyword_def/defp/defmacro/defmacrop/defstruct/defenum removed)
                 .keyword_type => {
                     if (self.parseTypeDecl()) |td| {
                         try items.append(self.allocator, .{ .type_decl = td });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_opaque => {
                     if (self.parseOpaqueDecl()) |od| {
                         try items.append(self.allocator, .{ .opaque_decl = od });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_alias => {
                     if (self.parseAliasDecl()) |ad| {
                         try items.append(self.allocator, .{ .alias_decl = ad });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .keyword_import => {
                     if (self.parseImportDecl()) |id| {
                         try items.append(self.allocator, .{ .import_decl = id });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 // Contextual keywords: use, describe, test; also field declarations
@@ -950,8 +1009,8 @@ pub const Parser = struct {
                     if (self.checkIdentifier("use")) {
                         if (self.parseUseDecl()) |ud| {
                             try items.append(self.allocator, .{ .use_decl = ud });
-                        } else |_| {
-                            self.synchronize();
+                        } else |err| {
+                            try self.recoverParseError(err);
                         }
                     } else if (self.isFieldDecl()) {
                         const field = try self.parseStructField();
@@ -966,18 +1025,19 @@ pub const Parser = struct {
                 .at_sign => {
                     if (self.parseAttributeDecl()) |attr| {
                         try items.append(self.allocator, .{ .attribute = attr });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .newline => {
                     _ = self.advance();
                 },
                 else => {
-                    try self.addRichError(
-                        std.fmt.allocPrint(self.allocator, "I was not expecting {s} inside a struct", .{
+                    try self.addRichErrorFmt(
+                        "I was not expecting {s} inside a struct",
+                        .{
                             tokenHumanName(self.current.tag),
-                        }) catch "unexpected token in struct",
+                        },
                         self.currentSpan(),
                         "not valid inside a struct body",
                         "structs can contain `pub fn`, `fn`, `pub macro`, `macro`, `pub struct`, `pub union`, `type`, `alias`, `import`, and `@attribute` declarations",
@@ -1164,8 +1224,8 @@ pub const Parser = struct {
                             self.restoreLexerState(saved);
                             if (self.parseFunctionDecl(.public)) |func| {
                                 try items.append(self.allocator, .{ .function = func });
-                            } else |_| {
-                                self.synchronize();
+                            } else |err| {
+                                try self.recoverParseError(err);
                             }
                         },
                         else => {
@@ -1183,8 +1243,8 @@ pub const Parser = struct {
                 .keyword_fn => {
                     if (self.parseFunctionDecl(.private)) |func| {
                         try items.append(self.allocator, .{ .priv_function = func });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .identifier => {
@@ -1204,18 +1264,19 @@ pub const Parser = struct {
                 .at_sign => {
                     if (self.parseAttributeDecl()) |attr| {
                         try items.append(self.allocator, .{ .attribute = attr });
-                    } else |_| {
-                        self.synchronize();
+                    } else |err| {
+                        try self.recoverParseError(err);
                     }
                 },
                 .newline => {
                     _ = self.advance();
                 },
                 else => {
-                    try self.addRichError(
-                        std.fmt.allocPrint(self.allocator, "I was not expecting {s} inside a `pub error` body", .{
+                    try self.addRichErrorFmt(
+                        "I was not expecting {s} inside a `pub error` body",
+                        .{
                             tokenHumanName(self.current.tag),
-                        }) catch "unexpected token inside `pub error`",
+                        },
                         self.currentSpan(),
                         "not valid inside an error declaration",
                         "`pub error` bodies contain field declarations and optional inline methods only",
@@ -1338,7 +1399,12 @@ pub const Parser = struct {
             const param_name = try self.internToken(param_name_tok);
 
             var type_ann: ?*const ast.TypeExpr = null;
+            var ownership: ast.Ownership = .shared;
+            var ownership_explicit = false;
             if (self.match(.double_colon)) {
+                const ownership_qualifier = try self.parseOptionalOwnershipQualifier();
+                ownership = ownership_qualifier.ownership;
+                ownership_explicit = ownership_qualifier.explicit;
                 type_ann = try self.parseTypeExpr();
             }
 
@@ -1346,6 +1412,8 @@ pub const Parser = struct {
                 .meta = .{ .span = ast.SourceSpan.merge(param_start, self.previousSpan()) },
                 .name = param_name,
                 .type_annotation = type_ann,
+                .ownership = ownership,
+                .ownership_explicit = ownership_explicit,
             });
 
             if (!self.match(.comma)) break;
@@ -1783,9 +1851,10 @@ pub const Parser = struct {
             struct_name.parts[0]
         else blk: {
             var name_buf: std.ArrayList(u8) = .empty;
+            defer name_buf.deinit(self.allocator);
             for (struct_name.parts, 0..) |part, i| {
-                if (i > 0) name_buf.append(self.allocator, '.') catch {};
-                name_buf.appendSlice(self.allocator, self.interner.get(part)) catch {};
+                if (i > 0) try name_buf.append(self.allocator, '.');
+                try name_buf.appendSlice(self.allocator, self.interner.get(part));
             }
             break :blk try self.interner.intern(name_buf.items);
         };
@@ -2486,11 +2555,8 @@ pub const Parser = struct {
                     }
                     const poison_span = self.currentSpan();
                     self.synchronizeStatement();
-                    try stmts.append(self.allocator, self.makePoisonStmt(poison_span) catch {
-                        // Allocation failure during recovery — propagate the
-                        // original parse failure rather than masking it.
-                        return error.ParseError;
-                    });
+                    const poison_stmt = try self.makePoisonStmt(poison_span);
+                    try stmts.append(self.allocator, poison_stmt);
                     self.skipNewlines();
                     continue;
                 },
@@ -2618,12 +2684,17 @@ pub const Parser = struct {
     // ============================================================
 
     pub fn parseExpr(self: *Parser) anyerror!*const ast.Expr {
+        try self.enterNesting(self.currentSpan());
+        defer self.leaveNesting();
         return self.parseOrExpr();
     }
 
     /// Parse a guard expression — like a regular expression but allows
     /// newlines before `and`/`or` continuation tokens.
     fn parseGuardExpr(self: *Parser) anyerror!*const ast.Expr {
+        try self.enterNesting(self.currentSpan());
+        defer self.leaveNesting();
+
         const saved = self.disable_trailing_block;
         self.disable_trailing_block = true;
         defer self.disable_trailing_block = saved;
@@ -3292,10 +3363,11 @@ pub const Parser = struct {
                 return error.ParseError;
             },
             else => {
-                try self.addRichError(
-                    std.fmt.allocPrint(self.allocator, "I was not expecting {s} here", .{
+                try self.addRichErrorFmt(
+                    "I was not expecting {s} here",
+                    .{
                         tokenHumanName(self.current.tag),
-                    }) catch "unexpected token in expression",
+                    },
                     self.currentSpan(),
                     "not a valid expression",
                     "expressions start with a value (number, string, variable), an operator, or a keyword like `if` or `case`",
@@ -3339,8 +3411,9 @@ pub const Parser = struct {
     fn parseFunctionArityLiteral(self: *Parser, arity_tok: Token, context: []const u8) !u32 {
         const arity_text = arity_tok.slice(self.source);
         return std.fmt.parseInt(u32, arity_text, 10) catch {
-            try self.addRichError(
-                try std.fmt.allocPrint(self.allocator, "Invalid function arity `{s}` in {s}", .{ arity_text, context }),
+            try self.addRichErrorFmt(
+                "Invalid function arity `{s}` in {s}",
+                .{ arity_text, context },
                 ast.SourceSpan.from(arity_tok.loc),
                 "arity must fit in an unsigned 32-bit integer",
                 "use a decimal value from 0 through 4294967295",
@@ -3386,12 +3459,9 @@ pub const Parser = struct {
     /// otherwise become `0` with no diagnostic). Mirrors the overflow policy
     /// in `docs/literal-context-adoption.md`.
     fn integerLiteralOutOfRange(self: *Parser, text: []const u8, span: ast.SourceSpan) anyerror {
-        try self.addRichError(
-            std.fmt.allocPrint(
-                self.allocator,
-                "the integer literal `{s}` is out of range",
-                .{text},
-            ) catch "integer literal is out of range",
+        try self.addRichErrorFmt(
+            "the integer literal `{s}` is out of range",
+            .{text},
             span,
             "does not fit in a 64-bit integer",
             "integer literals must fit in the range -9223372036854775808..9223372036854775807 (i64)",
@@ -3410,7 +3480,7 @@ pub const Parser = struct {
     fn parseIntLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
         const span = ast.SourceSpan.from(tok.loc);
-        const text = self.stripNumericUnderscores(tok.slice(self.source));
+        const text = try self.stripNumericUnderscores(tok.slice(self.source));
         const value = try self.parseI64Literal(text, span);
         return self.create(ast.Expr, .{
             .int_literal = .{ .meta = .{ .span = span }, .value = value },
@@ -3454,12 +3524,9 @@ pub const Parser = struct {
     /// at its source span, never compile silently to zero.
     fn parseF64Literal(self: *Parser, text: []const u8, span: ast.SourceSpan) anyerror!f64 {
         return std.fmt.parseFloat(f64, text) catch {
-            try self.addRichError(
-                std.fmt.allocPrint(
-                    self.allocator,
-                    "the float literal `{s}` is not a valid number",
-                    .{text},
-                ) catch "float literal is not a valid number",
+            try self.addRichErrorFmt(
+                "the float literal `{s}` is not a valid number",
+                .{text},
                 span,
                 "not a valid floating-point value",
                 "float literals look like `3.14`, `1.0e10`, or `0.5`",
@@ -3471,7 +3538,7 @@ pub const Parser = struct {
     fn parseFloatLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
         const span = ast.SourceSpan.from(tok.loc);
-        const text = self.stripNumericUnderscores(tok.slice(self.source));
+        const text = try self.stripNumericUnderscores(tok.slice(self.source));
         const value = try self.parseF64Literal(text, span);
         return self.create(ast.Expr, .{
             .float_literal = .{ .meta = .{ .span = span }, .value = value },
@@ -3487,7 +3554,7 @@ pub const Parser = struct {
     /// `"a\nb"` source token produces the identical 3-byte value in all
     /// positions (otherwise an escaped string pattern can never match the
     /// equally-escaped expression value: audit finding parser-2--01 / FE-02).
-    fn normalizeStringLiteralRaw(self: *Parser, raw: []const u8) []const u8 {
+    fn normalizeStringLiteralRaw(self: *Parser, raw: []const u8) ![]const u8 {
         // Heredoc: """content""" — strip 3 quotes each side, then strip indentation
         const is_heredoc = raw.len >= 6 and raw[0] == '"' and raw[1] == '"' and raw[2] == '"';
         const stripped = if (is_heredoc)
@@ -3497,12 +3564,12 @@ pub const Parser = struct {
         else
             raw;
 
-        return self.unescapeString(stripped);
+        return try self.unescapeString(stripped);
     }
 
     fn parseStringLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
-        const value = self.normalizeStringLiteralRaw(tok.slice(self.source));
+        const value = try self.normalizeStringLiteralRaw(tok.slice(self.source));
         return self.create(ast.Expr, .{
             .string_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = try self.interner.intern(value) },
         });
@@ -3559,7 +3626,7 @@ pub const Parser = struct {
             prefix_raw[1..]
         else
             prefix_raw;
-        const prefix = self.unescapeString(prefix_stripped);
+        const prefix = try self.unescapeString(prefix_stripped);
         if (prefix.len > 0) {
             try parts.append(self.allocator, .{ .literal = try self.interner.intern(prefix) });
         }
@@ -3573,7 +3640,7 @@ pub const Parser = struct {
             switch (self.peek()) {
                 .string_literal_part => {
                     const part_tok = self.advance();
-                    const part_raw = self.unescapeString(part_tok.slice(self.source));
+                    const part_raw = try self.unescapeString(part_tok.slice(self.source));
                     if (part_raw.len > 0) {
                         try parts.append(self.allocator, .{ .literal = try self.interner.intern(part_raw) });
                     }
@@ -3585,7 +3652,7 @@ pub const Parser = struct {
                     const end_raw = end_tok.slice(self.source);
                     // Strip closing quote, unescape
                     const suffix_stripped = if (end_raw.len > 0 and end_raw[end_raw.len - 1] == '"') end_raw[0 .. end_raw.len - 1] else end_raw;
-                    const suffix = self.unescapeString(suffix_stripped);
+                    const suffix = try self.unescapeString(suffix_stripped);
                     if (suffix.len > 0) {
                         try parts.append(self.allocator, .{ .literal = try self.interner.intern(suffix) });
                     }
@@ -3613,16 +3680,16 @@ pub const Parser = struct {
 
     fn parseAtomLiteral(self: *Parser) !*const ast.Expr {
         const tok = self.advance();
-        const value = self.parseAtomTokenValue(tok);
+        const value = try self.parseAtomTokenValue(tok);
         return self.create(ast.Expr, .{
             .atom_literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = try self.interner.intern(value) },
         });
     }
 
-    fn parseAtomTokenValue(self: *Parser, tok: Token) []const u8 {
+    fn parseAtomTokenValue(self: *Parser, tok: Token) ![]const u8 {
         const raw = tok.slice(self.source);
         if (raw.len >= 3 and std.mem.startsWith(u8, raw, ":\"") and raw[raw.len - 1] == '"') {
-            return self.unescapeString(raw[2 .. raw.len - 1]);
+            return try self.unescapeString(raw[2 .. raw.len - 1]);
         }
         return if (raw.len > 0 and raw[0] == ':') raw[1..] else raw;
     }
@@ -4174,8 +4241,8 @@ pub const Parser = struct {
 
         const prev_case_arm = self.case_arm_pattern_context;
         self.case_arm_pattern_context = true;
+        defer self.case_arm_pattern_context = prev_case_arm;
         const pattern = try self.parsePattern();
-        self.case_arm_pattern_context = prev_case_arm;
 
         var type_annotation: ?*const ast.TypeExpr = null;
         if (self.check(.double_colon)) {
@@ -4821,6 +4888,8 @@ pub const Parser = struct {
     // ============================================================
 
     pub fn parsePattern(self: *Parser) anyerror!*const ast.Pattern {
+        try self.enterNesting(self.currentSpan());
+        defer self.leaveNesting();
         switch (self.peek()) {
             .identifier => {
                 const tok = self.advance();
@@ -4937,7 +5006,7 @@ pub const Parser = struct {
             .int_literal => {
                 const tok = self.advance();
                 const span = ast.SourceSpan.from(tok.loc);
-                const text = self.stripNumericUnderscores(tok.slice(self.source));
+                const text = try self.stripNumericUnderscores(tok.slice(self.source));
                 const value = try self.parseI64Literal(text, span);
                 return self.create(ast.Pattern, .{
                     .literal = .{ .int = .{
@@ -4977,7 +5046,7 @@ pub const Parser = struct {
             .float_literal => {
                 const tok = self.advance();
                 const span = ast.SourceSpan.from(tok.loc);
-                const text = self.stripNumericUnderscores(tok.slice(self.source));
+                const text = try self.stripNumericUnderscores(tok.slice(self.source));
                 const value = try self.parseF64Literal(text, span);
                 return self.create(ast.Pattern, .{
                     .literal = .{ .float = .{
@@ -4992,7 +5061,7 @@ pub const Parser = struct {
                 // escape normalization as expression-position strings, or an
                 // escaped string pattern (e.g. `"a\nb"`) can never match the
                 // equally-escaped runtime value (audit finding parser-2--01).
-                const value = self.normalizeStringLiteralRaw(tok.slice(self.source));
+                const value = try self.normalizeStringLiteralRaw(tok.slice(self.source));
                 return self.create(ast.Pattern, .{
                     .literal = .{ .string = .{
                         .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
@@ -5002,7 +5071,7 @@ pub const Parser = struct {
             },
             .atom_literal => {
                 const tok = self.advance();
-                const value = self.parseAtomTokenValue(tok);
+                const value = try self.parseAtomTokenValue(tok);
                 return self.create(ast.Pattern, .{
                     .literal = .{ .atom = .{
                         .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
@@ -5047,7 +5116,7 @@ pub const Parser = struct {
                 if (self.check(.int_literal)) {
                     const tok = self.advance();
                     const span = ast.SourceSpan.merge(start, ast.SourceSpan.from(tok.loc));
-                    const magnitude = self.stripNumericUnderscores(tok.slice(self.source));
+                    const magnitude = try self.stripNumericUnderscores(tok.slice(self.source));
                     // Parse the SIGN together with the digits so the `i64`-MIN
                     // boundary round-trips: the magnitude `9223372036854775808`
                     // overflows `i64`, but `-9223372036854775808` is a valid
@@ -5075,10 +5144,11 @@ pub const Parser = struct {
                 return error.ParseError;
             },
             else => {
-                try self.addRichError(
-                    std.fmt.allocPrint(self.allocator, "I was not expecting {s} in this pattern", .{
+                try self.addRichErrorFmt(
+                    "I was not expecting {s} in this pattern",
+                    .{
                         tokenHumanName(self.current.tag),
-                    }) catch "unexpected token in pattern",
+                    },
                     self.currentSpan(),
                     "not valid in a pattern",
                     "patterns can be literals, variables, tuples `{a, b}`, lists `[a, b]`, or the wildcard `_`",
@@ -5482,7 +5552,7 @@ pub const Parser = struct {
                 // <<"\r\n"::String, rest::String>> matches the actual CRLF
                 // bytes, not a literal backslash-r (audit finding parser-2--01).
                 const tok = self.advance();
-                const str_val = self.normalizeStringLiteralRaw(tok.slice(self.source));
+                const str_val = try self.normalizeStringLiteralRaw(tok.slice(self.source));
                 break :blk .{ .string_literal = try self.interner.intern(str_val) };
             }
             if (context == .pattern) {
@@ -5542,17 +5612,14 @@ pub const Parser = struct {
         if (self.check(.int_literal)) {
             const tok = self.advance();
             const span = ast.SourceSpan.from(tok.loc);
-            const text = self.stripNumericUnderscores(tok.slice(self.source));
+            const text = try self.stripNumericUnderscores(tok.slice(self.source));
             // An out-of-range or unparseable size must diagnose, never fold to
             // `0`: a silent `size(0)` weakens the binary pattern's minimum
             // length requirement so it matches buffers it should reject.
             const value = std.fmt.parseInt(u32, text, 0) catch {
-                try self.addRichError(
-                    std.fmt.allocPrint(
-                        self.allocator,
-                        "the binary segment size `{s}` is out of range",
-                        .{text},
-                    ) catch "binary segment size is out of range",
+                try self.addRichErrorFmt(
+                    "the binary segment size `{s}` is out of range",
+                    .{text},
                     span,
                     "does not fit in a 32-bit unsigned integer",
                     "binary segment sizes must be in the range 0..4294967295 (u32)",
@@ -5605,6 +5672,8 @@ pub const Parser = struct {
     // ============================================================
 
     pub fn parseTypeExpr(self: *Parser) anyerror!*const ast.TypeExpr {
+        try self.enterNesting(self.currentSpan());
+        defer self.leaveNesting();
         return self.parseTypeUnion();
     }
 
@@ -5646,10 +5715,11 @@ pub const Parser = struct {
             .int_literal, .string_literal, .keyword_true, .keyword_false, .keyword_nil => return self.parseLiteralType(),
             .identifier, .type_identifier => return self.parseNamedType(),
             else => {
-                try self.addRichError(
-                    std.fmt.allocPrint(self.allocator, "I was not expecting {s} in this type annotation", .{
+                try self.addRichErrorFmt(
+                    "I was not expecting {s} in this type annotation",
+                    .{
                         tokenHumanName(self.current.tag),
-                    }) catch "unexpected token in type",
+                    },
                     self.currentSpan(),
                     "not a valid type",
                     "types look like: `i64`, `String`, `{:ok, i64}`, or `List(i64)`",
@@ -5888,7 +5958,7 @@ pub const Parser = struct {
 
     fn parseAtomType(self: *Parser) !*const ast.TypeExpr {
         const tok = self.advance();
-        const value = self.parseAtomTokenValue(tok);
+        const value = try self.parseAtomTokenValue(tok);
         return self.create(ast.TypeExpr, .{
             .literal = .{
                 .meta = .{ .span = ast.SourceSpan.from(tok.loc) },
@@ -5907,7 +5977,7 @@ pub const Parser = struct {
                 // underscored literals round-trip instead of silently folding
                 // to `0` (base-10 parse of `0xFF` formerly failed → `catch 0`,
                 // turning literal type `0xFF` into literal type `0`).
-                const text = self.stripNumericUnderscores(tok.slice(self.source));
+                const text = try self.stripNumericUnderscores(tok.slice(self.source));
                 const value = try self.parseI64Literal(text, span);
                 return self.create(ast.TypeExpr, .{
                     .literal = .{ .meta = .{ .span = span }, .value = .{ .int = value } },
@@ -5918,7 +5988,7 @@ pub const Parser = struct {
                 // literal type `"a\nb"` equals the same runtime string value
                 // (audit finding parser-2--01 / FE-02).
                 const tok = self.advance();
-                const value = self.normalizeStringLiteralRaw(tok.slice(self.source));
+                const value = try self.normalizeStringLiteralRaw(tok.slice(self.source));
                 return self.create(ast.TypeExpr, .{
                     .literal = .{ .meta = .{ .span = ast.SourceSpan.from(tok.loc) }, .value = .{ .string = try self.interner.intern(value) } },
                 });
@@ -6033,6 +6103,8 @@ pub const Parser = struct {
     // ============================================================
 
     fn exprToPattern(self: *Parser, expr: *const ast.Expr) !*const ast.Pattern {
+        try self.enterNesting(expr.getMeta().span);
+        defer self.leaveNesting();
         switch (expr.*) {
             .var_ref => |v| {
                 const name = self.interner.get(v.name);
@@ -6216,6 +6288,127 @@ fn tokenHumanName(tag: Token.Tag) []const u8 {
 // Tests
 // ============================================================
 
+const FailOnceAllocator = struct {
+    backing_allocator: std.mem.Allocator,
+    fail_index: usize,
+    allocation_index: usize = 0,
+    failed: bool = false,
+
+    fn init(backing_allocator: std.mem.Allocator, fail_index: usize) FailOnceAllocator {
+        return .{
+            .backing_allocator = backing_allocator,
+            .fail_index = fail_index,
+        };
+    }
+
+    fn allocator(self: *FailOnceAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        const current_index = self.allocation_index;
+        self.allocation_index += 1;
+        if (!self.failed and current_index == self.fail_index) {
+            self.failed = true;
+            return null;
+        }
+        return self.backing_allocator.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing_allocator.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing_allocator.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *FailOnceAllocator = @ptrCast(@alignCast(ctx));
+        self.backing_allocator.rawFree(memory, alignment, return_address);
+    }
+};
+
+test "numeric literal normalization propagates OutOfMemory during underscore removal" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var fail_once_allocator = FailOnceAllocator.init(std.testing.allocator, 0);
+    var parser = Parser.initWithSharedInterner(fail_once_allocator.allocator(), "1_000", &interner, 0);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, parser.parseExpr());
+    try std.testing.expect(fail_once_allocator.failed);
+    try std.testing.expectEqual(@as(usize, 0), parser.errors.items.len);
+}
+
+test "string literal normalization propagates OutOfMemory during escape processing" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var fail_once_allocator = FailOnceAllocator.init(std.testing.allocator, 0);
+    var parser = Parser.initWithSharedInterner(fail_once_allocator.allocator(), "\"\\n\"", &interner, 0);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, parser.parseExpr());
+    try std.testing.expect(fail_once_allocator.failed);
+    try std.testing.expectEqual(@as(usize, 0), parser.errors.items.len);
+}
+
+test "parser init propagates OutOfMemory while allocating owned interner" {
+    var fail_once_allocator = FailOnceAllocator.init(std.testing.allocator, 0);
+
+    try std.testing.expectError(error.OutOfMemory, Parser.init(fail_once_allocator.allocator(), ""));
+    try std.testing.expect(fail_once_allocator.failed);
+}
+
+test "dotted union-name assembly propagates OutOfMemory without interning partial name" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const source =
+        \\union IO.Mode {
+        \\  Read
+        \\}
+    ;
+
+    var fail_once_allocator = FailOnceAllocator.init(std.testing.allocator, 0);
+    var parser = Parser.initWithSharedInterner(fail_once_allocator.allocator(), source, &interner, 0);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, parser.parseProgram());
+    try std.testing.expect(fail_once_allocator.failed);
+    try std.testing.expectEqual(@as(usize, 0), parser.errors.items.len);
+    try std.testing.expect(interner.lookupExisting("IO.Mode") == null);
+    try std.testing.expect(interner.lookupExisting(".Mode") == null);
+    try std.testing.expect(interner.lookupExisting("IO.") == null);
+    try std.testing.expect(interner.lookupExisting("IOMode") == null);
+}
+
+test "parser diagnostic formatting propagates OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var fail_once_allocator = FailOnceAllocator.init(std.testing.allocator, 0);
+    var parser = Parser.initWithSharedInterner(fail_once_allocator.allocator(), ")", &interner, 0);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, parser.parseExpr());
+    try std.testing.expect(fail_once_allocator.failed);
+    try std.testing.expectEqual(@as(usize, 0), parser.errors.items.len);
+}
+
 test "top-level fn is rejected" {
     const source =
         \\fn foo() {
@@ -6225,7 +6418,7 @@ test "top-level fn is rejected" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const result = parser.parseProgram();
@@ -6241,7 +6434,7 @@ test "top-level pub fn is also rejected" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const result = parser.parseProgram();
@@ -6262,7 +6455,7 @@ test "non-script mode still rejects top-level fn" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expect(!parser.script_mode);
@@ -6294,7 +6487,7 @@ test "script-mode parser hoists single top-level main/1" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.initScript(arena.allocator(), source);
+    var parser = try Parser.initScript(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expect(parser.script_mode);
@@ -6349,7 +6542,7 @@ test "script-mode parser preserves a single literal main/1 with no other top-lev
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.initScript(arena.allocator(), source);
+    var parser = try Parser.initScript(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6371,7 +6564,7 @@ test "parse simple function" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6392,7 +6585,7 @@ test "parse unique param ownership annotation" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6410,11 +6603,33 @@ test "parse borrowed param ownership annotation" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
     try std.testing.expectEqual(ast.Ownership.borrowed, program.structs[0].items[0].function.clauses[0].params[0].ownership);
+}
+
+test "parse protocol param ownership annotation" {
+    const source =
+        \\pub protocol Disposable(item) {
+        \\  fn dispose(state :: unique Disposable(item)) -> Nil
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = try Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 1), program.top_items.len);
+    try std.testing.expect(program.top_items[0] == .protocol);
+    const protocol = program.top_items[0].protocol;
+    try std.testing.expectEqual(@as(usize, 1), protocol.functions.len);
+    try std.testing.expectEqual(@as(usize, 1), protocol.functions[0].params.len);
+    try std.testing.expectEqual(ast.Ownership.unique, protocol.functions[0].params[0].ownership);
+    try std.testing.expect(protocol.functions[0].params[0].ownership_explicit);
 }
 
 test "parse function type ownership annotations" {
@@ -6428,7 +6643,7 @@ test "parse function type ownership annotations" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6445,7 +6660,7 @@ test "parse fn() -> T function type (nullary)" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -6459,7 +6674,7 @@ test "parse fn(A) -> T function type (unary)" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -6474,7 +6689,7 @@ test "parse fn(A, B) -> T function type (binary)" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -6488,7 +6703,7 @@ test "parse fn function type with ownership qualifiers" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -6505,7 +6720,7 @@ test "parse right-associative nested fn function type" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -6522,7 +6737,7 @@ test "parse fn function type with a closure parameter type" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -6540,7 +6755,7 @@ test "parse fn function type stops before a trailing brace (type vs value)" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -6561,7 +6776,7 @@ test "parse return-position fn function type — brace is the outer fn body" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6579,7 +6794,7 @@ test "old arrow-in-parens function type is now a parse error" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const result = parser.parseTypeExpr();
@@ -6591,7 +6806,7 @@ test "old nullary arrow-in-parens function type is now a parse error" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const result = parser.parseTypeExpr();
@@ -6605,7 +6820,7 @@ test "grouped-paren type still parses after removing arrow form" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -6624,7 +6839,7 @@ test "parse struct" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6637,7 +6852,7 @@ test "parse type declaration" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6660,7 +6875,7 @@ test "parse if expression" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6681,7 +6896,7 @@ test "parse case expression" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6699,7 +6914,7 @@ test "parse binary operators" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6725,7 +6940,7 @@ test "parse tuple and list" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6743,7 +6958,7 @@ test "parse refinement predicate" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6763,7 +6978,7 @@ test "parse assignment" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6784,7 +6999,7 @@ test "parse function call" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6805,7 +7020,7 @@ test "parse quoted atom literals with double quotes" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6827,7 +7042,7 @@ test "parse quoted atom interpolation syntax" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6847,7 +7062,7 @@ test "parse unprefixed qualified function slash arity as expression, not functio
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6868,7 +7083,7 @@ test "parse ampersand qualified function slash arity as function ref" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6889,7 +7104,7 @@ test "parse pipe operator" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6910,7 +7125,7 @@ test "parse struct declaration" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6940,7 +7155,7 @@ test "parser records field-default expression on a top-level pub struct" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -6975,7 +7190,7 @@ test "parser records field-default expressions across mixed types" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7011,7 +7226,7 @@ test "parser leaves undefaulted fields with null default" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7032,7 +7247,7 @@ test "parse panic expression" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7055,7 +7270,7 @@ test "parse local function" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7085,7 +7300,7 @@ test "parse struct with types and functions" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7103,7 +7318,7 @@ test "parse top-level defstruct" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7122,7 +7337,7 @@ test "parse data struct field named struct" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7144,7 +7359,7 @@ test "parse defstruct extends" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7165,7 +7380,7 @@ test "parse union declaration" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7191,7 +7406,7 @@ test "parse struct extends" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7210,7 +7425,7 @@ test "parse struct literal field named struct" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7232,7 +7447,7 @@ test "parse struct pattern field named struct" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7258,7 +7473,7 @@ test "parse struct init with type annotation" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7282,7 +7497,7 @@ test "parse private struct" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7303,7 +7518,7 @@ test "parse defmacrop inside struct" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7330,7 +7545,7 @@ test "parse macro named case and case call expression" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7359,7 +7574,7 @@ test "parse struct is_private false by default" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7379,7 +7594,7 @@ test "parse typed struct attribute" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7407,7 +7622,7 @@ test "parse marker attribute" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7432,7 +7647,7 @@ test "parse multiple attributes on same function" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7460,7 +7675,7 @@ test "parse struct-level attribute" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7488,7 +7703,7 @@ test "parse attribute with integer value" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7513,7 +7728,7 @@ test "parse attribute with list value" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7537,7 +7752,7 @@ test "parse error pipe ~> with block handler" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7560,7 +7775,7 @@ test "parse error pipe ~> with function handler" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7585,7 +7800,7 @@ test "parse with expression: multi-step + else (Phase 3.c)" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7611,7 +7826,7 @@ test "parse with expression: else-less form (Phase 3.c)" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7637,7 +7852,7 @@ test "parse with: bare `with` identifier is not hijacked (Phase 3.c)" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7654,7 +7869,7 @@ test "parse keyword list expression desugars to tuples" {
     const source = "[name: \"Brian\", age: 42]";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7685,7 +7900,7 @@ test "parse use declaration with bare keyword options" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7712,7 +7927,7 @@ test "parse use declaration with explicit empty option list" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -7727,7 +7942,7 @@ test "parse keyword list pattern desugars to tuple patterns" {
     const source = "[name: n, age: a]";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const pat = try parser.parsePattern();
@@ -7746,7 +7961,7 @@ test "parse non-keyword list unchanged" {
     const source = "[1, 2, 3]";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7761,7 +7976,7 @@ test "parse for comprehension" {
     const source = "for x <- items { x * 2 }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7779,7 +7994,7 @@ test "parse for comprehension with filter" {
     const source = "for x <- items, x > 0 { x }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7792,7 +8007,7 @@ test "parse for comprehension with tuple-destructure pattern" {
     const source = "for {k, v} <- pairs { v }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7808,7 +8023,7 @@ test "parse for comprehension with type annotation on bare bind" {
     const source = "for x :: i64 <- numbers { x }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7824,7 +8039,7 @@ test "parse for comprehension with destructure + type annotation" {
     const source = "for {k, v} :: {Atom, i64} <- pairs { v }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7839,7 +8054,7 @@ test "parse for comprehension with cons pattern" {
     const source = "for [head | _tail] <- nested { head }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7851,7 +8066,7 @@ test "parse for comprehension with tagged tuple pattern" {
     const source = "for {:ok, n} <- results { n }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7866,7 +8081,7 @@ test "parse for comprehension annotation + filter" {
     const source = "for x :: i64 <- numbers, x > 0 { x }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7880,7 +8095,7 @@ test "parse list cons expression [h | t]" {
     const source = "[1 | rest]";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7893,7 +8108,7 @@ test "parse trailing block as last argument" {
     const source = "foo(\"name\") { 1 + 2 }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7908,7 +8123,7 @@ test "parse nested trailing blocks" {
     const source = "describe(\"math\") { test(\"add\") { 1 + 1 } }";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -7941,7 +8156,7 @@ test "missing call paren before trailing block reports one focused parser error"
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const result = parser.parseProgram();
@@ -7968,7 +8183,7 @@ test "missing call paren before body block preserves disabled trailing block bou
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const result = parser.parseProgram();
@@ -7995,7 +8210,7 @@ test "parse sigil desugars to function call" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8023,7 +8238,7 @@ test "parse multi-char sigil" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8046,7 +8261,7 @@ test "parse ~s sigil desugars to sigil_s call" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8072,7 +8287,7 @@ test "parse ~w sigil desugars to sigil_w call" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8095,7 +8310,7 @@ test "parse &Struct.function/arity as function_ref" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8121,7 +8336,7 @@ test "parse &function/arity as local function_ref" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8146,7 +8361,7 @@ test "parse &function/arity rejects out-of-range arity instead of folding to zer
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parseProgram());
@@ -8166,7 +8381,7 @@ test "parse &function/arity rejects non-decimal arity instead of folding to zero
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parseProgram());
@@ -8184,7 +8399,7 @@ test "parse import filter rejects out-of-range arity instead of folding to zero"
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parseProgram());
@@ -8202,7 +8417,7 @@ test "parse import filter rejects non-decimal arity instead of folding to zero" 
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parseProgram());
@@ -8224,7 +8439,7 @@ test "parse anonymous function expression" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8246,7 +8461,7 @@ test "parse protocol declaration" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8278,7 +8493,7 @@ test "parse protocol with multiple function signatures" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8300,7 +8515,7 @@ test "parse impl declaration" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8328,7 +8543,7 @@ test "parse impl with multiple functions" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8345,7 +8560,7 @@ test "parse private protocol" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8365,7 +8580,7 @@ test "parse private impl" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8385,7 +8600,7 @@ test "parse impl with generic type parameters" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8411,7 +8626,7 @@ test "parse impl with single type parameter" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8431,7 +8646,7 @@ test "parse impl with no type parameters keeps existing shape" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8448,7 +8663,7 @@ test "parse impl rejects nested type expression as type parameter" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     // Type-parameter slot must be a bare name. Nested calls like
@@ -8476,7 +8691,7 @@ test "parse pub struct with single type parameter" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8497,7 +8712,7 @@ test "parse pub struct with multiple type parameters" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8516,7 +8731,7 @@ test "parse pub struct without type parameters keeps existing shape" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8533,7 +8748,7 @@ test "parse pub struct rejects nested type expression in header" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const result = parser.parseProgram();
@@ -8550,7 +8765,7 @@ test "parse pub union with single type parameter" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8570,7 +8785,7 @@ test "parse pub union with multiple type parameters" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8591,7 +8806,7 @@ test "parse pub union without type parameters keeps existing shape" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8609,7 +8824,7 @@ test "parse pub union rejects nested type expression in header" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const result = parser.parseProgram();
@@ -8633,7 +8848,7 @@ test "parse struct literal with single type argument" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8675,7 +8890,7 @@ test "parse struct literal with multiple type arguments" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8708,7 +8923,7 @@ test "parse struct literal without type arguments keeps empty slice" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8747,7 +8962,7 @@ test "parse parametric tagged-union variant construction with payload" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8792,7 +9007,7 @@ test "parse parametric tagged-union nullary variant construction" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8834,7 +9049,7 @@ test "parse percent-prefixed parametric tagged-union variant construction" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8876,7 +9091,7 @@ test "parse parametric variant construction with multi-type-arg receiver" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8922,7 +9137,7 @@ test "parametric variant construction does not eat normal call expressions" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8942,7 +9157,7 @@ test "less-than expression after struct call still parses as comparison" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -8966,7 +9181,7 @@ test "contextual-keyword: `quote` binds as a variable and is callable" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const func = program.structs[0].items[0].function;
@@ -8987,7 +9202,7 @@ test "contextual-keyword: a function may be literally named `quote`" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     try std.testing.expect(program.structs[0].items[0] == .function);
@@ -9005,7 +9220,7 @@ test "contextual-keyword: `quote { ... }` produces a quote_expr" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const body = program.structs[0].items[0].function.clauses[0].body.?;
@@ -9022,7 +9237,7 @@ test "contextual-keyword: `unquote(x)` inside quote produces unquote_expr" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const body = program.structs[0].items[0].function.clauses[0].body.?;
@@ -9041,7 +9256,7 @@ test "contextual-keyword: identity macro with quote/unquote parses" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const decl = program.structs[0].items[0].macro;
@@ -9063,7 +9278,7 @@ test "contextual-keyword: `pub fn unquote(name)(...)` dynamic-name form parses" 
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const macro_decl = program.structs[0].items[0].macro;
@@ -9097,7 +9312,7 @@ test "parse tagged-union variant pattern with single-bind payload" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const body = program.structs[0].items[0].function.clauses[0].body.?;
@@ -9143,7 +9358,7 @@ test "parse tagged-union variant pattern with explicit type-args" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const body = program.structs[0].items[0].function.clauses[0].body.?;
@@ -9180,7 +9395,7 @@ test "parse tagged-union variant pattern with wildcard payload" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const body = program.structs[0].items[0].function.clauses[0].body.?;
@@ -9206,7 +9421,7 @@ test "parse tagged-union variant pattern with multi-type-arg receiver" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const body = program.structs[0].items[0].function.clauses[0].body.?;
@@ -9240,7 +9455,7 @@ test "tagged-union variant pattern preserves enum-style fallback for parameter c
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const func = program.structs[0].items[0].function;
@@ -9272,7 +9487,7 @@ test "parse union variant declared with Some(T) constructor-call form" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const decl_opt = findTopLevelUnion(program);
@@ -9309,10 +9524,10 @@ test "parse union variant Some(T) form matches canonical Some :: T payload shape
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser_a = Parser.init(arena.allocator(), source_canonical);
+    var parser_a = try Parser.init(arena.allocator(), source_canonical);
     defer parser_a.deinit();
     const program_a = try parser_a.parseProgram();
-    var parser_b = Parser.init(arena.allocator(), source_alias);
+    var parser_b = try Parser.init(arena.allocator(), source_alias);
     defer parser_b.deinit();
     const program_b = try parser_b.parseProgram();
 
@@ -9337,7 +9552,7 @@ test "parse union variant Some() with no payload rejects with a clear error" {
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
     _ = parser.parseProgram() catch {
         // Expected — the parser surfaces a richer error than
@@ -9367,7 +9582,7 @@ test "parser accepts a minimal pub error declaration" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -9391,7 +9606,7 @@ test "parser accepts a bare error declaration as priv_error_decl" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -9423,7 +9638,7 @@ test "parser preserves a pub error field with a default value" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -9448,7 +9663,7 @@ test "parser preserves an inline pub fn override on a pub error" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -9474,7 +9689,7 @@ test "parser captures `@code Z<digits>` attribute as a string-literal value" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -9502,7 +9717,7 @@ test "parser rejects `@code` with a malformed bareword value" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     _ = parser.parseProgram() catch {
@@ -9520,7 +9735,7 @@ test "parser accepts a parametric pub error declaration" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const program = try parser.parseProgram();
@@ -9541,7 +9756,7 @@ test "parser rejects nested structs inside a pub error body" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     _ = parser.parseProgram() catch return;
@@ -9570,7 +9785,7 @@ test "error-tolerant parsing surfaces all three statement errors in one body" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const result = parser.parseProgram();
@@ -9598,11 +9813,34 @@ test "error-tolerant parsing recovers and keeps later valid declarations" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     _ = parser.parseProgram() catch {};
     // Exactly the one broken statement is reported.
+    try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
+}
+
+test "error-tolerant parsing propagates OutOfMemory while creating poison recovery node" {
+    const source =
+        \\pub fn main() {
+        \\  &&
+        \\}
+    ;
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    // In this script-mode fixture, the first parser-owned allocation records
+    // the real parse diagnostic for `&&`; the second creates the poison
+    // statement used for recovery. Failing the second allocation must preserve
+    // the infrastructure error instead of demoting it to `ParseError`.
+    var fail_once_allocator = FailOnceAllocator.init(std.testing.allocator, 1);
+    var parser = Parser.initWithSharedInternerScriptMode(fail_once_allocator.allocator(), source, &interner, 0, true);
+    defer parser.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, parser.parseProgram());
+    try std.testing.expect(fail_once_allocator.failed);
     try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
 }
 
@@ -9640,7 +9878,7 @@ test "expression: out-of-range integer literal raises a diagnostic, never folds 
     const source = "9223372036854775808";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parseExpr());
@@ -9653,7 +9891,7 @@ test "expression: a valid i64-MAX literal still parses" {
     const source = "9223372036854775807";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const expr = try parser.parseExpr();
@@ -9668,7 +9906,7 @@ test "expression: an all-ones u64 hex mask raises a diagnostic, never folds to 0
     const source = "0xFFFF_FFFF_FFFF_FFFF";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parseExpr());
@@ -9683,7 +9921,7 @@ test "pattern: i64-MIN negative literal round-trips to the exact value, never fo
     const source = "-9223372036854775808";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const pat = try parser.parsePattern();
@@ -9697,7 +9935,7 @@ test "pattern: out-of-range integer literal raises a diagnostic, never folds to 
     const source = "99999999999999999999";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parsePattern());
@@ -9710,7 +9948,7 @@ test "pattern: out-of-range negative literal (beyond i64-MIN) raises a diagnosti
     const source = "-9223372036854775809";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parsePattern());
@@ -9724,7 +9962,7 @@ test "literal type: hex literal type round-trips to its value, never folds to 0"
     const source = "0xFF";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -9738,7 +9976,7 @@ test "literal type: underscored decimal literal type round-trips to its value" {
     const source = "1_000_000";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     const type_expr = try parser.parseTypeExpr();
@@ -9751,7 +9989,7 @@ test "literal type: out-of-range integer literal type raises a diagnostic, never
     const source = "99999999999999999999";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parseTypeExpr());
@@ -9767,7 +10005,7 @@ test "binary segment size: out-of-range size raises a diagnostic, never folds to
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var parser = Parser.init(arena.allocator(), source);
+    var parser = try Parser.init(arena.allocator(), source);
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parsePattern());
@@ -9777,4 +10015,91 @@ test "binary segment size: out-of-range size raises a diagnostic, never folds to
         if (std.mem.indexOf(u8, err.message, "out of range") != null) saw_size_error = true;
     }
     try std.testing.expect(saw_size_error);
+}
+
+test "parser rejects expression nesting before native stack overflow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source: std.ArrayList(u8) = .empty;
+    for (0..Parser.MAX_NESTING_DEPTH + 8) |_| try source.append(alloc, '(');
+    try source.append(alloc, '1');
+    for (0..Parser.MAX_NESTING_DEPTH + 8) |_| try source.append(alloc, ')');
+
+    var parser = try Parser.init(alloc, source.items);
+    defer parser.deinit();
+    try std.testing.expectError(error.ParseError, parser.parseExpr());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "code is nested too deeply") != null);
+}
+
+test "parser rejects parameter pattern nesting before native stack overflow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source: std.ArrayList(u8) = .empty;
+    try source.appendSlice(alloc,
+        \\pub struct Test {
+        \\  pub fn nested(
+    );
+    for (0..Parser.MAX_NESTING_DEPTH + 8) |_| try source.append(alloc, '[');
+    try source.append(alloc, '_');
+    for (0..Parser.MAX_NESTING_DEPTH + 8) |_| try source.append(alloc, ']');
+    try source.appendSlice(alloc,
+        \\) {
+        \\    0
+        \\  }
+        \\}
+    );
+
+    var parser = try Parser.init(alloc, source.items);
+    defer parser.deinit();
+    try std.testing.expectError(error.ParseError, parser.parseProgram());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "code is nested too deeply") != null);
+}
+
+test "parser rejects type nesting before native stack overflow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var source: std.ArrayList(u8) = .empty;
+    for (0..Parser.MAX_NESTING_DEPTH + 8) |_| try source.append(alloc, '[');
+    try source.appendSlice(alloc, "i64");
+    for (0..Parser.MAX_NESTING_DEPTH + 8) |_| try source.append(alloc, ']');
+
+    var parser = try Parser.init(alloc, source.items);
+    defer parser.deinit();
+    try std.testing.expectError(error.ParseError, parser.parseTypeExpr());
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "code is nested too deeply") != null);
+}
+
+test "parser rejects exprToPattern nesting before native stack overflow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, "");
+    defer parser.deinit();
+
+    const span = ast.SourceSpan{ .start = 0, .end = 1 };
+    var expr = try parser.create(ast.Expr, .{
+        .int_literal = .{ .meta = .{ .span = span }, .value = 1 },
+    });
+    for (0..Parser.MAX_NESTING_DEPTH + 8) |_| {
+        expr = try parser.create(ast.Expr, .{
+            .tuple = .{
+                .meta = .{ .span = span },
+                .elements = try alloc.dupe(*const ast.Expr, &.{expr}),
+            },
+        });
+    }
+
+    try std.testing.expectError(error.ParseError, parser.exprToPattern(expr));
+    try std.testing.expect(parser.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, parser.errors.items[0].message, "code is nested too deeply") != null);
 }

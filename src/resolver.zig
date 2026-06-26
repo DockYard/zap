@@ -562,11 +562,11 @@ test "resolve simple function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -591,11 +591,11 @@ test "resolve struct with function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -622,11 +622,11 @@ test "resolve case expression with bindings" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -651,11 +651,11 @@ test "resolve assignment" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 

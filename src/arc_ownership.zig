@@ -132,7 +132,7 @@ pub fn classifyAndNormalizeWithProgram(
 ) !void {
     _ = type_store;
 
-    refineParamGetOwnership(function);
+    try refineParamGetOwnership(allocator, function);
 
     // Two-pass strategy mirrors `arc_drop_insertion.zig`:
     //   1. Pre-pass: collect, across every instruction stream in
@@ -151,7 +151,7 @@ pub fn classifyAndNormalizeWithProgram(
     defer use_summary.deinit(allocator);
     try collectUseSummaryWithProgram(allocator, function, &use_summary, program);
 
-    preclassifyBorrowedAliases(function, &use_summary);
+    try preclassifyBorrowedAliases(allocator, function, &use_summary);
 
     // arc-own-1--02: the move gates below (`shouldMove`,
     // `shouldMoveIntoAggregate`, `shouldMoveIntoOwnedConsume`) key
@@ -164,7 +164,7 @@ pub fn classifyAndNormalizeWithProgram(
     // any future regression fails loudly in debug instead of silently
     // mis-keying the move/copy decision (no-op in release; no-op for
     // synthetic unit-test tables whose `record_count` is null).
-    arc_liveness.assertConsumerWalkMatches(ownership, arc_liveness.countInstructionRecords(function));
+    arc_liveness.assertConsumerWalkMatches(ownership, try arc_liveness.countInstructionRecords(allocator, function));
 
     var rewriter = StreamRewriter{
         .allocator = allocator,
@@ -176,7 +176,7 @@ pub fn classifyAndNormalizeWithProgram(
     for (function.body, 0..) |_, block_index| {
         const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
         const original = block_ptr.instructions;
-        rewriter.next_id = computeStreamStartIdForBlock(function, block_index);
+        rewriter.next_id = try computeStreamStartIdForBlock(allocator, function, block_index);
         const rebuilt = try rewriter.rewriteStream(original);
         if (rebuilt) |new_slice| {
             block_ptr.instructions = new_slice;
@@ -190,7 +190,11 @@ pub fn classifyAndNormalizeWithProgram(
     try promoter.rewriteFunction();
 }
 
-fn preclassifyBorrowedAliases(function: *ir.Function, summary: *const UseSummary) void {
+fn preclassifyBorrowedAliases(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    summary: *const UseSummary,
+) error{OutOfMemory}!void {
     const Visitor = struct {
         function: *ir.Function,
         summary: *const UseSummary,
@@ -218,10 +222,13 @@ fn preclassifyBorrowedAliases(function: *ir.Function, summary: *const UseSummary
     };
 
     var visitor = Visitor{ .function = function, .summary = summary };
-    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    try ir.forEachInstruction(allocator, function, &visitor, Visitor.visit);
 }
 
-fn refineParamGetOwnership(function: *ir.Function) void {
+fn refineParamGetOwnership(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+) error{OutOfMemory}!void {
     const Visitor = struct {
         function: *ir.Function,
 
@@ -239,7 +246,7 @@ fn refineParamGetOwnership(function: *ir.Function) void {
     };
 
     var visitor = Visitor{ .function = function };
-    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    try ir.forEachInstruction(allocator, function, &visitor, Visitor.visit);
 }
 
 fn appendCopyValueWithPersistentRetain(
@@ -251,6 +258,198 @@ fn appendCopyValueWithPersistentRetain(
     try out.append(allocator, .{ .copy_value = .{ .dest = dest, .source = source } });
     try out.append(allocator, .{ .retain = .{ .value = dest, .kind = .persistent } });
 }
+
+fn propagateProtocolBoxLocal(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    dest: ir.LocalId,
+    source: ir.LocalId,
+) error{OutOfMemory}!void {
+    if (function.protocol_box_locals.get(source)) |protocol_name| {
+        try function.protocol_box_locals.put(allocator, dest, protocol_name);
+    }
+}
+
+fn appendProtocolBoxAwareCopyValueWithPersistentRetain(
+    allocator: std.mem.Allocator,
+    function: *ir.Function,
+    out: *std.ArrayListUnmanaged(ir.Instruction),
+    dest: ir.LocalId,
+    source: ir.LocalId,
+) error{OutOfMemory}!void {
+    try appendCopyValueWithPersistentRetain(allocator, out, dest, source);
+    try propagateProtocolBoxLocal(allocator, function, dest, source);
+}
+
+const explicit_walk_inline_frame_capacity = 64;
+const explicit_walk_inline_child_capacity = 16;
+
+fn ExplicitInlineStack(comptime T: type, comptime inline_capacity: usize) type {
+    return struct {
+        inline_items: [inline_capacity]T = undefined,
+        inline_len: usize = 0,
+        spill: std.ArrayListUnmanaged(T) = .empty,
+
+        const Self = @This();
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.spill.deinit(allocator);
+        }
+
+        fn clearRetainingCapacity(self: *Self) void {
+            self.inline_len = 0;
+            self.spill.clearRetainingCapacity();
+        }
+
+        fn len(self: *const Self) usize {
+            return self.inline_len + self.spill.items.len;
+        }
+
+        fn append(self: *Self, allocator: std.mem.Allocator, item: T) error{OutOfMemory}!void {
+            if (self.spill.items.len == 0 and self.inline_len < inline_capacity) {
+                self.inline_items[self.inline_len] = item;
+                self.inline_len += 1;
+                return;
+            }
+            try self.spill.append(allocator, item);
+        }
+
+        fn get(self: *const Self, index: usize) T {
+            std.debug.assert(index < self.len());
+            if (index < self.inline_len) return self.inline_items[index];
+            return self.spill.items[index - self.inline_len];
+        }
+
+        fn topPtr(self: *Self) *T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) return &self.spill.items[self.spill.items.len - 1];
+            return &self.inline_items[self.inline_len - 1];
+        }
+
+        fn pop(self: *Self) T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) return self.spill.pop().?;
+            self.inline_len -= 1;
+            return self.inline_items[self.inline_len];
+        }
+    };
+}
+
+const ExplicitWalkControl = enum {
+    keep_walking,
+    stop,
+};
+
+const ExplicitInstructionFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+};
+
+const ExplicitInstructionWalker = struct {
+    allocator: std.mem.Allocator,
+    frames: ExplicitInlineStack(ExplicitInstructionFrame, explicit_walk_inline_frame_capacity) = .{},
+    child_streams: ExplicitInlineStack(ir.ChildStream, explicit_walk_inline_child_capacity) = .{},
+
+    fn init(allocator: std.mem.Allocator) ExplicitInstructionWalker {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *ExplicitInstructionWalker) void {
+        self.frames.deinit(self.allocator);
+        self.child_streams.deinit(self.allocator);
+    }
+
+    fn walkStream(
+        self: *ExplicitInstructionWalker,
+        root_stream: []const ir.Instruction,
+        context: anytype,
+        comptime visitFn: fn (
+            ctx: @TypeOf(context),
+            instr: *const ir.Instruction,
+        ) error{OutOfMemory}!ExplicitWalkControl,
+    ) error{OutOfMemory}!ExplicitWalkControl {
+        self.frames.clearRetainingCapacity();
+        self.child_streams.clearRetainingCapacity();
+        if (root_stream.len == 0) return .keep_walking;
+        try self.frames.append(self.allocator, .{ .stream = root_stream });
+        return self.drain(context, visitFn);
+    }
+
+    fn walkInstructionAndChildren(
+        self: *ExplicitInstructionWalker,
+        root_instruction: *const ir.Instruction,
+        context: anytype,
+        comptime visitFn: fn (
+            ctx: @TypeOf(context),
+            instr: *const ir.Instruction,
+        ) error{OutOfMemory}!ExplicitWalkControl,
+    ) error{OutOfMemory}!ExplicitWalkControl {
+        self.frames.clearRetainingCapacity();
+        self.child_streams.clearRetainingCapacity();
+        switch (try visitFn(context, root_instruction)) {
+            .keep_walking => {},
+            .stop => return .stop,
+        }
+        try self.pushInstructionChildren(root_instruction);
+        return self.drain(context, visitFn);
+    }
+
+    fn drain(
+        self: *ExplicitInstructionWalker,
+        context: anytype,
+        comptime visitFn: fn (
+            ctx: @TypeOf(context),
+            instr: *const ir.Instruction,
+        ) error{OutOfMemory}!ExplicitWalkControl,
+    ) error{OutOfMemory}!ExplicitWalkControl {
+        while (self.frames.len() != 0) {
+            const frame = self.frames.topPtr();
+            if (frame.next_index >= frame.stream.len) {
+                _ = self.frames.pop();
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            frame.next_index += 1;
+
+            switch (try visitFn(context, instr)) {
+                .keep_walking => {},
+                .stop => return .stop,
+            }
+            try self.pushInstructionChildren(instr);
+        }
+        return .keep_walking;
+    }
+
+    fn pushInstructionChildren(
+        self: *ExplicitInstructionWalker,
+        instr: *const ir.Instruction,
+    ) error{OutOfMemory}!void {
+        self.child_streams.clearRetainingCapacity();
+
+        const ChildCollector = struct {
+            walker: *ExplicitInstructionWalker,
+            err: ?error{OutOfMemory} = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null or child.stream.len == 0) return;
+                ctx.walker.child_streams.append(ctx.walker.allocator, child) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        var collector = ChildCollector{ .walker = self };
+        ir.forEachChildStream(instr, &collector, ChildCollector.onStream);
+        if (collector.err) |err| return err;
+
+        var child_index = self.child_streams.len();
+        while (child_index > 0) {
+            child_index -= 1;
+            try self.frames.append(self.allocator, .{ .stream = self.child_streams.get(child_index).stream });
+        }
+    }
+};
 
 const BorrowedResultPromoter = struct {
     allocator: std.mem.Allocator,
@@ -719,7 +918,7 @@ const BorrowedResultPromoter = struct {
         source: ir.LocalId,
     ) error{OutOfMemory}!ir.LocalId {
         const dest = try self.allocOwnedLocal();
-        try appendCopyValueWithPersistentRetain(self.allocator, out, dest, source);
+        try appendProtocolBoxAwareCopyValueWithPersistentRetain(self.allocator, self.function, out, dest, source);
         return dest;
     }
 
@@ -768,6 +967,24 @@ const BorrowedResultPromoter = struct {
 const LocalUseCounts = struct {
     borrow_use_count: u32 = 0,
     tail_call_arg_use_count: u32 = 0,
+    /// Count of uses where the local is the source of another `.local_get`.
+    /// This identifies pure alias chains. When the destination is carrying a
+    /// transfer-owned value and the alias chain ends in an explicit
+    /// `.move_value`, the classifier can lower the alias hop as `.move_value`
+    /// instead of copy/retain.
+    alias_use_count: u32 = 0,
+    /// Destination of the single alias use when `alias_use_count == 1`.
+    alias_dest: ?ir.LocalId = null,
+    /// Count of uses where the local is the source of `.move_value`.
+    /// A local_get whose destination is used only as a move source should
+    /// itself become a move when its source is also owned at that point.
+    move_source_use_count: u32 = 0,
+    /// Count of uses where the local is the value transferred into an
+    /// expression/function result (`ret`, `cond_return`, or `case_break`).
+    /// When an owned alias is used only as a result value, and its source is at
+    /// last-use on that path, the classifier can move the source into the
+    /// result instead of cloning it and leaving the original owner behind.
+    result_transfer_use_count: u32 = 0,
     /// Phase E.10: count of uses that occur as operands of a non-
     /// ARC aggregate-init instruction (`list_cons.head` /
     /// `list_cons.tail`, `list_init.elements[]`,
@@ -819,6 +1036,46 @@ const UseSummary = struct {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.total_use_count += 1;
         if (is_borrow_position) gop.value_ptr.borrow_use_count += 1;
+    }
+
+    fn recordAliasUse(
+        self: *UseSummary,
+        allocator: std.mem.Allocator,
+        source: ir.LocalId,
+        dest: ir.LocalId,
+    ) !void {
+        const gop = try self.counts.getOrPut(allocator, source);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.total_use_count += 1;
+        gop.value_ptr.borrow_use_count += 1;
+        if (gop.value_ptr.alias_use_count == 0) {
+            gop.value_ptr.alias_dest = dest;
+        } else {
+            gop.value_ptr.alias_dest = null;
+        }
+        gop.value_ptr.alias_use_count += 1;
+    }
+
+    fn recordMoveSourceUse(
+        self: *UseSummary,
+        allocator: std.mem.Allocator,
+        local: ir.LocalId,
+    ) !void {
+        const gop = try self.counts.getOrPut(allocator, local);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.total_use_count += 1;
+        gop.value_ptr.move_source_use_count += 1;
+    }
+
+    fn recordResultTransferUse(
+        self: *UseSummary,
+        allocator: std.mem.Allocator,
+        local: ir.LocalId,
+    ) !void {
+        const gop = try self.counts.getOrPut(allocator, local);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.total_use_count += 1;
+        gop.value_ptr.result_transfer_use_count += 1;
     }
 
     /// Phase E.8: record a use of `local` that occurs as a
@@ -924,7 +1181,7 @@ fn collectUseSummaryWithProgram(
         }
     };
     var walker = Walker{ .allocator = allocator, .summary = summary, .consume_share_dests = &consume_share_dests };
-    ir.forEachInstruction(function, &walker, Walker.visit);
+    try ir.forEachInstruction(allocator, function, &walker, Walker.visit);
     if (walker.err) |e| return e;
 }
 
@@ -956,9 +1213,60 @@ fn collectConsumeShareDestsInStream(
     index: *const ConventionIndex,
     consume_share_dests: *std.AutoHashMapUnmanaged(ir.LocalId, void),
 ) error{OutOfMemory}!void {
-    for (stream) |*instr| {
-        try collectConsumeShareDestsInInstr(allocator, instr, index, consume_share_dests);
+    const StreamFrame = struct {
+        stream: []const ir.Instruction,
+        next_index: usize = 0,
+    };
+
+    var frames: ExplicitInlineStack(StreamFrame, explicit_walk_inline_frame_capacity) = .{};
+    defer frames.deinit(allocator);
+    var child_streams: ExplicitInlineStack(ir.ChildStream, explicit_walk_inline_child_capacity) = .{};
+    defer child_streams.deinit(allocator);
+
+    try frames.append(allocator, .{ .stream = stream });
+
+    while (frames.len() != 0) {
+        const frame = frames.topPtr();
+        if (frame.next_index >= frame.stream.len) {
+            const finished = frames.pop();
+            try collectConsumeShareDestsInFlatStream(allocator, finished.stream, index, consume_share_dests);
+            continue;
+        }
+
+        const instr = &frame.stream[frame.next_index];
+        frame.next_index += 1;
+
+        child_streams.clearRetainingCapacity();
+        const ChildCollector = struct {
+            allocator: std.mem.Allocator,
+            child_streams: *ExplicitInlineStack(ir.ChildStream, explicit_walk_inline_child_capacity),
+            err: ?error{OutOfMemory} = null,
+
+            fn onStream(self: *@This(), child: ir.ChildStream) void {
+                if (self.err != null or child.stream.len == 0) return;
+                self.child_streams.append(self.allocator, child) catch |err| {
+                    self.err = err;
+                };
+            }
+        };
+        var collector = ChildCollector{ .allocator = allocator, .child_streams = &child_streams };
+        ir.forEachChildStream(instr, &collector, ChildCollector.onStream);
+        if (collector.err) |err| return err;
+
+        var child_index = child_streams.len();
+        while (child_index > 0) {
+            child_index -= 1;
+            try frames.append(allocator, .{ .stream = child_streams.get(child_index).stream });
+        }
     }
+}
+
+fn collectConsumeShareDestsInFlatStream(
+    allocator: std.mem.Allocator,
+    stream: []const ir.Instruction,
+    index: *const ConventionIndex,
+    consume_share_dests: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+) error{OutOfMemory}!void {
 
     // Within the same stream, scan for call sites whose owned-arg
     // slots reference a share_value's dest produced earlier in
@@ -1015,33 +1323,6 @@ fn collectConsumeShareDestsInStream(
             }
         }
     }
-}
-
-/// Recurse into every nested sub-stream via the canonical enumerator
-/// (covers `union_switch.else_instrs`, previously skipped) so the
-/// per-stream consume-share scan in `collectConsumeShareDestsInStream`
-/// runs over every region.
-fn collectConsumeShareDestsInInstr(
-    allocator: std.mem.Allocator,
-    instr: *const ir.Instruction,
-    index: *const ConventionIndex,
-    consume_share_dests: *std.AutoHashMapUnmanaged(ir.LocalId, void),
-) error{OutOfMemory}!void {
-    const Ctx = struct {
-        allocator: std.mem.Allocator,
-        index: *const ConventionIndex,
-        consume_share_dests: *std.AutoHashMapUnmanaged(ir.LocalId, void),
-        err: ?error{OutOfMemory} = null,
-        fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
-            if (self_ctx.err != null) return;
-            collectConsumeShareDestsInStream(self_ctx.allocator, child.stream, self_ctx.index, self_ctx.consume_share_dests) catch |e| {
-                self_ctx.err = e;
-            };
-        }
-    };
-    var ctx = Ctx{ .allocator = allocator, .index = index, .consume_share_dests = consume_share_dests };
-    ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-    if (ctx.err) |e| return e;
 }
 
 fn lookupCalleeConventionsForCall(
@@ -1197,7 +1478,7 @@ fn recordInstructionUses(
         },
         .local_get => |lg| {
             // Chained alias — propagate the borrow signal.
-            try summary.recordUse(allocator, lg.source, true);
+            try summary.recordAliasUse(allocator, lg.source, lg.dest);
         },
         .borrow_value => |bv| {
             try summary.recordUse(allocator, bv.source, true);
@@ -1209,10 +1490,10 @@ fn recordInstructionUses(
             try summary.recordUse(allocator, cv.source, true);
         },
         .move_value => |mv| {
-            // Move semantics: source is consumed. Counts as a
-            // non-borrow use so a `.local_get` feeding directly
-            // into a move classifies as `.copy_value`.
-            try summary.recordUse(allocator, mv.source, false);
+            // Move semantics: source is consumed. Keep a distinct counter so
+            // a local_get feeding directly into an ownership-transfer chain
+            // can itself lower as `.move_value` instead of copy/retain.
+            try summary.recordMoveSourceUse(allocator, mv.source);
         },
         .local_set => |ls| {
             // Direct binding write. Conservative: not a borrow
@@ -1220,11 +1501,11 @@ fn recordInstructionUses(
             try summary.recordUse(allocator, ls.value, false);
         },
         .ret => |r| {
-            if (r.value) |v| try summary.recordUse(allocator, v, false);
+            if (r.value) |v| try summary.recordResultTransferUse(allocator, v);
         },
         .cond_return => |cr| {
             try summary.recordUse(allocator, cr.condition, false);
-            if (cr.value) |v| try summary.recordUse(allocator, v, false);
+            if (cr.value) |v| try summary.recordResultTransferUse(allocator, v);
         },
         // Phase E.10 — aggregate-store positions are special "consume"
         // positions, NOT ordinary non-borrow uses. The classifier needs
@@ -1396,7 +1677,7 @@ fn recordInstructionUses(
         .phi => |p| {
             for (p.sources) |src| try summary.recordUse(allocator, src.value, false);
         },
-        .case_break => |cb| if (cb.value) |v| try summary.recordUse(allocator, v, false),
+        .case_break => |cb| if (cb.value) |v| try summary.recordResultTransferUse(allocator, v),
         .bin_len_check => |blc| try summary.recordUse(allocator, blc.scrutinee, false),
         .bin_read_int => |bri| try summary.recordUse(allocator, bri.source, false),
         .bin_read_float => |brf| try summary.recordUse(allocator, brf.source, false),
@@ -1462,6 +1743,11 @@ fn shouldBorrow(
     // takes precedence (no destroy, no retain).
     if (dest >= function.local_ownership.len or function.local_ownership[dest] == .trivial) {
         return true;
+    }
+    if (function.local_ownership[dest] == .owned and counts.total_use_count == 1 and
+        (counts.move_source_use_count == 1 or aliasChainFeedsMoveSource(summary, dest, 0)))
+    {
+        return false;
     }
     // Borrow only when EVERY use is a borrowing-position use.
     return counts.borrow_use_count == counts.total_use_count;
@@ -1700,6 +1986,94 @@ fn shouldMoveIntoAggregate(
     return ownership.isLastUseAt(source, local_get_id);
 }
 
+fn aliasChainFeedsMoveSource(
+    summary: *const UseSummary,
+    local: ir.LocalId,
+    depth: u32,
+) bool {
+    if (depth > 64) return false;
+    const counts = summary.get(local);
+    if (counts.total_use_count != 1) return false;
+    if (counts.move_source_use_count == 1) return true;
+    if (counts.alias_use_count != 1) return false;
+    const next = counts.alias_dest orelse return false;
+    if (next == local) return false;
+    return aliasChainFeedsMoveSource(summary, next, depth + 1);
+}
+
+fn shouldMoveIntoMoveSource(
+    function: *const ir.Function,
+    summary: *const UseSummary,
+    ownership: *const arc_liveness.ArcOwnership,
+    dest: ir.LocalId,
+    source: ir.LocalId,
+    local_get_id: arc_liveness.InstructionId,
+) bool {
+    if (dest >= function.local_ownership.len) return false;
+    if (function.local_ownership[dest] != .owned) return false;
+    if (source >= function.local_ownership.len) return false;
+    if (function.local_ownership[source] != .owned) return false;
+
+    const dest_counts = summary.get(dest);
+    if (dest_counts.total_use_count != 1) return false;
+    if (dest_counts.move_source_use_count != 1) return false;
+
+    if (ownership.last_use_sites.count() == 0) {
+        const source_counts = summary.get(source);
+        return source_counts.total_use_count == 1;
+    }
+    return ownership.isLastUseAt(source, local_get_id);
+}
+
+fn shouldMoveIntoResultTransfer(
+    function: *const ir.Function,
+    summary: *const UseSummary,
+    ownership: *const arc_liveness.ArcOwnership,
+    dest: ir.LocalId,
+    source: ir.LocalId,
+    local_get_id: arc_liveness.InstructionId,
+) bool {
+    if (dest >= function.local_ownership.len) return false;
+    if (function.local_ownership[dest] != .owned) return false;
+    if (source >= function.local_ownership.len) return false;
+    if (function.local_ownership[source] != .owned) return false;
+
+    const dest_counts = summary.get(dest);
+    if (dest_counts.total_use_count != 1) return false;
+    if (dest_counts.result_transfer_use_count != 1) return false;
+
+    if (ownership.last_use_sites.count() == 0) {
+        const source_counts = summary.get(source);
+        return source_counts.total_use_count == 1;
+    }
+    return ownership.isLastUseAt(source, local_get_id);
+}
+
+fn shouldMoveThroughOwnedAlias(
+    function: *const ir.Function,
+    summary: *const UseSummary,
+    ownership: *const arc_liveness.ArcOwnership,
+    dest: ir.LocalId,
+    source: ir.LocalId,
+    local_get_id: arc_liveness.InstructionId,
+) bool {
+    if (dest >= function.local_ownership.len) return false;
+    if (function.local_ownership[dest] != .owned) return false;
+    if (source >= function.local_ownership.len) return false;
+    if (function.local_ownership[source] != .owned) return false;
+
+    const dest_counts = summary.get(dest);
+    if (dest_counts.total_use_count != 1) return false;
+    if (dest_counts.alias_use_count != 1) return false;
+    if (!aliasChainFeedsMoveSource(summary, dest, 0)) return false;
+
+    if (ownership.last_use_sites.count() == 0) {
+        const source_counts = summary.get(source);
+        return source_counts.total_use_count == 1;
+    }
+    return ownership.isLastUseAt(source, local_get_id);
+}
+
 const StreamRewriter = struct {
     allocator: std.mem.Allocator,
     function: *ir.Function,
@@ -1767,7 +2141,19 @@ const StreamRewriter = struct {
             switch (effective) {
                 .local_get => |lg| {
                     any_change = true;
-                    if (shouldBorrow(self.function, self.use_summary, lg.dest)) {
+                    if (shouldMoveIntoMoveSource(self.function, self.use_summary, self.ownership, lg.dest, lg.source, local_get_id)) {
+                        try new_instrs.append(self.allocator, .{
+                            .move_value = .{ .dest = lg.dest, .source = lg.source },
+                        });
+                    } else if (shouldMoveIntoResultTransfer(self.function, self.use_summary, self.ownership, lg.dest, lg.source, local_get_id)) {
+                        try new_instrs.append(self.allocator, .{
+                            .move_value = .{ .dest = lg.dest, .source = lg.source },
+                        });
+                    } else if (shouldMoveThroughOwnedAlias(self.function, self.use_summary, self.ownership, lg.dest, lg.source, local_get_id)) {
+                        try new_instrs.append(self.allocator, .{
+                            .move_value = .{ .dest = lg.dest, .source = lg.source },
+                        });
+                    } else if (shouldBorrow(self.function, self.use_summary, lg.dest)) {
                         try new_instrs.append(self.allocator, .{
                             .borrow_value = .{ .dest = lg.dest, .source = lg.source },
                         });
@@ -1888,6 +2274,10 @@ const StreamRewriter = struct {
                             try new_instrs.append(self.allocator, .{
                                 .move_value = .{ .dest = bv.dest, .source = bv.source },
                             });
+                        } else if (shouldMoveIntoResultTransfer(self.function, self.use_summary, self.ownership, bv.dest, bv.source, local_get_id)) {
+                            try new_instrs.append(self.allocator, .{
+                                .move_value = .{ .dest = bv.dest, .source = bv.source },
+                            });
                         } else if (shouldMoveIntoAggregate(self.function, self.use_summary, self.ownership, bv.dest, bv.source, local_get_id)) {
                             try new_instrs.append(self.allocator, .{
                                 .move_value = .{ .dest = bv.dest, .source = bv.source },
@@ -1998,7 +2388,7 @@ pub fn rewriteOwnedConsumeSites(
 ) !void {
     // The move-vs-copy decision below is keyed by InstructionId, so this
     // pass must receive ownership computed for the current IR shape.
-    arc_liveness.assertConsumerWalkMatches(fn_ownership, arc_liveness.countInstructionRecords(function));
+    arc_liveness.assertConsumerWalkMatches(fn_ownership, try arc_liveness.countInstructionRecords(allocator, function));
 
     var index = try ConventionIndex.build(allocator, program);
     defer index.deinit();
@@ -2013,7 +2403,7 @@ pub fn rewriteOwnedConsumeSites(
     for (function.body, 0..) |_, block_index| {
         const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
         const original = block_ptr.instructions;
-        rewriter.next_id = computeStreamStartIdForBlock(function, block_index);
+        rewriter.next_id = try computeStreamStartIdForBlock(allocator, function, block_index);
         const rebuilt = try rewriter.rewriteStream(original);
         if (rebuilt) |new_slice| {
             block_ptr.instructions = new_slice;
@@ -2112,6 +2502,11 @@ const ConsumeSiteRewriter = struct {
         return dest;
     }
 
+    fn markMoveDestOwned(self: *ConsumeSiteRewriter, dest: ir.LocalId) void {
+        if (dest >= self.function.local_ownership.len) return;
+        self.function.local_ownership[dest] = .owned;
+    }
+
     fn rewriteStream(
         self: *ConsumeSiteRewriter,
         stream: []const ir.Instruction,
@@ -2189,7 +2584,7 @@ const ConsumeSiteRewriter = struct {
                         // call, clone an independent owner for the
                         // `.owned` callee slot and leave the caller's
                         // source intact.
-                        if (sourceOwnsForConsumeRewrite(self.function, prev.share_value.source) and
+                        if ((try sourceOwnsForConsumeRewrite(self.allocator, self.function, prev.share_value.source)) and
                             self.sourceAtLastUse(prev.share_value.source, top_level_ids.items[j]))
                         {
                             try rewrite_share_to_move.put(self.allocator, j, {});
@@ -2244,6 +2639,8 @@ const ConsumeSiteRewriter = struct {
                 // `.move_value` with the same dest/source.
                 std.debug.assert(effective == .share_value);
                 const sv = effective.share_value;
+                self.markMoveDestOwned(sv.dest);
+                try propagateProtocolBoxLocal(self.allocator, self.function, sv.dest, sv.source);
                 try new_instrs.append(self.allocator, .{
                     .move_value = .{ .dest = sv.dest, .source = sv.source },
                 });
@@ -2292,7 +2689,9 @@ const ConsumeSiteRewriter = struct {
                 std.debug.assert(effective == .share_value);
                 const sv = effective.share_value;
                 const clone = try self.allocOwnedLocal();
-                try appendCopyValueWithPersistentRetain(self.allocator, &new_instrs, clone, sv.source);
+                try appendProtocolBoxAwareCopyValueWithPersistentRetain(self.allocator, self.function, &new_instrs, clone, sv.source);
+                self.markMoveDestOwned(sv.dest);
+                try propagateProtocolBoxLocal(self.allocator, self.function, sv.dest, clone);
                 try new_instrs.append(self.allocator, .{
                     .move_value = .{ .dest = sv.dest, .source = clone },
                 });
@@ -2476,7 +2875,7 @@ pub fn rewriteOwnedConsumeBuiltinSites(
     // table recomputed against the post-rewrite IR. Assert the table is
     // in sync so a stale hand-off fails loudly in debug (no-op in
     // release; no-op for synthetic unit-test tables).
-    arc_liveness.assertConsumerWalkMatches(fn_ownership, arc_liveness.countInstructionRecords(function));
+    arc_liveness.assertConsumerWalkMatches(fn_ownership, try arc_liveness.countInstructionRecords(allocator, function));
 
     var rewriter = BuiltinConsumeSiteRewriter{
         .allocator = allocator,
@@ -2487,7 +2886,7 @@ pub fn rewriteOwnedConsumeBuiltinSites(
     for (function.body, 0..) |_, block_index| {
         const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
         const original = block_ptr.instructions;
-        rewriter.next_id = computeStreamStartIdForBlock(function, block_index);
+        rewriter.next_id = try computeStreamStartIdForBlock(allocator, function, block_index);
         const rebuilt = try rewriter.rewriteStream(original);
         if (rebuilt) |new_slice| {
             block_ptr.instructions = new_slice;
@@ -2501,47 +2900,38 @@ pub fn rewriteOwnedConsumeBuiltinSites(
 /// so the rewriter's last-use queries hit the same ids the analyzer
 /// recorded when populating `last_use_map`.
 fn computeStreamStartIdForBlock(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     block_index: usize,
-) arc_liveness.InstructionId {
+) error{OutOfMemory}!arc_liveness.InstructionId {
     var id: arc_liveness.InstructionId = 0;
     var i: usize = 0;
     while (i < block_index) : (i += 1) {
-        id = countStreamInstructionIds(function.body[i].instructions, id);
+        id = try countStreamInstructionIds(allocator, function.body[i].instructions, id);
     }
     return id;
 }
 
 fn countStreamInstructionIds(
+    allocator: std.mem.Allocator,
     stream: []const ir.Instruction,
     start_id: arc_liveness.InstructionId,
-) arc_liveness.InstructionId {
-    var id = start_id;
-    for (stream) |*instr| {
-        id += 1;
-        id = countNestedStreamInstructionIds(instr, id);
-    }
-    return id;
-}
-
-/// Count the InstructionIds occupied by `instr`'s nested sub-streams,
-/// recursing via the canonical `ir.forEachChildStream` so the numbering
-/// matches `arc_liveness.flattenChildren` exactly — including
-/// `union_switch.else_instrs`, previously skipped here, which had shifted
-/// every subsequent id below the analyzer's key.
-fn countNestedStreamInstructionIds(
-    instr: *const ir.Instruction,
-    start_id: arc_liveness.InstructionId,
-) arc_liveness.InstructionId {
-    const Ctx = struct {
+) error{OutOfMemory}!arc_liveness.InstructionId {
+    const Counter = struct {
         id: arc_liveness.InstructionId,
-        fn onStream(self: *@This(), child: ir.ChildStream) void {
-            self.id = countStreamInstructionIds(child.stream, self.id);
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+            _ = instr;
+            self.id += 1;
+            return .keep_walking;
         }
     };
-    var ctx = Ctx{ .id = start_id };
-    ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-    return ctx.id;
+
+    var walker = ExplicitInstructionWalker.init(allocator);
+    defer walker.deinit();
+    var counter = Counter{ .id = start_id };
+    _ = try walker.walkStream(stream, &counter, Counter.visit);
+    return counter.id;
 }
 
 const BuiltinConsumeSiteRewriter = struct {
@@ -2566,6 +2956,19 @@ const BuiltinConsumeSiteRewriter = struct {
         self.function.local_count = dest + 1;
         return dest;
     }
+
+    fn markMoveDestOwned(self: *BuiltinConsumeSiteRewriter, dest: ir.LocalId) void {
+        if (dest >= self.function.local_ownership.len) return;
+        self.function.local_ownership[dest] = .owned;
+    }
+
+    const DirectArgCopy = struct {
+        slot: usize,
+        source: ir.LocalId,
+        clone: ir.LocalId,
+    };
+
+    const DirectArgCopyList = std.ArrayListUnmanaged(DirectArgCopy);
 
     fn rewriteStream(
         self: *BuiltinConsumeSiteRewriter,
@@ -2617,6 +3020,14 @@ const BuiltinConsumeSiteRewriter = struct {
         defer drop_release.deinit(self.allocator);
         var drop_retain: std.AutoHashMapUnmanaged(usize, void) = .empty;
         defer drop_retain.deinit(self.allocator);
+        var direct_arg_copies: std.AutoHashMapUnmanaged(usize, DirectArgCopyList) = .empty;
+        defer {
+            var plans = direct_arg_copies.valueIterator();
+            while (plans.next()) |plan| {
+                plan.deinit(self.allocator);
+            }
+            direct_arg_copies.deinit(self.allocator);
+        }
 
         var i: usize = 0;
         while (i < stream.len) : (i += 1) {
@@ -2650,7 +3061,7 @@ const BuiltinConsumeSiteRewriter = struct {
                         // analyzer records the share_value's instruction
                         // id as the source's last use exactly in that
                         // case.
-                        if (sourceOwnsForConsumeRewrite(self.function, site.share.source) and
+                        if ((try sourceOwnsForConsumeRewrite(self.allocator, self.function, site.share.source)) and
                             self.sourceAtLastUse(site.share.source, site.id))
                         {
                             try rewrite_share_to_move.put(self.allocator, site.index, {});
@@ -2693,13 +3104,29 @@ const BuiltinConsumeSiteRewriter = struct {
                     continue;
                 }
 
-                if (always_consumed) {
+                if (always_consumed or requires_owned_input) {
                     if (try self.planBorrowedConsumeCopy(
                         stream,
                         rebuilt_children.items,
                         i,
                         arg_local,
                         &rewrite_borrow_to_copy,
+                    )) {
+                        any_change = true;
+                        if (try self.markPostCallReleaseDrop(
+                            stream,
+                            rebuilt_children.items,
+                            i,
+                            arg_local,
+                            &drop_release,
+                        )) {
+                            any_change = true;
+                        }
+                    } else if (try self.planDirectBorrowedConsumeCopy(
+                        i,
+                        slot,
+                        arg_local,
+                        &direct_arg_copies,
                     )) {
                         any_change = true;
                         if (try self.markPostCallReleaseDrop(
@@ -2720,7 +3147,12 @@ const BuiltinConsumeSiteRewriter = struct {
 
         var new_instrs: std.ArrayListUnmanaged(ir.Instruction) = .empty;
         errdefer new_instrs.deinit(self.allocator);
-        try new_instrs.ensureTotalCapacity(self.allocator, stream.len + rewrite_borrow_to_copy.count() + (rewrite_share_to_cow.count() * 2));
+        var direct_copy_count: usize = 0;
+        var direct_copy_iter = direct_arg_copies.valueIterator();
+        while (direct_copy_iter.next()) |plan| {
+            direct_copy_count += plan.items.len;
+        }
+        try new_instrs.ensureTotalCapacity(self.allocator, stream.len + rewrite_borrow_to_copy.count() + direct_copy_count * 2 + (rewrite_share_to_cow.count() * 2));
 
         for (stream, 0..) |_, idx| {
             if (drop_release.contains(idx)) continue;
@@ -2729,6 +3161,8 @@ const BuiltinConsumeSiteRewriter = struct {
             if (rewrite_share_to_move.contains(idx)) {
                 std.debug.assert(effective == .share_value);
                 const sv = effective.share_value;
+                self.markMoveDestOwned(sv.dest);
+                try propagateProtocolBoxLocal(self.allocator, self.function, sv.dest, sv.source);
                 try new_instrs.append(self.allocator, .{
                     .move_value = .{ .dest = sv.dest, .source = sv.source },
                 });
@@ -2736,14 +3170,23 @@ const BuiltinConsumeSiteRewriter = struct {
                 std.debug.assert(effective == .share_value);
                 const sv = effective.share_value;
                 const clone = try self.allocOwnedLocal();
-                try appendCopyValueWithPersistentRetain(self.allocator, &new_instrs, clone, sv.source);
+                try appendProtocolBoxAwareCopyValueWithPersistentRetain(self.allocator, self.function, &new_instrs, clone, sv.source);
+                self.markMoveDestOwned(sv.dest);
+                try propagateProtocolBoxLocal(self.allocator, self.function, sv.dest, clone);
                 try new_instrs.append(self.allocator, .{
                     .move_value = .{ .dest = sv.dest, .source = clone },
                 });
             } else if (rewrite_borrow_to_copy.contains(idx)) {
                 std.debug.assert(effective == .borrow_value);
                 const borrow = effective.borrow_value;
-                try appendCopyValueWithPersistentRetain(self.allocator, &new_instrs, borrow.dest, borrow.source);
+                try appendProtocolBoxAwareCopyValueWithPersistentRetain(self.allocator, self.function, &new_instrs, borrow.dest, borrow.source);
+            } else if (direct_arg_copies.get(idx)) |plans| {
+                std.debug.assert(effective == .call_builtin);
+                const rewritten_call = try self.callBuiltinWithDirectArgCopies(effective.call_builtin, plans.items);
+                for (plans.items) |plan| {
+                    try appendProtocolBoxAwareCopyValueWithPersistentRetain(self.allocator, self.function, &new_instrs, plan.clone, plan.source);
+                }
+                try new_instrs.append(self.allocator, .{ .call_builtin = rewritten_call });
             } else {
                 try new_instrs.append(self.allocator, effective);
             }
@@ -2853,6 +3296,42 @@ const BuiltinConsumeSiteRewriter = struct {
         return true;
     }
 
+    fn planDirectBorrowedConsumeCopy(
+        self: *BuiltinConsumeSiteRewriter,
+        call_index: usize,
+        slot: usize,
+        arg_local: ir.LocalId,
+        direct_arg_copies: *std.AutoHashMapUnmanaged(usize, DirectArgCopyList),
+    ) error{OutOfMemory}!bool {
+        if (arg_local >= self.function.local_ownership.len) return false;
+        if (self.function.local_ownership[arg_local] != .borrowed) return false;
+        if (!sourceCellIsLifetimeExtended(self.function, arg_local)) return false;
+
+        const clone = try self.allocOwnedLocal();
+        const gop = try direct_arg_copies.getOrPut(self.allocator, call_index);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, .{
+            .slot = slot,
+            .source = arg_local,
+            .clone = clone,
+        });
+        return true;
+    }
+
+    fn callBuiltinWithDirectArgCopies(
+        self: *BuiltinConsumeSiteRewriter,
+        original: ir.CallBuiltin,
+        plans: []const DirectArgCopy,
+    ) error{OutOfMemory}!ir.CallBuiltin {
+        var copy = original;
+        const args = try self.allocator.dupe(ir.LocalId, original.args);
+        for (plans) |plan| {
+            if (plan.slot < args.len) args[plan.slot] = plan.clone;
+        }
+        copy.args = args;
+        return copy;
+    }
+
     /// Rewrite every child stream via the canonical `ir.mapChildStreams`
     /// transformer — visits sub-streams in the analyzer's flatten order
     /// (so `next_id` stays aligned) and now rewrites
@@ -2872,8 +3351,12 @@ const BuiltinConsumeSiteRewriter = struct {
     }
 };
 
-fn sourceOwnsForConsumeRewrite(function: *const ir.Function, source: ir.LocalId) bool {
-    if (paramIndexForLocal(function, source)) |index| {
+fn sourceOwnsForConsumeRewrite(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    source: ir.LocalId,
+) error{OutOfMemory}!bool {
+    if (try paramIndexForLocal(allocator, function, source)) |index| {
         if (index >= function.param_conventions.len) return false;
         return function.param_conventions[index] == .owned;
     }
@@ -2881,7 +3364,11 @@ fn sourceOwnsForConsumeRewrite(function: *const ir.Function, source: ir.LocalId)
     return function.local_ownership[source] == .owned;
 }
 
-fn paramIndexForLocal(function: *const ir.Function, local: ir.LocalId) ?u32 {
+fn paramIndexForLocal(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local: ir.LocalId,
+) error{OutOfMemory}!?u32 {
     const Visitor = struct {
         target: ir.LocalId,
         result: ?u32 = null,
@@ -2898,7 +3385,7 @@ fn paramIndexForLocal(function: *const ir.Function, local: ir.LocalId) ?u32 {
     };
 
     var visitor = Visitor{ .target = local };
-    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    try ir.forEachInstruction(allocator, function, &visitor, Visitor.visit);
     return visitor.result;
 }
 
@@ -3031,7 +3518,7 @@ fn rewriteUncheckedUniquenessSitesInternal(
     // in debug (no-op in release; skipped when `ownership` is null or a
     // synthetic unit-test table).
     if (ownership) |owned| {
-        arc_liveness.assertConsumerWalkMatches(owned, arc_liveness.countInstructionRecords(function));
+        arc_liveness.assertConsumerWalkMatches(owned, try arc_liveness.countInstructionRecords(allocator, function));
     }
 
     var rewriter = UncheckedUniquenessSiteRewriter{
@@ -3045,7 +3532,7 @@ fn rewriteUncheckedUniquenessSitesInternal(
     for (function.body, 0..) |_, block_index| {
         const block_ptr: *ir.Block = @constCast(&function.body[block_index]);
         const original = block_ptr.instructions;
-        rewriter.next_id = computeStreamStartIdForBlock(function, block_index);
+        rewriter.next_id = try computeStreamStartIdForBlock(allocator, function, block_index);
         const rebuilt = try rewriter.rewriteStream(original);
         if (rebuilt) |new_slice| {
             block_ptr.instructions = new_slice;
@@ -3132,7 +3619,7 @@ const UncheckedUniquenessSiteRewriter = struct {
             const id = top_level_ids.items[idx];
             if (!self.uniqueness.isUnique(id)) continue;
 
-            if (self.planListTailConsume(effective, id)) |replacement| {
+            if (try self.planListTailConsume(effective, id)) |replacement| {
                 try plan.put(self.allocator, idx, .{ .replace = replacement });
                 any_change = true;
                 continue;
@@ -3181,7 +3668,7 @@ const UncheckedUniquenessSiteRewriter = struct {
             } else if (rewrite_borrow_to_copy.contains(idx)) {
                 std.debug.assert(effective == .borrow_value);
                 const borrow = effective.borrow_value;
-                try appendCopyValueWithPersistentRetain(self.allocator, &new_instrs, borrow.dest, borrow.source);
+                try appendProtocolBoxAwareCopyValueWithPersistentRetain(self.allocator, self.function, &new_instrs, borrow.dest, borrow.source);
             } else {
                 try new_instrs.append(self.allocator, effective);
             }
@@ -3229,14 +3716,14 @@ const UncheckedUniquenessSiteRewriter = struct {
         self: *UncheckedUniquenessSiteRewriter,
         instr: ir.Instruction,
         id: arc_liveness.InstructionId,
-    ) ?ir.Instruction {
+    ) error{OutOfMemory}!?ir.Instruction {
         const ownership = self.ownership orelse return null;
         const lt = switch (instr) {
             .list_tail => |value| value,
             else => return null,
         };
         if (lt.consume_source) return null;
-        if (!sourceOwnsForConsumeRewrite(self.function, lt.list)) return null;
+        if (!try sourceOwnsForConsumeRewrite(self.allocator, self.function, lt.list)) return null;
         if (!ownership.isLastUseAt(lt.list, id)) {
             if (ownership.last_use_map.get(lt.list)) |last_use| {
                 if (last_use != id) return null;
@@ -3281,7 +3768,7 @@ const UncheckedUniquenessSiteRewriter = struct {
         // mismatch between uniqueness's classifier and ours.
         if (functionHasOwnedReceiverConvention(callee) == null) return null;
 
-        const runtime_name = (findRuntimeOwnedMutatingCall(callee)) orelse return null;
+        const runtime_name = (try findRuntimeOwnedMutatingCall(self.allocator, callee)) orelse return null;
 
         // Only bypass when the wrapper's body is a thin 1:1 forward
         // to the runtime intrinsic — same arity, args lined up, no
@@ -3411,39 +3898,45 @@ fn lookupFunctionById(program: *const ir.Program, id: ?ir.FunctionId) ?*const ir
 /// the runtime call. Returns null when no owned-mutating runtime
 /// call_builtin exists in the wrapper's body (the function is not a
 /// thin wrapper around an owned-mutating intrinsic).
-fn findRuntimeOwnedMutatingCall(function: *const ir.Function) ?[]const u8 {
+fn findRuntimeOwnedMutatingCall(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+) error{OutOfMemory}!?[]const u8 {
     for (function.body) |block| {
-        if (findRuntimeOwnedMutatingCallInStream(block.instructions)) |name| return name;
+        if (try findRuntimeOwnedMutatingCallInStream(allocator, block.instructions)) |name| return name;
     }
     return null;
 }
 
-/// Recurse via the canonical enumerator (covers
+/// Walk via the canonical child-stream enumerator (covers
 /// `union_switch.else_instrs`, previously skipped) to find the first
 /// non-unchecked owned-mutating builtin call in `stream` or any nested
 /// sub-stream.
-fn findRuntimeOwnedMutatingCallInStream(stream: []const ir.Instruction) ?[]const u8 {
-    for (stream) |*instr| {
-        if (instr.* == .call_builtin) {
-            const cb = instr.call_builtin;
-            if (arc_liveness.ownedMutatingBuiltinSlot(cb.name) != null and
-                !arc_liveness.isUncheckedOwnedMutatingBuiltin(cb.name))
+fn findRuntimeOwnedMutatingCallInStream(
+    allocator: std.mem.Allocator,
+    stream: []const ir.Instruction,
+) error{OutOfMemory}!?[]const u8 {
+    const Finder = struct {
+        found: ?[]const u8 = null,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+            if (instr.* != .call_builtin) return .keep_walking;
+            const call_builtin = instr.call_builtin;
+            if (arc_liveness.ownedMutatingBuiltinSlot(call_builtin.name) != null and
+                !arc_liveness.isUncheckedOwnedMutatingBuiltin(call_builtin.name))
             {
-                return cb.name;
+                self.found = call_builtin.name;
+                return .stop;
             }
+            return .keep_walking;
         }
-        const Finder = struct {
-            found: ?[]const u8 = null,
-            fn onStream(self: *@This(), child: ir.ChildStream) void {
-                if (self.found != null) return;
-                if (findRuntimeOwnedMutatingCallInStream(child.stream)) |n| self.found = n;
-            }
-        };
-        var finder = Finder{};
-        ir.forEachChildStream(instr, &finder, Finder.onStream);
-        if (finder.found) |n| return n;
-    }
-    return null;
+    };
+
+    var walker = ExplicitInstructionWalker.init(allocator);
+    defer walker.deinit();
+    var finder = Finder{};
+    _ = try walker.walkStream(stream, &finder, Finder.visit);
+    return finder.found;
 }
 
 /// Return a copy of `instr` with its callee name replaced by
@@ -3717,9 +4210,10 @@ const BorrowedPassThroughRewriter = struct {
 
                 if (arg_local >= self.function.local_ownership.len) continue;
                 if (self.function.local_ownership[arg_local] != .owned) continue;
-                if (countLocalDefsInFunction(self.function, arg_local) != 1) continue;
-                if (countLocalUsesInFunction(self.function, arg_local) != 3) continue;
-                if (!shareDestHasOnlyBorrowedCallPath(
+                if ((try countLocalDefsInFunction(self.allocator, self.function, arg_local)) != 1) continue;
+                if ((try countLocalUsesInFunction(self.allocator, self.function, arg_local)) != 3) continue;
+                if (!(try shareDestHasOnlyBorrowedCallPath(
+                    self.allocator,
                     stream,
                     rebuilt_children.items,
                     share_idx,
@@ -3727,7 +4221,7 @@ const BorrowedPassThroughRewriter = struct {
                     i,
                     release_idx,
                     arg_local,
-                )) continue;
+                ))) continue;
 
                 // All four pieces matched: schedule the rewrite.
                 try rewrite_share_to_borrow.put(self.allocator, share_idx, {});
@@ -3910,6 +4404,7 @@ fn findPostCallRelease(
 /// could hide a real ownership edge from drop insertion or verifier
 /// checks, so the pass refuses those streams.
 fn shareDestHasOnlyBorrowedCallPath(
+    allocator: std.mem.Allocator,
     stream: []const ir.Instruction,
     rebuilt_children: []const ?ir.Instruction,
     share_idx: usize,
@@ -3917,11 +4412,11 @@ fn shareDestHasOnlyBorrowedCallPath(
     call_idx: usize,
     release_idx: usize,
     arg_local: ir.LocalId,
-) bool {
+) error{OutOfMemory}!bool {
     var total_uses: usize = 0;
     for (stream, 0..) |original, idx| {
         const effective = rebuilt_children[idx] orelse original;
-        const use_count = countLocalUsesRecursive(effective, arg_local);
+        const use_count = try countLocalUsesInInstructionTree(allocator, effective, arg_local);
         if (use_count == 0) continue;
         total_uses += use_count;
 
@@ -3960,44 +4455,76 @@ fn callUsesArgExactlyOnce(instr: ir.Instruction, arg_local: ir.LocalId) bool {
 }
 
 /// Count uses of `local` in `instr` and all its nested sub-streams,
-/// recursing via the canonical enumerator (covers
+/// walking via the canonical enumerator (covers
 /// `union_switch.else_instrs`, previously skipped — an undercount there
 /// could flip the elideBorrowedPassThroughShares soundness gate from
 /// refuse to allow). Used by the != 1 / != 3 exact-count soundness gates.
-fn countLocalUsesRecursive(instr: ir.Instruction, local: ir.LocalId) usize {
-    const count = countImmediateLocalUses(instr, local);
-    const Ctx = struct {
+fn countLocalUsesInInstructionTree(
+    allocator: std.mem.Allocator,
+    instr: ir.Instruction,
+    local: ir.LocalId,
+) error{OutOfMemory}!usize {
+    const Counter = struct {
+        allocator: std.mem.Allocator,
         local: ir.LocalId,
         count: usize = 0,
-        fn onStream(self: *@This(), child: ir.ChildStream) void {
-            self.count += countLocalUsesInStream(child.stream, self.local);
+
+        fn visit(self: *@This(), visited: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+            self.count += try countImmediateLocalUses(self.allocator, visited.*, self.local);
+            return .keep_walking;
         }
     };
-    var ctx = Ctx{ .local = local };
-    ir.forEachChildStream(&instr, &ctx, Ctx.onStream);
-    return count + ctx.count;
+
+    var walker = ExplicitInstructionWalker.init(allocator);
+    defer walker.deinit();
+    var counter = Counter{ .allocator = allocator, .local = local };
+    _ = try walker.walkInstructionAndChildren(&instr, &counter, Counter.visit);
+    return counter.count;
 }
 
-fn countLocalUsesInStream(stream: []const ir.Instruction, local: ir.LocalId) usize {
-    var count: usize = 0;
-    for (stream) |instr| {
-        count += countLocalUsesRecursive(instr, local);
-    }
-    return count;
+fn countLocalUsesInStream(
+    allocator: std.mem.Allocator,
+    stream: []const ir.Instruction,
+    local: ir.LocalId,
+) error{OutOfMemory}!usize {
+    const Counter = struct {
+        allocator: std.mem.Allocator,
+        local: ir.LocalId,
+        count: usize = 0,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+            self.count += try countImmediateLocalUses(self.allocator, instr.*, self.local);
+            return .keep_walking;
+        }
+    };
+
+    var walker = ExplicitInstructionWalker.init(allocator);
+    defer walker.deinit();
+    var counter = Counter{ .allocator = allocator, .local = local };
+    _ = try walker.walkStream(stream, &counter, Counter.visit);
+    return counter.count;
 }
 
-fn countLocalUsesInFunction(function: *const ir.Function, local: ir.LocalId) usize {
+fn countLocalUsesInFunction(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local: ir.LocalId,
+) error{OutOfMemory}!usize {
     var count: usize = 0;
     for (function.body) |block| {
-        count += countLocalUsesInStream(block.instructions, local);
+        count += try countLocalUsesInStream(allocator, block.instructions, local);
     }
     return count;
 }
 
-fn countImmediateLocalUses(instr: ir.Instruction, local: ir.LocalId) usize {
+fn countImmediateLocalUses(
+    allocator: std.mem.Allocator,
+    instr: ir.Instruction,
+    local: ir.LocalId,
+) error{OutOfMemory}!usize {
     var uses: arc_liveness.UseList = .{};
-    defer uses.deinit(std.heap.page_allocator);
-    arc_liveness.collectUses(instr, &uses);
+    defer uses.deinit(allocator);
+    try arc_liveness.collectUses(allocator, instr, &uses);
 
     var count: usize = 0;
     for (uses.slice()) |used_local| {
@@ -4013,36 +4540,39 @@ fn countImmediateLocalUses(instr: ir.Instruction, local: ir.LocalId) usize {
     return count;
 }
 
-/// Count definitions of `local` in `instr` and all its nested
-/// sub-streams, recursing via the canonical enumerator (covers
-/// `union_switch.else_instrs`, previously skipped). Used by the
+/// Count definitions of `local` in `stream` and all nested sub-streams
+/// through the canonical child-stream enumerator. Used by the
 /// elideBorrowedPassThroughShares != 1 soundness gate.
-fn countLocalDefsRecursive(instr: ir.Instruction, local: ir.LocalId) usize {
-    const count = countImmediateLocalDefs(instr, local);
-    const Ctx = struct {
+fn countLocalDefsInStream(
+    allocator: std.mem.Allocator,
+    stream: []const ir.Instruction,
+    local: ir.LocalId,
+) error{OutOfMemory}!usize {
+    const Counter = struct {
         local: ir.LocalId,
         count: usize = 0,
-        fn onStream(self: *@This(), child: ir.ChildStream) void {
-            self.count += countLocalDefsInStream(child.stream, self.local);
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
+            self.count += countImmediateLocalDefs(instr.*, self.local);
+            return .keep_walking;
         }
     };
-    var ctx = Ctx{ .local = local };
-    ir.forEachChildStream(&instr, &ctx, Ctx.onStream);
-    return count + ctx.count;
+
+    var walker = ExplicitInstructionWalker.init(allocator);
+    defer walker.deinit();
+    var counter = Counter{ .local = local };
+    _ = try walker.walkStream(stream, &counter, Counter.visit);
+    return counter.count;
 }
 
-fn countLocalDefsInStream(stream: []const ir.Instruction, local: ir.LocalId) usize {
-    var count: usize = 0;
-    for (stream) |instr| {
-        count += countLocalDefsRecursive(instr, local);
-    }
-    return count;
-}
-
-fn countLocalDefsInFunction(function: *const ir.Function, local: ir.LocalId) usize {
+fn countLocalDefsInFunction(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local: ir.LocalId,
+) error{OutOfMemory}!usize {
     var count: usize = 0;
     for (function.body) |block| {
-        count += countLocalDefsInStream(block.instructions, local);
+        count += try countLocalDefsInStream(allocator, block.instructions, local);
     }
     return count;
 }
@@ -4092,6 +4622,181 @@ test "arc_ownership: stub function signature compiles" {
     _ = fn_ptr;
 }
 
+fn buildDeepGuardStream(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    leaf: ir.Instruction,
+) error{OutOfMemory}![]const ir.Instruction {
+    var current = try allocator.dupe(ir.Instruction, &[_]ir.Instruction{leaf});
+    var remaining = depth;
+    while (remaining != 0) : (remaining -= 1) {
+        current = try allocator.dupe(ir.Instruction, &[_]ir.Instruction{
+            .{ .guard_block = .{ .condition = 0, .body = current } },
+        });
+    }
+    return current;
+}
+
+fn deepExplicitStackTestDepth() usize {
+    return explicit_walk_inline_frame_capacity + 8;
+}
+
+test "arc_ownership: collectConsumeShareDestsInStream walks nested child streams iteratively" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{ 1, 2 });
+    const arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{ .share, .borrow });
+    const child_stream = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .share_value = .{ .dest = 1, .source = 0 } },
+        .{ .call_builtin = .{
+            .dest = 3,
+            .name = "List.push",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+    });
+    const stream = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .guard_block = .{ .condition = 9, .body = child_stream } },
+    });
+
+    var index = ConventionIndex{ .by_name = .empty, .by_id = .empty, .allocator = arena };
+    defer index.deinit();
+    var consume_share_dests: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+    defer consume_share_dests.deinit(arena);
+
+    try collectConsumeShareDestsInStream(arena, stream, &index, &consume_share_dests);
+
+    try std.testing.expect(consume_share_dests.contains(1));
+}
+
+test "arc_ownership: countStreamInstructionIds walks deep child streams without recursion" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+    const depth = deepExplicitStackTestDepth();
+    const stream = try buildDeepGuardStream(arena, depth, .{ .ret = .{ .value = null } });
+
+    const end_id = try countStreamInstructionIds(std.testing.allocator, stream, 5);
+
+    try std.testing.expectEqual(@as(arc_liveness.InstructionId, @intCast(5 + depth + 1)), end_id);
+}
+
+test "arc_ownership: findRuntimeOwnedMutatingCallInStream preserves DFS early exit" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const nil_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{ 1, 2, 3 });
+    const nil_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{ .share, .borrow, .borrow });
+    const struct_args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{ 4, 5 });
+    const struct_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{ .share, .borrow });
+    const nil_stream = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .call_builtin = .{
+            .dest = 6,
+            .name = "Map.put",
+            .args = nil_args,
+            .arg_modes = nil_modes,
+        } },
+    });
+    const struct_stream = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .call_builtin = .{
+            .dest = 7,
+            .name = "List.push",
+            .args = struct_args,
+            .arg_modes = struct_modes,
+        } },
+    });
+    const stream = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .optional_dispatch = .{
+            .scrutinee_param = 0,
+            .payload_local = 4,
+            .nil_instrs = nil_stream,
+            .nil_result = null,
+            .struct_instrs = struct_stream,
+            .struct_result = null,
+        } },
+    });
+
+    const found = try findRuntimeOwnedMutatingCallInStream(std.testing.allocator, stream);
+
+    try std.testing.expectEqualStrings("Map.put", found orelse return error.TestUnexpectedResult);
+}
+
+test "arc_ownership: local use and def counters include nested child streams" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const child_stream = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .ret = .{ .value = 7 } },
+        .{ .const_int = .{ .dest = 9, .value = 42, .type_hint = null } },
+    });
+    const stream = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .guard_block = .{ .condition = 0, .body = child_stream } },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), try countLocalUsesInStream(std.testing.allocator, stream, 7));
+    try std.testing.expectEqual(@as(usize, 1), try countLocalDefsInStream(std.testing.allocator, stream, 9));
+}
+
+test "arc_ownership: explicit child-stream stacks propagate OutOfMemory" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+    const stream = try buildDeepGuardStream(arena, deepExplicitStackTestDepth(), .{ .ret = .{ .value = null } });
+
+    {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(
+            error.OutOfMemory,
+            countStreamInstructionIds(failing_allocator.allocator(), stream, 0),
+        );
+        try std.testing.expect(failing_allocator.has_induced_failure);
+    }
+
+    {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        var index = ConventionIndex{ .by_name = .empty, .by_id = .empty, .allocator = failing_allocator.allocator() };
+        defer index.deinit();
+        var consume_share_dests: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+        defer consume_share_dests.deinit(failing_allocator.allocator());
+        try std.testing.expectError(
+            error.OutOfMemory,
+            collectConsumeShareDestsInStream(failing_allocator.allocator(), stream, &index, &consume_share_dests),
+        );
+        try std.testing.expect(failing_allocator.has_induced_failure);
+    }
+
+    {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(
+            error.OutOfMemory,
+            findRuntimeOwnedMutatingCallInStream(failing_allocator.allocator(), stream),
+        );
+        try std.testing.expect(failing_allocator.has_induced_failure);
+    }
+
+    {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(
+            error.OutOfMemory,
+            countLocalUsesInStream(failing_allocator.allocator(), stream, 99),
+        );
+        try std.testing.expect(failing_allocator.has_induced_failure);
+    }
+
+    {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        try std.testing.expectError(
+            error.OutOfMemory,
+            countLocalDefsInStream(failing_allocator.allocator(), stream, 99),
+        );
+        try std.testing.expect(failing_allocator.has_induced_failure);
+    }
+}
+
 // ============================================================
 // Phase C tests: borrow / copy classification on representative
 // shapes. Each test parses Zap source, lowers to IR, runs
@@ -4130,15 +4835,15 @@ const ClassifyTestSuite = struct {
         const alloc = arena_ptr.allocator();
 
         const parser_ptr = try alloc.create(Parser);
-        parser_ptr.* = Parser.init(alloc, source);
+        parser_ptr.* = try Parser.init(alloc, source);
         const program = try parser_ptr.parseProgram();
 
         const collector_ptr = try alloc.create(Collector);
-        collector_ptr.* = Collector.init(alloc, parser_ptr.interner, null);
+        collector_ptr.* = try Collector.init(alloc, parser_ptr.interner, null);
         try collector_ptr.collectProgram(&program);
 
         const checker_ptr = try alloc.create(types_mod.TypeChecker);
-        checker_ptr.* = types_mod.TypeChecker.init(alloc, parser_ptr.interner, &collector_ptr.graph);
+        checker_ptr.* = try types_mod.TypeChecker.init(alloc, parser_ptr.interner, &collector_ptr.graph);
         try checker_ptr.checkProgram(&program);
 
         const hir_ptr = try alloc.create(HirBuilder);
@@ -4208,7 +4913,7 @@ const ClassifyCounts = struct {
 fn countClassificationsFromSource(
     function: *const ir.Function,
     source_local: ir.LocalId,
-) ClassifyCounts {
+) !ClassifyCounts {
     const Walker = struct {
         counts: *ClassifyCounts,
         source_local: ir.LocalId,
@@ -4232,13 +4937,13 @@ fn countClassificationsFromSource(
     };
     var counts = ClassifyCounts{};
     var walker = Walker{ .counts = &counts, .source_local = source_local };
-    ir.forEachInstruction(function, &walker, Walker.visit);
+    try ir.forEachInstruction(std.testing.allocator, function, &walker, Walker.visit);
     return counts;
 }
 
 /// Walk every instruction (top-level and nested) and tally the total
 /// counts of the three alias-shaped opcodes regardless of source.
-fn countAliasOpcodes(function: *const ir.Function) ClassifyCounts {
+fn countAliasOpcodes(function: *const ir.Function) !ClassifyCounts {
     const Walker = struct {
         counts: *ClassifyCounts,
         fn visit(self: *@This(), instr: *const ir.Instruction) void {
@@ -4253,7 +4958,7 @@ fn countAliasOpcodes(function: *const ir.Function) ClassifyCounts {
     };
     var counts = ClassifyCounts{};
     var walker = Walker{ .counts = &counts };
-    ir.forEachInstruction(function, &walker, Walker.visit);
+    try ir.forEachInstruction(std.testing.allocator, function, &walker, Walker.visit);
     return counts;
 }
 
@@ -4295,7 +5000,7 @@ test "arc_ownership: ARC param passed to a borrowing call yields borrow_value" {
     // tail expression also goes through a `.local_get` for its own
     // return; so multiple alias-shaped opcodes may legitimately
     // appear.
-    const totals = countAliasOpcodes(caller_func);
+    const totals = try countAliasOpcodes(caller_func);
     // Every `.local_get` must be replaced.
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     // At least one borrow_value should appear (the alias `aliased = h`).
@@ -4329,7 +5034,7 @@ test "arc_ownership: ARC param stored into struct field yields copy_value" {
     const caller_func = suite.findFunctionByName("caller") orelse return error.MissingFunction;
     try suite.classify(caller_func);
 
-    const totals = countAliasOpcodes(caller_func);
+    const totals = try countAliasOpcodes(caller_func);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     // At least one copy_value should appear (the alias whose use is
     // the struct_init field value).
@@ -4365,7 +5070,7 @@ test "arc_ownership: identity function emits copy_value at return site" {
     const id_func = suite.findFunctionByName("id") orelse return error.MissingFunction;
     try suite.classify(id_func);
 
-    const totals = countAliasOpcodes(id_func);
+    const totals = try countAliasOpcodes(id_func);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     // A copy_value must appear at the return site for the param's
     // borrow→owned promotion.
@@ -4380,7 +5085,7 @@ test "arc_ownership: borrowed param flowing through case_break is promoted to ow
 
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var type_store = types_mod.TypeStore.init(std.testing.allocator, &interner);
+    var type_store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
     defer type_store.deinit();
 
     var element_type: ir.ZigType = .i64;
@@ -4452,7 +5157,7 @@ test "arc_ownership: borrowed param through flat-case guard case_break is promot
 
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
-    var type_store = types_mod.TypeStore.init(std.testing.allocator, &interner);
+    var type_store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
     defer type_store.deinit();
 
     var element_type: ir.ZigType = .i64;
@@ -4523,6 +5228,80 @@ test "arc_ownership: borrowed param through flat-case guard case_break is promot
     try std.testing.expectEqual(@as(?ir.LocalId, 3), rewritten_guard.body[3].case_break.value);
 }
 
+test "arc_ownership: owned alias through flat-case guard case_break moves into case result" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var type_store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer type_store.deinit();
+
+    var element_type: ir.ZigType = .i64;
+    const list_type = ir.ZigType{ .list = &element_type };
+    var params = [_]ir.Param{.{
+        .name = "xs",
+        .type_expr = list_type,
+    }};
+    var param_conventions = [_]ir.ParamConvention{.owned};
+    var local_ownership = [_]ir.OwnershipClass{
+        .owned,
+        .owned,
+        .owned,
+        .trivial,
+    };
+    var guard_body = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 1, .index = 0 } },
+        .{ .local_get = .{ .dest = 2, .source = 1 } },
+        .{ .retain = .{ .value = 2, .kind = .normal } },
+        .{ .case_break = .{ .value = 2 } },
+    };
+    var pre_instrs = [_]ir.Instruction{
+        .{ .const_bool = .{ .dest = 3, .value = true } },
+        .{ .guard_block = .{ .condition = 3, .body = &guard_body } },
+    };
+    var instructions = [_]ir.Instruction{
+        .{ .case_block = .{
+            .dest = 0,
+            .pre_instrs = &pre_instrs,
+            .arms = &.{},
+            .default_instrs = &.{},
+            .default_result = null,
+        } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    var blocks = [_]ir.Block{.{ .label = 0, .instructions = &instructions }};
+    var function = ir.Function{
+        .id = 0,
+        .name = "flat_case_guard_owned_identity",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &params,
+        .return_type = list_type,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = &param_conventions,
+        .local_ownership = &local_ownership,
+        .result_convention = .owned,
+    };
+    var ownership = arc_liveness.ArcOwnership{};
+    defer ownership.deinit(alloc);
+
+    try classifyAndNormalize(alloc, &function, &ownership, &type_store);
+
+    const rewritten_case = function.body[0].instructions[0].case_block;
+    const rewritten_guard = rewritten_case.pre_instrs[1].guard_block;
+    try std.testing.expectEqual(@as(usize, 3), rewritten_guard.body.len);
+    try std.testing.expect(rewritten_guard.body[1] == .move_value);
+    try std.testing.expectEqual(@as(ir.LocalId, 2), rewritten_guard.body[1].move_value.dest);
+    try std.testing.expectEqual(@as(ir.LocalId, 1), rewritten_guard.body[1].move_value.source);
+    try std.testing.expect(rewritten_guard.body[2] == .case_break);
+    try std.testing.expectEqual(@as(?ir.LocalId, 2), rewritten_guard.body[2].case_break.value);
+}
+
 test "arc_ownership: aliased reads of a shared param both yield borrow_value" {
     // Phase C — pattern 4 from the redux plan §3.C tests: two
     // separate `.local_get`s aliasing the same ARC parameter, each
@@ -4558,7 +5337,7 @@ test "arc_ownership: aliased reads of a shared param both yield borrow_value" {
     const caller_func = suite.findFunctionByName("caller") orelse return error.MissingFunction;
     try suite.classify(caller_func);
 
-    const totals = countAliasOpcodes(caller_func);
+    const totals = try countAliasOpcodes(caller_func);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     // At least two borrow_values for the two aliases. Other
     // alias-shaped opcodes may appear from pattern-bind / call-
@@ -4574,7 +5353,7 @@ test "arc_ownership: aliased reads of a shared param both yield borrow_value" {
 
 /// Phase D test guard: skip the test cleanly if the IR builder
 /// declined to emit `optional_dispatch` for the input shape.
-fn ownershipFunctionContainsOptionalDispatch(function: *const ir.Function) bool {
+fn ownershipFunctionContainsOptionalDispatch(function: *const ir.Function) !bool {
     const Detector = struct {
         seen: bool = false,
         fn visit(self: *@This(), instr: *const ir.Instruction) void {
@@ -4582,7 +5361,7 @@ fn ownershipFunctionContainsOptionalDispatch(function: *const ir.Function) bool 
         }
     };
     var detector = Detector{};
-    ir.forEachInstruction(function, &detector, Detector.visit);
+    try ir.forEachInstruction(std.testing.allocator, function, &detector, Detector.visit);
     return detector.seen;
 }
 
@@ -4626,21 +5405,21 @@ test "arc_ownership: classifier normalises local_get inside optional_dispatch ar
     defer suite.deinit();
 
     const pick_func = suite.findFunctionByName("pick") orelse return error.MissingFunction;
-    if (!ownershipFunctionContainsOptionalDispatch(pick_func)) {
+    if (!try ownershipFunctionContainsOptionalDispatch(pick_func)) {
         // The IR builder declined to emit `optional_dispatch`.
         return;
     }
 
     // Pre-condition: at least one `.local_get` exists somewhere in
     // the function (proving the arms have something to rewrite).
-    const totals_before = countAliasOpcodes(pick_func);
+    const totals_before = try countAliasOpcodes(pick_func);
     try std.testing.expect(totals_before.local_get_count >= 1);
 
     try suite.classify(pick_func);
 
     // Post-condition: zero `.local_get` instructions remain — the
     // recursion structurally reached every nested stream.
-    const totals_after = countAliasOpcodes(pick_func);
+    const totals_after = try countAliasOpcodes(pick_func);
     try std.testing.expectEqual(@as(usize, 0), totals_after.local_get_count);
     // At least one classified opcode (borrow_value or copy_value)
     // appeared. The exact form depends on use-classification (the
@@ -4751,7 +5530,7 @@ test "arc_ownership: emits move_value for local_get whose dest's only use is a t
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     // No .local_get must remain after classification.
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     // The move_value path must fire — exactly one .move_value
@@ -4763,6 +5542,50 @@ test "arc_ownership: emits move_value for local_get whose dest's only use is a t
     // No .borrow_value either: the dest's only use (a tail_call
     // arg) is not a borrow-position use.
     try std.testing.expectEqual(@as(usize, 0), totals.borrow_count);
+}
+
+test "arc_ownership: moves through owned local_get chain feeding move_value" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .local_get = .{ .dest = 1, .source = 0 } },
+        .{ .local_get = .{ .dest = 2, .source = 1 } },
+        .{ .move_value = .{ .dest = 3, .source = 2 } },
+        .{ .ret = .{ .value = null } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .owned, .owned,
+    });
+    var function = ir.Function{
+        .id = 1,
+        .name = "chain",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+    var dummy_store: types_mod.TypeStore = undefined;
+    try classifyAndNormalize(arena, &function, &ownership, &dummy_store);
+
+    const totals = try countAliasOpcodes(&function);
+    try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
+    try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
+    try std.testing.expectEqual(@as(usize, 0), totals.borrow_count);
+    try std.testing.expectEqual(@as(usize, 3), totals.move_count);
 }
 
 // ============================================================
@@ -4830,8 +5653,12 @@ test "arc_ownership: rewriteOwnedConsumeSites converts share_value to move_value
     const caller_blocks = try arena.alloc(ir.Block, 1);
     caller_blocks[0] = .{ .label = 0, .instructions = caller_instrs };
     const caller_param_conv = try arena.alloc(ir.ParamConvention, 0);
+    // Start with the share destination misclassified as `.trivial`, matching
+    // the devirtualized-protocol gap that V11 caught: the consume-site rewrite
+    // reuses that local as `move_value.dest`, so it must repair the ownership
+    // class when it turns the share into a move.
     const caller_local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
-        .owned, .owned, .trivial,
+        .owned, .trivial, .trivial,
     });
     const caller_func = ir.Function{
         .id = 200,
@@ -4852,6 +5679,9 @@ test "arc_ownership: rewriteOwnedConsumeSites converts share_value to move_value
     const functions = try arena.alloc(ir.Function, 2);
     functions[0] = target_func;
     functions[1] = caller_func;
+    const callable_protocol_name = "Callable_Tuple_i64_i64";
+    try functions[1].protocol_box_locals.put(arena, 0, callable_protocol_name);
+    try functions[1].protocol_box_locals.put(arena, 1, callable_protocol_name);
     const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
 
     var ownership: arc_liveness.ArcOwnership = .{};
@@ -4878,6 +5708,7 @@ test "arc_ownership: rewriteOwnedConsumeSites converts share_value to move_value
     try std.testing.expect(!saw_share);
     try std.testing.expect(!saw_release_of_1);
     try std.testing.expect(saw_move_dest_1);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, functions[1].local_ownership[1]);
 }
 
 test "arc_ownership: rewriteOwnedConsumeSites clones owned sources that are not at last-use (FU-38)" {
@@ -4961,6 +5792,9 @@ test "arc_ownership: rewriteOwnedConsumeSites clones owned sources that are not 
     const functions = try arena.alloc(ir.Function, 2);
     functions[0] = target_func;
     functions[1] = caller_func;
+    const callable_protocol_name = "Callable_Tuple_i64_i64";
+    try functions[1].protocol_box_locals.put(arena, 0, callable_protocol_name);
+    try functions[1].protocol_box_locals.put(arena, 1, callable_protocol_name);
     const program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
 
     var ownership: arc_liveness.ArcOwnership = .{};
@@ -5027,6 +5861,8 @@ test "arc_ownership: rewriteOwnedConsumeSites clones owned sources that are not 
     try std.testing.expect(clone_local.? >= 4);
     try std.testing.expectEqual(@as(u32, clone_local.? + 1), functions[1].local_count);
     try std.testing.expectEqual(ir.OwnershipClass.owned, functions[1].local_ownership[clone_local.?]);
+    try std.testing.expectEqualStrings(callable_protocol_name, functions[1].protocol_box_locals.get(clone_local.?) orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings(callable_protocol_name, functions[1].protocol_box_locals.get(1) orelse return error.TestUnexpectedResult);
 }
 
 test "arc_ownership: rewriteOwnedConsumeSites is a no-op when callee param convention stays borrowed" {
@@ -5421,7 +6257,7 @@ test "arc_ownership: classifier uses last-wins callee conventions for owned-cons
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalizeWithProgram(arena, &functions[2], &dummy_ownership, &dummy_store, &program);
 
-    const totals = countAliasOpcodes(&functions[2]);
+    const totals = try countAliasOpcodes(&functions[2]);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     try std.testing.expectEqual(@as(usize, 0), totals.borrow_count);
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
@@ -5529,7 +6365,7 @@ test "arc_ownership: classifier promotes existing borrow_value when merged conve
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalizeWithProgram(arena, &functions[2], &dummy_ownership, &dummy_store, &program);
 
-    const totals = countAliasOpcodes(&functions[2]);
+    const totals = try countAliasOpcodes(&functions[2]);
     try std.testing.expectEqual(@as(usize, 0), totals.borrow_count);
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
     try std.testing.expectEqual(ir.OwnershipClass.owned, functions[2].local_ownership[1]);
@@ -5662,7 +6498,7 @@ test "arc_ownership: still emits copy_value when source has additional uses (Pha
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     // No move — source has another use (the retain).
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
@@ -5900,7 +6736,7 @@ test "arc_ownership: emits move_value for local_get whose dest's only use is a l
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     try std.testing.expectEqual(@as(usize, 1), totals.move_count);
     try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
@@ -5958,7 +6794,7 @@ test "arc_ownership: nested aggregate store copies from parent-stream borrow ali
 
     try std.testing.expectEqual(ir.OwnershipClass.borrowed, function.local_ownership[1]);
 
-    const alias_counts = countClassificationsFromSource(&function, 1);
+    const alias_counts = try countClassificationsFromSource(&function, 1);
     try std.testing.expectEqual(@as(usize, 0), alias_counts.move_count);
     try std.testing.expectEqual(@as(usize, 1), alias_counts.copy_count);
 }
@@ -6005,7 +6841,7 @@ test "arc_ownership: borrowed tuple_init operands are promoted before aggregate 
     try std.testing.expectEqual(@as(ir.LocalId, 3), rewritten[4].tuple_init.elements[0]);
     try std.testing.expectEqual(@as(ir.LocalId, 1), rewritten[4].tuple_init.elements[1]);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
 }
@@ -6044,7 +6880,7 @@ test "arc_ownership: borrowed struct_init fields are promoted before aggregate s
     try std.testing.expect(rewritten[3] == .struct_init);
     try std.testing.expectEqual(@as(ir.LocalId, 2), rewritten[3].struct_init.fields[0].value);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
 }
@@ -6086,7 +6922,7 @@ test "arc_ownership: borrowed list_init elements are promoted before aggregate s
     try std.testing.expectEqual(@as(ir.LocalId, 3), rewritten[4].list_init.elements[0]);
     try std.testing.expectEqual(@as(ir.LocalId, 1), rewritten[4].list_init.elements[1]);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
 }
@@ -6133,7 +6969,7 @@ test "arc_ownership: borrowed list_cons operands are promoted before aggregate s
     try std.testing.expectEqual(@as(ir.LocalId, 3), rewritten[6].list_cons.head);
     try std.testing.expectEqual(@as(ir.LocalId, 4), rewritten[6].list_cons.tail);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     try std.testing.expectEqual(@as(usize, 2), totals.copy_count);
 }
@@ -6182,7 +7018,7 @@ test "arc_ownership: borrowed map_init entries are promoted without consume sema
     try std.testing.expectEqual(@as(ir.LocalId, 3), rewritten[6].map_init.entries[0].key);
     try std.testing.expectEqual(@as(ir.LocalId, 4), rewritten[6].map_init.entries[0].value);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     try std.testing.expectEqual(@as(usize, 2), totals.copy_count);
 }
@@ -6219,7 +7055,7 @@ test "arc_ownership: borrowed union_init value is promoted before aggregate stor
     try std.testing.expect(rewritten[3] == .union_init);
     try std.testing.expectEqual(@as(ir.LocalId, 2), rewritten[3].union_init.value);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
 }
@@ -6246,7 +7082,7 @@ test "arc_ownership: emits move_value for local_get whose dest's only use is a s
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     try std.testing.expectEqual(@as(usize, 1), totals.move_count);
     try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
@@ -6274,7 +7110,7 @@ test "arc_ownership: emits move_value for local_get whose dest's only use is a t
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     try std.testing.expectEqual(@as(usize, 1), totals.move_count);
     try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
@@ -6302,7 +7138,7 @@ test "arc_ownership: emits move_value for local_get whose dest's only use is a l
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     try std.testing.expectEqual(@as(usize, 1), totals.move_count);
     try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
@@ -6328,7 +7164,7 @@ test "arc_ownership: emits move_value for local_get whose dest's only use is a u
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     try std.testing.expectEqual(@as(usize, 1), totals.move_count);
     try std.testing.expectEqual(@as(usize, 0), totals.copy_count);
@@ -6365,7 +7201,7 @@ test "arc_ownership: still emits copy_value for map_init operands — Map retain
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     // copy_value is correct here — Map.put's substrate retains the
     // inserted child, and a move would clear source's +1 leaving the
@@ -6404,7 +7240,7 @@ test "arc_ownership: still emits copy_value when source has additional uses outs
     var dummy_store: types_mod.TypeStore = undefined;
     try classifyAndNormalize(arena, &function, &dummy_ownership, &dummy_store);
 
-    const totals = countAliasOpcodes(&function);
+    const totals = try countAliasOpcodes(&function);
     try std.testing.expectEqual(@as(usize, 0), totals.local_get_count);
     try std.testing.expectEqual(@as(usize, 0), totals.move_count);
     try std.testing.expectEqual(@as(usize, 1), totals.copy_count);
@@ -6963,6 +7799,259 @@ test "arc_ownership: rewriteOwnedConsumeBuiltinSites copies borrowed List.push c
     try std.testing.expect(saw_copy_value);
     try std.testing.expect(saw_persistent_retain);
     try std.testing.expectEqual(ir.OwnershipClass.owned, function.local_ownership[3]);
+}
+
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites copies borrowed iterator next state" {
+    const cases = [_][]const u8{ "List.next", "Map.next" };
+
+    for (cases, 0..) |builtin_name, case_index| {
+        var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_obj.deinit();
+        const arena = arena_obj.allocator();
+
+        const args = try arena.alloc(ir.LocalId, 1);
+        args[0] = 1;
+
+        const arg_modes = try arena.alloc(ir.ValueMode, 1);
+        arg_modes[0] = .move;
+
+        const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+            .{ .borrow_value = .{ .dest = 1, .source = 0 } },
+            .{ .call_builtin = .{
+                .dest = 2,
+                .name = builtin_name,
+                .args = args,
+                .arg_modes = arg_modes,
+            } },
+            .{ .ret = .{ .value = 2 } },
+        });
+        const blocks = try arena.alloc(ir.Block, 1);
+        blocks[0] = .{ .label = 0, .instructions = instrs };
+        const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+            .borrowed, .borrowed, .owned,
+        });
+        var function = ir.Function{
+            .id = @intCast(208 + case_index),
+            .name = "Mod__iter_next_wrapper__0",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .void,
+            .body = blocks,
+            .is_closure = false,
+            .captures = &.{},
+            .local_count = 3,
+            .param_conventions = &.{},
+            .local_ownership = local_ownership,
+            .result_convention = .owned,
+        };
+
+        var ownership: arc_liveness.ArcOwnership = .{};
+        defer ownership.deinit(arena);
+
+        try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
+
+        const rewritten = function.body[0].instructions;
+        var saw_borrow = false;
+        var saw_copy_value = false;
+        var saw_persistent_retain = false;
+        for (rewritten) |instr| {
+            switch (instr) {
+                .borrow_value => saw_borrow = true,
+                .copy_value => |copy| {
+                    if (copy.dest == 1 and copy.source == 0) saw_copy_value = true;
+                },
+                .retain => |retain| {
+                    if (retain.value == 1 and retain.kind == .persistent) saw_persistent_retain = true;
+                },
+                else => {},
+            }
+        }
+        try std.testing.expect(!saw_borrow);
+        try std.testing.expect(saw_copy_value);
+        try std.testing.expect(saw_persistent_retain);
+        try std.testing.expectEqual(ir.OwnershipClass.owned, function.local_ownership[1]);
+    }
+}
+
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites copies direct borrowed iterator next parameter" {
+    const cases = [_][]const u8{ "List.next", "Map.next" };
+
+    for (cases, 0..) |builtin_name, case_index| {
+        var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_obj.deinit();
+        const arena = arena_obj.allocator();
+
+        const args = try arena.alloc(ir.LocalId, 1);
+        args[0] = 0;
+
+        const arg_modes = try arena.alloc(ir.ValueMode, 1);
+        arg_modes[0] = .move;
+
+        const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+            .{ .param_get = .{ .dest = 0, .index = 0 } },
+            .{ .call_builtin = .{
+                .dest = 1,
+                .name = builtin_name,
+                .args = args,
+                .arg_modes = arg_modes,
+            } },
+            .{ .ret = .{ .value = 1 } },
+        });
+        const blocks = try arena.alloc(ir.Block, 1);
+        blocks[0] = .{ .label = 0, .instructions = instrs };
+        const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+            .borrowed, .owned,
+        });
+        const param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{
+            .borrowed,
+        });
+        var function = ir.Function{
+            .id = @intCast(210 + case_index),
+            .name = "Mod__iter_next_wrapper__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &.{},
+            .return_type = .void,
+            .body = blocks,
+            .is_closure = false,
+            .captures = &.{},
+            .local_count = 2,
+            .param_conventions = param_conventions,
+            .local_ownership = local_ownership,
+            .result_convention = .owned,
+        };
+
+        var ownership: arc_liveness.ArcOwnership = .{};
+        defer ownership.deinit(arena);
+
+        try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
+
+        const rewritten = function.body[0].instructions;
+        var clone_local: ?ir.LocalId = null;
+        var saw_persistent_retain = false;
+        var call_arg: ?ir.LocalId = null;
+        for (rewritten) |instr| {
+            switch (instr) {
+                .copy_value => |copy| {
+                    if (copy.source == 0) clone_local = copy.dest;
+                },
+                .retain => |retain| {
+                    if (clone_local != null and retain.value == clone_local.? and retain.kind == .persistent) {
+                        saw_persistent_retain = true;
+                    }
+                },
+                .call_builtin => |call_builtin| {
+                    if (std.mem.eql(u8, call_builtin.name, builtin_name)) {
+                        call_arg = call_builtin.args[0];
+                    }
+                },
+                else => {},
+            }
+        }
+
+        const clone = clone_local orelse return error.TestUnexpectedResult;
+        try std.testing.expect(saw_persistent_retain);
+        try std.testing.expectEqual(clone, call_arg orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqual(ir.OwnershipClass.borrowed, function.local_ownership[0]);
+        try std.testing.expectEqual(ir.OwnershipClass.owned, function.local_ownership[clone]);
+    }
+}
+
+test "arc_ownership: rewriteOwnedConsumeBuiltinSites copies direct borrowed List.cons arguments" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.dupe(ir.LocalId, &[_]ir.LocalId{ 0, 1 });
+    const arg_modes = try arena.dupe(ir.ValueMode, &[_]ir.ValueMode{ .move, .move });
+
+    const instrs = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .call_builtin = .{
+            .dest = 2,
+            .name = "List.cons",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .ret = .{ .value = 2 } },
+    });
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = instrs };
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .borrowed, .borrowed, .owned,
+    });
+    const param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{
+        .borrowed, .borrowed,
+    });
+    var function = ir.Function{
+        .id = 212,
+        .name = "Mod__list_prepend_wrapper__0",
+        .scope_id = 0,
+        .arity = 2,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+    const callable_protocol_name = "Callable_Tuple_i64_i64";
+    try function.protocol_box_locals.put(arena, 0, callable_protocol_name);
+    try function.protocol_box_locals.put(arena, 1, callable_protocol_name);
+
+    var ownership: arc_liveness.ArcOwnership = .{};
+    defer ownership.deinit(arena);
+
+    try rewriteOwnedConsumeBuiltinSites(arena, &function, &ownership);
+
+    const rewritten = function.body[0].instructions;
+    var head_clone: ?ir.LocalId = null;
+    var tail_clone: ?ir.LocalId = null;
+    var head_retain = false;
+    var tail_retain = false;
+    var call_head: ?ir.LocalId = null;
+    var call_tail: ?ir.LocalId = null;
+    for (rewritten) |instr| {
+        switch (instr) {
+            .copy_value => |copy| {
+                if (copy.source == 0) head_clone = copy.dest;
+                if (copy.source == 1) tail_clone = copy.dest;
+            },
+            .retain => |retain| {
+                if (head_clone != null and retain.value == head_clone.? and retain.kind == .persistent) {
+                    head_retain = true;
+                }
+                if (tail_clone != null and retain.value == tail_clone.? and retain.kind == .persistent) {
+                    tail_retain = true;
+                }
+            },
+            .call_builtin => |call_builtin| {
+                if (std.mem.eql(u8, call_builtin.name, "List.cons")) {
+                    call_head = call_builtin.args[0];
+                    call_tail = call_builtin.args[1];
+                }
+            },
+            else => {},
+        }
+    }
+
+    const cloned_head = head_clone orelse return error.TestUnexpectedResult;
+    const cloned_tail = tail_clone orelse return error.TestUnexpectedResult;
+    try std.testing.expect(head_retain);
+    try std.testing.expect(tail_retain);
+    try std.testing.expectEqual(cloned_head, call_head orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(cloned_tail, call_tail orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(ir.OwnershipClass.borrowed, function.local_ownership[0]);
+    try std.testing.expectEqual(ir.OwnershipClass.borrowed, function.local_ownership[1]);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, function.local_ownership[cloned_head]);
+    try std.testing.expectEqual(ir.OwnershipClass.owned, function.local_ownership[cloned_tail]);
+    try std.testing.expectEqualStrings(callable_protocol_name, function.protocol_box_locals.get(cloned_head) orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings(callable_protocol_name, function.protocol_box_locals.get(cloned_tail) orelse return error.TestUnexpectedResult);
 }
 
 test "arc_ownership: rewriteOwnedConsumeBuiltinSites keeps non-last-use List.push value share but drops release" {
@@ -8835,7 +9924,7 @@ test "arc_ownership: elideBorrowedPassThroughShares handles nested streams (if_e
         }
     };
     var scan_ctx = ScanCtx{ .share = &saw_share, .release = &saw_release_5, .borrow = &saw_borrow_dest_5 };
-    ir.forEachInstruction(&functions[1], &scan_ctx, ScanCtx.visit);
+    try ir.forEachInstruction(std.testing.allocator, &functions[1], &scan_ctx, ScanCtx.visit);
     try std.testing.expect(!saw_share);
     try std.testing.expect(!saw_release_5);
     try std.testing.expect(saw_borrow_dest_5);
@@ -9543,7 +10632,7 @@ test "arc_ownership: rewriteOwnedConsumeBuiltinSites mutates instruction count, 
     // `record_count`. A real analysis would also populate
     // `last_use_sites`; the count is the load-bearing field for the
     // consistency invariant, so the synthetic table mirrors it.
-    const pre_count = arc_liveness.countInstructionRecords(&function);
+    const pre_count = try arc_liveness.countInstructionRecords(std.testing.allocator, &function);
     try std.testing.expectEqual(@as(usize, 5), pre_count);
 
     var stale_ownership: arc_liveness.ArcOwnership = .{};
@@ -9557,7 +10646,7 @@ test "arc_ownership: rewriteOwnedConsumeBuiltinSites mutates instruction count, 
     try rewriteOwnedConsumeBuiltinSites(arena, &function, &stale_ownership);
 
     // The rewrite dropped the release: the count is now strictly lower.
-    const post_count = arc_liveness.countInstructionRecords(&function);
+    const post_count = try arc_liveness.countInstructionRecords(std.testing.allocator, &function);
     try std.testing.expectEqual(@as(usize, 4), post_count);
     try std.testing.expect(post_count != pre_count);
 
@@ -9581,10 +10670,11 @@ test "arc_ownership: borrow->copy expansion in builtin consume rewrite grows ins
 
     // `List.push(list, value)` always consumes its element argument.
     // When the element is a borrowed alias of a lifetime-extended cell,
-    // the rewrite expands the `borrow_value` into `copy_value`+`retain`
-    // (two instructions where there was one), so the count GROWS — the
-    // `+K` insertion-shift direction the audit flags as the structurally
-    // unsound side of the desync.
+    // the rewrite expands the `borrow_value` into `copy_value`+`retain`.
+    // The borrowed receiver is also copied into a fresh owned local before
+    // entering `List.push`, because mutating receivers require owned input.
+    // The count therefore GROWS — the `+K` insertion-shift direction the
+    // audit flags as the structurally unsound side of the desync.
     //   [0] param_get %0        (the list receiver; borrowed param)
     //   [1] param_get %1        (the source cell; owned param, extended)
     //   [2] borrow_value %2 <- %1
@@ -9634,7 +10724,7 @@ test "arc_ownership: borrow->copy expansion in builtin consume rewrite grows ins
         .result_convention = .trivial,
     };
 
-    const pre_count = arc_liveness.countInstructionRecords(&function);
+    const pre_count = try arc_liveness.countInstructionRecords(std.testing.allocator, &function);
     try std.testing.expectEqual(@as(usize, 5), pre_count);
 
     var stale_ownership: arc_liveness.ArcOwnership = .{};
@@ -9643,9 +10733,10 @@ test "arc_ownership: borrow->copy expansion in builtin consume rewrite grows ins
 
     try rewriteOwnedConsumeBuiltinSites(arena, &function, &stale_ownership);
 
-    // borrow_value -> copy_value + retain: count grew by one.
-    const post_count = arc_liveness.countInstructionRecords(&function);
-    try std.testing.expectEqual(@as(usize, 6), post_count);
+    // borrow_value -> copy_value + retain, plus direct borrowed receiver
+    // copy_value + retain before the call.
+    const post_count = try arc_liveness.countInstructionRecords(std.testing.allocator, &function);
+    try std.testing.expectEqual(@as(usize, 8), post_count);
     try std.testing.expect(post_count > pre_count);
 
     // Stale table desynced in the growth direction too.

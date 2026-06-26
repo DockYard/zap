@@ -130,107 +130,388 @@ pub const FRESH_ALLOCATOR_MAX_DEPTH: usize = 8;
 /// `ones(n) -> List.new_filled(n, 1.0)` where the user wraps the runtime
 /// allocator in a thin Zap helper. When `program` is null, every non-builtin
 /// call counts as "other" (no transitive recognition).
-pub fn isFreshAllocatorWrapper(function: *const ir.Function, program: ?*const ir.Program) bool {
-    return isFreshAllocatorWrapperWithDepth(function, program, 0);
+///
+/// Returns `error.OutOfMemory` when the temporary program index or recursion
+/// memo cannot be allocated. Infrastructure failure is never demoted to
+/// "not fresh" because that would silently change uniqueness decisions.
+pub fn isFreshAllocatorWrapper(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+) std.mem.Allocator.Error!bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    return try isFreshAllocatorWrapperWithAllocator(arena.allocator(), function, program);
+}
+
+fn isFreshAllocatorWrapperWithAllocator(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+) std.mem.Allocator.Error!bool {
+    var ctx = try FreshAllocatorWrapperDecision.init(allocator, program);
+    return try ctx.isFresh(function);
+}
+
+const FreshAllocatorWrapperState = enum {
+    visiting,
+    fresh,
+    not_fresh,
+};
+
+const ProgramFunctionIndex = struct {
+    allocator: std.mem.Allocator,
+    by_name: std.StringHashMapUnmanaged(*const ir.Function) = .empty,
+    by_id: std.AutoHashMapUnmanaged(ir.FunctionId, *const ir.Function) = .empty,
+
+    fn init(allocator: std.mem.Allocator, program: *const ir.Program) std.mem.Allocator.Error!ProgramFunctionIndex {
+        var index = ProgramFunctionIndex{ .allocator = allocator };
+        errdefer index.deinit();
+
+        for (program.functions) |*func| {
+            const name_entry = try index.by_name.getOrPut(allocator, func.name);
+            if (!name_entry.found_existing) name_entry.value_ptr.* = func;
+
+            const id_entry = try index.by_id.getOrPut(allocator, func.id);
+            if (!id_entry.found_existing) id_entry.value_ptr.* = func;
+        }
+        return index;
+    }
+
+    fn deinit(self: *ProgramFunctionIndex) void {
+        self.by_name.deinit(self.allocator);
+        self.by_id.deinit(self.allocator);
+    }
+
+    fn lookupByName(self: *const ProgramFunctionIndex, name: []const u8) ?*const ir.Function {
+        return self.by_name.get(name);
+    }
+
+    fn lookupById(self: *const ProgramFunctionIndex, function_id: ir.FunctionId) ?*const ir.Function {
+        return self.by_id.get(function_id);
+    }
+};
+
+const FreshAllocatorWrapperDecision = struct {
+    allocator: std.mem.Allocator,
+    index: ?ProgramFunctionIndex,
+    memo: std.AutoHashMapUnmanaged(usize, FreshAllocatorWrapperState) = .empty,
+    scan_count: ?*usize = null,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        program: ?*const ir.Program,
+    ) std.mem.Allocator.Error!FreshAllocatorWrapperDecision {
+        return .{
+            .allocator = allocator,
+            .index = if (program) |p| try ProgramFunctionIndex.init(allocator, p) else null,
+        };
+    }
+
+    fn deinit(self: *FreshAllocatorWrapperDecision) void {
+        if (self.index) |*index| index.deinit();
+        self.memo.deinit(self.allocator);
+    }
+
+    fn isFresh(self: *FreshAllocatorWrapperDecision, function: *const ir.Function) std.mem.Allocator.Error!bool {
+        defer self.deinit();
+        return self.isFreshWithDepth(function, 0);
+    }
+
+    fn isFreshWithDepth(
+        self: *FreshAllocatorWrapperDecision,
+        function: *const ir.Function,
+        depth: usize,
+    ) std.mem.Allocator.Error!bool {
+        if (function.result_convention != .owned) return false;
+        if (depth >= FRESH_ALLOCATOR_MAX_DEPTH) return false;
+
+        const key = @intFromPtr(function);
+        const memo_entry = try self.memo.getOrPut(self.allocator, key);
+        if (memo_entry.found_existing) {
+            return switch (memo_entry.value_ptr.*) {
+                .fresh => true,
+                .not_fresh, .visiting => false,
+            };
+        }
+
+        memo_entry.value_ptr.* = .visiting;
+        const fresh = try self.scanFunction(function, depth);
+        memo_entry.value_ptr.* = if (fresh) .fresh else .not_fresh;
+        return fresh;
+    }
+
+    fn scanFunction(
+        self: *FreshAllocatorWrapperDecision,
+        function: *const ir.Function,
+        depth: usize,
+    ) std.mem.Allocator.Error!bool {
+        if (self.scan_count) |count| count.* += 1;
+
+        var allocator_count: usize = 0;
+        var other_call_count: usize = 0;
+        var scan = AllocatorWrapperScan{
+            .decision = self,
+            .allocator_count = &allocator_count,
+            .other_call_count = &other_call_count,
+            .depth = depth,
+        };
+        for (function.body) |block| {
+            try scanAllocatorWrapperStream(block.instructions, &scan);
+            if (allocator_count > 1 or other_call_count > 0) break;
+        }
+        return allocator_count == 1 and other_call_count == 0;
+    }
+
+    fn lookupByName(self: *const FreshAllocatorWrapperDecision, name: []const u8) ?*const ir.Function {
+        if (self.index) |*index| return index.lookupByName(name);
+        return null;
+    }
+
+    fn lookupById(self: *const FreshAllocatorWrapperDecision, function_id: ir.FunctionId) ?*const ir.Function {
+        if (self.index) |*index| return index.lookupById(function_id);
+        return null;
+    }
+};
+
+fn isFreshAllocatorWrapperWithScanCount(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+    scan_count: *usize,
+) std.mem.Allocator.Error!bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var ctx = try FreshAllocatorWrapperDecision.init(arena.allocator(), program);
+    ctx.scan_count = scan_count;
+    return try ctx.isFresh(function);
 }
 
 fn isFreshAllocatorWrapperWithDepth(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: ?*const ir.Program,
     depth: usize,
-) bool {
-    if (function.result_convention != .owned) return false;
-    if (depth >= FRESH_ALLOCATOR_MAX_DEPTH) return false;
-    var allocator_count: usize = 0;
-    var other_call_count: usize = 0;
-    var ctx = AllocatorWrapperScan{
-        .allocator_count = &allocator_count,
-        .other_call_count = &other_call_count,
-        .program = program,
-        .depth = depth,
-    };
-    for (function.body) |block| {
-        scanAllocatorWrapperStream(block.instructions, &ctx);
-    }
-    return allocator_count == 1 and other_call_count == 0;
+) std.mem.Allocator.Error!bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var ctx = try FreshAllocatorWrapperDecision.init(arena.allocator(), program);
+    defer ctx.deinit();
+    return try ctx.isFreshWithDepth(function, depth);
 }
 
 /// Resolve `name` in `program` and decide whether it is a thin
-/// fresh-allocator wrapper. False when the name does not match.
-pub fn isFreshAllocatorWrapperByName(program: *const ir.Program, name: []const u8) bool {
+/// fresh-allocator wrapper. Returns false when the name does not match, and
+/// `error.OutOfMemory` when recognition state cannot be allocated.
+pub fn isFreshAllocatorWrapperByName(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    name: []const u8,
+) std.mem.Allocator.Error!bool {
     const func = lookupFunctionByName(program, name) orelse return false;
-    return isFreshAllocatorWrapper(func, program);
+    return try isFreshAllocatorWrapper(allocator, func, program);
 }
 
 const AllocatorWrapperScan = struct {
+    decision: *FreshAllocatorWrapperDecision,
     allocator_count: *usize,
     other_call_count: *usize,
-    /// Optional program reference. When non-null, `call_named`/`call_direct`
-    /// targets are resolved and (transitively) checked. When null, every
-    /// non-builtin call counts as "other".
-    program: ?*const ir.Program = null,
     /// Current recursion depth. Passed to nested calls so transitive chains
     /// observe the same cap.
     depth: usize = 0,
 };
 
-fn scanAllocatorWrapperStream(stream: []const ir.Instruction, ctx: *AllocatorWrapperScan) void {
-    for (stream) |*instr| {
-        switch (instr.*) {
-            .call_builtin => |cb| {
-                if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
-                    ctx.allocator_count.* += 1;
-                } else {
-                    ctx.other_call_count.* += 1;
-                }
-            },
-            // Transitive recognition: a call to another fresh-allocator
-            // wrapper counts as an allocator call when the program is
-            // available. Mutual recursion is bounded by the depth cap.
-            .call_named => |cn| {
-                if (ctx.program) |program| {
-                    if (lookupFunctionByName(program, cn.name)) |target| {
-                        if (isFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
-                            ctx.allocator_count.* += 1;
-                            continue;
-                        }
-                    }
-                }
-                ctx.other_call_count.* += 1;
-            },
-            .call_direct => |cd| {
-                if (ctx.program) |program| {
-                    if (lookupFunctionById(program, cd.function)) |target| {
-                        if (isFreshAllocatorWrapperWithDepth(target, ctx.program, ctx.depth + 1)) {
-                            ctx.allocator_count.* += 1;
-                            continue;
-                        }
-                    }
-                }
-                ctx.other_call_count.* += 1;
-            },
-            .try_call_named, .call_dispatch, .call_closure, .tail_call => {
-                ctx.other_call_count.* += 1;
-            },
-            else => {},
+const allocator_wrapper_stream_inline_frame_capacity: usize = 64;
+const allocator_wrapper_stream_inline_child_capacity: usize = 16;
+
+const AllocatorWrapperStreamFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+    check_threshold_before_next: bool = false,
+};
+
+fn AllocatorWrapperInlineStack(comptime T: type, comptime inline_capacity: usize) type {
+    return struct {
+        inline_items: [inline_capacity]T = undefined,
+        inline_len: usize = 0,
+        spill: std.ArrayListUnmanaged(T) = .empty,
+
+        const Self = @This();
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.spill.deinit(allocator);
         }
-        // Recurse into every nested sub-stream via the canonical enumerator
-        // (covers e.g. union_switch.else_instrs). The call-counting arms above
-        // are leaf instructions with no child streams, so this is a no-op for
-        // them. Using `forEachChildStream` keeps the scan exhaustive: the
-        // comptime child-stream exhaustiveness guard (`ir.zig`) fails
-        // compilation if a new child-stream-bearing variant is added without a
-        // branch, so this recursion can never silently drop a sub-stream.
-        const Recurse = struct {
-            ctx: *AllocatorWrapperScan,
-            fn onStream(self: *@This(), child: ir.ChildStream) void {
-                scanAllocatorWrapperStream(child.stream, self.ctx);
+
+        fn clearRetainingCapacity(self: *Self) void {
+            self.inline_len = 0;
+            self.spill.clearRetainingCapacity();
+        }
+
+        fn len(self: *const Self) usize {
+            return self.inline_len + self.spill.items.len;
+        }
+
+        fn append(self: *Self, allocator: std.mem.Allocator, item: T) std.mem.Allocator.Error!void {
+            if (self.spill.items.len == 0 and self.inline_len < inline_capacity) {
+                self.inline_items[self.inline_len] = item;
+                self.inline_len += 1;
+                return;
             }
-        };
-        var rec = Recurse{ .ctx = ctx };
-        ir.forEachChildStream(instr, &rec, Recurse.onStream);
+            try self.spill.append(allocator, item);
+        }
+
+        fn get(self: *const Self, index: usize) T {
+            std.debug.assert(index < self.len());
+            if (index < self.inline_len) return self.inline_items[index];
+            return self.spill.items[index - self.inline_len];
+        }
+
+        fn topPtr(self: *Self) *T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) return &self.spill.items[self.spill.items.len - 1];
+            return &self.inline_items[self.inline_len - 1];
+        }
+
+        fn pop(self: *Self) T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) return self.spill.pop().?;
+            self.inline_len -= 1;
+            return self.inline_items[self.inline_len];
+        }
+    };
+}
+
+fn scanAllocatorWrapperStream(
+    stream: []const ir.Instruction,
+    ctx: *AllocatorWrapperScan,
+) std.mem.Allocator.Error!void {
+    var walker = AllocatorWrapperStreamWalker.init(ctx.decision.allocator);
+    defer walker.deinit();
+    try walker.scan(stream, ctx);
+}
+
+fn scanAllocatorWrapperInstruction(
+    instr: *const ir.Instruction,
+    ctx: *AllocatorWrapperScan,
+) std.mem.Allocator.Error!void {
+    switch (instr.*) {
+        .call_builtin => |cb| {
+            if (arc_liveness.isFreshAllocatorBuiltin(cb.name)) {
+                ctx.allocator_count.* += 1;
+            } else {
+                ctx.other_call_count.* += 1;
+            }
+        },
+        // Transitive recognition: a call to another fresh-allocator wrapper
+        // counts as an allocator call when the program is available. Mutual
+        // recursion is rejected by the decision context's `.visiting` state
+        // instead of repeatedly rescanning.
+        .call_named => |cn| {
+            if (ctx.decision.lookupByName(cn.name)) |target| {
+                if (try ctx.decision.isFreshWithDepth(target, ctx.depth + 1)) {
+                    ctx.allocator_count.* += 1;
+                    return;
+                }
+            }
+            ctx.other_call_count.* += 1;
+        },
+        .call_direct => |cd| {
+            if (ctx.decision.lookupById(cd.function)) |target| {
+                if (try ctx.decision.isFreshWithDepth(target, ctx.depth + 1)) {
+                    ctx.allocator_count.* += 1;
+                    return;
+                }
+            }
+            ctx.other_call_count.* += 1;
+        },
+        .try_call_named, .call_dispatch, .call_closure, .tail_call => {
+            ctx.other_call_count.* += 1;
+        },
+        else => {},
     }
 }
+
+fn allocatorWrapperScanThresholdReached(ctx: *const AllocatorWrapperScan) bool {
+    return ctx.allocator_count.* > 1 or ctx.other_call_count.* > 0;
+}
+
+const AllocatorWrapperStreamWalker = struct {
+    allocator: std.mem.Allocator,
+    stack: AllocatorWrapperInlineStack(AllocatorWrapperStreamFrame, allocator_wrapper_stream_inline_frame_capacity) = .{},
+    child_streams: AllocatorWrapperInlineStack([]const ir.Instruction, allocator_wrapper_stream_inline_child_capacity) = .{},
+
+    fn init(allocator: std.mem.Allocator) AllocatorWrapperStreamWalker {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *AllocatorWrapperStreamWalker) void {
+        self.stack.deinit(self.allocator);
+        self.child_streams.deinit(self.allocator);
+    }
+
+    fn scan(
+        self: *AllocatorWrapperStreamWalker,
+        root_stream: []const ir.Instruction,
+        ctx: *AllocatorWrapperScan,
+    ) std.mem.Allocator.Error!void {
+        self.stack.clearRetainingCapacity();
+        self.child_streams.clearRetainingCapacity();
+        if (root_stream.len == 0) return;
+
+        try self.stack.append(self.allocator, .{ .stream = root_stream });
+        while (self.stack.len() != 0) {
+            const frame = self.stack.topPtr();
+            if (frame.check_threshold_before_next) {
+                frame.check_threshold_before_next = false;
+                if (allocatorWrapperScanThresholdReached(ctx)) {
+                    _ = self.stack.pop();
+                    continue;
+                }
+            }
+
+            if (frame.next_index >= frame.stream.len) {
+                _ = self.stack.pop();
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            frame.next_index += 1;
+
+            try scanAllocatorWrapperInstruction(instr, ctx);
+            frame.check_threshold_before_next = true;
+            try self.pushInstructionChildren(instr);
+        }
+    }
+
+    fn pushInstructionChildren(
+        self: *AllocatorWrapperStreamWalker,
+        instr: *const ir.Instruction,
+    ) std.mem.Allocator.Error!void {
+        self.child_streams.clearRetainingCapacity();
+
+        const ChildStreamCollector = struct {
+            walker: *AllocatorWrapperStreamWalker,
+            err: ?std.mem.Allocator.Error = null,
+
+            fn onStream(collector: *@This(), child: ir.ChildStream) void {
+                if (collector.err != null or child.stream.len == 0) return;
+                collector.walker.child_streams.append(collector.walker.allocator, child.stream) catch |err| {
+                    collector.err = err;
+                };
+            }
+        };
+
+        var collector = ChildStreamCollector{ .walker = self };
+        ir.forEachChildStream(instr, &collector, ChildStreamCollector.onStream);
+        if (collector.err) |err| return err;
+
+        var child_index = self.child_streams.len();
+        while (child_index > 0) {
+            child_index -= 1;
+            try self.stack.append(self.allocator, .{ .stream = self.child_streams.get(child_index) });
+        }
+    }
+};
 
 // ============================================================
 // uniqueness--04 — whole-return-preserves-uniqueness signature witness
@@ -332,14 +613,18 @@ pub fn conventionPairResultUniqueByFunction(
 ///      whole-return PU AND the receiver was unique at the call site
 ///      (`conventionPairResultUnique`). The convention pair alone does NOT
 ///      prove result freshness.
+///
+/// Returns `error.OutOfMemory` if fresh-wrapper recognition cannot allocate
+/// its temporary index or memo.
 pub fn calleeContractResultUnique(
+    allocator: std.mem.Allocator,
     signatures: ?*const uniqueness_signature.ProgramSignatures,
     program: *const ir.Program,
     name: []const u8,
     pre_arg_unique: []const bool,
-) bool {
+) std.mem.Allocator.Error!bool {
     if (arc_liveness.ownedMutatingBuiltinSlot(name) != null) return true;
-    if (isFreshAllocatorWrapperByName(program, name)) return true;
+    if (try isFreshAllocatorWrapperByName(allocator, program, name)) return true;
     if (ownedReceiverSlotByName(program, name)) |slot| {
         return conventionPairResultUnique(signatures, program, name, slot, pre_arg_unique);
     }
@@ -393,6 +678,265 @@ fn buildCalleeWithConventions(
         .local_ownership = try arena.alloc(ir.OwnershipClass, 0),
         .result_convention = result_conv,
     };
+}
+
+fn builtinCall(name: []const u8) ir.Instruction {
+    return .{ .call_builtin = .{
+        .dest = 0,
+        .name = name,
+        .args = &.{},
+        .arg_modes = &.{},
+    } };
+}
+
+fn namedCall(name: []const u8) ir.Instruction {
+    return .{ .call_named = .{
+        .dest = 0,
+        .name = name,
+        .args = &.{},
+        .arg_modes = &.{},
+    } };
+}
+
+fn directCall(function_id: ir.FunctionId) ir.Instruction {
+    return .{ .call_direct = .{
+        .dest = 0,
+        .function = function_id,
+        .args = &.{},
+        .arg_modes = &.{},
+    } };
+}
+
+fn buildWrapperCandidate(
+    arena: std.mem.Allocator,
+    id: ir.FunctionId,
+    name: []const u8,
+    instructions: []const ir.Instruction,
+) !ir.Function {
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, instructions),
+    };
+    return ir.Function{
+        .id = id,
+        .name = name,
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+        .param_conventions = &.{},
+        .local_ownership = &.{},
+        .result_convention = .owned,
+    };
+}
+
+fn buildProgram(arena: std.mem.Allocator, functions: []const ir.Function) !ir.Program {
+    return .{
+        .functions = try arena.dupe(ir.Function, functions),
+        .type_defs = &.{},
+        .entry = null,
+    };
+}
+
+fn buildDeepGuardInstructionStream(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    leaf: ir.Instruction,
+) ![]ir.Instruction {
+    const instructions = try allocator.alloc(ir.Instruction, depth + 1);
+    instructions[depth] = leaf;
+
+    var index = depth;
+    while (index > 0) {
+        const child_index = index;
+        index -= 1;
+        instructions[index] = .{ .guard_block = .{
+            .condition = 0,
+            .body = instructions[child_index .. child_index + 1],
+        } };
+    }
+
+    return instructions;
+}
+
+test "uniqueness_decision: fresh allocator wrapper recognizes a single builtin allocator call" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const instrs = [_]ir.Instruction{builtinCall("List.new_empty")};
+    const function = try buildWrapperCandidate(arena, 0, "new_list", &instrs);
+
+    try testing.expect(try isFreshAllocatorWrapper(testing.allocator, &function, null));
+}
+
+test "uniqueness_decision: fresh allocator wrapper scans deeply nested child streams iteratively" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+    const depth: usize = 16 * 1024;
+
+    const instructions = try buildDeepGuardInstructionStream(arena, depth, builtinCall("List.new_empty"));
+    const function = try buildWrapperCandidate(arena, 0, "deep_new_list", instructions[0..1]);
+
+    try testing.expect(try isFreshAllocatorWrapper(testing.allocator, &function, null));
+}
+
+test "uniqueness_decision: fresh allocator wrapper propagates OOM from child-stream stack growth" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+    const depth = allocator_wrapper_stream_inline_frame_capacity + 1;
+
+    const instructions = try buildDeepGuardInstructionStream(arena, depth, builtinCall("List.new_empty"));
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var decision = FreshAllocatorWrapperDecision{
+        .allocator = failing_allocator.allocator(),
+        .index = null,
+    };
+    defer decision.deinit();
+
+    var allocator_count: usize = 0;
+    var other_call_count: usize = 0;
+    var scan = AllocatorWrapperScan{
+        .decision = &decision,
+        .allocator_count = &allocator_count,
+        .other_call_count = &other_call_count,
+    };
+
+    try testing.expectError(
+        error.OutOfMemory,
+        scanAllocatorWrapperStream(instructions[0..1], &scan),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "uniqueness_decision: fresh allocator wrapper rejects non-allocator calls" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const instrs = [_]ir.Instruction{builtinCall("List.length")};
+    const function = try buildWrapperCandidate(arena, 0, "length", &instrs);
+
+    const is_fresh = try isFreshAllocatorWrapper(testing.allocator, &function, null);
+    try testing.expect(!is_fresh);
+}
+
+test "uniqueness_decision: fresh allocator wrapper propagates OOM from recognition allocations" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const instrs = [_]ir.Instruction{builtinCall("List.new_empty")};
+    const function = try buildWrapperCandidate(arena, 0, "new_list", &instrs);
+
+    var memo_failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        isFreshAllocatorWrapper(memo_failing_allocator.allocator(), &function, null),
+    );
+    try testing.expect(memo_failing_allocator.has_induced_failure);
+
+    const functions = [_]ir.Function{function};
+    const program = try buildProgram(arena, &functions);
+    var index_failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        isFreshAllocatorWrapperByName(index_failing_allocator.allocator(), &program, "new_list"),
+    );
+    try testing.expect(index_failing_allocator.has_induced_failure);
+}
+
+test "uniqueness_decision: fresh allocator wrapper recognizes public-name and direct-id transitive wrappers" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const base_instrs = [_]ir.Instruction{builtinCall("List.new_empty")};
+    const named_instrs = [_]ir.Instruction{namedCall("base")};
+    const direct_instrs = [_]ir.Instruction{directCall(0)};
+    const functions = [_]ir.Function{
+        try buildWrapperCandidate(arena, 0, "base", &base_instrs),
+        try buildWrapperCandidate(arena, 1, "named_outer", &named_instrs),
+        try buildWrapperCandidate(arena, 2, "direct_outer", &direct_instrs),
+    };
+    const program = try buildProgram(arena, &functions);
+
+    try testing.expect(try isFreshAllocatorWrapper(testing.allocator, &program.functions[1], &program));
+    try testing.expect(try isFreshAllocatorWrapper(testing.allocator, &program.functions[2], &program));
+}
+
+test "uniqueness_decision: fresh allocator wrapper does not resolve transitive edges through local aliases" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const base_instrs = [_]ir.Instruction{builtinCall("List.new_empty")};
+    const alias_instrs = [_]ir.Instruction{namedCall("base_alias")};
+    var base = try buildWrapperCandidate(arena, 0, "base", &base_instrs);
+    base.local_name = "base_alias";
+    const functions = [_]ir.Function{
+        base,
+        try buildWrapperCandidate(arena, 1, "alias_outer", &alias_instrs),
+    };
+    const program = try buildProgram(arena, &functions);
+
+    const is_fresh = try isFreshAllocatorWrapper(testing.allocator, &program.functions[1], &program);
+    try testing.expect(!is_fresh);
+}
+
+test "uniqueness_decision: fresh allocator wrapper rejects recursive cycles without repeated rescanning" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const a_instrs = [_]ir.Instruction{namedCall("b")};
+    const b_instrs = [_]ir.Instruction{namedCall("a")};
+    const functions = [_]ir.Function{
+        try buildWrapperCandidate(arena, 0, "a", &a_instrs),
+        try buildWrapperCandidate(arena, 1, "b", &b_instrs),
+    };
+    const program = try buildProgram(arena, &functions);
+
+    var scan_count: usize = 0;
+    const is_fresh = try isFreshAllocatorWrapperWithScanCount(testing.allocator, &program.functions[0], &program, &scan_count);
+    try testing.expect(!is_fresh);
+    try testing.expect(scan_count <= functions.len);
+}
+
+test "uniqueness_decision: fresh allocator wrapper memoizes cross-linked transitive calls" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const root_instrs = [_]ir.Instruction{
+        namedCall("left"),
+        namedCall("right"),
+    };
+    const left_instrs = [_]ir.Instruction{namedCall("shared")};
+    const right_instrs = [_]ir.Instruction{namedCall("shared")};
+    const shared_instrs = [_]ir.Instruction{namedCall("leaf")};
+    const leaf_instrs = [_]ir.Instruction{builtinCall("List.new_empty")};
+    const functions = [_]ir.Function{
+        try buildWrapperCandidate(arena, 0, "root", &root_instrs),
+        try buildWrapperCandidate(arena, 1, "left", &left_instrs),
+        try buildWrapperCandidate(arena, 2, "right", &right_instrs),
+        try buildWrapperCandidate(arena, 3, "shared", &shared_instrs),
+        try buildWrapperCandidate(arena, 4, "leaf", &leaf_instrs),
+    };
+    const program = try buildProgram(arena, &functions);
+
+    var scan_count: usize = 0;
+    const is_fresh = try isFreshAllocatorWrapperWithScanCount(testing.allocator, &program.functions[0], &program, &scan_count);
+    try testing.expect(!is_fresh);
+    try testing.expect(scan_count <= functions.len);
 }
 
 test "uniqueness_decision: ownedReceiverSlot recognizes the .owned/.owned pair" {
@@ -462,12 +1006,13 @@ test "uniqueness_decision: calleeContractResultUnique routes owned-mutating buil
     });
 
     // Convention-pair callee: gated by receiver uniqueness.
-    try testing.expect(calleeContractResultUnique(&signatures, &program, "accum", &[_]bool{true}));
-    try testing.expect(!calleeContractResultUnique(&signatures, &program, "accum", &[_]bool{false}));
+    try testing.expect(try calleeContractResultUnique(testing.allocator, &signatures, &program, "accum", &[_]bool{true}));
+    const shared_receiver_unique = try calleeContractResultUnique(testing.allocator, &signatures, &program, "accum", &[_]bool{false});
+    try testing.expect(!shared_receiver_unique);
 
     // Owned-mutating builtin: unconditionally fresh (receiver uniqueness
     // irrelevant). "Map.put" is the canonical owned-mutating builtin.
-    try testing.expect(calleeContractResultUnique(&signatures, &program, "Map.put", &[_]bool{false}));
+    try testing.expect(try calleeContractResultUnique(testing.allocator, &signatures, &program, "Map.put", &[_]bool{false}));
 
     // Receiver slot for an owned-mutating builtin try_call is the builtin's
     // owned slot; for the convention-pair callee it is slot 0.

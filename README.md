@@ -381,12 +381,17 @@ Protocols provide compile-time dispatch across different data types:
 
 ```zap
 pub protocol Enumerable(element) {
-  fn next(state) -> {Atom, element, any}
+  fn next(state) -> {Atom, element, Enumerable(element)}
+  fn dispose(state) -> Nil
 }
 
 pub impl Enumerable(i64) for Range {
   pub fn next(range :: Range) -> {Atom, i64, Range} {
     :zig.Range.next(range)
+  }
+
+  pub fn dispose(_range :: Range) -> Nil {
+    nil
   }
 }
 ```

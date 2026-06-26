@@ -11,7 +11,18 @@ pub impl Enumerable(i64) for Range {
     or `{:done, 0, range}` when iteration is complete.
     """
 
-  pub fn next(range :: Range) -> {Atom, i64, Range} {
+  pub fn next(range :: unique Range) -> {Atom, i64, Range} {
     :zig.Range.next(range)
+  }
+
+  @doc = """
+    Disposes a range iteration state.
+
+    Range states are plain values and own no cursor resources, so disposal
+    is a no-op.
+    """
+
+  pub fn dispose(_range :: unique Range) -> Nil {
+    nil
   }
 }

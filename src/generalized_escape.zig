@@ -73,6 +73,9 @@ pub const GeneralizedEscapeAnalyzer = struct {
     /// Maps struct/tuple values to their ordered field name lists.
     /// Used for per-field escape tracking at field_get/field_set.
     field_name_lists: std.AutoHashMap(ValueKey, []const []const u8),
+    seed_instruction_depth: u32 = 0,
+
+    const MAX_SEED_INSTRUCTION_NESTING_DEPTH: u32 = 4096;
 
     const BorrowSite = struct {
         /// Unique ID for this borrow site.
@@ -163,9 +166,15 @@ pub const GeneralizedEscapeAnalyzer = struct {
     // Phase 1: Seed constraints from instructions
     // ========================================================
 
-    const SeedError = std.mem.Allocator.Error;
+    const SeedError = std.mem.Allocator.Error || error{AnalysisNestingLimitExceeded};
 
     fn seedInstructions(self: *GeneralizedEscapeAnalyzer, func_id: ir.FunctionId, instructions: []const ir.Instruction) SeedError!void {
+        if (self.seed_instruction_depth >= MAX_SEED_INSTRUCTION_NESTING_DEPTH) {
+            return error.AnalysisNestingLimitExceeded;
+        }
+        self.seed_instruction_depth += 1;
+        defer self.seed_instruction_depth -= 1;
+
         for (instructions) |instr| {
             try self.seedInstruction(func_id, instr);
         }
@@ -834,12 +843,9 @@ pub const GeneralizedEscapeAnalyzer = struct {
     // ========================================================
 
     fn runFixpoint(self: *GeneralizedEscapeAnalyzer) !void {
-        var iterations: u32 = 0;
-        const max_iterations: u32 = 1000;
-
-        while (self.worklist.items.len > 0 and iterations < max_iterations) {
-            iterations += 1;
-            const key = self.worklist.orderedRemove(0);
+        var worklist_index: usize = 0;
+        while (worklist_index < self.worklist.items.len) : (worklist_index += 1) {
+            const key = self.worklist.items[worklist_index];
             _ = self.in_worklist.remove(key);
 
             // Propagate this value's escape state to all its aliases.
@@ -855,6 +861,8 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 }
             }
         }
+
+        self.worklist.clearRetainingCapacity();
     }
 
     // ========================================================
@@ -981,7 +989,7 @@ pub const GeneralizedEscapeAnalyzer = struct {
                 // Determine specific reason by checking how it escapes.
                 .global_escape => blk: {
                     // Check if the borrowed value is returned from the function.
-                    if (self.isValueReturned(bs.value)) {
+                    if (try self.isValueReturned(bs.value)) {
                         break :blk BorrowVerdict{ .illegal = .{
                             .reason = .returned_from_function,
                             .escape_path = null,
@@ -1014,21 +1022,58 @@ pub const GeneralizedEscapeAnalyzer = struct {
     }
 
     /// Check if a value (identified by ValueKey) is returned from its function.
-    fn isValueReturned(self: *const GeneralizedEscapeAnalyzer, value: ValueKey) bool {
+    const ReturnScanFrame = struct {
+        stream: []const ir.Instruction,
+        next_index: usize = 0,
+    };
+
+    fn isValueReturned(self: *const GeneralizedEscapeAnalyzer, value: ValueKey) std.mem.Allocator.Error!bool {
+        var stack: std.ArrayListUnmanaged(ReturnScanFrame) = .empty;
+        defer stack.deinit(self.allocator);
+        var child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+        defer child_streams.deinit(self.allocator);
+
         // Scan the function's instructions for a ret that references this value
         // or an alias of it.
         for (self.program.functions) |func| {
             if (func.id != value.function) continue;
             for (func.body) |block| {
-                if (isValueReturnedInInstrs(value.local, block.instructions, self)) return true;
+                if (try isValueReturnedInInstrs(
+                    self.allocator,
+                    value.local,
+                    block.instructions,
+                    &stack,
+                    &child_streams,
+                )) return true;
             }
         }
         return false;
     }
 
-    fn isValueReturnedInInstrs(local: ir.LocalId, instrs: []const ir.Instruction, self: *const GeneralizedEscapeAnalyzer) bool {
-        for (instrs) |instr| {
-            switch (instr) {
+    fn isValueReturnedInInstrs(
+        allocator: std.mem.Allocator,
+        local: ir.LocalId,
+        instrs: []const ir.Instruction,
+        stack: *std.ArrayListUnmanaged(ReturnScanFrame),
+        child_streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+    ) std.mem.Allocator.Error!bool {
+        stack.clearRetainingCapacity();
+        child_streams.clearRetainingCapacity();
+        if (instrs.len == 0) return false;
+
+        try stack.append(allocator, .{ .stream = instrs });
+        while (stack.items.len > 0) {
+            const frame_index = stack.items.len - 1;
+            if (stack.items[frame_index].next_index >= stack.items[frame_index].stream.len) {
+                _ = stack.pop();
+                continue;
+            }
+
+            const instr_index = stack.items[frame_index].next_index;
+            stack.items[frame_index].next_index += 1;
+            const instr = &stack.items[frame_index].stream[instr_index];
+
+            switch (instr.*) {
                 .ret => |r| {
                     if (r.value) |v| {
                         if (v == local) return true;
@@ -1039,19 +1084,47 @@ pub const GeneralizedEscapeAnalyzer = struct {
                         if (v == local) return true;
                     }
                 },
-                .if_expr => |ie| {
-                    if (isValueReturnedInInstrs(local, ie.then_instrs, self)) return true;
-                    if (isValueReturnedInInstrs(local, ie.else_instrs, self)) return true;
-                },
-                .case_block => |cb| {
-                    for (cb.arms) |arm| {
-                        if (isValueReturnedInInstrs(local, arm.body_instrs, self)) return true;
-                    }
-                },
                 else => {},
             }
+
+            try pushReturnScanChildren(allocator, instr, stack, child_streams);
         }
         return false;
+    }
+
+    fn pushReturnScanChildren(
+        allocator: std.mem.Allocator,
+        instr: *const ir.Instruction,
+        stack: *std.ArrayListUnmanaged(ReturnScanFrame),
+        child_streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+    ) std.mem.Allocator.Error!void {
+        child_streams.clearRetainingCapacity();
+
+        const ChildCollector = struct {
+            allocator: std.mem.Allocator,
+            streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+            err: ?std.mem.Allocator.Error = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (child.stream.len == 0) return;
+                ctx.streams.append(ctx.allocator, child.stream) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        var child_collector = ChildCollector{
+            .allocator = allocator,
+            .streams = child_streams,
+        };
+        ir.forEachChildStream(instr, &child_collector, ChildCollector.onStream);
+        if (child_collector.err) |err| return err;
+
+        var stream_index = child_streams.items.len;
+        while (stream_index > 0) {
+            stream_index -= 1;
+            try stack.append(allocator, .{ .stream = child_streams.items[stream_index] });
+        }
     }
 
     /// Check if a value is stored in an escaping container (field_set, aggregate init).
@@ -1307,6 +1380,142 @@ fn makeTestProgram(functions: []const ir.Function) ir.Program {
         .type_defs = &.{},
         .entry = null,
     };
+}
+
+fn buildDeepReturnScanChain(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    terminal: ir.Instruction,
+) ![]ir.Instruction {
+    const instructions = try allocator.alloc(ir.Instruction, depth + 1);
+    errdefer allocator.free(instructions);
+
+    instructions[depth] = terminal;
+    var nesting_index = depth;
+    while (nesting_index > 0) {
+        nesting_index -= 1;
+        const child_stream = instructions[nesting_index + 1 .. nesting_index + 2];
+        if (nesting_index == depth - 1) {
+            instructions[nesting_index] = .{
+                .guard_block = .{
+                    .condition = 0,
+                    .body = child_stream,
+                },
+            };
+        } else {
+            instructions[nesting_index] = .{
+                .if_expr = .{
+                    .dest = 1,
+                    .condition = 0,
+                    .then_instrs = child_stream,
+                    .then_result = null,
+                    .else_instrs = &.{},
+                    .else_result = null,
+                },
+            };
+        }
+    }
+
+    return instructions;
+}
+
+fn buildEscapeAliasChainEndingInAllocation(
+    allocator: std.mem.Allocator,
+    alias_depth: usize,
+) ![]ir.Instruction {
+    const instructions = try allocator.alloc(ir.Instruction, alias_depth + 1);
+    errdefer allocator.free(instructions);
+
+    var alias_index: usize = 0;
+    while (alias_index < alias_depth) : (alias_index += 1) {
+        instructions[alias_index] = .{
+            .local_get = .{
+                .dest = @intCast(alias_index + 1),
+                .source = @intCast(alias_index),
+            },
+        };
+    }
+    instructions[alias_depth] = .{
+        .struct_init = .{
+            .dest = 0,
+            .type_name = "BudgetBox",
+            .fields = &.{},
+        },
+    };
+
+    return instructions;
+}
+
+test "runFixpoint converges on alias chains longer than the old fixed budget" {
+    const allocator = std.testing.allocator;
+
+    const instrs = try buildEscapeAliasChainEndingInAllocation(allocator, 1500);
+    defer allocator.free(instrs);
+
+    const blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = instrs },
+    };
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "escape_budget",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .void,
+            .body = &blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+
+    const program = makeTestProgram(&functions);
+    var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
+    defer analyzer.deinit();
+
+    var context = try analyzer.analyze();
+    defer context.deinit();
+
+    try std.testing.expectEqual(
+        EscapeState.no_escape,
+        context.getEscape(.{ .function = 0, .local = 1500 }),
+    );
+}
+
+test "isValueReturned traverses deeply nested canonical child streams without native recursion" {
+    const allocator = std.testing.allocator;
+    const deep_nesting_depth: usize = 8192;
+
+    const nested_chain = try buildDeepReturnScanChain(
+        allocator,
+        deep_nesting_depth,
+        .{ .ret = .{ .value = 7 } },
+    );
+    defer allocator.free(nested_chain);
+
+    const blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = nested_chain[0..1] },
+    };
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "deep_return_scan",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .any,
+            .body = &blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+
+    const program = makeTestProgram(&functions);
+    var analyzer = GeneralizedEscapeAnalyzer.init(allocator, program);
+    defer analyzer.deinit();
+
+    try std.testing.expect(try analyzer.isValueReturned(.{ .function = 0, .local = 7 }));
+    try std.testing.expect(!try analyzer.isValueReturned(.{ .function = 0, .local = 8 }));
 }
 
 test "struct that does not escape stays no_escape" {

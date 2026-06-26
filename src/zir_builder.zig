@@ -371,23 +371,165 @@ const index_field_names = [_][]const u8{
     "24", "25", "26", "27", "28", "29", "30", "31",
 };
 
-/// Returns a stable string pointer for a numeric index. For indices 0-31
-/// this uses a comptime table (no allocation, pointer is always valid).
-/// For larger indices, falls back to a static buffer.
-fn indexFieldName(index: anytype) struct { ptr: [*]const u8, len: u32 } {
+const max_index_field_name_len = std.fmt.count("{d}", .{std.math.maxInt(u32)});
+
+const IndexFieldName = struct {
+    ptr: [*]const u8,
+    len: u32,
+};
+
+/// Returns a field-name pointer for a numeric index. For indices 0-31 this
+/// uses a comptime table. Larger indices are formatted into caller-owned
+/// storage sized from maxInt(u32), so formatting cannot run out of space.
+fn indexFieldName(index: anytype, buffer: *[max_index_field_name_len]u8) IndexFieldName {
     const idx: u32 = @intCast(index);
     if (idx < index_field_names.len) {
         const name = index_field_names[idx];
         return .{ .ptr = name.ptr, .len = @intCast(name.len) };
     }
-    // Indices >= 32 are unlikely for tuples. Fall back to a static buffer
-    // — only valid until the next call with idx >= 32.
-    const F = struct {
-        var buf: [10]u8 = undefined;
-    };
-    const slice = std.fmt.bufPrint(&F.buf, "{d}", .{idx}) catch "0";
+    const slice = std.fmt.bufPrint(buffer, "{d}", .{idx}) catch unreachable;
     return .{ .ptr = slice.ptr, .len = @intCast(slice.len) };
 }
+
+const IndexFieldNameBatch = struct {
+    allocator: Allocator,
+    buffers: [][max_index_field_name_len]u8,
+    next_buffer: usize = 0,
+
+    fn init(allocator: Allocator, count: usize) BuildError!IndexFieldNameBatch {
+        const dynamic_count = if (count > index_field_names.len)
+            count - index_field_names.len
+        else
+            0;
+        const buffers: [][max_index_field_name_len]u8 = if (dynamic_count == 0)
+            &[_][max_index_field_name_len]u8{}
+        else
+            try allocator.alloc([max_index_field_name_len]u8, dynamic_count);
+        return .{ .allocator = allocator, .buffers = buffers };
+    }
+
+    fn deinit(self: *IndexFieldNameBatch) void {
+        self.allocator.free(self.buffers);
+    }
+
+    fn get(self: *IndexFieldNameBatch, index: anytype) IndexFieldName {
+        const idx: u32 = @intCast(index);
+        if (idx < index_field_names.len) {
+            const name = index_field_names[idx];
+            return .{ .ptr = name.ptr, .len = @intCast(name.len) };
+        }
+        std.debug.assert(self.next_buffer < self.buffers.len);
+        const slice = std.fmt.bufPrint(&self.buffers[self.next_buffer], "{d}", .{idx}) catch unreachable;
+        self.next_buffer += 1;
+        return .{ .ptr = slice.ptr, .len = @intCast(slice.len) };
+    }
+};
+
+const CurrentElseInsts = struct {
+    allocator: Allocator,
+    insts: ?[]u32 = null,
+
+    fn init(allocator: Allocator) CurrentElseInsts {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *CurrentElseInsts) void {
+        self.clear();
+    }
+
+    fn hasOwnedBuffer(self: *const CurrentElseInsts) bool {
+        return self.insts != null;
+    }
+
+    fn get(self: *const CurrentElseInsts) []const u32 {
+        return self.insts orelse unreachable;
+    }
+
+    fn clear(self: *CurrentElseInsts) void {
+        if (self.insts) |insts| {
+            self.allocator.free(insts);
+            self.insts = null;
+        }
+    }
+
+    fn replaceWithCopy(self: *CurrentElseInsts, source: []const u32) BuildError!void {
+        const next_insts = try self.allocator.alloc(u32, source.len);
+        @memcpy(next_insts, source);
+        self.clear();
+        self.insts = next_insts;
+    }
+
+    fn replaceWithSingle(self: *CurrentElseInsts, inst: u32) BuildError!void {
+        const next_insts = try self.allocator.alloc(u32, 1);
+        next_insts[0] = inst;
+        self.clear();
+        self.insts = next_insts;
+    }
+
+    fn replaceWithEmpty(self: *CurrentElseInsts) BuildError!void {
+        const next_insts = try self.allocator.alloc(u32, 0);
+        self.clear();
+        self.insts = next_insts;
+    }
+};
+
+const DestroyStructBuilderHandleFn = *const fn (*ZirBuilderHandle) void;
+
+fn destroyStructBuilderHandle(handle: *ZirBuilderHandle) void {
+    zir_builder_destroy(handle);
+}
+
+const StructEmissionScope = struct {
+    driver: *ZirDriver,
+    saved_handle: *ZirBuilderHandle,
+    saved_current_emit_struct: ?[]const u8,
+    temporary_handle: ?*ZirBuilderHandle,
+    destroy_temporary_handle: DestroyStructBuilderHandleFn,
+
+    fn enter(
+        driver: *ZirDriver,
+        temporary_handle: *ZirBuilderHandle,
+        struct_name: []const u8,
+    ) StructEmissionScope {
+        return enterWithDestroyFn(driver, temporary_handle, struct_name, destroyStructBuilderHandle);
+    }
+
+    fn enterWithDestroyFn(
+        driver: *ZirDriver,
+        temporary_handle: *ZirBuilderHandle,
+        struct_name: []const u8,
+        destroy_temporary_handle: DestroyStructBuilderHandleFn,
+    ) StructEmissionScope {
+        const scope = StructEmissionScope{
+            .driver = driver,
+            .saved_handle = driver.handle,
+            .saved_current_emit_struct = driver.current_emit_struct,
+            .temporary_handle = temporary_handle,
+            .destroy_temporary_handle = destroy_temporary_handle,
+        };
+        driver.handle = temporary_handle;
+        driver.current_emit_struct = struct_name;
+        return scope;
+    }
+
+    fn handle(self: *const StructEmissionScope) *ZirBuilderHandle {
+        return self.temporary_handle orelse unreachable;
+    }
+
+    fn markConsumedByInjection(self: *StructEmissionScope) void {
+        self.temporary_handle = null;
+    }
+
+    fn deinit(self: *StructEmissionScope) void {
+        const temporary_handle = self.temporary_handle;
+        self.temporary_handle = null;
+        self.driver.handle = self.saved_handle;
+        self.driver.current_emit_struct = self.saved_current_emit_struct;
+        if (temporary_handle) |unconsumed_handle| {
+            self.destroy_temporary_handle(unconsumed_handle);
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Return type mapping (ir.ZigType -> ZIR Ref u32 value)
@@ -851,10 +993,20 @@ pub const ZirDriver = struct {
     tuple_init_count: u32 = 0,
     /// Nested tuple types in DFS post-order (inner-first), matching tuple_init emission order.
     tuple_type_stack: std.ArrayListUnmanaged(ir.ZigType) = .empty,
+    /// Arena for synthetic `ZigType` wrapper nodes created while rewriting
+    /// recursive structs into pointer-backed storage/call-boundary shapes.
+    /// The nodes are tiny, emission-scoped, and can all be released together
+    /// when the driver is destroyed.
+    type_rewrite_arena: ?std.heap.ArenaAllocator = null,
     /// ID of the function currently being emitted (for analysis lookups).
     current_function_id: ir.FunctionId = 0,
     /// Parameter ownership conventions for the function currently being emitted.
     current_function_param_conventions: []const ir.ParamConvention = &.{},
+    /// Local ownership classes for the function currently being emitted.
+    /// Release lowering uses this as the final type-blind guard against
+    /// scheduling ARC runtime calls for locals that the IR classifies as
+    /// trivial values.
+    current_function_local_ownership: []const ir.OwnershipClass = &.{},
     /// Static Zig-level return type of the function currently being emitted.
     /// Used for generic constructors whose type variable appears only in
     /// the return position, so the call instruction itself may not carry
@@ -960,6 +1112,11 @@ pub const ZirDriver = struct {
     /// `.no_escape` / `.function_local` would leak (or, with
     /// path-copy structures whose cells get recycled, cause UAF).
     arc_managed_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
+    /// Original ZIR refs captured immediately before a persistent retain
+    /// rebinds a local to its independent owner. Aggregate-component releases
+    /// must drop that original component owner, while later scope releases drop
+    /// the current local binding.
+    aggregate_component_original_refs: std.AutoHashMapUnmanaged(ir.LocalId, u32) = .empty,
     /// Forward-propagating set of locals whose value originated from a
     /// function parameter. When such a local is used as a call_closure callee,
     /// the runtime value may be either a bare function pointer or a closure
@@ -1031,6 +1188,7 @@ pub const ZirDriver = struct {
         self.arc_share_skipped.deinit(self.allocator);
         self.arc_returned_locals.deinit(self.allocator);
         self.arc_managed_locals.deinit(self.allocator);
+        self.aggregate_component_original_refs.deinit(self.allocator);
         self.param_derived_closure_locals.deinit(self.allocator);
         self.capture_closure_function_map.deinit(self.allocator);
         self.capture_param_derived_closure_map.deinit(self.allocator);
@@ -1046,6 +1204,7 @@ pub const ZirDriver = struct {
         self.reuse_backed_tuple_locals.deinit(self.allocator);
         self.capture_param_refs.deinit(self.allocator);
         self.pending_ret_ty_untracked.deinit(self.allocator);
+        if (self.type_rewrite_arena) |*arena| arena.deinit();
         if (self.symbol_table_builder) |*sym| sym.deinit();
     }
 
@@ -1257,7 +1416,7 @@ pub const ZirDriver = struct {
     /// types (lists, maps, struct_ref, etc.) — without that fallback,
     /// `mapReturnType` returns 0 for complex types, leaving the outer
     /// tuple_decl with a null operand that crashes Sema's `resolveInst`.
-    fn mapTupleElementType(self: *ZirDriver, zig_type: ir.ZigType) u32 {
+    fn mapTupleElementType(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
         if (zig_type == .tuple) {
             // The zero-element tuple resolves to the canonical
             // `zap_runtime.EmptyTuple` named type (one shared nominal
@@ -1266,17 +1425,17 @@ pub const ZirDriver = struct {
             // surrounding ret_ty/param support body, mirroring the
             // non-empty tuple_decl tracking below.
             if (zig_type.tuple.len == 0) {
-                const empty_ref = self.emitEmptyTupleTypeRef() catch return 0;
+                const empty_ref = try self.emitEmptyTupleTypeRef();
                 const idx = zir_builder_ref_to_inst_index(self.handle, empty_ref);
                 if (idx != 0xFFFFFFFF) {
-                    self.pending_ret_ty_untracked.append(self.allocator, idx) catch return 0;
+                    try self.pending_ret_ty_untracked.append(self.allocator, idx);
                 }
                 return empty_ref;
             }
             var inner_refs: std.ArrayListUnmanaged(u32) = .empty;
             defer inner_refs.deinit(self.allocator);
             for (zig_type.tuple) |inner_elem| {
-                inner_refs.append(self.allocator, self.mapTupleElementType(inner_elem)) catch return 0;
+                try inner_refs.append(self.allocator, try self.mapTupleElementType(inner_elem));
             }
             // Emit *untracked* — `zir_builder_emit_tuple_decl` would
             // append to `param_inst_indices`, which then makes Sema's
@@ -1287,54 +1446,55 @@ pub const ZirDriver = struct {
             // `set_tuple_return_type_with_body`. Track the raw inst index
             // so the caller can include it in support_inst_indices.
             const ref = zir_builder_emit_tuple_decl_untracked(self.handle, inner_refs.items.ptr, @intCast(inner_refs.items.len));
-            if (ref == error_ref) return 0;
+            if (ref == error_ref) return error.EmitFailed;
             const idx = zir_builder_ref_to_inst_index(self.handle, ref);
             if (idx != 0xFFFFFFFF) {
-                self.pending_ret_ty_untracked.append(self.allocator, idx) catch return 0;
+                try self.pending_ret_ty_untracked.append(self.allocator, idx);
             }
             return ref;
         }
         const simple = mapReturnType(zig_type);
         if (simple != 0) return simple;
-        return self.emitImportedTypeRef(zig_type) catch 0;
+        return try self.emitImportedTypeRef(zig_type);
     }
 
     /// Collect nested tuple types in DFS post-order (inner-first).
     /// This matches the order in which tuple_init IR instructions are emitted.
-    fn collectNestedTupleTypes(self: *ZirDriver, zig_type: ir.ZigType) void {
+    fn collectNestedTupleTypes(self: *ZirDriver, zig_type: ir.ZigType) BuildError!void {
         if (zig_type != .tuple) return;
         // Visit children first (inner tuples emitted before outer)
         for (zig_type.tuple) |elem| {
-            self.collectNestedTupleTypes(elem);
+            try self.collectNestedTupleTypes(elem);
         }
         // Then add this tuple type
-        self.tuple_type_stack.append(self.allocator, zig_type) catch {};
+        try self.tuple_type_stack.append(self.allocator, zig_type);
     }
 
     /// Emit a body-local tuple_decl, recursively handling nested tuples.
     /// Returns the Ref to the emitted tuple_decl instruction. Falls back to
     /// `emitImportedTypeRef` for complex non-tuple types so list/map/struct_ref
     /// elements get a real ZIR ref instead of `mapReturnType`'s 0 fallback.
-    fn emitBodyLocalTupleType(self: *ZirDriver, zig_type: ir.ZigType) u32 {
+    fn emitBodyLocalTupleType(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
         if (zig_type != .tuple) {
             const simple = mapReturnType(zig_type);
             if (simple != 0) return simple;
-            return self.emitImportedTypeRef(zig_type) catch 0;
+            return try self.emitImportedTypeRef(zig_type);
         }
         // The zero-element tuple resolves to the canonical
         // `zap_runtime.EmptyTuple` named type so a body-local empty tuple
         // shares the same nominal identity as the param/return/vtable
         // positions.
         if (zig_type.tuple.len == 0) {
-            return self.emitEmptyTupleTypeRef() catch 0;
+            return try self.emitEmptyTupleTypeRef();
         }
         var inner_refs: std.ArrayListUnmanaged(u32) = .empty;
         defer inner_refs.deinit(self.allocator);
         for (zig_type.tuple) |inner_elem| {
-            inner_refs.append(self.allocator, self.emitBodyLocalTupleType(inner_elem)) catch return 0;
+            try inner_refs.append(self.allocator, try self.emitBodyLocalTupleType(inner_elem));
         }
         const ref = zir_builder_emit_tuple_decl_body(self.handle, inner_refs.items.ptr, @intCast(inner_refs.items.len));
-        return if (ref == error_ref) 0 else ref;
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
     }
 
     fn setLocal(self: *ZirDriver, local: ir.LocalId, ref: u32) !void {
@@ -1354,6 +1514,11 @@ pub const ZirDriver = struct {
         const result = zir_builder_end_capture(self.handle, out_len);
         if (self.capture_depth > 0) self.capture_depth -= 1;
         return result;
+    }
+
+    fn discardCapture(self: *ZirDriver) void {
+        var discard_len: u32 = 0;
+        _ = self.endCapture(&discard_len);
     }
 
     /// Phase E.7: classify whether `instructions` ends in a ZIR-level
@@ -1511,7 +1676,7 @@ pub const ZirDriver = struct {
 
     fn emitTypeRef(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32 {
         return switch (zig_type) {
-            .tuple => self.emitBodyLocalTupleType(zig_type),
+            .tuple => try self.emitBodyLocalTupleType(zig_type),
             // A closure type lowers to `*const fn(P...) Ret` — the
             // runtime representation of a non-capturing closure value.
             .function => |fn_type| try self.emitFuncPtrTypeRef(fn_type),
@@ -1590,7 +1755,7 @@ pub const ZirDriver = struct {
         }
 
         var env_name_buf: [64]u8 = undefined;
-        const env_name = self.closureEnvTypeName(self.current_function_id, &env_name_buf);
+        const env_name = try self.closureEnvTypeName(self.current_function_id, &env_name_buf);
         const ref = zir_builder_emit_param_decl_val_type(
             self.handle,
             "__closure_env".ptr,
@@ -1604,7 +1769,7 @@ pub const ZirDriver = struct {
 
     fn emitClosureEnvTypeRefForTarget(self: *ZirDriver, target_func: ir.Function) BuildError!u32 {
         var env_name_buf: [64]u8 = undefined;
-        const env_name = self.closureEnvTypeName(target_func.id, &env_name_buf);
+        const env_name = try self.closureEnvTypeName(target_func.id, &env_name_buf);
         const target_struct = target_func.struct_name;
         const is_cross = blk: {
             if (target_struct == null and self.current_emit_struct == null) break :blk false;
@@ -1761,7 +1926,7 @@ pub const ZirDriver = struct {
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
             },
-            .tuple => self.mapTupleElementType(zig_type),
+            .tuple => return try self.mapTupleElementType(zig_type),
             .struct_ref => |name| return try self.emitStructTypeRef(name),
             .term => return try self.emitTermTypeRef(),
             .protocol_box => return try self.emitProtocolBoxTypeRef(),
@@ -1823,6 +1988,36 @@ pub const ZirDriver = struct {
     fn refForLocal(self: *ZirDriver, local: ir.LocalId) BuildError!u32 {
         const value_ref = self.local_refs.get(local) orelse return error.EmitFailed;
         return self.materializeValueRef(value_ref);
+    }
+
+    fn localOwnershipClass(self: *const ZirDriver, local: ir.LocalId) ir.OwnershipClass {
+        if (local >= self.current_function_local_ownership.len) return .trivial;
+        return self.current_function_local_ownership[local];
+    }
+
+    /// Returns the stored value ref for an ARC release target, or null when the
+    /// local is statically trivial and absent from the post-drop ARC-managed
+    /// set. A non-trivial/ARC-managed local that materializes as Zig `void`
+    /// violates the IR ownership invariant and must fail emission rather than
+    /// silently dropping the release.
+    fn arcReleaseValueRefForLocal(self: *const ZirDriver, local: ir.LocalId) BuildError!?ValueRef {
+        if (self.localOwnershipClass(local) == .trivial and !self.arc_managed_locals.contains(local)) return null;
+
+        const value_ref = self.local_refs.get(local) orelse return error.EmitFailed;
+        switch (value_ref) {
+            .inst => |ref| if (ref == @intFromEnum(Zir.Inst.Ref.void_value)) return error.EmitFailed,
+            .decl => {},
+        }
+        return value_ref;
+    }
+
+    fn arcReleaseRefForLocal(self: *ZirDriver, local: ir.LocalId) BuildError!?u32 {
+        const value_ref = (try self.arcReleaseValueRefForLocal(local)) orelse return null;
+        return try self.materializeValueRef(value_ref);
+    }
+
+    fn aggregateComponentOriginalRefForLocal(self: *const ZirDriver, local: ir.LocalId) ?u32 {
+        return self.aggregate_component_original_refs.get(local);
     }
 
     fn refForParamIndex(self: *ZirDriver, param_index: u32) BuildError!u32 {
@@ -1992,9 +2187,9 @@ pub const ZirDriver = struct {
         return std.mem.eql(u8, normalized, current_struct);
     }
 
-    fn closureEnvTypeName(self: *const ZirDriver, function_id: ir.FunctionId, buf: []u8) []const u8 {
+    fn closureEnvTypeName(self: *const ZirDriver, function_id: ir.FunctionId, buf: []u8) BuildError![]const u8 {
         _ = self;
-        return std.fmt.bufPrint(buf, "__ClosureEnv_{d}", .{function_id}) catch "__ClosureEnv";
+        return std.fmt.bufPrint(buf, "__ClosureEnv_{d}", .{function_id}) catch error.EmitFailed;
     }
 
     /// Pre-pass: walk every function's body for `make_closure` and record, per
@@ -2134,7 +2329,7 @@ pub const ZirDriver = struct {
             try emitted_ids.put(func.id, {});
 
             var env_name_buf: [64]u8 = undefined;
-            const env_name = self.closureEnvTypeName(func.id, &env_name_buf);
+            const env_name = try self.closureEnvTypeName(func.id, &env_name_buf);
 
             // Emit the env struct via the streaming NAMED struct-decl API so
             // each capture field's type can be a COMPOUND type body, not just
@@ -2154,8 +2349,11 @@ pub const ZirDriver = struct {
                 return error.EmitFailed;
             }
 
+            var index_field_name_batch = try IndexFieldNameBatch.init(self.allocator, func.captures.len);
+            defer index_field_name_batch.deinit();
+
             for (func.captures, 0..) |capture, capture_index| {
-                const field_name = indexFieldName(capture_index);
+                const field_name = index_field_name_batch.get(capture_index);
                 const field_type = self.closureCaptureFieldType(func.id, capture_index, capture.type_expr);
                 const simple = mapReturnType(field_type);
                 if (simple != 0) {
@@ -2851,7 +3049,7 @@ pub const ZirDriver = struct {
                 else
                     type_def.name;
                 if (emitted.contains(short_name)) return;
-                emitted.put(short_name, {}) catch return;
+                try emitted.put(short_name, {});
 
                 var field_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
                 defer field_name_ptrs.deinit(self.allocator);
@@ -2947,7 +3145,7 @@ pub const ZirDriver = struct {
     /// portion of the recursive-storage work.
     fn emitRootFieldType(self: *ZirDriver, field: ir.StructFieldDef) !void {
         const lowered_type = if (field.storage == .indirect)
-            indirectFieldType(field.type_expr)
+            try self.indirectFieldType(field.type_expr)
         else
             field.type_expr;
 
@@ -3000,22 +3198,28 @@ pub const ZirDriver = struct {
     /// unchanged today; future work could extend the rewrite to
     /// indirect through container element positions, but the common
     /// recursive-tree pattern uses optional or bare struct refs.
-    fn indirectFieldType(t: ir.ZigType) ir.ZigType {
+    fn typeRewriteAllocator(self: *ZirDriver) Allocator {
+        if (self.type_rewrite_arena) |*arena| return arena.allocator();
+
+        self.type_rewrite_arena = std.heap.ArenaAllocator.init(self.allocator);
+        return self.type_rewrite_arena.?.allocator();
+    }
+
+    fn createTypeRewriteNode(self: *ZirDriver, zig_type: ir.ZigType) BuildError!*ir.ZigType {
+        const node = try self.typeRewriteAllocator().create(ir.ZigType);
+        node.* = zig_type;
+        return node;
+    }
+
+    fn indirectFieldType(self: *ZirDriver, t: ir.ZigType) BuildError!ir.ZigType {
         return switch (t) {
             .optional => |inner| blk: {
-                // Heap-allocate a new ZigType node for the pointer
-                // wrapper. The lifetime matches the surrounding
-                // struct emission scope, which is bounded — the
-                // global allocator behind ir.zig handles this fine.
-                const ptr_inner_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
-                ptr_inner_box.* = inner.*;
-                const ptr_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
-                ptr_box.* = .{ .ptr = ptr_inner_box };
+                const ptr_inner_box = try self.createTypeRewriteNode(inner.*);
+                const ptr_box = try self.createTypeRewriteNode(.{ .ptr = ptr_inner_box });
                 break :blk .{ .optional = ptr_box };
             },
             .struct_ref => blk: {
-                const inner_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
-                inner_box.* = t;
+                const inner_box = try self.createTypeRewriteNode(t);
                 break :blk .{ .ptr = inner_box };
             },
             else => t,
@@ -3082,26 +3286,21 @@ pub const ZirDriver = struct {
     /// entire substructure correctly at end-of-life points (Perceus drops,
     /// optional_dispatch struct-branch exits).
     ///
-    /// Allocates child `ZigType` nodes from the page allocator to mirror
-    /// `indirectFieldType`'s strategy — node lifetimes outlive the synchronous
-    /// emission scope, and the leak is bounded by the program's struct count.
-    fn boxRecursiveZigType(self: *const ZirDriver, t: ir.ZigType) ir.ZigType {
+    /// Allocates child `ZigType` nodes from the driver-owned type rewrite
+    /// arena to mirror `indirectFieldType`'s strategy. The nodes live for the
+    /// emission lifetime and are released with the driver.
+    fn boxRecursiveZigType(self: *ZirDriver, t: ir.ZigType) BuildError!ir.ZigType {
         return switch (t) {
             .struct_ref => |name| blk: {
                 if (!self.isRecursiveStruct(name)) break :blk t;
-                const inner_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
-                inner_box.* = t;
+                const inner_box = try self.createTypeRewriteNode(t);
                 break :blk .{ .ptr = inner_box };
             },
             .optional => |inner_ptr| blk: {
                 if (!self.zigTypeIsRecursiveStruct(inner_ptr.*)) break :blk t;
-                const ptr_inner = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
-                ptr_inner.* = inner_ptr.*;
-                const ptr_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
-                ptr_box.* = .{ .ptr = ptr_inner };
-                const opt_box = std.heap.page_allocator.create(ir.ZigType) catch break :blk t;
-                opt_box.* = .{ .optional = ptr_box };
-                break :blk opt_box.*;
+                const ptr_inner = try self.createTypeRewriteNode(inner_ptr.*);
+                const ptr_box = try self.createTypeRewriteNode(.{ .ptr = ptr_inner });
+                break :blk .{ .optional = ptr_box };
             },
             else => t,
         };
@@ -3287,8 +3486,10 @@ pub const ZirDriver = struct {
             defer names_lens.deinit(self.allocator);
             var values: std.ArrayListUnmanaged(u32) = .empty;
             defer values.deinit(self.allocator);
+            var index_field_name_batch = try IndexFieldNameBatch.init(self.allocator, arity);
+            defer index_field_name_batch.deinit();
             for (0..arity) |i| {
-                const name = indexFieldName(i);
+                const name = index_field_name_batch.get(i);
                 const field_ref = zir_builder_emit_field_val(self.handle, ptr_ref, name.ptr, name.len);
                 if (field_ref == error_ref) return error.EmitFailed;
                 try names_ptrs.append(self.allocator, name.ptr);
@@ -3417,7 +3618,7 @@ pub const ZirDriver = struct {
     /// program for a matching `local_name` whose `struct_name` (the
     /// emitted Zig namespace, which the IR field still calls a
     /// "struct") is the caller struct.
-    fn findMonomorphizedImplFor(self: *const ZirDriver, caller_struct: []const u8, call_name: []const u8) ?ir.Function {
+    fn findMonomorphizedImplFor(self: *const ZirDriver, caller_struct: []const u8, call_name: []const u8) BuildError!?ir.Function {
         const sep = std.mem.indexOf(u8, call_name, "__") orelse return null;
         const target_struct = call_name[0..sep];
         const rest = call_name[sep + 2 ..];
@@ -3425,12 +3626,18 @@ pub const ZirDriver = struct {
         const func_base = rest[0..arity_sep];
         const arity_suffix = rest[arity_sep..];
         const prog = self.program orelse return null;
+        var expected_prefix_buf: ?[]u8 = null;
+        defer if (expected_prefix_buf) |buf| self.allocator.free(buf);
+
         for (prog.functions) |func| {
             const emit_ns = func.struct_name orelse continue;
             if (!std.mem.eql(u8, emit_ns, caller_struct)) continue;
-            const expected_prefix_buf = std.fmt.allocPrint(self.allocator, "{s}_{s}__", .{ target_struct, func_base }) catch continue;
-            defer self.allocator.free(expected_prefix_buf);
-            if (!std.mem.startsWith(u8, func.local_name, expected_prefix_buf)) continue;
+            const expected_prefix = expected_prefix_buf orelse blk: {
+                const buf = try std.fmt.allocPrint(self.allocator, "{s}_{s}__", .{ target_struct, func_base });
+                expected_prefix_buf = buf;
+                break :blk buf;
+            };
+            if (!std.mem.startsWith(u8, func.local_name, expected_prefix)) continue;
             if (!std.mem.endsWith(u8, func.local_name, arity_suffix)) continue;
             return func;
         }
@@ -3467,21 +3674,94 @@ pub const ZirDriver = struct {
     fn deduplicateFunctions(allocator: std.mem.Allocator, funcs: []const ir.Function) !std.ArrayListUnmanaged(ir.Function) {
         // Build a map of local_name → last index
         var last_index = std.StringHashMap(usize).init(allocator);
+        defer last_index.deinit();
+        try last_index.ensureTotalCapacity(@intCast(funcs.len));
         for (funcs, 0..) |func, i| {
             const key = if (func.local_name.len > 0) func.local_name else func.name;
             try last_index.put(key, i);
         }
         // Collect functions in order, keeping only the last occurrence of each name
         var result: std.ArrayListUnmanaged(ir.Function) = .empty;
+        errdefer result.deinit(allocator);
+        try result.ensureTotalCapacity(allocator, @intCast(last_index.count()));
         for (funcs, 0..) |func, i| {
             const key = if (func.local_name.len > 0) func.local_name else func.name;
             if (last_index.get(key)) |last_i| {
                 if (last_i == i) {
-                    try result.append(allocator, func);
+                    result.appendAssumeCapacity(func);
                 }
             }
         }
         return result;
+    }
+
+    fn deinitArrayListMap(comptime T: type, allocator: Allocator, map: *std.StringHashMap(std.ArrayListUnmanaged(T))) void {
+        var value_iter = map.valueIterator();
+        while (value_iter.next()) |list| {
+            list.deinit(allocator);
+        }
+        map.deinit();
+    }
+
+    const ProgramFunctionGroups = struct {
+        root_funcs: std.ArrayListUnmanaged(ir.Function) = .empty,
+        struct_funcs: std.StringHashMap(std.ArrayListUnmanaged(ir.Function)),
+        all_struct_names: std.StringHashMap(void),
+
+        fn init(allocator: Allocator) ProgramFunctionGroups {
+            return .{
+                .struct_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(allocator),
+                .all_struct_names = std.StringHashMap(void).init(allocator),
+            };
+        }
+
+        fn deinit(self: *ProgramFunctionGroups, allocator: Allocator) void {
+            self.root_funcs.deinit(allocator);
+            deinitArrayListMap(ir.Function, allocator, &self.struct_funcs);
+            self.all_struct_names.deinit();
+        }
+    };
+
+    fn buildProgramFunctionGroups(allocator: Allocator, program: ir.Program) !ProgramFunctionGroups {
+        var groups = ProgramFunctionGroups.init(allocator);
+        errdefer groups.deinit(allocator);
+
+        // First pass: collect all functions per struct, allowing duplicates.
+        var raw_root_funcs: std.ArrayListUnmanaged(ir.Function) = .empty;
+        defer raw_root_funcs.deinit(allocator);
+
+        var raw_struct_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(allocator);
+        defer deinitArrayListMap(ir.Function, allocator, &raw_struct_funcs);
+
+        try groups.all_struct_names.ensureTotalCapacity(@intCast(program.functions.len));
+        try raw_struct_funcs.ensureTotalCapacity(@intCast(program.functions.len));
+
+        for (program.functions) |func| {
+            if (func.struct_name) |mod| {
+                try groups.all_struct_names.put(mod, {});
+            }
+            const is_entry = if (program.entry) |eid| func.id == eid else false;
+            if (is_entry or func.struct_name == null) {
+                try raw_root_funcs.append(allocator, func);
+            } else {
+                const mod = func.struct_name.?;
+                const gop = try raw_struct_funcs.getOrPut(mod);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(allocator, func);
+            }
+        }
+
+        // Second pass: deduplicate by local_name within each group, keeping last.
+        groups.root_funcs = try deduplicateFunctions(allocator, raw_root_funcs.items);
+        try groups.struct_funcs.ensureTotalCapacity(raw_struct_funcs.count());
+        var raw_iter = raw_struct_funcs.iterator();
+        while (raw_iter.next()) |entry| {
+            var deduped = try deduplicateFunctions(allocator, entry.value_ptr.items);
+            errdefer deduped.deinit(allocator);
+            try groups.struct_funcs.put(entry.key_ptr.*, deduped);
+        }
+
+        return groups;
     }
 
     // -- Program emission -----------------------------------------------------
@@ -3538,51 +3818,22 @@ pub const ZirDriver = struct {
 
         // ── Step 1: Group functions by struct ────────────────────────
         if (self.progress) |progress| progress.stage("ZIR: grouping functions", .{});
-        var struct_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
-        var root_funcs: std.ArrayListUnmanaged(ir.Function) = .empty;
+        var function_groups = try buildProgramFunctionGroups(self.allocator, program);
+        defer function_groups.deinit(self.allocator);
+        const struct_funcs = &function_groups.struct_funcs;
+        const root_funcs = &function_groups.root_funcs;
         // Track every struct name we see (including namespace-only structs
         // with no functions of their own) so re-export emission below can
         // generate parent shells for nested namespaces.
-        var all_struct_names = std.StringHashMap(void).init(self.allocator);
-
-        // Deduplicate functions by (struct, local_name), keeping the LAST
-        // occurrence. The IR may contain duplicate entries from monomorphization;
-        // duplicates cause putNoClobber assertion failures in Zig 0.16's scanNamespace.
-        // We keep the last occurrence because decl_ref/decl_val resolve to the final
-        // declaration in the namespace.
-        {
-            // First pass: collect all functions per struct, allowing duplicates.
-            var raw_root_funcs: std.ArrayListUnmanaged(ir.Function) = .empty;
-            var raw_struct_funcs = std.StringHashMap(std.ArrayListUnmanaged(ir.Function)).init(self.allocator);
-            for (program.functions) |func| {
-                if (func.struct_name) |mod| {
-                    try all_struct_names.put(mod, {});
-                }
-                const is_entry = if (program.entry) |eid| func.id == eid else false;
-                if (is_entry or func.struct_name == null) {
-                    try raw_root_funcs.append(self.allocator, func);
-                } else {
-                    const mod = func.struct_name.?;
-                    const gop = try raw_struct_funcs.getOrPut(mod);
-                    if (!gop.found_existing) gop.value_ptr.* = .empty;
-                    try gop.value_ptr.append(self.allocator, func);
-                }
-            }
-
-            // Second pass: deduplicate by local_name within each group, keeping last.
-            root_funcs = try deduplicateFunctions(self.allocator, raw_root_funcs.items);
-            var raw_iter = raw_struct_funcs.iterator();
-            while (raw_iter.next()) |entry| {
-                const deduped = try deduplicateFunctions(self.allocator, entry.value_ptr.items);
-                try struct_funcs.put(entry.key_ptr.*, deduped);
-            }
-        }
+        const all_struct_names = &function_groups.all_struct_names;
 
         // ── Step 2: Detect namespace hierarchy for re-export structs ─
         // Scan every struct name (function-bearing and namespace-only) for
         // parent_child patterns. A parent re-export is generated when a struct
         // name contains '_'.
         var namespace_children = std.StringHashMap(std.ArrayListUnmanaged(NamespaceChild)).init(self.allocator);
+        defer deinitArrayListMap(NamespaceChild, self.allocator, &namespace_children);
+        try namespace_children.ensureTotalCapacity(all_struct_names.count());
         {
             var name_iter = all_struct_names.iterator();
             while (name_iter.next()) |entry| {
@@ -3622,7 +3873,9 @@ pub const ZirDriver = struct {
                         defer self.allocator.free(mod_name_z);
                         const stub = "comptime {}\n";
                         dumpSyntheticSourceIfRequested(mod_name_z, stub.ptr, @intCast(stub.len));
-                        _ = zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len));
+                        if (zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len)) != 0) {
+                            return error.EmitFailed;
+                        }
                     }
                 }
             }
@@ -3655,30 +3908,29 @@ pub const ZirDriver = struct {
                 }
 
                 const mod_handle = zir_builder_create() orelse return error.ZirCreateFailed;
-                const saved_handle = self.handle;
-                self.current_emit_struct = mod_name;
-                self.handle = mod_handle;
+                {
+                    var struct_scope = StructEmissionScope.enter(self, mod_handle, mod_name);
+                    defer struct_scope.deinit();
 
-                // Emit struct type declarations before functions so they
-                // can be referenced in return types and parameter types.
-                try self.emitStructTypeDecls();
+                    // Emit struct type declarations before functions so they
+                    // can be referenced in return types and parameter types.
+                    try self.emitStructTypeDecls();
 
-                for (funcs) |func| {
-                    self.reuse_backed_struct_locals.clearRetainingCapacity();
-                    self.reuse_backed_union_locals.clearRetainingCapacity();
-                    self.reuse_backed_tuple_locals.clearRetainingCapacity();
-                    self.emitFunction(func) catch |err| {
-                        std.log.err("ZIR emit failed for function {s}: {s}", .{ func.name, @errorName(err) });
-                        return err;
-                    };
+                    for (funcs) |func| {
+                        self.reuse_backed_struct_locals.clearRetainingCapacity();
+                        self.reuse_backed_union_locals.clearRetainingCapacity();
+                        self.reuse_backed_tuple_locals.clearRetainingCapacity();
+                        self.emitFunction(func) catch |err| {
+                            std.log.err("ZIR emit failed for function {s}: {s}", .{ func.name, @errorName(err) });
+                            return err;
+                        };
+                    }
+
+                    if (zir_builder_inject_struct(struct_scope.handle(), c, mod_name_z) != 0) {
+                        return error.ZirInjectionFailed;
+                    }
+                    struct_scope.markConsumedByInjection();
                 }
-
-                if (zir_builder_inject_struct(mod_handle, c, mod_name_z) != 0) {
-                    return error.ZirInjectionFailed;
-                }
-
-                self.handle = saved_handle;
-                self.current_emit_struct = null;
             }
 
             // ── Step 3.5: Emit fields-only top-level structs ─────────
@@ -3712,18 +3964,17 @@ pub const ZirDriver = struct {
                 }
 
                 const struct_handle = zir_builder_create() orelse return error.ZirCreateFailed;
-                const saved_handle = self.handle;
-                self.current_emit_struct = type_def.name;
-                self.handle = struct_handle;
+                {
+                    var struct_scope = StructEmissionScope.enter(self, struct_handle, type_def.name);
+                    defer struct_scope.deinit();
 
-                try self.emitStructTypeDecls();
+                    try self.emitStructTypeDecls();
 
-                if (zir_builder_inject_struct(struct_handle, c, struct_name_z) != 0) {
-                    return error.ZirInjectionFailed;
+                    if (zir_builder_inject_struct(struct_scope.handle(), c, struct_name_z) != 0) {
+                        return error.ZirInjectionFailed;
+                    }
+                    struct_scope.markConsumedByInjection();
                 }
-
-                self.handle = saved_handle;
-                self.current_emit_struct = null;
             }
 
             // ── Step 3.6: Emit per-instantiation union/enum specializations ───
@@ -3842,18 +4093,24 @@ pub const ZirDriver = struct {
 
                     const children = entry.value_ptr.items;
                     var source_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer source_buf.deinit(self.allocator);
                     for (children) |child| {
                         const line = try std.fmt.allocPrint(self.allocator, "pub const {s} = @import(\"{s}\");\n", .{ child.name, child.full_struct });
+                        defer self.allocator.free(line);
                         try source_buf.appendSlice(self.allocator, line);
                     }
                     const source = try source_buf.toOwnedSlice(self.allocator);
+                    defer self.allocator.free(source);
 
                     const parent_z = try self.allocator.dupeZ(u8, parent_name);
                     defer self.allocator.free(parent_z);
                     // This will overwrite the empty stub if already registered
                     dumpSyntheticSourceIfRequested(parent_z, source.ptr, @intCast(source.len));
-                    if (zir_compilation_add_struct_source(c, parent_z, source.ptr, @intCast(source.len)) != 0) {
-                        return error.ZirInjectionFailed;
+                    // The Zig fork copies the bytes synchronously by writing
+                    // them to the compilation cache before returning.
+                    const registration_status = zir_compilation_add_struct_source(c, parent_z, source.ptr, @intCast(source.len));
+                    if (registration_status != 0) {
+                        return error.EmitFailed;
                     }
                 }
             }
@@ -3931,7 +4188,8 @@ pub const ZirDriver = struct {
                 const serialize_fn = zir_builder_emit_field_val(self.handle, builder_rt, "serializeManifest", 17);
                 if (serialize_fn == error_ref) return error.EmitFailed;
                 const ser_args = [_]u32{manifest};
-                _ = zir_builder_emit_call_ref(self.handle, serialize_fn, &ser_args, 1);
+                const serialize_ref = zir_builder_emit_call_ref(self.handle, serialize_fn, &ser_args, 1);
+                if (serialize_ref == error_ref) return error.EmitFailed;
 
                 if (zir_builder_emit_ret_void(self.handle) != 0) {
                     return error.EmitFailed;
@@ -4049,8 +4307,7 @@ pub const ZirDriver = struct {
                     return @intFromEnum(Zir.Inst.Ref.u32_type);
                 }
                 if (self.findStructDef(name) != null or self.findStructDef(short_name) != null) {
-                    const ref = self.emitStructTypeRef(name) catch return null;
-                    return ref;
+                    return try self.emitStructTypeRef(name);
                 }
                 return null;
             },
@@ -4068,15 +4325,15 @@ pub const ZirDriver = struct {
                 const inner_ref = try self.emitContainerElementTypeRef(inner.*);
                 if (inner_ref) |iref| {
                     const type_args = [_]u32{iref};
-                    const inner_list = self.emitGenericContainerRef("List", &type_args) catch return null;
+                    const inner_list = try self.emitGenericContainerRef("List", &type_args);
                     // Call .empty() to get a value of type ?*const List(T)
                     const empty_fn = zir_builder_emit_field_val(self.handle, inner_list, "empty", 5);
-                    if (empty_fn == error_ref) return null;
+                    if (empty_fn == error_ref) return error.EmitFailed;
                     const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
-                    if (empty_val == error_ref) return null;
+                    if (empty_val == error_ref) return error.EmitFailed;
                     // @TypeOf(empty_val) gives ?*const List(T)
                     const type_ref = zir_builder_emit_typeof(self.handle, empty_val);
-                    if (type_ref == error_ref) return null;
+                    if (type_ref == error_ref) return error.EmitFailed;
                     return type_ref;
                 }
                 return null;
@@ -4087,24 +4344,24 @@ pub const ZirDriver = struct {
                 const val_ref = try self.emitContainerElementTypeRef(mt.value.*);
                 if (key_ref != null and val_ref != null) {
                     const type_args = [_]u32{ key_ref.?, val_ref.? };
-                    const inner_map = self.emitGenericContainerRef("Map", &type_args) catch return null;
+                    const inner_map = try self.emitGenericContainerRef("Map", &type_args);
                     // Call .empty() to get ?*const MapOf(K, V), then @TypeOf
                     const empty_fn = zir_builder_emit_field_val(self.handle, inner_map, "empty", 5);
-                    if (empty_fn == error_ref) return null;
+                    if (empty_fn == error_ref) return error.EmitFailed;
                     const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
-                    if (empty_val == error_ref) return null;
+                    if (empty_val == error_ref) return error.EmitFailed;
                     const type_ref = zir_builder_emit_typeof(self.handle, empty_val);
-                    if (type_ref == error_ref) return null;
+                    if (type_ref == error_ref) return error.EmitFailed;
                     return type_ref;
                 }
                 return null;
             },
-            .term => return self.emitTermTypeRef() catch null,
+            .term => return try self.emitTermTypeRef(),
             // A `[fn(i64) -> i64]` list (or map value) of boxed closures
             // lowers to a `List(ProtocolBox)` — the element is the runtime
             // fat-pointer carrier. Without this arm `emitListCellRef`
             // returns null and the list literal fails to emit.
-            .protocol_box => return self.emitProtocolBoxTypeRef() catch null,
+            .protocol_box => return try self.emitProtocolBoxTypeRef(),
             .tuple => {
                 // Tuple element types (e.g. keyword lists `[{Atom, String}]`):
                 // emit the tuple type body inline so the runtime container
@@ -4112,8 +4369,7 @@ pub const ZirDriver = struct {
                 // for nested tuples and falls back to `emitImportedTypeRef`
                 // for each component type — so `[{Atom, String}]` resolves
                 // to a proper `tuple{u32, []const u8}`-keyed `List`.
-                const ref = self.emitBodyLocalTupleType(zig_type);
-                if (ref == 0 or ref == error_ref) return null;
+                const ref = try self.emitBodyLocalTupleType(zig_type);
                 return ref;
             },
             else => null,
@@ -4279,12 +4535,8 @@ pub const ZirDriver = struct {
     /// Emit a reference to a `MapOf(K, V)` type instantiation for any key/value types.
     /// Uses comptime generic instantiation via `@import("zap_runtime").MapOf(K, V)`.
     fn emitMapCellRef(self: *ZirDriver, key_type: ir.ZigType, value_type: ir.ZigType) BuildError!u32 {
-        const key_ref = (try self.emitContainerElementTypeRef(key_type)) orelse
-            zigTypeToTypeRef(key_type) orelse
-            @intFromEnum(Zir.Inst.Ref.u32_type);
-        const val_ref = (try self.emitContainerElementTypeRef(value_type)) orelse
-            zigTypeToTypeRef(value_type) orelse
-            @intFromEnum(Zir.Inst.Ref.i64_type);
+        const key_ref = (try self.emitContainerElementTypeRef(key_type)) orelse return error.EmitFailed;
+        const val_ref = (try self.emitContainerElementTypeRef(value_type)) orelse return error.EmitFailed;
         const type_args = [_]u32{ key_ref, val_ref };
         return self.emitGenericContainerRef("Map", &type_args);
     }
@@ -4448,8 +4700,7 @@ pub const ZirDriver = struct {
         for (elements) |element_type| {
             const before = zir_builder_get_body_inst_count(self.handle);
             const untracked_before = self.pending_ret_ty_untracked.items.len;
-            const ref = self.mapTupleElementType(element_type);
-            if (ref == 0) return error.EmitFailed;
+            const ref = try self.mapTupleElementType(element_type);
             try self.captureBodyInsts(before, &support_inst_indices);
             if (self.pending_ret_ty_untracked.items.len > untracked_before) {
                 for (self.pending_ret_ty_untracked.items[untracked_before..]) |idx| {
@@ -4624,6 +4875,7 @@ pub const ZirDriver = struct {
             if (std.mem.eql(u8, func_name, "merge_owned_unchecked")) return "mapMergeOwnedUnchecked";
             if (std.mem.eql(u8, func_name, "size")) return "mapSize";
             if (std.mem.eql(u8, func_name, "isEmpty")) return "mapIsEmpty";
+            if (std.mem.eql(u8, func_name, "release")) return "mapRelease";
             if (std.mem.eql(u8, func_name, "next")) return "mapNext";
             if (std.mem.eql(u8, func_name, "keys")) return "mapKeys";
             if (std.mem.eql(u8, func_name, "values")) return "mapValues";
@@ -4652,6 +4904,7 @@ pub const ZirDriver = struct {
             if (std.mem.eql(u8, func_name, "append_owned_unchecked")) return "listAppendOwnedUnchecked";
             if (std.mem.eql(u8, func_name, "contains")) return "listContains";
             if (std.mem.eql(u8, func_name, "take")) return "listTake";
+            if (std.mem.eql(u8, func_name, "release")) return "listRelease";
             if (std.mem.eql(u8, func_name, "next")) return "listNext";
             if (std.mem.eql(u8, func_name, "cons")) return "listCons";
             if (std.mem.eql(u8, func_name, "drop")) return "listDrop";
@@ -4699,7 +4952,18 @@ pub const ZirDriver = struct {
     fn emitEncodedContainerElementTypeRef(self: *ZirDriver, name: []const u8) BuildError!?u32 {
         if (encodedNameToTypeRef(name)) |ref| return ref;
         if (std.mem.eql(u8, name, "Term")) return try self.emitTermTypeRef();
-        return self.emitStructTypeRef(name) catch null;
+        if (!self.findAnyTypeDef(name)) return null;
+        return try self.emitStructTypeRef(name);
+    }
+
+    fn emitRequiredEncodedContainerElementTypeRef(self: *ZirDriver, name: []const u8) BuildError!u32 {
+        return (try self.emitEncodedContainerElementTypeRef(name)) orelse error.EmitFailed;
+    }
+
+    fn encodedContainerElementNameIsKnown(self: *const ZirDriver, name: []const u8) bool {
+        return encodedNameToTypeRef(name) != null or
+            std.mem.eql(u8, name, "Term") or
+            self.findAnyTypeDef(name);
     }
 
     /// Extract element type from a list ZigType. Callers validate the outer
@@ -4722,7 +4986,7 @@ pub const ZirDriver = struct {
         // source-Arc pointer through every call so deep release
         // observes a real allocation).
         if (self.zigTypeIsRecursiveStruct(param.type_expr)) {
-            const boxed = self.boxRecursiveZigType(param.type_expr);
+            const boxed = try self.boxRecursiveZigType(param.type_expr);
             var support: std.ArrayListUnmanaged(u32) = .empty;
             defer support.deinit(self.allocator);
             const before = zir_builder_get_body_inst_count(self.handle);
@@ -4772,7 +5036,8 @@ pub const ZirDriver = struct {
                                 param.name.ptr,
                                 @intCast(param.name.len),
                             );
-                            if (ref != error_ref) return ref;
+                            if (ref == error_ref) return error.EmitFailed;
+                            return ref;
                         },
                         .nested => {
                             // Nested inside the primary — reachable
@@ -4787,7 +5052,8 @@ pub const ZirDriver = struct {
                                 short_name.ptr,
                                 @intCast(short_name.len),
                             );
-                            if (ref != error_ref) return ref;
+                            if (ref == error_ref) return error.EmitFailed;
+                            return ref;
                         },
                         .foreign => {
                             if (std.mem.lastIndexOf(u8, name, ".")) |_| {
@@ -4804,7 +5070,8 @@ pub const ZirDriver = struct {
                                     short_name.ptr,
                                     @intCast(short_name.len),
                                 );
-                                if (ref != error_ref) return ref;
+                                if (ref == error_ref) return error.EmitFailed;
+                                return ref;
                             } else {
                                 // Foreign top-level — file IS the
                                 // struct: `@import(name)`.
@@ -4815,7 +5082,8 @@ pub const ZirDriver = struct {
                                     name.ptr,
                                     @intCast(name.len),
                                 );
-                                if (ref != error_ref) return ref;
+                                if (ref == error_ref) return error.EmitFailed;
+                                return ref;
                             }
                         },
                     }
@@ -4890,7 +5158,7 @@ pub const ZirDriver = struct {
         // body's final result, not the ZIR Ref the emit helpers return,
         // so convert via `ref_to_inst_index` after capturing the body.
         if (self.zigTypeIsRecursiveStruct(return_type)) {
-            const boxed = self.boxRecursiveZigType(return_type);
+            const boxed = try self.boxRecursiveZigType(return_type);
             var support: std.ArrayListUnmanaged(u32) = .empty;
             defer support.deinit(self.allocator);
             const before = zir_builder_get_body_inst_count(self.handle);
@@ -4943,8 +5211,7 @@ pub const ZirDriver = struct {
                 defer support.deinit(self.allocator);
                 const before = zir_builder_get_body_inst_count(self.handle);
                 const elem_ref = (try self.emitContainerElementTypeRef(getListElementType(return_type))) orelse
-                    zigTypeToTypeRef(getListElementType(return_type)) orelse
-                    @intFromEnum(Zir.Inst.Ref.i64_type);
+                    return error.EmitFailed;
                 try self.captureBodyInsts(before, &support);
                 const type_args = [_]u32{elem_ref};
                 try self.setContainerReturnTypeWithSupport("List", &type_args, support.items);
@@ -4954,13 +5221,11 @@ pub const ZirDriver = struct {
                 defer support.deinit(self.allocator);
                 const before_key = zir_builder_get_body_inst_count(self.handle);
                 const key_ref = (try self.emitContainerElementTypeRef(mt.key.*)) orelse
-                    zigTypeToTypeRef(mt.key.*) orelse
-                    @intFromEnum(Zir.Inst.Ref.u32_type);
+                    return error.EmitFailed;
                 try self.captureBodyInsts(before_key, &support);
                 const before_val = zir_builder_get_body_inst_count(self.handle);
                 const val_ref = (try self.emitContainerElementTypeRef(mt.value.*)) orelse
-                    zigTypeToTypeRef(mt.value.*) orelse
-                    @intFromEnum(Zir.Inst.Ref.i64_type);
+                    return error.EmitFailed;
                 try self.captureBodyInsts(before_val, &support);
                 const type_args = [_]u32{ key_ref, val_ref };
                 try self.setContainerReturnTypeWithSupport("Map", &type_args, support.items);
@@ -5302,6 +5567,7 @@ pub const ZirDriver = struct {
         self.arc_share_skipped.clearRetainingCapacity();
         self.arc_returned_locals.clearRetainingCapacity();
         self.arc_managed_locals.clearRetainingCapacity();
+        self.aggregate_component_original_refs.clearRetainingCapacity();
         // Phase 4 of the k-nucleotide RSS gap implementation plan:
         // when the IR-lowering phase produced an ARC ownership table
         // for this function, replay its `return_source_locals` into
@@ -5340,6 +5606,7 @@ pub const ZirDriver = struct {
         self.skip_next_ret_local = null;
         self.current_function_id = func.id;
         self.current_function_param_conventions = func.param_conventions;
+        self.current_function_local_ownership = func.local_ownership;
         self.current_function_return_type = func.return_type;
         self.current_function_is_closure = func.captures.len > 0;
         const closure_lowering = self.getClosureLowering(func.id, func.captures.len);
@@ -5526,10 +5793,13 @@ pub const ZirDriver = struct {
         // slots and `repeat` the loop instead of musttail-ing — see
         // `Function.loopify` and the `tail_call` lowering for the
         // dispatch.
+        var loopify_capture_open = false;
         if (func.loopify) {
             try self.beginLoopification(func);
             self.beginCapture();
+            loopify_capture_open = true;
         }
+        errdefer if (loopify_capture_open) self.discardCapture();
 
         // Emit body blocks.
         for (func.body) |block| {
@@ -5561,6 +5831,7 @@ pub const ZirDriver = struct {
             try self.emitRepeat();
             var body_len: u32 = 0;
             const body_ptr = self.endCapture(&body_len);
+            loopify_capture_open = false;
             const body_insts = try self.allocator.alloc(u32, body_len);
             defer self.allocator.free(body_insts);
             @memcpy(body_insts, body_ptr[0..body_len]);
@@ -5734,26 +6005,26 @@ pub const ZirDriver = struct {
     /// Check if a local holds a bare function reference (0-capture make_closure).
     /// Bare function refs are stored as decl_ref values, not closure structs,
     /// so they must be called via call_ref rather than struct field access.
-    fn isBareFunctionRef(self: *const ZirDriver, local: ir.LocalId) bool {
-        if (self.findClosureCallTarget(local)) |target| {
+    fn isBareFunctionRef(self: *const ZirDriver, local: ir.LocalId) BuildError!bool {
+        if (try self.findClosureCallTarget(local)) |target| {
             return target.captures.len == 0;
         }
         return false;
     }
 
-    fn findClosureCallTarget(self: *const ZirDriver, local: ir.LocalId) ?ClosureCallTarget {
+    fn findClosureCallTarget(self: *const ZirDriver, local: ir.LocalId) BuildError!?ClosureCallTarget {
         if (self.program) |prog| {
             for (prog.functions) |func| {
                 if (func.id != self.current_function_id) continue;
                 // Search across ALL blocks in the function body so that
                 // local chains spanning block boundaries can be resolved.
                 for (func.body) |block| {
-                    if (findClosureTargetInInstrs(block.instructions, local)) |target| return target;
+                    if (try findClosureTargetInInstrs(self.allocator, block.instructions, local)) |target| return target;
                 }
                 // Second pass: if a local_set in one block references a value
                 // defined in another block, resolve the chain across blocks.
                 for (func.body) |block| {
-                    if (findClosureTargetCrossBlock(func.body, block.instructions, local)) |target| return target;
+                    if (try findClosureTargetCrossBlock(self.allocator, func.body, block.instructions, local)) |target| return target;
                 }
             }
         }
@@ -5762,7 +6033,7 @@ pub const ZirDriver = struct {
 
     /// Search for a closure target across block boundaries. When a local_set/local_get
     /// in one block references a value from another block, search all blocks for the source.
-    fn findClosureTargetCrossBlock(all_blocks: []const ir.Block, instrs: []const ir.Instruction, local: ir.LocalId) ?ClosureCallTarget {
+    fn findClosureTargetCrossBlock(allocator: Allocator, all_blocks: []const ir.Block, instrs: []const ir.Instruction, local: ir.LocalId) BuildError!?ClosureCallTarget {
         for (instrs) |instr| {
             const source_local: ?ir.LocalId = switch (instr) {
                 .local_set => |ls| if (ls.dest == local) ls.value else null,
@@ -5776,7 +6047,7 @@ pub const ZirDriver = struct {
             if (source_local) |src| {
                 // Search all blocks for the source local
                 for (all_blocks) |block| {
-                    if (findClosureTargetInInstrs(block.instructions, src)) |target| return target;
+                    if (try findClosureTargetInInstrs(allocator, block.instructions, src)) |target| return target;
                 }
             }
         }
@@ -5787,90 +6058,86 @@ pub const ZirDriver = struct {
     /// Cycle protection uses a visited set rather than a depth cap so deeply-
     /// aliased code (long pipeline chains, decision-tree fan-out) still resolves
     /// to a direct call instead of silently degrading to dynamic dispatch.
-    fn findClosureTargetInInstrs(instrs: []const ir.Instruction, local: ir.LocalId) ?ClosureCallTarget {
-        var stack_buf: [64]ir.LocalId = undefined;
-        var visited = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(&stack_buf));
-        var visited_list: std.ArrayListUnmanaged(ir.LocalId) = .empty;
-        defer visited_list.deinit(visited.allocator());
-        return findClosureTargetInInstrsRec(instrs, local, &visited_list, visited.allocator());
+    fn findClosureTargetInInstrs(allocator: Allocator, instrs: []const ir.Instruction, local: ir.LocalId) BuildError!?ClosureCallTarget {
+        var visited: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+        defer visited.deinit(allocator);
+        return try findClosureTargetInInstrsRec(allocator, instrs, local, &visited);
     }
 
     fn findClosureTargetInInstrsRec(
+        allocator: Allocator,
         instrs: []const ir.Instruction,
         local: ir.LocalId,
-        visited: *std.ArrayListUnmanaged(ir.LocalId),
-        visited_alloc: std.mem.Allocator,
-    ) ?ClosureCallTarget {
-        for (visited.items) |seen| {
-            if (seen == local) return null;
-        }
-        visited.append(visited_alloc, local) catch return null;
+        visited: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+    ) BuildError!?ClosureCallTarget {
+        const visited_entry = try visited.getOrPut(allocator, local);
+        if (visited_entry.found_existing) return null;
         for (instrs) |instr| {
             switch (instr) {
                 .make_closure => |mc| if (mc.dest == local) return .{ .function_id = mc.function, .captures = mc.captures },
                 .local_get => |lg| if (lg.dest == local) {
-                    if (findClosureTargetInInstrsRec(instrs, lg.source, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, instrs, lg.source, visited)) |target| return target;
                 },
                 .borrow_value => |bv| if (bv.dest == local) {
-                    if (findClosureTargetInInstrsRec(instrs, bv.source, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, instrs, bv.source, visited)) |target| return target;
                 },
                 .copy_value => |cv| if (cv.dest == local) {
-                    if (findClosureTargetInInstrsRec(instrs, cv.source, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, instrs, cv.source, visited)) |target| return target;
                 },
                 .local_set => |ls| if (ls.dest == local) {
-                    if (findClosureTargetInInstrsRec(instrs, ls.value, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, instrs, ls.value, visited)) |target| return target;
                 },
                 .move_value => |mv| if (mv.dest == local) {
-                    if (findClosureTargetInInstrsRec(instrs, mv.source, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, instrs, mv.source, visited)) |target| return target;
                 },
                 .share_value => |sv| if (sv.dest == local) {
-                    if (findClosureTargetInInstrsRec(instrs, sv.source, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, instrs, sv.source, visited)) |target| return target;
                 },
                 .if_expr => |ie| {
-                    if (findClosureTargetInInstrsRec(ie.then_instrs, local, visited, visited_alloc)) |target| return target;
-                    if (findClosureTargetInInstrsRec(ie.else_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, ie.then_instrs, local, visited)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, ie.else_instrs, local, visited)) |target| return target;
                 },
                 .case_block => |cb| {
-                    if (findClosureTargetInInstrsRec(cb.pre_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, cb.pre_instrs, local, visited)) |target| return target;
                     for (cb.arms) |arm| {
-                        if (findClosureTargetInInstrsRec(arm.cond_instrs, local, visited, visited_alloc)) |target| return target;
-                        if (findClosureTargetInInstrsRec(arm.body_instrs, local, visited, visited_alloc)) |target| return target;
+                        if (try findClosureTargetInInstrsRec(allocator, arm.cond_instrs, local, visited)) |target| return target;
+                        if (try findClosureTargetInInstrsRec(allocator, arm.body_instrs, local, visited)) |target| return target;
                     }
-                    if (findClosureTargetInInstrsRec(cb.default_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, cb.default_instrs, local, visited)) |target| return target;
                 },
-                .guard_block => |gb| if (findClosureTargetInInstrsRec(gb.body, local, visited, visited_alloc)) |target| return target,
+                .guard_block => |gb| if (try findClosureTargetInInstrsRec(allocator, gb.body, local, visited)) |target| return target,
                 .switch_literal => |sl| {
                     for (sl.cases) |case| {
-                        if (findClosureTargetInInstrsRec(case.body_instrs, local, visited, visited_alloc)) |target| return target;
+                        if (try findClosureTargetInInstrsRec(allocator, case.body_instrs, local, visited)) |target| return target;
                     }
-                    if (findClosureTargetInInstrsRec(sl.default_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, sl.default_instrs, local, visited)) |target| return target;
                 },
                 .switch_return => |sr| {
                     for (sr.cases) |case| {
-                        if (findClosureTargetInInstrsRec(case.body_instrs, local, visited, visited_alloc)) |target| return target;
+                        if (try findClosureTargetInInstrsRec(allocator, case.body_instrs, local, visited)) |target| return target;
                     }
-                    if (findClosureTargetInInstrsRec(sr.default_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, sr.default_instrs, local, visited)) |target| return target;
                 },
                 .union_switch_return => |usr| {
                     for (usr.cases) |case| {
-                        if (findClosureTargetInInstrsRec(case.body_instrs, local, visited, visited_alloc)) |target| return target;
+                        if (try findClosureTargetInInstrsRec(allocator, case.body_instrs, local, visited)) |target| return target;
                     }
                 },
                 .union_switch => |us| {
                     for (us.cases) |case| {
-                        if (findClosureTargetInInstrsRec(case.body_instrs, local, visited, visited_alloc)) |target| return target;
+                        if (try findClosureTargetInInstrsRec(allocator, case.body_instrs, local, visited)) |target| return target;
                     }
                     if (us.has_else) {
-                        if (findClosureTargetInInstrsRec(us.else_instrs, local, visited, visited_alloc)) |target| return target;
+                        if (try findClosureTargetInInstrsRec(allocator, us.else_instrs, local, visited)) |target| return target;
                     }
                 },
                 .try_call_named => |tcn| {
-                    if (findClosureTargetInInstrsRec(tcn.handler_instrs, local, visited, visited_alloc)) |target| return target;
-                    if (findClosureTargetInInstrsRec(tcn.success_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, tcn.handler_instrs, local, visited)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, tcn.success_instrs, local, visited)) |target| return target;
                 },
                 .optional_dispatch => |od| {
-                    if (findClosureTargetInInstrsRec(od.nil_instrs, local, visited, visited_alloc)) |target| return target;
-                    if (findClosureTargetInInstrsRec(od.struct_instrs, local, visited, visited_alloc)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, od.nil_instrs, local, visited)) |target| return target;
+                    if (try findClosureTargetInInstrsRec(allocator, od.struct_instrs, local, visited)) |target| return target;
                 },
                 else => {},
             }
@@ -5883,7 +6150,7 @@ pub const ZirDriver = struct {
         var args: std.ArrayListUnmanaged(u32) = .empty;
         defer args.deinit(self.allocator);
         for (args_locals) |arg| {
-            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+            const ref = try self.refForValueLocal(arg);
             try args.append(self.allocator, ref);
         }
 
@@ -5928,7 +6195,7 @@ pub const ZirDriver = struct {
 
     fn emitCapturedClosureTargetCall(self: *ZirDriver, callee: ir.LocalId, target_id: ir.FunctionId, args_locals: []const ir.LocalId) !u32 {
         const target_func = self.findFunctionById(target_id) orelse return error.EmitFailed;
-        const callee_ref = self.refForLocal(callee) catch return error.EmitFailed;
+        const callee_ref = try self.refForLocal(callee);
         const env_ref = zir_builder_emit_field_val(self.handle, callee_ref, "env", 3);
         if (env_ref == error_ref) return error.EmitFailed;
 
@@ -5936,7 +6203,7 @@ pub const ZirDriver = struct {
         defer args.deinit(self.allocator);
         try args.append(self.allocator, env_ref);
         for (args_locals) |arg| {
-            const ref_arg = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+            const ref_arg = try self.refForValueLocal(arg);
             try args.append(self.allocator, ref_arg);
         }
 
@@ -5967,9 +6234,9 @@ pub const ZirDriver = struct {
     fn emitTailInvokeWrapperCall(self: *ZirDriver, callee: ir.LocalId, function_id: ir.FunctionId, args_locals: []const ir.LocalId) !bool {
         const func_def = self.findFunctionById(function_id) orelse return false;
 
-        const callee_ref = self.refForLocal(callee) catch return false;
+        const callee_ref = try self.refForLocal(callee);
         const env_ref = zir_builder_emit_field_val(self.handle, callee_ref, "env", 3);
-        if (env_ref == error_ref) return false;
+        if (env_ref == error_ref) return error.EmitFailed;
 
         const invoke_name = try std.fmt.allocPrint(self.allocator, "__closure_invoke_{d}", .{function_id});
         defer self.allocator.free(invoke_name);
@@ -5984,16 +6251,16 @@ pub const ZirDriver = struct {
             name_ptrs[i] = param.name.ptr;
             name_lens[i] = @intCast(param.name.len);
             values[i] = if (i < args_locals.len)
-                self.refForLocal(args_locals[i]) catch @intFromEnum(Zir.Inst.Ref.void_value)
+                try self.refForLocal(args_locals[i])
             else
                 @intFromEnum(Zir.Inst.Ref.void_value);
         }
         const arg_struct = zir_builder_emit_struct_init_anon(self.handle, name_ptrs.ptr, name_lens.ptr, values.ptr, @intCast(values.len));
-        if (arg_struct == error_ref) return false;
+        if (arg_struct == error_ref) return error.EmitFailed;
 
         const call_args = [_]u32{ env_ref, arg_struct };
         const ref = zir_builder_emit_call(self.handle, invoke_name.ptr, @intCast(invoke_name.len), &call_args, 2);
-        if (ref == error_ref) return false;
+        if (ref == error_ref) return error.EmitFailed;
         if (zir_builder_emit_ret(self.handle, ref) != 0) return error.EmitFailed;
         return true;
     }
@@ -6024,25 +6291,32 @@ pub const ZirDriver = struct {
     }
 
     fn emitClosureSwitchDispatch(self: *ZirDriver, cc: ir.CallClosure, targets: []const ir.FunctionId) !bool {
-        const callee_ref = self.refForLocal(cc.callee) catch return false;
+        const callee_ref = try self.refForLocal(cc.callee);
         const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
-        if (call_fn_ref == error_ref) return false;
+        if (call_fn_ref == error_ref) return error.EmitFailed;
 
         var fallback_args: std.ArrayListUnmanaged(u32) = .empty;
         defer fallback_args.deinit(self.allocator);
         for (cc.args) |arg| {
-            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+            const ref = try self.refForValueLocal(arg);
             try fallback_args.append(self.allocator, ref);
         }
 
+        var fallback_ref: u32 = undefined;
+        var current_else_insts = CurrentElseInsts.init(self.allocator);
+        defer current_else_insts.deinit();
+
         self.beginCapture();
-        const fallback_ref = zir_builder_emit_call_ref(self.handle, callee_ref, fallback_args.items.ptr, @intCast(fallback_args.items.len));
-        if (fallback_ref == error_ref) return false;
+        var fallback_capture_open = true;
+        errdefer if (fallback_capture_open) self.discardCapture();
+
+        fallback_ref = zir_builder_emit_call_ref(self.handle, callee_ref, fallback_args.items.ptr, @intCast(fallback_args.items.len));
+        if (fallback_ref == error_ref) return error.EmitFailed;
         try self.setLocal(cc.dest, fallback_ref);
         var else_len: u32 = 0;
         const else_ptr = self.endCapture(&else_len);
-        var current_else_insts = try self.allocator.alloc(u32, else_len);
-        @memcpy(current_else_insts, else_ptr[0..else_len]);
+        fallback_capture_open = false;
+        try current_else_insts.replaceWithCopy(else_ptr[0..else_len]);
         var current_else_result = fallback_ref;
 
         var emitted = false;
@@ -6060,43 +6334,49 @@ pub const ZirDriver = struct {
             const cond_ref = zir_builder_emit_binop(self.handle, @intFromEnum(Zir.Inst.Tag.cmp_eq), call_fn_ref, name_ref);
             if (cond_ref == error_ref) return error.EmitFailed;
 
-            self.beginCapture();
-            const direct_ref = try self.emitNamedCallToTarget(target_id, cc.args);
-            try self.setLocal(cc.dest, direct_ref);
-            var then_len: u32 = 0;
-            const then_ptr = self.endCapture(&then_len);
-            const then_insts = try self.allocator.alloc(u32, then_len);
-            @memcpy(then_insts, then_ptr[0..then_len]);
+            const then_body = blk: {
+                self.beginCapture();
+                var capture_open = true;
+                errdefer if (capture_open) self.discardCapture();
+
+                const direct_ref = try self.emitNamedCallToTarget(target_id, cc.args);
+                try self.setLocal(cc.dest, direct_ref);
+                var then_len: u32 = 0;
+                const then_ptr = self.endCapture(&then_len);
+                capture_open = false;
+                const then_insts = try self.allocator.alloc(u32, then_len);
+                @memcpy(then_insts, then_ptr[0..then_len]);
+                break :blk .{ .result = direct_ref, .insts = then_insts };
+            };
+            defer self.allocator.free(then_body.insts);
+
+            const else_insts = current_else_insts.get();
 
             const ref = zir_builder_emit_if_else_bodies(
                 self.handle,
                 cond_ref,
-                then_insts.ptr,
-                @intCast(then_insts.len),
-                direct_ref,
-                current_else_insts.ptr,
-                @intCast(current_else_insts.len),
+                then_body.insts.ptr,
+                @intCast(then_body.insts.len),
+                then_body.result,
+                else_insts.ptr,
+                @intCast(else_insts.len),
                 current_else_result,
                 0,
                 0,
             );
 
-            self.allocator.free(then_insts);
-            self.allocator.free(current_else_insts);
+            current_else_insts.clear();
             if (ref == error_ref) return error.EmitFailed;
 
             if (i > 0) {
                 const block_idx = zir_builder_pop_body_inst(self.handle);
-                current_else_insts = try self.allocator.alloc(u32, 1);
-                current_else_insts[0] = block_idx;
+                try current_else_insts.replaceWithSingle(block_idx);
                 current_else_result = ref;
             } else {
-                current_else_insts = try self.allocator.alloc(u32, 0);
                 current_else_result = ref;
             }
         }
 
-        defer self.allocator.free(current_else_insts);
         if (!emitted) return false;
         try self.setLocal(cc.dest, current_else_result);
         return true;
@@ -6365,7 +6645,8 @@ pub const ZirDriver = struct {
                                 const note_consume_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "noteConsume", 11);
                                 if (note_consume_fn == error_ref) return error.EmitFailed;
                                 const args = [_]u32{};
-                                _ = zir_builder_emit_call_ref(self.handle, note_consume_fn, &args, 0);
+                                const note_consume_ref = zir_builder_emit_call_ref(self.handle, note_consume_fn, &args, 0);
+                                if (note_consume_ref == error_ref) return error.EmitFailed;
                             }
                         },
                         .retain => {
@@ -6431,25 +6712,25 @@ pub const ZirDriver = struct {
                 if (bo.op == .bool_and or bo.op == .bool_or) {
                     // Emit short-circuit bool_br_and / bool_br_or ZIR instructions.
                     // The RHS is wrapped in a body so it's only evaluated when needed.
-                    const lhs = self.refForLocal(bo.lhs) catch return;
-                    const rhs = self.refForLocal(bo.rhs) catch return;
+                    const lhs = try self.refForLocal(bo.lhs);
+                    const rhs = try self.refForLocal(bo.rhs);
                     // Body is empty (RHS already evaluated as a local), just pass the result.
                     const empty_body = [_]u32{};
                     const ref = if (bo.op == .bool_and)
-                        self.emitBoolBrAnd(lhs, &empty_body, rhs) catch return error.EmitFailed
+                        try self.emitBoolBrAnd(lhs, &empty_body, rhs)
                     else
-                        self.emitBoolBrOr(lhs, &empty_body, rhs) catch return error.EmitFailed;
+                        try self.emitBoolBrOr(lhs, &empty_body, rhs);
                     try self.setLocal(bo.dest, ref);
                 } else if (mapBinopTag(bo.op, bo.result_type, self.arithmetic_overflow_traps)) |tag| {
-                    const lhs = self.refForLocal(bo.lhs) catch return;
-                    const rhs = self.refForLocal(bo.rhs) catch return;
+                    const lhs = try self.refForLocal(bo.lhs);
+                    const rhs = try self.refForLocal(bo.rhs);
                     const ref = zir_builder_emit_binop(self.handle, tag, lhs, rhs);
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(bo.dest, ref);
                 } else if (bo.op == .string_eq or bo.op == .string_neq) {
                     // String comparison via std.mem.eql(u8, lhs, rhs)
-                    const lhs = self.refForLocal(bo.lhs) catch return;
-                    const rhs = self.refForLocal(bo.rhs) catch return;
+                    const lhs = try self.refForLocal(bo.lhs);
+                    const rhs = try self.refForLocal(bo.rhs);
 
                     const std_import = zir_builder_emit_import(self.handle, "std", 3);
                     if (std_import == error_ref) return error.EmitFailed;
@@ -6471,8 +6752,8 @@ pub const ZirDriver = struct {
                     try self.setLocal(bo.dest, ref);
                 } else if (bo.op == .concat) {
                     // concat — emit @import("zap_runtime").String.concat(lhs, rhs)
-                    const lhs = self.refForLocal(bo.lhs) catch return;
-                    const rhs = self.refForLocal(bo.rhs) catch return;
+                    const lhs = try self.refForLocal(bo.lhs);
+                    const rhs = try self.refForLocal(bo.rhs);
 
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
@@ -6488,8 +6769,8 @@ pub const ZirDriver = struct {
                 } else if (bo.op == .in_list) {
                     // in — emit: lhs == list[0] or lhs == list[1] or ...
                     // For runtime lists, call the list's contains method via generic dispatch.
-                    const lhs = self.refForLocal(bo.lhs) catch return;
-                    const rhs = self.refForLocal(bo.rhs) catch return;
+                    const lhs = try self.refForLocal(bo.lhs);
+                    const rhs = try self.refForLocal(bo.rhs);
 
                     // Use the generic list contains: get the list type, then call .contains(list, value)
                     // The list (rhs) already has the right type at runtime — call contains as a method.
@@ -6504,8 +6785,8 @@ pub const ZirDriver = struct {
                 } else if (bo.op == .in_range) {
                     // in_range: check value >= min(start,end) and value <= max(start,end)
                     // and rem(value - start, step) == 0
-                    const value_ref = self.refForLocal(bo.lhs) catch return;
-                    const range_ref = self.refForLocal(bo.rhs) catch return;
+                    const value_ref = try self.refForLocal(bo.lhs);
+                    const range_ref = try self.refForLocal(bo.rhs);
 
                     // Extract range fields: start, end, step
                     const start_ref = zir_builder_emit_field_val(self.handle, range_ref, "start", 5);
@@ -6551,8 +6832,8 @@ pub const ZirDriver = struct {
 
                     // Combine: gte_min and lte_max and on_step (short-circuit)
                     const empty_body = [_]u32{};
-                    const in_bounds = self.emitBoolBrAnd(gte_min, &empty_body, lte_max) catch return error.EmitFailed;
-                    const result = self.emitBoolBrAnd(in_bounds, &empty_body, on_step) catch return error.EmitFailed;
+                    const in_bounds = try self.emitBoolBrAnd(gte_min, &empty_body, lte_max);
+                    const result = try self.emitBoolBrAnd(in_bounds, &empty_body, on_step);
 
                     try self.setLocal(bo.dest, result);
                 }
@@ -6560,7 +6841,7 @@ pub const ZirDriver = struct {
 
             // Unary operations
             .unary_op => |uo| {
-                const operand = self.refForLocal(uo.operand) catch return;
+                const operand = try self.refForLocal(uo.operand);
                 const ref = switch (uo.op) {
                     .negate => zir_builder_emit_negate(self.handle, operand),
                     .bool_not => zir_builder_emit_bool_not(self.handle, operand),
@@ -6601,7 +6882,7 @@ pub const ZirDriver = struct {
                 var args: std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (cn.args) |arg| {
-                    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const ref = try self.refForValueLocal(arg);
                     try args.append(self.allocator, ref);
                 }
 
@@ -6682,7 +6963,7 @@ pub const ZirDriver = struct {
                     // `__<arity>` suffix matches.
                     if (target_func == null) {
                         if (self.current_emit_struct) |caller_struct| {
-                            target_func = self.findMonomorphizedImplFor(caller_struct, resolved_call_name);
+                            target_func = try self.findMonomorphizedImplFor(caller_struct, resolved_call_name);
                         }
                     }
                     const target_struct = if (target_func) |tf| tf.struct_name else null;
@@ -6720,9 +7001,8 @@ pub const ZirDriver = struct {
                         // Fallback: emit as regular call
                         const call_name = if (target_func) |tf| tf.name else resolved_call_name;
                         const ref = zir_builder_emit_call(self.handle, call_name.ptr, @intCast(call_name.len), args.items.ptr, @intCast(args.items.len));
-                        if (ref != error_ref) {
-                            try self.setLocal(cn.dest, ref);
-                        }
+                        if (ref == error_ref) return error.EmitFailed;
+                        try self.setLocal(cn.dest, ref);
                     } else {
                         const call_name = if (self.current_emit_struct != null)
                             if (target_func) |tf| tf.local_name else cn.name
@@ -6745,7 +7025,7 @@ pub const ZirDriver = struct {
                 var args: std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (tcn.args) |arg| {
-                    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const ref = try self.refForValueLocal(arg);
                     try args.append(self.allocator, ref);
                 }
                 zir_builder_set_call_modifier(self.handle, 3); // no_optimizations
@@ -6788,21 +7068,29 @@ pub const ZirDriver = struct {
                 // inline so a failure in any earlier step short-circuits
                 // them. The catch-basin expression value is then the
                 // result of the deepest success path (or the handler).
-                self.beginCapture();
-                const payload = zir_builder_emit_optional_payload_unsafe(self.handle, call_ref);
-                if (payload == error_ref) return error.EmitFailed;
-                if (tcn.payload_local) |pl| {
-                    try self.setLocal(pl, payload);
-                }
-                for (tcn.success_instrs) |si| try self.emitInstruction(si);
-                const success_value_ref = if (tcn.success_result) |sr|
-                    (self.refForLocal(sr) catch payload)
-                else
-                    payload;
-                var then_len: u32 = 0;
-                const then_ptr = self.endCapture(&then_len);
-                const then_insts = try self.allocator.alloc(u32, then_len);
-                @memcpy(then_insts, then_ptr[0..then_len]);
+                const then_body = blk: {
+                    self.beginCapture();
+                    var capture_open = true;
+                    errdefer if (capture_open) self.discardCapture();
+
+                    const payload = zir_builder_emit_optional_payload_unsafe(self.handle, call_ref);
+                    if (payload == error_ref) return error.EmitFailed;
+                    if (tcn.payload_local) |pl| {
+                        try self.setLocal(pl, payload);
+                    }
+                    for (tcn.success_instrs) |si| try self.emitInstruction(si);
+                    const success_value_ref = if (tcn.success_result) |sr|
+                        try self.refForLocal(sr)
+                    else
+                        payload;
+                    var then_len: u32 = 0;
+                    const then_ptr = self.endCapture(&then_len);
+                    capture_open = false;
+                    const then_insts = try self.allocator.alloc(u32, then_len);
+                    @memcpy(then_insts, then_ptr[0..then_len]);
+                    break :blk .{ .insts = then_insts, .result = success_value_ref };
+                };
+                defer self.allocator.free(then_body.insts);
 
                 // Else branch (null = no match): evaluate handler with input.
                 // The handler's result becomes the value of the if-else block (and
@@ -6813,15 +7101,22 @@ pub const ZirDriver = struct {
                 // return type differs from the handler's value type — most
                 // notably `main`, which Zap lowers as `void`/`u8` to satisfy
                 // Zig's entry-point ABI even when the user wrote `-> String`.
-                self.beginCapture();
-                // Emit handler instructions (they reference the input local via __err)
-                for (tcn.handler_instrs) |hi| try self.emitInstruction(hi);
-                var else_len: u32 = 0;
-                const else_ptr = self.endCapture(&else_len);
-                const handler_result_ref = if (tcn.handler_result) |hr|
-                    self.refForLocal(hr) catch @intFromEnum(Zir.Inst.Ref.void_value)
-                else
-                    @intFromEnum(Zir.Inst.Ref.void_value);
+                const else_body = blk: {
+                    self.beginCapture();
+                    var capture_open = true;
+                    errdefer if (capture_open) self.discardCapture();
+
+                    // Emit handler instructions (they reference the input local via __err)
+                    for (tcn.handler_instrs) |hi| try self.emitInstruction(hi);
+                    const handler_result_ref = if (tcn.handler_result) |hr|
+                        try self.refForLocal(hr)
+                    else
+                        @intFromEnum(Zir.Inst.Ref.void_value);
+                    var else_len: u32 = 0;
+                    const else_ptr = self.endCapture(&else_len);
+                    capture_open = false;
+                    break :blk .{ .ptr = else_ptr, .len = else_len, .result = handler_result_ref };
+                };
 
                 // Emit if-else: if (non_null) { unwrap; ...rest_of_pipe } else { handler_instrs }
                 // Both branches break with their respective values; the block's
@@ -6829,29 +7124,28 @@ pub const ZirDriver = struct {
                 const result = zir_builder_emit_if_else_bodies(
                     self.handle,
                     is_non_null,
-                    then_insts.ptr,
-                    @intCast(then_insts.len),
-                    success_value_ref,
-                    else_ptr,
-                    else_len,
-                    handler_result_ref,
+                    then_body.insts.ptr,
+                    @intCast(then_body.insts.len),
+                    then_body.result,
+                    else_body.ptr,
+                    else_body.len,
+                    else_body.result,
                     0,
                     0,
                 );
-                self.allocator.free(then_insts);
                 if (result == error_ref) return error.EmitFailed;
                 try self.setLocal(tcn.dest, result);
             },
             // Error catch — no longer needed (try_call_named handles unwrapping).
             .error_catch => |ec| {
-                const source_ref = self.refForValueLocal(ec.source) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const source_ref = try self.refForValueLocal(ec.source);
                 try self.setLocal(ec.dest, source_ref);
             },
             .unwrap_error_union => |ueu| {
                 // Phase 3.b: the source local holds a raising callee's
                 // `error{ZapRaise}!T`. Unwrap it to the payload `T`, rebinding
                 // the dest local's ref; the error case is dispatched by mode.
-                const source_ref = self.refForValueLocal(ueu.source) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const source_ref = try self.refForValueLocal(ueu.source);
                 switch (ueu.mode) {
                     .propagate => {
                         // `try source` — propagate `error.ZapRaise` out of the
@@ -6896,20 +7190,14 @@ pub const ZirDriver = struct {
                         // yields the payload and the abort fires only on a real
                         // raise.
                         self.beginCapture();
-                        const abort_ref = self.emitAbortRecoverableRaise(ueu.payload_type) catch |err| {
-                            // Balance the capture stack before propagating an
-                            // emit failure, so a later capture is not skewed.
-                            var discard_len: u32 = 0;
-                            _ = self.endCapture(&discard_len);
-                            return err;
-                        };
-                        if (abort_ref == error_ref) {
-                            var discard_len: u32 = 0;
-                            _ = self.endCapture(&discard_len);
-                            return error.EmitFailed;
-                        }
+                        var abort_capture_open = true;
+                        errdefer if (abort_capture_open) self.discardCapture();
+
+                        const abort_ref = try self.emitAbortRecoverableRaise(ueu.payload_type);
+                        if (abort_ref == error_ref) return error.EmitFailed;
                         var else_len: u32 = 0;
                         const else_ptr = self.endCapture(&else_len);
+                        abort_capture_open = false;
                         const else_insts = try self.allocator.alloc(u32, else_len);
                         defer self.allocator.free(else_insts);
                         @memcpy(else_insts, else_ptr[0..else_len]);
@@ -6935,7 +7223,7 @@ pub const ZirDriver = struct {
                 var args: std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (cb.args) |arg| {
-                    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const ref = try self.refForValueLocal(arg);
                     try args.append(self.allocator, ref);
                 }
 
@@ -6943,174 +7231,110 @@ pub const ZirDriver = struct {
                 // These are emitted by the IR builder for struct element lists.
                 const generic_handled = if (std.mem.startsWith(u8, cb.name, "List:")) blk: {
                     const after_prefix = cb.name["List:".len..];
-                    if (std.mem.findScalar(u8, after_prefix, '.')) |dot_idx| {
-                        const type_name = after_prefix[0..dot_idx];
-                        const method_name = after_prefix[dot_idx + 1 ..];
-                        const type_ref = encodedNameToTypeRef(type_name) orelse
-                            (self.emitStructTypeRef(type_name) catch error_ref);
-                        if (type_ref != error_ref) {
-                            const type_args = [_]u32{type_ref};
-                            const list_type = self.emitGenericContainerRef("List", &type_args) catch break :blk false;
-                            const fn_ref = zir_builder_emit_field_val(self.handle, list_type, method_name.ptr, @intCast(method_name.len));
-                            if (fn_ref != error_ref) {
-                                const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                                if (ref != error_ref) {
-                                    try self.setLocal(cb.dest, ref);
-                                    break :blk true;
-                                }
-                            }
-                        }
-                    }
-                    break :blk false;
+                    const dot_idx = std.mem.findScalar(u8, after_prefix, '.') orelse return error.EmitFailed;
+                    const type_name = after_prefix[0..dot_idx];
+                    const method_name = after_prefix[dot_idx + 1 ..];
+                    const type_ref = try self.emitRequiredEncodedContainerElementTypeRef(type_name);
+                    const type_args = [_]u32{type_ref};
+                    const list_type = try self.emitGenericContainerRef("List", &type_args);
+                    const fn_ref = zir_builder_emit_field_val(self.handle, list_type, method_name.ptr, @intCast(method_name.len));
+                    if (fn_ref == error_ref) return error.EmitFailed;
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(cb.dest, ref);
+                    break :blk true;
                 } else if (std.mem.startsWith(u8, cb.name, "Map:")) blk2: {
                     // Handle "Map:keytype:ValueStructName.method"
                     const after_prefix = cb.name["Map:".len..];
                     // Parse key_type_name:value_struct_name.method
-                    if (std.mem.findScalar(u8, after_prefix, ':')) |colon_idx| {
-                        const key_type_name = after_prefix[0..colon_idx];
-                        const rest = after_prefix[colon_idx + 1 ..];
-                        if (std.mem.findScalar(u8, rest, '.')) |dot_idx| {
-                            const value_struct_name = rest[0..dot_idx];
-                            const method_name = rest[dot_idx + 1 ..];
-                            // Resolve key type ref. "Term" reaches into the
-                            // runtime via @import; primitive names map to
-                            // builtin ZIR refs.
-                            const key_ref: u32 = if (std.mem.eql(u8, key_type_name, "u32"))
-                                @intFromEnum(Zir.Inst.Ref.u32_type)
-                            else if (std.mem.eql(u8, key_type_name, "str"))
-                                @intFromEnum(Zir.Inst.Ref.slice_const_u8_type)
-                            else if (std.mem.eql(u8, key_type_name, "Term"))
-                                (self.emitTermTypeRef() catch break :blk2 false)
-                            else
-                                @intFromEnum(Zir.Inst.Ref.u32_type);
-                            // Resolve value type — primitive, Term, or struct
-                            const val_ref = if (std.mem.eql(u8, value_struct_name, "Term"))
-                                (self.emitTermTypeRef() catch error_ref)
-                            else
-                                (encodedNameToTypeRef(value_struct_name) orelse
-                                    (self.emitStructTypeRef(value_struct_name) catch error_ref));
-                            if (val_ref != error_ref) {
-                                const type_args = [_]u32{ key_ref, val_ref };
-                                const map_type = self.emitGenericContainerRef("Map", &type_args) catch break :blk2 false;
-                                const fn_ref = zir_builder_emit_field_val(self.handle, map_type, method_name.ptr, @intCast(method_name.len));
-                                if (fn_ref != error_ref) {
-                                    // For Map(_, Term).get/put-style methods
-                                    // whose default value or value argument
-                                    // is supplied as a concrete Zap type,
-                                    // wrap the relevant arg in `Term.from`
-                                    // and remember the original ref so the
-                                    // result can be unwrapped back to that
-                                    // type.
-                                    var dispatched_args = args.items;
-                                    var wrapped_buf: [16]u32 = undefined;
-                                    var unwrap_default_ref: ?u32 = null;
-                                    const value_is_term = std.mem.eql(u8, value_struct_name, "Term");
-                                    if (value_is_term and args.items.len <= wrapped_buf.len) {
-                                        @memcpy(wrapped_buf[0..args.items.len], args.items);
-                                        if (std.mem.eql(u8, method_name, "get") and args.items.len >= 3) {
-                                            unwrap_default_ref = wrapped_buf[2];
-                                            wrapped_buf[2] = try self.emitTermWrap(wrapped_buf[2]);
-                                        }
-                                        if (std.mem.eql(u8, method_name, "put") and args.items.len >= 3) {
-                                            wrapped_buf[2] = try self.emitTermWrap(wrapped_buf[2]);
-                                        }
-                                        dispatched_args = wrapped_buf[0..args.items.len];
-                                    }
-                                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, dispatched_args.ptr, @intCast(dispatched_args.len));
-                                    if (ref != error_ref) {
-                                        var final_ref = ref;
-                                        // For `Map(_, Term).get`, unwrap the
-                                        // returned Term back to the default
-                                        // argument's static type so the call
-                                        // site stays type-compatible with
-                                        // the user-declared `value` slot in
-                                        // `Map.get` (`-> value`). Uses
-                                        // `Term.to(@TypeOf(default), result, default)`.
-                                        if (unwrap_default_ref) |default_ref| {
-                                            final_ref = try self.emitTermUnwrapWithDefault(ref, default_ref);
-                                        }
-                                        try self.setLocal(cb.dest, final_ref);
-                                        break :blk2 true;
-                                    }
-                                }
-                            }
+                    const colon_idx = std.mem.findScalar(u8, after_prefix, ':') orelse return error.EmitFailed;
+                    const key_type_name = after_prefix[0..colon_idx];
+                    const rest = after_prefix[colon_idx + 1 ..];
+                    const dot_idx = std.mem.findScalar(u8, rest, '.') orelse return error.EmitFailed;
+                    const value_struct_name = rest[0..dot_idx];
+                    const method_name = rest[dot_idx + 1 ..];
+                    const key_ref = try self.emitRequiredEncodedContainerElementTypeRef(key_type_name);
+                    const val_ref = try self.emitRequiredEncodedContainerElementTypeRef(value_struct_name);
+                    const type_args = [_]u32{ key_ref, val_ref };
+                    const map_type = try self.emitGenericContainerRef("Map", &type_args);
+                    const fn_ref = zir_builder_emit_field_val(self.handle, map_type, method_name.ptr, @intCast(method_name.len));
+                    if (fn_ref == error_ref) return error.EmitFailed;
+                    // For Map(_, Term).get/put-style methods whose default value
+                    // or value argument is supplied as a concrete Zap type, wrap
+                    // the relevant arg in `Term.from` and remember the original
+                    // ref so the result can be unwrapped back to that type.
+                    var dispatched_args = args.items;
+                    var wrapped_buf: [16]u32 = undefined;
+                    var unwrap_default_ref: ?u32 = null;
+                    const value_is_term = std.mem.eql(u8, value_struct_name, "Term");
+                    if (value_is_term and args.items.len <= wrapped_buf.len) {
+                        @memcpy(wrapped_buf[0..args.items.len], args.items);
+                        if (std.mem.eql(u8, method_name, "get") and args.items.len >= 3) {
+                            unwrap_default_ref = wrapped_buf[2];
+                            wrapped_buf[2] = try self.emitTermWrap(wrapped_buf[2]);
                         }
+                        if (std.mem.eql(u8, method_name, "put") and args.items.len >= 3) {
+                            wrapped_buf[2] = try self.emitTermWrap(wrapped_buf[2]);
+                        }
+                        dispatched_args = wrapped_buf[0..args.items.len];
                     }
-                    break :blk2 false;
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, dispatched_args.ptr, @intCast(dispatched_args.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    var final_ref = ref;
+                    // For `Map(_, Term).get`, unwrap the returned Term back to
+                    // the default argument's static type so the call site stays
+                    // type-compatible with the user-declared `value` slot in
+                    // `Map.get` (`-> value`). Uses
+                    // `Term.to(@TypeOf(default), result, default)`.
+                    if (unwrap_default_ref) |default_ref| {
+                        final_ref = try self.emitTermUnwrapWithDefault(ref, default_ref);
+                    }
+                    try self.setLocal(cb.dest, final_ref);
+                    break :blk2 true;
                 } else if (std.mem.startsWith(u8, cb.name, "ListNested:")) blk3: {
                     // Handle "ListNested:inner_type.method" for nested list dispatch
                     const after_prefix = cb.name["ListNested:".len..];
-                    if (std.mem.findScalar(u8, after_prefix, '.')) |dot_idx| {
-                        const inner_type_name = after_prefix[0..dot_idx];
-                        const method_name = after_prefix[dot_idx + 1 ..];
-                        const inner_type_ref = (try self.emitEncodedContainerElementTypeRef(inner_type_name)) orelse
-                            return error.EmitFailed;
-                        // Build List(inner), call .empty(), @TypeOf for the pointer type
-                        const inner_args = [_]u32{inner_type_ref};
-                        const inner_list = self.emitGenericContainerRef("List", &inner_args) catch break :blk3 false;
-                        const empty_fn = zir_builder_emit_field_val(self.handle, inner_list, "empty", 5);
-                        if (empty_fn == error_ref) break :blk3 false;
-                        const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
-                        if (empty_val == error_ref) break :blk3 false;
-                        const elem_type_ref = zir_builder_emit_typeof(self.handle, empty_val);
-                        if (elem_type_ref == error_ref) break :blk3 false;
-                        // Now call List(@TypeOf(empty_val)).method
-                        const outer_args = [_]u32{elem_type_ref};
-                        const outer_list = self.emitGenericContainerRef("List", &outer_args) catch break :blk3 false;
-                        const fn_ref = zir_builder_emit_field_val(self.handle, outer_list, method_name.ptr, @intCast(method_name.len));
-                        if (fn_ref != error_ref) {
-                            const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                            if (ref != error_ref) {
-                                try self.setLocal(cb.dest, ref);
-                                break :blk3 true;
-                            }
-                        }
-                    }
-                    break :blk3 false;
+                    const dot_idx = std.mem.findScalar(u8, after_prefix, '.') orelse return error.EmitFailed;
+                    const inner_type_name = after_prefix[0..dot_idx];
+                    const method_name = after_prefix[dot_idx + 1 ..];
+                    const inner_type_ref = try self.emitRequiredEncodedContainerElementTypeRef(inner_type_name);
+                    // Build List(inner), call .empty(), @TypeOf for the pointer type
+                    const inner_args = [_]u32{inner_type_ref};
+                    const inner_list = try self.emitGenericContainerRef("List", &inner_args);
+                    const empty_fn = zir_builder_emit_field_val(self.handle, inner_list, "empty", 5);
+                    if (empty_fn == error_ref) return error.EmitFailed;
+                    const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
+                    if (empty_val == error_ref) return error.EmitFailed;
+                    const elem_type_ref = zir_builder_emit_typeof(self.handle, empty_val);
+                    if (elem_type_ref == error_ref) return error.EmitFailed;
+                    // Now call List(@TypeOf(empty_val)).method
+                    const outer_args = [_]u32{elem_type_ref};
+                    const outer_list = try self.emitGenericContainerRef("List", &outer_args);
+                    const fn_ref = zir_builder_emit_field_val(self.handle, outer_list, method_name.ptr, @intCast(method_name.len));
+                    if (fn_ref == error_ref) return error.EmitFailed;
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(cb.dest, ref);
+                    break :blk3 true;
                 } else if (std.mem.startsWith(u8, cb.name, "MapNested:")) blk4: {
                     // Handle "MapNested:keytype:valtype.method" for nested map dispatch
                     const after_prefix = cb.name["MapNested:".len..];
-                    if (std.mem.findScalar(u8, after_prefix, ':')) |colon_idx| {
-                        const key_type_name = after_prefix[0..colon_idx];
-                        const rest = after_prefix[colon_idx + 1 ..];
-                        if (std.mem.findScalar(u8, rest, '.')) |dot_idx| {
-                            const val_type_name = rest[0..dot_idx];
-                            const method_name = rest[dot_idx + 1 ..];
-                            // Resolve key type
-                            const key_ref: u32 = if (std.mem.eql(u8, key_type_name, "u32"))
-                                @intFromEnum(Zir.Inst.Ref.u32_type)
-                            else if (std.mem.eql(u8, key_type_name, "str"))
-                                @intFromEnum(Zir.Inst.Ref.slice_const_u8_type)
-                            else
-                                @intFromEnum(Zir.Inst.Ref.u32_type);
-                            // For nested map values, build the value type as ?*const MapOf(K, V)
-                            // For now, use the same key type for inner map (atom keys)
-                            if (std.mem.eql(u8, val_type_name, "map")) {
-                                // Inner map: MapOf(u32, i64) as default inner type
-                                const inner_key = @intFromEnum(Zir.Inst.Ref.u32_type);
-                                const inner_val = @intFromEnum(Zir.Inst.Ref.i64_type);
-                                const inner_args = [_]u32{ inner_key, inner_val };
-                                const inner_map = self.emitGenericContainerRef("Map", &inner_args) catch break :blk4 false;
-                                const empty_fn = zir_builder_emit_field_val(self.handle, inner_map, "empty", 5);
-                                if (empty_fn == error_ref) break :blk4 false;
-                                const empty_val = zir_builder_emit_call_ref(self.handle, empty_fn, &.{}, 0);
-                                if (empty_val == error_ref) break :blk4 false;
-                                const val_type = zir_builder_emit_typeof(self.handle, empty_val);
-                                if (val_type == error_ref) break :blk4 false;
-                                const outer_args = [_]u32{ key_ref, val_type };
-                                const outer_map = self.emitGenericContainerRef("Map", &outer_args) catch break :blk4 false;
-                                const fn_ref = zir_builder_emit_field_val(self.handle, outer_map, method_name.ptr, @intCast(method_name.len));
-                                if (fn_ref != error_ref) {
-                                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
-                                    if (ref != error_ref) {
-                                        try self.setLocal(cb.dest, ref);
-                                        break :blk4 true;
-                                    }
-                                }
-                            }
-                        }
+                    const colon_idx = std.mem.findScalar(u8, after_prefix, ':') orelse return error.EmitFailed;
+                    const key_type_name = after_prefix[0..colon_idx];
+                    const rest = after_prefix[colon_idx + 1 ..];
+                    const dot_idx = std.mem.findScalar(u8, rest, '.') orelse return error.EmitFailed;
+                    const val_type_name = rest[0..dot_idx];
+                    const method_name = rest[dot_idx + 1 ..];
+                    if (!self.encodedContainerElementNameIsKnown(key_type_name)) return error.EmitFailed;
+                    if (!(std.mem.eql(u8, val_type_name, "map") or std.mem.eql(u8, val_type_name, "list"))) {
+                        return error.EmitFailed;
                     }
-                    break :blk4 false;
+                    const helper_name = mapBridgeMethodToHelper("Map", method_name) orelse return error.EmitFailed;
+                    const fn_ref = try self.emitRuntimeHelper(helper_name);
+                    const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.items.ptr, @intCast(args.items.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(cb.dest, ref);
+                    break :blk4 true;
                 } else false;
 
                 if (!generic_handled) {
@@ -7265,7 +7489,7 @@ pub const ZirDriver = struct {
                     var arg_refs: std.ArrayListUnmanaged(u32) = .empty;
                     defer arg_refs.deinit(self.allocator);
                     for (tc.args) |arg| {
-                        const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        const ref = try self.refForValueLocal(arg);
                         try arg_refs.append(self.allocator, ref);
                     }
                     // Commit the new arg values into their slots. The
@@ -7294,7 +7518,7 @@ pub const ZirDriver = struct {
                 var args: std.ArrayListUnmanaged(u32) = .empty;
                 defer args.deinit(self.allocator);
                 for (tc.args) |arg| {
-                    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    const ref = try self.refForValueLocal(arg);
                     try args.append(self.allocator, ref);
                 }
                 const tail_name = if (self.current_emit_struct != null)
@@ -7353,7 +7577,7 @@ pub const ZirDriver = struct {
                         var args: std.ArrayListUnmanaged(u32) = .empty;
                         defer args.deinit(self.allocator);
                         for (cd.args) |arg| {
-                            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                            const ref = try self.refForValueLocal(arg);
                             try args.append(self.allocator, ref);
                         }
 
@@ -7382,12 +7606,17 @@ pub const ZirDriver = struct {
                                     args.items.ptr,
                                     @intCast(args.items.len),
                                 );
-                                if (ref != error_ref) {
-                                    try self.setLocal(cd.dest, ref);
-                                }
+                                if (ref == error_ref) return error.EmitFailed;
+                                try self.setLocal(cd.dest, ref);
                             }
                         }
+                    } else {
+                        std.log.err("ZIR emit failed resolving call_direct target function id {d}", .{cd.function});
+                        return error.EmitFailed;
                     }
+                } else {
+                    std.log.err("ZIR emit failed resolving call_direct target function id {d}: no program context", .{cd.function});
+                    return error.EmitFailed;
                 }
             },
 
@@ -7412,7 +7641,7 @@ pub const ZirDriver = struct {
                     @intFromEnum(Zir.Inst.Ref.bool_true)
                 else
                     @intFromEnum(Zir.Inst.Ref.bool_false);
-                _ = zir_builder_emit_set_runtime_safety(self.handle, ref);
+                if (!zir_builder_emit_set_runtime_safety(self.handle, ref)) return error.EmitFailed;
             },
             // Phase 0 — DWARF foundation: emit a ZIR `dbg_stmt` at every
             // Zap statement boundary, carrying the Zap source line and
@@ -7501,9 +7730,9 @@ pub const ZirDriver = struct {
                 try self.emitOptionalDispatch(od);
             },
             .cond_return => |cr| {
-                const cond_ref = self.refForLocal(cr.condition) catch return;
+                const cond_ref = try self.refForLocal(cr.condition);
                 if (cr.value) |val| {
-                    const val_ref = self.refForLocal(val) catch return;
+                    const val_ref = try self.refForLocal(val);
                     if (zir_builder_emit_cond_return(self.handle, cond_ref, val_ref) != 0)
                         return error.EmitFailed;
                 } else {
@@ -7568,15 +7797,17 @@ pub const ZirDriver = struct {
                 defer names_lens.deinit(self.allocator);
                 var values: std.ArrayListUnmanaged(u32) = .empty;
                 defer values.deinit(self.allocator);
+                var index_field_name_batch = try IndexFieldNameBatch.init(self.allocator, ti.elements.len);
+                defer index_field_name_batch.deinit();
 
                 for (ti.elements, 0..) |elem, i| {
-                    var ref = self.refForLocal(elem) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    var ref = try self.refForLocal(elem);
                     if (ti.component_types) |comps| {
                         if (i < comps.len and comps[i] == .term) {
                             ref = try self.emitTermWrap(ref);
                         }
                     }
-                    const name = indexFieldName(i);
+                    const name = index_field_name_batch.get(i);
                     try names_ptrs.append(self.allocator, name.ptr);
                     try names_lens.append(self.allocator, name.len);
                     try values.append(self.allocator, ref);
@@ -7659,7 +7890,7 @@ pub const ZirDriver = struct {
                     const push_fn = zir_builder_emit_field_val(self.handle, list_cell, "push", 4);
                     if (push_fn == error_ref) return error.EmitFailed;
                     for (li.elements) |element_local| {
-                        var elem_ref = self.refForLocal(element_local) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        var elem_ref = try self.refForLocal(element_local);
                         if (li.element_type == .term) {
                             elem_ref = try self.emitTermWrap(elem_ref);
                         }
@@ -7671,8 +7902,8 @@ pub const ZirDriver = struct {
                 }
             },
             .list_cons => |lc| {
-                var head_ref = self.refForLocal(lc.head) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                const tail_ref = self.refForLocal(lc.tail) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                var head_ref = try self.refForLocal(lc.head);
+                const tail_ref = try self.refForLocal(lc.tail);
                 if (lc.element_type == .term) {
                     head_ref = try self.emitTermWrap(head_ref);
                 }
@@ -7687,10 +7918,10 @@ pub const ZirDriver = struct {
             .map_init => |mi| {
                 // Maps use generic MapOf(K, V) instantiation.
                 // For complex types (structs), emit type refs dynamically.
-                const key_type_ref = (try self.emitContainerElementTypeRef(mi.key_type)) orelse @intFromEnum(Zir.Inst.Ref.u32_type);
-                const val_type_ref = (try self.emitContainerElementTypeRef(mi.value_type)) orelse @intFromEnum(Zir.Inst.Ref.i64_type);
+                const key_type_ref = (try self.emitContainerElementTypeRef(mi.key_type)) orelse return error.EmitFailed;
+                const val_type_ref = (try self.emitContainerElementTypeRef(mi.value_type)) orelse return error.EmitFailed;
                 const map_type_args = [_]u32{ key_type_ref, val_type_ref };
-                const map_cell = self.emitGenericContainerRef("Map", &map_type_args) catch return error.EmitFailed;
+                const map_cell = try self.emitGenericContainerRef("Map", &map_type_args);
 
                 if (mi.entries.len == 0) {
                     // Empty map: MapCell.empty()
@@ -7710,8 +7941,8 @@ pub const ZirDriver = struct {
                     if (put_fn == error_ref) return error.EmitFailed;
 
                     for (mi.entries) |entry| {
-                        var key_ref = self.refForLocal(entry.key) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                        var val_ref = self.refForLocal(entry.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        var key_ref = try self.refForLocal(entry.key);
+                        var val_ref = try self.refForLocal(entry.value);
                         // When the map's value/key type was promoted to
                         // `Term`, wrap each concrete value at the call site
                         // so `Map.put(_, K, Term)` accepts it.
@@ -7741,7 +7972,7 @@ pub const ZirDriver = struct {
                 const si_struct_def = self.findStructDef(si.type_name);
 
                 for (si.fields) |field| {
-                    var ref = self.refForValueLocal(field.value) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                    var ref = try self.refForValueLocal(field.value);
                     // Indirect-storage fields (self-referential
                     // recursive types) are laid out as `?*const T`.
                     // Promote a non-null `T` value to a heap-
@@ -7789,16 +8020,19 @@ pub const ZirDriver = struct {
                                 const default_ref: u32 = switch (default) {
                                     .int => |v| blk: {
                                         const ref = zir_builder_emit_int(self.handle, v);
-                                        break :blk if (ref == error_ref) @intFromEnum(Zir.Inst.Ref.zero) else ref;
+                                        if (ref == error_ref) return error.EmitFailed;
+                                        break :blk ref;
                                     },
                                     .bool_val => |v| if (v) @intFromEnum(Zir.Inst.Ref.bool_true) else @intFromEnum(Zir.Inst.Ref.bool_false),
                                     .float => |v| blk: {
                                         const ref = zir_builder_emit_float(self.handle, v);
-                                        break :blk if (ref == error_ref) @intFromEnum(Zir.Inst.Ref.zero) else ref;
+                                        if (ref == error_ref) return error.EmitFailed;
+                                        break :blk ref;
                                     },
                                     .string => |v| blk: {
                                         const ref = zir_builder_emit_str(self.handle, v.ptr, @intCast(v.len));
-                                        break :blk if (ref == error_ref) @intFromEnum(Zir.Inst.Ref.void_value) else ref;
+                                        if (ref == error_ref) return error.EmitFailed;
+                                        break :blk ref;
                                     },
                                     .nil => @intFromEnum(Zir.Inst.Ref.void_value),
                                 };
@@ -7828,10 +8062,10 @@ pub const ZirDriver = struct {
                     const empty_struct = blk: {
                         if (!self.current_function_is_closure) {
                             if (self.findStructDef(si.type_name) != null) {
-                                if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
-                                    const typed = zir_builder_emit_struct_init_empty(self.handle, type_ref);
-                                    if (typed != error_ref) break :blk typed;
-                                }
+                                const type_ref = try self.emitStructTypeRef(si.type_name);
+                                const typed = zir_builder_emit_struct_init_empty(self.handle, type_ref);
+                                if (typed == error_ref) return error.EmitFailed;
+                                break :blk typed;
                             }
                         }
                         const anon = zir_builder_emit_struct_init_anon(self.handle, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, 0);
@@ -7863,10 +8097,10 @@ pub const ZirDriver = struct {
                     const seed_ref = blk: {
                         if (!self.current_function_is_closure) {
                             if (self.findStructDef(si.type_name) != null) {
-                                if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
-                                    const typed = zir_builder_emit_struct_init_typed(self.handle, type_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
-                                    if (typed != error_ref) break :blk typed;
-                                }
+                                const type_ref = try self.emitStructTypeRef(si.type_name);
+                                const typed = zir_builder_emit_struct_init_typed(self.handle, type_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
+                                if (typed == error_ref) return error.EmitFailed;
+                                break :blk typed;
                             }
                         }
                         break :blk zir_builder_emit_struct_init_anon(self.handle, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
@@ -7911,10 +8145,10 @@ pub const ZirDriver = struct {
                     const seed_ref = blk: {
                         if (!self.current_function_is_closure) {
                             if (self.findStructDef(si.type_name) != null) {
-                                if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
-                                    const typed = zir_builder_emit_struct_init_typed(self.handle, type_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
-                                    if (typed != error_ref) break :blk typed;
-                                }
+                                const type_ref = try self.emitStructTypeRef(si.type_name);
+                                const typed = zir_builder_emit_struct_init_typed(self.handle, type_ref, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
+                                if (typed == error_ref) return error.EmitFailed;
+                                break :blk typed;
                             }
                         }
                         break :blk zir_builder_emit_struct_init_anon(self.handle, names_ptrs.items.ptr, names_lens.items.ptr, values.items.ptr, @intCast(values.items.len));
@@ -7923,10 +8157,10 @@ pub const ZirDriver = struct {
                     const type_ref = zir_builder_emit_typeof(self.handle, seed_ref);
                     if (type_ref == error_ref) return error.EmitFailed;
                     // Allocate on stack and store
-                    const alloc_ref = self.emitAlloc(type_ref) catch return error.EmitFailed;
+                    const alloc_ref = try self.emitAlloc(type_ref);
                     if (zir_builder_emit_store(self.handle, alloc_ref, seed_ref) != 0) return error.EmitFailed;
-                    const const_ptr = self.emitMakePtrConst(alloc_ref) catch return error.EmitFailed;
-                    const loaded = self.emitLoad(const_ptr) catch return error.EmitFailed;
+                    const const_ptr = try self.emitMakePtrConst(alloc_ref);
+                    const loaded = try self.emitLoad(const_ptr);
                     try self.setLocal(si.dest, loaded);
                 } else {
                     _ = self.reuse_backed_struct_locals.remove(si.dest);
@@ -7942,17 +8176,16 @@ pub const ZirDriver = struct {
                     var struct_value: u32 = error_ref;
                     if (!self.current_function_is_closure) {
                         if (self.findStructDef(si.type_name) != null) {
-                            if (self.emitStructTypeRef(si.type_name) catch null) |type_ref| {
-                                const typed_result = zir_builder_emit_struct_init_typed(
-                                    self.handle,
-                                    type_ref,
-                                    names_ptrs.items.ptr,
-                                    names_lens.items.ptr,
-                                    values.items.ptr,
-                                    @intCast(values.items.len),
-                                );
-                                if (typed_result != error_ref) struct_value = typed_result;
-                            }
+                            const type_ref = try self.emitStructTypeRef(si.type_name);
+                            struct_value = zir_builder_emit_struct_init_typed(
+                                self.handle,
+                                type_ref,
+                                names_ptrs.items.ptr,
+                                names_lens.items.ptr,
+                                values.items.ptr,
+                                @intCast(values.items.len),
+                            );
+                            if (struct_value == error_ref) return error.EmitFailed;
                         }
                     }
                     if (struct_value == error_ref) {
@@ -7983,7 +8216,7 @@ pub const ZirDriver = struct {
                 }
             },
             .field_get => |fg| {
-                const obj_ref = self.refForLocal(fg.object) catch return;
+                const obj_ref = try self.refForLocal(fg.object);
                 var ref = zir_builder_emit_field_val(self.handle, obj_ref, fg.field.ptr, @intCast(fg.field.len));
                 if (ref == error_ref) return error.EmitFailed;
                 // Indirect-storage fields (self-referential recursive types)
@@ -8034,8 +8267,8 @@ pub const ZirDriver = struct {
                 try self.setLocal(fg.dest, ref);
             },
             .field_set => |fs| {
-                const obj_ref = self.refForLocal(fs.object) catch return;
-                const val_ref = self.refForLocal(fs.value) catch return;
+                const obj_ref = try self.refForLocal(fs.object);
+                const val_ref = try self.refForLocal(fs.value);
                 const ptr = zir_builder_emit_field_ptr(self.handle, obj_ref, fs.field.ptr, @intCast(fs.field.len));
                 if (ptr == error_ref) return error.EmitFailed;
                 if (zir_builder_emit_store(self.handle, ptr, val_ref) != 0) return error.EmitFailed;
@@ -8048,11 +8281,12 @@ pub const ZirDriver = struct {
                 // helper `coerceFromMaybeTerm(value, default)` handles
                 // both via a comptime check on `@TypeOf(value)` so the
                 // emitted code stays correct under either monomorphisation.
-                const obj_ref = self.refForLocal(ig.object) catch return;
+                const obj_ref = try self.refForLocal(ig.object);
                 var ref = zir_builder_emit_elem_val_imm(self.handle, obj_ref, ig.index);
                 if (ref == error_ref) return error.EmitFailed;
                 if (ig.coerce_term_to != .any) {
-                    const default_ref = self.emitZeroDefaultForType(ig.coerce_term_to) catch ref;
+                    const default_ref = try self.emitZeroDefaultForType(ig.coerce_term_to);
+                    if (default_ref == error_ref) return error.EmitFailed;
                     const helper_fn = try self.emitRuntimeHelper("coerceFromMaybeTerm");
                     const args = [_]u32{ ref, default_ref };
                     const coerced = zir_builder_emit_call_ref(self.handle, helper_fn, &args, 2);
@@ -8065,7 +8299,7 @@ pub const ZirDriver = struct {
                 // Cons-cell length check. When `via_helper` is set, dispatch
                 // through `listLength(anytype)` so the runtime element type
                 // is honored even if the declared element type differs.
-                const list_ref = self.refForLocal(llc.scrutinee) catch return;
+                const list_ref = try self.refForLocal(llc.scrutinee);
                 const len_ref = if (llc.via_helper) blk: {
                     const helper_fn = try self.emitRuntimeHelper("listLength");
                     const call_args = [_]u32{list_ref};
@@ -8091,7 +8325,7 @@ pub const ZirDriver = struct {
                 // (heterogeneous keyword lists), so route through the
                 // `listGet(anytype, index)` helper which derives the actual
                 // type from `@TypeOf(list)`.
-                const list_ref = self.refForLocal(lg.list) catch return;
+                const list_ref = try self.refForLocal(lg.list);
                 const index_ref = zir_builder_emit_int(self.handle, @intCast(lg.index));
                 if (index_ref == error_ref) return error.EmitFailed;
                 const ref = if (lg.via_helper) blk: {
@@ -8112,7 +8346,7 @@ pub const ZirDriver = struct {
                 // Flat List non-empty check: length(list) != 0.
                 // Allocated zero-length buffers from List.new_empty are
                 // non-null but still empty.
-                const list_ref = self.refForValueLocal(lne.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const list_ref = try self.refForValueLocal(lne.list);
                 const len_ref = if (lne.via_helper) blk: {
                     const helper_fn = try self.emitRuntimeHelper("listLength");
                     const call_args = [_]u32{list_ref};
@@ -8136,7 +8370,7 @@ pub const ZirDriver = struct {
                 // List head extraction. When `via_helper` is set, dispatch
                 // through `listGetHead(anytype)` so the head's runtime type
                 // is read from `@TypeOf(list)` instead of the declared one.
-                const list_ref = self.refForValueLocal(lh.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const list_ref = try self.refForValueLocal(lh.list);
                 const ref = if (lh.via_helper) blk: {
                     const helper_fn = try self.emitRuntimeHelper("listGetHead");
                     const call_args = [_]u32{list_ref};
@@ -8155,7 +8389,7 @@ pub const ZirDriver = struct {
                 // List suffix extraction. Multi-head rest patterns set
                 // `start_index` above one so the rest is materialized by
                 // one indexed slice instead of chained tail clones.
-                const list_ref = self.refForValueLocal(lt.list) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const list_ref = try self.refForValueLocal(lt.list);
                 const start_ref = zir_builder_emit_int(self.handle, @intCast(lt.start_index));
                 if (start_ref == error_ref) return error.EmitFailed;
                 const ref = if (lt.via_helper) blk: {
@@ -8182,8 +8416,8 @@ pub const ZirDriver = struct {
                 // `.atom`/`.i64` when the IR lacks concrete types,
                 // matching pre-existing behaviour for atom-keyed
                 // integer maps emitted by older code paths.
-                const map_ref = self.refForLocal(mhk.map) catch return;
-                const key_ref = self.refForLocal(mhk.key) catch return;
+                const map_ref = try self.refForLocal(mhk.map);
+                const key_ref = try self.refForLocal(mhk.key);
                 const map_cell = try self.emitMapCellRef(mhk.key_type, mhk.value_type);
                 const fn_ref = zir_builder_emit_field_val(self.handle, map_cell, "hasKey", 6);
                 if (fn_ref == error_ref) return error.EmitFailed;
@@ -8198,9 +8432,9 @@ pub const ZirDriver = struct {
                 // generic is monomorphised per (K, V) pair, so a
                 // `Map(u32, []const u8)` cell can't be reused for an
                 // atom→int map.
-                const map_ref = self.refForLocal(mg.map) catch return;
-                const key_ref = self.refForLocal(mg.key) catch return;
-                const default_ref = self.refForLocal(mg.default) catch return;
+                const map_ref = try self.refForLocal(mg.map);
+                const key_ref = try self.refForLocal(mg.key);
+                const default_ref = try self.refForLocal(mg.default);
                 const map_cell = try self.emitMapCellRef(mg.key_type, mg.value_type);
                 const fn_ref = zir_builder_emit_field_val(self.handle, map_cell, "get", 3);
                 if (fn_ref == error_ref) return error.EmitFailed;
@@ -8251,7 +8485,7 @@ pub const ZirDriver = struct {
                 const val_ref = if (variant_is_void)
                     @intFromEnum(Zir.Inst.Ref.void_value)
                 else
-                    self.refForValueLocal(ui.value) catch return;
+                    try self.refForValueLocal(ui.value);
                 const names = [_][*]const u8{ui.variant_name.ptr};
                 const lens = [_]u32{@intCast(ui.variant_name.len)};
                 const vals = [_]u32{val_ref};
@@ -8259,16 +8493,16 @@ pub const ZirDriver = struct {
                     const seed_ref = blk: {
                         if (!self.current_function_is_closure) {
                             if (self.findUnionDef(ui.union_type) != null) {
-                                if (self.emitStructTypeRef(ui.union_type) catch null) |union_type_ref| {
-                                    const typed = zir_builder_emit_union_init(
-                                        self.handle,
-                                        union_type_ref,
-                                        ui.variant_name.ptr,
-                                        @intCast(ui.variant_name.len),
-                                        val_ref,
-                                    );
-                                    if (typed != error_ref) break :blk typed;
-                                }
+                                const union_type_ref = try self.emitStructTypeRef(ui.union_type);
+                                const typed = zir_builder_emit_union_init(
+                                    self.handle,
+                                    union_type_ref,
+                                    ui.variant_name.ptr,
+                                    @intCast(ui.variant_name.len),
+                                    val_ref,
+                                );
+                                if (typed == error_ref) return error.EmitFailed;
+                                break :blk typed;
                             }
                         }
                         break :blk zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
@@ -8298,19 +8532,17 @@ pub const ZirDriver = struct {
                     // shared struct/union-type dispatcher.
                     if (!self.current_function_is_closure) {
                         if (self.findUnionDef(ui.union_type) != null) {
-                            if (self.emitStructTypeRef(ui.union_type) catch null) |union_type_ref| {
-                                const ref = zir_builder_emit_union_init(
-                                    self.handle,
-                                    union_type_ref,
-                                    ui.variant_name.ptr,
-                                    @intCast(ui.variant_name.len),
-                                    val_ref,
-                                );
-                                if (ref != error_ref) {
-                                    try self.setLocal(ui.dest, ref);
-                                    return;
-                                }
-                            }
+                            const union_type_ref = try self.emitStructTypeRef(ui.union_type);
+                            const ref = zir_builder_emit_union_init(
+                                self.handle,
+                                union_type_ref,
+                                ui.variant_name.ptr,
+                                @intCast(ui.variant_name.len),
+                                val_ref,
+                            );
+                            if (ref == error_ref) return error.EmitFailed;
+                            try self.setLocal(ui.dest, ref);
+                            return;
                         }
                     }
 
@@ -8331,12 +8563,9 @@ pub const ZirDriver = struct {
                         return;
                     }
 
-                    // Fallback 2: anonymous struct. This is the legacy
-                    // pre-Round-2 behavior; downstream `activeTag` checks
-                    // fail against this, so it should only ever land for
-                    // discard-only construction sites or builds where
-                    // the union TypeDef hasn't reached the ZIR program
-                    // (an IR-side bug we'd want to surface).
+                    // Fallback 2: anonymous construction. This is only for
+                    // emission contexts that do not have a nominal union
+                    // definition or reusable nominal return-type ref.
                     const ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(ui.dest, ref);
@@ -8368,7 +8597,7 @@ pub const ZirDriver = struct {
             // box's release through the vtable's `__drop__` slot
             // pairs against the alloc that just happened.
             .box_as_protocol => |bx| {
-                const value_ref = self.refForValueLocal(bx.value) catch return;
+                const value_ref = try self.refForValueLocal(bx.value);
                 const inner_ptr_ref = try self.heapPromoteForIndirectField(value_ref);
 
                 // Take the address of the per-impl vtable instance
@@ -8501,12 +8730,12 @@ pub const ZirDriver = struct {
                 // non-receiver arg in source order. The dispatcher
                 // helper takes the receiver by value and unwraps
                 // `box.data_ptr` internally.
-                const receiver_ref = self.refForLocal(pd.receiver) catch return;
+                const receiver_ref = try self.refForLocal(pd.receiver);
                 var call_args: std.ArrayListUnmanaged(u32) = .empty;
                 defer call_args.deinit(self.allocator);
                 try call_args.append(self.allocator, receiver_ref);
                 for (pd.args) |arg_local| {
-                    const arg_ref = self.refForLocal(arg_local) catch return;
+                    const arg_ref = try self.refForLocal(arg_local);
                     try call_args.append(self.allocator, arg_ref);
                 }
 
@@ -8562,7 +8791,7 @@ pub const ZirDriver = struct {
                 );
                 if (unbox_fn == error_ref) return error.EmitFailed;
 
-                const box_ref = self.refForLocal(bu.box) catch return;
+                const box_ref = try self.refForLocal(bu.box);
                 const args = [_]u32{box_ref};
                 const result_ref = zir_builder_emit_call_ref(
                     self.handle,
@@ -8610,7 +8839,7 @@ pub const ZirDriver = struct {
                 );
                 if (vtable_eq_fn == error_ref) return error.EmitFailed;
 
-                const box_ref = self.refForLocal(ve.box) catch return;
+                const box_ref = try self.refForLocal(ve.box);
                 const args = [_]u32{box_ref};
                 const result_ref = zir_builder_emit_call_ref(
                     self.handle,
@@ -8626,7 +8855,7 @@ pub const ZirDriver = struct {
             .match_atom => |ma| {
                 // Scrutinee is already a u32 atom ID (from atomIntern).
                 // Intern the expected atom and compare IDs.
-                const scrutinee_ref = self.refForLocal(ma.scrutinee) catch return;
+                const scrutinee_ref = try self.refForLocal(ma.scrutinee);
 
                 // Intern the expected atom name
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
@@ -8654,7 +8883,7 @@ pub const ZirDriver = struct {
                 //   activeTag(scrutinee) == .VariantName
                 // The result is a bool the surrounding guard_block
                 // consumes for branching.
-                const scrutinee_ref = self.refForLocal(mvt.scrutinee) catch return;
+                const scrutinee_ref = try self.refForLocal(mvt.scrutinee);
                 const std_import = zir_builder_emit_import(self.handle, "std", 3);
                 if (std_import == error_ref) return error.EmitFailed;
                 const meta_mod = zir_builder_emit_field_val(self.handle, std_import, "meta", 4);
@@ -8680,14 +8909,14 @@ pub const ZirDriver = struct {
                 // preceding `match_variant_tag` + `guard_block`
                 // ensures Sema reaches this only when the variant
                 // actually matches.
-                const scrutinee_ref = self.refForLocal(vpg.scrutinee) catch return;
+                const scrutinee_ref = try self.refForLocal(vpg.scrutinee);
                 const payload_ref = zir_builder_emit_field_val(self.handle, scrutinee_ref, vpg.variant_name.ptr, @intCast(vpg.variant_name.len));
                 if (payload_ref == error_ref) return error.EmitFailed;
                 try self.setLocal(vpg.dest, payload_ref);
             },
             .match_int => |mi| {
                 // Compare scrutinee against expected int via cmp_eq
-                const scrutinee_ref = self.refForLocal(mi.scrutinee) catch return;
+                const scrutinee_ref = try self.refForLocal(mi.scrutinee);
                 const expected_ref = zir_builder_emit_int(self.handle, mi.value);
                 if (expected_ref == error_ref) return error.EmitFailed;
                 const cmp_tag = @intFromEnum(Zir.Inst.Tag.cmp_eq);
@@ -8697,7 +8926,7 @@ pub const ZirDriver = struct {
             },
             .match_float => |mf| {
                 // Compare scrutinee against expected float via cmp_eq
-                const scrutinee_ref = self.refForLocal(mf.scrutinee) catch return;
+                const scrutinee_ref = try self.refForLocal(mf.scrutinee);
                 const expected_ref = zir_builder_emit_float(self.handle, mf.value);
                 if (expected_ref == error_ref) return error.EmitFailed;
                 const cmp_tag = @intFromEnum(Zir.Inst.Tag.cmp_eq);
@@ -8708,7 +8937,7 @@ pub const ZirDriver = struct {
             .match_string => |ms| {
                 // Compare scrutinee against expected string via std.mem.eql
                 // (Zig's == on []const u8 compares pointer+length, not contents)
-                const scrutinee_ref = self.refForLocal(ms.scrutinee) catch return;
+                const scrutinee_ref = try self.refForLocal(ms.scrutinee);
                 const expected_ref = zir_builder_emit_str(self.handle, ms.expected.ptr, @intCast(ms.expected.len));
                 if (expected_ref == error_ref) return error.EmitFailed;
 
@@ -8727,12 +8956,13 @@ pub const ZirDriver = struct {
                 try self.setLocal(ms.dest, ref);
             },
             .match_type => |mt| {
-                const scrutinee_ref = self.refForLocal(mt.scrutinee) catch return;
+                const scrutinee_ref = try self.refForLocal(mt.scrutinee);
 
                 // For .any, always matches — emit true
                 if (mt.expected_type == .any) {
                     const ref = zir_builder_emit_bool(self.handle, true);
-                    if (ref != error_ref) try self.setLocal(mt.dest, ref);
+                    if (ref == error_ref) return error.EmitFailed;
+                    try self.setLocal(mt.dest, ref);
                     return;
                 }
 
@@ -8750,10 +8980,7 @@ pub const ZirDriver = struct {
                 // For simple types, emit: @TypeOf(scrutinee) == expected_type_ref
                 const expected_type_raw = mapReturnType(mt.expected_type);
                 if (expected_type_raw == 0) {
-                    // Unsupported type or void — emit true as fallback
-                    const ref = zir_builder_emit_bool(self.handle, true);
-                    if (ref != error_ref) try self.setLocal(mt.dest, ref);
-                    return;
+                    return error.EmitFailed;
                 }
 
                 const typeof_ref = zir_builder_emit_typeof(self.handle, scrutinee_ref);
@@ -8796,9 +9023,10 @@ pub const ZirDriver = struct {
                 if (msg_ref == error_ref) return error.EmitFailed;
 
                 const args = [_]u32{msg_ref};
-                _ = zir_builder_emit_call_ref(self.handle, sink_fn, &args, 1);
+                const sink_ref = zir_builder_emit_call_ref(self.handle, sink_fn, &args, 1);
+                if (sink_ref == error_ref) return error.EmitFailed;
                 // The sink is noreturn — emit unreachable so Zig knows control never continues
-                _ = zir_builder_emit_unreachable(self.handle);
+                if (zir_builder_emit_unreachable(self.handle) != 0) return error.EmitFailed;
             },
             .match_error_return => {
                 // No-match in __try variant: return null.
@@ -8892,11 +9120,11 @@ pub const ZirDriver = struct {
                 // param-position dynamic dispatch). The IR builder set this
                 // flag from the callee expression's shape + function type.
                 if (cc.callee_is_bare_fn_value) {
-                    const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
+                    const callee_ref = try self.refForLocal(cc.callee);
                     var args: std.ArrayListUnmanaged(u32) = .empty;
                     defer args.deinit(self.allocator);
                     for (cc.args) |arg| {
-                        const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        const ref = try self.refForValueLocal(arg);
                         try args.append(self.allocator, ref);
                     }
                     var ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
@@ -8909,7 +9137,8 @@ pub const ZirDriver = struct {
                     const ret_type_ref = if (cc.raises) @as(u32, 0) else mapReturnType(cc.return_type);
                     if (ret_type_ref != 0) {
                         const cast = zir_builder_emit_as(self.handle, ret_type_ref, ref);
-                        if (cast != error_ref) ref = cast;
+                        if (cast == error_ref) return error.EmitFailed;
+                        ref = cast;
                     }
                     try self.setLocal(cc.dest, ref);
                     return;
@@ -8929,10 +9158,8 @@ pub const ZirDriver = struct {
                                             try self.emitNamedCallToTarget(target_id, cc.args)
                                         else
                                             try self.emitCapturedClosureTargetCall(cc.callee, target_id, cc.args);
-                                        if (ref != error_ref) {
-                                            try self.setLocal(cc.dest, ref);
-                                            return;
-                                        }
+                                        try self.setLocal(cc.dest, ref);
+                                        return;
                                     }
                                 }
                             },
@@ -8940,71 +9167,64 @@ pub const ZirDriver = struct {
                         }
                     }
 
-                    const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
+                    const callee_ref = try self.refForLocal(cc.callee);
                     var args: std.ArrayListUnmanaged(u32) = .empty;
                     defer args.deinit(self.allocator);
                     for (cc.args) |arg| {
-                        const ref2 = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        const ref2 = try self.refForValueLocal(arg);
                         try args.append(self.allocator, ref2);
                     }
 
                     const rt_ref = zir_builder_emit_import(self.handle, "zap_runtime", 11);
-                    if (rt_ref != error_ref) {
-                        const kernel_ref = emitRuntimeNamespaceField(self.handle, rt_ref, runtime_ns.kernel);
-                        if (kernel_ref != error_ref) {
-                            const helper_name = switch (args.items.len) {
-                                0 => "callCallable0",
-                                1 => "callCallable1",
-                                2 => "callCallable2",
-                                3 => "callCallable3",
-                                else => {
-                                    var ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
-                                    if (ref == error_ref) return error.EmitFailed;
-                                    // #201 — a raising closure's call yields
-                                    // `error{ZapRaise}!T`; do NOT narrow to the
-                                    // payload here (the `@as` would reject the
-                                    // error union). The following
-                                    // `unwrap_error_union` consumes the union.
-                                    const ret_type_ref2 = if (cc.raises) @as(u32, 0) else mapReturnType(cc.return_type);
-                                    if (ret_type_ref2 != 0) {
-                                        const cast2 = zir_builder_emit_as(self.handle, ret_type_ref2, ref);
-                                        if (cast2 != error_ref) ref = cast2;
-                                    }
-                                    try self.setLocal(cc.dest, ref);
-                                    return;
-                                },
-                            };
-                            const helper_ref = zir_builder_emit_field_val(self.handle, kernel_ref, helper_name.ptr, @intCast(helper_name.len));
-                            if (helper_ref != error_ref) {
-                                var full_args: std.ArrayListUnmanaged(u32) = .empty;
-                                defer full_args.deinit(self.allocator);
-                                try full_args.append(self.allocator, callee_ref);
-                                try full_args.appendSlice(self.allocator, args.items);
-                                var ref = zir_builder_emit_call_ref(self.handle, helper_ref, full_args.items.ptr, @intCast(full_args.items.len));
-                                if (ref != error_ref) {
-                                    // Cast the callCallableN result to the expected return
-                                    // type. The runtime helper returns CallReturnType which
-                                    // Zig infers from the callable, but the monomorphized
-                                    // function may declare a different concrete return type.
-                                    // #201 — for a raising closure the helper returns
-                                    // `error{ZapRaise}!T`; skip the payload-narrowing
-                                    // `@as` and let the following `unwrap_error_union`
-                                    // `try`/`catch` the error union.
-                                    const ret_type_ref = if (cc.raises) @as(u32, 0) else mapReturnType(cc.return_type);
-                                    if (ret_type_ref != 0) {
-                                        const cast = zir_builder_emit_as(self.handle, ret_type_ref, ref);
-                                        if (cast != error_ref) ref = cast;
-                                    }
-                                    try self.setLocal(cc.dest, ref);
-                                    return;
-                                }
+                    if (rt_ref == error_ref) return error.EmitFailed;
+                    const kernel_ref = emitRuntimeNamespaceField(self.handle, rt_ref, runtime_ns.kernel);
+                    if (kernel_ref == error_ref) return error.EmitFailed;
+                    const helper_name = switch (args.items.len) {
+                        0 => "callCallable0",
+                        1 => "callCallable1",
+                        2 => "callCallable2",
+                        3 => "callCallable3",
+                        else => {
+                            // Arity fallback: callCallableN helpers cover 0..3.
+                            var ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                            if (ref == error_ref) return error.EmitFailed;
+                            // #201 — a raising closure's call yields
+                            // `error{ZapRaise}!T`; do NOT narrow to the
+                            // payload here (the `@as` would reject the
+                            // error union). The following
+                            // `unwrap_error_union` consumes the union.
+                            const ret_type_ref2 = if (cc.raises) @as(u32, 0) else mapReturnType(cc.return_type);
+                            if (ret_type_ref2 != 0) {
+                                const cast2 = zir_builder_emit_as(self.handle, ret_type_ref2, ref);
+                                if (cast2 == error_ref) return error.EmitFailed;
+                                ref = cast2;
                             }
-                        }
-                    }
-
-                    // Fallback: bare function pointer call
-                    const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
+                            try self.setLocal(cc.dest, ref);
+                            return;
+                        },
+                    };
+                    const helper_ref = zir_builder_emit_field_val(self.handle, kernel_ref, helper_name.ptr, @intCast(helper_name.len));
+                    if (helper_ref == error_ref) return error.EmitFailed;
+                    var full_args: std.ArrayListUnmanaged(u32) = .empty;
+                    defer full_args.deinit(self.allocator);
+                    try full_args.append(self.allocator, callee_ref);
+                    try full_args.appendSlice(self.allocator, args.items);
+                    var ref = zir_builder_emit_call_ref(self.handle, helper_ref, full_args.items.ptr, @intCast(full_args.items.len));
                     if (ref == error_ref) return error.EmitFailed;
+                    // Cast the callCallableN result to the expected return
+                    // type. The runtime helper returns CallReturnType which
+                    // Zig infers from the callable, but the monomorphized
+                    // function may declare a different concrete return type.
+                    // #201 — for a raising closure the helper returns
+                    // `error{ZapRaise}!T`; skip the payload-narrowing
+                    // `@as` and let the following `unwrap_error_union`
+                    // `try`/`catch` the error union.
+                    const ret_type_ref = if (cc.raises) @as(u32, 0) else mapReturnType(cc.return_type);
+                    if (ret_type_ref != 0) {
+                        const cast = zir_builder_emit_as(self.handle, ret_type_ref, ref);
+                        if (cast == error_ref) return error.EmitFailed;
+                        ref = cast;
+                    }
                     try self.setLocal(cc.dest, ref);
                     return;
                 }
@@ -9017,10 +9237,8 @@ pub const ZirDriver = struct {
                     if (self.findFunctionById(func_id)) |target_func| {
                         if (target_func.captures.len == 0) {
                             const ref = try self.emitNamedCallToTarget(func_id, cc.args);
-                            if (ref != error_ref) {
-                                try self.setLocal(cc.dest, ref);
-                                return;
-                            }
+                            try self.setLocal(cc.dest, ref);
+                            return;
                         }
                     }
                 }
@@ -9054,10 +9272,8 @@ pub const ZirDriver = struct {
                                 if (self.findFunctionById(target_id)) |target_func| {
                                     if (target_func.captures.len == 0) {
                                         const ref = try self.emitNamedCallToTarget(target_id, cc.args);
-                                        if (ref != error_ref) {
-                                            try self.setLocal(cc.dest, ref);
-                                            return;
-                                        }
+                                        try self.setLocal(cc.dest, ref);
+                                        return;
                                     }
                                 }
                             }
@@ -9098,20 +9314,21 @@ pub const ZirDriver = struct {
 
                 if (direct_target) |target| {
                     const ref = try self.emitNamedCallToTarget(target.function_id, cc.args);
-                    if (ref != error_ref) try self.setLocal(cc.dest, ref);
+                    try self.setLocal(cc.dest, ref);
                 } else {
                     // Dynamic dispatch: extract call_fn and env from closure struct,
                     // call function with env prepended to args.
-                    const callee_ref = self.refForLocal(cc.callee) catch return error.EmitFailed;
+                    const callee_ref = try self.refForLocal(cc.callee);
 
                     // When the callee is a function parameter or a bare function ref
                     // (from a 0-capture make_closure), emit a direct call_ref without
                     // trying to destructure a closure struct.
-                    if (callee_is_param or self.isBareFunctionRef(cc.callee)) {
+                    const callee_is_bare_function_ref = if (callee_is_param) false else try self.isBareFunctionRef(cc.callee);
+                    if (callee_is_param or callee_is_bare_function_ref) {
                         var args: std.ArrayListUnmanaged(u32) = .empty;
                         defer args.deinit(self.allocator);
                         for (cc.args) |arg| {
-                            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                            const ref = try self.refForValueLocal(arg);
                             try args.append(self.allocator, ref);
                         }
                         const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
@@ -9122,19 +9339,7 @@ pub const ZirDriver = struct {
 
                     // Extract function pointer and environment from closure struct
                     const call_fn_ref = zir_builder_emit_field_val(self.handle, callee_ref, "call_fn", 7);
-                    if (call_fn_ref == error_ref) {
-                        // Fallback: callee might be a bare function ref, not a closure struct
-                        var args: std.ArrayListUnmanaged(u32) = .empty;
-                        defer args.deinit(self.allocator);
-                        for (cc.args) |arg| {
-                            const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                            try args.append(self.allocator, ref);
-                        }
-                        const ref = zir_builder_emit_call_ref(self.handle, callee_ref, args.items.ptr, @intCast(args.items.len));
-                        if (ref == error_ref) return error.EmitFailed;
-                        try self.setLocal(cc.dest, ref);
-                        return;
-                    }
+                    if (call_fn_ref == error_ref) return error.EmitFailed;
 
                     const env_ref = zir_builder_emit_field_val(self.handle, callee_ref, "env", 3);
                     if (env_ref == error_ref) return error.EmitFailed;
@@ -9144,7 +9349,7 @@ pub const ZirDriver = struct {
                     defer full_args.deinit(self.allocator);
                     try full_args.append(self.allocator, env_ref);
                     for (cc.args) |arg| {
-                        const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                        const ref = try self.refForValueLocal(arg);
                         try full_args.append(self.allocator, ref);
                     }
 
@@ -9207,10 +9412,12 @@ pub const ZirDriver = struct {
                 defer env_names_lens.deinit(self.allocator);
                 var env_values: std.ArrayListUnmanaged(u32) = .empty;
                 defer env_values.deinit(self.allocator);
+                var index_field_name_batch = try IndexFieldNameBatch.init(self.allocator, mc.captures.len);
+                defer index_field_name_batch.deinit();
 
                 for (mc.captures, 0..) |cap, i| {
-                    const cap_ref = self.refForLocal(cap) catch @intFromEnum(Zir.Inst.Ref.void_value);
-                    const name = indexFieldName(i);
+                    const cap_ref = try self.refForLocal(cap);
+                    const name = index_field_name_batch.get(i);
                     try env_names_ptrs.append(self.allocator, name.ptr);
                     try env_names_lens.append(self.allocator, name.len);
                     try env_values.append(self.allocator, cap_ref);
@@ -9230,10 +9437,11 @@ pub const ZirDriver = struct {
                 // Build the closure struct: .{ .call_fn = func_ref, .env = env_ref }
                 // Use struct-aware resolution: decl_ref for same-struct, @import for cross-struct.
                 const fn_name_ref = if (is_cross_struct and target_struct != null)
-                    self.emitCrossStructRef(target_struct.?, target_func.local_name) catch @intFromEnum(Zir.Inst.Ref.void_value)
+                    try self.emitCrossStructRef(target_struct.?, target_func.local_name)
                 else blk: {
                     const ref = zir_builder_emit_decl_ref(self.handle, emit_name.ptr, @intCast(emit_name.len));
-                    break :blk if (ref != error_ref) ref else zir_builder_emit_str(self.handle, emit_name.ptr, @intCast(emit_name.len));
+                    if (ref == error_ref) return error.EmitFailed;
+                    break :blk ref;
                 };
                 if (fn_name_ref == error_ref) return error.EmitFailed;
                 const null_ref = @intFromEnum(Zir.Inst.Ref.null_value);
@@ -9268,10 +9476,12 @@ pub const ZirDriver = struct {
                     if (lowering.needs_env_param) {
                         const env_ref = self.current_closure_env_ref orelse {
                             const ref = zir_builder_emit_void(self.handle);
-                            if (ref != error_ref) try self.setLocal(cg.dest, ref);
+                            if (ref == error_ref) return error.EmitFailed;
+                            try self.setLocal(cg.dest, ref);
                             return;
                         };
-                        const name = indexFieldName(cg.index);
+                        var field_name_buf: [max_index_field_name_len]u8 = undefined;
+                        const name = indexFieldName(cg.index, &field_name_buf);
                         const ref = zir_builder_emit_field_val(self.handle, env_ref, name.ptr, name.len);
                         if (ref == error_ref) return error.EmitFailed;
                         try self.setLocal(cg.dest, ref);
@@ -9287,11 +9497,12 @@ pub const ZirDriver = struct {
                 }
 
                 const ref = zir_builder_emit_void(self.handle);
-                if (ref != error_ref) try self.setLocal(cg.dest, ref);
+                if (ref == error_ref) return error.EmitFailed;
+                try self.setLocal(cg.dest, ref);
             },
 
             .optional_unwrap => |ou| {
-                const source_ref = self.refForLocal(ou.source) catch return;
+                const source_ref = try self.refForLocal(ou.source);
 
                 // Check if source is non-null
                 const is_nonnull = zir_builder_emit_is_non_null(self.handle, source_ref);
@@ -9299,10 +9510,14 @@ pub const ZirDriver = struct {
 
                 // Then branch: extract optional payload
                 self.beginCapture();
+                var then_capture_open = true;
+                errdefer if (then_capture_open) self.discardCapture();
+
                 const payload = zir_builder_emit_optional_payload(self.handle, source_ref);
                 if (payload == error_ref) return error.EmitFailed;
                 var then_len: u32 = 0;
                 const then_ptr = self.endCapture(&then_len);
+                then_capture_open = false;
 
                 // Copy then instructions (capture buffer reused for else)
                 var then_insts = try std.ArrayListUnmanaged(u32).initCapacity(self.allocator, then_len);
@@ -9314,6 +9529,9 @@ pub const ZirDriver = struct {
                 // which calls crashReport with the canonical `nil_error` kind
                 // plus a symbolized Zap backtrace (Phase 2.f GP1).
                 self.beginCapture();
+                var else_capture_open = true;
+                errdefer if (else_capture_open) self.discardCapture();
+
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                 if (rt_import == error_ref) return error.EmitFailed;
                 const kernel = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.kernel);
@@ -9328,6 +9546,7 @@ pub const ZirDriver = struct {
                 if (panic_call == error_ref) return error.EmitFailed;
                 var else_len: u32 = 0;
                 const else_ptr = self.endCapture(&else_len);
+                else_capture_open = false;
 
                 // Emit if_else_bodies: if (is_nonnull) { payload } else { panic }
                 const result = zir_builder_emit_if_else_bodies(
@@ -9411,7 +9630,7 @@ pub const ZirDriver = struct {
                 const source_ref = try self.refForLocal(bri.source);
                 const offset_ref = switch (bri.offset) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
+                    .dynamic => |d| try self.refForLocal(d),
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
 
@@ -9459,7 +9678,7 @@ pub const ZirDriver = struct {
                 const source_ref = try self.refForLocal(brf.source);
                 const offset_ref = switch (brf.offset) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
+                    .dynamic => |d| try self.refForLocal(d),
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
 
@@ -9484,7 +9703,7 @@ pub const ZirDriver = struct {
                 const source_ref = try self.refForLocal(bs.source);
                 const offset_ref = switch (bs.offset) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
+                    .dynamic => |d| try self.refForLocal(d),
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
 
@@ -9493,7 +9712,7 @@ pub const ZirDriver = struct {
                     if (fn_ref == error_ref) return error.EmitFailed;
                     const length_ref = switch (len) {
                         .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                        .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
+                        .dynamic => |d| try self.refForLocal(d),
                     };
                     if (length_ref == error_ref) return error.EmitFailed;
                     const args = [_]u32{ source_ref, offset_ref, length_ref };
@@ -9519,7 +9738,7 @@ pub const ZirDriver = struct {
                 const source_ref = try self.refForLocal(bru.source);
                 const offset_ref = switch (bru.offset) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
+                    .dynamic => |d| try self.refForLocal(d),
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
 
@@ -9553,7 +9772,7 @@ pub const ZirDriver = struct {
                 const source_ref = try self.refForLocal(bmp.source);
                 const offset_ref = switch (bmp.offset) {
                     .static => |s| zir_builder_emit_int(self.handle, @intCast(s)),
-                    .dynamic => |d| self.refForLocal(d) catch return error.EmitFailed,
+                    .dynamic => |d| try self.refForLocal(d),
                 };
                 if (offset_ref == error_ref) return error.EmitFailed;
                 const expected_ref = zir_builder_emit_str(self.handle, bmp.expected.ptr, @intCast(bmp.expected.len));
@@ -9607,9 +9826,10 @@ pub const ZirDriver = struct {
                     );
                     if (retain_helper == error_ref) return error.EmitFailed;
 
-                    const box_ref = self.refForLocal(ret.value) catch return;
+                    const box_ref = try self.refForLocal(ret.value);
                     const retain_args = [_]u32{box_ref};
-                    _ = zir_builder_emit_call_ref(self.handle, retain_helper, &retain_args, 1);
+                    const retain_ref = zir_builder_emit_call_ref(self.handle, retain_helper, &retain_args, 1);
+                    if (retain_ref == error_ref) return error.EmitFailed;
                     return;
                 }
 
@@ -9652,11 +9872,13 @@ pub const ZirDriver = struct {
                     );
                     if (share_helper == error_ref) return error.EmitFailed;
 
-                    const box_ref = self.refForLocal(ret.value) catch return;
+                    const box_ref = try self.refForLocal(ret.value);
                     const share_args = [_]u32{box_ref};
                     const shared_ref = zir_builder_emit_call_ref(self.handle, share_helper, &share_args, 1);
                     if (shared_ref == error_ref) return error.EmitFailed;
+                    try self.aggregate_component_original_refs.put(self.allocator, ret.value, box_ref);
                     try self.setLocal(ret.value, shared_ref);
+                    self.unmarkShareSkippedForClone(ret.value);
                     return;
                 }
 
@@ -9711,7 +9933,7 @@ pub const ZirDriver = struct {
                     //     value-level analog of the `.protocol_box_share`
                     //     clone-on-share rebind above and the container
                     //     `ownElement` path.
-                    const val_ref = self.refForLocal(ret.value) catch return;
+                    const val_ref = try self.refForLocal(ret.value);
 
                     const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
                     if (rt_import == error_ref) return error.EmitFailed;
@@ -9723,7 +9945,8 @@ pub const ZirDriver = struct {
                             const retain_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "retainAny", 9);
                             if (retain_fn == error_ref) return error.EmitFailed;
                             const args = [_]u32{val_ref};
-                            _ = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                            const retain_ref = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);
+                            if (retain_ref == error_ref) return error.EmitFailed;
                         },
                         .persistent => {
                             const share_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "shareAnyPersistent", 18);
@@ -9731,6 +9954,7 @@ pub const ZirDriver = struct {
                             const args = [_]u32{val_ref};
                             const shared_ref = zir_builder_emit_call_ref(self.handle, share_fn, &args, 1);
                             if (shared_ref == error_ref) return error.EmitFailed;
+                            try self.aggregate_component_original_refs.put(self.allocator, ret.value, val_ref);
                             try self.setLocal(ret.value, shared_ref);
                             // Under `clone_on_share_active` a `.persistent` retain
                             // emits a REAL `shareAnyPersistent` clone (above), so
@@ -9755,7 +9979,7 @@ pub const ZirDriver = struct {
                 }
             },
             .release => |rel| {
-                if (self.isReleaseSuppressed(rel.value)) {
+                if (rel.kind != .aggregate_component and self.isReleaseSuppressed(rel.value)) {
                     // The matching retain was either skipped (escape
                     // analysis), elided because ownership transferred to
                     // a callee (consume mode — phase 4), or elided
@@ -9790,7 +10014,8 @@ pub const ZirDriver = struct {
                         const note_return_fn = zir_builder_emit_field_val(self.handle, arc_runtime, "noteReturnElision", 17);
                         if (note_return_fn == error_ref) return error.EmitFailed;
                         const args = [_]u32{};
-                        _ = zir_builder_emit_call_ref(self.handle, note_return_fn, &args, 0);
+                        const note_return_ref = zir_builder_emit_call_ref(self.handle, note_return_fn, &args, 0);
+                        if (note_return_ref == error_ref) return error.EmitFailed;
                     }
                     return;
                 }
@@ -9814,7 +10039,7 @@ pub const ZirDriver = struct {
                 // would otherwise have its scope-exit drop silently
                 // dropped — the construction-site `allocAny` inner leaks
                 // for every box passed by value. (G-box, round 2.)
-                if (rel.kind == .protocol_box_drop) {
+                if (rel.kind == .protocol_box_drop or (rel.kind == .aggregate_component and rel.protocol_name != null)) {
                     const protocol_name = rel.protocol_name orelse return error.EmitFailed;
                     const vtable_module_name = try std.fmt.allocPrint(
                         self.allocator,
@@ -9838,9 +10063,14 @@ pub const ZirDriver = struct {
                     );
                     if (drop_fn == error_ref) return error.EmitFailed;
 
-                    const box_ref = self.refForLocal(rel.value) catch return;
+                    const box_ref = if (rel.kind == .aggregate_component)
+                        self.aggregateComponentOriginalRefForLocal(rel.value) orelse
+                            ((try self.arcReleaseRefForLocal(rel.value)) orelse return)
+                    else
+                        try self.refForLocal(rel.value);
                     const drop_args = [_]u32{box_ref};
-                    _ = zir_builder_emit_call_ref(self.handle, drop_fn, &drop_args, 1);
+                    const drop_ref = zir_builder_emit_call_ref(self.handle, drop_fn, &drop_args, 1);
+                    if (drop_ref == error_ref) return error.EmitFailed;
                     return;
                 }
 
@@ -9876,8 +10106,9 @@ pub const ZirDriver = struct {
                 // emission too keeps the ZIR free of any `releaseAny` call site
                 // and guarantees zero refcount overhead). Under REFCOUNTED the
                 // `shouldSkipArc` path below handles the release.
+                const release_walk_kind = rel.kind == .release or rel.kind == .aggregate_component;
                 const emit_deep_walk_under_no_refcount = self.reclamationModel() == .individual_no_refcount and
-                    rel.kind == .release and
+                    release_walk_kind and
                     self.arc_managed_locals.contains(rel.value);
                 if (!self.shouldSkipArc(rel.value) or emit_deep_walk_under_no_refcount) {
                     // Phase 2 Class B: dispatch on the IR-level kind
@@ -9893,11 +10124,15 @@ pub const ZirDriver = struct {
                     // an inner consumer — destructive-optional
                     // dispatch).
                     const helper_name: []const u8 = switch (rel.kind) {
-                        .release => "releaseAny",
+                        .release, .aggregate_component => "releaseAny",
                         .free => "freeAny",
                         .protocol_box_drop => unreachable, // handled above
                     };
-                    const val_ref = self.refForLocal(rel.value) catch return;
+                    const val_ref = if (rel.kind == .aggregate_component)
+                        self.aggregateComponentOriginalRefForLocal(rel.value) orelse
+                            ((try self.arcReleaseRefForLocal(rel.value)) orelse return)
+                    else
+                        (try self.arcReleaseRefForLocal(rel.value)) orelse return;
 
                     const alloc_ref = try self.emitAllocatorRef();
 
@@ -9909,11 +10144,12 @@ pub const ZirDriver = struct {
                     if (release_fn == error_ref) return error.EmitFailed;
 
                     const args = [_]u32{ alloc_ref, val_ref };
-                    _ = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);
+                    const release_ref = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);
+                    if (release_ref == error_ref) return error.EmitFailed;
                 }
             },
             .reset => |r| {
-                const val_ref = self.refForLocal(r.source) catch return;
+                const val_ref = try self.refForLocal(r.source);
                 const alloc_ref = try self.emitAllocatorRef();
 
                 const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
@@ -9945,7 +10181,7 @@ pub const ZirDriver = struct {
             // instead of SSA phi.
             // Numeric widening — emit @as(DestType, source)
             .int_widen, .float_widen => |nw| {
-                const source_ref = self.refForValueLocal(nw.source) catch @intFromEnum(Zir.Inst.Ref.void_value);
+                const source_ref = try self.refForValueLocal(nw.source);
                 const dest_type_ref = mapReturnType(nw.dest_type);
                 const ref = zir_builder_emit_as(self.handle, dest_type_ref, source_ref);
                 if (ref == error_ref) return error.EmitFailed;
@@ -9996,11 +10232,15 @@ pub const ZirDriver = struct {
 
         // --- then branch: capture top-level body instructions ---
         self.beginCapture();
+        var then_capture_open = true;
+        errdefer if (then_capture_open) self.discardCapture();
+
         for (ie.then_instrs) |ti| {
             try self.emitInstruction(ti);
         }
         var then_len: u32 = 0;
         const then_insts_ptr = self.endCapture(&then_len);
+        then_capture_open = false;
 
         // Phase E.7: when the rewriter has collapsed the arm's
         // recursive call into a `tail_call`, `ie.then_result` is
@@ -10024,11 +10264,15 @@ pub const ZirDriver = struct {
 
         // --- else branch: capture top-level body instructions ---
         self.beginCapture();
+        var else_capture_open = true;
+        errdefer if (else_capture_open) self.discardCapture();
+
         for (ie.else_instrs) |ei| {
             try self.emitInstruction(ei);
         }
         var else_len: u32 = 0;
         const else_insts_ptr = self.endCapture(&else_len);
+        else_capture_open = false;
 
         const else_ref: u32 = if (else_is_noreturn)
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
@@ -10079,7 +10323,15 @@ pub const ZirDriver = struct {
             }
         }
         if (!has_guard) {
-            for (instrs) |i| try self.emitInstruction(i);
+            for (instrs, 0..) |i, instr_index| {
+                self.emitInstruction(i) catch |err| {
+                    std.log.err(
+                        "ZIR emit failed in flattened guard sequence at instruction {d} ({s}): {s}",
+                        .{ instr_index, @tagName(i), @errorName(err) },
+                    );
+                    return err;
+                };
+            }
             return;
         }
 
@@ -10136,18 +10388,23 @@ pub const ZirDriver = struct {
         // Capture the trailing default body, recursing so any guard_blocks
         // it contains are themselves flattened.
         self.beginCapture();
+        var default_capture_open = true;
+        errdefer if (default_capture_open) self.discardCapture();
+
         try self.emitFlattenedGuardSequence(default_instrs);
         var default_len: u32 = 0;
         const default_ptr = self.endCapture(&default_len);
+        default_capture_open = false;
         const default_result: u32 = if (dest_opt) |d|
-            if (self.local_refs.get(d)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref
+            if (self.local_refs.get(d)) |vr| try self.materializeValueRef(vr) else void_ref
         else if (self.instructionsEndNoReturnFor(default_instrs))
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             void_ref;
 
-        var current_else_insts = try self.allocator.alloc(u32, default_len);
-        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_insts = CurrentElseInsts.init(self.allocator);
+        defer current_else_insts.deinit();
+        try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);
         var current_else_result: u32 = default_result;
 
         var gi = guards.items.len;
@@ -10164,48 +10421,49 @@ pub const ZirDriver = struct {
             const cond_ref = try self.refForLocal(gb.condition);
 
             self.beginCapture();
+            var body_capture_open = true;
+            errdefer if (body_capture_open) self.discardCapture();
+
             try self.emitFlattenedGuardSequence(gb.body);
             var body_len: u32 = 0;
             const body_ptr = self.endCapture(&body_len);
+            body_capture_open = false;
 
             const body_result: u32 = if (dest_opt) |d|
-                if (self.local_refs.get(d)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref
+                if (self.local_refs.get(d)) |vr| try self.materializeValueRef(vr) else void_ref
             else
                 void_ref;
 
             const body_insts = try self.allocator.alloc(u32, body_len);
             @memcpy(body_insts, body_ptr[0..body_len]);
 
+            const else_insts = current_else_insts.get();
             const ref = zir_builder_emit_if_else_bodies(
                 self.handle,
                 cond_ref,
                 body_insts.ptr,
                 @intCast(body_insts.len),
                 body_result,
-                current_else_insts.ptr,
-                @intCast(current_else_insts.len),
+                else_insts.ptr,
+                @intCast(else_insts.len),
                 current_else_result,
                 0,
                 0,
             );
 
             self.allocator.free(body_insts);
-            self.allocator.free(current_else_insts);
+            current_else_insts.clear();
 
             if (ref == error_ref) return error.EmitFailed;
 
             if (gi > 0) {
                 const block_idx = zir_builder_pop_body_inst(self.handle);
-                current_else_insts = try self.allocator.alloc(u32, 1);
-                current_else_insts[0] = block_idx;
+                try current_else_insts.replaceWithSingle(block_idx);
                 current_else_result = ref;
             } else {
-                current_else_insts = try self.allocator.alloc(u32, 0);
                 current_else_result = ref;
             }
         }
-
-        self.allocator.free(current_else_insts);
 
         if (dest_opt) |d| {
             try self.setLocal(d, current_else_result);
@@ -10222,9 +10480,13 @@ pub const ZirDriver = struct {
         // the body into proper if-else-bodies so trailing default ops do
         // not run unconditionally alongside the matching guard.
         self.beginCapture();
+        var body_capture_open = true;
+        errdefer if (body_capture_open) self.discardCapture();
+
         try self.emitFlattenedGuardSequence(gb.body);
         var body_len: u32 = 0;
         const body_ptr = self.endCapture(&body_len);
+        body_capture_open = false;
 
         // Copy body indices (capture buffer may be reused)
         var body_insts = try std.ArrayListUnmanaged(u32).initCapacity(self.allocator, body_len);
@@ -10249,7 +10511,7 @@ pub const ZirDriver = struct {
         } else {
             const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
             const empty = [_]u32{};
-            _ = zir_builder_emit_if_else_bodies(
+            const guard_ref = zir_builder_emit_if_else_bodies(
                 self.handle,
                 cond_ref,
                 body_insts.items.ptr,
@@ -10261,6 +10523,7 @@ pub const ZirDriver = struct {
                 0,
                 0,
             );
+            if (guard_ref == error_ref) return error.EmitFailed;
         }
     }
 
@@ -10375,6 +10638,9 @@ pub const ZirDriver = struct {
 
         // Then-branch: deref the pointer payload and coerce to `?T`.
         self.beginCapture();
+        var then_capture_open = true;
+        errdefer if (then_capture_open) self.discardCapture();
+
         const ptr_ref = zir_builder_emit_optional_payload_unsafe(self.handle, field_storage_ref);
         if (ptr_ref == error_ref) return error.EmitFailed;
         const value_ref = try self.emitLoad(ptr_ref);
@@ -10382,17 +10648,22 @@ pub const ZirDriver = struct {
         if (then_value == error_ref) return error.EmitFailed;
         var then_len: u32 = 0;
         const then_ptr = self.endCapture(&then_len);
+        then_capture_open = false;
         const then_insts = try self.allocator.alloc(u32, then_len);
         defer self.allocator.free(then_insts);
         @memcpy(then_insts, then_ptr[0..then_len]);
 
         // Else-branch: coerce `null` to `?T`.
         self.beginCapture();
+        var else_capture_open = true;
+        errdefer if (else_capture_open) self.discardCapture();
+
         const null_ref = @intFromEnum(Zir.Inst.Ref.null_value);
         const else_value = zir_builder_emit_as(self.handle, optional_type_ref, null_ref);
         if (else_value == error_ref) return error.EmitFailed;
         var else_len: u32 = 0;
         const else_ptr = self.endCapture(&else_len);
+        else_capture_open = false;
         const else_insts = try self.allocator.alloc(u32, else_len);
         defer self.allocator.free(else_insts);
         @memcpy(else_insts, else_ptr[0..else_len]);
@@ -10469,25 +10740,36 @@ pub const ZirDriver = struct {
 
         // Capture the default body
         self.beginCapture();
-        for (sl.default_instrs) |di| {
-            try self.emitInstruction(di);
+        var default_capture_open = true;
+        errdefer if (default_capture_open) self.discardCapture();
+
+        for (sl.default_instrs, 0..) |di, default_index| {
+            self.emitInstruction(di) catch |err| {
+                std.log.err(
+                    "ZIR emit failed in switch_literal default body at instruction {d} ({s}): {s}",
+                    .{ default_index, @tagName(di), @errorName(err) },
+                );
+                return err;
+            };
         }
         var default_len: u32 = 0;
         const default_ptr = self.endCapture(&default_len);
+        default_capture_open = false;
         // Phase E.7: also recognise `tail_call` as noreturn in non-
         // loopify mode (see `instructionsEndNoReturnFor`). Without
         // this, a tail-call-rewritten default arm would be treated as
         // void-typed and Sema would reject the if/else merge.
         const default_result: u32 = if (sl.default_result) |dr|
-            self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
+            try self.refForLocal(dr)
         else if (self.instructionsEndNoReturnFor(sl.default_instrs))
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
 
         // Copy default instructions
-        var current_else_insts = try self.allocator.alloc(u32, default_len);
-        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_insts = CurrentElseInsts.init(self.allocator);
+        defer current_else_insts.deinit();
+        try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);
         var current_else_result: u32 = default_result;
 
         // Process cases in REVERSE order, building nested if-else from inside out.
@@ -10510,7 +10792,7 @@ pub const ZirDriver = struct {
                 .bool_val => |v| zir_builder_emit_bool(self.handle, v),
             };
             if (case_val_ref == error_ref) {
-                self.allocator.free(current_else_insts);
+                std.log.err("ZIR emit failed emitting switch_literal case value", .{});
                 return error.EmitFailed;
             }
 
@@ -10518,17 +10800,27 @@ pub const ZirDriver = struct {
             const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
             const cond_ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, case_val_ref);
             if (cond_ref == error_ref) {
-                self.allocator.free(current_else_insts);
+                std.log.err("ZIR emit failed emitting switch_literal condition", .{});
                 return error.EmitFailed;
             }
 
             // Capture the case body
             self.beginCapture();
-            for (case.body_instrs) |bi| {
-                try self.emitInstruction(bi);
+            var case_capture_open = true;
+            errdefer if (case_capture_open) self.discardCapture();
+
+            for (case.body_instrs, 0..) |bi, body_index| {
+                self.emitInstruction(bi) catch |err| {
+                    std.log.err(
+                        "ZIR emit failed in switch_literal case body at instruction {d} ({s}): {s}",
+                        .{ body_index, @tagName(bi), @errorName(err) },
+                    );
+                    return err;
+                };
             }
             var case_len: u32 = 0;
             const case_ptr = self.endCapture(&case_len);
+            case_capture_open = false;
 
             // Phase E.7: a tail-call-rewritten case (`case.result == null`
             // because `tail_call` produces no merge value) is noreturn
@@ -10538,7 +10830,13 @@ pub const ZirDriver = struct {
             // arm falls through to the wrapping `loop`'s `repeat` and
             // `void_value` remains correct.
             const case_result: u32 = if (case.result) |r|
-                self.refForLocal(r) catch @intFromEnum(Zir.Inst.Ref.void_value)
+                self.refForLocal(r) catch |err| {
+                    std.log.err(
+                        "ZIR emit failed resolving switch_literal case result local {d}: {s}",
+                        .{ r, @errorName(err) },
+                    );
+                    return err;
+                }
             else if (self.instructionsEndNoReturnFor(case.body_instrs))
                 @intFromEnum(Zir.Inst.Ref.unreachable_value)
             else
@@ -10549,39 +10847,49 @@ pub const ZirDriver = struct {
             @memcpy(case_insts, case_ptr[0..case_len]);
 
             // Emit: if (cond) { case_body } else { current_else }
+            const else_insts = current_else_insts.get();
             const ref = zir_builder_emit_if_else_bodies(
                 self.handle,
                 cond_ref,
                 case_insts.ptr,
                 @intCast(case_insts.len),
                 case_result,
-                current_else_insts.ptr,
-                @intCast(current_else_insts.len),
+                else_insts.ptr,
+                @intCast(else_insts.len),
                 current_else_result,
                 0,
                 0,
             );
 
             self.allocator.free(case_insts);
-            self.allocator.free(current_else_insts);
+            current_else_insts.clear();
 
-            if (ref == error_ref) return error.EmitFailed;
+            if (ref == error_ref) {
+                std.log.err(
+                    "ZIR emit failed building switch_literal branch merge: then_len={d} else_len={d} then_result={d} else_result={d}",
+                    .{ case_insts.len, else_insts.len, case_result, current_else_result },
+                );
+                return error.EmitFailed;
+            }
 
             if (i > 0) {
                 // Inner iteration: pop the block_inline from function body
                 // and include it in the else branch for the next outer level.
                 const block_idx = zir_builder_pop_body_inst(self.handle);
-                current_else_insts = try self.allocator.alloc(u32, 1);
-                current_else_insts[0] = block_idx;
+                if (block_idx == error_ref) {
+                    std.log.err(
+                        "ZIR emit failed popping nested switch_literal block for else chain",
+                        .{},
+                    );
+                    return error.EmitFailed;
+                }
+                try current_else_insts.replaceWithSingle(block_idx);
                 current_else_result = ref;
             } else {
                 // Outermost iteration — block_inline stays in function body.
-                current_else_insts = try self.allocator.alloc(u32, 0);
                 current_else_result = ref;
             }
         }
-
-        self.allocator.free(current_else_insts);
 
         // The last ref produced is the result of the entire switch
         // Set the case_block result
@@ -10611,18 +10919,23 @@ pub const ZirDriver = struct {
 
         // Capture the default body
         self.beginCapture();
+        var default_capture_open = true;
+        errdefer if (default_capture_open) self.discardCapture();
+
         for (cb.default_instrs) |di| try self.emitInstruction(di);
         var default_len: u32 = 0;
         const default_ptr = self.endCapture(&default_len);
+        default_capture_open = false;
         const default_result: u32 = if (cb.default_result) |dr|
-            self.refForLocal(dr) catch @intFromEnum(Zir.Inst.Ref.void_value)
+            try self.refForLocal(dr)
         else if (self.instructionsEndNoReturnFor(cb.default_instrs))
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
             @intFromEnum(Zir.Inst.Ref.void_value);
 
-        var current_else_insts = try self.allocator.alloc(u32, default_len);
-        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_insts = CurrentElseInsts.init(self.allocator);
+        defer current_else_insts.deinit();
+        try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);
         var current_else_result: u32 = default_result;
 
         // Process arms in REVERSE order
@@ -10639,16 +10952,20 @@ pub const ZirDriver = struct {
 
             // Capture the arm body
             self.beginCapture();
+            var arm_capture_open = true;
+            errdefer if (arm_capture_open) self.discardCapture();
+
             for (arm.body_instrs) |bi| try self.emitInstruction(bi);
             var arm_len: u32 = 0;
             const arm_ptr = self.endCapture(&arm_len);
+            arm_capture_open = false;
 
             // Phase E.7: tail-call-rewritten arms have `result == null`
             // and the captured ZIR ends in a noreturn `ret` (musttail
             // mode). Use `unreachable_value` so Sema does not try to
             // type-merge the arm into the enclosing block.
             const arm_result: u32 = if (arm.result) |r|
-                self.refForLocal(r) catch @intFromEnum(Zir.Inst.Ref.void_value)
+                try self.refForLocal(r)
             else if (self.instructionsEndNoReturnFor(arm.body_instrs))
                 @intFromEnum(Zir.Inst.Ref.unreachable_value)
             else
@@ -10658,36 +10975,33 @@ pub const ZirDriver = struct {
             @memcpy(arm_insts, arm_ptr[0..arm_len]);
 
             // Emit: if (arm.condition) { arm_body } else { current_else }
+            const else_insts = current_else_insts.get();
             const ref = zir_builder_emit_if_else_bodies(
                 self.handle,
                 cond_ref,
                 arm_insts.ptr,
                 @intCast(arm_insts.len),
                 arm_result,
-                current_else_insts.ptr,
-                @intCast(current_else_insts.len),
+                else_insts.ptr,
+                @intCast(else_insts.len),
                 current_else_result,
                 0,
                 0,
             );
 
             self.allocator.free(arm_insts);
-            self.allocator.free(current_else_insts);
+            current_else_insts.clear();
 
             if (ref == error_ref) return error.EmitFailed;
 
             if (i > 0) {
                 const block_idx = zir_builder_pop_body_inst(self.handle);
-                current_else_insts = try self.allocator.alloc(u32, 1);
-                current_else_insts[0] = block_idx;
+                try current_else_insts.replaceWithSingle(block_idx);
                 current_else_result = ref;
             } else {
-                current_else_insts = try self.allocator.alloc(u32, 0);
                 current_else_result = ref;
             }
         }
-
-        self.allocator.free(current_else_insts);
 
         // The last ref produced is the result of the entire case block
         try self.setLocal(cb.dest, current_else_result);
@@ -10874,12 +11188,16 @@ pub const ZirDriver = struct {
 
         // Capture the default body (from both trailing pre_instrs and default_instrs).
         self.beginCapture();
+        var default_capture_open = true;
+        errdefer if (default_capture_open) self.discardCapture();
+
         for (default_pre_instrs) |di| try self.emitInstruction(di);
         for (cb.default_instrs) |di| try self.emitInstruction(di);
         var default_len: u32 = 0;
         const default_ptr = self.endCapture(&default_len);
+        default_capture_open = false;
         var default_result: u32 = if (cb.default_result) |dr|
-            self.refForLocal(dr) catch void_ref
+            try self.refForLocal(dr)
         else if (self.instructionsEndNoReturnFor(default_pre_instrs) or self.instructionsEndNoReturnFor(cb.default_instrs))
             @intFromEnum(Zir.Inst.Ref.unreachable_value)
         else
@@ -10888,11 +11206,12 @@ pub const ZirDriver = struct {
         // If default_result is still void but default body was captured,
         // check if case_break inside the body set cb.dest
         if (default_result == void_ref and (default_len > 0 or default_pre_instrs.len > 0)) {
-            default_result = if (self.local_refs.get(cb.dest)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref;
+            default_result = if (self.local_refs.get(cb.dest)) |vr| try self.materializeValueRef(vr) else void_ref;
         }
 
-        var current_else_insts = try self.allocator.alloc(u32, default_len);
-        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_insts = CurrentElseInsts.init(self.allocator);
+        defer current_else_insts.deinit();
+        try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);
         var current_else_result: u32 = default_result;
 
         var index_get_pre_emitted = false;
@@ -10942,15 +11261,17 @@ pub const ZirDriver = struct {
             // guard_blocks so that trailing default ops inside the catchall
             // body do not execute alongside the matching inner guard.
             self.beginCapture();
+            var catchall_capture_open = true;
+            errdefer if (catchall_capture_open) self.discardCapture();
+
             try self.emitFlattenedGuardSequence(last_gb.body);
             var catchall_len: u32 = 0;
             const catchall_ptr = self.endCapture(&catchall_len);
+            catchall_capture_open = false;
 
-            const catchall_result: u32 = if (self.local_refs.get(cb.dest)) |vr| self.materializeValueRef(vr) catch @intFromEnum(Zir.Inst.Ref.void_value) else @intFromEnum(Zir.Inst.Ref.void_value);
+            const catchall_result: u32 = if (self.local_refs.get(cb.dest)) |vr| try self.materializeValueRef(vr) else @intFromEnum(Zir.Inst.Ref.void_value);
 
-            self.allocator.free(current_else_insts);
-            current_else_insts = try self.allocator.alloc(u32, catchall_len);
-            @memcpy(current_else_insts, catchall_ptr[0..catchall_len]);
+            try current_else_insts.replaceWithCopy(catchall_ptr[0..catchall_len]);
             current_else_result = catchall_result;
 
             _ = guards.pop();
@@ -10980,50 +11301,51 @@ pub const ZirDriver = struct {
             // lowerings) so each inner branch is a proper if-else and
             // trailing default ops do not run unconditionally.
             self.beginCapture();
+            var body_capture_open = true;
+            errdefer if (body_capture_open) self.discardCapture();
+
             try self.emitFlattenedGuardSequence(gb.body);
             var body_len: u32 = 0;
             const body_ptr = self.endCapture(&body_len);
+            body_capture_open = false;
 
             // The guard body contains case_break which sets cb.dest via
             // current_case_dest. Use that ref as the body result.
-            const body_result: u32 = if (self.local_refs.get(cb.dest)) |vr| self.materializeValueRef(vr) catch void_ref else void_ref;
+            const body_result: u32 = if (self.local_refs.get(cb.dest)) |vr| try self.materializeValueRef(vr) else void_ref;
 
             const body_insts = try self.allocator.alloc(u32, body_len);
             @memcpy(body_insts, body_ptr[0..body_len]);
 
             // Emit: if (guard_cond) { guard_body } else { current_else }
+            const else_insts = current_else_insts.get();
             const ref = zir_builder_emit_if_else_bodies(
                 self.handle,
                 cond_ref,
                 body_insts.ptr,
                 @intCast(body_insts.len),
                 body_result,
-                current_else_insts.ptr,
-                @intCast(current_else_insts.len),
+                else_insts.ptr,
+                @intCast(else_insts.len),
                 current_else_result,
                 0,
                 0,
             );
 
             self.allocator.free(body_insts);
-            self.allocator.free(current_else_insts);
+            current_else_insts.clear();
 
             if (ref == error_ref) return error.EmitFailed;
 
             if (gi > 0) {
                 // Inner — pop block_inline from body for nesting
                 const block_idx = zir_builder_pop_body_inst(self.handle);
-                current_else_insts = try self.allocator.alloc(u32, 1);
-                current_else_insts[0] = block_idx;
+                try current_else_insts.replaceWithSingle(block_idx);
                 current_else_result = ref;
             } else {
                 // Outermost — block_inline stays in function body
-                current_else_insts = try self.allocator.alloc(u32, 0);
                 current_else_result = ref;
             }
         }
-
-        self.allocator.free(current_else_insts);
 
         // Set the case_block result
         try self.setLocal(cb.dest, current_else_result);
@@ -11054,6 +11376,9 @@ pub const ZirDriver = struct {
         // Capture the default body (includes the return). Skip the trailing
         // `ret` when the body already ends in a no-return terminator.
         self.beginCapture();
+        var default_capture_open = true;
+        errdefer if (default_capture_open) self.discardCapture();
+
         for (sr.default_instrs) |di| try self.emitInstruction(di);
         if (sr.default_result) |dr| {
             if (!self.instructionsEndNoReturnFor(sr.default_instrs)) {
@@ -11063,10 +11388,12 @@ pub const ZirDriver = struct {
         }
         var default_len: u32 = 0;
         const default_ptr = self.endCapture(&default_len);
+        default_capture_open = false;
         const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
 
-        var current_else_insts = try self.allocator.alloc(u32, default_len);
-        @memcpy(current_else_insts, default_ptr[0..default_len]);
+        var current_else_insts = CurrentElseInsts.init(self.allocator);
+        defer current_else_insts.deinit();
+        try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);
         var current_else_result: u32 = void_ref;
 
         // Process cases in REVERSE order
@@ -11082,18 +11409,12 @@ pub const ZirDriver = struct {
                 .string => |v| zir_builder_emit_str(self.handle, v.ptr, @intCast(v.len)),
                 .bool_val => |v| zir_builder_emit_bool(self.handle, v),
             };
-            if (case_val_ref == error_ref) {
-                self.allocator.free(current_else_insts);
-                return error.EmitFailed;
-            }
+            if (case_val_ref == error_ref) return error.EmitFailed;
 
             // Emit: scrutinee == case_value
             const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
             const cond_ref = zir_builder_emit_binop(self.handle, cmp_tag, scrutinee_ref, case_val_ref);
-            if (cond_ref == error_ref) {
-                self.allocator.free(current_else_insts);
-                return error.EmitFailed;
-            }
+            if (cond_ref == error_ref) return error.EmitFailed;
 
             // Capture case body (includes the return). A clause whose body
             // already ends in a no-return terminator — e.g. `raise` lowered to
@@ -11101,6 +11422,9 @@ pub const ZirDriver = struct {
             // union — must NOT get a trailing `ret` appended after the hard
             // exit, which Sema would reject as a `ret` after a terminator.
             self.beginCapture();
+            var case_capture_open = true;
+            errdefer if (case_capture_open) self.discardCapture();
+
             for (case.body_instrs) |bi| try self.emitInstruction(bi);
             if (case.return_value) |rv| {
                 if (!self.instructionsEndNoReturnFor(case.body_instrs)) {
@@ -11112,41 +11436,39 @@ pub const ZirDriver = struct {
             }
             var case_len: u32 = 0;
             const case_ptr = self.endCapture(&case_len);
+            case_capture_open = false;
 
             const case_insts = try self.allocator.alloc(u32, case_len);
             @memcpy(case_insts, case_ptr[0..case_len]);
 
             // Emit: if (cond) { case_body_with_ret } else { current_else }
+            const else_insts = current_else_insts.get();
             const ref = zir_builder_emit_if_else_bodies(
                 self.handle,
                 cond_ref,
                 case_insts.ptr,
                 @intCast(case_insts.len),
                 void_ref,
-                current_else_insts.ptr,
-                @intCast(current_else_insts.len),
+                else_insts.ptr,
+                @intCast(else_insts.len),
                 current_else_result,
                 0,
                 0,
             );
 
             self.allocator.free(case_insts);
-            self.allocator.free(current_else_insts);
+            current_else_insts.clear();
 
             if (ref == error_ref) return error.EmitFailed;
 
             if (i > 0) {
                 const block_idx = zir_builder_pop_body_inst(self.handle);
-                current_else_insts = try self.allocator.alloc(u32, 1);
-                current_else_insts[0] = block_idx;
+                try current_else_insts.replaceWithSingle(block_idx);
                 current_else_result = ref;
             } else {
-                current_else_insts = try self.allocator.alloc(u32, 0);
                 current_else_result = ref;
             }
         }
-
-        self.allocator.free(current_else_insts);
     }
 
     /// Emit a union_switch_return as a chain of if-else-bodies.
@@ -11170,7 +11492,9 @@ pub const ZirDriver = struct {
         if (tag_ref == error_ref) return error.EmitFailed;
 
         // Build from the last case backwards. The innermost else is unreachable.
-        var current_else_insts = try self.allocator.alloc(u32, 0);
+        var current_else_insts = CurrentElseInsts.init(self.allocator);
+        defer current_else_insts.deinit();
+        try current_else_insts.replaceWithEmpty();
         var current_else_result: u32 = void_ref;
 
         var i = usr.cases.len;
@@ -11180,26 +11504,19 @@ pub const ZirDriver = struct {
 
             // Emit: activeTag(scrutinee) == .variant_name
             const variant_ref = zir_builder_emit_enum_literal(self.handle, case.variant_name.ptr, @intCast(case.variant_name.len));
-            if (variant_ref == error_ref) {
-                self.allocator.free(current_else_insts);
-                return error.EmitFailed;
-            }
+            if (variant_ref == error_ref) return error.EmitFailed;
             const cmp_tag: u8 = @intFromEnum(Zir.Inst.Tag.cmp_eq);
             const cond_ref = zir_builder_emit_binop(self.handle, cmp_tag, tag_ref, variant_ref);
-            if (cond_ref == error_ref) {
-                self.allocator.free(current_else_insts);
-                return error.EmitFailed;
-            }
+            if (cond_ref == error_ref) return error.EmitFailed;
 
             // Capture case body (payload extraction + field bindings + body + return)
             self.beginCapture();
+            var case_capture_open = true;
+            errdefer if (case_capture_open) self.discardCapture();
 
             // Extract variant payload: scrutinee.VariantName → struct payload
             const payload_ref = zir_builder_emit_field_val(self.handle, scrutinee_ref, case.variant_name.ptr, @intCast(case.variant_name.len));
-            if (payload_ref == error_ref) {
-                self.allocator.free(current_else_insts);
-                return error.EmitFailed;
-            }
+            if (payload_ref == error_ref) return error.EmitFailed;
 
             // Extract each field from the payload and bind to the correct local.
             // For scalar payloads (e.g., u8 from binary pattern matching), field
@@ -11227,10 +11544,7 @@ pub const ZirDriver = struct {
                 // Struct payload: extract fields normally.
                 for (case.field_bindings) |fb| {
                     const field_ref = zir_builder_emit_field_val(self.handle, payload_ref, fb.field_name.ptr, @intCast(fb.field_name.len));
-                    if (field_ref == error_ref) {
-                        self.allocator.free(current_else_insts);
-                        return error.EmitFailed;
-                    }
+                    if (field_ref == error_ref) return error.EmitFailed;
                     try self.setLocal(fb.local_index, field_ref);
                 }
             }
@@ -11249,41 +11563,39 @@ pub const ZirDriver = struct {
             }
             var case_len: u32 = 0;
             const case_ptr = self.endCapture(&case_len);
+            case_capture_open = false;
 
             const case_insts = try self.allocator.alloc(u32, case_len);
             @memcpy(case_insts, case_ptr[0..case_len]);
 
             // Emit: if (tag == .variant) { case_body_with_ret } else { current_else }
+            const else_insts = current_else_insts.get();
             const ref = zir_builder_emit_if_else_bodies(
                 self.handle,
                 cond_ref,
                 case_insts.ptr,
                 @intCast(case_insts.len),
                 void_ref,
-                current_else_insts.ptr,
-                @intCast(current_else_insts.len),
+                else_insts.ptr,
+                @intCast(else_insts.len),
                 current_else_result,
                 0,
                 0,
             );
 
             self.allocator.free(case_insts);
-            self.allocator.free(current_else_insts);
+            current_else_insts.clear();
 
             if (ref == error_ref) return error.EmitFailed;
 
             if (i > 0) {
                 const block_idx = zir_builder_pop_body_inst(self.handle);
-                current_else_insts = try self.allocator.alloc(u32, 1);
-                current_else_insts[0] = block_idx;
+                try current_else_insts.replaceWithSingle(block_idx);
                 current_else_result = ref;
             } else {
-                current_else_insts = try self.allocator.alloc(u32, 0);
                 current_else_result = ref;
             }
         }
-
-        self.allocator.free(current_else_insts);
     }
 
     /// Emit a `f(nil) / f(t :: T)` optional dispatcher as
@@ -11306,54 +11618,56 @@ pub const ZirDriver = struct {
 
         // then-branch: unwrap, override param ref, emit struct body, ret.
         self.beginCapture();
+        var then_capture_open = true;
+        errdefer if (then_capture_open) self.discardCapture();
+
         const payload_ref = zir_builder_emit_optional_payload_unsafe(self.handle, scrutinee_ref);
-        if (payload_ref == error_ref) {
-            var dropped_len: u32 = 0;
-            _ = self.endCapture(&dropped_len);
-            return error.EmitFailed;
-        }
+        if (payload_ref == error_ref) return error.EmitFailed;
         try self.setLocal(od.payload_local, payload_ref);
 
-        const saved_param_ref = self.param_refs.items[od.scrutinee_param];
-        self.param_refs.items[od.scrutinee_param] = payload_ref;
-        for (od.struct_instrs) |bi| try self.emitInstruction(bi);
-        // Perceus drop point for owned optional-dispatch payloads.
-        // Borrowed optional params are an unwrapped view of the
-        // caller-owned `?T`; dropping that payload would decrement the
-        // caller's Arc and poison any subsequent use after this
-        // function returns. Owned optional params, by contrast, have
-        // transferred their refcount unit into this function, so the
-        // payload must be released between the struct branch body and
-        // the ret unless the return-specialization suppresses it.
-        if (od.struct_result) |sr| {
-            const ret_ref = try self.refForLocal(sr);
-            if (zir_builder_emit_ret(self.handle, ret_ref) != 0) {
-                self.param_refs.items[od.scrutinee_param] = saved_param_ref;
-                var dropped_len: u32 = 0;
-                _ = self.endCapture(&dropped_len);
-                return error.EmitFailed;
+        {
+            const saved_param_ref = self.param_refs.items[od.scrutinee_param];
+            self.param_refs.items[od.scrutinee_param] = payload_ref;
+            defer self.param_refs.items[od.scrutinee_param] = saved_param_ref;
+
+            for (od.struct_instrs) |bi| try self.emitInstruction(bi);
+            // Perceus drop point for owned optional-dispatch payloads.
+            // Borrowed optional params are an unwrapped view of the
+            // caller-owned `?T`; dropping that payload would decrement the
+            // caller's Arc and poison any subsequent use after this
+            // function returns. Owned optional params, by contrast, have
+            // transferred their refcount unit into this function, so the
+            // payload must be released between the struct branch body and
+            // the ret unless the return-specialization suppresses it.
+            if (od.struct_result) |sr| {
+                const ret_ref = try self.refForLocal(sr);
+                if (zir_builder_emit_ret(self.handle, ret_ref) != 0) {
+                    return error.EmitFailed;
+                }
             }
         }
-        self.param_refs.items[od.scrutinee_param] = saved_param_ref;
         var then_len: u32 = 0;
         const then_ptr = self.endCapture(&then_len);
+        then_capture_open = false;
         const then_insts = try self.allocator.alloc(u32, then_len);
         defer self.allocator.free(then_insts);
         @memcpy(then_insts, then_ptr[0..then_len]);
 
         // else-branch: emit nil body, ret.
         self.beginCapture();
+        var else_capture_open = true;
+        errdefer if (else_capture_open) self.discardCapture();
+
         for (od.nil_instrs) |bi| try self.emitInstruction(bi);
         if (od.nil_result) |nr| {
             const ret_ref = try self.refForLocal(nr);
             if (zir_builder_emit_ret(self.handle, ret_ref) != 0) {
-                var dropped_len: u32 = 0;
-                _ = self.endCapture(&dropped_len);
                 return error.EmitFailed;
             }
         }
         var else_len: u32 = 0;
         const else_ptr = self.endCapture(&else_len);
+        else_capture_open = false;
         const else_insts = try self.allocator.alloc(u32, else_len);
         defer self.allocator.free(else_insts);
         @memcpy(else_insts, else_ptr[0..else_len]);
@@ -11543,12 +11857,16 @@ pub const ZirDriver = struct {
         self.current_case_dest = case_dest;
         defer self.current_case_dest = saved_case_dest;
 
-        zir_builder_begin_capture(self.handle);
+        self.beginCapture();
+        var capture_open = true;
+        errdefer if (capture_open) self.discardCapture();
+
         for (instrs) |bi| {
             try self.emitInstruction(bi);
         }
         var captured_len: u32 = 0;
-        const captured_ptr = zir_builder_end_capture(self.handle, &captured_len);
+        const captured_ptr = self.endCapture(&captured_len);
+        capture_open = false;
 
         const body_len = captured_len;
         for (captured_ptr[0..captured_len]) |inst_i| {
@@ -11556,9 +11874,9 @@ pub const ZirDriver = struct {
         }
 
         const result_ref: u32 = if (explicit_result) |rv|
-            self.refForValueLocal(rv) catch void_ref
+            try self.refForValueLocal(rv)
         else if (self.local_refs.get(case_dest)) |vr|
-            self.materializeValueRef(vr) catch void_ref
+            try self.materializeValueRef(vr)
         else
             void_ref;
 
@@ -11774,6 +12092,433 @@ test "mapReturnType routes optional returns through complex ret_ty emission" {
     try std.testing.expectEqual(@as(u32, 0), mapReturnType(.{ .optional = optional_string_inner }));
 }
 
+fn p4j2TestFunction(id: ir.FunctionId, name: []const u8, local_name: []const u8, struct_name: ?[]const u8) ir.Function {
+    return .{
+        .id = id,
+        .name = name,
+        .struct_name = struct_name,
+        .local_name = local_name,
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+    };
+}
+
+fn exerciseDeduplicateFunctionsAllocationFailures(allocator: Allocator) !void {
+    const functions = [_]ir.Function{
+        p4j2TestFunction(1, "first", "dup__0", null),
+        p4j2TestFunction(2, "second", "second__0", null),
+        p4j2TestFunction(3, "replacement", "dup__0", null),
+        p4j2TestFunction(4, "fallback_name", "", null),
+    };
+
+    var deduped = try ZirDriver.deduplicateFunctions(allocator, &functions);
+    defer deduped.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), deduped.items.len);
+    try std.testing.expectEqual(@as(ir.FunctionId, 2), deduped.items[0].id);
+    try std.testing.expectEqual(@as(ir.FunctionId, 3), deduped.items[1].id);
+    try std.testing.expectEqual(@as(ir.FunctionId, 4), deduped.items[2].id);
+}
+
+test "ZirDriver.deduplicateFunctions keeps last function and cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseDeduplicateFunctionsAllocationFailures,
+        .{},
+    );
+}
+
+fn exerciseBuildProgramFunctionGroupsAllocationFailures(allocator: Allocator) !void {
+    const functions = [_]ir.Function{
+        p4j2TestFunction(1, "root_old", "root__0", null),
+        p4j2TestFunction(2, "root_new", "root__0", null),
+        p4j2TestFunction(3, "Math.old", "dup__0", "Math"),
+        p4j2TestFunction(4, "Math.unique", "unique__0", "Math"),
+        p4j2TestFunction(5, "Math.new", "dup__0", "Math"),
+        p4j2TestFunction(6, "Parent_Child.member", "member__0", "Parent_Child"),
+    };
+    const program = ir.Program{
+        .functions = &functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    var groups = try ZirDriver.buildProgramFunctionGroups(allocator, program);
+    defer groups.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), groups.root_funcs.items.len);
+    try std.testing.expectEqual(@as(ir.FunctionId, 2), groups.root_funcs.items[0].id);
+    try std.testing.expect(groups.all_struct_names.contains("Math"));
+    try std.testing.expect(groups.all_struct_names.contains("Parent_Child"));
+
+    const math_functions = groups.struct_funcs.get("Math") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), math_functions.items.len);
+    try std.testing.expectEqual(@as(ir.FunctionId, 4), math_functions.items[0].id);
+    try std.testing.expectEqual(@as(ir.FunctionId, 5), math_functions.items[1].id);
+
+    const child_functions = groups.struct_funcs.get("Parent_Child") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), child_functions.items.len);
+    try std.testing.expectEqual(@as(ir.FunctionId, 6), child_functions.items[0].id);
+}
+
+test "ZirDriver buildProgram grouping cleans up nested lists on allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseBuildProgramFunctionGroupsAllocationFailures,
+        .{},
+    );
+}
+
+test "ZIR naming helpers do not use semantic fallback literals" {
+    const source = @embedFile("zir_builder.zig");
+    const catch_zero = "catch " ++ "\"0\"";
+    const catch_closure_env = "catch " ++ "\"__ClosureEnv\"";
+
+    try std.testing.expect(std.mem.indexOf(u8, source, catch_zero) == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, catch_closure_env) == null);
+}
+
+test "indexFieldName formats max u32 without fallback" {
+    var name_buf: [max_index_field_name_len]u8 = undefined;
+    const name = indexFieldName(std.math.maxInt(u32), &name_buf);
+    const name_len: usize = @intCast(name.len);
+
+    try std.testing.expectEqualStrings("4294967295", name.ptr[0..name_len]);
+}
+
+test "IndexFieldNameBatch keeps dynamic names stable and propagates allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        IndexFieldNameBatch.init(failing_allocator.allocator(), index_field_names.len + 1),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+
+    var batch = try IndexFieldNameBatch.init(std.testing.allocator, index_field_names.len + 2);
+    defer batch.deinit();
+
+    var dynamic_names: [2]IndexFieldName = undefined;
+    for (0..index_field_names.len + dynamic_names.len) |i| {
+        const name = batch.get(i);
+        if (i >= index_field_names.len) dynamic_names[i - index_field_names.len] = name;
+    }
+
+    const first_len: usize = @intCast(dynamic_names[0].len);
+    const second_len: usize = @intCast(dynamic_names[1].len);
+    try std.testing.expectEqualStrings("32", dynamic_names[0].ptr[0..first_len]);
+    try std.testing.expectEqualStrings("33", dynamic_names[1].ptr[0..second_len]);
+}
+
+test "closureEnvTypeName propagates buffer exhaustion" {
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+    };
+
+    var name_buf: [64]u8 = undefined;
+    const name = try driver.closureEnvTypeName(42, &name_buf);
+    try std.testing.expectEqualStrings("__ClosureEnv_42", name);
+
+    var too_small_buf: [4]u8 = undefined;
+    try std.testing.expectError(error.EmitFailed, driver.closureEnvTypeName(42, &too_small_buf));
+}
+
+test "ZirDriver local ref materialization propagates emission failures" {
+    const source = @embedFile("zir_builder.zig");
+    const ref_for_local = "self." ++ "refForLocal(";
+    const ref_for_value_local = "self." ++ "refForValueLocal(";
+    const materialize_value_ref = "self." ++ "materializeValueRef(";
+    const catch_token = " " ++ "catch" ++ " ";
+
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const materializes_local =
+            std.mem.indexOf(u8, line, ref_for_local) != null or
+            std.mem.indexOf(u8, line, ref_for_value_local) != null or
+            std.mem.indexOf(u8, line, materialize_value_ref) != null;
+        if (!materializes_local) continue;
+
+        if (std.mem.indexOf(u8, line, catch_token) == null) continue;
+        if (std.mem.indexOf(u8, line, "catch return error.EmitFailed") != null) continue;
+        if (std.mem.indexOf(u8, line, "catch |err|") != null) {
+            if (std.mem.indexOf(u8, line, "return err;") != null) continue;
+
+            var found_err_return = false;
+            var remaining_lookahead: usize = 12;
+            while (remaining_lookahead > 0) : (remaining_lookahead -= 1) {
+                const catch_line = lines.next() orelse break;
+                if (std.mem.indexOf(u8, catch_line, "return err;") != null) {
+                    found_err_return = true;
+                    break;
+                }
+            }
+            try std.testing.expect(found_err_return);
+            continue;
+        }
+
+        try std.testing.expect(false);
+    }
+}
+
+test "ZirDriver nested type emission propagates emitted-name allocation failure at source level" {
+    const source = @embedFile("zir_builder.zig");
+    const start = std.mem.indexOf(u8, source, "fn emitNestedTypeDecl") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, source, start, "fn emitRootFields") orelse return error.TestUnexpectedResult;
+    const nested_source = source[start..end];
+
+    try std.testing.expect(std.mem.indexOf(u8, nested_source, "fn emitNestedTypeDecl(self: *ZirDriver, type_def: ir.TypeDef, emitted: *std.StringHashMap(void)) !void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nested_source, "try emitted.put(short_name, {});") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nested_source, "emitted.put(short_name, {}) catch return") == null);
+}
+
+test "ZirDriver monomorphized impl lookup distinguishes allocation failure from semantic absence" {
+    const matching_function = ir.Function{
+        .id = 1,
+        .name = "List__member?__2",
+        .struct_name = "Caller",
+        .local_name = "List_member?__i64__2",
+        .scope_id = 0,
+        .arity = 2,
+        .params = &.{},
+        .return_type = .bool_type,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+    };
+    const unrelated_function = ir.Function{
+        .id = 2,
+        .name = "Map__member?__2",
+        .struct_name = "Caller",
+        .local_name = "Map_member?__i64__2",
+        .scope_id = 0,
+        .arity = 2,
+        .params = &.{},
+        .return_type = .bool_type,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+    };
+    const functions = [_]ir.Function{ unrelated_function, matching_function };
+    const program = ir.Program{
+        .functions = &functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = program,
+    };
+    defer driver.deinitOwnedState();
+
+    const found = (try driver.findMonomorphizedImplFor("Caller", "List__member?__2")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(ir.FunctionId, 1), found.id);
+
+    const semantic_missing = try driver.findMonomorphizedImplFor("Caller", "Set__member?__2");
+    try std.testing.expectEqual(@as(?ir.Function, null), semantic_missing);
+
+    const other_namespace_function = ir.Function{
+        .id = 3,
+        .name = "List__member?__2",
+        .struct_name = "Other",
+        .local_name = "List_member?__i64__2",
+        .scope_id = 0,
+        .arity = 2,
+        .params = &.{},
+        .return_type = .bool_type,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+    };
+    const other_namespace_functions = [_]ir.Function{other_namespace_function};
+    const other_namespace_program = ir.Program{
+        .functions = &other_namespace_functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+    var no_namespace_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var no_namespace_driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = no_namespace_allocator.allocator(),
+        .program = other_namespace_program,
+    };
+    defer no_namespace_driver.deinitOwnedState();
+
+    const no_namespace_match = try no_namespace_driver.findMonomorphizedImplFor("Caller", "List__member?__2");
+    try std.testing.expectEqual(@as(?ir.Function, null), no_namespace_match);
+    try std.testing.expect(!no_namespace_allocator.has_induced_failure);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing_driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = failing_allocator.allocator(),
+        .program = program,
+    };
+    defer failing_driver.deinitOwnedState();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failing_driver.findMonomorphizedImplFor("Caller", "List__member?__2"),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "ZirDriver tuple type emission helpers propagate failures at source level" {
+    const source = @embedFile("zir_builder.zig");
+    const start = std.mem.indexOf(u8, source, "fn mapTupleElementType") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, source, start, "fn setLocal") orelse return error.TestUnexpectedResult;
+    const helper_source = source[start..end];
+
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "fn mapTupleElementType(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "fn collectNestedTupleTypes(self: *ZirDriver, zig_type: ir.ZigType) BuildError!void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "fn emitBodyLocalTupleType(self: *ZirDriver, zig_type: ir.ZigType) BuildError!u32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "try self.pending_ret_ty_untracked.append") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "try inner_refs.append(self.allocator, try self.mapTupleElementType(inner_elem))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "try self.tuple_type_stack.append") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "try inner_refs.append(self.allocator, try self.emitBodyLocalTupleType(inner_elem))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "return error.EmitFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "catch return 0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "catch {}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "catch 0") == null);
+}
+
+test "ZirDriver recursive struct boxing helpers propagate allocation failures at source level" {
+    const source = @embedFile("zir_builder.zig");
+    const start = std.mem.indexOf(u8, source, "fn indirectFieldType") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, source, start, "fn findEnumDef") orelse return error.TestUnexpectedResult;
+    const helper_source = source[start..end];
+
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "fn indirectFieldType(self: *ZirDriver, t: ir.ZigType) BuildError!ir.ZigType") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "fn boxRecursiveZigType(self: *ZirDriver, t: ir.ZigType) BuildError!ir.ZigType") != null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "page_allocator.create(ir.ZigType)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "catch break :blk t") == null);
+}
+
+test "ZirDriver.indirectFieldType propagates OutOfMemory instead of leaving recursive fields unboxed" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = failing_allocator.allocator(),
+        .program = null,
+    };
+    defer driver.deinitOwnedState();
+
+    try std.testing.expectError(error.OutOfMemory, driver.indirectFieldType(.{ .struct_ref = "Tree" }));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "ZirDriver.boxRecursiveZigType boxes recursive structs and propagates OutOfMemory" {
+    const recursive_field_type: ir.ZigType = .{ .struct_ref = "Tree" };
+    const recursive_fields = [_]ir.StructFieldDef{
+        .{ .name = "left", .type_expr = recursive_field_type, .storage = .indirect },
+    };
+    const recursive_type_defs = [_]ir.TypeDef{
+        .{ .name = "Tree", .kind = .{ .struct_def = .{ .fields = &recursive_fields } } },
+    };
+    const recursive_program = ir.Program{
+        .functions = &.{},
+        .type_defs = &recursive_type_defs,
+        .entry = null,
+    };
+
+    var normal_driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = recursive_program,
+    };
+    defer normal_driver.deinitOwnedState();
+
+    const boxed_struct = try normal_driver.boxRecursiveZigType(.{ .struct_ref = "Tree" });
+    try std.testing.expect(boxed_struct == .ptr);
+    try std.testing.expect(boxed_struct.ptr.* == .struct_ref);
+    try std.testing.expectEqualStrings("Tree", boxed_struct.ptr.struct_ref);
+
+    const optional_inner = try std.testing.allocator.create(ir.ZigType);
+    defer std.testing.allocator.destroy(optional_inner);
+    optional_inner.* = .{ .struct_ref = "Tree" };
+    const boxed_optional = try normal_driver.boxRecursiveZigType(.{ .optional = optional_inner });
+    try std.testing.expect(boxed_optional == .optional);
+    try std.testing.expect(boxed_optional.optional.* == .ptr);
+    try std.testing.expect(boxed_optional.optional.ptr.* == .struct_ref);
+    try std.testing.expectEqualStrings("Tree", boxed_optional.optional.ptr.struct_ref);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing_driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = failing_allocator.allocator(),
+        .program = recursive_program,
+    };
+    defer failing_driver.deinitOwnedState();
+
+    try std.testing.expectError(error.OutOfMemory, failing_driver.boxRecursiveZigType(.{ .struct_ref = "Tree" }));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "ZirDriver.collectNestedTupleTypes preserves DFS post-order" {
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+    };
+    defer driver.tuple_type_stack.deinit(driver.allocator);
+
+    const inner_elements = [_]ir.ZigType{ .i64, .string };
+    const outer_elements = [_]ir.ZigType{
+        .bool_type,
+        .{ .tuple = &inner_elements },
+    };
+    const tuple_type: ir.ZigType = .{ .tuple = &outer_elements };
+
+    try driver.collectNestedTupleTypes(tuple_type);
+
+    try std.testing.expectEqual(@as(usize, 2), driver.tuple_type_stack.items.len);
+    try std.testing.expect(driver.tuple_type_stack.items[0] == .tuple);
+    try std.testing.expect(driver.tuple_type_stack.items[1] == .tuple);
+    try std.testing.expectEqual(@as(usize, inner_elements.len), driver.tuple_type_stack.items[0].tuple.len);
+    try std.testing.expectEqual(@as(usize, outer_elements.len), driver.tuple_type_stack.items[1].tuple.len);
+}
+
+test "ZirDriver.collectNestedTupleTypes propagates stack allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = failing_allocator.allocator(),
+        .program = null,
+    };
+    defer driver.tuple_type_stack.deinit(driver.allocator);
+
+    const tuple_elements = [_]ir.ZigType{.i64};
+    const tuple_type: ir.ZigType = .{ .tuple = &tuple_elements };
+
+    try std.testing.expectError(error.OutOfMemory, driver.collectNestedTupleTypes(tuple_type));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), driver.tuple_type_stack.items.len);
+}
+
 test "closure lowering helper distinguishes immediate and stack tiers" {
     const lattice = @import("escape_lattice.zig");
 
@@ -11840,16 +12585,710 @@ test "findClosureTargetInInstrs follows local aliases" {
         .{ .share_value = .{ .dest = 6, .source = 5 } },
     };
 
-    const target = ZirDriver.findClosureTargetInInstrs(&instrs, 6) orelse return error.TestUnexpectedResult;
+    const target = (try ZirDriver.findClosureTargetInInstrs(std.testing.allocator, &instrs, 6)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(ir.FunctionId, 9), target.function_id);
     try std.testing.expectEqual(@as(usize, 1), target.captures.len);
     try std.testing.expectEqual(@as(ir.LocalId, 7), target.captures[0]);
+}
+
+test "findClosureTargetInInstrs resolves aliases beyond inline capacity" {
+    const allocator = std.testing.allocator;
+    const captures = [_]ir.LocalId{7};
+    var instrs: std.ArrayListUnmanaged(ir.Instruction) = .empty;
+    defer instrs.deinit(allocator);
+
+    try instrs.append(allocator, .{ .make_closure = .{ .dest = 0, .function = 9, .captures = &captures } });
+    for (1..72) |local_index| {
+        try instrs.append(allocator, .{ .local_set = .{
+            .dest = @intCast(local_index),
+            .value = @intCast(local_index - 1),
+        } });
+    }
+
+    const target = (try ZirDriver.findClosureTargetInInstrs(allocator, instrs.items, 71)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(ir.FunctionId, 9), target.function_id);
+    try std.testing.expectEqual(@as(usize, 1), target.captures.len);
+    try std.testing.expectEqual(@as(ir.LocalId, 7), target.captures[0]);
+}
+
+test "findClosureTargetInInstrs propagates visited allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const captures = [_]ir.LocalId{7};
+    const instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 4, .function = 9, .captures = &captures } },
+    };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ZirDriver.findClosureTargetInInstrs(failing_allocator.allocator(), &instrs, 4),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
 }
 
 test "encoded type-name resolver rejects unknown nested list elements" {
     try std.testing.expectEqual(@as(?u32, null), ZirDriver.encodedNameToTypeRef("not_a_type"));
     try std.testing.expect(ZirDriver.encodedNameToTypeRef("i64") != null);
     try std.testing.expect(ZirDriver.encodedNameToTypeRef("str") != null);
+}
+
+test "ZirDriver container type-ref helpers keep emission errors distinct from semantic null" {
+    const source = @embedFile("zir_builder.zig");
+    const container_start = std.mem.indexOf(u8, source, "fn emitContainerElementTypeRef") orelse return error.TestUnexpectedResult;
+    const container_end = std.mem.indexOfPos(u8, source, container_start, "/// Emit a comptime generic container instantiation.") orelse return error.TestUnexpectedResult;
+    const container_source = source[container_start..container_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, container_source, "fn emitContainerElementTypeRef(self: *ZirDriver, zig_type: ir.ZigType) BuildError!?u32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, container_source, "catch return null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, container_source, "catch null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, container_source, "== error_ref) return null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, container_source, "try self.emitStructTypeRef(name)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, container_source, "try self.emitGenericContainerRef(\"List\", &type_args)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, container_source, "try self.emitGenericContainerRef(\"Map\", &type_args)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, container_source, "try self.emitTermTypeRef()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, container_source, "try self.emitProtocolBoxTypeRef()") != null);
+
+    const encoded_start = std.mem.indexOf(u8, source, "fn emitEncodedContainerElementTypeRef") orelse return error.TestUnexpectedResult;
+    const encoded_end = std.mem.indexOfPos(u8, source, encoded_start, "/// Extract element type from a list ZigType.") orelse return error.TestUnexpectedResult;
+    const encoded_source = source[encoded_start..encoded_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded_source, "fn emitEncodedContainerElementTypeRef(self: *ZirDriver, name: []const u8) BuildError!?u32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_source, "catch null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_source, "if (!self.findAnyTypeDef(name)) return null;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_source, "return try self.emitStructTypeRef(name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_source, "fn emitRequiredEncodedContainerElementTypeRef(self: *ZirDriver, name: []const u8) BuildError!u32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_source, "orelse error.EmitFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_source, "fn encodedContainerElementNameIsKnown(self: *const ZirDriver, name: []const u8) bool") != null);
+
+    const map_cell_start = std.mem.indexOf(u8, source, "fn emitMapCellRef") orelse return error.TestUnexpectedResult;
+    const map_cell_end = std.mem.indexOfPos(u8, source, map_cell_start, "/// Set the return type to a generic container type.") orelse return error.TestUnexpectedResult;
+    const map_cell_source = source[map_cell_start..map_cell_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, map_cell_source, "orelse return error.EmitFailed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, map_cell_source, "zigTypeToTypeRef(key_type) orelse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, map_cell_source, "zigTypeToTypeRef(value_type) orelse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, map_cell_source, "@intFromEnum(Zir.Inst.Ref.u32_type)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, map_cell_source, "@intFromEnum(Zir.Inst.Ref.i64_type)") == null);
+}
+
+test "ZirDriver generic container builtin lowering propagates emission failures at source level" {
+    const source = @embedFile("zir_builder.zig");
+    const start = std.mem.indexOf(u8, source, "            .call_builtin => |cb| {") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, source, start, "            .list_init => |li| {") orelse return error.TestUnexpectedResult;
+    const call_builtin_source = source[start..end];
+
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "catch error_ref") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "catch break :blk") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "break :blk false") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "break :blk2 false") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "break :blk3 false") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "break :blk4 false") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "MapOf(u32, i64)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "const type_ref = try self.emitRequiredEncodedContainerElementTypeRef(type_name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "const key_ref = try self.emitRequiredEncodedContainerElementTypeRef(key_type_name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "const val_ref = try self.emitRequiredEncodedContainerElementTypeRef(value_struct_name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "const inner_type_ref = try self.emitRequiredEncodedContainerElementTypeRef(inner_type_name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "const helper_name = mapBridgeMethodToHelper(\"Map\", method_name) orelse return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_builtin_source, "const fn_ref = try self.emitRuntimeHelper(helper_name);") != null);
+}
+
+test "ZirDriver map init and match type lowering reject unresolved emission inputs at source level" {
+    const source = @embedFile("zir_builder.zig");
+    const map_start = std.mem.indexOf(u8, source, "            .map_init => |mi| {") orelse return error.TestUnexpectedResult;
+    const map_end = std.mem.indexOfPos(u8, source, map_start, "            .struct_init => |si| {") orelse return error.TestUnexpectedResult;
+    const map_source = source[map_start..map_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, map_source, "const key_type_ref = (try self.emitContainerElementTypeRef(mi.key_type)) orelse return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, map_source, "const val_type_ref = (try self.emitContainerElementTypeRef(mi.value_type)) orelse return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, map_source, "orelse @intFromEnum(Zir.Inst.Ref.u32_type)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, map_source, "orelse @intFromEnum(Zir.Inst.Ref.i64_type)") == null);
+
+    const match_start = std.mem.indexOf(u8, source, "            .match_type => |mt| {") orelse return error.TestUnexpectedResult;
+    const match_end = std.mem.indexOfPos(u8, source, match_start, "            .match_fail => |mf| {") orelse return error.TestUnexpectedResult;
+    const match_source = source[match_start..match_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, match_source, "if (ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, match_source, "if (ref != error_ref) try self.setLocal(mt.dest, ref);") == null);
+    try std.testing.expect(std.mem.indexOf(u8, match_source, "if (expected_type_raw == 0) {\n                    return error.EmitFailed;\n                }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, match_source, "Unsupported type or void") == null);
+    try std.testing.expect(std.mem.indexOf(u8, match_source, "emit true as fallback") == null);
+}
+
+test "ZirDriver nominal aggregate init lowering preserves type-ref emission failures" {
+    const source = @embedFile("zir_builder.zig");
+
+    const struct_start = std.mem.indexOf(u8, source, ".struct_init => |si| {") orelse return error.TestUnexpectedResult;
+    const struct_end = std.mem.indexOfPos(u8, source, struct_start, ".field_get => |fg| {") orelse return error.TestUnexpectedResult;
+    const struct_source = source[struct_start..struct_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, struct_source, "emitStructTypeRef(si.type_name) catch null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, struct_source, "const type_ref = try self.emitStructTypeRef(si.type_name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, struct_source, "if (typed == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, struct_source, "if (typed_result != error_ref) struct_value = typed_result;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, struct_source, "zir_builder_emit_struct_init_anon") != null);
+
+    const union_start = std.mem.indexOf(u8, source, ".union_init => |ui| {") orelse return error.TestUnexpectedResult;
+    const union_end = std.mem.indexOfPos(u8, source, union_start, ".box_as_protocol => |bx| {") orelse return error.TestUnexpectedResult;
+    const union_source = source[union_start..union_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, union_source, "emitStructTypeRef(ui.union_type) catch null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, union_source, "const union_type_ref = try self.emitStructTypeRef(ui.union_type);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, union_source, "if (typed == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, union_source, "if (ref != error_ref)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, union_source, "zir_builder_emit_struct_init_anon") != null);
+}
+
+test "ZirDriver struct default emission propagates primitive emit failures at source level" {
+    const source = @embedFile("zir_builder.zig");
+    const struct_start = std.mem.indexOf(u8, source, ".struct_init => |si| {") orelse return error.TestUnexpectedResult;
+    const struct_end = std.mem.indexOfPos(u8, source, struct_start, ".field_get => |fg| {") orelse return error.TestUnexpectedResult;
+    const struct_source = source[struct_start..struct_end];
+    const default_start = std.mem.indexOf(u8, struct_source, "Fill in missing fields with default values") orelse return error.TestUnexpectedResult;
+    const default_end = std.mem.indexOfPos(u8, struct_source, default_start, "A zero-field struct construction") orelse return error.TestUnexpectedResult;
+    const default_source = struct_source[default_start..default_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, default_source, "break :blk if (ref == error_ref)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_source, "@intFromEnum(Zir.Inst.Ref.zero) else ref") == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_source, "@intFromEnum(Zir.Inst.Ref.void_value) else ref") == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_source, "if (ref == error_ref) return error.EmitFailed;\n                                        break :blk ref;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_source, "const ref = zir_builder_emit_int(self.handle, v);\n                                        if (ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_source, "const ref = zir_builder_emit_float(self.handle, v);\n                                        if (ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_source, "const ref = zir_builder_emit_str(self.handle, v.ptr, @intCast(v.len));\n                                        if (ref == error_ref) return error.EmitFailed;") != null);
+}
+
+test "ZirDriver index_get term coercion propagates default emission failure at source level" {
+    const source = @embedFile("zir_builder.zig");
+    const index_get_start = std.mem.indexOf(u8, source, ".index_get => |ig| {") orelse return error.TestUnexpectedResult;
+    const index_get_end = std.mem.indexOfPos(u8, source, index_get_start, ".list_len_check => |llc| {") orelse return error.TestUnexpectedResult;
+    const index_get_source = source[index_get_start..index_get_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, index_get_source, "emitZeroDefaultForType(ig.coerce_term_to) catch ref") == null);
+    try std.testing.expect(std.mem.indexOf(u8, index_get_source, "const default_ref = try self.emitZeroDefaultForType(ig.coerce_term_to);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_get_source, "if (default_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_get_source, "const args = [_]u32{ ref, default_ref };") != null);
+}
+
+test "ZirDriver closure dispatch emission failures do not fall back at source level" {
+    const source = @embedFile("zir_builder.zig");
+
+    const tail_start = std.mem.indexOf(u8, source, "fn emitTailInvokeWrapperCall") orelse return error.TestUnexpectedResult;
+    const tail_end = std.mem.indexOfPos(u8, source, tail_start, "/// True when the `call_closure`") orelse return error.TestUnexpectedResult;
+    const tail_source = source[tail_start..tail_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, tail_source, "const func_def = self.findFunctionById(function_id) orelse return false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail_source, "if (env_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail_source, "if (arg_struct == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail_source, "if (ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail_source, "== error_ref) return false") == null);
+
+    const switch_start = std.mem.indexOf(u8, source, "fn emitClosureSwitchDispatch") orelse return error.TestUnexpectedResult;
+    const switch_end = std.mem.indexOfPos(u8, source, switch_start, "fn emitInstruction") orelse return error.TestUnexpectedResult;
+    const switch_source = source[switch_start..switch_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, switch_source, "if (call_fn_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, switch_source, "if (fallback_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, switch_source, "if (!emitted) return false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, switch_source, "== error_ref) return false") == null);
+
+    const param_start = std.mem.indexOf(u8, source, "                // Parameter-derived closures:") orelse return error.TestUnexpectedResult;
+    const runtime_start = std.mem.indexOfPos(u8, source, param_start, "const rt_ref = zir_builder_emit_import(self.handle, \"zap_runtime\", 11);") orelse return error.TestUnexpectedResult;
+    const runtime_end = std.mem.indexOfPos(u8, source, runtime_start, "\n                }\n\n                // Fast path:") orelse return error.TestUnexpectedResult;
+    const runtime_source = source[runtime_start..runtime_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, runtime_source, "if (rt_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_source, "if (kernel_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_source, "if (helper_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_source, "var ref = zir_builder_emit_call_ref(self.handle, helper_ref, full_args.items.ptr, @intCast(full_args.items.len));\n                    if (ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_source, "// Arity fallback: callCallableN helpers cover 0..3.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_source, "if (rt_ref != error_ref)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_source, "if (kernel_ref != error_ref)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_source, "if (helper_ref != error_ref)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_source, "if (ref != error_ref) {\n                                    // Cast the callCallableN result") == null);
+}
+
+test "CurrentElseInsts preserves old buffer when replacement allocation fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var current_else_insts = CurrentElseInsts.init(failing_allocator.allocator());
+    defer current_else_insts.deinit();
+
+    try current_else_insts.replaceWithCopy(&.{ 10, 20 });
+    try std.testing.expectError(error.OutOfMemory, current_else_insts.replaceWithCopy(&.{ 30, 40, 50 }));
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20 }, current_else_insts.get());
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "CurrentElseInsts clears consumed buffer before replacement" {
+    var current_else_insts = CurrentElseInsts.init(std.testing.allocator);
+    defer current_else_insts.deinit();
+
+    try current_else_insts.replaceWithCopy(&.{ 1, 2, 3 });
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, current_else_insts.get());
+
+    current_else_insts.clear();
+    try std.testing.expect(!current_else_insts.hasOwnedBuffer());
+
+    try current_else_insts.replaceWithSingle(99);
+    try std.testing.expectEqualSlices(u32, &.{99}, current_else_insts.get());
+
+    try current_else_insts.replaceWithEmpty();
+    try std.testing.expectEqual(@as(usize, 0), current_else_insts.get().len);
+}
+
+fn expectCurrentElseGuard(function_source: []const u8, initial_replace_marker: []const u8) !void {
+    const init_marker = "var current_else_insts = CurrentElseInsts.init(self.allocator);";
+    const defer_marker = "defer current_else_insts.deinit();";
+    const get_marker = "const else_insts = current_else_insts.get();";
+    const clear_marker = "current_else_insts.clear();";
+
+    const init_pos = std.mem.indexOf(u8, function_source, init_marker) orelse return error.TestUnexpectedResult;
+    const defer_pos = std.mem.indexOfPos(u8, function_source, init_pos, defer_marker) orelse return error.TestUnexpectedResult;
+    const initial_replace_pos = std.mem.indexOfPos(u8, function_source, defer_pos, initial_replace_marker) orelse return error.TestUnexpectedResult;
+    const get_pos = std.mem.indexOfPos(u8, function_source, initial_replace_pos, get_marker) orelse return error.TestUnexpectedResult;
+    const clear_pos = std.mem.indexOfPos(u8, function_source, get_pos, clear_marker) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(init_pos < defer_pos);
+    try std.testing.expect(defer_pos < initial_replace_pos);
+    try std.testing.expect(initial_replace_pos < get_pos);
+    try std.testing.expect(get_pos < clear_pos);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "self.allocator.free(current_else_insts)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "current_else_insts = try self.allocator.alloc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "var current_else_insts = try self.allocator.alloc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, function_source, "current_else_insts.ptr") == null);
+}
+
+test "ZirDriver current else instruction ownership is guarded across nested emitters at source level" {
+    const source = @embedFile("zir_builder.zig");
+
+    const CurrentElseSource = struct {
+        start_marker: []const u8,
+        end_marker: []const u8,
+        initial_replace_marker: []const u8,
+    };
+    const current_else_sources = [_]CurrentElseSource{
+        .{
+            .start_marker = "fn emitClosureSwitchDispatch",
+            .end_marker = "fn emitInstruction",
+            .initial_replace_marker = "try current_else_insts.replaceWithCopy(else_ptr[0..else_len]);",
+        },
+        .{
+            .start_marker = "fn emitFlattenedGuardSequence",
+            .end_marker = "/// Emit a guard block",
+            .initial_replace_marker = "try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);",
+        },
+        .{
+            .start_marker = "fn emitSwitchLiteral",
+            .end_marker = "/// Emit a case_block as a chain",
+            .initial_replace_marker = "try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);",
+        },
+        .{
+            .start_marker = "fn emitCaseBlock",
+            .end_marker = "/// Find the setup instruction",
+            .initial_replace_marker = "try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);",
+        },
+        .{
+            .start_marker = "fn emitFlatCaseBlock",
+            .end_marker = "/// Emit a switch_return",
+            .initial_replace_marker = "try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);",
+        },
+        .{
+            .start_marker = "fn emitSwitchReturn",
+            .end_marker = "/// Emit a union_switch_return",
+            .initial_replace_marker = "try current_else_insts.replaceWithCopy(default_ptr[0..default_len]);",
+        },
+        .{
+            .start_marker = "fn emitUnionSwitchReturn",
+            .end_marker = "/// Emit a `f(nil) / f(t :: T)` optional dispatcher",
+            .initial_replace_marker = "try current_else_insts.replaceWithEmpty();",
+        },
+    };
+
+    for (current_else_sources) |current_else_source| {
+        const source_start = std.mem.indexOf(u8, source, current_else_source.start_marker) orelse return error.TestUnexpectedResult;
+        const source_end = std.mem.indexOfPos(u8, source, source_start, current_else_source.end_marker) orelse return error.TestUnexpectedResult;
+        try expectCurrentElseGuard(source[source_start..source_end], current_else_source.initial_replace_marker);
+    }
+}
+
+test "ZirDriver closure switch dispatch owns else body on all exits at source level" {
+    const source = @embedFile("zir_builder.zig");
+
+    const switch_start = std.mem.indexOf(u8, source, "fn emitClosureSwitchDispatch") orelse return error.TestUnexpectedResult;
+    const switch_end = std.mem.indexOfPos(u8, source, switch_start, "fn emitInstruction") orelse return error.TestUnexpectedResult;
+    const switch_source = source[switch_start..switch_end];
+
+    const owner = "var current_else_insts = CurrentElseInsts.init(self.allocator);";
+    const immediate_defer = "defer current_else_insts.deinit();";
+    const initial_else_copy = "try current_else_insts.replaceWithCopy(else_ptr[0..else_len]);";
+    const loop_start = "var emitted = false;";
+
+    const owner_pos = std.mem.indexOf(u8, switch_source, owner) orelse return error.TestUnexpectedResult;
+    const defer_pos = std.mem.indexOfPos(u8, switch_source, owner_pos, immediate_defer) orelse return error.TestUnexpectedResult;
+    const copy_pos = std.mem.indexOfPos(u8, switch_source, defer_pos, initial_else_copy) orelse return error.TestUnexpectedResult;
+    const loop_pos = std.mem.indexOfPos(u8, switch_source, defer_pos, loop_start) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(owner_pos < defer_pos);
+    try std.testing.expect(defer_pos < copy_pos);
+    try std.testing.expect(copy_pos < loop_pos);
+    try std.testing.expect(defer_pos < loop_pos);
+    try std.testing.expect(std.mem.indexOf(u8, switch_source, "defer self.allocator.free(current_else_insts);\n        if (!emitted) return false;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, switch_source, "const else_insts = current_else_insts.get();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, switch_source, "current_else_insts.clear();") != null);
+}
+
+test "ZirDriver closure switch dispatch balances capture cleanup on error at source level" {
+    const source = @embedFile("zir_builder.zig");
+
+    const helper_start = std.mem.indexOf(u8, source, "fn discardCapture") orelse return error.TestUnexpectedResult;
+    const helper_end = std.mem.indexOfPos(u8, source, helper_start, "/// Phase E.7") orelse return error.TestUnexpectedResult;
+    const helper_source = source[helper_start..helper_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "_ = self.endCapture(&discard_len);") != null);
+
+    const switch_start = std.mem.indexOf(u8, source, "fn emitClosureSwitchDispatch") orelse return error.TestUnexpectedResult;
+    const switch_end = std.mem.indexOfPos(u8, source, switch_start, "fn emitInstruction") orelse return error.TestUnexpectedResult;
+    const switch_source = source[switch_start..switch_end];
+
+    try expectCaptureCleanupBalance(switch_source, 2);
+
+    const fallback_begin = std.mem.indexOf(u8, switch_source, "self.beginCapture();") orelse return error.TestUnexpectedResult;
+    const fallback_errdefer = std.mem.indexOfPos(u8, switch_source, fallback_begin, "errdefer if (fallback_capture_open) self.discardCapture();") orelse return error.TestUnexpectedResult;
+    const fallback_call = std.mem.indexOfPos(u8, switch_source, fallback_errdefer, "fallback_ref = zir_builder_emit_call_ref") orelse return error.TestUnexpectedResult;
+    const fallback_end = std.mem.indexOfPos(u8, switch_source, fallback_call, "const else_ptr = self.endCapture(&else_len);") orelse return error.TestUnexpectedResult;
+    const fallback_close = std.mem.indexOfPos(u8, switch_source, fallback_end, "fallback_capture_open = false;") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(fallback_begin < fallback_errdefer);
+    try std.testing.expect(fallback_errdefer < fallback_call);
+    try std.testing.expect(fallback_end < fallback_close);
+
+    const then_begin = std.mem.indexOfPos(u8, switch_source, fallback_call, "self.beginCapture();") orelse return error.TestUnexpectedResult;
+    const then_errdefer = std.mem.indexOfPos(u8, switch_source, then_begin, "errdefer if (capture_open) self.discardCapture();") orelse return error.TestUnexpectedResult;
+    const direct_call = std.mem.indexOfPos(u8, switch_source, then_errdefer, "const direct_ref = try self.emitNamedCallToTarget") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(then_begin < then_errdefer);
+    try std.testing.expect(then_errdefer < direct_call);
+}
+
+test "ZirDriver try_call_named balances capture cleanup on error at source level" {
+    const source = @embedFile("zir_builder.zig");
+
+    const helper_start = std.mem.indexOf(u8, source, "fn discardCapture") orelse return error.TestUnexpectedResult;
+    const helper_end = std.mem.indexOfPos(u8, source, helper_start, "/// Phase E.7") orelse return error.TestUnexpectedResult;
+    const helper_source = source[helper_start..helper_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, helper_source, "_ = self.endCapture(&discard_len);") != null);
+
+    const emit_start = std.mem.indexOf(u8, source, "fn emitInstruction") orelse return error.TestUnexpectedResult;
+    const try_call_start = std.mem.indexOfPos(u8, source, emit_start, "            .try_call_named => |tcn| {") orelse return error.TestUnexpectedResult;
+    const try_call_end = std.mem.indexOfPos(u8, source, try_call_start, "            // Error catch") orelse return error.TestUnexpectedResult;
+    const try_call_source = source[try_call_start..try_call_end];
+
+    const begin_count = std.mem.count(u8, try_call_source, "self.beginCapture();");
+    const guarded_cleanup_count = std.mem.count(u8, try_call_source, "errdefer if (capture_open) self.discardCapture();");
+
+    try std.testing.expectEqual(@as(usize, 2), begin_count);
+    try std.testing.expectEqual(begin_count, guarded_cleanup_count);
+
+    const then_begin = std.mem.indexOf(u8, try_call_source, "self.beginCapture();") orelse return error.TestUnexpectedResult;
+    const then_errdefer = std.mem.indexOfPos(u8, try_call_source, then_begin, "errdefer if (capture_open) self.discardCapture();") orelse return error.TestUnexpectedResult;
+    const payload_emit = std.mem.indexOfPos(u8, try_call_source, then_errdefer, "const payload = zir_builder_emit_optional_payload_unsafe") orelse return error.TestUnexpectedResult;
+    const then_end = std.mem.indexOfPos(u8, try_call_source, payload_emit, "const then_ptr = self.endCapture(&then_len);") orelse return error.TestUnexpectedResult;
+    const then_close = std.mem.indexOfPos(u8, try_call_source, then_end, "capture_open = false;") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(then_begin < then_errdefer);
+    try std.testing.expect(then_errdefer < payload_emit);
+    try std.testing.expect(then_end < then_close);
+
+    const else_begin = std.mem.indexOfPos(u8, try_call_source, then_close, "self.beginCapture();") orelse return error.TestUnexpectedResult;
+    const else_errdefer = std.mem.indexOfPos(u8, try_call_source, else_begin, "errdefer if (capture_open) self.discardCapture();") orelse return error.TestUnexpectedResult;
+    const handler_loop = std.mem.indexOfPos(u8, try_call_source, else_errdefer, "for (tcn.handler_instrs) |hi| try self.emitInstruction(hi);") orelse return error.TestUnexpectedResult;
+    const handler_result = std.mem.indexOfPos(u8, try_call_source, handler_loop, "const handler_result_ref = if (tcn.handler_result) |hr|") orelse return error.TestUnexpectedResult;
+    const else_end = std.mem.indexOfPos(u8, try_call_source, handler_result, "const else_ptr = self.endCapture(&else_len);") orelse return error.TestUnexpectedResult;
+    const else_close = std.mem.indexOfPos(u8, try_call_source, else_end, "capture_open = false;") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(else_begin < else_errdefer);
+    try std.testing.expect(else_errdefer < handler_loop);
+    try std.testing.expect(handler_result < else_end);
+    try std.testing.expect(else_end < else_close);
+}
+
+fn expectCaptureCleanupBalance(function_source: []const u8, expected_begin_count: usize) !void {
+    const begin_marker = "self.beginCapture();";
+    const errdefer_marker = "errdefer if (";
+    const discard_marker = ") self.discardCapture();";
+    const end_marker = "self.endCapture(&";
+
+    var search_pos: usize = 0;
+    var begin_count: usize = 0;
+    while (std.mem.indexOfPos(u8, function_source, search_pos, begin_marker)) |begin_pos| {
+        begin_count += 1;
+
+        const end_pos = std.mem.indexOfPos(u8, function_source, begin_pos, end_marker) orelse return error.TestUnexpectedResult;
+        const errdefer_pos = std.mem.indexOfPos(u8, function_source, begin_pos, errdefer_marker) orelse return error.TestUnexpectedResult;
+        const discard_pos = std.mem.indexOfPos(
+            u8,
+            function_source,
+            errdefer_pos + errdefer_marker.len,
+            discard_marker,
+        ) orelse return error.TestUnexpectedResult;
+
+        try std.testing.expect(errdefer_pos < end_pos);
+        try std.testing.expect(discard_pos < end_pos);
+
+        const flag_name = function_source[errdefer_pos + errdefer_marker.len .. discard_pos];
+        try std.testing.expect(flag_name.len > 0);
+
+        const close_marker = try std.fmt.allocPrint(std.testing.allocator, "{s} = false;", .{flag_name});
+        defer std.testing.allocator.free(close_marker);
+
+        const close_pos = std.mem.indexOfPos(
+            u8,
+            function_source,
+            end_pos + end_marker.len,
+            close_marker,
+        ) orelse return error.TestUnexpectedResult;
+        const next_begin_pos = std.mem.indexOfPos(
+            u8,
+            function_source,
+            begin_pos + begin_marker.len,
+            begin_marker,
+        ) orelse function_source.len;
+        try std.testing.expect(close_pos < next_begin_pos);
+
+        search_pos = begin_pos + begin_marker.len;
+    }
+
+    try std.testing.expectEqual(expected_begin_count, begin_count);
+}
+
+test "ZirDriver P4J2 remaining capture cleanup paths are balanced at source level" {
+    const source = @embedFile("zir_builder.zig");
+
+    const CaptureSource = struct {
+        start_marker: []const u8,
+        end_marker: []const u8,
+        begin_count: usize,
+    };
+    const captures = [_]CaptureSource{
+        .{
+            .start_marker = "fn emitFunction(self: *ZirDriver",
+            .end_marker = "/// Allocate one mutable stack slot per parameter",
+            .begin_count = 1,
+        },
+        .{
+            .start_marker = "            .unwrap_error_union => |ueu| {",
+            .end_marker = "            // Builtin calls",
+            .begin_count = 1,
+        },
+        .{
+            .start_marker = "            .optional_unwrap => |ou| {",
+            .end_marker = "            .bin_len_check => |blc| {",
+            .begin_count = 2,
+        },
+        .{
+            .start_marker = "fn emitIfExpr",
+            .end_marker = "/// Emit a flat IR instruction sequence",
+            .begin_count = 2,
+        },
+        .{
+            .start_marker = "fn emitFlattenedGuardSequence",
+            .end_marker = "/// Emit a guard block",
+            .begin_count = 2,
+        },
+        .{
+            .start_marker = "fn emitGuardBlock",
+            .end_marker = "/// Emit a short-circuit boolean AND",
+            .begin_count = 1,
+        },
+        .{
+            .start_marker = "fn emitIndirectFieldDeref",
+            .end_marker = "/// Emit a mutable stack allocation",
+            .begin_count = 2,
+        },
+        .{
+            .start_marker = "fn emitSwitchLiteral",
+            .end_marker = "/// Emit a case_block as a chain",
+            .begin_count = 2,
+        },
+        .{
+            .start_marker = "fn emitCaseBlock",
+            .end_marker = "/// Find the setup instruction",
+            .begin_count = 2,
+        },
+        .{
+            .start_marker = "fn emitFlatCaseBlock",
+            .end_marker = "/// Emit a switch_return",
+            .begin_count = 3,
+        },
+        .{
+            .start_marker = "fn emitSwitchReturn",
+            .end_marker = "/// Emit a union_switch_return",
+            .begin_count = 2,
+        },
+        .{
+            .start_marker = "fn emitUnionSwitchReturn",
+            .end_marker = "/// Emit a `f(nil) / f(t :: T)` optional dispatcher",
+            .begin_count = 1,
+        },
+        .{
+            .start_marker = "fn emitOptionalDispatch",
+            .end_marker = "/// Lower a `union_switch` IR instruction",
+            .begin_count = 2,
+        },
+        .{
+            .start_marker = "fn emitSwitchProngBody",
+            .end_marker = "// ---------------------------------------------------------------------------\n// Public API",
+            .begin_count = 1,
+        },
+    };
+
+    for (captures) |capture_source| {
+        const source_start = std.mem.indexOf(u8, source, capture_source.start_marker) orelse return error.TestUnexpectedResult;
+        const source_end = std.mem.indexOfPos(u8, source, source_start, capture_source.end_marker) orelse return error.TestUnexpectedResult;
+        try expectCaptureCleanupBalance(source[source_start..source_end], capture_source.begin_count);
+    }
+
+    const prong_start = std.mem.indexOf(u8, source, "fn emitSwitchProngBody") orelse return error.TestUnexpectedResult;
+    const prong_end = std.mem.indexOfPos(u8, source, prong_start, "// ---------------------------------------------------------------------------\n// Public API") orelse return error.TestUnexpectedResult;
+    const prong_source = source[prong_start..prong_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, prong_source, "zir_builder_begin_capture(self.handle);") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prong_source, "zir_builder_end_capture(self.handle") == null);
+}
+
+test "ZirDriver try_call_named owns then body until if-else emission at source level" {
+    const source = @embedFile("zir_builder.zig");
+
+    const emit_start = std.mem.indexOf(u8, source, "fn emitInstruction") orelse return error.TestUnexpectedResult;
+    const try_call_start = std.mem.indexOfPos(u8, source, emit_start, "            .try_call_named => |tcn| {") orelse return error.TestUnexpectedResult;
+    const try_call_end = std.mem.indexOfPos(u8, source, try_call_start, "            // Error catch") orelse return error.TestUnexpectedResult;
+    const try_call_source = source[try_call_start..try_call_end];
+
+    const then_alloc = std.mem.indexOf(u8, try_call_source, "const then_insts = try self.allocator.alloc(u32, then_len);") orelse return error.TestUnexpectedResult;
+    const then_copy = std.mem.indexOfPos(u8, try_call_source, then_alloc, "@memcpy(then_insts, then_ptr[0..then_len]);") orelse return error.TestUnexpectedResult;
+    const then_transfer = std.mem.indexOfPos(u8, try_call_source, then_copy, "break :blk .{ .insts = then_insts, .result = success_value_ref };") orelse return error.TestUnexpectedResult;
+    const then_defer = std.mem.indexOfPos(u8, try_call_source, then_transfer, "defer self.allocator.free(then_body.insts);") orelse return error.TestUnexpectedResult;
+    const else_begin = std.mem.indexOfPos(u8, try_call_source, then_defer, "self.beginCapture();") orelse return error.TestUnexpectedResult;
+    const emit_if_else = std.mem.indexOfPos(u8, try_call_source, else_begin, "const result = zir_builder_emit_if_else_bodies(") orelse return error.TestUnexpectedResult;
+    const result_check = std.mem.indexOfPos(u8, try_call_source, emit_if_else, "if (result == error_ref) return error.EmitFailed;") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(then_alloc < then_copy);
+    try std.testing.expect(then_copy < then_transfer);
+    try std.testing.expect(then_transfer < then_defer);
+    try std.testing.expect(then_defer < else_begin);
+    try std.testing.expect(then_defer < emit_if_else);
+    try std.testing.expect(emit_if_else < result_check);
+    try std.testing.expect(std.mem.indexOf(u8, try_call_source, "self.allocator.free(then_insts);\n                if (result == error_ref) return error.EmitFailed;") == null);
+}
+
+test "ZirDriver P4J2 residual error_ref paths fail instead of falling through" {
+    const source = @embedFile("zir_builder.zig");
+
+    const param_start = std.mem.indexOf(u8, source, "fn emitTypedParam") orelse return error.TestUnexpectedResult;
+    const param_end = std.mem.indexOfPos(u8, source, param_start, "/// Emit the return type declaration") orelse return error.TestUnexpectedResult;
+    const param_source = source[param_start..param_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, param_source, "if (ref != error_ref) return ref;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, param_source, "zir_builder_emit_param_this_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, param_source, "zir_builder_emit_param_decl_val_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, param_source, "zir_builder_emit_param_imported_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, param_source, "zir_builder_emit_param_imported_root_type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, param_source, "if (ref == error_ref) return error.EmitFailed;") != null);
+
+    const call_named_start = std.mem.indexOf(u8, source, "            .call_named => |cn| {") orelse return error.TestUnexpectedResult;
+    const call_named_end = std.mem.indexOfPos(u8, source, call_named_start, "            .try_call_named => |tcn| {") orelse return error.TestUnexpectedResult;
+    const call_named_source = source[call_named_start..call_named_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, call_named_source, "if (ref != error_ref) {\n                            try self.setLocal(cn.dest, ref);\n                        }") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_named_source, "if (ref == error_ref) return error.EmitFailed;\n                        try self.setLocal(cn.dest, ref);") != null);
+
+    const call_direct_start = std.mem.indexOf(u8, source, "            .call_direct => |cd| {") orelse return error.TestUnexpectedResult;
+    const call_direct_end = std.mem.indexOfPos(u8, source, call_direct_start, "            .call_closure => |cc| {") orelse return error.TestUnexpectedResult;
+    const call_direct_source = source[call_direct_start..call_direct_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, call_direct_source, "if (func_name) |fname| {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_direct_source, "return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_direct_source, "no program context") != null);
+
+    const call_closure_start = std.mem.indexOf(u8, source, "            .call_closure => |cc| {") orelse return error.TestUnexpectedResult;
+    const call_closure_end = std.mem.indexOfPos(u8, source, call_closure_start, "            .make_closure => |mc| {") orelse return error.TestUnexpectedResult;
+    const call_closure_source = source[call_closure_start..call_closure_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, call_closure_source, "if (cast != error_ref) ref = cast;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_closure_source, "if (cast2 != error_ref) ref = cast2;") == null);
+    try std.testing.expect(std.mem.count(u8, call_closure_source, "if (cast == error_ref) return error.EmitFailed;\n                        ref = cast;") >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, call_closure_source, "if (cast2 == error_ref) return error.EmitFailed;\n                                ref = cast2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_closure_source, "if (call_fn_ref == error_ref) {\n                        // Fallback: callee might be a bare function ref") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_closure_source, "if (call_fn_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call_closure_source, "if (ref != error_ref) {\n                                            try self.setLocal(cc.dest, ref);") == null);
+    try std.testing.expect(std.mem.indexOf(u8, call_closure_source, "if (ref != error_ref) try self.setLocal(cc.dest, ref);") == null);
+
+    const make_closure_start = std.mem.indexOf(u8, source, "            .make_closure => |mc| {") orelse return error.TestUnexpectedResult;
+    const make_closure_end = std.mem.indexOfPos(u8, source, make_closure_start, "            .capture_get => |cg| {") orelse return error.TestUnexpectedResult;
+    const make_closure_source = source[make_closure_start..make_closure_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, make_closure_source, "break :blk if (ref != error_ref) ref else zir_builder_emit_str") == null);
+    try std.testing.expect(std.mem.indexOf(u8, make_closure_source, "zir_builder_emit_str(self.handle, emit_name.ptr") == null);
+    try std.testing.expect(std.mem.indexOf(u8, make_closure_source, "if (ref == error_ref) return error.EmitFailed;\n                    break :blk ref;") != null);
+
+    const capture_get_start = std.mem.indexOf(u8, source, "            .capture_get => |cg| {") orelse return error.TestUnexpectedResult;
+    const capture_get_end = std.mem.indexOfPos(u8, source, capture_get_start, "            .optional_unwrap => |ou| {") orelse return error.TestUnexpectedResult;
+    const capture_get_source = source[capture_get_start..capture_get_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, capture_get_source, "if (ref != error_ref) try self.setLocal(cg.dest, ref);") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture_get_source, "const ref = zir_builder_emit_void(self.handle);\n                            if (ref == error_ref) return error.EmitFailed;\n                            try self.setLocal(cg.dest, ref);\n                            return;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture_get_source, "const ref = zir_builder_emit_void(self.handle);\n                if (ref == error_ref) return error.EmitFailed;\n                try self.setLocal(cg.dest, ref);") != null);
+}
+
+test "ZirDriver P4J2 side-effect emissions propagate backend failures at source level" {
+    const source = @embedFile("zir_builder.zig");
+    const discarded_emit = "_ = " ++ "zir_builder_emit_";
+
+    try std.testing.expect(std.mem.indexOf(u8, source, discarded_emit) == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const serialize_ref = zir_builder_emit_call_ref(self.handle, serialize_fn, &ser_args, 1);\n                if (serialize_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const note_consume_ref = zir_builder_emit_call_ref(self.handle, note_consume_fn, &args, 0);\n                                if (note_consume_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (!zir_builder_emit_set_runtime_safety(self.handle, ref)) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const sink_ref = zir_builder_emit_call_ref(self.handle, sink_fn, &args, 1);\n                if (sink_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (zir_builder_emit_unreachable(self.handle) != 0) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const retain_ref = zir_builder_emit_call_ref(self.handle, retain_helper, &retain_args, 1);\n                    if (retain_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const retain_ref = zir_builder_emit_call_ref(self.handle, retain_fn, &args, 1);\n                            if (retain_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const note_return_ref = zir_builder_emit_call_ref(self.handle, note_return_fn, &args, 0);\n                        if (note_return_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const drop_ref = zir_builder_emit_call_ref(self.handle, drop_fn, &drop_args, 1);\n                    if (drop_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const release_ref = zir_builder_emit_call_ref(self.handle, release_fn, &args, 2);\n                    if (release_ref == error_ref) return error.EmitFailed;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "const guard_ref = zir_builder_emit_if_else_bodies(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "if (guard_ref == error_ref) return error.EmitFailed;") != null);
+}
+
+test "ZirDriver P4J2 synthetic namespace stubs propagate registration failures at source level" {
+    const source = @embedFile("zir_builder.zig");
+
+    const registration_start = std.mem.indexOf(u8, source, "// Register empty stub structs for any namespace name") orelse return error.TestUnexpectedResult;
+    const registration_end = std.mem.indexOfPos(u8, source, registration_start, "// ── Step 3: Emit each leaf struct as its own ZIR struct") orelse return error.TestUnexpectedResult;
+    const registration_source = source[registration_start..registration_end];
+
+    const discarded_struct_source_registration = "_ = " ++ "zir_compilation_add_struct_source";
+    try std.testing.expect(std.mem.indexOf(u8, registration_source, discarded_struct_source_registration) == null);
+
+    try std.testing.expect(std.mem.indexOf(u8, registration_source, "if (zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len)) != 0) {\n                            return error.EmitFailed;\n                        }") != null);
+}
+
+test "ZirDriver P4J2 namespace re-export source ownership is balanced at source level" {
+    const source = @embedFile("zir_builder.zig");
+
+    const reexport_start = std.mem.indexOf(u8, source, "// ── Step 4: Generate namespace re-export structs") orelse return error.TestUnexpectedResult;
+    const reexport_end = std.mem.indexOfPos(u8, source, reexport_start, "// ── Step 5: Emit root struct functions") orelse return error.TestUnexpectedResult;
+    const reexport_source = source[reexport_start..reexport_end];
+
+    const source_buf_decl = std.mem.indexOf(u8, reexport_source, "var source_buf: std.ArrayListUnmanaged(u8) = .empty;") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, reexport_source, source_buf_decl, "defer source_buf.deinit(self.allocator);") orelse return error.TestUnexpectedResult;
+
+    const line_alloc = std.mem.indexOf(u8, reexport_source, "const line = try std.fmt.allocPrint(self.allocator") orelse return error.TestUnexpectedResult;
+    const line_free = std.mem.indexOfPos(u8, reexport_source, line_alloc, "defer self.allocator.free(line);") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, reexport_source, line_free, "try source_buf.appendSlice(self.allocator, line);") orelse return error.TestUnexpectedResult;
+
+    const source_owned = std.mem.indexOf(u8, reexport_source, "const source = try source_buf.toOwnedSlice(self.allocator);") orelse return error.TestUnexpectedResult;
+    const source_free = std.mem.indexOfPos(u8, reexport_source, source_owned, "defer self.allocator.free(source);") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, reexport_source, source_free, "The Zig fork copies the bytes synchronously") orelse return error.TestUnexpectedResult;
+    const registration = std.mem.indexOfPos(u8, reexport_source, source_free, "const registration_status = zir_compilation_add_struct_source(c, parent_z, source.ptr, @intCast(source.len));") orelse return error.TestUnexpectedResult;
+    _ = std.mem.indexOfPos(u8, reexport_source, registration, "if (registration_status != 0) {\n                        return error.EmitFailed;\n                    }") orelse return error.TestUnexpectedResult;
 }
 
 // Runtime function routing is handled by `:zig.Struct.function(args)` calls
@@ -11972,6 +13411,38 @@ test "ZirDriver.isReleaseSuppressed: causes are independent" {
     try std.testing.expect(!driver.arc_share_skipped.contains(51));
 }
 
+test "ZirDriver.unmarkShareSkippedForClone clears provisional suppression only under clone-on-share" {
+    const memory_abi = @import("memory/abi.zig");
+
+    var tracking_driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+        .declared_caps = memory_abi.CAPS_INDIVIDUAL_NO_REFCOUNT,
+    };
+    defer tracking_driver.arc_share_skipped.deinit(tracking_driver.allocator);
+
+    try tracking_driver.arc_share_skipped.put(tracking_driver.allocator, 7, {});
+    tracking_driver.unmarkShareSkippedForClone(7);
+    try std.testing.expect(!tracking_driver.arc_share_skipped.contains(7));
+
+    var arc_driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+        .declared_caps = memory_abi.REFCOUNT_V1_BIT,
+    };
+    defer arc_driver.arc_share_skipped.deinit(arc_driver.allocator);
+
+    try arc_driver.arc_share_skipped.put(arc_driver.allocator, 8, {});
+    arc_driver.unmarkShareSkippedForClone(8);
+    try std.testing.expect(arc_driver.arc_share_skipped.contains(8));
+}
+
 test "ZirDriver.shouldSkipArc returns true unconditionally under declared_caps=0" {
     // Phase 6 elision contract: when the active manager omits
     // REFCOUNT_V1, every retain/release call site is skipped before
@@ -12076,6 +13547,143 @@ test "ZirDriver.shouldSkipArc respects local state under REFCOUNT_V1" {
     // global-escape local — not stack-eligible per the escape lattice,
     // so retain/release must fire.
     try std.testing.expect(!driver.shouldSkipArc(200));
+}
+
+test "ZirDriver.arcReleaseValueRefForLocal skips trivial locals and trusts arc-managed releases" {
+    const local_ownership = [_]ir.OwnershipClass{
+        .trivial,
+        .owned,
+        .owned,
+        .trivial,
+    };
+    const value_ref = @intFromEnum(Zir.Inst.Ref.one);
+    const void_ref = @intFromEnum(Zir.Inst.Ref.void_value);
+
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+        .current_function_local_ownership = &local_ownership,
+    };
+    defer driver.local_refs.deinit(driver.allocator);
+    defer driver.arc_managed_locals.deinit(driver.allocator);
+
+    try driver.local_refs.put(driver.allocator, 0, .{ .inst = value_ref });
+    try driver.local_refs.put(driver.allocator, 1, .{ .inst = void_ref });
+    try driver.local_refs.put(driver.allocator, 2, .{ .inst = value_ref });
+    try driver.local_refs.put(driver.allocator, 3, .{ .inst = value_ref });
+    try driver.arc_managed_locals.put(driver.allocator, 3, {});
+
+    try std.testing.expect(try driver.arcReleaseValueRefForLocal(0) == null);
+    try std.testing.expectError(error.EmitFailed, driver.arcReleaseValueRefForLocal(1));
+    const releasable = (try driver.arcReleaseValueRefForLocal(2)).?;
+    switch (releasable) {
+        .inst => |ref| try std.testing.expectEqual(value_ref, ref),
+        .decl => return error.UnexpectedDeclRef,
+    }
+    const arc_managed_trivial = (try driver.arcReleaseValueRefForLocal(3)).?;
+    switch (arc_managed_trivial) {
+        .inst => |ref| try std.testing.expectEqual(value_ref, ref),
+        .decl => return error.UnexpectedDeclRef,
+    }
+}
+
+test "ZirDriver.aggregateComponentOriginalRefForLocal preserves pre-rebind component ref" {
+    const original_ref = @intFromEnum(Zir.Inst.Ref.one);
+    const rebound_ref = @intFromEnum(Zir.Inst.Ref.zero);
+
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+    };
+    defer driver.local_refs.deinit(driver.allocator);
+    defer driver.aggregate_component_original_refs.deinit(driver.allocator);
+
+    try driver.local_refs.put(driver.allocator, 0, .{ .inst = rebound_ref });
+    try driver.aggregate_component_original_refs.put(driver.allocator, 0, original_ref);
+
+    try std.testing.expectEqual(
+        original_ref,
+        driver.aggregateComponentOriginalRefForLocal(0).?,
+    );
+    try std.testing.expectEqual(rebound_ref, driver.local_refs.get(0).?.inst);
+    try std.testing.expect(driver.aggregateComponentOriginalRefForLocal(1) == null);
+}
+
+test "StructEmissionScope restores driver state and destroys unconsumed temporary handle" {
+    const FakeDestroy = struct {
+        var call_count: usize = 0;
+        var destroyed_handle: ?*ZirBuilderHandle = null;
+
+        fn destroy(handle: *ZirBuilderHandle) void {
+            call_count += 1;
+            destroyed_handle = handle;
+        }
+    };
+    FakeDestroy.call_count = 0;
+    FakeDestroy.destroyed_handle = null;
+
+    const root_handle: *ZirBuilderHandle = @ptrFromInt(0x1000);
+    const temporary_handle: *ZirBuilderHandle = @ptrFromInt(0x2000);
+    var driver = ZirDriver{
+        .handle = root_handle,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+    };
+    driver.current_emit_struct = "Root";
+
+    {
+        var struct_scope = StructEmissionScope.enterWithDestroyFn(&driver, temporary_handle, "Leaf", FakeDestroy.destroy);
+        defer struct_scope.deinit();
+
+        try std.testing.expect(driver.handle == temporary_handle);
+        try std.testing.expectEqualStrings("Leaf", driver.current_emit_struct.?);
+    }
+
+    try std.testing.expect(driver.handle == root_handle);
+    try std.testing.expectEqualStrings("Root", driver.current_emit_struct.?);
+    try std.testing.expectEqual(@as(usize, 1), FakeDestroy.call_count);
+    try std.testing.expect(FakeDestroy.destroyed_handle.? == temporary_handle);
+}
+
+test "StructEmissionScope transfers consumed temporary handle and restores driver state" {
+    const FakeDestroy = struct {
+        var call_count: usize = 0;
+
+        fn destroy(_: *ZirBuilderHandle) void {
+            call_count += 1;
+        }
+    };
+    FakeDestroy.call_count = 0;
+
+    const root_handle: *ZirBuilderHandle = @ptrFromInt(0x3000);
+    const temporary_handle: *ZirBuilderHandle = @ptrFromInt(0x4000);
+    var driver = ZirDriver{
+        .handle = root_handle,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+    };
+    {
+        var struct_scope = StructEmissionScope.enterWithDestroyFn(&driver, temporary_handle, "Leaf", FakeDestroy.destroy);
+        defer struct_scope.deinit();
+
+        try std.testing.expect(driver.handle == temporary_handle);
+        try std.testing.expectEqualStrings("Leaf", driver.current_emit_struct.?);
+        struct_scope.markConsumedByInjection();
+    }
+
+    try std.testing.expect(driver.handle == root_handle);
+    try std.testing.expect(driver.current_emit_struct == null);
+    try std.testing.expectEqual(@as(usize, 0), FakeDestroy.call_count);
 }
 
 test "renderSpecializationSourceFileBody injects zap_runtime import for protocol_box variant payloads" {

@@ -4,5 +4,5 @@
   """
 
 pub protocol ReflectionProtocol(element) {
-  fn next(state) -> {Atom, element, any}
+  fn next(state) -> {Atom, element, ReflectionProtocol(element)}
 }

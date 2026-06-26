@@ -12,7 +12,18 @@ pub impl Enumerable(String) for String {
     `{:done, "", string}` when the string is empty.
     """
 
-  pub fn next(s :: String) -> {Atom, String, String} {
+  pub fn next(s :: unique String) -> {Atom, String, String} {
     :zig.String.next(s)
+  }
+
+  @doc = """
+    Disposes a string iteration state.
+
+    String iteration states are slices and own no cursor resources, so
+    disposal is a no-op.
+    """
+
+  pub fn dispose(_s :: unique String) -> Nil {
+    nil
   }
 }

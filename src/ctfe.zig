@@ -12,6 +12,73 @@ const ir = @import("ir.zig");
 const ast = @import("ast.zig");
 const env = @import("env.zig");
 const glob = @import("glob.zig");
+const build_cache = @import("build_cache.zig");
+
+const VALUE_TRAVERSAL_INLINE_STACK_CAPACITY = 128;
+const MAX_VALUE_TRAVERSAL_DEPTH = 4096;
+const MAX_VALUE_TRAVERSAL_NODES = 1_000_000;
+
+pub const ValueTraversalError = error{
+    ValueTraversalDepthExceeded,
+    ValueTraversalBudgetExceeded,
+    OutOfMemory,
+};
+
+fn InlineTraversalStack(comptime T: type) type {
+    return struct {
+        inline_items: [VALUE_TRAVERSAL_INLINE_STACK_CAPACITY]T = undefined,
+        len: usize = 0,
+        spill: std.ArrayListUnmanaged(T) = .empty,
+
+        const Self = @This();
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.spill.deinit(allocator);
+        }
+
+        fn push(self: *Self, allocator: std.mem.Allocator, item: T) error{OutOfMemory}!void {
+            if (self.len < self.inline_items.len) {
+                self.inline_items[self.len] = item;
+            } else {
+                try self.spill.append(allocator, item);
+            }
+            self.len += 1;
+        }
+
+        fn pop(self: *Self) ?T {
+            if (self.len == 0) return null;
+            if (self.len > self.inline_items.len) {
+                self.len -= 1;
+                const item = self.spill.items[self.spill.items.len - 1];
+                self.spill.items.len -= 1;
+                return item;
+            }
+            self.len -= 1;
+            return self.inline_items[self.len];
+        }
+    };
+}
+
+const ValueTraversalBudget = struct {
+    visited_nodes: usize = 0,
+
+    fn visit(self: *ValueTraversalBudget, depth: usize) ValueTraversalError!void {
+        if (depth > MAX_VALUE_TRAVERSAL_DEPTH) return error.ValueTraversalDepthExceeded;
+        if (self.visited_nodes >= MAX_VALUE_TRAVERSAL_NODES) return error.ValueTraversalBudgetExceeded;
+        self.visited_nodes += 1;
+    }
+
+    fn ensureChildren(self: *ValueTraversalBudget, depth: usize, child_count: usize) ValueTraversalError!void {
+        if (child_count == 0) return;
+        if (depth >= MAX_VALUE_TRAVERSAL_DEPTH) return error.ValueTraversalDepthExceeded;
+        const remaining_nodes = MAX_VALUE_TRAVERSAL_NODES - self.visited_nodes;
+        if (child_count > remaining_nodes) return error.ValueTraversalBudgetExceeded;
+    }
+};
+
+fn checkedChildCount(count: usize, multiplier: usize) ValueTraversalError!usize {
+    return std.math.mul(usize, count, multiplier) catch return error.ValueTraversalBudgetExceeded;
+}
 
 // ============================================================
 // Symbolic Memory Model
@@ -45,14 +112,14 @@ pub const AllocationStore = struct {
     next_id: AllocId = 1,
     records: std.ArrayListUnmanaged(AllocationRecord) = .empty,
 
-    pub fn alloc(self: *AllocationStore, allocator: std.mem.Allocator, kind: AllocKind, source_fn: ?ir.FunctionId) AllocId {
+    pub fn alloc(self: *AllocationStore, allocator: std.mem.Allocator, kind: AllocKind, source_fn: ?ir.FunctionId) std.mem.Allocator.Error!AllocId {
         const id = self.next_id;
-        self.next_id += 1;
-        self.records.append(allocator, .{
+        try self.records.append(allocator, .{
             .id = id,
             .kind = kind,
             .source_function = source_fn,
-        }) catch {};
+        });
+        self.next_id += 1;
         return id;
     }
 
@@ -161,90 +228,279 @@ pub const CtValue = union(enum) {
     }
 
     /// Value equality for matching and comparisons.
-    pub fn eql(self: CtValue, other: CtValue) bool {
-        const self_tag = std.meta.activeTag(self);
-        const other_tag = std.meta.activeTag(other);
-        if (self_tag != other_tag) return false;
+    pub fn eql(self: CtValue, other: CtValue) ValueTraversalError!bool {
+        return self.eqlWithAllocator(std.heap.page_allocator, other);
+    }
 
-        return switch (self) {
-            .int => |a| a == other.int,
-            .float => |a| a == other.float,
-            .string => |a| std.mem.eql(u8, a, other.string),
-            .bool_val => |a| a == other.bool_val,
-            .atom => |a| std.mem.eql(u8, a, other.atom),
-            .nil => true,
-            .void => true,
-            .consumed => true,
-            .reuse_token => |a| {
-                const b = other.reuse_token;
-                return a.alloc_id == b.alloc_id and a.kind == b.kind;
-            },
-            .tuple => |a| {
-                const b = other.tuple;
-                if (a.elems.len != b.elems.len) return false;
-                for (a.elems, b.elems) |av, bv| {
-                    if (!av.eql(bv)) return false;
-                }
-                return true;
-            },
-            .list => |a| {
-                const b = other.list;
-                if (a.elems.len != b.elems.len) return false;
-                for (a.elems, b.elems) |av, bv| {
-                    if (!av.eql(bv)) return false;
-                }
-                return true;
-            },
-            .map => |a| {
-                const b = other.map;
-                if (a.entries.len != b.entries.len) return false;
-                for (a.entries) |entry_a| {
-                    var found = false;
-                    for (b.entries) |entry_b| {
-                        if (entry_a.key.eql(entry_b.key) and entry_a.value.eql(entry_b.value)) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) return false;
-                }
-                return true;
-            },
-            .struct_val => |a| {
-                const b = other.struct_val;
-                if (!std.mem.eql(u8, a.type_name, b.type_name)) return false;
-                if (a.fields.len != b.fields.len) return false;
-                for (a.fields) |fa| {
-                    var found = false;
-                    for (b.fields) |fb| {
-                        if (std.mem.eql(u8, fa.name, fb.name) and fa.value.eql(fb.value)) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) return false;
-                }
-                return true;
-            },
-            .enum_val => |a| {
-                const b = other.enum_val;
-                return std.mem.eql(u8, a.type_name, b.type_name) and
-                    std.mem.eql(u8, a.variant, b.variant);
-            },
-            .union_val => |a| {
-                const b = other.union_val;
-                return std.mem.eql(u8, a.type_name, b.type_name) and
-                    std.mem.eql(u8, a.variant, b.variant) and
-                    a.payload.eql(b.payload.*);
-            },
-            .optional => |a| {
-                const b = other.optional;
-                if (a.value == null and b.value == null) return true;
-                if (a.value != null and b.value != null) return a.value.?.eql(b.value.?.*);
-                return false;
-            },
-            .closure => false, // closures are never equal
+    pub fn eqlWithAllocator(self: CtValue, allocator: std.mem.Allocator, other: CtValue) ValueTraversalError!bool {
+        const CompareFrame = struct {
+            left: CtValue,
+            right: CtValue,
+            depth: usize,
         };
+        const SequenceFrame = struct {
+            left: []const CtValue,
+            right: []const CtValue,
+            index: usize,
+            depth: usize,
+        };
+        const MapSearchFrame = struct {
+            left: []const CtValue.CtMapEntry,
+            right: []const CtValue.CtMapEntry,
+            left_index: usize,
+            right_index: usize,
+            depth: usize,
+        };
+        const StructSearchFrame = struct {
+            left: []const CtValue.CtFieldValue,
+            right: []const CtValue.CtFieldValue,
+            left_index: usize,
+            right_index: usize,
+            depth: usize,
+        };
+        const EqlFrame = union(enum) {
+            compare: CompareFrame,
+            sequence_next: SequenceFrame,
+            sequence_after_value: SequenceFrame,
+            map_search: MapSearchFrame,
+            map_after_key: MapSearchFrame,
+            map_after_value: MapSearchFrame,
+            struct_search: StructSearchFrame,
+            struct_after_value: StructSearchFrame,
+        };
+
+        var budget = ValueTraversalBudget{};
+        var stack = InlineTraversalStack(EqlFrame){};
+        defer stack.deinit(allocator);
+
+        try stack.push(allocator, .{ .compare = .{ .left = self, .right = other, .depth = 1 } });
+        var last_result = false;
+
+        while (stack.pop()) |frame| {
+            switch (frame) {
+                .compare => |pair| {
+                    try budget.visit(pair.depth);
+                    const left_tag = std.meta.activeTag(pair.left);
+                    const right_tag = std.meta.activeTag(pair.right);
+                    if (left_tag != right_tag) {
+                        last_result = false;
+                        continue;
+                    }
+
+                    switch (pair.left) {
+                        .int => |left_value| last_result = left_value == pair.right.int,
+                        .float => |left_value| last_result = left_value == pair.right.float,
+                        .string => |left_value| last_result = std.mem.eql(u8, left_value, pair.right.string),
+                        .bool_val => |left_value| last_result = left_value == pair.right.bool_val,
+                        .atom => |left_value| last_result = std.mem.eql(u8, left_value, pair.right.atom),
+                        .nil, .void, .consumed => last_result = true,
+                        .reuse_token => |left_value| {
+                            const right_value = pair.right.reuse_token;
+                            last_result = left_value.alloc_id == right_value.alloc_id and left_value.kind == right_value.kind;
+                        },
+                        .tuple => |left_value| {
+                            const right_value = pair.right.tuple;
+                            if (left_value.elems.len != right_value.elems.len) return false;
+                            try budget.ensureChildren(pair.depth, left_value.elems.len);
+                            try stack.push(allocator, .{ .sequence_next = .{
+                                .left = left_value.elems,
+                                .right = right_value.elems,
+                                .index = 0,
+                                .depth = pair.depth,
+                            } });
+                        },
+                        .list => |left_value| {
+                            const right_value = pair.right.list;
+                            if (left_value.elems.len != right_value.elems.len) return false;
+                            try budget.ensureChildren(pair.depth, left_value.elems.len);
+                            try stack.push(allocator, .{ .sequence_next = .{
+                                .left = left_value.elems,
+                                .right = right_value.elems,
+                                .index = 0,
+                                .depth = pair.depth,
+                            } });
+                        },
+                        .map => |left_value| {
+                            const right_value = pair.right.map;
+                            if (left_value.entries.len != right_value.entries.len) return false;
+                            try budget.ensureChildren(pair.depth, try checkedChildCount(left_value.entries.len, 2));
+                            try stack.push(allocator, .{ .map_search = .{
+                                .left = left_value.entries,
+                                .right = right_value.entries,
+                                .left_index = 0,
+                                .right_index = 0,
+                                .depth = pair.depth,
+                            } });
+                        },
+                        .struct_val => |left_value| {
+                            const right_value = pair.right.struct_val;
+                            if (!std.mem.eql(u8, left_value.type_name, right_value.type_name)) return false;
+                            if (left_value.fields.len != right_value.fields.len) return false;
+                            try budget.ensureChildren(pair.depth, left_value.fields.len);
+                            try stack.push(allocator, .{ .struct_search = .{
+                                .left = left_value.fields,
+                                .right = right_value.fields,
+                                .left_index = 0,
+                                .right_index = 0,
+                                .depth = pair.depth,
+                            } });
+                        },
+                        .enum_val => |left_value| {
+                            const right_value = pair.right.enum_val;
+                            last_result = std.mem.eql(u8, left_value.type_name, right_value.type_name) and
+                                std.mem.eql(u8, left_value.variant, right_value.variant);
+                        },
+                        .union_val => |left_value| {
+                            const right_value = pair.right.union_val;
+                            if (!std.mem.eql(u8, left_value.type_name, right_value.type_name) or
+                                !std.mem.eql(u8, left_value.variant, right_value.variant))
+                            {
+                                return false;
+                            }
+                            try budget.ensureChildren(pair.depth, 1);
+                            try stack.push(allocator, .{ .compare = .{
+                                .left = left_value.payload.*,
+                                .right = right_value.payload.*,
+                                .depth = pair.depth + 1,
+                            } });
+                        },
+                        .optional => |left_value| {
+                            const right_value = pair.right.optional;
+                            if (left_value.value == null and right_value.value == null) {
+                                last_result = true;
+                            } else if (left_value.value != null and right_value.value != null) {
+                                try budget.ensureChildren(pair.depth, 1);
+                                try stack.push(allocator, .{ .compare = .{
+                                    .left = left_value.value.?.*,
+                                    .right = right_value.value.?.*,
+                                    .depth = pair.depth + 1,
+                                } });
+                            } else {
+                                last_result = false;
+                            }
+                        },
+                        .closure => last_result = false,
+                    }
+                },
+                .sequence_next => |sequence| {
+                    if (sequence.index >= sequence.left.len) {
+                        last_result = true;
+                        continue;
+                    }
+                    try stack.push(allocator, .{ .sequence_after_value = sequence });
+                    try stack.push(allocator, .{ .compare = .{
+                        .left = sequence.left[sequence.index],
+                        .right = sequence.right[sequence.index],
+                        .depth = sequence.depth + 1,
+                    } });
+                },
+                .sequence_after_value => |sequence| {
+                    if (!last_result) return false;
+                    try stack.push(allocator, .{ .sequence_next = .{
+                        .left = sequence.left,
+                        .right = sequence.right,
+                        .index = sequence.index + 1,
+                        .depth = sequence.depth,
+                    } });
+                },
+                .map_search => |search| {
+                    if (search.left_index >= search.left.len) {
+                        last_result = true;
+                        continue;
+                    }
+                    if (search.right_index >= search.right.len) return false;
+                    try stack.push(allocator, .{ .map_after_key = search });
+                    try stack.push(allocator, .{ .compare = .{
+                        .left = search.left[search.left_index].key,
+                        .right = search.right[search.right_index].key,
+                        .depth = search.depth + 1,
+                    } });
+                },
+                .map_after_key => |search| {
+                    if (last_result) {
+                        try stack.push(allocator, .{ .map_after_value = search });
+                        try stack.push(allocator, .{ .compare = .{
+                            .left = search.left[search.left_index].value,
+                            .right = search.right[search.right_index].value,
+                            .depth = search.depth + 1,
+                        } });
+                    } else {
+                        try stack.push(allocator, .{ .map_search = .{
+                            .left = search.left,
+                            .right = search.right,
+                            .left_index = search.left_index,
+                            .right_index = search.right_index + 1,
+                            .depth = search.depth,
+                        } });
+                    }
+                },
+                .map_after_value => |search| {
+                    if (last_result) {
+                        try stack.push(allocator, .{ .map_search = .{
+                            .left = search.left,
+                            .right = search.right,
+                            .left_index = search.left_index + 1,
+                            .right_index = 0,
+                            .depth = search.depth,
+                        } });
+                    } else {
+                        try stack.push(allocator, .{ .map_search = .{
+                            .left = search.left,
+                            .right = search.right,
+                            .left_index = search.left_index,
+                            .right_index = search.right_index + 1,
+                            .depth = search.depth,
+                        } });
+                    }
+                },
+                .struct_search => |search| {
+                    if (search.left_index >= search.left.len) {
+                        last_result = true;
+                        continue;
+                    }
+                    var candidate_index = search.right_index;
+                    while (candidate_index < search.right.len and
+                        !std.mem.eql(u8, search.left[search.left_index].name, search.right[candidate_index].name))
+                    {
+                        candidate_index += 1;
+                    }
+                    if (candidate_index >= search.right.len) return false;
+                    try stack.push(allocator, .{ .struct_after_value = .{
+                        .left = search.left,
+                        .right = search.right,
+                        .left_index = search.left_index,
+                        .right_index = candidate_index,
+                        .depth = search.depth,
+                    } });
+                    try stack.push(allocator, .{ .compare = .{
+                        .left = search.left[search.left_index].value,
+                        .right = search.right[candidate_index].value,
+                        .depth = search.depth + 1,
+                    } });
+                },
+                .struct_after_value => |search| {
+                    if (last_result) {
+                        try stack.push(allocator, .{ .struct_search = .{
+                            .left = search.left,
+                            .right = search.right,
+                            .left_index = search.left_index + 1,
+                            .right_index = 0,
+                            .depth = search.depth,
+                        } });
+                    } else {
+                        try stack.push(allocator, .{ .struct_search = .{
+                            .left = search.left,
+                            .right = search.right,
+                            .left_index = search.left_index,
+                            .right_index = search.right_index + 1,
+                            .depth = search.depth,
+                        } });
+                    }
+                },
+            }
+        }
+
+        return last_result;
     }
 
     /// Compare for ordering (lt/gt/lte/gte). Returns null if incomparable.
@@ -263,59 +519,613 @@ pub const CtValue = union(enum) {
     }
 
     /// Hash a CtValue for memoization cache keys.
-    pub fn hash(self: CtValue) u64 {
+    pub fn hash(self: CtValue, allocator: std.mem.Allocator) ValueTraversalError!u64 {
         var hasher = std.hash.Wyhash.init(0);
-        self.hashInto(&hasher);
+        try self.hashInto(allocator, &hasher);
         return hasher.final();
     }
 
-    fn hashInto(self: CtValue, hasher: *std.hash.Wyhash) void {
-        // Hash the tag discriminant
-        const tag_byte = [_]u8{@intFromEnum(std.meta.activeTag(self))};
-        hasher.update(&tag_byte);
-        switch (self) {
-            .int => |v| hasher.update(std.mem.asBytes(&v)),
-            .float => |v| hasher.update(std.mem.asBytes(&v)),
-            .string => |v| hasher.update(v),
-            .bool_val => |v| hasher.update(&[_]u8{@intFromBool(v)}),
-            .atom => |v| hasher.update(v),
-            .nil, .void, .consumed => {},
-            .reuse_token => |rt| {
-                hasher.update(std.mem.asBytes(&rt.alloc_id));
-                hasher.update(&[_]u8{@intFromEnum(rt.kind)});
-            },
-            .tuple => |tv| for (tv.elems) |e| e.hashInto(hasher),
-            .list => |lv| for (lv.elems) |e| e.hashInto(hasher),
-            .map => |mv| for (mv.entries) |entry| {
-                entry.key.hashInto(hasher);
-                entry.value.hashInto(hasher);
-            },
-            .struct_val => |sv| {
-                hasher.update(sv.type_name);
-                for (sv.fields) |f| {
-                    hasher.update(f.name);
-                    f.value.hashInto(hasher);
-                }
-            },
-            .union_val => |uv| {
-                hasher.update(uv.type_name);
-                hasher.update(uv.variant);
-                uv.payload.hashInto(hasher);
-            },
-            .enum_val => |ev| {
-                hasher.update(ev.type_name);
-                hasher.update(ev.variant);
-            },
-            .optional => |o| {
-                if (o.value) |v| v.hashInto(hasher);
-            },
-            .closure => |cl| {
-                hasher.update(std.mem.asBytes(&cl.function_id));
-                for (cl.captures) |c| c.hashInto(hasher);
-            },
+    fn hashInto(self: CtValue, allocator: std.mem.Allocator, hasher: *std.hash.Wyhash) ValueTraversalError!void {
+        const HashValueFrame = struct {
+            value: CtValue,
+            depth: usize,
+        };
+        const HashFrame = union(enum) {
+            value: HashValueFrame,
+            bytes: []const u8,
+        };
+
+        var budget = ValueTraversalBudget{};
+        var stack = InlineTraversalStack(HashFrame){};
+        defer stack.deinit(allocator);
+
+        try stack.push(allocator, .{ .value = .{ .value = self, .depth = 1 } });
+
+        while (stack.pop()) |frame| {
+            switch (frame) {
+                .bytes => |bytes| hasher.update(bytes),
+                .value => |value_frame| {
+                    try budget.visit(value_frame.depth);
+                    const tag_byte = [_]u8{@intFromEnum(std.meta.activeTag(value_frame.value))};
+                    hasher.update(&tag_byte);
+                    switch (value_frame.value) {
+                        .int => |value| hasher.update(std.mem.asBytes(&value)),
+                        .float => |value| hasher.update(std.mem.asBytes(&value)),
+                        .string => |value| hasher.update(value),
+                        .bool_val => |value| hasher.update(&[_]u8{@intFromBool(value)}),
+                        .atom => |value| hasher.update(value),
+                        .nil, .void, .consumed => {},
+                        .reuse_token => |reuse_token| {
+                            hasher.update(std.mem.asBytes(&reuse_token.alloc_id));
+                            hasher.update(&[_]u8{@intFromEnum(reuse_token.kind)});
+                        },
+                        .tuple => |tuple_value| {
+                            try budget.ensureChildren(value_frame.depth, tuple_value.elems.len);
+                            var index = tuple_value.elems.len;
+                            while (index > 0) {
+                                index -= 1;
+                                try stack.push(allocator, .{ .value = .{
+                                    .value = tuple_value.elems[index],
+                                    .depth = value_frame.depth + 1,
+                                } });
+                            }
+                        },
+                        .list => |list_value| {
+                            try budget.ensureChildren(value_frame.depth, list_value.elems.len);
+                            var index = list_value.elems.len;
+                            while (index > 0) {
+                                index -= 1;
+                                try stack.push(allocator, .{ .value = .{
+                                    .value = list_value.elems[index],
+                                    .depth = value_frame.depth + 1,
+                                } });
+                            }
+                        },
+                        .map => |map_value| {
+                            try budget.ensureChildren(value_frame.depth, try checkedChildCount(map_value.entries.len, 2));
+                            var index = map_value.entries.len;
+                            while (index > 0) {
+                                index -= 1;
+                                const entry = map_value.entries[index];
+                                try stack.push(allocator, .{ .value = .{ .value = entry.value, .depth = value_frame.depth + 1 } });
+                                try stack.push(allocator, .{ .value = .{ .value = entry.key, .depth = value_frame.depth + 1 } });
+                            }
+                        },
+                        .struct_val => |struct_value| {
+                            hasher.update(struct_value.type_name);
+                            try budget.ensureChildren(value_frame.depth, struct_value.fields.len);
+                            var index = struct_value.fields.len;
+                            while (index > 0) {
+                                index -= 1;
+                                const field = struct_value.fields[index];
+                                try stack.push(allocator, .{ .value = .{ .value = field.value, .depth = value_frame.depth + 1 } });
+                                try stack.push(allocator, .{ .bytes = field.name });
+                            }
+                        },
+                        .union_val => |union_value| {
+                            hasher.update(union_value.type_name);
+                            hasher.update(union_value.variant);
+                            try budget.ensureChildren(value_frame.depth, 1);
+                            try stack.push(allocator, .{ .value = .{
+                                .value = union_value.payload.*,
+                                .depth = value_frame.depth + 1,
+                            } });
+                        },
+                        .enum_val => |enum_value| {
+                            hasher.update(enum_value.type_name);
+                            hasher.update(enum_value.variant);
+                        },
+                        .optional => |optional_value| {
+                            if (optional_value.value) |child_value| {
+                                try budget.ensureChildren(value_frame.depth, 1);
+                                try stack.push(allocator, .{ .value = .{
+                                    .value = child_value.*,
+                                    .depth = value_frame.depth + 1,
+                                } });
+                            }
+                        },
+                        .closure => |closure_value| {
+                            hasher.update(std.mem.asBytes(&closure_value.function_id));
+                            try budget.ensureChildren(value_frame.depth, closure_value.captures.len);
+                            var index = closure_value.captures.len;
+                            while (index > 0) {
+                                index -= 1;
+                                try stack.push(allocator, .{ .value = .{
+                                    .value = closure_value.captures[index],
+                                    .depth = value_frame.depth + 1,
+                                } });
+                            }
+                        },
+                    }
+                },
+            }
         }
     }
 };
+
+fn initCtValueSlots(values: []CtValue) void {
+    for (values) |*value| {
+        value.* = .void;
+    }
+}
+
+fn initCtMapEntries(entries: []CtValue.CtMapEntry) void {
+    for (entries) |*entry| {
+        entry.* = .{
+            .key = .void,
+            .value = .void,
+        };
+    }
+}
+
+fn initCtFieldValues(fields: []CtValue.CtFieldValue) void {
+    for (fields) |*field| {
+        field.* = .{
+            .name = "",
+            .value = .void,
+        };
+    }
+}
+
+fn freeUncommittedCtValueSlots(
+    alloc: std.mem.Allocator,
+    values: []CtValue,
+    initialized_count: usize,
+) void {
+    std.debug.assert(initialized_count <= values.len);
+    for (values[0..initialized_count]) |*value| {
+        value.* = .void;
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
+fn freeUncommittedCtMapEntries(
+    alloc: std.mem.Allocator,
+    entries: []CtValue.CtMapEntry,
+    initialized_count: usize,
+) void {
+    std.debug.assert(initialized_count <= entries.len);
+    for (entries[0..initialized_count]) |*entry| {
+        entry.* = .{
+            .key = .void,
+            .value = .void,
+        };
+    }
+    if (entries.len > 0) alloc.free(entries);
+}
+
+fn freeUncommittedCtFieldValues(
+    alloc: std.mem.Allocator,
+    fields: []CtValue.CtFieldValue,
+    initialized_count: usize,
+) void {
+    std.debug.assert(initialized_count <= fields.len);
+    for (fields[0..initialized_count]) |*field| {
+        field.* = .{
+            .name = "",
+            .value = .void,
+        };
+    }
+    if (fields.len > 0) alloc.free(fields);
+}
+
+// `borrowed` names point into the source CtValue; `owned` names are
+// allocator-owned dotted aliases and must be deinitialized or transferred.
+const ExtractedStructRefName = union(enum) {
+    borrowed: []const u8,
+    owned: []const u8,
+
+    fn bytes(self: ExtractedStructRefName) []const u8 {
+        return switch (self) {
+            .borrowed => |name| name,
+            .owned => |name| name,
+        };
+    }
+
+    fn deinit(self: ExtractedStructRefName, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .borrowed => {},
+            .owned => |name| alloc.free(name),
+        }
+    }
+};
+
+fn deinitOwnedCtValueSlice(alloc: std.mem.Allocator, values: []const CtValue) void {
+    for (values) |value| {
+        deinitOwnedCtValue(alloc, value);
+    }
+}
+
+fn deinitOwnedCtMapEntries(alloc: std.mem.Allocator, entries: []const CtValue.CtMapEntry) void {
+    for (entries) |entry| {
+        deinitOwnedCtValue(alloc, entry.key);
+        deinitOwnedCtValue(alloc, entry.value);
+    }
+}
+
+fn deinitOwnedCtFieldValues(alloc: std.mem.Allocator, fields: []const CtValue.CtFieldValue) void {
+    for (fields) |field| {
+        deinitOwnedCtValue(alloc, field.value);
+    }
+}
+
+fn deinitOwnedCtValue(alloc: std.mem.Allocator, value: CtValue) void {
+    switch (value) {
+        .tuple => |tuple_value| {
+            deinitOwnedCtValueSlice(alloc, tuple_value.elems);
+            if (tuple_value.elems.len > 0) alloc.free(tuple_value.elems);
+        },
+        .list => |list_value| {
+            deinitOwnedCtValueSlice(alloc, list_value.elems);
+            if (list_value.elems.len > 0) alloc.free(list_value.elems);
+        },
+        .map => |map_value| {
+            deinitOwnedCtMapEntries(alloc, map_value.entries);
+            if (map_value.entries.len > 0) alloc.free(map_value.entries);
+        },
+        .struct_val => |struct_value| {
+            deinitOwnedCtFieldValues(alloc, struct_value.fields);
+            if (struct_value.fields.len > 0) alloc.free(struct_value.fields);
+        },
+        .int,
+        .float,
+        .string,
+        .bool_val,
+        .atom,
+        .nil,
+        .void,
+        .consumed,
+        .reuse_token,
+        .union_val,
+        .enum_val,
+        .optional,
+        .closure,
+        => {},
+    }
+}
+
+fn deinitMemoizedCtValueSlice(alloc: std.mem.Allocator, values: []const CtValue) void {
+    for (values) |value| {
+        deinitMemoizedCtValue(alloc, value);
+    }
+}
+
+fn deinitMemoizedCtMapEntries(alloc: std.mem.Allocator, entries: []const CtValue.CtMapEntry) void {
+    for (entries) |entry| {
+        deinitMemoizedCtValue(alloc, entry.key);
+        deinitMemoizedCtValue(alloc, entry.value);
+    }
+}
+
+fn deinitMemoizedCtFieldValues(alloc: std.mem.Allocator, fields: []const CtValue.CtFieldValue) void {
+    for (fields) |field| {
+        alloc.free(field.name);
+        deinitMemoizedCtValue(alloc, field.value);
+    }
+}
+
+fn deinitMemoizedCtValue(alloc: std.mem.Allocator, value: CtValue) void {
+    switch (value) {
+        .string, .atom => |bytes| alloc.free(bytes),
+        .tuple => |tuple_value| {
+            deinitMemoizedCtValueSlice(alloc, tuple_value.elems);
+            alloc.free(tuple_value.elems);
+        },
+        .list => |list_value| {
+            deinitMemoizedCtValueSlice(alloc, list_value.elems);
+            alloc.free(list_value.elems);
+        },
+        .map => |map_value| {
+            deinitMemoizedCtMapEntries(alloc, map_value.entries);
+            alloc.free(map_value.entries);
+        },
+        .struct_val => |struct_value| {
+            alloc.free(struct_value.type_name);
+            deinitMemoizedCtFieldValues(alloc, struct_value.fields);
+            alloc.free(struct_value.fields);
+        },
+        .union_val => |union_value| {
+            alloc.free(union_value.type_name);
+            alloc.free(union_value.variant);
+            deinitMemoizedCtValue(alloc, union_value.payload.*);
+            alloc.destroy(union_value.payload);
+        },
+        .enum_val => |enum_value| {
+            alloc.free(enum_value.type_name);
+            alloc.free(enum_value.variant);
+        },
+        .optional => |optional_value| {
+            if (optional_value.value) |payload| {
+                deinitMemoizedCtValue(alloc, payload.*);
+                alloc.destroy(payload);
+            }
+        },
+        .closure => |closure_value| {
+            deinitMemoizedCtValueSlice(alloc, closure_value.captures);
+            alloc.free(closure_value.captures);
+        },
+        .int,
+        .float,
+        .bool_val,
+        .nil,
+        .void,
+        .consumed,
+        .reuse_token,
+        => {},
+    }
+}
+
+fn cloneCtValueForMemo(alloc: std.mem.Allocator, value: CtValue) ValueTraversalError!CtValue {
+    const CloneFrame = struct {
+        source: CtValue,
+        dest: *CtValue,
+        depth: usize,
+    };
+
+    var budget = ValueTraversalBudget{};
+    var stack = InlineTraversalStack(CloneFrame){};
+    defer stack.deinit(alloc);
+
+    var cloned_root: CtValue = .void;
+    errdefer deinitMemoizedCtValue(alloc, cloned_root);
+    try stack.push(alloc, .{ .source = value, .dest = &cloned_root, .depth = 1 });
+
+    while (stack.pop()) |frame| {
+        try budget.visit(frame.depth);
+        switch (frame.source) {
+            .int => |int_value| frame.dest.* = .{ .int = int_value },
+            .float => |float_value| frame.dest.* = .{ .float = float_value },
+            .string => |string_value| frame.dest.* = .{ .string = try alloc.dupe(u8, string_value) },
+            .bool_val => |bool_value| frame.dest.* = .{ .bool_val = bool_value },
+            .atom => |atom_value| frame.dest.* = .{ .atom = try alloc.dupe(u8, atom_value) },
+            .nil => frame.dest.* = .nil,
+            .void => frame.dest.* = .void,
+            .consumed => frame.dest.* = .consumed,
+            .reuse_token => |reuse_token| frame.dest.* = .{ .reuse_token = reuse_token },
+            .tuple => |tuple_value| {
+                try budget.ensureChildren(frame.depth, tuple_value.elems.len);
+                const cloned_elems = try alloc.alloc(CtValue, tuple_value.elems.len);
+                initCtValueSlots(cloned_elems);
+                frame.dest.* = .{ .tuple = .{ .alloc_id = tuple_value.alloc_id, .elems = cloned_elems } };
+                var index = tuple_value.elems.len;
+                while (index > 0) {
+                    index -= 1;
+                    try stack.push(alloc, .{
+                        .source = tuple_value.elems[index],
+                        .dest = &cloned_elems[index],
+                        .depth = frame.depth + 1,
+                    });
+                }
+            },
+            .list => |list_value| {
+                try budget.ensureChildren(frame.depth, list_value.elems.len);
+                const cloned_elems = try alloc.alloc(CtValue, list_value.elems.len);
+                initCtValueSlots(cloned_elems);
+                frame.dest.* = .{ .list = .{ .alloc_id = list_value.alloc_id, .elems = cloned_elems } };
+                var index = list_value.elems.len;
+                while (index > 0) {
+                    index -= 1;
+                    try stack.push(alloc, .{
+                        .source = list_value.elems[index],
+                        .dest = &cloned_elems[index],
+                        .depth = frame.depth + 1,
+                    });
+                }
+            },
+            .map => |map_value| {
+                try budget.ensureChildren(frame.depth, try checkedChildCount(map_value.entries.len, 2));
+                const cloned_entries = try alloc.alloc(CtValue.CtMapEntry, map_value.entries.len);
+                initCtMapEntries(cloned_entries);
+                frame.dest.* = .{ .map = .{ .alloc_id = map_value.alloc_id, .entries = cloned_entries } };
+                var index = map_value.entries.len;
+                while (index > 0) {
+                    index -= 1;
+                    try stack.push(alloc, .{
+                        .source = map_value.entries[index].value,
+                        .dest = &cloned_entries[index].value,
+                        .depth = frame.depth + 1,
+                    });
+                    try stack.push(alloc, .{
+                        .source = map_value.entries[index].key,
+                        .dest = &cloned_entries[index].key,
+                        .depth = frame.depth + 1,
+                    });
+                }
+            },
+            .struct_val => |struct_value| {
+                try budget.ensureChildren(frame.depth, struct_value.fields.len);
+                const cloned_type_name = try alloc.dupe(u8, struct_value.type_name);
+                var type_name_transferred = false;
+                errdefer if (!type_name_transferred) alloc.free(cloned_type_name);
+
+                const cloned_fields = try alloc.alloc(CtValue.CtFieldValue, struct_value.fields.len);
+                var fields_transferred = false;
+                errdefer if (!fields_transferred) alloc.free(cloned_fields);
+                initCtFieldValues(cloned_fields);
+
+                frame.dest.* = .{ .struct_val = .{
+                    .alloc_id = struct_value.alloc_id,
+                    .type_name = cloned_type_name,
+                    .fields = cloned_fields,
+                } };
+                type_name_transferred = true;
+                fields_transferred = true;
+
+                var index = struct_value.fields.len;
+                while (index > 0) {
+                    index -= 1;
+                    cloned_fields[index].name = try alloc.dupe(u8, struct_value.fields[index].name);
+                    try stack.push(alloc, .{
+                        .source = struct_value.fields[index].value,
+                        .dest = &cloned_fields[index].value,
+                        .depth = frame.depth + 1,
+                    });
+                }
+            },
+            .union_val => |union_value| {
+                try budget.ensureChildren(frame.depth, 1);
+                const cloned_type_name = try alloc.dupe(u8, union_value.type_name);
+                var type_name_transferred = false;
+                errdefer if (!type_name_transferred) alloc.free(cloned_type_name);
+
+                const cloned_variant = try alloc.dupe(u8, union_value.variant);
+                var variant_transferred = false;
+                errdefer if (!variant_transferred) alloc.free(cloned_variant);
+
+                const cloned_payload = try alloc.create(CtValue);
+                cloned_payload.* = .void;
+                var payload_transferred = false;
+                errdefer if (!payload_transferred) alloc.destroy(cloned_payload);
+
+                frame.dest.* = .{ .union_val = .{
+                    .alloc_id = union_value.alloc_id,
+                    .type_name = cloned_type_name,
+                    .variant = cloned_variant,
+                    .payload = cloned_payload,
+                } };
+                type_name_transferred = true;
+                variant_transferred = true;
+                payload_transferred = true;
+                try stack.push(alloc, .{
+                    .source = union_value.payload.*,
+                    .dest = cloned_payload,
+                    .depth = frame.depth + 1,
+                });
+            },
+            .enum_val => |enum_value| {
+                const cloned_type_name = try alloc.dupe(u8, enum_value.type_name);
+                var type_name_transferred = false;
+                errdefer if (!type_name_transferred) alloc.free(cloned_type_name);
+
+                const cloned_variant = try alloc.dupe(u8, enum_value.variant);
+                frame.dest.* = .{ .enum_val = .{
+                    .type_name = cloned_type_name,
+                    .variant = cloned_variant,
+                } };
+                type_name_transferred = true;
+            },
+            .optional => |optional_value| {
+                if (optional_value.value) |payload| {
+                    try budget.ensureChildren(frame.depth, 1);
+                    const cloned_payload = try alloc.create(CtValue);
+                    cloned_payload.* = .void;
+                    frame.dest.* = .{ .optional = .{ .value = cloned_payload } };
+                    try stack.push(alloc, .{
+                        .source = payload.*,
+                        .dest = cloned_payload,
+                        .depth = frame.depth + 1,
+                    });
+                } else {
+                    frame.dest.* = .{ .optional = .{ .value = null } };
+                }
+            },
+            .closure => |closure_value| {
+                try budget.ensureChildren(frame.depth, closure_value.captures.len);
+                const cloned_captures = try alloc.alloc(CtValue, closure_value.captures.len);
+                initCtValueSlots(cloned_captures);
+                frame.dest.* = .{ .closure = .{
+                    .alloc_id = closure_value.alloc_id,
+                    .function_id = closure_value.function_id,
+                    .captures = cloned_captures,
+                } };
+                var index = closure_value.captures.len;
+                while (index > 0) {
+                    index -= 1;
+                    try stack.push(alloc, .{
+                        .source = closure_value.captures[index],
+                        .dest = &cloned_captures[index],
+                        .depth = frame.depth + 1,
+                    });
+                }
+            },
+        }
+    }
+
+    return cloned_root;
+}
+
+fn mapEntryKeyMatchesField(key: CtValue, field_name: []const u8) bool {
+    return switch (key) {
+        .string => |key_name| std.mem.eql(u8, key_name, field_name),
+        .atom => |key_name| std.mem.eql(u8, key_name, field_name),
+        else => false,
+    };
+}
+
+fn rebuildMapEntriesForFieldSet(
+    alloc: std.mem.Allocator,
+    original_entries: []const CtValue.CtMapEntry,
+    field_name: []const u8,
+    replacement_value: CtValue,
+) std.mem.Allocator.Error![]CtValue.CtMapEntry {
+    var matching_index: ?usize = null;
+    for (original_entries, 0..) |entry, index| {
+        if (mapEntryKeyMatchesField(entry.key, field_name)) {
+            matching_index = index;
+            break;
+        }
+    }
+
+    const replacement_entry_count = if (matching_index == null)
+        std.math.add(usize, original_entries.len, 1) catch return error.OutOfMemory
+    else
+        original_entries.len;
+    const replacement_entries = try alloc.alloc(CtValue.CtMapEntry, replacement_entry_count);
+    errdefer alloc.free(replacement_entries);
+
+    @memcpy(replacement_entries[0..original_entries.len], original_entries);
+    if (matching_index) |index| {
+        replacement_entries[index].value = replacement_value;
+    } else {
+        replacement_entries[original_entries.len] = .{
+            .key = .{ .string = field_name },
+            .value = replacement_value,
+        };
+    }
+
+    return replacement_entries;
+}
+
+fn appendOwnedCtValue(
+    alloc: std.mem.Allocator,
+    values: *std.ArrayListUnmanaged(CtValue),
+    value: CtValue,
+) std.mem.Allocator.Error!void {
+    errdefer deinitOwnedCtValue(alloc, value);
+    try values.append(alloc, value);
+}
+
+fn finishOwnedCtValueList(
+    alloc: std.mem.Allocator,
+    allocation_store: *AllocationStore,
+    source_fn: ?ir.FunctionId,
+    values: *std.ArrayListUnmanaged(CtValue),
+) std.mem.Allocator.Error!CtValue {
+    const result_elems = try values.toOwnedSlice(alloc);
+    errdefer {
+        deinitOwnedCtValueSlice(alloc, result_elems);
+        if (result_elems.len > 0) alloc.free(result_elems);
+    }
+
+    const alloc_id = try allocation_store.alloc(alloc, .list, source_fn);
+    return .{ .list = .{ .alloc_id = alloc_id, .elems = result_elems } };
+}
+
+fn finishBorrowedCtValueList(
+    alloc: std.mem.Allocator,
+    allocation_store: *AllocationStore,
+    source_fn: ?ir.FunctionId,
+    elems: []const CtValue,
+) std.mem.Allocator.Error!CtValue {
+    var elems_transferred = false;
+    errdefer if (!elems_transferred and elems.len > 0) {
+        alloc.free(elems);
+    };
+
+    const alloc_id = try allocation_store.alloc(alloc, .list, source_fn);
+    elems_transferred = true;
+    return .{ .list = .{ .alloc_id = alloc_id, .elems = elems } };
+}
 
 // ============================================================
 // ConstValue — compiler-facing stable export
@@ -353,65 +1163,127 @@ pub const ConstValue = union(enum) {
 /// Convert a CtValue (interpreter-internal) to a ConstValue (compiler-facing).
 /// Deep-copies all data. Closures and union values cannot be exported.
 pub fn exportValue(alloc: std.mem.Allocator, val: CtValue) ExportError!ConstValue {
-    return switch (val) {
-        .int => |v| .{ .int = v },
-        .float => |v| .{ .float = v },
-        .string => |v| .{ .string = try alloc.dupe(u8, v) },
-        .bool_val => |v| .{ .bool_val = v },
-        .atom => |v| .{ .atom = try alloc.dupe(u8, v) },
-        .nil => .nil,
-        .void => .void,
-        .consumed => error.CannotExport,
-        .reuse_token => error.CannotExport,
-        .tuple => |tv| {
-            const exported = try alloc.alloc(ConstValue, tv.elems.len);
-            for (tv.elems, 0..) |elem, i| {
-                exported[i] = try exportValue(alloc, elem);
-            }
-            return .{ .tuple = exported };
-        },
-        .list => |lv| {
-            const exported = try alloc.alloc(ConstValue, lv.elems.len);
-            for (lv.elems, 0..) |elem, i| {
-                exported[i] = try exportValue(alloc, elem);
-            }
-            return .{ .list = exported };
-        },
-        .map => |mv| {
-            const exported = try alloc.alloc(ConstValue.ConstMapEntry, mv.entries.len);
-            for (mv.entries, 0..) |entry, i| {
-                exported[i] = .{
-                    .key = try exportValue(alloc, entry.key),
-                    .value = try exportValue(alloc, entry.value),
-                };
-            }
-            return .{ .map = exported };
-        },
-        .struct_val => |sv| {
-            const exported_fields = try alloc.alloc(ConstValue.ConstFieldValue, sv.fields.len);
-            for (sv.fields, 0..) |field, i| {
-                exported_fields[i] = .{
-                    .name = try alloc.dupe(u8, field.name),
-                    .value = try exportValue(alloc, field.value),
-                };
-            }
-            return .{ .struct_val = .{
-                .type_name = try alloc.dupe(u8, sv.type_name),
-                .fields = exported_fields,
-            } };
-        },
-        .enum_val => |ev| .{ .atom = try alloc.dupe(u8, ev.variant) },
-        .optional => |o| {
-            if (o.value) |v| return exportValue(alloc, v.*);
-            return .nil;
-        },
-        .union_val => error.CannotExport,
-        .closure => error.CannotExport,
+    const ExportFrame = struct {
+        source: CtValue,
+        dest: *ConstValue,
+        depth: usize,
     };
+
+    var budget = ValueTraversalBudget{};
+    var stack = InlineTraversalStack(ExportFrame){};
+    defer stack.deinit(alloc);
+
+    var exported_root: ConstValue = .void;
+    errdefer deinitConstValue(alloc, exported_root);
+    try stack.push(alloc, .{ .source = val, .dest = &exported_root, .depth = 1 });
+
+    while (stack.pop()) |frame| {
+        try budget.visit(frame.depth);
+        switch (frame.source) {
+            .int => |value| frame.dest.* = .{ .int = value },
+            .float => |value| frame.dest.* = .{ .float = value },
+            .string => |value| frame.dest.* = .{ .string = try alloc.dupe(u8, value) },
+            .bool_val => |value| frame.dest.* = .{ .bool_val = value },
+            .atom => |value| frame.dest.* = .{ .atom = try alloc.dupe(u8, value) },
+            .nil => frame.dest.* = .nil,
+            .void => frame.dest.* = .void,
+            .consumed, .reuse_token, .union_val, .closure => return error.CannotExport,
+            .tuple => |tuple_value| {
+                try budget.ensureChildren(frame.depth, tuple_value.elems.len);
+                const exported_elems = try alloc.alloc(ConstValue, tuple_value.elems.len);
+                initConstValueSlots(exported_elems);
+                frame.dest.* = .{ .tuple = exported_elems };
+                var index = tuple_value.elems.len;
+                while (index > 0) {
+                    index -= 1;
+                    try stack.push(alloc, .{
+                        .source = tuple_value.elems[index],
+                        .dest = &exported_elems[index],
+                        .depth = frame.depth + 1,
+                    });
+                }
+            },
+            .list => |list_value| {
+                try budget.ensureChildren(frame.depth, list_value.elems.len);
+                const exported_elems = try alloc.alloc(ConstValue, list_value.elems.len);
+                initConstValueSlots(exported_elems);
+                frame.dest.* = .{ .list = exported_elems };
+                var index = list_value.elems.len;
+                while (index > 0) {
+                    index -= 1;
+                    try stack.push(alloc, .{
+                        .source = list_value.elems[index],
+                        .dest = &exported_elems[index],
+                        .depth = frame.depth + 1,
+                    });
+                }
+            },
+            .map => |map_value| {
+                try budget.ensureChildren(frame.depth, try checkedChildCount(map_value.entries.len, 2));
+                const exported_entries = try alloc.alloc(ConstValue.ConstMapEntry, map_value.entries.len);
+                initConstMapEntries(exported_entries);
+                frame.dest.* = .{ .map = exported_entries };
+                var index = map_value.entries.len;
+                while (index > 0) {
+                    index -= 1;
+                    try stack.push(alloc, .{
+                        .source = map_value.entries[index].value,
+                        .dest = &exported_entries[index].value,
+                        .depth = frame.depth + 1,
+                    });
+                    try stack.push(alloc, .{
+                        .source = map_value.entries[index].key,
+                        .dest = &exported_entries[index].key,
+                        .depth = frame.depth + 1,
+                    });
+                }
+            },
+            .struct_val => |struct_value| {
+                try budget.ensureChildren(frame.depth, struct_value.fields.len);
+                const exported_type_name = try alloc.dupe(u8, struct_value.type_name);
+                var struct_transferred = false;
+                errdefer if (!struct_transferred) alloc.free(exported_type_name);
+                const exported_fields = try alloc.alloc(ConstValue.ConstFieldValue, struct_value.fields.len);
+                initConstFieldValues(exported_fields);
+                frame.dest.* = .{ .struct_val = .{
+                    .type_name = exported_type_name,
+                    .fields = exported_fields,
+                } };
+                struct_transferred = true;
+                var index = struct_value.fields.len;
+                while (index > 0) {
+                    index -= 1;
+                    exported_fields[index].name = try alloc.dupe(u8, struct_value.fields[index].name);
+                    try stack.push(alloc, .{
+                        .source = struct_value.fields[index].value,
+                        .dest = &exported_fields[index].value,
+                        .depth = frame.depth + 1,
+                    });
+                }
+            },
+            .enum_val => |enum_value| frame.dest.* = .{ .atom = try alloc.dupe(u8, enum_value.variant) },
+            .optional => |optional_value| {
+                if (optional_value.value) |child_value| {
+                    try budget.ensureChildren(frame.depth, 1);
+                    try stack.push(alloc, .{
+                        .source = child_value.*,
+                        .dest = frame.dest,
+                        .depth = frame.depth + 1,
+                    });
+                } else {
+                    frame.dest.* = .nil;
+                }
+            },
+        }
+    }
+
+    return exported_root;
 }
 
 pub const ExportError = error{
     CannotExport,
+    ValueTraversalDepthExceeded,
+    ValueTraversalBudgetExceeded,
     OutOfMemory,
 };
 
@@ -488,13 +1360,139 @@ pub const CtDependency = union(enum) {
         paths: []const []const u8,
         graph_hash: u64,
     },
+
+    /// Deep-copy this dependency into allocator-owned storage. The returned
+    /// dependency must be released with `deinitOwned`.
+    pub fn cloneOwned(self: CtDependency, alloc: std.mem.Allocator) !CtDependency {
+        return cloneDependency(alloc, self);
+    }
+
+    /// Free payload storage owned by a cloned or cached dependency.
+    pub fn deinitOwned(self: CtDependency, alloc: std.mem.Allocator) void {
+        deinitCachedDependency(alloc, self);
+    }
+};
+
+/// Errors that mean persistent dependency validation could not complete.
+pub const DependencyValidationError =
+    std.Io.Dir.ReadFileAllocError ||
+    std.Io.Dir.AccessError ||
+    std.Io.Dir.OpenError ||
+    std.Io.Dir.Iterator.Error ||
+    SourcePathCanonicalizationError ||
+    ValueTraversalError;
+
+const SourcePathCanonicalizationError = error{
+    OutOfMemory,
+    SourcePathCanonicalizationFailed,
 };
 
 pub const CtEvalResult = struct {
     value: ConstValue,
     dependencies: []const CtDependency,
     result_hash: u64,
+
+    /// Free the deep-exported value and owned dependency slice returned by
+    /// `Interpreter.evalAndExport` or `PersistentCache.load`.
+    pub fn deinit(self: CtEvalResult, alloc: std.mem.Allocator) void {
+        deinitConstValue(alloc, self.value);
+        for (self.dependencies) |dependency| {
+            dependency.deinitOwned(alloc);
+        }
+        alloc.free(self.dependencies);
+    }
 };
+
+/// Free all allocations owned by a deep-exported `ConstValue`.
+pub fn deinitConstValue(alloc: std.mem.Allocator, value: ConstValue) void {
+    switch (value) {
+        .string, .atom => |bytes| alloc.free(bytes),
+        .tuple, .list => |items| {
+            for (items) |item| deinitConstValue(alloc, item);
+            alloc.free(items);
+        },
+        .map => |entries| {
+            for (entries) |entry| {
+                deinitConstValue(alloc, entry.key);
+                deinitConstValue(alloc, entry.value);
+            }
+            alloc.free(entries);
+        },
+        .struct_val => |struct_value| {
+            alloc.free(struct_value.type_name);
+            for (struct_value.fields) |field| {
+                alloc.free(field.name);
+                deinitConstValue(alloc, field.value);
+            }
+            alloc.free(struct_value.fields);
+        },
+        .int, .float, .bool_val, .nil, .void => {},
+    }
+}
+
+fn initConstValueSlots(values: []ConstValue) void {
+    for (values) |*value| {
+        value.* = .void;
+    }
+}
+
+fn initConstMapEntries(entries: []ConstValue.ConstMapEntry) void {
+    for (entries) |*entry| {
+        entry.* = .{
+            .key = .void,
+            .value = .void,
+        };
+    }
+}
+
+fn initConstFieldValues(fields: []ConstValue.ConstFieldValue) void {
+    for (fields) |*field| {
+        field.* = .{
+            .name = &.{},
+            .value = .void,
+        };
+    }
+}
+
+fn deinitCachedDependency(alloc: std.mem.Allocator, dependency: CtDependency) void {
+    switch (dependency) {
+        .file => |file| alloc.free(file.path),
+        .env_var => |env_var| alloc.free(env_var.name),
+        .glob => |glob_dep| alloc.free(glob_dep.pattern),
+        .reflected_struct => |reflected_struct| alloc.free(reflected_struct.struct_name),
+        .reflected_source => |reflected_source| {
+            for (reflected_source.paths) |path| alloc.free(path);
+            alloc.free(reflected_source.paths);
+        },
+    }
+}
+
+fn deinitLiveDependency(alloc: std.mem.Allocator, dependency: CtDependency) void {
+    switch (dependency) {
+        .reflected_struct => |reflected_struct| alloc.free(reflected_struct.struct_name),
+        .reflected_source => |reflected_source| alloc.free(reflected_source.paths),
+        .file, .env_var, .glob => {},
+    }
+}
+
+fn clearLiveDependencies(alloc: std.mem.Allocator, dependencies: *std.ArrayListUnmanaged(CtDependency)) void {
+    for (dependencies.items) |dependency| {
+        deinitLiveDependency(alloc, dependency);
+    }
+    dependencies.clearRetainingCapacity();
+}
+
+fn deinitLiveDependencies(alloc: std.mem.Allocator, dependencies: *std.ArrayListUnmanaged(CtDependency)) void {
+    for (dependencies.items) |dependency| {
+        deinitLiveDependency(alloc, dependency);
+    }
+    dependencies.deinit(alloc);
+    dependencies.* = .empty;
+}
+
+fn deinitCachedEvalResult(alloc: std.mem.Allocator, result: CtEvalResult) void {
+    result.deinit(alloc);
+}
 
 fn cloneDependency(alloc: std.mem.Allocator, dep: CtDependency) !CtDependency {
     return switch (dep) {
@@ -517,8 +1515,16 @@ fn cloneDependency(alloc: std.mem.Allocator, dep: CtDependency) !CtDependency {
         } },
         .reflected_source => |rs| blk: {
             const paths = try alloc.alloc([]const u8, rs.paths.len);
+            var path_count: usize = 0;
+            errdefer {
+                for (paths[0..path_count]) |path| {
+                    alloc.free(path);
+                }
+                alloc.free(paths);
+            }
             for (rs.paths, 0..) |path, i| {
                 paths[i] = try alloc.dupe(u8, path);
+                path_count += 1;
             }
             break :blk .{ .reflected_source = .{
                 .paths = paths,
@@ -530,8 +1536,16 @@ fn cloneDependency(alloc: std.mem.Allocator, dep: CtDependency) !CtDependency {
 
 fn cloneDependencies(alloc: std.mem.Allocator, deps: []const CtDependency) ![]const CtDependency {
     const cloned = try alloc.alloc(CtDependency, deps.len);
+    var cloned_count: usize = 0;
+    errdefer {
+        for (cloned[0..cloned_count]) |dependency| {
+            deinitCachedDependency(alloc, dependency);
+        }
+        alloc.free(cloned);
+    }
     for (deps, 0..) |dep, i| {
         cloned[i] = try cloneDependency(alloc, dep);
+        cloned_count += 1;
     }
     return cloned;
 }
@@ -554,6 +1568,7 @@ pub const CtfeErrorKind = enum {
     step_limit_exceeded,
     recursion_limit_exceeded,
     unsupported_instruction,
+    host_io_failure,
     type_error,
     use_after_consume,
     division_by_zero,
@@ -562,6 +1577,7 @@ pub const CtfeErrorKind = enum {
     match_failure,
     undefined_function,
     index_out_of_bounds,
+    value_traversal_limit_exceeded,
 };
 
 pub const CtfeFrame = struct {
@@ -584,23 +1600,58 @@ pub const CtfeError = struct {
     };
 };
 
+fn deinitCtfeError(alloc: std.mem.Allocator, err: CtfeError) void {
+    if (err.message.len > 0) alloc.free(err.message);
+    if (err.call_stack.len > 0) alloc.free(err.call_stack);
+    if (err.attribute_context) |ctx| {
+        if (ctx.attr_name.len > 0) alloc.free(ctx.attr_name);
+        if (ctx.struct_name.len > 0) alloc.free(ctx.struct_name);
+    }
+}
+
+fn deinitCtfeErrorEntries(alloc: std.mem.Allocator, errors: []const CtfeError) void {
+    for (errors) |err| {
+        deinitCtfeError(alloc, err);
+    }
+}
+
+fn deinitClonedCtfeErrors(alloc: std.mem.Allocator, errors: []const CtfeError) void {
+    deinitCtfeErrorEntries(alloc, errors);
+    alloc.free(errors);
+}
+
 fn cloneCtfeError(alloc: std.mem.Allocator, err: CtfeError) !CtfeError {
-    const cloned_stack = try alloc.dupe(CtfeFrame, err.call_stack);
-    return .{
-        .message = try alloc.dupe(u8, err.message),
+    var cloned = CtfeError{
+        .message = &.{},
         .kind = err.kind,
-        .call_stack = cloned_stack,
-        .attribute_context = if (err.attribute_context) |ctx| .{
-            .attr_name = try alloc.dupe(u8, ctx.attr_name),
-            .struct_name = try alloc.dupe(u8, ctx.struct_name),
-        } else null,
+        .call_stack = &.{},
+        .attribute_context = null,
     };
+    errdefer deinitCtfeError(alloc, cloned);
+
+    cloned.call_stack = try alloc.dupe(CtfeFrame, err.call_stack);
+    cloned.message = try alloc.dupe(u8, err.message);
+    if (err.attribute_context) |ctx| {
+        cloned.attribute_context = .{
+            .attr_name = try alloc.dupe(u8, ctx.attr_name),
+            .struct_name = &.{},
+        };
+        cloned.attribute_context.?.struct_name = try alloc.dupe(u8, ctx.struct_name);
+    }
+
+    return cloned;
 }
 
 fn cloneCtfeErrors(alloc: std.mem.Allocator, errors: []const CtfeError) ![]const CtfeError {
     const cloned = try alloc.alloc(CtfeError, errors.len);
+    var initialized_count: usize = 0;
+    errdefer {
+        deinitCtfeErrorEntries(alloc, cloned[0..initialized_count]);
+        alloc.free(cloned);
+    }
     for (errors, 0..) |err, i| {
         cloned[i] = try cloneCtfeError(alloc, err);
+        initialized_count += 1;
     }
     return cloned;
 }
@@ -673,7 +1724,9 @@ pub fn formatCtfeError(alloc: std.mem.Allocator, err: CtfeError) ![]const u8 {
         .arithmetic_overflow => try w.writeAll("  help: the computation overflows its integer type (e.g. minInt / -1) — adjust the operands\n"),
         .undefined_function => try w.writeAll("  help: the function may not exist or may not be visible at compile time\n"),
         .match_failure => try w.writeAll("  help: no clause matched the compile-time value — add a catch-all clause\n"),
+        .host_io_failure => try w.writeAll("  help: check that the compile-time file access is valid and repeatable\n"),
         .type_error => try w.writeAll("  help: compile-time values must have compatible types\n"),
+        .value_traversal_limit_exceeded => try w.writeAll("  help: simplify the compile-time value or reduce its nesting/size\n"),
         else => {},
     }
 
@@ -705,8 +1758,18 @@ pub const CacheKey = struct {
     options_hash: u64 = 0,
 };
 
+fn deinitMemoCache(alloc: std.mem.Allocator, memo_cache: *std.AutoHashMapUnmanaged(CacheKey, CtValue)) void {
+    var iterator = memo_cache.iterator();
+    while (iterator.next()) |entry| {
+        deinitMemoizedCtValue(alloc, entry.value_ptr.*);
+    }
+    memo_cache.deinit(alloc);
+    memo_cache.* = .empty;
+}
+
 /// Schema version for cache invalidation when interpreter semantics change.
 pub const CTFE_SCHEMA_VERSION: u32 = 1;
+pub const MAX_CONST_EXPR_RECURSION_DEPTH: u32 = 2048;
 
 /// Build a complete options hash from compile-relevant settings.
 pub fn hashCompileOptions(target: []const u8, optimize: []const u8) u64 {
@@ -1292,6 +2355,8 @@ pub const Interpreter = struct {
     step_budget: u64,
     steps_remaining: u64,
     recursion_limit: u32,
+    const_expr_recursion_limit: u32,
+    const_expr_depth: u32,
     allocation_store: AllocationStore,
     persistent_cache: ?PersistentCache = null,
     capabilities: CapabilitySet,
@@ -1309,7 +2374,7 @@ pub const Interpreter = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         program: *const ir.Program,
-    ) Interpreter {
+    ) std.mem.Allocator.Error!Interpreter {
         var interp = Interpreter{
             .allocator = allocator,
             .program = program,
@@ -1317,6 +2382,8 @@ pub const Interpreter = struct {
             .step_budget = 1_000_000,
             .steps_remaining = 1_000_000,
             .recursion_limit = 256,
+            .const_expr_recursion_limit = MAX_CONST_EXPR_RECURSION_DEPTH,
+            .const_expr_depth = 0,
             .capabilities = CapabilitySet.pure_only,
             .dependencies = .empty,
             .call_stack = .empty,
@@ -1328,25 +2395,22 @@ pub const Interpreter = struct {
             .current_struct_scope = null,
             .current_attribute_context = null,
         };
+        errdefer interp.function_by_name.deinit(allocator);
+
         // Build name -> id index (use func.id, NOT array index)
         for (program.functions) |func| {
-            interp.function_by_name.put(allocator, func.name, func.id) catch {};
+            try interp.function_by_name.put(allocator, func.name, func.id);
         }
         return interp;
     }
 
     pub fn deinit(self: *Interpreter) void {
         self.function_by_name.deinit(self.allocator);
-        self.dependencies.deinit(self.allocator);
+        deinitLiveDependencies(self.allocator, &self.dependencies);
         self.call_stack.deinit(self.allocator);
-        for (self.errors.items) |err| {
-            if (err.attribute_context) |ctx| {
-                self.allocator.free(ctx.attr_name);
-                self.allocator.free(ctx.struct_name);
-            }
-        }
+        deinitCtfeErrorEntries(self.allocator, self.errors.items);
         self.errors.deinit(self.allocator);
-        self.memo_cache.deinit(self.allocator);
+        deinitMemoCache(self.allocator, &self.memo_cache);
         self.allocation_store.deinit(self.allocator);
     }
 
@@ -1360,6 +2424,7 @@ pub const Interpreter = struct {
             try self.emitError(.recursion_limit_exceeded, "recursion limit exceeded");
             return error.CtfeFailure;
         }
+        const is_top_level_eval = self.call_stack.items.len == 0;
 
         // Look up function by ID (not array index) — function IDs may not
         // match array indices when generic stubs or monomorphized copies are present.
@@ -1372,10 +2437,11 @@ pub const Interpreter = struct {
         };
 
         // Memoization: check in-process cache
+        const args_hash = self.hashArgs(args) catch |err| return self.traversalFailure(err);
         const cache_key = CacheKey{
             .function_id = function_id,
             .function_hash = hashFunctionIdentity(func),
-            .args_hash = hashArgs(args),
+            .args_hash = args_hash,
             .capability_flags = self.capabilities.flags,
             .options_hash = hashEvaluationOptions(self.compile_options_hash, self.build_opts),
         };
@@ -1385,7 +2451,7 @@ pub const Interpreter = struct {
 
         // Persistent cache: check disk cache (top-level calls only)
         if (self.persistent_cache) |*pc| {
-            if (self.call_stack.items.len == 0) {
+            if (is_top_level_eval) {
                 const pk = PersistentCache.cacheKeyFor(
                     func.name,
                     cache_key.function_hash,
@@ -1393,11 +2459,23 @@ pub const Interpreter = struct {
                     cache_key.capability_flags,
                     cache_key.options_hash,
                 );
-                if (pc.load(self.allocator, pk)) |cached_result| {
-                    if (PersistentCache.validateDependencies(self.allocator, cached_result.dependencies, self.scope_graph, self.interner)) {
-                        const imported = importConstValue(cached_result.value);
-                        self.memo_cache.put(self.allocator, cache_key, imported) catch {};
-                        return imported;
+                const maybe_cached_result = pc.load(self.allocator, pk) catch |err| return self.persistentCacheLoadFailure(err);
+                if (maybe_cached_result) |cached_result| {
+                    defer deinitCachedEvalResult(self.allocator, cached_result);
+                    const dependencies_valid = PersistentCache.validateDependencies(self.allocator, cached_result.dependencies, self.scope_graph, self.interner) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ValueTraversalDepthExceeded,
+                        error.ValueTraversalBudgetExceeded,
+                        => |traversal_err| return self.traversalFailure(traversal_err),
+                        else => {
+                            try self.emitErrorFmt(.host_io_failure, "persistent CTFE cache dependency validation failed: {s}", .{@errorName(err)});
+                            return error.CtfeFailure;
+                        },
+                    };
+                    if (dependencies_valid) {
+                        const imported = importConstValue(self.allocator, cached_result.value) catch |err| return self.traversalFailure(err);
+                        defer deinitOwnedCtValue(self.allocator, imported);
+                        return try self.putMemoizedCtValue(cache_key, imported);
                     }
                 }
             }
@@ -1418,30 +2496,55 @@ pub const Interpreter = struct {
         const result = try self.execFunctionBlocks(func, &frame);
 
         // Store in memo cache
-        self.memo_cache.put(self.allocator, cache_key, result) catch {};
+        _ = try self.putMemoizedCtValue(cache_key, result);
 
         // Store in persistent cache (top-level calls only)
         if (self.persistent_cache) |*pc| {
-            if (self.call_stack.items.len == 0) {
-                const exported = exportValue(self.allocator, result) catch null;
-                if (exported) |ev| {
-                    const pk = PersistentCache.cacheKeyFor(
-                        func.name,
-                        cache_key.function_hash,
-                        cache_key.args_hash,
-                        cache_key.capability_flags,
-                        cache_key.options_hash,
-                    );
-                    pc.store(self.allocator, pk, .{
-                        .value = ev,
-                        .dependencies = self.dependencies.items,
-                        .result_hash = hashConstValue(ev),
-                    });
-                }
+            if (is_top_level_eval) {
+                const exported = exportValue(self.allocator, result) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ValueTraversalDepthExceeded,
+                    error.ValueTraversalBudgetExceeded,
+                    => |traversal_err| return self.traversalFailure(traversal_err),
+                    error.CannotExport => return result,
+                };
+                defer deinitConstValue(self.allocator, exported);
+
+                const pk = PersistentCache.cacheKeyFor(
+                    func.name,
+                    cache_key.function_hash,
+                    cache_key.args_hash,
+                    cache_key.capability_flags,
+                    cache_key.options_hash,
+                );
+                const result_hash = hashConstValue(self.allocator, exported) catch |err| return self.traversalFailure(err);
+                pc.store(self.allocator, pk, .{
+                    .value = exported,
+                    .dependencies = self.dependencies.items,
+                    .result_hash = result_hash,
+                }) catch |err| return self.persistentCacheStoreFailure(err);
             }
         }
 
         return result;
+    }
+
+    fn putMemoizedCtValue(
+        self: *Interpreter,
+        cache_key: CacheKey,
+        value: CtValue,
+    ) CtfeInterpretError!CtValue {
+        const memoized_value = cloneCtValueForMemo(self.allocator, value) catch |err| return self.traversalFailure(err);
+        errdefer deinitMemoizedCtValue(self.allocator, memoized_value);
+
+        if (self.memo_cache.getPtr(cache_key)) |existing_value| {
+            deinitMemoizedCtValue(self.allocator, existing_value.*);
+            existing_value.* = memoized_value;
+            return memoized_value;
+        }
+
+        try self.memo_cache.putNoClobber(self.allocator, cache_key, memoized_value);
+        return memoized_value;
     }
 
     /// Evaluate a function by name.
@@ -1466,53 +2569,125 @@ pub const Interpreter = struct {
         caps: CapabilitySet,
     ) CtfeInterpretError!CtEvalResult {
         self.capabilities = caps;
-        self.dependencies = .empty;
+        clearLiveDependencies(self.allocator, &self.dependencies);
         self.steps_remaining = self.step_budget;
 
         // Import ConstValue args to CtValue
         const ct_args = self.allocator.alloc(CtValue, args.len) catch return error.OutOfMemory;
+        initCtValueSlots(ct_args);
+        defer {
+            deinitOwnedCtValueSlice(self.allocator, ct_args);
+            self.allocator.free(ct_args);
+        }
         for (args, 0..) |arg, i| {
-            ct_args[i] = importConstValue(arg);
+            ct_args[i] = importConstValue(self.allocator, arg) catch |err| return self.traversalFailure(err);
         }
 
         const result = try self.evalFunction(function_id, ct_args);
-        const exported = exportValue(self.allocator, result) catch return error.CtfeFailure;
+        const exported = exportValue(self.allocator, result) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ValueTraversalDepthExceeded => return self.traversalFailure(error.ValueTraversalDepthExceeded),
+            error.ValueTraversalBudgetExceeded => return self.traversalFailure(error.ValueTraversalBudgetExceeded),
+            error.CannotExport => return error.CtfeFailure,
+        };
+        errdefer deinitConstValue(self.allocator, exported);
         const dependencies = cloneDependencies(self.allocator, self.dependencies.items) catch return error.OutOfMemory;
+        errdefer {
+            for (dependencies) |dependency| {
+                deinitCachedDependency(self.allocator, dependency);
+            }
+            self.allocator.free(dependencies);
+        }
+        const result_hash = hashConstValue(self.allocator, exported) catch |err| return self.traversalFailure(err);
 
         return .{
             .value = exported,
             .dependencies = dependencies,
-            .result_hash = hashConstValue(exported),
+            .result_hash = result_hash,
         };
     }
 
-    fn hashConstValue(val: ConstValue) u64 {
+    fn hashConstValue(allocator: std.mem.Allocator, val: ConstValue) ValueTraversalError!u64 {
         var hasher = std.hash.Wyhash.init(0);
-        hashConstValueInto(&hasher, val);
+        try hashConstValueInto(allocator, &hasher, val);
         return hasher.final();
     }
 
-    fn hashConstValueInto(hasher: *std.hash.Wyhash, val: ConstValue) void {
-        switch (val) {
-            .int => |v| hasher.update(std.mem.asBytes(&v)),
-            .float => |v| hasher.update(std.mem.asBytes(&v)),
-            .string => |v| hasher.update(v),
-            .bool_val => |v| hasher.update(&[_]u8{@intFromBool(v)}),
-            .atom => |v| hasher.update(v),
-            .nil, .void => {},
-            .tuple => |elems| for (elems) |e| hashConstValueInto(hasher, e),
-            .list => |elems| for (elems) |e| hashConstValueInto(hasher, e),
-            .map => |entries| for (entries) |entry| {
-                hashConstValueInto(hasher, entry.key);
-                hashConstValueInto(hasher, entry.value);
-            },
-            .struct_val => |sv| {
-                hasher.update(sv.type_name);
-                for (sv.fields) |f| {
-                    hasher.update(f.name);
-                    hashConstValueInto(hasher, f.value);
-                }
-            },
+    fn hashConstValueInto(allocator: std.mem.Allocator, hasher: *std.hash.Wyhash, val: ConstValue) ValueTraversalError!void {
+        const HashValueFrame = struct {
+            value: ConstValue,
+            depth: usize,
+        };
+        const HashFrame = union(enum) {
+            value: HashValueFrame,
+            bytes: []const u8,
+        };
+
+        var budget = ValueTraversalBudget{};
+        var stack = InlineTraversalStack(HashFrame){};
+        defer stack.deinit(allocator);
+
+        try stack.push(allocator, .{ .value = .{ .value = val, .depth = 1 } });
+
+        while (stack.pop()) |frame| {
+            switch (frame) {
+                .bytes => |bytes| hasher.update(bytes),
+                .value => |value_frame| {
+                    try budget.visit(value_frame.depth);
+                    switch (value_frame.value) {
+                        .int => |value| hasher.update(std.mem.asBytes(&value)),
+                        .float => |value| hasher.update(std.mem.asBytes(&value)),
+                        .string => |value| hasher.update(value),
+                        .bool_val => |value| hasher.update(&[_]u8{@intFromBool(value)}),
+                        .atom => |value| hasher.update(value),
+                        .nil, .void => {},
+                        .tuple => |elems| {
+                            try budget.ensureChildren(value_frame.depth, elems.len);
+                            var index = elems.len;
+                            while (index > 0) {
+                                index -= 1;
+                                try stack.push(allocator, .{ .value = .{
+                                    .value = elems[index],
+                                    .depth = value_frame.depth + 1,
+                                } });
+                            }
+                        },
+                        .list => |elems| {
+                            try budget.ensureChildren(value_frame.depth, elems.len);
+                            var index = elems.len;
+                            while (index > 0) {
+                                index -= 1;
+                                try stack.push(allocator, .{ .value = .{
+                                    .value = elems[index],
+                                    .depth = value_frame.depth + 1,
+                                } });
+                            }
+                        },
+                        .map => |entries| {
+                            try budget.ensureChildren(value_frame.depth, try checkedChildCount(entries.len, 2));
+                            var index = entries.len;
+                            while (index > 0) {
+                                index -= 1;
+                                try stack.push(allocator, .{ .value = .{ .value = entries[index].value, .depth = value_frame.depth + 1 } });
+                                try stack.push(allocator, .{ .value = .{ .value = entries[index].key, .depth = value_frame.depth + 1 } });
+                            }
+                        },
+                        .struct_val => |struct_value| {
+                            hasher.update(struct_value.type_name);
+                            try budget.ensureChildren(value_frame.depth, struct_value.fields.len);
+                            var index = struct_value.fields.len;
+                            while (index > 0) {
+                                index -= 1;
+                                try stack.push(allocator, .{ .value = .{
+                                    .value = struct_value.fields[index].value,
+                                    .depth = value_frame.depth + 1,
+                                } });
+                                try stack.push(allocator, .{ .bytes = struct_value.fields[index].name });
+                            }
+                        },
+                    }
+                },
+            }
         }
     }
 
@@ -1644,64 +2819,104 @@ pub const Interpreter = struct {
             // === Aggregates ===
             .tuple_init => |ti| {
                 const elems = try self.collectLocals(ti.elements, frame);
-                const alloc_id = self.allocIdForDest(frame, ti.dest, .tuple);
-                frame.setLocal(ti.dest, .{ .tuple = .{ .alloc_id = alloc_id, .elems = elems } });
+                var elems_transferred = false;
+                errdefer if (!elems_transferred) {
+                    freeUncommittedCtValueSlots(self.allocator, elems, elems.len);
+                };
+                const alloc_id = try self.allocIdForDest(frame, ti.dest, .tuple);
+                try self.setAggregateLocal(ti.dest, frame, .{ .tuple = .{ .alloc_id = alloc_id, .elems = elems } });
+                elems_transferred = true;
                 return .continued;
             },
             .list_init => |li| {
                 const elems = try self.collectLocals(li.elements, frame);
-                const alloc_id = self.allocIdForDest(frame, li.dest, .list);
-                frame.setLocal(li.dest, .{ .list = .{ .alloc_id = alloc_id, .elems = elems } });
+                var elems_transferred = false;
+                errdefer if (!elems_transferred) {
+                    freeUncommittedCtValueSlots(self.allocator, elems, elems.len);
+                };
+                const alloc_id = try self.allocIdForDest(frame, li.dest, .list);
+                try self.setAggregateLocal(li.dest, frame, .{ .list = .{ .alloc_id = alloc_id, .elems = elems } });
+                elems_transferred = true;
                 return .continued;
             },
             .list_cons => |lc| {
                 const head_val = try self.readLocal(frame, lc.head);
                 const tail_val = try self.readLocal(frame, lc.tail);
                 const elems = try self.allocator.alloc(CtValue, 2);
+                var initialized_elem_count: usize = 0;
+                var elems_transferred = false;
+                errdefer if (!elems_transferred) {
+                    freeUncommittedCtValueSlots(self.allocator, elems, initialized_elem_count);
+                };
                 elems[0] = head_val;
+                initialized_elem_count += 1;
                 elems[1] = tail_val;
-                const alloc_id = self.allocIdForDest(frame, lc.dest, .tuple);
-                frame.setLocal(lc.dest, .{ .tuple = .{ .alloc_id = alloc_id, .elems = elems } });
+                initialized_elem_count += 1;
+                const alloc_id = try self.allocIdForDest(frame, lc.dest, .tuple);
+                try self.setAggregateLocal(lc.dest, frame, .{ .tuple = .{ .alloc_id = alloc_id, .elems = elems } });
+                elems_transferred = true;
                 return .continued;
             },
             .map_init => |mi| {
                 const entries = try self.allocator.alloc(CtValue.CtMapEntry, mi.entries.len);
+                var initialized_entry_count: usize = 0;
+                var entries_transferred = false;
+                errdefer if (!entries_transferred) {
+                    freeUncommittedCtMapEntries(self.allocator, entries, initialized_entry_count);
+                };
                 for (mi.entries, 0..) |entry, i| {
                     entries[i] = .{
                         .key = try self.readLocal(frame, entry.key),
                         .value = try self.readLocal(frame, entry.value),
                     };
+                    initialized_entry_count += 1;
                 }
-                const alloc_id = self.allocIdForDest(frame, mi.dest, .map);
-                frame.setLocal(mi.dest, .{ .map = .{ .alloc_id = alloc_id, .entries = entries } });
+                const alloc_id = try self.allocIdForDest(frame, mi.dest, .map);
+                try self.setAggregateLocal(mi.dest, frame, .{ .map = .{ .alloc_id = alloc_id, .entries = entries } });
+                entries_transferred = true;
                 return .continued;
             },
             .struct_init => |si| {
                 const fields = try self.allocator.alloc(CtValue.CtFieldValue, si.fields.len);
+                var initialized_field_count: usize = 0;
+                var fields_transferred = false;
+                errdefer if (!fields_transferred) {
+                    freeUncommittedCtFieldValues(self.allocator, fields, initialized_field_count);
+                };
                 for (si.fields, 0..) |field, i| {
                     fields[i] = .{
                         .name = field.name,
                         .value = try self.readLocal(frame, field.value),
                     };
+                    initialized_field_count += 1;
                 }
-                const alloc_id = self.allocIdForDest(frame, si.dest, .struct_val);
-                frame.setLocal(si.dest, .{ .struct_val = .{
+                const alloc_id = try self.allocIdForDest(frame, si.dest, .struct_val);
+                try self.setAggregateLocal(si.dest, frame, .{ .struct_val = .{
                     .alloc_id = alloc_id,
                     .type_name = si.type_name,
                     .fields = fields,
                 } });
+                fields_transferred = true;
                 return .continued;
             },
             .union_init => |ui| {
                 const payload = try self.allocator.create(CtValue);
+                var payload_initialized = false;
+                var payload_transferred = false;
+                errdefer if (!payload_transferred) {
+                    if (payload_initialized) payload.* = .void;
+                    self.allocator.destroy(payload);
+                };
                 payload.* = try self.readLocal(frame, ui.value);
-                const alloc_id = self.allocIdForDest(frame, ui.dest, .union_val);
-                frame.setLocal(ui.dest, .{ .union_val = .{
+                payload_initialized = true;
+                const alloc_id = try self.allocIdForDest(frame, ui.dest, .union_val);
+                try self.setAggregateLocal(ui.dest, frame, .{ .union_val = .{
                     .alloc_id = alloc_id,
                     .type_name = ui.union_type,
                     .variant = ui.variant_name,
                     .payload = payload,
                 } });
+                payload_transferred = true;
                 return .continued;
             },
             .enum_literal => |el| {
@@ -1796,7 +3011,7 @@ pub const Interpreter = struct {
                     .map => |mv| {
                         var found = false;
                         for (mv.entries) |entry| {
-                            if (entry.key.eql(key_val)) {
+                            if (entry.key.eqlWithAllocator(self.allocator, key_val) catch |err| return self.traversalFailure(err)) {
                                 found = true;
                                 break;
                             }
@@ -1817,7 +3032,7 @@ pub const Interpreter = struct {
                     .map => |mv| {
                         var result: ?CtValue = null;
                         for (mv.entries) |entry| {
-                            if (entry.key.eql(key_val)) {
+                            if (entry.key.eqlWithAllocator(self.allocator, key_val) catch |err| return self.traversalFailure(err)) {
                                 result = entry.value;
                                 break;
                             }
@@ -2122,7 +3337,7 @@ pub const Interpreter = struct {
             // === Closures ===
             .make_closure => |mc| {
                 const caps = try self.collectLocals(mc.captures, frame);
-                const alloc_id = self.allocIdForDest(frame, mc.dest, .closure);
+                const alloc_id = try self.allocIdForDest(frame, mc.dest, .closure);
                 frame.setLocal(mc.dest, .{ .closure = .{
                     .alloc_id = alloc_id,
                     .function_id = mc.function,
@@ -2157,6 +3372,8 @@ pub const Interpreter = struct {
                 switch (obj) {
                     .struct_val => |sv| {
                         const new_fields = self.allocator.alloc(CtValue.CtFieldValue, sv.fields.len) catch return error.OutOfMemory;
+                        var new_fields_committed = false;
+                        errdefer if (!new_fields_committed) self.allocator.free(new_fields);
                         for (sv.fields, 0..) |field, i| {
                             if (std.mem.eql(u8, field.name, fs.field)) {
                                 new_fields[i] = .{ .name = field.name, .value = try self.readLocal(frame, fs.value) };
@@ -2169,29 +3386,20 @@ pub const Interpreter = struct {
                             .type_name = sv.type_name,
                             .fields = new_fields,
                         } });
+                        new_fields_committed = true;
                     },
                     .map => |mv| {
-                        var new_entries = std.ArrayListUnmanaged(CtValue.CtMapEntry).fromOwnedSlice(@constCast(mv.entries));
-                        var found = false;
-                        for (new_entries.items, 0..) |entry, i| {
-                            const key_matches = switch (entry.key) {
-                                .string => |k| std.mem.eql(u8, k, fs.field),
-                                .atom => |k| std.mem.eql(u8, k, fs.field),
-                                else => false,
-                            };
-                            if (key_matches) {
-                                new_entries.items[i].value = try self.readLocal(frame, fs.value);
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            new_entries.append(self.allocator, .{
-                                .key = .{ .string = fs.field },
-                                .value = try self.readLocal(frame, fs.value),
-                            }) catch return error.OutOfMemory;
-                        }
-                        frame.setLocal(fs.object, .{ .map = .{ .alloc_id = mv.alloc_id, .entries = new_entries.items } });
+                        const replacement_value = try self.readLocal(frame, fs.value);
+                        const replacement_entries = rebuildMapEntriesForFieldSet(
+                            self.allocator,
+                            mv.entries,
+                            fs.field,
+                            replacement_value,
+                        ) catch return error.OutOfMemory;
+                        var replacement_entries_committed = false;
+                        errdefer if (!replacement_entries_committed) self.allocator.free(replacement_entries);
+                        frame.setLocal(fs.object, .{ .map = .{ .alloc_id = mv.alloc_id, .entries = replacement_entries } });
+                        replacement_entries_committed = true;
                     },
                     else => {
                         try self.emitError(.type_error, "field_set on non-struct/map value");
@@ -2493,8 +3701,8 @@ pub const Interpreter = struct {
                 }
                 return self.numericOp(lhs, rhs, .rem_op);
             },
-            .eq, .string_eq => return .{ .bool_val = lhs.eql(rhs) },
-            .neq, .string_neq => return .{ .bool_val = !lhs.eql(rhs) },
+            .eq, .string_eq => return .{ .bool_val = lhs.eqlWithAllocator(self.allocator, rhs) catch |err| return self.traversalFailure(err) },
+            .neq, .string_neq => return .{ .bool_val = !(lhs.eqlWithAllocator(self.allocator, rhs) catch |err| return self.traversalFailure(err)) },
             .lt => {
                 const ord = lhs.compare(rhs) orelse {
                     try self.emitError(.type_error, "incomparable types");
@@ -2530,7 +3738,7 @@ pub const Interpreter = struct {
                 switch (rhs) {
                     .list => |list| {
                         for (list.elems) |elem| {
-                            if (lhs.eql(elem)) return .{ .bool_val = true };
+                            if (lhs.eqlWithAllocator(self.allocator, elem) catch |err| return self.traversalFailure(err)) return .{ .bool_val = true };
                         }
                         return .{ .bool_val = false };
                     },
@@ -2645,8 +3853,7 @@ pub const Interpreter = struct {
                     const result = self.allocator.alloc(CtValue, a.elems.len + b.elems.len) catch return error.OutOfMemory;
                     @memcpy(result[0..a.elems.len], a.elems);
                     @memcpy(result[a.elems.len..], b.elems);
-                    const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
-                    return .{ .list = .{ .alloc_id = alloc_id, .elems = result } };
+                    return finishBorrowedCtValueList(self.allocator, &self.allocation_store, self.currentFunctionId(), result);
                 },
                 else => {},
             },
@@ -3129,11 +4336,13 @@ pub const Interpreter = struct {
 
     fn execCallDirect(self: *Interpreter, cd: ir.CallDirect, frame: *const Frame) CtfeInterpretError!CtValue {
         const args = try self.collectLocals(cd.args, frame);
+        defer self.allocator.free(args);
         return self.evalFunction(cd.function, args);
     }
 
     fn execCallNamed(self: *Interpreter, cn: ir.CallNamed, frame: *const Frame) CtfeInterpretError!CtValue {
         const args = try self.collectLocals(cn.args, frame);
+        defer self.allocator.free(args);
         const func_id = self.function_by_name.get(cn.name) orelse {
             try self.emitError(.undefined_function, cn.name);
             return error.CtfeFailure;
@@ -3143,6 +4352,7 @@ pub const Interpreter = struct {
 
     fn execCallBuiltin(self: *Interpreter, cb: ir.CallBuiltin, frame: *const Frame) CtfeInterpretError!CtValue {
         const args = try self.collectLocals(cb.args, frame);
+        defer self.allocator.free(args);
 
         // Reflection intrinsics
         if (std.mem.eql(u8, cb.name, "source_graph_structs")) {
@@ -3290,7 +4500,7 @@ pub const Interpreter = struct {
             try self.emitError(.type_error, "inspect expects 1 argument");
             return error.CtfeFailure;
         }
-        const s = formatCtValue(self.allocator, args[0]) catch return error.OutOfMemory;
+        const s = formatCtValue(self.allocator, args[0]) catch |err| return self.traversalFailure(err);
         return .{ .string = s };
     }
 
@@ -3304,7 +4514,7 @@ pub const Interpreter = struct {
         if (args[0] != .map) return default_value;
 
         for (args[0].map.entries) |entry| {
-            if (entry.key.eql(args[1])) {
+            if (entry.key.eqlWithAllocator(self.allocator, args[1]) catch |err| return self.traversalFailure(err)) {
                 return entry.value;
             }
         }
@@ -3334,19 +4544,27 @@ pub const Interpreter = struct {
         };
 
         // Read the file
-        const content = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, self.allocator, .limited(10 * 1024 * 1024)) catch {
-            // Record dependency on absent file
-            self.dependencies.append(self.allocator, .{
-                .file = .{ .path = path, .content_hash = 0 },
-            }) catch {};
-            return .nil;
+        const content = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, self.allocator, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => {
+                // Record dependency on absent file
+                try self.recordDependency(.{
+                    .file = .{ .path = path, .content_hash = 0 },
+                });
+                return .nil;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try self.emitErrorFmt(.host_io_failure, "File.read failed for `{s}`: {s}", .{ path, @errorName(err) });
+                return error.CtfeFailure;
+            },
         };
+        errdefer self.allocator.free(content);
 
         // Record dependency with content hash
         const content_hash = std.hash.Wyhash.hash(0, content);
-        self.dependencies.append(self.allocator, .{
+        try self.recordDependency(.{
             .file = .{ .path = path, .content_hash = content_hash },
-        }) catch {};
+        });
 
         return .{ .string = content };
     }
@@ -3370,20 +4588,29 @@ pub const Interpreter = struct {
             },
         };
 
-        const matches = glob.collect(self.allocator, std.Options.debug_io, pattern, .{}) catch return error.OutOfMemory;
+        const matches = glob.collect(self.allocator, std.Options.debug_io, pattern, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try self.emitErrorFmt(.host_io_failure, ":zig.Prim.glob failed for `{s}`: {s}", .{ pattern, @errorName(err) });
+                return error.CtfeFailure;
+            },
+        };
+        errdefer glob.freeMatches(self.allocator, matches);
         const result_items = self.allocator.alloc(CtValue, matches.len) catch return error.OutOfMemory;
+        errdefer self.allocator.free(result_items);
         for (matches, 0..) |matched_path, index| {
             result_items[index] = .{ .string = matched_path };
         }
 
-        self.dependencies.append(self.allocator, .{
+        try self.recordDependency(.{
             .glob = .{
                 .pattern = pattern,
                 .result_hash = hashGlobMatches(matches),
             },
-        }) catch {};
+        });
 
-        const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        const alloc_id = try self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        self.allocator.free(matches);
         return .{ .list = .{ .alloc_id = alloc_id, .elems = result_items } };
     }
 
@@ -3411,16 +4638,17 @@ pub const Interpreter = struct {
 
         if (value) |v| {
             const val_copy = self.allocator.dupe(u8, v) catch return error.OutOfMemory;
+            errdefer self.allocator.free(val_copy);
             const value_hash = std.hash.Wyhash.hash(0, v);
-            self.dependencies.append(self.allocator, .{
+            try self.recordDependency(.{
                 .env_var = .{ .name = name, .value_hash = value_hash, .present = true },
-            }) catch {};
+            });
             return .{ .string = val_copy };
         } else {
             // Record dependency on absent env var
-            self.dependencies.append(self.allocator, .{
+            try self.recordDependency(.{
                 .env_var = .{ .name = name, .value_hash = 0, .present = false },
-            }) catch {};
+            });
             return .nil;
         }
     }
@@ -3474,24 +4702,44 @@ pub const Interpreter = struct {
         };
 
         const path_filter = try self.extractPathFilter(args[0]);
-        const graph_hash = computeSourceReflectionHash(self.allocator, graph, interner, path_filter);
+        var path_filter_transferred = false;
+        errdefer if (!path_filter_transferred) self.allocator.free(path_filter);
+
+        const graph_hash = computeSourceReflectionHash(self.allocator, graph, interner, path_filter) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.SourcePathCanonicalizationFailed => {
+                try self.emitError(.host_io_failure, "source reflection path canonicalization failed");
+                return error.CtfeFailure;
+            },
+        };
         try self.dependencies.append(self.allocator, .{
             .reflected_source = .{
                 .paths = path_filter,
                 .graph_hash = graph_hash,
             },
         });
+        path_filter_transferred = true;
 
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+        errdefer {
+            deinitOwnedCtValueSlice(self.allocator, result_list.items);
+            result_list.deinit(self.allocator);
+        }
         for (graph.structs.items) |struct_entry| {
             const source_id = struct_entry.decl.meta.span.source_id orelse continue;
             const path = graph.sourcePathById(source_id) orelse continue;
-            if (!pathFilterContains(self.allocator, path_filter, path)) continue;
-            try result_list.append(self.allocator, try self.makeStructRef(struct_entry, path, source_id));
+            if (!(pathFilterContains(self.allocator, path_filter, path) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.SourcePathCanonicalizationFailed => {
+                    try self.emitError(.host_io_failure, "source reflection path canonicalization failed");
+                    return error.CtfeFailure;
+                },
+            })) continue;
+            const struct_ref = try self.makeStructRef(struct_entry, path, source_id);
+            try appendOwnedCtValue(self.allocator, &result_list, struct_ref);
         }
 
-        const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
-        return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
+        return finishOwnedCtValueList(self.allocator, &self.allocation_store, self.currentFunctionId(), &result_list);
     }
 
     fn builtinReflectedStructFunctions(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
@@ -3513,32 +4761,50 @@ pub const Interpreter = struct {
             return error.CtfeFailure;
         };
 
-        const struct_name = (try self.extractStructRefName(args[0])) orelse {
+        const struct_name_ref = (try self.extractStructRefName(args[0])) orelse {
             try self.emitError(.type_error, "struct_functions expects a reflected struct, atom, or string");
             return error.CtfeFailure;
         };
+        defer struct_name_ref.deinit(self.allocator);
+        const struct_name = struct_name_ref.bytes();
         const struct_scope_id = self.findStructScopeByName(graph, struct_name) orelse {
             try self.emitError(.undefined_function, "struct not found for reflection");
             return error.CtfeFailure;
         };
 
-        const iface_hash = computeStructInterfaceHash(graph, struct_scope_id, self.interner, struct_name);
-        try self.dependencies.append(self.allocator, .{
-            .reflected_struct = .{ .struct_name = struct_name, .interface_hash = iface_hash },
-        });
+        const iface_hash = computeStructInterfaceHash(self.allocator, graph, struct_scope_id, self.interner, struct_name) catch |err| return self.traversalFailure(err);
+        try self.recordReflectedStructDependency(struct_name, iface_hash);
 
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+        errdefer {
+            deinitOwnedCtValueSlice(self.allocator, result_list.items);
+            result_list.deinit(self.allocator);
+        }
         const struct_scope = graph.getScope(struct_scope_id);
         var family_iter = struct_scope.function_families.iterator();
         while (family_iter.next()) |entry| {
             const family = &graph.families.items[entry.value_ptr.*];
             if (family.visibility != .public) continue;
             const name_str = interner.get(family.name);
-            try result_list.append(self.allocator, try self.makeFunctionRef(name_str, family.arity, family.visibility));
+            const function_ref = try self.makeFunctionRef(name_str, family.arity, family.visibility);
+            try appendOwnedCtValue(self.allocator, &result_list, function_ref);
         }
 
-        const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
-        return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
+        return finishOwnedCtValueList(self.allocator, &self.allocation_store, self.currentFunctionId(), &result_list);
+    }
+
+    fn putExportedStructAttribute(
+        allocator: std.mem.Allocator,
+        graph: *scope.ScopeGraph,
+        struct_entry: *scope.StructEntry,
+        name_id: ast.StringId,
+        exported: ConstValue,
+    ) std.mem.Allocator.Error!void {
+        var exported_transferred = false;
+        errdefer if (!exported_transferred) deinitConstValue(allocator, exported);
+
+        graph.putStructAttribute(struct_entry, name_id, exported) catch return error.OutOfMemory;
+        exported_transferred = true;
     }
 
     fn builtinStructPutAttribute(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
@@ -3550,8 +4816,13 @@ pub const Interpreter = struct {
         const name = extractAttributeName(args[0]) orelse return .nil;
         const name_id = interner.lookupExisting(name) orelse return .nil;
         const value = unwrapCtAstLiteral(args[1]);
-        const exported = exportValue(self.allocator, value) catch return .nil;
-        graph.putStructAttribute(struct_entry, name_id, exported) catch return error.OutOfMemory;
+        const exported = exportValue(graph.allocator, value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ValueTraversalDepthExceeded => return self.traversalFailure(error.ValueTraversalDepthExceeded),
+            error.ValueTraversalBudgetExceeded => return self.traversalFailure(error.ValueTraversalBudgetExceeded),
+            error.CannotExport => return .nil,
+        };
+        putExportedStructAttribute(graph.allocator, graph, struct_entry, name_id, exported) catch return error.OutOfMemory;
         return .nil;
     }
 
@@ -3563,8 +4834,12 @@ pub const Interpreter = struct {
         const struct_entry = graph.findStructByScope(scope_id) orelse return .nil;
         const name = extractAttributeName(args[0]) orelse return .nil;
         const name_id = interner.lookupExisting(name) orelse return .nil;
-        const value = graph.getStructAttribute(struct_entry, name_id) catch return error.OutOfMemory;
-        return if (value) |attribute_value| importConstValue(attribute_value) else .nil;
+        var value = graph.getStructAttribute(struct_entry, name_id) catch return error.OutOfMemory;
+        if (value) |*attribute_value| {
+            defer attribute_value.deinit(self.allocator);
+            return importConstValue(self.allocator, attribute_value.value) catch |err| return self.traversalFailure(err);
+        }
+        return .nil;
     }
 
     fn builtinStructRegisterAttribute(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
@@ -3602,6 +4877,7 @@ pub const Interpreter = struct {
             },
             .list => |list| blk: {
                 const paths = try self.allocator.alloc([]const u8, list.elems.len);
+                errdefer self.allocator.free(paths);
                 for (list.elems, 0..) |elem, i| {
                     paths[i] = switch (elem) {
                         .string => |path| path,
@@ -3621,27 +4897,31 @@ pub const Interpreter = struct {
         };
     }
 
-    fn extractStructRefName(self: *Interpreter, value: CtValue) CtfeInterpretError!?[]const u8 {
+    fn extractStructRefName(self: *Interpreter, value: CtValue) CtfeInterpretError!?ExtractedStructRefName {
         return switch (value) {
-            .string => |name| name,
-            .atom => |name| name,
+            .string => |name| .{ .borrowed = name },
+            .atom => |name| .{ .borrowed = name },
             .tuple => |tuple| blk: {
                 if (tuple.elems.len != 3) break :blk null;
                 if (tuple.elems[0] != .atom or !std.mem.eql(u8, tuple.elems[0].atom, "__aliases__")) break :blk null;
                 if (tuple.elems[2] != .list) break :blk null;
                 var buffer: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer buffer.deinit(self.allocator);
                 for (tuple.elems[2].list.elems, 0..) |part, index| {
-                    if (part != .atom) break :blk null;
+                    if (part != .atom) {
+                        buffer.deinit(self.allocator);
+                        break :blk null;
+                    }
                     if (index > 0) try buffer.append(self.allocator, '.');
                     try buffer.appendSlice(self.allocator, part.atom);
                 }
-                break :blk try buffer.toOwnedSlice(self.allocator);
+                break :blk .{ .owned = try buffer.toOwnedSlice(self.allocator) };
             },
             .map => |map| blk: {
                 for (map.entries) |entry| {
                     if (entry.key == .atom and std.mem.eql(u8, entry.key.atom, "name")) {
-                        if (entry.value == .string) break :blk entry.value.string;
-                        if (entry.value == .atom) break :blk entry.value.atom;
+                        if (entry.value == .string) break :blk .{ .borrowed = entry.value.string };
+                        if (entry.value == .atom) break :blk .{ .borrowed = entry.value.atom };
                     }
                 }
                 break :blk null;
@@ -3660,18 +4940,33 @@ pub const Interpreter = struct {
         _ = source_id;
 
         const tuple_elems = try self.allocator.alloc(CtValue, 3);
+        initCtValueSlots(tuple_elems);
+        var tuple_elems_transferred = false;
+        errdefer if (!tuple_elems_transferred) {
+            deinitOwnedCtValueSlice(self.allocator, tuple_elems);
+            self.allocator.free(tuple_elems);
+        };
+
         const parts = try self.allocator.alloc(CtValue, struct_entry.name.parts.len);
+        initCtValueSlots(parts);
+        var parts_transferred = false;
+        errdefer if (!parts_transferred) {
+            deinitOwnedCtValueSlice(self.allocator, parts);
+            self.allocator.free(parts);
+        };
         for (struct_entry.name.parts, 0..) |part, index| {
             parts[index] = .{ .atom = self.interner.?.get(part) };
         }
 
-        const empty_list_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
-        const parts_list_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        const empty_list_id = try self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        const parts_list_id = try self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
         tuple_elems[0] = .{ .atom = "__aliases__" };
         tuple_elems[1] = .{ .list = .{ .alloc_id = empty_list_id, .elems = &.{} } };
         tuple_elems[2] = .{ .list = .{ .alloc_id = parts_list_id, .elems = parts } };
+        parts_transferred = true;
 
-        const tuple_id = self.allocation_store.alloc(self.allocator, .tuple, self.currentFunctionId());
+        const tuple_id = try self.allocation_store.alloc(self.allocator, .tuple, self.currentFunctionId());
+        tuple_elems_transferred = true;
         return .{ .tuple = .{ .alloc_id = tuple_id, .elems = tuple_elems } };
     }
 
@@ -3682,10 +4977,11 @@ pub const Interpreter = struct {
         visibility: ast.FunctionDecl.Visibility,
     ) CtfeInterpretError!CtValue {
         const entries = try self.allocator.alloc(CtValue.CtMapEntry, 3);
+        errdefer self.allocator.free(entries);
         entries[0] = .{ .key = .{ .atom = "name" }, .value = .{ .string = name } };
         entries[1] = .{ .key = .{ .atom = "arity" }, .value = .{ .int = @intCast(arity) } };
         entries[2] = .{ .key = .{ .atom = "visibility" }, .value = .{ .atom = @tagName(visibility) } };
-        const alloc_id = self.allocation_store.alloc(self.allocator, .map, self.currentFunctionId());
+        const alloc_id = try self.allocation_store.alloc(self.allocator, .map, self.currentFunctionId());
         return .{ .map = .{ .alloc_id = alloc_id, .entries = entries } };
     }
 
@@ -3720,14 +5016,16 @@ pub const Interpreter = struct {
         };
 
         // Record dependency with interface hash
-        const iface_hash = computeStructInterfaceHash(graph, mod_scope_id, self.interner, mod_name_str);
-        try self.dependencies.append(self.allocator, .{
-            .reflected_struct = .{ .struct_name = mod_name_str, .interface_hash = iface_hash },
-        });
+        const iface_hash = computeStructInterfaceHash(self.allocator, graph, mod_scope_id, self.interner, mod_name_str) catch |err| return self.traversalFailure(err);
+        try self.recordReflectedStructDependency(mod_name_str, iface_hash);
 
         // Collect public functions from this struct's scope
         const mod_scope = graph.getScope(mod_scope_id);
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+        errdefer {
+            deinitOwnedCtValueSlice(self.allocator, result_list.items);
+            result_list.deinit(self.allocator);
+        }
 
         var family_iter = mod_scope.function_families.iterator();
         while (family_iter.next()) |entry| {
@@ -3735,15 +5033,21 @@ pub const Interpreter = struct {
             if (family.visibility == .public) {
                 const name_str = if (self.interner) |int| int.get(family.name) else "?";
                 const tuple_elems = self.allocator.alloc(CtValue, 2) catch return error.OutOfMemory;
+                initCtValueSlots(tuple_elems);
+                var tuple_elems_transferred = false;
+                errdefer if (!tuple_elems_transferred) {
+                    deinitOwnedCtValueSlice(self.allocator, tuple_elems);
+                    self.allocator.free(tuple_elems);
+                };
                 tuple_elems[0] = .{ .atom = name_str };
                 tuple_elems[1] = .{ .int = @intCast(family.arity) };
-                const alloc_id = self.allocation_store.alloc(self.allocator, .tuple, self.currentFunctionId());
-                result_list.append(self.allocator, .{ .tuple = .{ .alloc_id = alloc_id, .elems = tuple_elems } }) catch return error.OutOfMemory;
+                const alloc_id = try self.allocation_store.alloc(self.allocator, .tuple, self.currentFunctionId());
+                tuple_elems_transferred = true;
+                try appendOwnedCtValue(self.allocator, &result_list, .{ .tuple = .{ .alloc_id = alloc_id, .elems = tuple_elems } });
             }
         }
 
-        const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
-        return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
+        return finishOwnedCtValueList(self.allocator, &self.allocation_store, self.currentFunctionId(), &result_list);
     }
 
     fn builtinStructAttributes(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
@@ -3772,34 +5076,44 @@ pub const Interpreter = struct {
 
         // Record dependency with interface hash
         const mod_scope_id = self.findStructScopeByName(graph, mod_name_str);
-        const iface_hash = if (mod_scope_id) |sid| computeStructInterfaceHash(graph, sid, self.interner, mod_name_str) else 0;
-        try self.dependencies.append(self.allocator, .{
-            .reflected_struct = .{ .struct_name = mod_name_str, .interface_hash = iface_hash },
-        });
+        const iface_hash = if (mod_scope_id) |sid| blk: {
+            break :blk computeStructInterfaceHash(self.allocator, graph, sid, self.interner, mod_name_str) catch |err| return self.traversalFailure(err);
+        } else 0;
+        try self.recordReflectedStructDependency(mod_name_str, iface_hash);
 
         // Find struct entry and collect its attributes
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+        errdefer {
+            deinitOwnedCtValueSlice(self.allocator, result_list.items);
+            result_list.deinit(self.allocator);
+        }
         for (graph.structs.items) |mod_entry| {
             if (self.structNameMatches(mod_entry.name, mod_name_str)) {
                 for (mod_entry.attributes.items) |attr| {
                     const name_str = if (self.interner) |int| int.get(attr.name) else "?";
                     const tuple_elems = self.allocator.alloc(CtValue, 2) catch return error.OutOfMemory;
+                    initCtValueSlots(tuple_elems);
+                    var tuple_elems_transferred = false;
+                    errdefer if (!tuple_elems_transferred) {
+                        deinitOwnedCtValueSlice(self.allocator, tuple_elems);
+                        self.allocator.free(tuple_elems);
+                    };
                     tuple_elems[0] = .{ .atom = name_str };
                     // Include computed value if available, otherwise nil
                     if (attr.computed_value) |cv| {
-                        tuple_elems[1] = importConstValue(cv);
+                        tuple_elems[1] = importConstValue(self.allocator, cv) catch |err| return self.traversalFailure(err);
                     } else {
                         tuple_elems[1] = .nil;
                     }
-                    const alloc_id = self.allocation_store.alloc(self.allocator, .tuple, self.currentFunctionId());
-                    result_list.append(self.allocator, .{ .tuple = .{ .alloc_id = alloc_id, .elems = tuple_elems } }) catch return error.OutOfMemory;
+                    const alloc_id = try self.allocation_store.alloc(self.allocator, .tuple, self.currentFunctionId());
+                    tuple_elems_transferred = true;
+                    try appendOwnedCtValue(self.allocator, &result_list, .{ .tuple = .{ .alloc_id = alloc_id, .elems = tuple_elems } });
                 }
                 break;
             }
         }
 
-        const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
-        return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
+        return finishOwnedCtValueList(self.allocator, &self.allocation_store, self.currentFunctionId(), &result_list);
     }
 
     fn builtinStructTypes(self: *Interpreter, args: []const CtValue) CtfeInterpretError!CtValue {
@@ -3828,17 +5142,14 @@ pub const Interpreter = struct {
 
         // Record dependency with interface hash
         const mod_scope_id = self.findStructScopeByName(graph, mod_name_str) orelse {
-            try self.dependencies.append(self.allocator, .{
-                .reflected_struct = .{ .struct_name = mod_name_str, .interface_hash = 0 },
-            });
+            try self.recordReflectedStructDependency(mod_name_str, 0);
             return .{ .list = .{ .alloc_id = 0, .elems = &.{} } };
         };
-        const iface_hash = computeStructInterfaceHash(graph, mod_scope_id, self.interner, mod_name_str);
-        try self.dependencies.append(self.allocator, .{
-            .reflected_struct = .{ .struct_name = mod_name_str, .interface_hash = iface_hash },
-        });
+        const iface_hash = computeStructInterfaceHash(self.allocator, graph, mod_scope_id, self.interner, mod_name_str) catch |err| return self.traversalFailure(err);
+        try self.recordReflectedStructDependency(mod_name_str, iface_hash);
 
         var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+        errdefer result_list.deinit(self.allocator);
         for (graph.types.items) |type_entry| {
             // Check if type belongs to this struct by matching scope
             if (self.structNameMatchesByScope(graph, type_entry.scope_id, mod_name_str)) {
@@ -3847,8 +5158,10 @@ pub const Interpreter = struct {
             }
         }
 
-        const alloc_id = self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
-        return .{ .list = .{ .alloc_id = alloc_id, .elems = result_list.items } };
+        const result_elems = result_list.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+        errdefer if (result_elems.len > 0) self.allocator.free(result_elems);
+        const alloc_id = try self.allocation_store.alloc(self.allocator, .list, self.currentFunctionId());
+        return .{ .list = .{ .alloc_id = alloc_id, .elems = result_elems } };
     }
 
     fn findStructScopeByName(self: *Interpreter, graph: *const scope.ScopeGraph, name_str: []const u8) ?scope.ScopeId {
@@ -3901,62 +5214,105 @@ pub const Interpreter = struct {
         return false;
     }
 
-    fn importConstValue(cv: ConstValue) CtValue {
-        return importConstValueInner(cv);
-    }
-
-    fn importConstValueInner(cv: ConstValue) CtValue {
-        return switch (cv) {
-            .int => |v| .{ .int = v },
-            .float => |v| .{ .float = v },
-            .string => |v| .{ .string = v },
-            .bool_val => |v| .{ .bool_val = v },
-            .atom => |v| .{ .atom = v },
-            .nil => .nil,
-            .void => .void,
-            .tuple => |elems| blk: {
-                // Reinterpret in-place: ConstValue and CtValue have compatible
-                // scalar layouts for the types that exportValue can produce.
-                // For aggregates loaded from the persistent cache, the backing
-                // memory is arena-owned so in-place mutation is safe.
-                var ct_elems = std.heap.page_allocator.alloc(CtValue, elems.len) catch return .nil;
-                for (elems, 0..) |elem, i| {
-                    ct_elems[i] = importConstValueInner(elem);
-                }
-                break :blk .{ .tuple = .{ .alloc_id = 0, .elems = ct_elems } };
-            },
-            .list => |elems| blk: {
-                var ct_elems = std.heap.page_allocator.alloc(CtValue, elems.len) catch return .nil;
-                for (elems, 0..) |elem, i| {
-                    ct_elems[i] = importConstValueInner(elem);
-                }
-                break :blk .{ .list = .{ .alloc_id = 0, .elems = ct_elems } };
-            },
-            .map => |entries| blk: {
-                var ct_entries = std.heap.page_allocator.alloc(CtValue.CtMapEntry, entries.len) catch return .nil;
-                for (entries, 0..) |entry, i| {
-                    ct_entries[i] = .{
-                        .key = importConstValueInner(entry.key),
-                        .value = importConstValueInner(entry.value),
-                    };
-                }
-                break :blk .{ .map = .{ .alloc_id = 0, .entries = ct_entries } };
-            },
-            .struct_val => |sv| blk: {
-                var ct_fields = std.heap.page_allocator.alloc(CtValue.CtFieldValue, sv.fields.len) catch return .nil;
-                for (sv.fields, 0..) |field, i| {
-                    ct_fields[i] = .{
-                        .name = field.name,
-                        .value = importConstValueInner(field.value),
-                    };
-                }
-                break :blk .{ .struct_val = .{
-                    .alloc_id = 0,
-                    .type_name = sv.type_name,
-                    .fields = ct_fields,
-                } };
-            },
+    fn importConstValue(allocator: std.mem.Allocator, cv: ConstValue) ValueTraversalError!CtValue {
+        const ImportFrame = struct {
+            source: ConstValue,
+            dest: *CtValue,
+            depth: usize,
         };
+
+        var budget = ValueTraversalBudget{};
+        var stack = InlineTraversalStack(ImportFrame){};
+        defer stack.deinit(allocator);
+
+        var imported_root: CtValue = .void;
+        errdefer deinitOwnedCtValue(allocator, imported_root);
+        try stack.push(allocator, .{ .source = cv, .dest = &imported_root, .depth = 1 });
+
+        while (stack.pop()) |frame| {
+            try budget.visit(frame.depth);
+            switch (frame.source) {
+                .int => |value| frame.dest.* = .{ .int = value },
+                .float => |value| frame.dest.* = .{ .float = value },
+                .string => |value| frame.dest.* = .{ .string = value },
+                .bool_val => |value| frame.dest.* = .{ .bool_val = value },
+                .atom => |value| frame.dest.* = .{ .atom = value },
+                .nil => frame.dest.* = .nil,
+                .void => frame.dest.* = .void,
+                .tuple => |elems| {
+                    try budget.ensureChildren(frame.depth, elems.len);
+                    const imported_elems = try allocator.alloc(CtValue, elems.len);
+                    initCtValueSlots(imported_elems);
+                    frame.dest.* = .{ .tuple = .{ .alloc_id = 0, .elems = imported_elems } };
+                    var index = elems.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try stack.push(allocator, .{
+                            .source = elems[index],
+                            .dest = &imported_elems[index],
+                            .depth = frame.depth + 1,
+                        });
+                    }
+                },
+                .list => |elems| {
+                    try budget.ensureChildren(frame.depth, elems.len);
+                    const imported_elems = try allocator.alloc(CtValue, elems.len);
+                    initCtValueSlots(imported_elems);
+                    frame.dest.* = .{ .list = .{ .alloc_id = 0, .elems = imported_elems } };
+                    var index = elems.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try stack.push(allocator, .{
+                            .source = elems[index],
+                            .dest = &imported_elems[index],
+                            .depth = frame.depth + 1,
+                        });
+                    }
+                },
+                .map => |entries| {
+                    try budget.ensureChildren(frame.depth, try checkedChildCount(entries.len, 2));
+                    const imported_entries = try allocator.alloc(CtValue.CtMapEntry, entries.len);
+                    initCtMapEntries(imported_entries);
+                    frame.dest.* = .{ .map = .{ .alloc_id = 0, .entries = imported_entries } };
+                    var index = entries.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try stack.push(allocator, .{
+                            .source = entries[index].value,
+                            .dest = &imported_entries[index].value,
+                            .depth = frame.depth + 1,
+                        });
+                        try stack.push(allocator, .{
+                            .source = entries[index].key,
+                            .dest = &imported_entries[index].key,
+                            .depth = frame.depth + 1,
+                        });
+                    }
+                },
+                .struct_val => |struct_value| {
+                    try budget.ensureChildren(frame.depth, struct_value.fields.len);
+                    const imported_fields = try allocator.alloc(CtValue.CtFieldValue, struct_value.fields.len);
+                    initCtFieldValues(imported_fields);
+                    frame.dest.* = .{ .struct_val = .{
+                        .alloc_id = 0,
+                        .type_name = struct_value.type_name,
+                        .fields = imported_fields,
+                    } };
+                    var index = struct_value.fields.len;
+                    while (index > 0) {
+                        index -= 1;
+                        imported_fields[index].name = struct_value.fields[index].name;
+                        try stack.push(allocator, .{
+                            .source = struct_value.fields[index].value,
+                            .dest = &imported_fields[index].value,
+                            .depth = frame.depth + 1,
+                        });
+                    }
+                },
+            }
+        }
+
+        return imported_root;
     }
 
     fn evalClosureCall(
@@ -3996,6 +5352,7 @@ pub const Interpreter = struct {
 
     fn execTailCall(self: *Interpreter, tc: ir.TailCall, frame: *const Frame) CtfeInterpretError!CtValue {
         const args = try self.collectLocals(tc.args, frame);
+        defer self.allocator.free(args);
         const func_id = self.function_by_name.get(tc.name) orelse {
             try self.emitError(.undefined_function, tc.name);
             return error.CtfeFailure;
@@ -4007,29 +5364,121 @@ pub const Interpreter = struct {
     // Helpers
     // --------------------------------------------------------
 
-    fn collectLocals(self: *Interpreter, locals: []const ir.LocalId, frame: *const Frame) CtfeInterpretError![]const CtValue {
+    fn collectLocals(self: *Interpreter, locals: []const ir.LocalId, frame: *const Frame) CtfeInterpretError![]CtValue {
         const result = self.allocator.alloc(CtValue, locals.len) catch return error.OutOfMemory;
+        errdefer self.allocator.free(result);
         for (locals, 0..) |local_id, i| {
             result[i] = try self.readLocal(frame, local_id);
         }
         return result;
     }
 
+    fn recordDependency(self: *Interpreter, dependency: CtDependency) CtfeInterpretError!void {
+        try self.dependencies.append(self.allocator, dependency);
+    }
+
+    fn recordReflectedStructDependency(
+        self: *Interpreter,
+        struct_name: []const u8,
+        interface_hash: u64,
+    ) CtfeInterpretError!void {
+        const owned_struct_name = self.allocator.dupe(u8, struct_name) catch return error.OutOfMemory;
+        errdefer self.allocator.free(owned_struct_name);
+        try self.dependencies.append(self.allocator, .{
+            .reflected_struct = .{
+                .struct_name = owned_struct_name,
+                .interface_hash = interface_hash,
+            },
+        });
+    }
+
     fn emitError(self: *Interpreter, kind: CtfeErrorKind, message: []const u8) !void {
+        const message_copy = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(message_copy);
+        try self.emitOwnedError(kind, message_copy);
+    }
+
+    fn emitErrorFmt(self: *Interpreter, kind: CtfeErrorKind, comptime format: []const u8, args: anytype) !void {
+        const message = try std.fmt.allocPrint(self.allocator, format, args);
+        errdefer self.allocator.free(message);
+        try self.emitOwnedError(kind, message);
+    }
+
+    fn emitOwnedError(self: *Interpreter, kind: CtfeErrorKind, owned_message: []const u8) !void {
         const stack_copy = try self.allocator.alloc(CtfeFrame, self.call_stack.items.len);
+        errdefer self.allocator.free(stack_copy);
         @memcpy(stack_copy, self.call_stack.items);
 
-        const attribute_context = if (self.current_attribute_context) |ctx| CtfeError.AttributeContext{
-            .attr_name = try self.allocator.dupe(u8, ctx.attr_name),
-            .struct_name = try self.allocator.dupe(u8, ctx.struct_name),
-        } else null;
+        var attribute_context: ?CtfeError.AttributeContext = null;
+        errdefer if (attribute_context) |ctx| {
+            self.allocator.free(ctx.attr_name);
+            self.allocator.free(ctx.struct_name);
+        };
+        if (self.current_attribute_context) |ctx| {
+            const attr_name = try self.allocator.dupe(u8, ctx.attr_name);
+            errdefer self.allocator.free(attr_name);
+            const struct_name = try self.allocator.dupe(u8, ctx.struct_name);
+            attribute_context = .{
+                .attr_name = attr_name,
+                .struct_name = struct_name,
+            };
+        }
 
         try self.errors.append(self.allocator, .{
-            .message = message,
+            .message = owned_message,
             .kind = kind,
             .call_stack = stack_copy,
             .attribute_context = attribute_context,
         });
+    }
+
+    fn traversalFailure(self: *Interpreter, err: ValueTraversalError) CtfeInterpretError {
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ValueTraversalDepthExceeded => {
+                self.emitError(.value_traversal_limit_exceeded, "compile-time value traversal depth exceeded") catch return error.OutOfMemory;
+                return error.CtfeFailure;
+            },
+            error.ValueTraversalBudgetExceeded => {
+                self.emitError(.value_traversal_limit_exceeded, "compile-time value traversal budget exceeded") catch return error.OutOfMemory;
+                return error.CtfeFailure;
+            },
+        }
+    }
+
+    fn persistentCacheLoadFailure(self: *Interpreter, err: PersistentCache.LoadError) CtfeInterpretError {
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ReadFailure => {
+                self.emitError(.host_io_failure, "persistent CTFE cache read failed") catch return error.OutOfMemory;
+                return error.CtfeFailure;
+            },
+            error.CorruptEntry => {
+                self.emitError(.host_io_failure, "persistent CTFE cache entry is corrupt") catch return error.OutOfMemory;
+                return error.CtfeFailure;
+            },
+            error.HostIoFailure => {
+                self.emitError(.host_io_failure, "persistent CTFE cache host I/O failed") catch return error.OutOfMemory;
+                return error.CtfeFailure;
+            },
+        }
+    }
+
+    fn persistentCacheStoreFailure(self: *Interpreter, err: PersistentCache.StoreError) CtfeInterpretError {
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ValueTraversalDepthExceeded,
+            error.ValueTraversalBudgetExceeded,
+            => |traversal_err| return self.traversalFailure(traversal_err),
+            error.SerializationFailure => {
+                self.emitError(.host_io_failure, "persistent CTFE cache serialization failed") catch return error.OutOfMemory;
+                return error.CtfeFailure;
+            },
+            error.HostIoFailure => {
+                self.emitError(.host_io_failure, "persistent CTFE cache store host I/O failed") catch return error.OutOfMemory;
+                return error.CtfeFailure;
+            },
+        }
     }
 
     fn currentFunctionId(self: *const Interpreter) ?ir.FunctionId {
@@ -4092,9 +5541,9 @@ pub const Interpreter = struct {
         return fallback;
     }
 
-    fn hashArgs(args: []const CtValue) u64 {
+    fn hashArgs(self: *Interpreter, args: []const CtValue) ValueTraversalError!u64 {
         var hasher = std.hash.Wyhash.init(0);
-        for (args) |arg| arg.hashInto(&hasher);
+        for (args) |arg| try arg.hashInto(self.allocator, &hasher);
         return hasher.final();
     }
 
@@ -4117,12 +5566,25 @@ pub const Interpreter = struct {
         };
     }
 
-    fn allocIdForDest(self: *Interpreter, frame: *const Frame, dest: ir.LocalId, kind: AllocKind) AllocId {
+    fn allocIdForDest(self: *Interpreter, frame: *const Frame, dest: ir.LocalId, kind: AllocKind) std.mem.Allocator.Error!AllocId {
         const existing = frame.getLocal(dest);
         return switch (existing) {
-            .reuse_token => |rt| if (rt.kind == kind) rt.alloc_id else self.allocation_store.alloc(self.allocator, kind, self.currentFunctionId()),
-            else => self.allocation_store.alloc(self.allocator, kind, self.currentFunctionId()),
+            .reuse_token => |rt| if (rt.kind == kind) rt.alloc_id else try self.allocation_store.alloc(self.allocator, kind, self.currentFunctionId()),
+            else => try self.allocation_store.alloc(self.allocator, kind, self.currentFunctionId()),
         };
+    }
+
+    fn setAggregateLocal(
+        self: *Interpreter,
+        dest: ir.LocalId,
+        frame: *Frame,
+        value: CtValue,
+    ) CtfeInterpretError!void {
+        if (dest >= frame.locals.len) {
+            try self.emitErrorFmt(.unsupported_instruction, "aggregate destination local {d} out of range", .{dest});
+            return error.CtfeFailure;
+        }
+        frame.setLocal(dest, value);
     }
 
     fn isReusableValue(val: CtValue) bool {
@@ -4184,11 +5646,12 @@ pub const Interpreter = struct {
 /// Compute a deterministic hash of a struct's public interface.
 /// Hashes public function families (sorted by name+arity) and struct attribute names/values.
 fn computeStructInterfaceHash(
+    allocator: std.mem.Allocator,
     graph: *const scope.ScopeGraph,
     mod_scope_id: scope.ScopeId,
     interner: ?*const ast.StringInterner,
     mod_name_str: []const u8,
-) u64 {
+) ValueTraversalError!u64 {
     var hasher = std.hash.Wyhash.init(0);
 
     // Hash struct name for disambiguation
@@ -4220,7 +5683,7 @@ fn computeStructInterfaceHash(
                 const attr_name = if (interner) |int| int.get(attr.name) else "";
                 ah.update(attr_name);
                 if (attr.computed_value) |cv| {
-                    const cv_hash = Interpreter.hashConstValue(cv);
+                    const cv_hash = try Interpreter.hashConstValue(allocator, cv);
                     ah.update(std.mem.asBytes(&cv_hash));
                 }
                 attr_hash ^= ah.final();
@@ -4238,14 +5701,14 @@ fn computeSourceReflectionHash(
     graph: *const scope.ScopeGraph,
     interner: *const ast.StringInterner,
     paths: []const []const u8,
-) u64 {
+) SourcePathCanonicalizationError!u64 {
     var aggregate_hash: u64 = 0;
     var matched_count: u64 = 0;
 
     for (graph.structs.items) |struct_entry| {
         const source_id = struct_entry.decl.meta.span.source_id orelse continue;
         const path = graph.sourcePathById(source_id) orelse continue;
-        if (!pathFilterContains(alloc, paths, path)) continue;
+        if (!try pathFilterContains(alloc, paths, path)) continue;
 
         var struct_hasher = std.hash.Wyhash.init(0);
         struct_hasher.update(normalizeSourcePath(path));
@@ -4263,21 +5726,21 @@ fn computeSourceReflectionHash(
     return final_hasher.final();
 }
 
-fn pathFilterContains(alloc: std.mem.Allocator, paths: []const []const u8, path: []const u8) bool {
+fn pathFilterContains(alloc: std.mem.Allocator, paths: []const []const u8, path: []const u8) SourcePathCanonicalizationError!bool {
     for (paths) |candidate| {
-        if (sourcePathsEqual(alloc, candidate, path)) return true;
+        if (try sourcePathsEqual(alloc, candidate, path)) return true;
     }
     return false;
 }
 
-fn sourcePathsEqual(alloc: std.mem.Allocator, left: []const u8, right: []const u8) bool {
+fn sourcePathsEqual(alloc: std.mem.Allocator, left: []const u8, right: []const u8) SourcePathCanonicalizationError!bool {
     const normalized_left = normalizeSourcePath(left);
     const normalized_right = normalizeSourcePath(right);
     if (std.mem.eql(u8, normalized_left, normalized_right)) return true;
 
-    const canonical_left = canonicalSourcePath(alloc, normalized_left) catch return false;
+    const canonical_left = try canonicalSourcePath(alloc, normalized_left);
     defer alloc.free(canonical_left);
-    const canonical_right = canonicalSourcePath(alloc, normalized_right) catch return false;
+    const canonical_right = try canonicalSourcePath(alloc, normalized_right);
     defer alloc.free(canonical_right);
 
     return std.mem.eql(u8, canonical_left, canonical_right);
@@ -4291,11 +5754,13 @@ fn normalizeSourcePath(path: []const u8) []const u8 {
     return normalized;
 }
 
-fn canonicalSourcePath(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const real_path = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, path, alloc) catch
-        return std.fs.path.resolve(alloc, &.{path});
+fn canonicalSourcePath(alloc: std.mem.Allocator, path: []const u8) SourcePathCanonicalizationError![]const u8 {
+    const real_path = std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, path, alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SourcePathCanonicalizationFailed,
+    };
     defer alloc.free(real_path);
-    return try alloc.dupe(u8, real_path);
+    return alloc.dupe(u8, real_path) catch return error.OutOfMemory;
 }
 
 fn unwrapCtAstLiteral(value: CtValue) CtValue {
@@ -4326,60 +5791,157 @@ fn baseFunctionName(function_name: []const u8) []const u8 {
         core_name;
 }
 
+fn appendFormatCtValue(
+    alloc: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) error{OutOfMemory}!void {
+    const formatted = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(formatted);
+    try buf.appendSlice(alloc, formatted);
+}
+
 /// Format a CtValue as a human-readable inspect string.
-fn formatCtValue(alloc: std.mem.Allocator, val: CtValue) ![]const u8 {
-    return switch (val) {
-        .int => |v| try std.fmt.allocPrint(alloc, "{d}", .{v}),
-        .float => |v| try std.fmt.allocPrint(alloc, "{d}", .{v}),
-        .string => |v| try std.fmt.allocPrint(alloc, "\"{s}\"", .{v}),
-        .bool_val => |v| try std.fmt.allocPrint(alloc, "{}", .{v}),
-        .atom => |v| try std.fmt.allocPrint(alloc, ":{s}", .{v}),
-        .nil => try alloc.dupe(u8, "nil"),
-        .void => try alloc.dupe(u8, "void"),
-        .consumed => try alloc.dupe(u8, "<consumed>"),
-        .reuse_token => try alloc.dupe(u8, "<reuse-token>"),
-        .tuple => |tv| {
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            try buf.append(alloc, '{');
-            for (tv.elems, 0..) |elem, i| {
-                if (i > 0) try buf.appendSlice(alloc, ", ");
-                const s = try formatCtValue(alloc, elem);
-                try buf.appendSlice(alloc, s);
-            }
-            try buf.append(alloc, '}');
-            return buf.toOwnedSlice(alloc);
-        },
-        .list => |lv| {
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            try buf.append(alloc, '[');
-            for (lv.elems, 0..) |elem, i| {
-                if (i > 0) try buf.appendSlice(alloc, ", ");
-                const s = try formatCtValue(alloc, elem);
-                try buf.appendSlice(alloc, s);
-            }
-            try buf.append(alloc, ']');
-            return buf.toOwnedSlice(alloc);
-        },
-        .map => |mv| {
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
-            try buf.appendSlice(alloc, "%{");
-            for (mv.entries, 0..) |entry, i| {
-                if (i > 0) try buf.appendSlice(alloc, ", ");
-                const k = try formatCtValue(alloc, entry.key);
-                const v = try formatCtValue(alloc, entry.value);
-                try buf.appendSlice(alloc, k);
-                try buf.appendSlice(alloc, " => ");
-                try buf.appendSlice(alloc, v);
-            }
-            try buf.append(alloc, '}');
-            return buf.toOwnedSlice(alloc);
-        },
-        .struct_val => |sv| try std.fmt.allocPrint(alloc, "%{s}{{...}}", .{sv.type_name}),
-        .union_val => |uv| try std.fmt.allocPrint(alloc, "{s}.{s}(...)", .{ uv.type_name, uv.variant }),
-        .enum_val => |ev| try std.fmt.allocPrint(alloc, "{s}.{s}", .{ ev.type_name, ev.variant }),
-        .optional => |o| if (o.value) |v| formatCtValue(alloc, v.*) else try alloc.dupe(u8, "nil"),
-        .closure => try alloc.dupe(u8, "#Function<closure>"),
+fn formatCtValue(alloc: std.mem.Allocator, val: CtValue) ValueTraversalError![]const u8 {
+    const FormatValueFrame = struct {
+        value: CtValue,
+        depth: usize,
     };
+    const FormatSequenceFrame = struct {
+        elems: []const CtValue,
+        index: usize,
+        depth: usize,
+        close: u8,
+    };
+    const FormatMapFrame = struct {
+        entries: []const CtValue.CtMapEntry,
+        index: usize,
+        depth: usize,
+    };
+    const FormatFrame = union(enum) {
+        value: FormatValueFrame,
+        sequence: FormatSequenceFrame,
+        map: FormatMapFrame,
+        literal: []const u8,
+    };
+
+    var budget = ValueTraversalBudget{};
+    var stack = InlineTraversalStack(FormatFrame){};
+    defer stack.deinit(alloc);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+
+    try stack.push(alloc, .{ .value = .{ .value = val, .depth = 1 } });
+
+    while (stack.pop()) |frame| {
+        switch (frame) {
+            .literal => |literal| try buf.appendSlice(alloc, literal),
+            .sequence => |sequence| {
+                if (sequence.index >= sequence.elems.len) {
+                    try buf.append(alloc, sequence.close);
+                    continue;
+                }
+
+                if (sequence.index > 0) try buf.appendSlice(alloc, ", ");
+                try stack.push(alloc, .{ .sequence = .{
+                    .elems = sequence.elems,
+                    .index = sequence.index + 1,
+                    .depth = sequence.depth,
+                    .close = sequence.close,
+                } });
+                try stack.push(alloc, .{ .value = .{
+                    .value = sequence.elems[sequence.index],
+                    .depth = sequence.depth + 1,
+                } });
+            },
+            .map => |map| {
+                if (map.index >= map.entries.len) {
+                    try buf.append(alloc, '}');
+                    continue;
+                }
+
+                if (map.index > 0) try buf.appendSlice(alloc, ", ");
+                const entry = map.entries[map.index];
+                try stack.push(alloc, .{ .map = .{
+                    .entries = map.entries,
+                    .index = map.index + 1,
+                    .depth = map.depth,
+                } });
+                try stack.push(alloc, .{ .value = .{ .value = entry.value, .depth = map.depth + 1 } });
+                try stack.push(alloc, .{ .literal = " => " });
+                try stack.push(alloc, .{ .value = .{ .value = entry.key, .depth = map.depth + 1 } });
+            },
+            .value => |value_frame| {
+                try budget.visit(value_frame.depth);
+                switch (value_frame.value) {
+                    .int => |value| try appendFormatCtValue(alloc, &buf, "{d}", .{value}),
+                    .float => |value| try appendFormatCtValue(alloc, &buf, "{d}", .{value}),
+                    .string => |value| {
+                        try buf.append(alloc, '"');
+                        try buf.appendSlice(alloc, value);
+                        try buf.append(alloc, '"');
+                    },
+                    .bool_val => |value| try buf.appendSlice(alloc, if (value) "true" else "false"),
+                    .atom => |value| {
+                        try buf.append(alloc, ':');
+                        try buf.appendSlice(alloc, value);
+                    },
+                    .nil => try buf.appendSlice(alloc, "nil"),
+                    .void => try buf.appendSlice(alloc, "void"),
+                    .consumed => try buf.appendSlice(alloc, "<consumed>"),
+                    .reuse_token => try buf.appendSlice(alloc, "<reuse-token>"),
+                    .tuple => |tuple_value| {
+                        try budget.ensureChildren(value_frame.depth, tuple_value.elems.len);
+                        try buf.append(alloc, '{');
+                        try stack.push(alloc, .{ .sequence = .{
+                            .elems = tuple_value.elems,
+                            .index = 0,
+                            .depth = value_frame.depth,
+                            .close = '}',
+                        } });
+                    },
+                    .list => |list_value| {
+                        try budget.ensureChildren(value_frame.depth, list_value.elems.len);
+                        try buf.append(alloc, '[');
+                        try stack.push(alloc, .{ .sequence = .{
+                            .elems = list_value.elems,
+                            .index = 0,
+                            .depth = value_frame.depth,
+                            .close = ']',
+                        } });
+                    },
+                    .map => |map_value| {
+                        try budget.ensureChildren(value_frame.depth, try checkedChildCount(map_value.entries.len, 2));
+                        try buf.appendSlice(alloc, "%{");
+                        try stack.push(alloc, .{ .map = .{
+                            .entries = map_value.entries,
+                            .index = 0,
+                            .depth = value_frame.depth,
+                        } });
+                    },
+                    .struct_val => |struct_value| try appendFormatCtValue(alloc, &buf, "%{s}{{...}}", .{struct_value.type_name}),
+                    .union_val => |union_value| try appendFormatCtValue(alloc, &buf, "{s}.{s}(...)", .{ union_value.type_name, union_value.variant }),
+                    .enum_val => |enum_value| try appendFormatCtValue(alloc, &buf, "{s}.{s}", .{ enum_value.type_name, enum_value.variant }),
+                    .optional => |optional_value| {
+                        if (optional_value.value) |child_value| {
+                            try budget.ensureChildren(value_frame.depth, 1);
+                            try stack.push(alloc, .{ .value = .{
+                                .value = child_value.*,
+                                .depth = value_frame.depth + 1,
+                            } });
+                        } else {
+                            try buf.appendSlice(alloc, "nil");
+                        }
+                    },
+                    .closure => try buf.appendSlice(alloc, "#Function<closure>"),
+                }
+            },
+        }
+    }
+
+    return buf.toOwnedSlice(alloc);
 }
 
 // ============================================================
@@ -4535,64 +6097,247 @@ pub const CtfeInterpretError = error{
 // Bridge: ConstValue → AST Expr (for attribute substitution)
 // ============================================================
 
+const ConstValueExprBuildGuard = struct {
+    allocator: std.mem.Allocator,
+    expr_nodes: std.ArrayListUnmanaged(*ast.Expr) = .empty,
+    expr_slices: std.ArrayListUnmanaged([]*const ast.Expr) = .empty,
+    map_field_slices: std.ArrayListUnmanaged([]ast.MapField) = .empty,
+    struct_field_slices: std.ArrayListUnmanaged([]ast.StructField) = .empty,
+    name_part_slices: std.ArrayListUnmanaged([]ast.StringId) = .empty,
+    active: bool = true,
+
+    fn deinit(self: *ConstValueExprBuildGuard) void {
+        if (self.active) {
+            for (self.expr_slices.items) |slice| {
+                self.allocator.free(slice);
+            }
+            for (self.map_field_slices.items) |slice| {
+                self.allocator.free(slice);
+            }
+            for (self.struct_field_slices.items) |slice| {
+                self.allocator.free(slice);
+            }
+            for (self.name_part_slices.items) |slice| {
+                self.allocator.free(slice);
+            }
+            for (self.expr_nodes.items) |expr| {
+                self.allocator.destroy(expr);
+            }
+        }
+
+        self.expr_nodes.deinit(self.allocator);
+        self.expr_slices.deinit(self.allocator);
+        self.map_field_slices.deinit(self.allocator);
+        self.struct_field_slices.deinit(self.allocator);
+        self.name_part_slices.deinit(self.allocator);
+    }
+
+    fn release(self: *ConstValueExprBuildGuard) void {
+        self.active = false;
+    }
+
+    fn createExpr(self: *ConstValueExprBuildGuard) std.mem.Allocator.Error!*ast.Expr {
+        const expr = try self.allocator.create(ast.Expr);
+        errdefer self.allocator.destroy(expr);
+        try self.expr_nodes.append(self.allocator, expr);
+        return expr;
+    }
+
+    fn allocExprSlice(self: *ConstValueExprBuildGuard, len: usize) std.mem.Allocator.Error![]*const ast.Expr {
+        const slice = try self.allocator.alloc(*const ast.Expr, len);
+        errdefer self.allocator.free(slice);
+        try self.expr_slices.append(self.allocator, slice);
+        return slice;
+    }
+
+    fn allocMapFields(self: *ConstValueExprBuildGuard, len: usize) std.mem.Allocator.Error![]ast.MapField {
+        const slice = try self.allocator.alloc(ast.MapField, len);
+        errdefer self.allocator.free(slice);
+        try self.map_field_slices.append(self.allocator, slice);
+        return slice;
+    }
+
+    fn allocStructFields(self: *ConstValueExprBuildGuard, len: usize) std.mem.Allocator.Error![]ast.StructField {
+        const slice = try self.allocator.alloc(ast.StructField, len);
+        errdefer self.allocator.free(slice);
+        try self.struct_field_slices.append(self.allocator, slice);
+        return slice;
+    }
+
+    fn allocNameParts(self: *ConstValueExprBuildGuard, len: usize) std.mem.Allocator.Error![]ast.StringId {
+        const slice = try self.allocator.alloc(ast.StringId, len);
+        errdefer self.allocator.free(slice);
+        try self.name_part_slices.append(self.allocator, slice);
+        return slice;
+    }
+};
+
+/// Free an expression tree returned by `constValueToExpr`.
+///
+/// The tree owns only the AST nodes and slices produced by the ConstValue
+/// conversion. Interned string ids and source-independent scalar metadata are
+/// borrowed and are not freed here.
+pub fn deinitConstValueExpr(alloc: std.mem.Allocator, expr: *const ast.Expr) void {
+    deinitConvertedConstValueExpr(alloc, expr);
+}
+
+fn deinitConvertedConstValueExpr(alloc: std.mem.Allocator, expr: *const ast.Expr) void {
+    const mutable = @constCast(expr);
+    switch (mutable.*) {
+        .int_literal,
+        .float_literal,
+        .string_literal,
+        .atom_literal,
+        .bool_literal,
+        .nil_literal,
+        => {},
+        .tuple => |tuple_expr| {
+            for (tuple_expr.elements) |element| {
+                deinitConvertedConstValueExpr(alloc, element);
+            }
+            alloc.free(tuple_expr.elements);
+        },
+        .list => |list_expr| {
+            for (list_expr.elements) |element| {
+                deinitConvertedConstValueExpr(alloc, element);
+            }
+            alloc.free(list_expr.elements);
+        },
+        .map => |map_expr| {
+            for (map_expr.fields) |field| {
+                deinitConvertedConstValueExpr(alloc, field.key);
+                deinitConvertedConstValueExpr(alloc, field.value);
+            }
+            alloc.free(map_expr.fields);
+        },
+        .struct_expr => |struct_expr| {
+            for (struct_expr.fields) |field| {
+                deinitConvertedConstValueExpr(alloc, field.value);
+            }
+            alloc.free(struct_expr.fields);
+            alloc.free(struct_expr.struct_name.parts);
+        },
+        else => unreachable,
+    }
+    alloc.destroy(mutable);
+}
+
 pub fn constValueToExpr(
     alloc: std.mem.Allocator,
     val: ConstValue,
     interner: *ast.StringInterner,
 ) !*const ast.Expr {
-    const expr = try alloc.create(ast.Expr);
     const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
-    expr.* = switch (val) {
-        .int => |v| .{ .int_literal = .{ .meta = meta, .value = v } },
-        .float => |v| .{ .float_literal = .{ .meta = meta, .value = v } },
-        .string => |v| .{ .string_literal = .{ .meta = meta, .value = try interner.intern(v) } },
-        .bool_val => |v| .{ .bool_literal = .{ .meta = meta, .value = v } },
-        .atom => |v| .{ .atom_literal = .{ .meta = meta, .value = try interner.intern(v) } },
-        .nil => .{ .nil_literal = .{ .meta = meta } },
-        .void => .{ .nil_literal = .{ .meta = meta } },
-        .tuple => |elems| blk: {
-            const converted = try alloc.alloc(*const ast.Expr, elems.len);
-            for (elems, 0..) |elem, i| {
-                converted[i] = try constValueToExpr(alloc, elem, interner);
-            }
-            break :blk .{ .tuple = .{ .meta = meta, .elements = converted } };
-        },
-        .list => |elems| blk: {
-            const converted = try alloc.alloc(*const ast.Expr, elems.len);
-            for (elems, 0..) |elem, i| {
-                converted[i] = try constValueToExpr(alloc, elem, interner);
-            }
-            break :blk .{ .list = .{ .meta = meta, .elements = converted } };
-        },
-        .map => |entries| blk: {
-            const converted = try alloc.alloc(ast.MapField, entries.len);
-            for (entries, 0..) |entry, i| {
-                converted[i] = .{
-                    .key = try constValueToExpr(alloc, entry.key, interner),
-                    .value = try constValueToExpr(alloc, entry.value, interner),
-                };
-            }
-            break :blk .{ .map = .{ .meta = meta, .fields = converted } };
-        },
-        .struct_val => |sv| blk: {
-            const converted = try alloc.alloc(ast.StructField, sv.fields.len);
-            for (sv.fields, 0..) |field, i| {
-                converted[i] = .{
-                    .name = try interner.intern(field.name),
-                    .value = try constValueToExpr(alloc, field.value, interner),
-                };
-            }
-            const name_parts = try alloc.alloc(ast.StringId, 1);
-            name_parts[0] = try interner.intern(sv.type_name);
-            break :blk .{ .struct_expr = .{
-                .meta = meta,
-                .struct_name = .{ .parts = name_parts, .span = .{ .start = 0, .end = 0 } },
-                .update_source = null,
-                .fields = converted,
-            } };
-        },
+    const ConvertFrame = struct {
+        source: ConstValue,
+        dest: *ast.Expr,
+        depth: usize,
     };
-    return expr;
+
+    var budget = ValueTraversalBudget{};
+    var stack = InlineTraversalStack(ConvertFrame){};
+    defer stack.deinit(alloc);
+    var guard = ConstValueExprBuildGuard{ .allocator = alloc };
+    defer guard.deinit();
+
+    const root_expr = try guard.createExpr();
+    try stack.push(alloc, .{ .source = val, .dest = root_expr, .depth = 1 });
+
+    while (stack.pop()) |frame| {
+        try budget.visit(frame.depth);
+        frame.dest.* = switch (frame.source) {
+            .int => |value| .{ .int_literal = .{ .meta = meta, .value = value } },
+            .float => |value| .{ .float_literal = .{ .meta = meta, .value = value } },
+            .string => |value| .{ .string_literal = .{ .meta = meta, .value = try interner.intern(value) } },
+            .bool_val => |value| .{ .bool_literal = .{ .meta = meta, .value = value } },
+            .atom => |value| .{ .atom_literal = .{ .meta = meta, .value = try interner.intern(value) } },
+            .nil => .{ .nil_literal = .{ .meta = meta } },
+            .void => .{ .nil_literal = .{ .meta = meta } },
+            .tuple => |elems| blk: {
+                try budget.ensureChildren(frame.depth, elems.len);
+                const converted = try guard.allocExprSlice(elems.len);
+                var index = elems.len;
+                while (index > 0) {
+                    index -= 1;
+                    const child_expr = try guard.createExpr();
+                    converted[index] = child_expr;
+                    try stack.push(alloc, .{
+                        .source = elems[index],
+                        .dest = child_expr,
+                        .depth = frame.depth + 1,
+                    });
+                }
+                break :blk .{ .tuple = .{ .meta = meta, .elements = converted } };
+            },
+            .list => |elems| blk: {
+                try budget.ensureChildren(frame.depth, elems.len);
+                const converted = try guard.allocExprSlice(elems.len);
+                var index = elems.len;
+                while (index > 0) {
+                    index -= 1;
+                    const child_expr = try guard.createExpr();
+                    converted[index] = child_expr;
+                    try stack.push(alloc, .{
+                        .source = elems[index],
+                        .dest = child_expr,
+                        .depth = frame.depth + 1,
+                    });
+                }
+                break :blk .{ .list = .{ .meta = meta, .elements = converted } };
+            },
+            .map => |entries| blk: {
+                try budget.ensureChildren(frame.depth, try checkedChildCount(entries.len, 2));
+                const converted = try guard.allocMapFields(entries.len);
+                var index = entries.len;
+                while (index > 0) {
+                    index -= 1;
+                    const key_expr = try guard.createExpr();
+                    const value_expr = try guard.createExpr();
+                    converted[index] = .{ .key = key_expr, .value = value_expr };
+                    try stack.push(alloc, .{
+                        .source = entries[index].value,
+                        .dest = value_expr,
+                        .depth = frame.depth + 1,
+                    });
+                    try stack.push(alloc, .{
+                        .source = entries[index].key,
+                        .dest = key_expr,
+                        .depth = frame.depth + 1,
+                    });
+                }
+                break :blk .{ .map = .{ .meta = meta, .fields = converted } };
+            },
+            .struct_val => |struct_value| blk: {
+                try budget.ensureChildren(frame.depth, struct_value.fields.len);
+                const converted = try guard.allocStructFields(struct_value.fields.len);
+                var index = struct_value.fields.len;
+                while (index > 0) {
+                    index -= 1;
+                    const value_expr = try guard.createExpr();
+                    converted[index] = .{
+                        .name = try interner.intern(struct_value.fields[index].name),
+                        .value = value_expr,
+                    };
+                    try stack.push(alloc, .{
+                        .source = struct_value.fields[index].value,
+                        .dest = value_expr,
+                        .depth = frame.depth + 1,
+                    });
+                }
+                const name_parts = try guard.allocNameParts(1);
+                name_parts[0] = try interner.intern(struct_value.type_name);
+                break :blk .{ .struct_expr = .{
+                    .meta = meta,
+                    .struct_name = .{ .parts = name_parts, .span = .{ .start = 0, .end = 0 } },
+                    .update_source = null,
+                    .fields = converted,
+                } };
+            },
+        };
+    }
+
+    guard.release();
+    return root_expr;
 }
 
 // ============================================================
@@ -4803,14 +6548,13 @@ pub fn evaluateComputedAttributes(
     cache_dir: ?[]const u8,
     compile_options_hash: u64,
 ) EvalAttrError!EvalAttrResult {
-    var interp = Interpreter.init(alloc, program);
+    var interp = try Interpreter.init(alloc, program);
     defer interp.deinit();
     interp.scope_graph = graph;
     interp.interner = interner;
     interp.compile_options_hash = compile_options_hash;
-    if (cache_dir) |dir| {
-        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch {};
-        interp.persistent_cache = PersistentCache.init(dir);
+    if (!try enableComputedAttributePersistentCache(&interp, cache_dir)) {
+        return finishEvalAttrResult(alloc, &interp, 0, 0);
     }
 
     var evaluated: u32 = 0;
@@ -4820,9 +6564,9 @@ pub fn evaluateComputedAttributes(
     for (graph.structs.items) |*mod_entry| {
         for (mod_entry.attributes.items) |*attr| {
             if (attr.computed_value != null) continue; // already computed
-            if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
+            if (try evaluateAttributeForResult(alloc, &interp, attr, mod_entry.name, interner)) {
                 evaluated += 1;
-            } else |_| {
+            } else {
                 failed += 1;
             }
         }
@@ -4834,19 +6578,15 @@ pub fn evaluateComputedAttributes(
         const mod_name = findStructForScope(graph, family.scope_id);
         for (family.attributes.items) |*attr| {
             if (attr.computed_value != null) continue;
-            if (tryEvalAttribute(alloc, &interp, attr, mod_name, interner)) {
+            if (try evaluateAttributeForResult(alloc, &interp, attr, mod_name, interner)) {
                 evaluated += 1;
-            } else |_| {
+            } else {
                 failed += 1;
             }
         }
     }
 
-    return .{
-        .evaluated = evaluated,
-        .failed = failed,
-        .errors = try cloneCtfeErrors(alloc, interp.errors.items),
-    };
+    return finishEvalAttrResult(alloc, &interp, evaluated, failed);
 }
 
 pub const EvalAttrResult = struct {
@@ -4858,6 +6598,36 @@ pub const EvalAttrResult = struct {
 pub const EvalAttrError = error{
     OutOfMemory,
 };
+
+fn finishEvalAttrResult(
+    alloc: std.mem.Allocator,
+    interp: *const Interpreter,
+    evaluated: u32,
+    failed: u32,
+) EvalAttrError!EvalAttrResult {
+    return .{
+        .evaluated = evaluated,
+        .failed = failed,
+        .errors = try cloneCtfeErrors(alloc, interp.errors.items),
+    };
+}
+
+fn enableComputedAttributePersistentCache(
+    interp: *Interpreter,
+    cache_dir: ?[]const u8,
+) EvalAttrError!bool {
+    const dir = cache_dir orelse return true;
+    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch |err| {
+        try interp.emitErrorFmt(
+            .host_io_failure,
+            "persistent CTFE cache setup failed for `{s}`: {s}",
+            .{ dir, @errorName(err) },
+        );
+        return false;
+    };
+    interp.persistent_cache = PersistentCache.init(dir);
+    return true;
+}
 
 /// Evaluate computed attributes in dependency order.
 ///
@@ -4874,14 +6644,13 @@ pub fn evaluateStructAttributesInOrder(
     cache_dir: ?[]const u8,
     compile_options_hash: u64,
 ) EvalAttrError!EvalAttrResult {
-    var interp = Interpreter.init(alloc, program);
+    var interp = try Interpreter.init(alloc, program);
     defer interp.deinit();
     interp.scope_graph = graph;
     interp.interner = interner;
     interp.compile_options_hash = compile_options_hash;
-    if (cache_dir) |dir| {
-        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch {};
-        interp.persistent_cache = PersistentCache.init(dir);
+    if (!try enableComputedAttributePersistentCache(&interp, cache_dir)) {
+        return finishEvalAttrResult(alloc, &interp, 0, 0);
     }
 
     var evaluated: u32 = 0;
@@ -4895,9 +6664,9 @@ pub fn evaluateStructAttributesInOrder(
                 // Evaluate struct-level attributes
                 for (mod_entry.attributes.items) |*attr| {
                     if (attr.computed_value != null) continue;
-                    if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
+                    if (try evaluateAttributeForResult(alloc, &interp, attr, mod_entry.name, interner)) {
                         evaluated += 1;
-                    } else |_| {
+                    } else {
                         failed += 1;
                     }
                 }
@@ -4907,9 +6676,9 @@ pub fn evaluateStructAttributesInOrder(
                     if (family.scope_id == mod_entry.scope_id) {
                         for (family.attributes.items) |*attr| {
                             if (attr.computed_value != null) continue;
-                            if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
+                            if (try evaluateAttributeForResult(alloc, &interp, attr, mod_entry.name, interner)) {
                                 evaluated += 1;
-                            } else |_| {
+                            } else {
                                 failed += 1;
                             }
                         }
@@ -4924,19 +6693,15 @@ pub fn evaluateStructAttributesInOrder(
     for (graph.structs.items) |*mod_entry| {
         for (mod_entry.attributes.items) |*attr| {
             if (attr.computed_value != null) continue;
-            if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
+            if (try evaluateAttributeForResult(alloc, &interp, attr, mod_entry.name, interner)) {
                 evaluated += 1;
-            } else |_| {
+            } else {
                 failed += 1;
             }
         }
     }
 
-    return .{
-        .evaluated = evaluated,
-        .failed = failed,
-        .errors = try cloneCtfeErrors(alloc, interp.errors.items),
-    };
+    return finishEvalAttrResult(alloc, &interp, evaluated, failed);
 }
 
 /// Evaluate computed attributes for a single struct against the struct IR that
@@ -4952,14 +6717,13 @@ pub fn evaluateComputedAttributesForStruct(
     cache_dir: ?[]const u8,
     compile_options_hash: u64,
 ) EvalAttrError!EvalAttrResult {
-    var interp = Interpreter.init(alloc, program);
+    var interp = try Interpreter.init(alloc, program);
     defer interp.deinit();
     interp.scope_graph = graph;
     interp.interner = interner;
     interp.compile_options_hash = compile_options_hash;
-    if (cache_dir) |dir| {
-        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, dir) catch {};
-        interp.persistent_cache = PersistentCache.init(dir);
+    if (!try enableComputedAttributePersistentCache(&interp, cache_dir)) {
+        return finishEvalAttrResult(alloc, &interp, 0, 0);
     }
 
     var evaluated: u32 = 0;
@@ -4970,9 +6734,9 @@ pub fn evaluateComputedAttributesForStruct(
 
         for (mod_entry.attributes.items) |*attr| {
             if (attr.computed_value != null) continue;
-            if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
+            if (try evaluateAttributeForResult(alloc, &interp, attr, mod_entry.name, interner)) {
                 evaluated += 1;
-            } else |_| {
+            } else {
                 failed += 1;
             }
         }
@@ -4981,9 +6745,9 @@ pub fn evaluateComputedAttributesForStruct(
             if (family.scope_id != mod_entry.scope_id) continue;
             for (family.attributes.items) |*attr| {
                 if (attr.computed_value != null) continue;
-                if (tryEvalAttribute(alloc, &interp, attr, mod_entry.name, interner)) {
+                if (try evaluateAttributeForResult(alloc, &interp, attr, mod_entry.name, interner)) {
                     evaluated += 1;
-                } else |_| {
+                } else {
                     failed += 1;
                 }
             }
@@ -4992,11 +6756,7 @@ pub fn evaluateComputedAttributesForStruct(
         break;
     }
 
-    return .{
-        .evaluated = evaluated,
-        .failed = failed,
-        .errors = try cloneCtfeErrors(alloc, interp.errors.items),
-    };
+    return finishEvalAttrResult(alloc, &interp, evaluated, failed);
 }
 
 fn structNameMatchesStr(name: ast.StructName, target: []const u8, interner: *const ast.StringInterner) bool {
@@ -5017,6 +6777,22 @@ fn structNameMatchesStr(name: ast.StructName, target: []const u8, interner: *con
         pos = end;
     }
     return std.mem.eql(u8, buf[0..pos], target);
+}
+
+fn evaluateAttributeForResult(
+    alloc: std.mem.Allocator,
+    interp: *Interpreter,
+    attr: *scope.Attribute,
+    mod_name: ?ast.StructName,
+    interner: *const ast.StringInterner,
+) EvalAttrError!bool {
+    tryEvalAttribute(alloc, interp, attr, mod_name, interner) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NotComputable,
+        error.CtfeFailed,
+        => return false,
+    };
+    return true;
 }
 
 /// Try to evaluate a single attribute's value via CTFE.
@@ -5047,8 +6823,18 @@ fn tryEvalAttribute(
         };
     }
 
-    const ct_value = try evaluateConstExpr(alloc, interp, value_expr, mod_name, interner);
-    attr.computed_value = exportValue(alloc, ct_value) catch return error.CtfeFailed;
+    var temp_scope = ConstExprTempScope.init(alloc);
+    defer temp_scope.deinit();
+
+    const attribute_allocator = if (interp.scope_graph) |graph| graph.allocator else alloc;
+    const ct_value = try evaluateConstExpr(&temp_scope, interp, value_expr, mod_name, interner);
+    const exported = exportValue(attribute_allocator, ct_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ValueTraversalDepthExceeded => return attrTraversalFailure(interp, error.ValueTraversalDepthExceeded),
+        error.ValueTraversalBudgetExceeded => return attrTraversalFailure(interp, error.ValueTraversalBudgetExceeded),
+        error.CannotExport => return error.CtfeFailed,
+    };
+    attr.setComputedValueOwned(attribute_allocator, exported);
 }
 
 /// Convert a literal AST expression to a CtValue for use as a CTFE argument.
@@ -5065,107 +6851,104 @@ fn astLiteralToCtValue(expr: *const ast.Expr, interner: *const ast.StringInterne
     };
 }
 
-fn importComputedConstValue(cv: ConstValue) CtValue {
-    return switch (cv) {
-        .int => |v| .{ .int = v },
-        .float => |v| .{ .float = v },
-        .string => |v| .{ .string = v },
-        .bool_val => |v| .{ .bool_val = v },
-        .atom => |v| .{ .atom = v },
-        .nil => .nil,
-        .void => .void,
-        .tuple => |elems| blk: {
-            var ct_elems = std.heap.page_allocator.alloc(CtValue, elems.len) catch return .nil;
-            for (elems, 0..) |elem, i| {
-                ct_elems[i] = importComputedConstValue(elem);
-            }
-            break :blk .{ .tuple = .{ .alloc_id = 0, .elems = ct_elems } };
-        },
-        .list => |elems| blk: {
-            var ct_elems = std.heap.page_allocator.alloc(CtValue, elems.len) catch return .nil;
-            for (elems, 0..) |elem, i| {
-                ct_elems[i] = importComputedConstValue(elem);
-            }
-            break :blk .{ .list = .{ .alloc_id = 0, .elems = ct_elems } };
-        },
-        .map => |entries| blk: {
-            var ct_entries = std.heap.page_allocator.alloc(CtValue.CtMapEntry, entries.len) catch return .nil;
-            for (entries, 0..) |entry, i| {
-                ct_entries[i] = .{
-                    .key = importComputedConstValue(entry.key),
-                    .value = importComputedConstValue(entry.value),
-                };
-            }
-            break :blk .{ .map = .{ .alloc_id = 0, .entries = ct_entries } };
-        },
-        .struct_val => |sv| blk: {
-            var ct_fields = std.heap.page_allocator.alloc(CtValue.CtFieldValue, sv.fields.len) catch return .nil;
-            for (sv.fields, 0..) |field, i| {
-                ct_fields[i] = .{
-                    .name = field.name,
-                    .value = importComputedConstValue(field.value),
-                };
-            }
-            break :blk .{ .struct_val = .{ .alloc_id = 0, .type_name = sv.type_name, .fields = ct_fields } };
-        },
-    };
+fn importComputedConstValue(alloc: std.mem.Allocator, interp: *Interpreter, cv: ConstValue) AttrEvalInternalError!CtValue {
+    return Interpreter.importConstValue(alloc, cv) catch |err| return attrTraversalFailure(interp, err);
 }
 
+// Const-expression CtValues returned from evaluateConstExpr are valid only
+// while this scope lives. Aggregate payloads, concatenated strings, imported
+// aggregate wrappers, and dotted type names are allocated here; allocation
+// records remain interpreter-owned so Interpreter.deinit can release them.
+const ConstExprTempScope = struct {
+    arena: std.heap.ArenaAllocator,
+
+    fn init(backing_allocator: std.mem.Allocator) ConstExprTempScope {
+        return .{ .arena = std.heap.ArenaAllocator.init(backing_allocator) };
+    }
+
+    fn deinit(self: *ConstExprTempScope) void {
+        self.arena.deinit();
+    }
+
+    fn allocator(self: *ConstExprTempScope) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    fn allocId(
+        self: *ConstExprTempScope,
+        interp: *Interpreter,
+        kind: AllocKind,
+    ) std.mem.Allocator.Error!AllocId {
+        _ = self;
+        return interp.allocation_store.alloc(interp.allocator, kind, interp.currentFunctionId());
+    }
+};
+
 fn evaluateConstExpr(
-    alloc: std.mem.Allocator,
+    temp_scope: *ConstExprTempScope,
     interp: *Interpreter,
     expr: *const ast.Expr,
     mod_name: ?ast.StructName,
     interner: *const ast.StringInterner,
 ) AttrEvalInternalError!CtValue {
+    if (interp.const_expr_depth >= interp.const_expr_recursion_limit) {
+        try interp.emitError(.recursion_limit_exceeded, "constant expression recursion limit exceeded");
+        return error.CtfeFailed;
+    }
+    interp.const_expr_depth += 1;
+    defer interp.const_expr_depth -= 1;
+
     if (astLiteralToCtValue(expr, interner)) |lit| return lit;
 
+    const alloc = temp_scope.allocator();
     return switch (expr.*) {
         .tuple => |t| blk: {
             const elems = alloc.alloc(CtValue, t.elements.len) catch return error.OutOfMemory;
+            initCtValueSlots(elems);
             for (t.elements, 0..) |elem, i| {
-                elems[i] = try evaluateConstExpr(alloc, interp, elem, mod_name, interner);
+                elems[i] = try evaluateConstExpr(temp_scope, interp, elem, mod_name, interner);
             }
-            const alloc_id = interp.allocation_store.alloc(alloc, .tuple, interp.currentFunctionId());
+            const alloc_id = try temp_scope.allocId(interp, .tuple);
             break :blk .{ .tuple = .{ .alloc_id = alloc_id, .elems = elems } };
         },
         .list => |l| blk: {
             const elems = alloc.alloc(CtValue, l.elements.len) catch return error.OutOfMemory;
+            initCtValueSlots(elems);
             for (l.elements, 0..) |elem, i| {
-                elems[i] = try evaluateConstExpr(alloc, interp, elem, mod_name, interner);
+                elems[i] = try evaluateConstExpr(temp_scope, interp, elem, mod_name, interner);
             }
-            const alloc_id = interp.allocation_store.alloc(alloc, .list, interp.currentFunctionId());
+            const alloc_id = try temp_scope.allocId(interp, .list);
             break :blk .{ .list = .{ .alloc_id = alloc_id, .elems = elems } };
         },
         .map => |m| blk: {
             const entries = alloc.alloc(CtValue.CtMapEntry, m.fields.len) catch return error.OutOfMemory;
+            initCtMapEntries(entries);
             for (m.fields, 0..) |field, i| {
-                entries[i] = .{
-                    .key = try evaluateConstExpr(alloc, interp, field.key, mod_name, interner),
-                    .value = try evaluateConstExpr(alloc, interp, field.value, mod_name, interner),
-                };
+                entries[i].key = try evaluateConstExpr(temp_scope, interp, field.key, mod_name, interner);
+                entries[i].value = try evaluateConstExpr(temp_scope, interp, field.value, mod_name, interner);
             }
-            const alloc_id = interp.allocation_store.alloc(alloc, .map, interp.currentFunctionId());
+            const alloc_id = try temp_scope.allocId(interp, .map);
             break :blk .{ .map = .{ .alloc_id = alloc_id, .entries = entries } };
         },
         .struct_expr => |s| blk: {
             if (s.update_source != null) return error.NotComputable;
             const fields = alloc.alloc(CtValue.CtFieldValue, s.fields.len) catch return error.OutOfMemory;
+            initCtFieldValues(fields);
             const type_name = try structNameToString(alloc, s.struct_name, interner);
             for (s.fields, 0..) |field, i| {
                 fields[i] = .{
                     .name = interner.get(field.name),
-                    .value = try evaluateConstExpr(alloc, interp, field.value, mod_name, interner),
+                    .value = try evaluateConstExpr(temp_scope, interp, field.value, mod_name, interner),
                 };
             }
-            const alloc_id = interp.allocation_store.alloc(alloc, .struct_val, interp.currentFunctionId());
+            const alloc_id = try temp_scope.allocId(interp, .struct_val);
             break :blk .{ .struct_val = .{ .alloc_id = alloc_id, .type_name = type_name, .fields = fields } };
         },
         .struct_ref => |s| blk: {
             const graph = interp.scope_graph orelse return error.NotComputable;
             if (!try isKnownTypeReference(alloc, graph, s.name, interner)) return error.NotComputable;
             const type_name = try structNameToString(alloc, s.name, interner);
-            break :blk try buildTypeReferenceValue(alloc, interp, type_name);
+            break :blk try buildTypeReferenceValue(temp_scope, interp, type_name);
         },
         .function_ref => |function_ref| blk: {
             const graph = interp.scope_graph orelse return error.NotComputable;
@@ -5174,7 +6957,7 @@ fn evaluateConstExpr(
             const narrowed_arity = narrowedFunctionArity(function_ref.arity);
             if (graph.resolveFamilyAllowingDefaults(target_scope, function_ref.function, narrowed_arity) == null) return error.NotComputable;
             const type_name = try structNameToString(alloc, target_struct_name, interner);
-            break :blk try buildFunctionReferenceValue(alloc, interp, type_name, interner.get(function_ref.function), narrowed_arity);
+            break :blk try buildFunctionReferenceValue(temp_scope, interp, type_name, interner.get(function_ref.function), narrowed_arity);
         },
         .attr_ref => |ar| blk: {
             const graph = interp.scope_graph orelse return error.NotComputable;
@@ -5184,44 +6967,52 @@ fn evaluateConstExpr(
                 for (mod_entry.attributes.items) |attr| {
                     if (attr.name != ar.name) continue;
                     if (attr.computed_value) |cv| {
-                        break :blk importComputedConstValue(cv);
+                        break :blk try importComputedConstValue(alloc, interp, cv);
                     }
                     return error.NotComputable;
                 }
             }
             return error.NotComputable;
         },
-        .binary_op => |b| try evaluateConstBinaryOp(alloc, interp, b, mod_name, interner),
-        .unary_op => |u| try evaluateConstUnaryOp(alloc, interp, u, mod_name, interner),
-        .type_annotated => |ta| try evaluateConstExpr(alloc, interp, ta.expr, mod_name, interner),
+        .binary_op => |b| try evaluateConstBinaryOp(temp_scope, interp, b, mod_name, interner),
+        .unary_op => |u| try evaluateConstUnaryOp(temp_scope, interp, u, mod_name, interner),
+        .type_annotated => |ta| try evaluateConstExpr(temp_scope, interp, ta.expr, mod_name, interner),
         .call => |call| blk: {
-            const callee_name = resolveCalleeName(alloc, call.callee, mod_name, interner) orelse
+            const callee_name = (try resolveCalleeName(alloc, call.callee, mod_name, interner)) orelse
                 return error.NotComputable;
+            defer callee_name.deinit(alloc);
 
-            const func_id = interp.function_by_name.get(callee_name) orelse
+            const func_id = interp.function_by_name.get(callee_name.bytes) orelse
                 return error.NotComputable;
 
             var ct_args: std.ArrayListUnmanaged(CtValue) = .empty;
+            defer ct_args.deinit(alloc);
             for (call.args) |arg| {
-                ct_args.append(alloc, try evaluateConstExpr(alloc, interp, arg, mod_name, interner)) catch return error.OutOfMemory;
+                const arg_value = try evaluateConstExpr(temp_scope, interp, arg, mod_name, interner);
+                try ct_args.append(alloc, arg_value);
             }
 
             interp.steps_remaining = interp.step_budget;
-            break :blk interp.evalFunction(func_id, ct_args.items) catch return error.CtfeFailed;
+            const result = interp.evalFunction(func_id, ct_args.items) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.CtfeFailure => return error.CtfeFailed,
+            };
+            break :blk result;
         },
         else => error.NotComputable,
     };
 }
 
 fn evaluateConstBinaryOp(
-    alloc: std.mem.Allocator,
+    temp_scope: *ConstExprTempScope,
     interp: *Interpreter,
     op: ast.BinaryOp,
     mod_name: ?ast.StructName,
     interner: *const ast.StringInterner,
 ) AttrEvalInternalError!CtValue {
-    const lhs = try evaluateConstExpr(alloc, interp, op.lhs, mod_name, interner);
-    const rhs = try evaluateConstExpr(alloc, interp, op.rhs, mod_name, interner);
+    const alloc = temp_scope.allocator();
+    const lhs = try evaluateConstExpr(temp_scope, interp, op.lhs, mod_name, interner);
+    const rhs = try evaluateConstExpr(temp_scope, interp, op.rhs, mod_name, interner);
 
     return switch (op.op) {
         .add => switch (lhs) {
@@ -5306,8 +7097,8 @@ fn evaluateConstBinaryOp(
             },
             else => error.NotComputable,
         },
-        .equal => .{ .bool_val = lhs.eql(rhs) },
-        .not_equal => .{ .bool_val = !lhs.eql(rhs) },
+        .equal => .{ .bool_val = lhs.eqlWithAllocator(alloc, rhs) catch |err| return attrTraversalFailure(interp, err) },
+        .not_equal => .{ .bool_val = !(lhs.eqlWithAllocator(alloc, rhs) catch |err| return attrTraversalFailure(interp, err)) },
         .less => blk: {
             const ord = lhs.compare(rhs) orelse return error.NotComputable;
             break :blk .{ .bool_val = ord == .lt };
@@ -5341,7 +7132,7 @@ fn evaluateConstBinaryOp(
                     const result = alloc.alloc(CtValue, a.elems.len + b.elems.len) catch return error.OutOfMemory;
                     @memcpy(result[0..a.elems.len], a.elems);
                     @memcpy(result[a.elems.len..], b.elems);
-                    const alloc_id = interp.allocation_store.alloc(alloc, .list, interp.currentFunctionId());
+                    const alloc_id = try temp_scope.allocId(interp, .list);
                     break :blk .{ .list = .{ .alloc_id = alloc_id, .elems = result } };
                 },
                 else => error.NotComputable,
@@ -5351,7 +7142,7 @@ fn evaluateConstBinaryOp(
         .in_op => switch (rhs) {
             .list => |list| blk: {
                 for (list.elems) |elem| {
-                    if (lhs.eql(elem)) break :blk .{ .bool_val = true };
+                    if (lhs.eqlWithAllocator(alloc, elem) catch |err| return attrTraversalFailure(interp, err)) break :blk .{ .bool_val = true };
                 }
                 break :blk .{ .bool_val = false };
             },
@@ -5360,7 +7151,7 @@ fn evaluateConstBinaryOp(
         .not_in_op => switch (rhs) {
             .list => |list| blk: {
                 for (list.elems) |elem| {
-                    if (lhs.eql(elem)) break :blk .{ .bool_val = false };
+                    if (lhs.eqlWithAllocator(alloc, elem) catch |err| return attrTraversalFailure(interp, err)) break :blk .{ .bool_val = false };
                 }
                 break :blk .{ .bool_val = true };
             },
@@ -5370,13 +7161,13 @@ fn evaluateConstBinaryOp(
 }
 
 fn evaluateConstUnaryOp(
-    alloc: std.mem.Allocator,
+    temp_scope: *ConstExprTempScope,
     interp: *Interpreter,
     op: ast.UnaryOp,
     mod_name: ?ast.StructName,
     interner: *const ast.StringInterner,
 ) AttrEvalInternalError!CtValue {
-    const operand = try evaluateConstExpr(alloc, interp, op.operand, mod_name, interner);
+    const operand = try evaluateConstExpr(temp_scope, interp, op.operand, mod_name, interner);
     return switch (op.op) {
         .negate => switch (operand) {
             .int => |v| .{ .int = -%v },
@@ -5393,6 +7184,20 @@ const AttrEvalInternalError = error{
     OutOfMemory,
 };
 
+fn attrTraversalFailure(interp: *Interpreter, err: ValueTraversalError) AttrEvalInternalError {
+    switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ValueTraversalDepthExceeded => {
+            interp.emitError(.value_traversal_limit_exceeded, "compile-time value traversal depth exceeded") catch return error.OutOfMemory;
+            return error.CtfeFailed;
+        },
+        error.ValueTraversalBudgetExceeded => {
+            interp.emitError(.value_traversal_limit_exceeded, "compile-time value traversal budget exceeded") catch return error.OutOfMemory;
+            return error.CtfeFailed;
+        },
+    }
+}
+
 /// Resolve a callee AST expression to a mangled IR function name.
 /// Handles: bare `func()` and `Struct.func()` forms.
 fn resolveCalleeName(
@@ -5400,16 +7205,20 @@ fn resolveCalleeName(
     callee: *const ast.Expr,
     mod_name: ?ast.StructName,
     interner: *const ast.StringInterner,
-) ?[]const u8 {
+) std.mem.Allocator.Error!?ResolvedCalleeName {
     switch (callee.*) {
         // Bare call: func() → Struct__func
         .var_ref => |vr| {
             const func_name = interner.get(vr.name);
             if (mod_name) |mn| {
-                const prefix = structNameToPrefix(alloc, mn, interner) catch return null;
-                return std.fmt.allocPrint(alloc, "{s}__{s}", .{ prefix, func_name }) catch null;
+                const prefix = try structNameToPrefix(alloc, mn, interner);
+                defer prefix.deinit(alloc);
+                return .{
+                    .bytes = try std.fmt.allocPrint(alloc, "{s}__{s}", .{ prefix.bytes, func_name }),
+                    .owned = true,
+                };
             }
-            return func_name;
+            return .{ .bytes = func_name, .owned = false };
         },
         // Qualified call: Struct.func() → Struct__func
         .field_access => |fa| {
@@ -5417,12 +7226,19 @@ fn resolveCalleeName(
             const field_name = interner.get(fa.field);
             switch (fa.object.*) {
                 .struct_ref => |mr| {
-                    const prefix = structNameToPrefix(alloc, mr.name, interner) catch return null;
-                    return std.fmt.allocPrint(alloc, "{s}__{s}", .{ prefix, field_name }) catch null;
+                    const prefix = try structNameToPrefix(alloc, mr.name, interner);
+                    defer prefix.deinit(alloc);
+                    return .{
+                        .bytes = try std.fmt.allocPrint(alloc, "{s}__{s}", .{ prefix.bytes, field_name }),
+                        .owned = true,
+                    };
                 },
                 .var_ref => |vr| {
                     const obj_name = interner.get(vr.name);
-                    return std.fmt.allocPrint(alloc, "{s}__{s}", .{ obj_name, field_name }) catch null;
+                    return .{
+                        .bytes = try std.fmt.allocPrint(alloc, "{s}__{s}", .{ obj_name, field_name }),
+                        .owned = true,
+                    };
                 },
                 else => return null,
             }
@@ -5431,15 +7247,35 @@ fn resolveCalleeName(
     }
 }
 
+const ResolvedCalleeName = struct {
+    bytes: []const u8,
+    owned: bool,
+
+    fn deinit(self: ResolvedCalleeName, alloc: std.mem.Allocator) void {
+        if (self.owned) alloc.free(self.bytes);
+    }
+};
+
+const StructNamePrefix = struct {
+    bytes: []const u8,
+    owned: bool,
+
+    fn deinit(self: StructNamePrefix, alloc: std.mem.Allocator) void {
+        if (self.owned) alloc.free(self.bytes);
+    }
+};
+
 /// Convert an ast.StructName to a prefix string, matching IR builder convention.
 /// Single-part: "IO". Multi-part: "IO_File".
 fn structNameToPrefix(
     alloc: std.mem.Allocator,
     name: ast.StructName,
     interner: *const ast.StringInterner,
-) ![]const u8 {
-    if (name.parts.len == 1) return interner.get(name.parts[0]);
-    return name.joinedWith(alloc, interner, "_");
+) std.mem.Allocator.Error!StructNamePrefix {
+    if (name.parts.len == 1) {
+        return .{ .bytes = interner.get(name.parts[0]), .owned = false };
+    }
+    return .{ .bytes = try name.joinedWith(alloc, interner, "_"), .owned = true };
 }
 
 fn structNameToString(
@@ -5455,16 +7291,17 @@ fn narrowedFunctionArity(raw_arity: u32) u8 {
 }
 
 fn buildTypeReferenceValue(
-    alloc: std.mem.Allocator,
+    temp_scope: *ConstExprTempScope,
     interp: *Interpreter,
     type_name: []const u8,
 ) !CtValue {
+    const alloc = temp_scope.allocator();
     const fields = try alloc.alloc(CtValue.CtFieldValue, 1);
     fields[0] = .{
         .name = "name",
         .value = .{ .atom = type_name },
     };
-    const alloc_id = interp.allocation_store.alloc(alloc, .struct_val, interp.currentFunctionId());
+    const alloc_id = try temp_scope.allocId(interp, .struct_val);
     return .{ .struct_val = .{
         .alloc_id = alloc_id,
         .type_name = "Type",
@@ -5473,16 +7310,17 @@ fn buildTypeReferenceValue(
 }
 
 fn buildFunctionReferenceValue(
-    alloc: std.mem.Allocator,
+    temp_scope: *ConstExprTempScope,
     interp: *Interpreter,
     type_name: []const u8,
     function_name: []const u8,
     arity: u8,
 ) !CtValue {
+    const alloc = temp_scope.allocator();
     const fields = try alloc.alloc(CtValue.CtFieldValue, 3);
     fields[0] = .{
         .name = "struct",
-        .value = try buildTypeReferenceValue(alloc, interp, type_name),
+        .value = try buildTypeReferenceValue(temp_scope, interp, type_name),
     };
     fields[1] = .{
         .name = "name",
@@ -5492,7 +7330,7 @@ fn buildFunctionReferenceValue(
         .name = "arity",
         .value = .{ .int = arity },
     };
-    const alloc_id = interp.allocation_store.alloc(alloc, .struct_val, interp.currentFunctionId());
+    const alloc_id = try temp_scope.allocId(interp, .struct_val);
     return .{ .struct_val = .{
         .alloc_id = alloc_id,
         .type_name = "Function",
@@ -5510,6 +7348,7 @@ fn isKnownTypeReference(
     if (graph.findStructScope(name) != null) return true;
 
     const dotted_name = try structNameToString(alloc, name, interner);
+    defer alloc.free(dotted_name);
     for (graph.types.items) |type_entry| {
         if (std.mem.eql(u8, interner.get(type_entry.name), dotted_name)) return true;
     }
@@ -5598,12 +7437,302 @@ fn makeTestProgram(functions: []const ir.Function) ir.Program {
     };
 }
 
+test "Interpreter.init propagates OOM while populating function name index" {
+    const function = ir.Function{
+        .id = 42,
+        .name = "indexed_function",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 0,
+    };
+    const functions = [_]ir.Function{function};
+    const program = makeTestProgram(&functions);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, Interpreter.init(failing_allocator.allocator(), &program));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "AllocationStore.alloc propagates OOM without reserving an id" {
+    var allocation_store = AllocationStore{};
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    try testing.expectError(error.OutOfMemory, allocation_store.alloc(failing_allocator.allocator(), .list, null));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(u32, 0), allocation_store.count());
+}
+
+fn reserveAllocationStoreCapacity(
+    alloc: std.mem.Allocator,
+    allocation_store: *AllocationStore,
+    capacity: usize,
+) !void {
+    std.debug.assert(allocation_store.records.items.len == 0);
+    std.debug.assert(allocation_store.records.capacity == 0);
+    allocation_store.records = try std.ArrayListUnmanaged(AllocationRecord).initCapacity(alloc, capacity);
+}
+
+test "P4J2: interpreter list concat frees result buffer when allocation store fails" {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const lhs_elems = [_]CtValue{.{ .int = 1 }};
+    const rhs_elems = [_]CtValue{.{ .int = 2 }};
+    const lhs = CtValue{ .list = .{ .alloc_id = 1, .elems = &lhs_elems } };
+    const rhs = CtValue{ .list = .{ .alloc_id = 2, .elems = &rhs_elems } };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 1;
+
+    try testing.expectError(error.OutOfMemory, interp.evalConcat(lhs, rhs));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(u32, 0), interp.allocation_store.count());
+}
+
+test "P4J2: constant-expression list concat frees payloads when allocation store fails" {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    try reserveAllocationStoreCapacity(alloc, &interp.allocation_store, 2);
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    interp.interner = &interner;
+
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const lhs = ast.Expr{ .int_literal = .{ .meta = meta, .value = 1 } };
+    const rhs = ast.Expr{ .int_literal = .{ .meta = meta, .value = 2 } };
+    const lhs_elements = [_]*const ast.Expr{&lhs};
+    const rhs_elements = [_]*const ast.Expr{&rhs};
+    const lhs_list = ast.Expr{ .list = .{ .meta = meta, .elements = &lhs_elements } };
+    const rhs_list = ast.Expr{ .list = .{ .meta = meta, .elements = &rhs_elements } };
+    const op = ast.BinaryOp{
+        .meta = meta,
+        .op = .concat,
+        .lhs = &lhs_list,
+        .rhs = &rhs_list,
+    };
+
+    var temp_scope = ConstExprTempScope.init(testing.allocator);
+    defer temp_scope.deinit();
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(error.OutOfMemory, evaluateConstBinaryOp(&temp_scope, &interp, op, null, &interner));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 2), interp.allocation_store.records.items.len);
+}
+
+test "P4J2: type reference builder frees fields when allocation store fails" {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    var temp_scope = ConstExprTempScope.init(testing.allocator);
+    defer temp_scope.deinit();
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(error.OutOfMemory, buildTypeReferenceValue(&temp_scope, &interp, "App"));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(u32, 0), interp.allocation_store.count());
+}
+
+test "P4J2: function reference builder frees nested type when allocation store fails" {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    try reserveAllocationStoreCapacity(alloc, &interp.allocation_store, 2);
+    interp.allocation_store.records.appendAssumeCapacity(.{
+        .id = 1,
+        .kind = .list,
+        .source_function = null,
+    });
+    interp.allocation_store.next_id = 2;
+
+    var temp_scope = ConstExprTempScope.init(testing.allocator);
+    defer temp_scope.deinit();
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(
+        error.OutOfMemory,
+        buildFunctionReferenceValue(&temp_scope, &interp, "App", "run", 0),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 2), interp.allocation_store.records.items.len);
+}
+
+test "P4J2: computed attribute export releases temporary aggregate value" {
+    const alloc = testing.allocator;
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    const struct_scope = try graph.createScope(0, .struct_scope);
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const app_id = try interner.intern("App");
+    const config_id = try interner.intern("config");
+
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const app_name = ast.StructName{ .parts = &.{app_id}, .span = span };
+    var app_decl = ast.StructDecl{
+        .meta = .{ .span = span },
+        .name = app_name,
+        .items = &.{},
+    };
+    try graph.registerStruct(app_name, struct_scope, &app_decl);
+
+    var first_expr = ast.Expr{ .int_literal = .{
+        .meta = .{ .span = span },
+        .value = 1,
+    } };
+    var second_expr = ast.Expr{ .int_literal = .{
+        .meta = .{ .span = span },
+        .value = 2,
+    } };
+    const list_elements = [_]*const ast.Expr{ &first_expr, &second_expr };
+    var list_expr = ast.Expr{ .list = .{
+        .meta = .{ .span = span },
+        .elements = &list_elements,
+    } };
+    try graph.structs.items[0].attributes.append(alloc, .{
+        .name = config_id,
+        .value = &list_expr,
+    });
+
+    const result = try evaluateComputedAttributes(alloc, &program, &graph, &interner, null, 0);
+    defer deinitClonedCtfeErrors(alloc, result.errors);
+
+    try testing.expectEqual(@as(u32, 1), result.evaluated);
+    try testing.expectEqual(@as(u32, 0), result.failed);
+    try testing.expect(graph.structs.items[0].attributes.items[0].computed_value.? == .list);
+}
+
+test "P4J2: type reference builder frees owned name when allocation store fails" {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    var temp_scope = ConstExprTempScope.init(testing.allocator);
+    defer temp_scope.deinit();
+    const owned_type_name = try temp_scope.allocator().dupe(u8, "App");
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(error.OutOfMemory, buildTypeReferenceValue(&temp_scope, &interp, owned_type_name));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(u32, 0), interp.allocation_store.count());
+}
+
+test "P4J2: function reference builder frees owned name when parent allocation store fails" {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    try reserveAllocationStoreCapacity(alloc, &interp.allocation_store, 1);
+
+    var temp_scope = ConstExprTempScope.init(testing.allocator);
+    defer temp_scope.deinit();
+    const owned_type_name = try temp_scope.allocator().dupe(u8, "App");
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(
+        error.OutOfMemory,
+        buildFunctionReferenceValue(&temp_scope, &interp, owned_type_name, "run", 0),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 1), interp.allocation_store.records.items.len);
+}
+
+test "P4J2: isKnownTypeReference frees dotted name on registered type match and miss" {
+    const alloc = testing.allocator;
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const outer_id = try interner.intern("Outer");
+    const inner_id = try interner.intern("Inner");
+    const dotted_id = try interner.intern("Outer.Inner");
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const struct_name = ast.StructName{ .parts = &.{ outer_id, inner_id }, .span = span };
+
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    const type_scope = try graph.createScope(0, .struct_scope);
+    const dummy_type_expr = ast.TypeExpr{ .never = .{ .meta = .{ .span = span } } };
+    _ = try graph.registerType(dotted_id, type_scope, .{ .type_alias = &dummy_type_expr }, &.{});
+
+    try testing.expect(try isKnownTypeReference(alloc, &graph, struct_name, &interner));
+
+    var miss_graph = try scope.ScopeGraph.init(alloc);
+    defer miss_graph.deinit();
+    try testing.expect(!try isKnownTypeReference(alloc, &miss_graph, struct_name, &interner));
+}
+
+test "P4J2: isKnownTypeReference propagates dotted name allocation failure" {
+    const alloc = testing.allocator;
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const outer_id = try interner.intern("Outer");
+    const inner_id = try interner.intern("Inner");
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const struct_name = ast.StructName{ .parts = &.{ outer_id, inner_id }, .span = span };
+
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        isKnownTypeReference(failing_allocator.allocator(), &graph, struct_name, &interner),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
 // ============================================================
 // Persistent CTFE Cache
 // ============================================================
 
 pub const PersistentCache = struct {
     cache_dir: []const u8,
+
+    pub const LoadError = error{
+        OutOfMemory,
+        HostIoFailure,
+        ReadFailure,
+        CorruptEntry,
+    };
+
+    pub const StoreError = error{
+        OutOfMemory,
+        HostIoFailure,
+        SerializationFailure,
+        ValueTraversalDepthExceeded,
+        ValueTraversalBudgetExceeded,
+    };
 
     pub fn init(cache_dir: []const u8) PersistentCache {
         return .{ .cache_dir = cache_dir };
@@ -5621,35 +7750,107 @@ pub const PersistentCache = struct {
         return hasher.final();
     }
 
-    /// Try to load a cached result. Returns null if not found or stale.
-    pub fn load(self: *const PersistentCache, alloc: std.mem.Allocator, key: u64) ?CtEvalResult {
-        const hex_key = std.fmt.allocPrint(alloc, "{x:0>16}", .{key}) catch return null;
-        defer alloc.free(hex_key);
-        const path = std.fmt.allocPrint(alloc, "{s}/{s}.ctfe", .{ self.cache_dir, hex_key }) catch return null;
+    fn entryPath(self: *const PersistentCache, alloc: std.mem.Allocator, key: u64) std.mem.Allocator.Error![]const u8 {
+        return std.fmt.allocPrint(alloc, "{s}/{x:0>16}.ctfe", .{ self.cache_dir, key });
+    }
+
+    fn mapLoadReadError(err: std.Io.Dir.ReadFileAllocError) LoadError {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ConnectionResetByPeer,
+            error.FileTooBig,
+            error.InputOutput,
+            error.IsDir,
+            error.NotOpenForReading,
+            error.SocketUnconnected,
+            error.StreamTooLong,
+            => error.ReadFailure,
+            else => error.HostIoFailure,
+        };
+    }
+
+    fn mapDeserializeError(err: DeserializeError) LoadError {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.TrailingData,
+            error.UnexpectedEndOfData,
+            error.ValueTraversalDepthExceeded,
+            error.ValueTraversalBudgetExceeded,
+            => error.CorruptEntry,
+        };
+    }
+
+    fn mapSerializeError(err: SerializeError) StoreError {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ValueTraversalDepthExceeded,
+            error.ValueTraversalBudgetExceeded,
+            => |traversal_err| traversal_err,
+            error.UnexpectedEndOfData => error.SerializationFailure,
+        };
+    }
+
+    fn mapStoreWriteError(err: anyerror) StoreError {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.HostIoFailure,
+        };
+    }
+
+    /// Try to load a cached result. Returns null only when the entry is absent.
+    pub fn load(self: *const PersistentCache, alloc: std.mem.Allocator, key: u64) LoadError!?CtEvalResult {
+        const path = try self.entryPath(alloc, key);
         defer alloc.free(path);
 
-        const data = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, alloc, .limited(1024 * 1024)) catch return null;
+        const data = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, alloc, .limited(1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => |read_err| return mapLoadReadError(read_err),
+        };
         defer alloc.free(data);
 
-        return deserializeResult(alloc, data) catch null;
+        return deserializeResult(alloc, data) catch |err| return mapDeserializeError(err);
     }
 
     /// Store a result in the persistent cache.
-    pub fn store(self: *const PersistentCache, alloc: std.mem.Allocator, key: u64, result: CtEvalResult) void {
-        const hex_key = std.fmt.allocPrint(alloc, "{x:0>16}", .{key}) catch return;
-        defer alloc.free(hex_key);
+    pub fn store(self: *const PersistentCache, alloc: std.mem.Allocator, key: u64, result: CtEvalResult) StoreError!void {
+        return self.storeWithFileWriter(alloc, key, result, PersistentCacheFileWriter{});
+    }
 
-        std.Io.Dir.cwd().createDirPath(std.Options.debug_io, self.cache_dir) catch return;
-
-        const path = std.fmt.allocPrint(alloc, "{s}/{s}.ctfe", .{ self.cache_dir, hex_key }) catch return;
+    fn storeWithFileWriter(
+        self: *const PersistentCache,
+        alloc: std.mem.Allocator,
+        key: u64,
+        result: CtEvalResult,
+        file_writer: anytype,
+    ) StoreError!void {
+        const path = try self.entryPath(alloc, key);
         defer alloc.free(path);
 
-        const data = serializeResult(alloc, result) catch return;
+        const data = serializeResult(alloc, result) catch |err| return mapSerializeError(err);
         defer alloc.free(data);
 
-        const file = std.Io.Dir.cwd().createFile(std.Options.debug_io, path, .{}) catch return;
-        defer file.close(std.Options.debug_io);
-        file.writeStreamingAll(std.Options.debug_io, data) catch return;
+        file_writer.writeFileAtomic(alloc, path, data) catch |err| return mapStoreWriteError(err);
+    }
+
+    const PersistentCacheFileWriter = struct {
+        fn writeFileAtomic(
+            _: PersistentCacheFileWriter,
+            alloc: std.mem.Allocator,
+            path: []const u8,
+            contents: []const u8,
+        ) !void {
+            try build_cache.writeFileAtomic(alloc, path, contents);
+        }
+    };
+
+    fn readFileDependencyContent(alloc: std.mem.Allocator, path: []const u8) DependencyValidationError!?[]u8 {
+        return std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, alloc, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound,
+            error.NotDir,
+            error.IsDir,
+            => return null,
+            else => |validation_err| return validation_err,
+        };
     }
 
     /// Validate that all dependencies in a cached result are still current.
@@ -5658,11 +7859,11 @@ pub const PersistentCache = struct {
         deps: []const CtDependency,
         graph: ?*const scope.ScopeGraph,
         interner: ?*const ast.StringInterner,
-    ) bool {
+    ) DependencyValidationError!bool {
         for (deps) |dep| {
             switch (dep) {
                 .file => |f| {
-                    const content = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, f.path, alloc, .limited(10 * 1024 * 1024)) catch return false;
+                    const content = (try readFileDependencyContent(alloc, f.path)) orelse return false;
                     defer alloc.free(content);
                     const current_hash = std.hash.Wyhash.hash(0, content);
                     if (current_hash != f.content_hash) return false;
@@ -5677,7 +7878,7 @@ pub const PersistentCache = struct {
                     }
                 },
                 .glob => |g| {
-                    const matches = glob.collect(alloc, std.Options.debug_io, g.pattern, .{}) catch return false;
+                    const matches = try glob.collect(alloc, std.Options.debug_io, g.pattern, .{});
                     defer glob.freeMatches(alloc, matches);
                     const current_hash = hashGlobMatches(matches);
                     if (current_hash != g.result_hash) return false;
@@ -5686,13 +7887,18 @@ pub const PersistentCache = struct {
                     const current_graph = graph orelse return false;
                     const current_interner = interner orelse return false;
                     const mod_scope_id = findStructScopeByNameForCache(current_graph, current_interner, rm.struct_name) orelse return false;
-                    const current_hash = computeStructInterfaceHash(current_graph, mod_scope_id, current_interner, rm.struct_name);
+                    const current_hash = computeStructInterfaceHash(alloc, current_graph, mod_scope_id, current_interner, rm.struct_name) catch |err| switch (err) {
+                        error.OutOfMemory,
+                        error.ValueTraversalDepthExceeded,
+                        error.ValueTraversalBudgetExceeded,
+                        => |validation_err| return validation_err,
+                    };
                     if (current_hash != rm.interface_hash) return false;
                 },
                 .reflected_source => |rs| {
                     const current_graph = graph orelse return false;
                     const current_interner = interner orelse return false;
-                    const current_hash = computeSourceReflectionHash(alloc, current_graph, current_interner, rs.paths);
+                    const current_hash = try computeSourceReflectionHash(alloc, current_graph, current_interner, rs.paths);
                     if (current_hash != rs.graph_hash) return false;
                 },
             }
@@ -5778,6 +7984,7 @@ fn deserializeDependency(alloc: std.mem.Allocator, data: []const u8, pos: *usize
             pos.* += 4;
             if (pos.* + path_len > data.len) return error.UnexpectedEndOfData;
             const path = try alloc.dupe(u8, data[pos.*..][0..path_len]);
+            errdefer alloc.free(path);
             pos.* += path_len;
             if (pos.* + 8 > data.len) return error.UnexpectedEndOfData;
             const content_hash = std.mem.readInt(u64, data[pos.*..][0..8], .little);
@@ -5790,6 +7997,7 @@ fn deserializeDependency(alloc: std.mem.Allocator, data: []const u8, pos: *usize
             pos.* += 4;
             if (pos.* + name_len > data.len) return error.UnexpectedEndOfData;
             const name = try alloc.dupe(u8, data[pos.*..][0..name_len]);
+            errdefer alloc.free(name);
             pos.* += name_len;
             if (pos.* + 9 > data.len) return error.UnexpectedEndOfData;
             const value_hash = std.mem.readInt(u64, data[pos.*..][0..8], .little);
@@ -5804,6 +8012,7 @@ fn deserializeDependency(alloc: std.mem.Allocator, data: []const u8, pos: *usize
             pos.* += 4;
             if (pos.* + pattern_len > data.len) return error.UnexpectedEndOfData;
             const pattern = try alloc.dupe(u8, data[pos.*..][0..pattern_len]);
+            errdefer alloc.free(pattern);
             pos.* += pattern_len;
             if (pos.* + 8 > data.len) return error.UnexpectedEndOfData;
             const result_hash = std.mem.readInt(u64, data[pos.*..][0..8], .little);
@@ -5816,6 +8025,7 @@ fn deserializeDependency(alloc: std.mem.Allocator, data: []const u8, pos: *usize
             pos.* += 4;
             if (pos.* + name_len > data.len) return error.UnexpectedEndOfData;
             const struct_name = try alloc.dupe(u8, data[pos.*..][0..name_len]);
+            errdefer alloc.free(struct_name);
             pos.* += name_len;
             if (pos.* + 8 > data.len) return error.UnexpectedEndOfData;
             const interface_hash = std.mem.readInt(u64, data[pos.*..][0..8], .little);
@@ -5827,12 +8037,20 @@ fn deserializeDependency(alloc: std.mem.Allocator, data: []const u8, pos: *usize
             const path_count = std.mem.readInt(u32, data[pos.*..][0..4], .little);
             pos.* += 4;
             const paths = try alloc.alloc([]const u8, path_count);
+            var initialized_path_count: usize = 0;
+            errdefer {
+                for (paths[0..initialized_path_count]) |path| {
+                    alloc.free(path);
+                }
+                alloc.free(paths);
+            }
             for (paths) |*path_slot| {
                 if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
                 const path_len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
                 pos.* += 4;
                 if (pos.* + path_len > data.len) return error.UnexpectedEndOfData;
                 path_slot.* = try alloc.dupe(u8, data[pos.*..][0..path_len]);
+                initialized_path_count += 1;
                 pos.* += path_len;
             }
             if (pos.* + 8 > data.len) return error.UnexpectedEndOfData;
@@ -5844,193 +8062,331 @@ fn deserializeDependency(alloc: std.mem.Allocator, data: []const u8, pos: *usize
     };
 }
 
-fn serializeConstValue(alloc: std.mem.Allocator, val: ConstValue) ![]const u8 {
+fn appendSerializedLength(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), len: usize) SerializeError!void {
+    if (len > std.math.maxInt(u32)) return error.ValueTraversalBudgetExceeded;
+    const serialized_len: u32 = @intCast(len);
+    try buf.appendSlice(alloc, std.mem.asBytes(&serialized_len));
+}
+
+fn appendLengthPrefixedBytes(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), bytes: []const u8) SerializeError!void {
+    try appendSerializedLength(alloc, buf, bytes.len);
+    try buf.appendSlice(alloc, bytes);
+}
+
+fn ensureDeserializeAvailable(data: []const u8, pos: usize, len: usize) SerializeError!void {
+    if (pos > data.len or len > data.len - pos) return error.UnexpectedEndOfData;
+}
+
+fn readSerializedU32(data: []const u8, pos: *usize) SerializeError!u32 {
+    try ensureDeserializeAvailable(data, pos.*, 4);
+    const value = std.mem.readInt(u32, data[pos.*..][0..4], .little);
+    pos.* += 4;
+    return value;
+}
+
+fn readSerializedBytes(alloc: std.mem.Allocator, data: []const u8, pos: *usize, len: usize) SerializeError![]const u8 {
+    try ensureDeserializeAvailable(data, pos.*, len);
+    const bytes = try alloc.dupe(u8, data[pos.*..][0..len]);
+    pos.* += len;
+    return bytes;
+}
+
+fn serializeConstValue(alloc: std.mem.Allocator, val: ConstValue) SerializeError![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
     try serializeConstValueInto(alloc, &buf, val);
     return buf.toOwnedSlice(alloc);
 }
 
-fn serializeConstValueInto(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), val: ConstValue) !void {
-    switch (val) {
-        .int => |v| {
-            try buf.append(alloc, CONST_TAG_INT);
-            try buf.appendSlice(alloc, std.mem.asBytes(&v));
-        },
-        .float => |v| {
-            try buf.append(alloc, CONST_TAG_FLOAT);
-            try buf.appendSlice(alloc, std.mem.asBytes(&v));
-        },
-        .string => |v| {
-            try buf.append(alloc, CONST_TAG_STRING);
-            const len: u32 = @intCast(v.len);
-            try buf.appendSlice(alloc, std.mem.asBytes(&len));
-            try buf.appendSlice(alloc, v);
-        },
-        .bool_val => |v| {
-            try buf.append(alloc, CONST_TAG_BOOL);
-            try buf.append(alloc, @intFromBool(v));
-        },
-        .atom => |v| {
-            try buf.append(alloc, CONST_TAG_ATOM);
-            const len: u32 = @intCast(v.len);
-            try buf.appendSlice(alloc, std.mem.asBytes(&len));
-            try buf.appendSlice(alloc, v);
-        },
-        .nil => try buf.append(alloc, CONST_TAG_NIL),
-        .void => try buf.append(alloc, CONST_TAG_VOID),
-        .tuple => |elems| {
-            try buf.append(alloc, CONST_TAG_TUPLE);
-            const len: u32 = @intCast(elems.len);
-            try buf.appendSlice(alloc, std.mem.asBytes(&len));
-            for (elems) |e| try serializeConstValueInto(alloc, buf, e);
-        },
-        .list => |elems| {
-            try buf.append(alloc, CONST_TAG_LIST);
-            const len: u32 = @intCast(elems.len);
-            try buf.appendSlice(alloc, std.mem.asBytes(&len));
-            for (elems) |e| try serializeConstValueInto(alloc, buf, e);
-        },
-        .map => |entries| {
-            try buf.append(alloc, CONST_TAG_MAP);
-            const len: u32 = @intCast(entries.len);
-            try buf.appendSlice(alloc, std.mem.asBytes(&len));
-            for (entries) |entry| {
-                try serializeConstValueInto(alloc, buf, entry.key);
-                try serializeConstValueInto(alloc, buf, entry.value);
-            }
-        },
-        .struct_val => |sv| {
-            try buf.append(alloc, CONST_TAG_STRUCT);
-            const name_len: u32 = @intCast(sv.type_name.len);
-            try buf.appendSlice(alloc, std.mem.asBytes(&name_len));
-            try buf.appendSlice(alloc, sv.type_name);
-            const field_count: u32 = @intCast(sv.fields.len);
-            try buf.appendSlice(alloc, std.mem.asBytes(&field_count));
-            for (sv.fields) |field| {
-                const fname_len: u32 = @intCast(field.name.len);
-                try buf.appendSlice(alloc, std.mem.asBytes(&fname_len));
-                try buf.appendSlice(alloc, field.name);
-                try serializeConstValueInto(alloc, buf, field.value);
-            }
-        },
+fn serializeConstValueInto(alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), val: ConstValue) SerializeError!void {
+    const SerializeValueFrame = struct {
+        value: ConstValue,
+        depth: usize,
+    };
+    const SerializeFrame = union(enum) {
+        value: SerializeValueFrame,
+        field_name: []const u8,
+    };
+
+    var budget = ValueTraversalBudget{};
+    var stack = InlineTraversalStack(SerializeFrame){};
+    defer stack.deinit(alloc);
+
+    try stack.push(alloc, .{ .value = .{ .value = val, .depth = 1 } });
+
+    while (stack.pop()) |frame| {
+        switch (frame) {
+            .field_name => |name| try appendLengthPrefixedBytes(alloc, buf, name),
+            .value => |value_frame| {
+                try budget.visit(value_frame.depth);
+                switch (value_frame.value) {
+                    .int => |value| {
+                        try buf.append(alloc, CONST_TAG_INT);
+                        try buf.appendSlice(alloc, std.mem.asBytes(&value));
+                    },
+                    .float => |value| {
+                        try buf.append(alloc, CONST_TAG_FLOAT);
+                        try buf.appendSlice(alloc, std.mem.asBytes(&value));
+                    },
+                    .string => |value| {
+                        try buf.append(alloc, CONST_TAG_STRING);
+                        try appendLengthPrefixedBytes(alloc, buf, value);
+                    },
+                    .bool_val => |value| {
+                        try buf.append(alloc, CONST_TAG_BOOL);
+                        try buf.append(alloc, @intFromBool(value));
+                    },
+                    .atom => |value| {
+                        try buf.append(alloc, CONST_TAG_ATOM);
+                        try appendLengthPrefixedBytes(alloc, buf, value);
+                    },
+                    .nil => try buf.append(alloc, CONST_TAG_NIL),
+                    .void => try buf.append(alloc, CONST_TAG_VOID),
+                    .tuple => |elems| {
+                        try budget.ensureChildren(value_frame.depth, elems.len);
+                        try buf.append(alloc, CONST_TAG_TUPLE);
+                        try appendSerializedLength(alloc, buf, elems.len);
+                        var index = elems.len;
+                        while (index > 0) {
+                            index -= 1;
+                            try stack.push(alloc, .{ .value = .{
+                                .value = elems[index],
+                                .depth = value_frame.depth + 1,
+                            } });
+                        }
+                    },
+                    .list => |elems| {
+                        try budget.ensureChildren(value_frame.depth, elems.len);
+                        try buf.append(alloc, CONST_TAG_LIST);
+                        try appendSerializedLength(alloc, buf, elems.len);
+                        var index = elems.len;
+                        while (index > 0) {
+                            index -= 1;
+                            try stack.push(alloc, .{ .value = .{
+                                .value = elems[index],
+                                .depth = value_frame.depth + 1,
+                            } });
+                        }
+                    },
+                    .map => |entries| {
+                        try budget.ensureChildren(value_frame.depth, try checkedChildCount(entries.len, 2));
+                        try buf.append(alloc, CONST_TAG_MAP);
+                        try appendSerializedLength(alloc, buf, entries.len);
+                        var index = entries.len;
+                        while (index > 0) {
+                            index -= 1;
+                            try stack.push(alloc, .{ .value = .{ .value = entries[index].value, .depth = value_frame.depth + 1 } });
+                            try stack.push(alloc, .{ .value = .{ .value = entries[index].key, .depth = value_frame.depth + 1 } });
+                        }
+                    },
+                    .struct_val => |struct_value| {
+                        try budget.ensureChildren(value_frame.depth, struct_value.fields.len);
+                        try buf.append(alloc, CONST_TAG_STRUCT);
+                        try appendLengthPrefixedBytes(alloc, buf, struct_value.type_name);
+                        try appendSerializedLength(alloc, buf, struct_value.fields.len);
+                        var index = struct_value.fields.len;
+                        while (index > 0) {
+                            index -= 1;
+                            try stack.push(alloc, .{ .value = .{
+                                .value = struct_value.fields[index].value,
+                                .depth = value_frame.depth + 1,
+                            } });
+                            try stack.push(alloc, .{ .field_name = struct_value.fields[index].name });
+                        }
+                    },
+                }
+            },
+        }
     }
 }
 
-fn deserializeConstValue(alloc: std.mem.Allocator, data: []const u8, pos: *usize) !ConstValue {
-    if (pos.* >= data.len) return error.UnexpectedEndOfData;
-    const tag = data[pos.*];
-    pos.* += 1;
-
-    return switch (tag) {
-        CONST_TAG_INT => {
-            if (pos.* + 8 > data.len) return error.UnexpectedEndOfData;
-            const v = std.mem.readInt(i64, data[pos.*..][0..8], .little);
-            pos.* += 8;
-            return .{ .int = v };
-        },
-        CONST_TAG_FLOAT => {
-            if (pos.* + 8 > data.len) return error.UnexpectedEndOfData;
-            const v: f64 = @bitCast(std.mem.readInt(u64, data[pos.*..][0..8], .little));
-            pos.* += 8;
-            return .{ .float = v };
-        },
-        CONST_TAG_STRING => {
-            if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
-            const len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
-            pos.* += 4;
-            if (pos.* + len > data.len) return error.UnexpectedEndOfData;
-            const s = try alloc.dupe(u8, data[pos.*..][0..len]);
-            pos.* += len;
-            return .{ .string = s };
-        },
-        CONST_TAG_BOOL => {
-            if (pos.* >= data.len) return error.UnexpectedEndOfData;
-            const v = data[pos.*] != 0;
-            pos.* += 1;
-            return .{ .bool_val = v };
-        },
-        CONST_TAG_ATOM => {
-            if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
-            const len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
-            pos.* += 4;
-            if (pos.* + len > data.len) return error.UnexpectedEndOfData;
-            const s = try alloc.dupe(u8, data[pos.*..][0..len]);
-            pos.* += len;
-            return .{ .atom = s };
-        },
-        CONST_TAG_NIL => .nil,
-        CONST_TAG_VOID => .void,
-        CONST_TAG_TUPLE => {
-            if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
-            const len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
-            pos.* += 4;
-            const elems = try alloc.alloc(ConstValue, len);
-            for (0..len) |i| {
-                elems[i] = try deserializeConstValue(alloc, data, pos);
-            }
-            return .{ .tuple = elems };
-        },
-        CONST_TAG_LIST => {
-            if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
-            const len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
-            pos.* += 4;
-            const elems = try alloc.alloc(ConstValue, len);
-            for (0..len) |i| {
-                elems[i] = try deserializeConstValue(alloc, data, pos);
-            }
-            return .{ .list = elems };
-        },
-        CONST_TAG_MAP => {
-            if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
-            const entry_count = std.mem.readInt(u32, data[pos.*..][0..4], .little);
-            pos.* += 4;
-            const entries = try alloc.alloc(ConstValue.ConstMapEntry, entry_count);
-            for (0..entry_count) |i| {
-                entries[i] = .{
-                    .key = try deserializeConstValue(alloc, data, pos),
-                    .value = try deserializeConstValue(alloc, data, pos),
-                };
-            }
-            return .{ .map = entries };
-        },
-        CONST_TAG_STRUCT => {
-            // type_name
-            if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
-            const name_len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
-            pos.* += 4;
-            if (pos.* + name_len > data.len) return error.UnexpectedEndOfData;
-            const type_name = try alloc.dupe(u8, data[pos.*..][0..name_len]);
-            pos.* += name_len;
-            // fields
-            if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
-            const field_count = std.mem.readInt(u32, data[pos.*..][0..4], .little);
-            pos.* += 4;
-            const fields = try alloc.alloc(ConstValue.ConstFieldValue, field_count);
-            for (0..field_count) |i| {
-                if (pos.* + 4 > data.len) return error.UnexpectedEndOfData;
-                const fname_len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
-                pos.* += 4;
-                if (pos.* + fname_len > data.len) return error.UnexpectedEndOfData;
-                const fname = try alloc.dupe(u8, data[pos.*..][0..fname_len]);
-                pos.* += fname_len;
-                fields[i] = .{
-                    .name = fname,
-                    .value = try deserializeConstValue(alloc, data, pos),
-                };
-            }
-            return .{ .struct_val = .{ .type_name = type_name, .fields = fields } };
-        },
-        else => return error.UnexpectedEndOfData,
+fn deserializeConstValue(alloc: std.mem.Allocator, data: []const u8, pos: *usize) SerializeError!ConstValue {
+    const DeserializeValueFrame = struct {
+        dest: *ConstValue,
+        depth: usize,
+        is_root: bool = false,
     };
+    const DeserializeStructFieldFrame = struct {
+        fields: []ConstValue.ConstFieldValue,
+        index: usize,
+        depth: usize,
+    };
+    const DeserializeFrame = union(enum) {
+        value: DeserializeValueFrame,
+        struct_field: DeserializeStructFieldFrame,
+    };
+
+    var budget = ValueTraversalBudget{};
+    var stack = InlineTraversalStack(DeserializeFrame){};
+    defer stack.deinit(alloc);
+
+    var result: ConstValue = .void;
+    var result_initialized = false;
+    errdefer if (result_initialized) deinitConstValue(alloc, result);
+    try stack.push(alloc, .{ .value = .{ .dest = &result, .depth = 1, .is_root = true } });
+
+    while (stack.pop()) |frame| {
+        switch (frame) {
+            .value => |value_frame| {
+                try budget.visit(value_frame.depth);
+                try ensureDeserializeAvailable(data, pos.*, 1);
+                const tag = data[pos.*];
+                pos.* += 1;
+
+                switch (tag) {
+                    CONST_TAG_INT => {
+                        try ensureDeserializeAvailable(data, pos.*, 8);
+                        const value = std.mem.readInt(i64, data[pos.*..][0..8], .little);
+                        pos.* += 8;
+                        value_frame.dest.* = .{ .int = value };
+                        if (value_frame.is_root) result_initialized = true;
+                    },
+                    CONST_TAG_FLOAT => {
+                        try ensureDeserializeAvailable(data, pos.*, 8);
+                        const value: f64 = @bitCast(std.mem.readInt(u64, data[pos.*..][0..8], .little));
+                        pos.* += 8;
+                        value_frame.dest.* = .{ .float = value };
+                        if (value_frame.is_root) result_initialized = true;
+                    },
+                    CONST_TAG_STRING => {
+                        const len: usize = try readSerializedU32(data, pos);
+                        value_frame.dest.* = .{ .string = try readSerializedBytes(alloc, data, pos, len) };
+                        if (value_frame.is_root) result_initialized = true;
+                    },
+                    CONST_TAG_BOOL => {
+                        try ensureDeserializeAvailable(data, pos.*, 1);
+                        const value = data[pos.*] != 0;
+                        pos.* += 1;
+                        value_frame.dest.* = .{ .bool_val = value };
+                        if (value_frame.is_root) result_initialized = true;
+                    },
+                    CONST_TAG_ATOM => {
+                        const len: usize = try readSerializedU32(data, pos);
+                        value_frame.dest.* = .{ .atom = try readSerializedBytes(alloc, data, pos, len) };
+                        if (value_frame.is_root) result_initialized = true;
+                    },
+                    CONST_TAG_NIL => {
+                        value_frame.dest.* = .nil;
+                        if (value_frame.is_root) result_initialized = true;
+                    },
+                    CONST_TAG_VOID => {
+                        value_frame.dest.* = .void;
+                        if (value_frame.is_root) result_initialized = true;
+                    },
+                    CONST_TAG_TUPLE => {
+                        const len: usize = try readSerializedU32(data, pos);
+                        try budget.ensureChildren(value_frame.depth, len);
+                        const elems = try alloc.alloc(ConstValue, len);
+                        initConstValueSlots(elems);
+                        value_frame.dest.* = .{ .tuple = elems };
+                        if (value_frame.is_root) result_initialized = true;
+                        var index = len;
+                        while (index > 0) {
+                            index -= 1;
+                            try stack.push(alloc, .{ .value = .{
+                                .dest = &elems[index],
+                                .depth = value_frame.depth + 1,
+                            } });
+                        }
+                    },
+                    CONST_TAG_LIST => {
+                        const len: usize = try readSerializedU32(data, pos);
+                        try budget.ensureChildren(value_frame.depth, len);
+                        const elems = try alloc.alloc(ConstValue, len);
+                        initConstValueSlots(elems);
+                        value_frame.dest.* = .{ .list = elems };
+                        if (value_frame.is_root) result_initialized = true;
+                        var index = len;
+                        while (index > 0) {
+                            index -= 1;
+                            try stack.push(alloc, .{ .value = .{
+                                .dest = &elems[index],
+                                .depth = value_frame.depth + 1,
+                            } });
+                        }
+                    },
+                    CONST_TAG_MAP => {
+                        const entry_count: usize = try readSerializedU32(data, pos);
+                        try budget.ensureChildren(value_frame.depth, try checkedChildCount(entry_count, 2));
+                        const entries = try alloc.alloc(ConstValue.ConstMapEntry, entry_count);
+                        initConstMapEntries(entries);
+                        value_frame.dest.* = .{ .map = entries };
+                        if (value_frame.is_root) result_initialized = true;
+                        var index = entry_count;
+                        while (index > 0) {
+                            index -= 1;
+                            try stack.push(alloc, .{ .value = .{
+                                .dest = &entries[index].value,
+                                .depth = value_frame.depth + 1,
+                            } });
+                            try stack.push(alloc, .{ .value = .{
+                                .dest = &entries[index].key,
+                                .depth = value_frame.depth + 1,
+                            } });
+                        }
+                    },
+                    CONST_TAG_STRUCT => {
+                        const name_len: usize = try readSerializedU32(data, pos);
+                        const type_name = try readSerializedBytes(alloc, data, pos, name_len);
+                        var type_name_transferred = false;
+                        errdefer if (!type_name_transferred) alloc.free(type_name);
+                        const field_count: usize = try readSerializedU32(data, pos);
+                        try budget.ensureChildren(value_frame.depth, field_count);
+                        const fields = try alloc.alloc(ConstValue.ConstFieldValue, field_count);
+                        var fields_transferred = false;
+                        errdefer if (!fields_transferred) alloc.free(fields);
+                        initConstFieldValues(fields);
+                        value_frame.dest.* = .{ .struct_val = .{ .type_name = type_name, .fields = fields } };
+                        type_name_transferred = true;
+                        fields_transferred = true;
+                        if (value_frame.is_root) result_initialized = true;
+                        if (field_count > 0) {
+                            try stack.push(alloc, .{ .struct_field = .{
+                                .fields = fields,
+                                .index = 0,
+                                .depth = value_frame.depth,
+                            } });
+                        }
+                    },
+                    else => return error.UnexpectedEndOfData,
+                }
+            },
+            .struct_field => |field_frame| {
+                const name_len: usize = try readSerializedU32(data, pos);
+                const field_name = try readSerializedBytes(alloc, data, pos, name_len);
+                field_frame.fields[field_frame.index].name = field_name;
+                if (field_frame.index + 1 < field_frame.fields.len) {
+                    try stack.push(alloc, .{ .struct_field = .{
+                        .fields = field_frame.fields,
+                        .index = field_frame.index + 1,
+                        .depth = field_frame.depth,
+                    } });
+                }
+                try stack.push(alloc, .{ .value = .{
+                    .dest = &field_frame.fields[field_frame.index].value,
+                    .depth = field_frame.depth + 1,
+                } });
+            },
+        }
+    }
+
+    return result;
 }
 
 const SerializeError = error{
     UnexpectedEndOfData,
+    ValueTraversalDepthExceeded,
+    ValueTraversalBudgetExceeded,
     OutOfMemory,
 };
 
-fn serializeResult(alloc: std.mem.Allocator, result: CtEvalResult) ![]const u8 {
+const DeserializeError = SerializeError || error{
+    TrailingData,
+};
+
+fn serializeResult(alloc: std.mem.Allocator, result: CtEvalResult) SerializeError![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
     // Magic + version
     try buf.appendSlice(alloc, "CTFE");
     try buf.append(alloc, 2); // version 2: full dependency serialization
@@ -6047,12 +8403,13 @@ fn serializeResult(alloc: std.mem.Allocator, result: CtEvalResult) ![]const u8 {
     return buf.toOwnedSlice(alloc);
 }
 
-fn deserializeResult(alloc: std.mem.Allocator, data: []const u8) SerializeError!CtEvalResult {
+fn deserializeResult(alloc: std.mem.Allocator, data: []const u8) DeserializeError!CtEvalResult {
     if (data.len < 5) return error.UnexpectedEndOfData;
     if (!std.mem.eql(u8, data[0..4], "CTFE")) return error.UnexpectedEndOfData;
     if (data[4] != 2) return error.UnexpectedEndOfData; // version 2
     var pos: usize = 5;
     const value = try deserializeConstValue(alloc, data, &pos);
+    errdefer deinitConstValue(alloc, value);
     if (pos + 8 > data.len) return error.UnexpectedEndOfData;
     const result_hash = std.mem.readInt(u64, data[pos..][0..8], .little);
     pos += 8;
@@ -6061,9 +8418,18 @@ fn deserializeResult(alloc: std.mem.Allocator, data: []const u8) SerializeError!
     const dep_count = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
     const deps = try alloc.alloc(CtDependency, dep_count);
+    var initialized_dep_count: usize = 0;
+    errdefer {
+        for (deps[0..initialized_dep_count]) |dependency| {
+            deinitCachedDependency(alloc, dependency);
+        }
+        alloc.free(deps);
+    }
     for (0..dep_count) |i| {
         deps[i] = try deserializeDependency(alloc, data, &pos);
+        initialized_dep_count += 1;
     }
+    if (pos != data.len) return error.TrailingData;
     return .{
         .value = value,
         .dependencies = deps,
@@ -6079,6 +8445,14 @@ fn testArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(std.heap.page_allocator);
 }
 
+fn expectComputedAttributeCacheSetupHostIoFailure(result: EvalAttrResult) !void {
+    try testing.expectEqual(@as(u32, 0), result.evaluated);
+    try testing.expectEqual(@as(u32, 0), result.failed);
+    try testing.expectEqual(@as(usize, 1), result.errors.len);
+    try testing.expectEqual(CtfeErrorKind.host_io_failure, result.errors[0].kind);
+    try testing.expect(std.mem.indexOf(u8, result.errors[0].message, "persistent CTFE cache setup failed") != null);
+}
+
 test "CtValue.isTruthy" {
     try testing.expect((CtValue{ .bool_val = true }).isTruthy());
     try testing.expect(!(CtValue{ .bool_val = false }).isTruthy());
@@ -6092,19 +8466,19 @@ test "CtValue.isTruthy" {
 }
 
 test "CtValue.eql" {
-    try testing.expect((CtValue{ .int = 42 }).eql(.{ .int = 42 }));
-    try testing.expect(!(CtValue{ .int = 42 }).eql(.{ .int = 43 }));
-    try testing.expect((CtValue{ .string = "abc" }).eql(.{ .string = "abc" }));
-    try testing.expect(!(CtValue{ .string = "abc" }).eql(.{ .string = "def" }));
-    try testing.expect((CtValue{ .bool_val = true }).eql(.{ .bool_val = true }));
-    try testing.expect(!(CtValue{ .bool_val = true }).eql(.{ .bool_val = false }));
-    try testing.expect((CtValue{ .atom = "ok" }).eql(.{ .atom = "ok" }));
-    try testing.expect(!(CtValue{ .atom = "ok" }).eql(.{ .atom = "error" }));
-    try testing.expect((@as(CtValue, .nil)).eql(.nil));
-    try testing.expect((@as(CtValue, .void)).eql(.void));
+    try testing.expect(try (CtValue{ .int = 42 }).eql(.{ .int = 42 }));
+    try testing.expect(!(try (CtValue{ .int = 42 }).eql(.{ .int = 43 })));
+    try testing.expect(try (CtValue{ .string = "abc" }).eql(.{ .string = "abc" }));
+    try testing.expect(!(try (CtValue{ .string = "abc" }).eql(.{ .string = "def" })));
+    try testing.expect(try (CtValue{ .bool_val = true }).eql(.{ .bool_val = true }));
+    try testing.expect(!(try (CtValue{ .bool_val = true }).eql(.{ .bool_val = false })));
+    try testing.expect(try (CtValue{ .atom = "ok" }).eql(.{ .atom = "ok" }));
+    try testing.expect(!(try (CtValue{ .atom = "ok" }).eql(.{ .atom = "error" })));
+    try testing.expect(try (@as(CtValue, .nil)).eql(.nil));
+    try testing.expect(try (@as(CtValue, .void)).eql(.void));
     // Cross-type inequality
-    try testing.expect(!(CtValue{ .int = 0 }).eql(.nil));
-    try testing.expect(!(CtValue{ .int = 1 }).eql(.{ .bool_val = true }));
+    try testing.expect(!(try (CtValue{ .int = 0 }).eql(.nil)));
+    try testing.expect(!(try (CtValue{ .int = 1 }).eql(.{ .bool_val = true })));
 }
 
 test "CtValue.compare" {
@@ -6244,16 +8618,392 @@ test "constValueToExpr: nested list of tuples" {
     try testing.expectEqual(@as(usize, 2), expr.list.elements[0].tuple.elements.len);
 }
 
+fn exerciseConstValueToExprNestedAllocationFailures(
+    allocator: std.mem.Allocator,
+    value: ConstValue,
+) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const expr = try constValueToExpr(allocator, value, &interner);
+    defer deinitConvertedConstValueExpr(allocator, expr);
+
+    try testing.expect(expr.* == .struct_expr);
+    try testing.expectEqual(@as(usize, 2), expr.struct_expr.fields.len);
+}
+
+test "constValueToExpr frees partial nested aggregate AST on allocation failure" {
+    const tuple_items = [_]ConstValue{
+        .{ .atom = "key" },
+        .{ .int = 2 },
+    };
+    const list_items = [_]ConstValue{
+        .{ .tuple = &tuple_items },
+        .{ .string = "value" },
+    };
+    const map_entries = [_]ConstValue.ConstMapEntry{
+        .{
+            .key = .{ .atom = "items" },
+            .value = .{ .list = &list_items },
+        },
+        .{
+            .key = .{ .string = "other" },
+            .value = .{ .tuple = &tuple_items },
+        },
+    };
+    const fields = [_]ConstValue.ConstFieldValue{
+        .{
+            .name = "payload",
+            .value = .{ .map = &map_entries },
+        },
+        .{
+            .name = "tail",
+            .value = .{ .list = &list_items },
+        },
+    };
+    const value = ConstValue{ .struct_val = .{
+        .type_name = "NestedExpr",
+        .fields = &fields,
+    } };
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseConstValueToExprNestedAllocationFailures,
+        .{value},
+    );
+}
+
 test "importConstValue: aggregates round-trip" {
     const alloc = testing.allocator;
     // Test tuple round-trip through export→import
     const ct_tuple = CtValue{ .tuple = .{ .alloc_id = 1, .elems = &.{ .{ .int = 1 }, .{ .int = 2 } } } };
     const exported = try exportValue(alloc, ct_tuple);
     defer alloc.free(exported.tuple);
-    const imported = Interpreter.importConstValue(exported);
+    const imported = try Interpreter.importConstValue(alloc, exported);
+    defer alloc.free(imported.tuple.elems);
     try testing.expect(imported == .tuple);
     try testing.expectEqual(@as(usize, 2), imported.tuple.elems.len);
     try testing.expectEqual(@as(i64, 1), imported.tuple.elems[0].int);
+}
+
+fn exerciseImportConstValueNestedAllocationFailures(allocator: std.mem.Allocator, value: ConstValue) !void {
+    const imported = try Interpreter.importConstValue(allocator, value);
+    defer deinitOwnedCtValue(allocator, imported);
+
+    try testing.expect(imported == .struct_val);
+    try testing.expectEqual(@as(usize, 2), imported.struct_val.fields.len);
+}
+
+test "importConstValue frees partial nested aggregate roots on allocation failure" {
+    const tuple_items = [_]ConstValue{
+        .{ .atom = "key" },
+        .{ .int = 2 },
+    };
+    const list_items = [_]ConstValue{
+        .{ .tuple = &tuple_items },
+        .{ .string = "value" },
+    };
+    const map_entries = [_]ConstValue.ConstMapEntry{
+        .{
+            .key = .{ .atom = "items" },
+            .value = .{ .list = &list_items },
+        },
+        .{
+            .key = .{ .string = "other" },
+            .value = .{ .tuple = &tuple_items },
+        },
+    };
+    const fields = [_]ConstValue.ConstFieldValue{
+        .{
+            .name = "payload",
+            .value = .{ .map = &map_entries },
+        },
+        .{
+            .name = "tail",
+            .value = .{ .list = &list_items },
+        },
+    };
+    const value = ConstValue{ .struct_val = .{
+        .type_name = "NestedImport",
+        .fields = &fields,
+    } };
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseImportConstValueNestedAllocationFailures,
+        .{value},
+    );
+}
+
+fn nestedCtListForTraversalTest(alloc: std.mem.Allocator, list_depth: usize) !CtValue {
+    const nodes = try alloc.alloc(CtValue, list_depth + 1);
+    nodes[list_depth] = .{ .int = 1 };
+    var index = list_depth;
+    while (index > 0) {
+        index -= 1;
+        nodes[index] = .{ .list = .{
+            .alloc_id = @intCast(index + 1),
+            .elems = nodes[index + 1 .. index + 2],
+        } };
+    }
+    return nodes[0];
+}
+
+fn nestedCtTupleForTraversalTest(alloc: std.mem.Allocator, tuple_depth: usize) !CtValue {
+    const nodes = try alloc.alloc(CtValue, tuple_depth + 1);
+    nodes[tuple_depth] = .{ .int = 1 };
+    var index = tuple_depth;
+    while (index > 0) {
+        index -= 1;
+        nodes[index] = .{ .tuple = .{
+            .alloc_id = @intCast(index + 1),
+            .elems = nodes[index + 1 .. index + 2],
+        } };
+    }
+    return nodes[0];
+}
+
+fn nestedCtMapForTraversalTest(alloc: std.mem.Allocator, map_depth: usize) !CtValue {
+    if (map_depth == 0) return .{ .int = 1 };
+
+    const nodes = try alloc.alloc(CtValue, map_depth + 1);
+    const entries = try alloc.alloc(CtValue.CtMapEntry, map_depth);
+    nodes[map_depth] = .{ .int = 1 };
+
+    var index = map_depth;
+    while (index > 0) {
+        index -= 1;
+        entries[index] = .{
+            .key = .{ .atom = "k" },
+            .value = nodes[index + 1],
+        };
+        nodes[index] = .{ .map = .{
+            .alloc_id = @intCast(index + 1),
+            .entries = entries[index .. index + 1],
+        } };
+    }
+    return nodes[0];
+}
+
+fn nestedCtOptionalForTraversalTest(alloc: std.mem.Allocator, optional_depth: usize) !CtValue {
+    const nodes = try alloc.alloc(CtValue, optional_depth + 1);
+    nodes[optional_depth] = .{ .int = 1 };
+    var index = optional_depth;
+    while (index > 0) {
+        index -= 1;
+        nodes[index] = .{ .optional = .{ .value = &nodes[index + 1] } };
+    }
+    return nodes[0];
+}
+
+fn nestedConstListForTraversalTest(alloc: std.mem.Allocator, list_depth: usize) !ConstValue {
+    const nodes = try alloc.alloc(ConstValue, list_depth + 1);
+    nodes[list_depth] = .{ .int = 1 };
+    var index = list_depth;
+    while (index > 0) {
+        index -= 1;
+        nodes[index] = .{ .list = nodes[index + 1 .. index + 2] };
+    }
+    return nodes[0];
+}
+
+fn appendNestedConstListSerializationForTraversalTest(
+    alloc: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    list_depth: usize,
+) !void {
+    for (0..list_depth) |_| {
+        try buf.append(alloc, CONST_TAG_LIST);
+        try appendSerializedLength(alloc, buf, 1);
+    }
+    try buf.append(alloc, CONST_TAG_INT);
+    const value: i64 = 1;
+    try buf.appendSlice(alloc, std.mem.asBytes(&value));
+}
+
+test "exportValue rejects CtValue nesting beyond traversal depth" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedCtListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, exportValue(alloc, root));
+}
+
+test "CtValue.eqlWithAllocator rejects nesting beyond traversal depth" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const left = try nestedCtListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    const right = try nestedCtListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, left.eqlWithAllocator(alloc, right));
+}
+
+test "CtValue.eqlWithAllocator propagates traversal stack OOM" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const spill_depth = VALUE_TRAVERSAL_INLINE_STACK_CAPACITY + 8;
+    const left = try nestedCtListForTraversalTest(alloc, spill_depth);
+    const right = try nestedCtListForTraversalTest(alloc, spill_depth);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, left.eqlWithAllocator(failing_allocator.allocator(), right));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "CtValue.eql propagates traversal errors" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const left = try nestedCtListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    const right = try nestedCtListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, left.eql(right));
+}
+
+test "CtValue.hash rejects nesting beyond traversal depth" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedCtListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, root.hash(alloc));
+}
+
+test "ConstValue hash rejects nesting beyond traversal depth" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedConstListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, Interpreter.hashConstValue(alloc, root));
+}
+
+test "constValueToExpr rejects nesting beyond traversal depth" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var interner = ast.StringInterner.init(alloc);
+
+    const root = try nestedConstListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, constValueToExpr(alloc, root, &interner));
+}
+
+test "importConstValue rejects nesting beyond traversal depth" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedConstListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, Interpreter.importConstValue(alloc, root));
+}
+
+test "serializeConstValue rejects nesting beyond traversal depth" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedConstListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, serializeConstValue(alloc, root));
+}
+
+test "deserializeConstValue rejects nesting beyond traversal depth" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(alloc);
+    try appendNestedConstListSerializationForTraversalTest(alloc, &data, MAX_VALUE_TRAVERSAL_DEPTH);
+
+    var pos: usize = 0;
+    try testing.expectError(error.ValueTraversalDepthExceeded, deserializeConstValue(alloc, data.items, &pos));
+}
+
+test "formatCtValue preserves aggregate inspect output" {
+    const alloc = testing.allocator;
+    const display_list_elems = [_]CtValue{ .{ .string = "two" }, .{ .atom = "ok" } };
+    const optional_list_elems = [_]CtValue{ .{ .bool_val = true }, .nil };
+    const optional_payload = CtValue{ .list = .{
+        .alloc_id = 2,
+        .elems = &optional_list_elems,
+    } };
+    const optional_some = CtValue{ .optional = .{ .value = &optional_payload } };
+    const map_entries = [_]CtValue.CtMapEntry{
+        .{ .key = .{ .atom = "name" }, .value = optional_some },
+        .{ .key = .{ .string = "count" }, .value = .{ .int = 2 } },
+    };
+    const tuple_elems = [_]CtValue{
+        .{ .int = 1 },
+        .{ .list = .{ .alloc_id = 1, .elems = &display_list_elems } },
+        .{ .map = .{ .alloc_id = 3, .entries = &map_entries } },
+        .{ .optional = .{ .value = null } },
+    };
+    const root = CtValue{ .tuple = .{ .alloc_id = 4, .elems = &tuple_elems } };
+
+    const formatted = try formatCtValue(alloc, root);
+    defer alloc.free(formatted);
+
+    try testing.expectEqualStrings(
+        "{1, [\"two\", :ok], %{:name => [true, nil], \"count\" => 2}, nil}",
+        formatted,
+    );
+}
+
+test "formatCtValue rejects deeply nested tuple inspect formatting" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedCtTupleForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, formatCtValue(alloc, root));
+}
+
+test "formatCtValue rejects deeply nested list inspect formatting" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedCtListForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, formatCtValue(alloc, root));
+}
+
+test "formatCtValue rejects deeply nested map inspect formatting" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedCtMapForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, formatCtValue(alloc, root));
+}
+
+test "formatCtValue rejects deeply nested optional inspect formatting" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedCtOptionalForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    try testing.expectError(error.ValueTraversalDepthExceeded, formatCtValue(alloc, root));
+}
+
+test "builtinInspect reports traversal diagnostic for deep inspect formatting" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try nestedCtOptionalForTraversalTest(alloc, MAX_VALUE_TRAVERSAL_DEPTH);
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    try testing.expectError(error.CtfeFailure, interp.builtinInspect(&.{root}));
+    try testing.expectEqual(@as(usize, 1), interp.errors.items.len);
+    try testing.expectEqual(CtfeErrorKind.value_traversal_limit_exceeded, interp.errors.items[0].kind);
+    try testing.expect(std.mem.indexOf(u8, interp.errors.items[0].message, "depth") != null);
 }
 
 test "interpreter: constants" {
@@ -6280,7 +9030,7 @@ test "interpreter: constants" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -6313,7 +9063,7 @@ test "interpreter: binary_op add" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -6356,7 +9106,7 @@ test "interpreter: if_expr true branch" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -6399,7 +9149,7 @@ test "interpreter: if_expr false branch" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -6430,7 +9180,7 @@ test "interpreter: param_get" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalByName("identity", &.{.{ .int = 99 }});
@@ -6483,7 +9233,7 @@ test "interpreter: call_direct between functions" {
     };
     const functions = [_]ir.Function{ inner, outer };
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(1, &.{});
@@ -6535,7 +9285,7 @@ test "interpreter: call_named" {
     };
     const functions = [_]ir.Function{ callee, caller };
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalByName("main", &.{});
@@ -6576,7 +9326,7 @@ test "interpreter: struct_init and field_get" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -6608,7 +9358,7 @@ test "interpreter: step budget exceeded" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.step_budget = 100;
     interp.steps_remaining = 100;
@@ -6643,7 +9393,7 @@ test "interpreter: recursion limit exceeded" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.recursion_limit = 5;
     interp.step_budget = 1_000_000;
@@ -6701,7 +9451,7 @@ test "interpreter: switch_return dispatch" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const r1 = try interp.evalFunction(0, &.{.{ .int = 1 }});
@@ -6737,7 +9487,7 @@ test "interpreter: branch between blocks" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -6769,7 +9519,7 @@ test "interpreter: cond_branch between blocks" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -6804,7 +9554,7 @@ test "interpreter: switch_tag dispatch" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{union_value});
@@ -6840,7 +9590,7 @@ test "interpreter: phi selects predecessor value" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -6873,7 +9623,7 @@ test "interpreter: division by zero" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -6907,7 +9657,7 @@ test "interpreter: remainder by zero" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -6945,7 +9695,7 @@ test "interpreter: minInt / -1 is a clean overflow diagnostic, not a panic" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -6979,7 +9729,7 @@ test "interpreter: minInt rem -1 is a clean overflow diagnostic, not a panic" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -7001,7 +9751,7 @@ fn evalConstBinop(alloc: std.mem.Allocator, op: ast.BinaryOp.Op, lhs: i64, rhs: 
     const functions = [_]ir.Function{};
     const program = makeTestProgram(&functions);
     var interner = ast.StringInterner.init(alloc);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.interner = &interner;
     const binop = ast.BinaryOp{
@@ -7010,7 +9760,9 @@ fn evalConstBinop(alloc: std.mem.Allocator, op: ast.BinaryOp.Op, lhs: i64, rhs: 
         .lhs = try constIntExpr(alloc, lhs),
         .rhs = try constIntExpr(alloc, rhs),
     };
-    return evaluateConstBinaryOp(alloc, &interp, binop, null, &interner);
+    var temp_scope = ConstExprTempScope.init(alloc);
+    defer temp_scope.deinit();
+    return evaluateConstBinaryOp(&temp_scope, &interp, binop, null, &interner);
 }
 
 test "attribute folder: division by zero is a clean diagnostic, not a panic" {
@@ -7066,7 +9818,7 @@ test "interpreter: minInt / 2 evaluates normally" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -7099,7 +9851,7 @@ test "interpreter: error records failing instruction index" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -7117,7 +9869,7 @@ test "interpreter: error captures function source span provenance" {
     var interner = ast.StringInterner.init(alloc);
     const fn_name = try interner.intern("div_idx");
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     const mod_scope = try graph.createScope(0, .struct_scope);
@@ -7162,7 +9914,7 @@ test "interpreter: error captures function source span provenance" {
     };
     const program = makeTestProgram(&.{func});
 
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.scope_graph = &graph;
     interp.interner = &interner;
@@ -7198,7 +9950,7 @@ test "interpreter: match_atom" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const r1 = try interp.evalFunction(0, &.{.{ .atom = "ok" }});
@@ -7236,7 +9988,7 @@ test "interpreter: tuple_init and index_get" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -7263,6 +10015,531 @@ test "CapabilitySet" {
     try testing.expect(!with_source_reflect.has(.read_file));
 }
 
+test "reflection: source path matching handles normalized and canonical paths" {
+    const alloc = testing.allocator;
+
+    try testing.expect(try sourcePathsEqual(alloc, "./app.zap", "app.zap"));
+    try testing.expect(try sourcePathsEqual(alloc, "src/ctfe.zig", "src/../src/ctfe.zig"));
+    try testing.expect(!try sourcePathsEqual(alloc, "src/ctfe.zig", "src/main.zig"));
+
+    const normalized_paths = [_][]const u8{"./app.zap"};
+    try testing.expect(try pathFilterContains(alloc, &normalized_paths, "app.zap"));
+    const canonical_paths = [_][]const u8{"src/../src/ctfe.zig"};
+    try testing.expect(try pathFilterContains(alloc, &canonical_paths, "src/ctfe.zig"));
+    const existing_paths = [_][]const u8{ "src/discovery.zig", "src/ctfe.zig" };
+    try testing.expect(!try pathFilterContains(alloc, &existing_paths, "src/main.zig"));
+}
+
+test "reflection: source path matching propagates canonicalization OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    try testing.expectError(
+        error.OutOfMemory,
+        sourcePathsEqual(failing_allocator.allocator(), "src/ctfe.zig", "src/../src/ctfe.zig"),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: reflection source path matching propagates canonicalization failure" {
+    try testing.expectError(
+        error.SourcePathCanonicalizationFailed,
+        sourcePathsEqual(testing.allocator, "missing/p4j2/source-left.zap", "missing/p4j2/source-right.zap"),
+    );
+}
+
+test "reflection: source reflection hash filters paths and propagates matching OOM" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const app_id = try interner.intern("App");
+    const other_id = try interner.intern("Other");
+    const canonical_id = try interner.intern("Canonical");
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "app.zap", .data = "pub struct App {\n}\n" });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "other.zap", .data = "pub struct Other {\n}\n" });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "canonical.zap", .data = "pub struct Canonical {\n}\n" });
+    try tmp_dir.dir.createDirPath(std.Options.debug_io, "nested");
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const app_path = try std.fs.path.join(alloc, &.{ tmp_path, "app.zap" });
+    const app_path_with_dot = try std.fmt.allocPrint(alloc, "{s}/./app.zap", .{tmp_path});
+    const other_path = try std.fs.path.join(alloc, &.{ tmp_path, "other.zap" });
+    const canonical_path = try std.fs.path.join(alloc, &.{ tmp_path, "canonical.zap" });
+    const canonical_surface_path = try std.fmt.allocPrint(alloc, "{s}/nested/../canonical.zap", .{tmp_path});
+
+    var graph = try scope.ScopeGraph.init(alloc);
+    try graph.registerSourceFile(0, app_path);
+    try graph.registerSourceFile(1, other_path);
+    try graph.registerSourceFile(2, canonical_surface_path);
+
+    const app_scope = try graph.createScope(0, .struct_scope);
+    const app_decl = try alloc.create(ast.StructDecl);
+    app_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .name = .{ .parts = &.{app_id}, .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .items = &.{},
+    };
+    try graph.registerStruct(app_decl.name, app_scope, app_decl);
+
+    const other_scope = try graph.createScope(0, .struct_scope);
+    const other_decl = try alloc.create(ast.StructDecl);
+    other_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 5, .source_id = 1 } },
+        .name = .{ .parts = &.{other_id}, .span = .{ .start = 0, .end = 5, .source_id = 1 } },
+        .items = &.{},
+    };
+    try graph.registerStruct(other_decl.name, other_scope, other_decl);
+
+    const canonical_scope = try graph.createScope(0, .struct_scope);
+    const canonical_decl = try alloc.create(ast.StructDecl);
+    canonical_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 3, .source_id = 2 } },
+        .name = .{ .parts = &.{canonical_id}, .span = .{ .start = 0, .end = 3, .source_id = 2 } },
+        .items = &.{},
+    };
+    try graph.registerStruct(canonical_decl.name, canonical_scope, canonical_decl);
+
+    const app_hash = try computeSourceReflectionHash(alloc, &graph, &interner, &.{app_path});
+    const normalized_app_hash = try computeSourceReflectionHash(alloc, &graph, &interner, &.{app_path_with_dot});
+    const other_hash = try computeSourceReflectionHash(alloc, &graph, &interner, &.{other_path});
+    const canonical_hash = try computeSourceReflectionHash(alloc, &graph, &interner, &.{canonical_path});
+    try testing.expectEqual(app_hash, normalized_app_hash);
+    try testing.expect(app_hash != other_hash);
+    try testing.expect(canonical_hash != app_hash);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        computeSourceReflectionHash(failing_allocator.allocator(), &graph, &interner, &.{canonical_path}),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: extractPathFilter frees owned slice on invalid list element" {
+    const alloc = testing.allocator;
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const elems = [_]CtValue{
+        .{ .string = "app.zap" },
+        .{ .int = 1 },
+    };
+    const filter_value = CtValue{ .list = .{ .alloc_id = 0, .elems = &elems } };
+
+    try testing.expectError(error.CtfeFailure, interp.extractPathFilter(filter_value));
+    try testing.expectEqual(@as(usize, 1), interp.errors.items.len);
+    try testing.expectEqual(CtfeErrorKind.type_error, interp.errors.items[0].kind);
+}
+
+test "P4J2: source_graph_structs frees path filter before dependency transfer on hash failure" {
+    var graph_arena = testArena();
+    defer graph_arena.deinit();
+    const graph_alloc = graph_arena.allocator();
+
+    var interner = ast.StringInterner.init(graph_alloc);
+    const app_id = try interner.intern("App");
+
+    var graph = try scope.ScopeGraph.init(graph_alloc);
+    try graph.registerSourceFile(0, "missing/p4j2/source.zap");
+    const app_scope = try graph.createScope(0, .struct_scope);
+    const app_decl = try graph_alloc.create(ast.StructDecl);
+    app_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .name = .{ .parts = &.{app_id}, .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .items = &.{},
+    };
+    try graph.registerStruct(app_decl.name, app_scope, app_decl);
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(testing.allocator, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.pure_only.with(.reflect_source);
+    interp.scope_graph = &graph;
+    interp.interner = &interner;
+
+    try testing.expectError(error.CtfeFailure, interp.builtinSourceGraphStructs(&.{.{ .string = "missing/p4j2/filter.zap" }}));
+    try testing.expectEqual(@as(usize, 0), interp.dependencies.items.len);
+    try testing.expectEqual(@as(usize, 1), interp.errors.items.len);
+    try testing.expectEqual(CtfeErrorKind.host_io_failure, interp.errors.items[0].kind);
+}
+
+test "P4J2: source_graph_structs frees path filter when dependency append fails" {
+    var graph_arena = testArena();
+    defer graph_arena.deinit();
+    const graph_alloc = graph_arena.allocator();
+
+    var interner = ast.StringInterner.init(graph_alloc);
+    var graph = try scope.ScopeGraph.init(graph_alloc);
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var interp = try Interpreter.init(failing_allocator.allocator(), &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.pure_only.with(.reflect_source);
+    interp.scope_graph = &graph;
+    interp.interner = &interner;
+
+    try testing.expectError(error.OutOfMemory, interp.builtinSourceGraphStructs(&.{.{ .string = "app.zap" }}));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), interp.dependencies.items.len);
+}
+
+test "P4J2: Interpreter.deinit frees reflected-source live dependency filter slice" {
+    const alloc = testing.allocator;
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    var interp_initialized = true;
+    defer if (interp_initialized) interp.deinit();
+
+    const paths = try alloc.alloc([]const u8, 2);
+    var paths_transferred = false;
+    errdefer if (!paths_transferred) alloc.free(paths);
+    paths[0] = "lib/config.zap";
+    paths[1] = "lib/runtime.zap";
+
+    try interp.dependencies.append(alloc, .{
+        .reflected_source = .{ .paths = paths, .graph_hash = 0x1234 },
+    });
+    paths_transferred = true;
+
+    interp.deinit();
+    interp_initialized = false;
+}
+
+test "P4J2: CTFE extractStructRefName returns owned alias names" {
+    const alloc = testing.allocator;
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const parts = [_]CtValue{
+        .{ .atom = "Outer" },
+        .{ .atom = "Inner" },
+    };
+    const tuple_elems = [_]CtValue{
+        .{ .atom = "__aliases__" },
+        .nil,
+        .{ .list = .{ .alloc_id = 0, .elems = &parts } },
+    };
+    const alias_ref = CtValue{ .tuple = .{ .alloc_id = 0, .elems = &tuple_elems } };
+
+    const extracted_optional = try interp.extractStructRefName(alias_ref);
+    try testing.expect(extracted_optional != null);
+    const extracted = extracted_optional.?;
+    defer extracted.deinit(alloc);
+
+    try testing.expect(extracted == .owned);
+    try testing.expectEqualStrings("Outer.Inner", extracted.bytes());
+}
+
+test "P4J2: CTFE extractStructRefName frees partial alias buffer on malformed tuple" {
+    const alloc = testing.allocator;
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const parts = [_]CtValue{
+        .{ .atom = "Outer" },
+        .{ .string = "not-an-alias-segment" },
+    };
+    const tuple_elems = [_]CtValue{
+        .{ .atom = "__aliases__" },
+        .nil,
+        .{ .list = .{ .alloc_id = 0, .elems = &parts } },
+    };
+    const malformed_alias_ref = CtValue{ .tuple = .{ .alloc_id = 0, .elems = &tuple_elems } };
+
+    const extracted = try interp.extractStructRefName(malformed_alias_ref);
+    try testing.expect(extracted == null);
+}
+
+test "P4J2: CTFE reflected-struct live dependencies own struct names" {
+    const alloc = testing.allocator;
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    var interp_initialized = true;
+    defer if (interp_initialized) interp.deinit();
+
+    const owned_input_name = try alloc.dupe(u8, "Outer.Inner");
+    defer alloc.free(owned_input_name);
+
+    try interp.recordReflectedStructDependency(owned_input_name, 0x1234);
+    try testing.expectEqual(@as(usize, 1), interp.dependencies.items.len);
+    try testing.expect(interp.dependencies.items[0] == .reflected_struct);
+    try testing.expectEqualStrings("Outer.Inner", interp.dependencies.items[0].reflected_struct.struct_name);
+    try testing.expect(interp.dependencies.items[0].reflected_struct.struct_name.ptr != owned_input_name.ptr);
+
+    interp.deinit();
+    interp_initialized = false;
+}
+
+fn exerciseBuiltinStructTypesAllocationFailures(
+    allocator: std.mem.Allocator,
+    graph: *scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+) !void {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(allocator, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.pure_only.with(.reflect_struct);
+    interp.scope_graph = graph;
+    interp.interner = interner;
+
+    const result = try interp.builtinStructTypes(&.{.{ .string = "App" }});
+    defer deinitOwnedCtValue(allocator, result);
+
+    try testing.expect(result == .list);
+    try testing.expectEqual(@as(usize, 12), result.list.elems.len);
+    try testing.expect(result.list.elems[0] == .atom);
+    try testing.expectEqualStrings("Type00", result.list.elems[0].atom);
+    try testing.expect(result.list.elems[11] == .atom);
+    try testing.expectEqualStrings("Type11", result.list.elems[11].atom);
+}
+
+test "P4J2: Struct.types frees result list on allocation failure" {
+    var graph_arena = testArena();
+    defer graph_arena.deinit();
+    const graph_alloc = graph_arena.allocator();
+
+    var interner = ast.StringInterner.init(graph_alloc);
+    const app_id = try interner.intern("App");
+
+    var graph = try scope.ScopeGraph.init(graph_alloc);
+    const app_scope = try graph.createScope(0, .struct_scope);
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const app_decl = try graph_alloc.create(ast.StructDecl);
+    app_decl.* = .{
+        .meta = .{ .span = span },
+        .name = .{ .parts = &.{app_id}, .span = span },
+        .items = &.{},
+    };
+    try graph.registerStruct(app_decl.name, app_scope, app_decl);
+
+    const dummy_type_expr = try graph_alloc.create(ast.TypeExpr);
+    dummy_type_expr.* = .{ .never = .{ .meta = .{ .span = span } } };
+    const type_names = [_][]const u8{
+        "Type00",
+        "Type01",
+        "Type02",
+        "Type03",
+        "Type04",
+        "Type05",
+        "Type06",
+        "Type07",
+        "Type08",
+        "Type09",
+        "Type10",
+        "Type11",
+    };
+    for (type_names) |type_name| {
+        const type_id = try interner.intern(type_name);
+        _ = try graph.registerType(type_id, app_scope, .{ .type_alias = dummy_type_expr }, &.{});
+    }
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseBuiltinStructTypesAllocationFailures,
+        .{ &graph, &interner },
+    );
+}
+
+fn initP4J2ReflectionListFixture(
+    alloc: std.mem.Allocator,
+    graph: *scope.ScopeGraph,
+    interner: *ast.StringInterner,
+) !void {
+    const app_id = try interner.intern("App");
+    const main_id = try interner.intern("main");
+    const config_id = try interner.intern("config");
+
+    try graph.registerSourceFile(0, "app.zap");
+    const app_scope = try graph.createScope(0, .struct_scope);
+    const span = ast.SourceSpan{ .start = 0, .end = 3, .source_id = 0 };
+    const app_decl = try alloc.create(ast.StructDecl);
+    app_decl.* = .{
+        .meta = .{ .span = span },
+        .name = .{ .parts = &.{app_id}, .span = span },
+        .items = &.{},
+    };
+    try graph.registerStruct(app_decl.name, app_scope, app_decl);
+    _ = try graph.createFamily(app_scope, main_id, 1, .public);
+
+    const computed_values = try alloc.alloc(ConstValue, 2);
+    computed_values[0] = .{ .atom = "enabled" };
+    computed_values[1] = .{ .int = 42 };
+    try graph.structs.items[0].attributes.append(alloc, .{
+        .name = config_id,
+        .computed_value = .{ .list = computed_values },
+    });
+}
+
+fn exerciseBuiltinSourceGraphStructsAllocationFailures(
+    allocator: std.mem.Allocator,
+    graph: *scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+) !void {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(allocator, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.pure_only.with(.reflect_source);
+    interp.scope_graph = graph;
+    interp.interner = interner;
+
+    const result = try interp.builtinSourceGraphStructs(&.{.{ .string = "app.zap" }});
+    defer deinitOwnedCtValue(allocator, result);
+
+    try testing.expect(result == .list);
+    try testing.expectEqual(@as(usize, 1), result.list.elems.len);
+    try testing.expect(result.list.elems[0] == .tuple);
+}
+
+test "P4J2: SourceGraph.structs frees owned result list on allocation failure" {
+    var graph_arena = testArena();
+    defer graph_arena.deinit();
+    const graph_alloc = graph_arena.allocator();
+
+    var interner = ast.StringInterner.init(graph_alloc);
+    var graph = try scope.ScopeGraph.init(graph_alloc);
+    try initP4J2ReflectionListFixture(graph_alloc, &graph, &interner);
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseBuiltinSourceGraphStructsAllocationFailures,
+        .{ &graph, &interner },
+    );
+}
+
+fn exerciseBuiltinReflectedStructFunctionsAllocationFailures(
+    allocator: std.mem.Allocator,
+    graph: *scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+) !void {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(allocator, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.pure_only.with(.reflect_source);
+    interp.scope_graph = graph;
+    interp.interner = interner;
+
+    const result = try interp.builtinReflectedStructFunctions(&.{.{ .string = "App" }});
+    defer deinitOwnedCtValue(allocator, result);
+
+    try testing.expect(result == .list);
+    try testing.expectEqual(@as(usize, 1), result.list.elems.len);
+    try testing.expect(result.list.elems[0] == .map);
+}
+
+test "P4J2: reflected Struct.functions frees owned result list on allocation failure" {
+    var graph_arena = testArena();
+    defer graph_arena.deinit();
+    const graph_alloc = graph_arena.allocator();
+
+    var interner = ast.StringInterner.init(graph_alloc);
+    var graph = try scope.ScopeGraph.init(graph_alloc);
+    try initP4J2ReflectionListFixture(graph_alloc, &graph, &interner);
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseBuiltinReflectedStructFunctionsAllocationFailures,
+        .{ &graph, &interner },
+    );
+}
+
+fn exerciseBuiltinStructFunctionsAllocationFailures(
+    allocator: std.mem.Allocator,
+    graph: *scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+) !void {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(allocator, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.pure_only.with(.reflect_struct);
+    interp.scope_graph = graph;
+    interp.interner = interner;
+
+    const result = try interp.builtinStructFunctions(&.{.{ .string = "App" }});
+    defer deinitOwnedCtValue(allocator, result);
+
+    try testing.expect(result == .list);
+    try testing.expectEqual(@as(usize, 1), result.list.elems.len);
+    try testing.expect(result.list.elems[0] == .tuple);
+}
+
+test "P4J2: Struct.functions frees owned result list on allocation failure" {
+    var graph_arena = testArena();
+    defer graph_arena.deinit();
+    const graph_alloc = graph_arena.allocator();
+
+    var interner = ast.StringInterner.init(graph_alloc);
+    var graph = try scope.ScopeGraph.init(graph_alloc);
+    try initP4J2ReflectionListFixture(graph_alloc, &graph, &interner);
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseBuiltinStructFunctionsAllocationFailures,
+        .{ &graph, &interner },
+    );
+}
+
+fn exerciseBuiltinStructAttributesAllocationFailures(
+    allocator: std.mem.Allocator,
+    graph: *scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+) !void {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(allocator, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.pure_only.with(.reflect_struct);
+    interp.scope_graph = graph;
+    interp.interner = interner;
+
+    const result = try interp.builtinStructAttributes(&.{.{ .string = "App" }});
+    defer deinitOwnedCtValue(allocator, result);
+
+    try testing.expect(result == .list);
+    try testing.expectEqual(@as(usize, 1), result.list.elems.len);
+    try testing.expect(result.list.elems[0] == .tuple);
+}
+
+test "P4J2: Struct.attributes frees owned result list on allocation failure" {
+    var graph_arena = testArena();
+    defer graph_arena.deinit();
+    const graph_alloc = graph_arena.allocator();
+
+    var interner = ast.StringInterner.init(graph_alloc);
+    var graph = try scope.ScopeGraph.init(graph_alloc);
+    try initP4J2ReflectionListFixture(graph_alloc, &graph, &interner);
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseBuiltinStructAttributesAllocationFailures,
+        .{ &graph, &interner },
+    );
+}
+
 test "reflection: SourceGraph.structs filters by source path" {
     var arena = testArena();
     defer arena.deinit();
@@ -7271,7 +10548,7 @@ test "reflection: SourceGraph.structs filters by source path" {
     var interner = ast.StringInterner.init(alloc);
     const app_id = try interner.intern("App");
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     try graph.registerSourceFile(0, "./app.zap");
     const app_scope = try graph.createScope(0, .struct_scope);
 
@@ -7304,7 +10581,7 @@ test "reflection: SourceGraph.structs filters by source path" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.capabilities = CapabilitySet.pure_only.with(.reflect_source);
     interp.scope_graph = &graph;
@@ -7335,7 +10612,7 @@ test "reflection: Struct.functions returns public function refs" {
     const app_id = try interner.intern("App");
     const main_id = try interner.intern("main");
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const app_scope = try graph.createScope(0, .struct_scope);
     const app_decl = try alloc.create(ast.StructDecl);
     app_decl.* = .{
@@ -7367,7 +10644,7 @@ test "reflection: Struct.functions returns public function refs" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.capabilities = CapabilitySet.pure_only.with(.reflect_source);
     interp.scope_graph = &graph;
@@ -7394,6 +10671,252 @@ test "reflection: Struct.functions returns public function refs" {
     }
     try testing.expect(found_name);
     try testing.expect(found_arity);
+}
+
+test "P4J2: reflected source append guards free constructed values on allocation failure" {
+    var setup_arena = testArena();
+    defer setup_arena.deinit();
+    const setup_alloc = setup_arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    const app_id = try interner.intern("App");
+
+    var graph = try scope.ScopeGraph.init(setup_alloc);
+    try graph.registerSourceFile(0, "app.zap");
+    const app_scope = try graph.createScope(0, .struct_scope);
+    const app_decl = try setup_alloc.create(ast.StructDecl);
+    app_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .name = .{ .parts = &.{app_id}, .span = .{ .start = 0, .end = 3, .source_id = 0 } },
+        .items = &.{},
+    };
+    try graph.registerStruct(app_decl.name, app_scope, app_decl);
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.interner = &interner;
+
+    const struct_ref = try interp.makeStructRef(graph.structs.items[0], "app.zap", 0);
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(error.OutOfMemory, appendOwnedCtValue(alloc, &result_list, struct_ref));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), result_list.items.len);
+}
+
+test "P4J2: reflected function append guard frees constructed map on allocation failure" {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const function_ref = try interp.makeFunctionRef("main", 1, .public);
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(error.OutOfMemory, appendOwnedCtValue(alloc, &result_list, function_ref));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), result_list.items.len);
+}
+
+test "P4J2: struct reflection append guard frees tuple and imported value on allocation failure" {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const computed_values = [_]ConstValue{.{ .int = 1 }};
+    const imported_value = try Interpreter.importConstValue(alloc, .{ .list = &computed_values });
+    const tuple_elems = try alloc.alloc(CtValue, 2);
+    initCtValueSlots(tuple_elems);
+    tuple_elems[0] = .{ .atom = "docs" };
+    tuple_elems[1] = imported_value;
+    const tuple_id = try interp.allocation_store.alloc(alloc, .tuple, interp.currentFunctionId());
+    const tuple_value = CtValue{ .tuple = .{ .alloc_id = tuple_id, .elems = tuple_elems } };
+    var result_list: std.ArrayListUnmanaged(CtValue) = .empty;
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(error.OutOfMemory, appendOwnedCtValue(alloc, &result_list, tuple_value));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), result_list.items.len);
+}
+
+test "P4J2: Struct.put_attribute frees exported value when scope append fails" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const struct_name_id: ast.StringId = 1;
+    const attr_name_id: ast.StringId = 2;
+    const struct_name = ast.StructName{ .parts = &[_]ast.StringId{struct_name_id}, .span = span };
+    var struct_decl = ast.StructDecl{
+        .meta = .{ .span = span },
+        .name = struct_name,
+    };
+    const struct_scope = try graph.createScope(graph.prelude_scope, .struct_scope);
+    try graph.structs.append(alloc, .{
+        .name = struct_name,
+        .scope_id = struct_scope,
+        .decl = &struct_decl,
+    });
+
+    const exported = try exportValue(alloc, .{ .string = "owned" });
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(
+        error.OutOfMemory,
+        Interpreter.putExportedStructAttribute(alloc, &graph, &graph.structs.items[0], attr_name_id, exported),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), graph.structs.items[0].attributes.items.len);
+}
+
+test "P4J2: accumulating struct attribute import frees only shallow wrapper" {
+    const alloc = testing.allocator;
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const struct_name_id: ast.StringId = 10;
+    const attr_name_id: ast.StringId = 11;
+    const struct_name = ast.StructName{ .parts = &[_]ast.StringId{struct_name_id}, .span = span };
+    var struct_decl = ast.StructDecl{
+        .meta = .{ .span = span },
+        .name = struct_name,
+    };
+    const struct_scope = try graph.createScope(graph.prelude_scope, .struct_scope);
+    try graph.structs.append(alloc, .{
+        .name = struct_name,
+        .scope_id = struct_scope,
+        .decl = &struct_decl,
+    });
+
+    try graph.registerAccumulatingAttribute(&graph.structs.items[0], attr_name_id);
+    try Interpreter.putExportedStructAttribute(
+        alloc,
+        &graph,
+        &graph.structs.items[0],
+        attr_name_id,
+        try exportValue(alloc, .{ .string = "first" }),
+    );
+    try Interpreter.putExportedStructAttribute(
+        alloc,
+        &graph,
+        &graph.structs.items[0],
+        attr_name_id,
+        try exportValue(alloc, .{ .string = "second" }),
+    );
+
+    const maybe_attribute_value = try graph.getStructAttribute(&graph.structs.items[0], attr_name_id);
+    try testing.expect(maybe_attribute_value != null);
+    var attribute_value = maybe_attribute_value.?;
+    defer attribute_value.deinit(alloc);
+
+    const imported = try Interpreter.importConstValue(alloc, attribute_value.value);
+    defer deinitOwnedCtValue(alloc, imported);
+
+    try testing.expect(imported == .list);
+    try testing.expectEqual(@as(usize, 2), imported.list.elems.len);
+    try testing.expectEqualStrings("first", imported.list.elems[0].string);
+    try testing.expectEqualStrings("second", imported.list.elems[1].string);
+}
+
+test "P4J2: constant-call argument append frees aggregate value on allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+
+    const arg_elements = try alloc.alloc(CtValue, 2);
+    initCtValueSlots(arg_elements);
+    arg_elements[0] = .{ .int = 1 };
+    arg_elements[1] = .{ .int = 2 };
+    const arg_value = CtValue{ .list = .{ .alloc_id = 0, .elems = arg_elements } };
+    var ct_args: std.ArrayListUnmanaged(CtValue) = .empty;
+    defer ct_args.deinit(alloc);
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try testing.expectError(error.OutOfMemory, appendOwnedCtValue(alloc, &ct_args, arg_value));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), ct_args.items.len);
+}
+
+test "P4J2: constant-call evalFunction releases temporary argument backing storage" {
+    var setup_arena = testArena();
+    defer setup_arena.deinit();
+    const setup_alloc = setup_arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    const app_id = try interner.intern("App");
+    const compute_id = try interner.intern("compute");
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const app_name = ast.StructName{ .parts = &.{app_id}, .span = span };
+
+    const first_expr = try setup_alloc.create(ast.Expr);
+    first_expr.* = .{ .int_literal = .{
+        .meta = .{ .span = span },
+        .value = 1,
+    } };
+    const second_expr = try setup_alloc.create(ast.Expr);
+    second_expr.* = .{ .int_literal = .{
+        .meta = .{ .span = span },
+        .value = 2,
+    } };
+    const list_expr = try setup_alloc.create(ast.Expr);
+    list_expr.* = .{ .list = .{
+        .meta = .{ .span = span },
+        .elements = &.{ first_expr, second_expr },
+    } };
+    const callee_expr = try setup_alloc.create(ast.Expr);
+    callee_expr.* = .{ .var_ref = .{
+        .meta = .{ .span = span },
+        .name = compute_id,
+    } };
+    const call_expr = try setup_alloc.create(ast.Expr);
+    call_expr.* = .{ .call = .{
+        .meta = .{ .span = span },
+        .callee = callee_expr,
+        .args = &.{list_expr},
+    } };
+
+    const compute_fn = ir.Function{
+        .id = 0,
+        .name = "App__compute",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &.{.{ .name = "values", .type_expr = .any }},
+        .return_type = .any,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .param_get = .{ .dest = 0, .index = 0 } },
+                .{ .ret = .{ .value = 0 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+    const functions = [_]ir.Function{compute_fn};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(testing.allocator, &program);
+    defer interp.deinit();
+
+    var temp_scope = ConstExprTempScope.init(testing.allocator);
+    defer temp_scope.deinit();
+    const result = try evaluateConstExpr(&temp_scope, &interp, call_expr, app_name, &interner);
+    try testing.expect(result == .list);
+    try testing.expectEqual(@as(usize, 2), result.list.elems.len);
 }
 
 test "interpreter: make_closure and call_closure" {
@@ -7452,11 +10975,70 @@ test "interpreter: make_closure and call_closure" {
     };
     const functions = [_]ir.Function{ closure_body, outer };
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(1, &.{});
     try testing.expectEqual(@as(i64, 15), result.int); // 10 + 5
+}
+
+test "computed attribute cache setup reports mkdir host I/O failure" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "blocked",
+        .data = "not a directory",
+    });
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const blocked_cache_dir = try std.fs.path.join(alloc, &.{ tmp_path, "blocked", "ctfe" });
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var graph = try scope.ScopeGraph.init(alloc);
+    var interner = ast.StringInterner.init(alloc);
+
+    const all_result = try evaluateComputedAttributes(alloc, &program, &graph, &interner, blocked_cache_dir, 0);
+    try expectComputedAttributeCacheSetupHostIoFailure(all_result);
+
+    const struct_order = [_][]const u8{};
+    const ordered_result = try evaluateStructAttributesInOrder(alloc, &program, &graph, &interner, &struct_order, blocked_cache_dir, 0);
+    try expectComputedAttributeCacheSetupHostIoFailure(ordered_result);
+
+    const struct_result = try evaluateComputedAttributesForStruct(alloc, &program, &graph, &interner, "Foo", blocked_cache_dir, 0);
+    try expectComputedAttributeCacheSetupHostIoFailure(struct_result);
+}
+
+test "computed attribute cache setup propagates OOM while recording mkdir failure" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "blocked",
+        .data = "not a directory",
+    });
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const blocked_cache_dir = try std.fs.path.join(alloc, &.{ tmp_path, "blocked", "ctfe" });
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var graph = try scope.ScopeGraph.init(alloc);
+    var interner = ast.StringInterner.init(alloc);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        evaluateComputedAttributes(failing_allocator.allocator(), &program, &graph, &interner, blocked_cache_dir, 0),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
 }
 
 test "evaluateComputedAttributes: call expression" {
@@ -7487,7 +11069,7 @@ test "evaluateComputedAttributes: call expression" {
     const program = makeTestProgram(&functions);
 
     // Build a scope graph with a struct "Foo" and an attribute @config = compute()
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
 
     // Create struct scope (child of prelude)
     const mod_scope = try graph.createScope(0, .struct_scope);
@@ -7571,7 +11153,7 @@ test "evaluateComputedAttributes: failing attribute records attribute context" {
     const functions = [_]ir.Function{compute_fn};
     const program = makeTestProgram(&functions);
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
@@ -7625,7 +11207,7 @@ test "evaluateComputedAttributes: binary expression value" {
     const functions = [_]ir.Function{};
     const program = makeTestProgram(&functions);
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
@@ -7693,7 +11275,7 @@ test "evaluateComputedAttributes: call expression with computed args" {
     const functions = [_]ir.Function{compute_fn};
     const program = makeTestProgram(&functions);
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
@@ -7756,7 +11338,7 @@ test "evaluateComputedAttributes: attr_ref can use earlier computed attribute" {
     const functions = [_]ir.Function{};
     const program = makeTestProgram(&functions);
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
@@ -7811,7 +11393,7 @@ test "tryEvalAttribute: literal int value" {
     const functions = [_]ir.Function{};
     const program = makeTestProgram(&functions);
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
@@ -7855,7 +11437,7 @@ test "tryEvalAttribute: literal string value" {
     const functions = [_]ir.Function{};
     const program = makeTestProgram(&functions);
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const mod_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
@@ -7899,7 +11481,7 @@ test "evaluateConstExpr: struct_ref produces Type value" {
     const functions = [_]ir.Function{};
     const program = makeTestProgram(&functions);
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const app_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
@@ -7913,7 +11495,7 @@ test "evaluateConstExpr: struct_ref produces Type value" {
     };
     try graph.registerStruct(app_decl.name, app_scope, app_decl);
 
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.scope_graph = &graph;
     interp.interner = &interner;
@@ -7924,13 +11506,230 @@ test "evaluateConstExpr: struct_ref produces Type value" {
         .name = app_decl.name,
     } };
 
-    const result = try evaluateConstExpr(alloc, &interp, expr, app_decl.name, &interner);
+    var temp_scope = ConstExprTempScope.init(alloc);
+    defer temp_scope.deinit();
+    const result = try evaluateConstExpr(&temp_scope, &interp, expr, app_decl.name, &interner);
     try testing.expect(result == .struct_val);
     try testing.expectEqualStrings("Type", result.struct_val.type_name);
     try testing.expectEqual(@as(usize, 1), result.struct_val.fields.len);
     try testing.expectEqualStrings("name", result.struct_val.fields[0].name);
     try testing.expect(result.struct_val.fields[0].value == .atom);
     try testing.expectEqualStrings("App", result.struct_val.fields[0].value.atom);
+}
+
+test "evaluateConstExpr rejects excessive AST recursion depth" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const Parser = @import("parser.zig").Parser;
+    var parser = try Parser.init(alloc, "1 + (2 + (3 + 4))");
+    defer parser.deinit();
+    const expr = try parser.parseExpr();
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.const_expr_recursion_limit = 2;
+
+    var temp_scope = ConstExprTempScope.init(alloc);
+    defer temp_scope.deinit();
+    try testing.expectError(error.CtfeFailed, evaluateConstExpr(&temp_scope, &interp, expr, null, parser.interner));
+    try testing.expect(interp.errors.items.len > 0);
+    try testing.expectEqual(CtfeErrorKind.recursion_limit_exceeded, interp.errors.items[0].kind);
+    try testing.expect(std.mem.indexOf(u8, interp.errors.items[0].message, "constant expression recursion limit exceeded") != null);
+}
+
+test "evaluateConstExpr: qualified callee name allocation OOM propagates" {
+    var arena = testArena();
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    const app_id = try interner.intern("App");
+    const compute_id = try interner.intern("compute");
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const app_parts = [_]ast.StringId{app_id};
+    const app_name = ast.StructName{ .parts = &app_parts, .span = span };
+
+    const object_expr = try setup_alloc.create(ast.Expr);
+    object_expr.* = .{ .struct_ref = .{
+        .meta = .{ .span = span },
+        .name = app_name,
+    } };
+    const callee_expr = try setup_alloc.create(ast.Expr);
+    callee_expr.* = .{ .field_access = .{
+        .meta = .{ .span = span },
+        .object = object_expr,
+        .field = compute_id,
+    } };
+    const call_expr = try setup_alloc.create(ast.Expr);
+    call_expr.* = .{ .call = .{
+        .meta = .{ .span = span },
+        .callee = callee_expr,
+        .args = &.{},
+    } };
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(setup_alloc, &program);
+    defer interp.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var temp_scope = ConstExprTempScope.init(failing_allocator.allocator());
+    defer temp_scope.deinit();
+    try testing.expectError(
+        error.OutOfMemory,
+        evaluateConstExpr(&temp_scope, &interp, call_expr, app_name, &interner),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "evaluateConstExpr: unresolved callee remains not computable" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const app_id = try interner.intern("App");
+    const compute_id = try interner.intern("compute");
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const app_parts = [_]ast.StringId{app_id};
+    const app_name = ast.StructName{ .parts = &app_parts, .span = span };
+
+    const object_expr = try alloc.create(ast.Expr);
+    object_expr.* = .{ .int_literal = .{
+        .meta = .{ .span = span },
+        .value = 1,
+    } };
+    const callee_expr = try alloc.create(ast.Expr);
+    callee_expr.* = .{ .field_access = .{
+        .meta = .{ .span = span },
+        .object = object_expr,
+        .field = compute_id,
+    } };
+    const call_expr = try alloc.create(ast.Expr);
+    call_expr.* = .{ .call = .{
+        .meta = .{ .span = span },
+        .callee = callee_expr,
+        .args = &.{},
+    } };
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    var temp_scope = ConstExprTempScope.init(alloc);
+    defer temp_scope.deinit();
+    try testing.expectError(error.NotComputable, evaluateConstExpr(&temp_scope, &interp, call_expr, app_name, &interner));
+}
+
+test "evaluateConstExpr: constant-call evalFunction OOM propagates" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const app_id = try interner.intern("App");
+    const compute_id = try interner.intern("compute");
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const app_name = ast.StructName{ .parts = &.{app_id}, .span = span };
+
+    const callee_expr = try alloc.create(ast.Expr);
+    callee_expr.* = .{ .var_ref = .{
+        .meta = .{ .span = span },
+        .name = compute_id,
+    } };
+    const call_expr = try alloc.create(ast.Expr);
+    call_expr.* = .{ .call = .{
+        .meta = .{ .span = span },
+        .callee = callee_expr,
+        .args = &.{},
+    } };
+
+    const func = ir.Function{
+        .id = 0,
+        .name = "App__compute",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_allocator = interp.allocator;
+    interp.allocator = failing_allocator.allocator();
+    defer interp.allocator = original_allocator;
+
+    var temp_scope = ConstExprTempScope.init(alloc);
+    defer temp_scope.deinit();
+    try testing.expectError(error.OutOfMemory, evaluateConstExpr(&temp_scope, &interp, call_expr, app_name, &interner));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "evaluateConstExpr: constant-call semantic failure maps to CtfeFailed" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const app_id = try interner.intern("App");
+    const compute_id = try interner.intern("compute");
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const app_name = ast.StructName{ .parts = &.{app_id}, .span = span };
+
+    const callee_expr = try alloc.create(ast.Expr);
+    callee_expr.* = .{ .var_ref = .{
+        .meta = .{ .span = span },
+        .name = compute_id,
+    } };
+    const call_expr = try alloc.create(ast.Expr);
+    call_expr.* = .{ .call = .{
+        .meta = .{ .span = span },
+        .callee = callee_expr,
+        .args = &.{},
+    } };
+
+    const func = ir.Function{
+        .id = 0,
+        .name = "App__compute",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = 1 } },
+                .{ .const_int = .{ .dest = 1, .value = 0 } },
+                .{ .binary_op = .{ .dest = 2, .op = .div, .lhs = 0, .rhs = 1 } },
+                .{ .ret = .{ .value = 2 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    var temp_scope = ConstExprTempScope.init(alloc);
+    defer temp_scope.deinit();
+    try testing.expectError(error.CtfeFailed, evaluateConstExpr(&temp_scope, &interp, call_expr, app_name, &interner));
+    try testing.expectEqual(@as(usize, 1), interp.errors.items.len);
+    try testing.expectEqual(CtfeErrorKind.division_by_zero, interp.errors.items[0].kind);
 }
 
 test "evaluateConstExpr: function_ref produces Function value with narrowed arity" {
@@ -7941,7 +11740,7 @@ test "evaluateConstExpr: function_ref produces Function value with narrowed arit
     const functions = [_]ir.Function{};
     const program = makeTestProgram(&functions);
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const app_scope = try graph.createScope(0, .struct_scope);
 
     var interner = ast.StringInterner.init(alloc);
@@ -7957,7 +11756,7 @@ test "evaluateConstExpr: function_ref produces Function value with narrowed arit
     try graph.registerStruct(app_decl.name, app_scope, app_decl);
     _ = try graph.createFamily(app_scope, target_id, 44, .public);
 
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.scope_graph = &graph;
     interp.interner = &interner;
@@ -7970,7 +11769,9 @@ test "evaluateConstExpr: function_ref produces Function value with narrowed arit
         .arity = 300,
     } };
 
-    const result = try evaluateConstExpr(alloc, &interp, expr, app_decl.name, &interner);
+    var temp_scope = ConstExprTempScope.init(alloc);
+    defer temp_scope.deinit();
+    const result = try evaluateConstExpr(&temp_scope, &interp, expr, app_decl.name, &interner);
     try testing.expect(result == .struct_val);
     try testing.expectEqualStrings("Function", result.struct_val.type_name);
     try testing.expectEqual(@as(usize, 3), result.struct_val.fields.len);
@@ -8021,7 +11822,242 @@ test "interpreter: field_set on struct" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const result = try interp.evalFunction(0, &.{});
+    try testing.expectEqual(@as(i64, 99), result.int);
+}
+
+fn exerciseFieldSetMapReplacementAllocations(allocator: std.mem.Allocator) !void {
+    const original_list_elems = try allocator.alloc(CtValue, 1);
+    defer allocator.free(original_list_elems);
+    original_list_elems[0] = .{ .int = 7 };
+
+    const original_entries = try allocator.alloc(CtValue.CtMapEntry, 1);
+    defer allocator.free(original_entries);
+    original_entries[0] = .{
+        .key = .{ .atom = "existing" },
+        .value = .{ .list = .{ .alloc_id = 1, .elems = original_list_elems } },
+    };
+
+    const replacement_entries = try rebuildMapEntriesForFieldSet(
+        allocator,
+        original_entries,
+        "added",
+        .{ .int = 99 },
+    );
+    defer allocator.free(replacement_entries);
+
+    try testing.expectEqual(@as(usize, 1), original_entries.len);
+    try testing.expectEqual(@as(usize, 1), original_entries[0].value.list.elems.len);
+    try testing.expectEqual(@as(i64, 7), original_entries[0].value.list.elems[0].int);
+
+    try testing.expectEqual(@as(usize, 2), replacement_entries.len);
+    try testing.expectEqualStrings("existing", replacement_entries[0].key.atom);
+    try testing.expectEqual(@as(i64, 7), replacement_entries[0].value.list.elems[0].int);
+    try testing.expectEqualStrings("added", replacement_entries[1].key.string);
+    try testing.expectEqual(@as(i64, 99), replacement_entries[1].value.int);
+}
+
+test "P4J2: field_set map replacement uses exact slice and preserves original on OOM" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseFieldSetMapReplacementAllocations,
+        .{},
+    );
+}
+
+fn expectAggregateConstructorAllocIdFailureCleansPayload(
+    instruction: ir.Instruction,
+    source_values: []const CtValue,
+    local_count: u32,
+) !void {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(testing.allocator, &program);
+    defer interp.deinit();
+
+    const function = ir.Function{
+        .id = 0,
+        .name = "aggregate_constructor_alloc_id_failure_fn",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .any,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = local_count,
+    };
+    var frame = try Frame.init(testing.allocator, &function, &.{});
+    defer frame.deinit(testing.allocator);
+
+    for (source_values, 0..) |source_value, index| {
+        frame.setLocal(@intCast(index), source_value);
+    }
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    const original_allocator = interp.allocator;
+    interp.allocator = failing_allocator.allocator();
+    defer interp.allocator = original_allocator;
+
+    try testing.expectError(error.OutOfMemory, interp.execOneInstruction(instruction, &frame));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+fn expectAggregateConstructorCtfeFailureCleansPayload(
+    instruction: ir.Instruction,
+    source_values: []const CtValue,
+    local_count: u32,
+    expected_error_kind: CtfeErrorKind,
+) !void {
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(testing.allocator, &program);
+    defer interp.deinit();
+
+    const function = ir.Function{
+        .id = 0,
+        .name = "aggregate_constructor_read_failure_fn",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .any,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = local_count,
+    };
+    var frame = try Frame.init(testing.allocator, &function, &.{});
+    defer frame.deinit(testing.allocator);
+
+    for (source_values, 0..) |source_value, index| {
+        frame.setLocal(@intCast(index), source_value);
+    }
+
+    try testing.expectError(error.CtfeFailure, interp.execOneInstruction(instruction, &frame));
+    try testing.expectEqual(@as(usize, 1), interp.errors.items.len);
+    try testing.expectEqual(expected_error_kind, interp.errors.items[0].kind);
+}
+
+test "P4J2: aggregate constructors clean payload when alloc id allocation fails" {
+    const nested_list_elems = try testing.allocator.alloc(CtValue, 1);
+    nested_list_elems[0] = .{ .int = 11 };
+    const nested_list = CtValue{ .list = .{ .alloc_id = 77, .elems = nested_list_elems } };
+    defer deinitOwnedCtValue(testing.allocator, nested_list);
+
+    const tuple_elements = [_]ir.LocalId{0};
+    try expectAggregateConstructorAllocIdFailureCleansPayload(
+        .{ .tuple_init = .{ .dest = 1, .elements = &tuple_elements } },
+        &.{nested_list},
+        2,
+    );
+
+    const list_elements = [_]ir.LocalId{0};
+    try expectAggregateConstructorAllocIdFailureCleansPayload(
+        .{ .list_init = .{ .dest = 1, .elements = &list_elements } },
+        &.{.{ .int = 1 }},
+        2,
+    );
+
+    try expectAggregateConstructorAllocIdFailureCleansPayload(
+        .{ .list_cons = .{ .dest = 2, .head = 0, .tail = 1 } },
+        &.{ .{ .int = 1 }, .nil },
+        3,
+    );
+
+    const map_entries = [_]ir.MapEntry{.{ .key = 0, .value = 1 }};
+    try expectAggregateConstructorAllocIdFailureCleansPayload(
+        .{ .map_init = .{ .dest = 2, .entries = &map_entries } },
+        &.{ .{ .atom = "key" }, .{ .int = 1 } },
+        3,
+    );
+
+    const struct_fields = [_]ir.StructFieldInit{.{ .name = "field", .value = 0 }};
+    try expectAggregateConstructorAllocIdFailureCleansPayload(
+        .{ .struct_init = .{ .dest = 1, .type_name = "Box", .fields = &struct_fields } },
+        &.{.{ .int = 1 }},
+        2,
+    );
+
+    try expectAggregateConstructorAllocIdFailureCleansPayload(
+        .{ .union_init = .{ .dest = 1, .union_type = "Maybe", .variant_name = "Some", .value = 0 } },
+        &.{.{ .int = 1 }},
+        2,
+    );
+}
+
+test "P4J2: aggregate constructors clean payload when local read fails" {
+    const map_entries = [_]ir.MapEntry{.{ .key = 0, .value = 1 }};
+    try expectAggregateConstructorCtfeFailureCleansPayload(
+        .{ .map_init = .{ .dest = 2, .entries = &map_entries } },
+        &.{ .consumed, .{ .int = 1 } },
+        3,
+        .use_after_consume,
+    );
+
+    const struct_fields = [_]ir.StructFieldInit{.{ .name = "field", .value = 0 }};
+    try expectAggregateConstructorCtfeFailureCleansPayload(
+        .{ .struct_init = .{ .dest = 1, .type_name = "Box", .fields = &struct_fields } },
+        &.{.consumed},
+        2,
+        .use_after_consume,
+    );
+
+    try expectAggregateConstructorCtfeFailureCleansPayload(
+        .{ .union_init = .{ .dest = 1, .union_type = "Maybe", .variant_name = "Some", .value = 0 } },
+        &.{.consumed},
+        2,
+        .use_after_consume,
+    );
+}
+
+test "P4J2: aggregate constructor cleans payload when local transfer fails" {
+    const list_elements = [_]ir.LocalId{0};
+    try expectAggregateConstructorCtfeFailureCleansPayload(
+        .{ .list_init = .{ .dest = 2, .elements = &list_elements } },
+        &.{.{ .int = 1 }},
+        1,
+        .unsupported_instruction,
+    );
+}
+
+test "interpreter: field_set appends map key" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const func = ir.Function{
+        .id = 0,
+        .name = "field_set_map_fn",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_string = .{ .dest = 0, .value = "existing" } },
+                .{ .const_int = .{ .dest = 1, .value = 7 } },
+                .{ .map_init = .{
+                    .dest = 2,
+                    .entries = &.{
+                        .{ .key = 0, .value = 1 },
+                    },
+                } },
+                .{ .const_int = .{ .dest = 3, .value = 99 } },
+                .{ .field_set = .{ .object = 2, .field = "added", .value = 3 } },
+                .{ .field_get = .{ .dest = 4, .object = 2, .field = "added" } },
+                .{ .ret = .{ .value = 4 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 5,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -8053,7 +12089,7 @@ test "interpreter: bin_len_check" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const r1 = try interp.evalFunction(0, &.{.{ .string = "hello" }});
@@ -8089,7 +12125,7 @@ test "interpreter: bin_match_prefix" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const r1 = try interp.evalFunction(0, &.{.{ .string = "hello" }});
@@ -8125,7 +12161,7 @@ test "interpreter: bin_slice" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{.{ .string = "hello world" }});
@@ -8158,7 +12194,7 @@ test "memoization: cache hit on second call" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     // First call — executes function body, consumes steps
@@ -8177,18 +12213,139 @@ test "memoization: cache hit on second call" {
     try testing.expect(interp.steps_remaining < steps_after_first);
 }
 
+test "memoization: insertion OOM propagates" {
+    const func = ir.Function{
+        .id = 0,
+        .name = "memo_insert_oom",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = 7 } },
+                .{ .ret = .{ .value = 0 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(testing.allocator, &program);
+    defer interp.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    const original_allocator = interp.allocator;
+    interp.allocator = failing_allocator.allocator();
+    defer interp.allocator = original_allocator;
+
+    try testing.expectError(error.OutOfMemory, interp.evalFunction(0, &.{}));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(u32, 0), interp.memo_cache.count());
+}
+
+fn memoOwnershipTestKey() CacheKey {
+    return .{
+        .function_id = 0,
+        .function_hash = 0x1111,
+        .args_hash = 0x2222,
+        .capability_flags = CapabilitySet.pure_only.flags,
+        .options_hash = 0x3333,
+    };
+}
+
+test "memoization: cache replacement and teardown free memo-owned payloads" {
+    const alloc = testing.allocator;
+    const program = makeTestProgram(&.{});
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const original_fields = [_]CtValue.CtFieldValue{
+        .{ .name = "label", .value = .{ .string = "original" } },
+        .{ .name = "state", .value = .{ .atom = "ready" } },
+    };
+    const original_value = CtValue{ .struct_val = .{
+        .alloc_id = 0,
+        .type_name = "OriginalMemoValue",
+        .fields = &original_fields,
+    } };
+    const original_memoized = try interp.putMemoizedCtValue(memoOwnershipTestKey(), original_value);
+    try testing.expectEqualStrings("OriginalMemoValue", original_memoized.struct_val.type_name);
+    try testing.expectEqualStrings("original", original_memoized.struct_val.fields[0].value.string);
+
+    const replacement_elems = [_]CtValue{
+        .{ .string = "replacement" },
+        .{ .atom = "done" },
+    };
+    const replacement_value = CtValue{ .list = .{
+        .alloc_id = 0,
+        .elems = &replacement_elems,
+    } };
+    const replacement_memoized = try interp.putMemoizedCtValue(memoOwnershipTestKey(), replacement_value);
+
+    try testing.expectEqual(@as(u32, 1), interp.memo_cache.count());
+    try testing.expect(replacement_memoized == .list);
+    try testing.expectEqualStrings("replacement", replacement_memoized.list.elems[0].string);
+    try testing.expectEqualStrings("done", replacement_memoized.list.elems[1].atom);
+}
+
+fn exerciseMemoizeCtValueAllocationFailures(allocator: std.mem.Allocator) !void {
+    const program = makeTestProgram(&.{});
+    var interp = try Interpreter.init(allocator, &program);
+    defer interp.deinit();
+
+    const optional_payload = CtValue{ .string = "payload" };
+    const union_payload = CtValue{ .atom = "some" };
+    const captures = [_]CtValue{
+        .{ .string = "captured" },
+        .{ .optional = .{ .value = &optional_payload } },
+    };
+    const fields = [_]CtValue.CtFieldValue{
+        .{ .name = "name", .value = .{ .string = "memo" } },
+        .{ .name = "variant", .value = .{ .union_val = .{
+            .alloc_id = 0,
+            .type_name = "Maybe",
+            .variant = "some",
+            .payload = &union_payload,
+        } } },
+        .{ .name = "callback", .value = .{ .closure = .{
+            .alloc_id = 0,
+            .function_id = 0,
+            .captures = &captures,
+        } } },
+    };
+    const value = CtValue{ .struct_val = .{
+        .alloc_id = 0,
+        .type_name = "MemoAllocationFailureValue",
+        .fields = &fields,
+    } };
+
+    _ = try interp.putMemoizedCtValue(memoOwnershipTestKey(), value);
+}
+
+test "memoization: insert frees partial memo-owned clone on allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseMemoizeCtValueAllocationFailures,
+        .{},
+    );
+}
+
 test "CtValue.hash consistency" {
     const a = CtValue{ .int = 42 };
     const b = CtValue{ .int = 42 };
     const c = CtValue{ .int = 43 };
-    try testing.expectEqual(a.hash(), b.hash());
-    try testing.expect(a.hash() != c.hash());
+    try testing.expectEqual(try a.hash(testing.allocator), try b.hash(testing.allocator));
+    try testing.expect(try a.hash(testing.allocator) != try c.hash(testing.allocator));
 
     const s1 = CtValue{ .string = "hello" };
     const s2 = CtValue{ .string = "hello" };
     const s3 = CtValue{ .string = "world" };
-    try testing.expectEqual(s1.hash(), s2.hash());
-    try testing.expect(s1.hash() != s3.hash());
+    try testing.expectEqual(try s1.hash(testing.allocator), try s2.hash(testing.allocator));
+    try testing.expect(try s1.hash(testing.allocator) != try s3.hash(testing.allocator));
 }
 
 test "persistent cache: serialize/deserialize round-trip" {
@@ -8249,6 +12406,356 @@ test "persistent cache: serialize/deserialize round-trip" {
     }
 }
 
+test "persistent cache load returns null for absent entry only" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(cache_dir);
+
+    const cache = PersistentCache.init(cache_dir);
+    const loaded = try cache.load(alloc, 0xabc);
+    try testing.expect(loaded == null);
+}
+
+test "persistent cache load propagates allocation failure" {
+    const cache = PersistentCache.init(".zap-cache/ctfe");
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    try testing.expectError(error.OutOfMemory, cache.load(failing_allocator.allocator(), 0xabc));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "persistent cache load classifies oversized reads" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(cache_dir);
+    const cache = PersistentCache.init(cache_dir);
+    const key: u64 = 0x1234;
+    const cache_path = try cache.entryPath(alloc, key);
+    defer alloc.free(cache_path);
+
+    const large_data = try alloc.alloc(u8, 1024 * 1024 + 1);
+    defer alloc.free(large_data);
+    @memset(large_data, 'x');
+    try std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{
+        .sub_path = cache_path,
+        .data = large_data,
+    });
+
+    try testing.expectError(error.ReadFailure, cache.load(alloc, key));
+}
+
+test "persistent cache load classifies corrupt serialized entries" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(cache_dir);
+    const cache = PersistentCache.init(cache_dir);
+    const key: u64 = 0x5678;
+    const cache_path = try cache.entryPath(alloc, key);
+    defer alloc.free(cache_path);
+
+    try std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{
+        .sub_path = cache_path,
+        .data = "not a ctfe cache entry",
+    });
+
+    try testing.expectError(error.CorruptEntry, cache.load(alloc, key));
+}
+
+test "persistent cache load classifies trailing garbage as corrupt entry" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(cache_dir);
+    const cache = PersistentCache.init(cache_dir);
+    const key: u64 = 0x9abc;
+    const cache_path = try cache.entryPath(alloc, key);
+    defer alloc.free(cache_path);
+
+    const result = CtEvalResult{
+        .value = .{ .string = "cached" },
+        .dependencies = &.{},
+        .result_hash = 0xfeed_beef,
+    };
+    const data = try serializeResult(alloc, result);
+    defer alloc.free(data);
+
+    const corrupt_data = try alloc.alloc(u8, data.len + 4);
+    defer alloc.free(corrupt_data);
+    @memcpy(corrupt_data[0..data.len], data);
+    @memcpy(corrupt_data[data.len..], "junk");
+
+    try std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{
+        .sub_path = cache_path,
+        .data = corrupt_data,
+    });
+
+    const loaded = cache.load(alloc, key) catch |err| {
+        try testing.expectEqual(error.CorruptEntry, err);
+        return;
+    };
+    if (loaded) |cached_result| {
+        deinitCachedEvalResult(alloc, cached_result);
+    }
+    try testing.expect(false);
+}
+
+fn expectTruncatedDependencyDeserializeCleansPayloads(dependency: CtDependency) !void {
+    const alloc = testing.allocator;
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(alloc);
+
+    try serializeDependencyInto(alloc, &data, dependency);
+    var pos: usize = 0;
+    try testing.expectError(
+        error.UnexpectedEndOfData,
+        deserializeDependency(alloc, data.items[0 .. data.items.len - 1], &pos),
+    );
+}
+
+test "deserializeDependency frees payloads on truncated trailing fields" {
+    try expectTruncatedDependencyDeserializeCleansPayloads(.{
+        .file = .{ .path = "lib/config.zap", .content_hash = 0x1111 },
+    });
+    try expectTruncatedDependencyDeserializeCleansPayloads(.{
+        .env_var = .{ .name = "DATABASE_URL", .value_hash = 0x2222, .present = true },
+    });
+    try expectTruncatedDependencyDeserializeCleansPayloads(.{
+        .glob = .{ .pattern = "lib/**/*.zap", .result_hash = 0x3333 },
+    });
+    try expectTruncatedDependencyDeserializeCleansPayloads(.{
+        .reflected_struct = .{ .struct_name = "Config", .interface_hash = 0x4444 },
+    });
+
+    const reflected_paths = [_][]const u8{ "lib/config.zap", "lib/runtime.zap" };
+    try expectTruncatedDependencyDeserializeCleansPayloads(.{
+        .reflected_source = .{ .paths = &reflected_paths, .graph_hash = 0x5555 },
+    });
+}
+
+test "deserializeConstValue frees partial aggregate on truncated data" {
+    const alloc = testing.allocator;
+    const values = [_]ConstValue{
+        .{ .string = "first" },
+        .{ .string = "second" },
+    };
+    const value = ConstValue{ .list = &values };
+    const data = try serializeConstValue(alloc, value);
+    defer alloc.free(data);
+
+    var pos: usize = 0;
+    try testing.expectError(
+        error.UnexpectedEndOfData,
+        deserializeConstValue(alloc, data[0 .. data.len - 1], &pos),
+    );
+}
+
+test "deserializeConstValue frees struct type name when field count is truncated" {
+    const alloc = testing.allocator;
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(alloc);
+
+    try data.append(alloc, CONST_TAG_STRUCT);
+    try appendLengthPrefixedBytes(alloc, &data, "CacheEntry");
+
+    var pos: usize = 0;
+    try testing.expectError(error.UnexpectedEndOfData, deserializeConstValue(alloc, data.items, &pos));
+}
+
+test "deserializeResult frees value and dependencies when dependency payload is truncated" {
+    const alloc = testing.allocator;
+    const deps = [_]CtDependency{
+        .{ .file = .{ .path = "lib/config.zap", .content_hash = 0x1234 } },
+        .{ .env_var = .{ .name = "DATABASE_URL", .value_hash = 0x5678, .present = true } },
+    };
+    const result = CtEvalResult{
+        .value = .{ .string = "cached" },
+        .dependencies = &deps,
+        .result_hash = 0x9999,
+    };
+    const data = try serializeResult(alloc, result);
+    defer alloc.free(data);
+
+    try testing.expectError(error.UnexpectedEndOfData, deserializeResult(alloc, data[0 .. data.len - 1]));
+}
+
+test "deserializeResult rejects trailing garbage" {
+    const alloc = testing.allocator;
+    const result = CtEvalResult{
+        .value = .{ .string = "cached" },
+        .dependencies = &.{},
+        .result_hash = 0x1234,
+    };
+    const data = try serializeResult(alloc, result);
+    defer alloc.free(data);
+
+    const corrupt_data = try alloc.alloc(u8, data.len + 4);
+    defer alloc.free(corrupt_data);
+    @memcpy(corrupt_data[0..data.len], data);
+    @memcpy(corrupt_data[data.len..], "junk");
+
+    const restored = deserializeResult(alloc, corrupt_data) catch |err| {
+        try testing.expectEqual(error.TrailingData, err);
+        return;
+    };
+    deinitCachedEvalResult(alloc, restored);
+    try testing.expect(false);
+}
+
+test "cloneDependency frees reflected_source paths on allocation failure" {
+    const paths = [_][]const u8{ "lib/config.zap", "lib/runtime.zap" };
+    const dependency = CtDependency{
+        .reflected_source = .{ .paths = &paths, .graph_hash = 0x7777 },
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+
+    try testing.expectError(error.OutOfMemory, cloneDependency(failing_allocator.allocator(), dependency));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "cloneDependencies frees partial dependency array on allocation failure" {
+    const reflected_paths = [_][]const u8{ "lib/config.zap", "lib/runtime.zap" };
+    const deps = [_]CtDependency{
+        .{ .file = .{ .path = "build.zap", .content_hash = 0x1111 } },
+        .{ .reflected_source = .{ .paths = &reflected_paths, .graph_hash = 0x2222 } },
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 4 });
+
+    try testing.expectError(error.OutOfMemory, cloneDependencies(failing_allocator.allocator(), &deps));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "persistent cache store propagates serialization allocation failure" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(cache_dir);
+    const cache = PersistentCache.init(cache_dir);
+    const result = CtEvalResult{
+        .value = .{ .int = 42 },
+        .dependencies = &.{},
+        .result_hash = 42,
+    };
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    try testing.expectError(error.OutOfMemory, cache.store(failing_allocator.allocator(), 0x42, result));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "persistent cache store preserves existing entry when atomic publish fails" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(cache_dir);
+    const cache = PersistentCache.init(cache_dir);
+    const key: u64 = 0x5151;
+    const existing_result = CtEvalResult{
+        .value = .{ .int = 1 },
+        .dependencies = &.{},
+        .result_hash = 1,
+    };
+    const replacement_result = CtEvalResult{
+        .value = .{ .int = 2 },
+        .dependencies = &.{},
+        .result_hash = 2,
+    };
+    try cache.store(alloc, key, existing_result);
+
+    const replacement_bytes = try serializeResult(alloc, replacement_result);
+    defer alloc.free(replacement_bytes);
+
+    const FailingAtomicWriter = struct {
+        calls: usize = 0,
+        bytes_len: usize = 0,
+
+        fn writeFileAtomic(
+            self: *@This(),
+            file_allocator: std.mem.Allocator,
+            path: []const u8,
+            contents: []const u8,
+        ) !void {
+            _ = file_allocator;
+            _ = path;
+            self.calls += 1;
+            self.bytes_len = contents.len;
+            return error.AccessDenied;
+        }
+    };
+
+    var writer = FailingAtomicWriter{};
+    try testing.expectError(
+        error.HostIoFailure,
+        cache.storeWithFileWriter(alloc, key, replacement_result, &writer),
+    );
+    try testing.expectEqual(@as(usize, 1), writer.calls);
+    try testing.expectEqual(replacement_bytes.len, writer.bytes_len);
+
+    const loaded_result = (try cache.load(alloc, key)).?;
+    defer deinitCachedEvalResult(alloc, loaded_result);
+    try testing.expectEqual(@as(i64, 1), loaded_result.value.int);
+    try testing.expectEqual(@as(u64, 1), loaded_result.result_hash);
+}
+
+test "persistent cache store propagates directory creation failure" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "blocked",
+        .data = "not a directory",
+    });
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(tmp_path);
+    const blocked_cache_dir = try std.fs.path.join(alloc, &.{ tmp_path, "blocked", "ctfe" });
+    defer alloc.free(blocked_cache_dir);
+
+    const cache = PersistentCache.init(blocked_cache_dir);
+    const result = CtEvalResult{
+        .value = .{ .int = 42 },
+        .dependencies = &.{},
+        .result_hash = 42,
+    };
+
+    try testing.expectError(error.HostIoFailure, cache.store(alloc, 0x42, result));
+}
+
+test "persistent cache store propagates entry create failure" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(cache_dir);
+    const cache = PersistentCache.init(cache_dir);
+    const key: u64 = 0;
+    const cache_path = try cache.entryPath(alloc, key);
+    defer alloc.free(cache_path);
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, cache_path);
+
+    const result = CtEvalResult{
+        .value = .{ .int = 42 },
+        .dependencies = &.{},
+        .result_hash = 42,
+    };
+
+    try testing.expectError(error.HostIoFailure, cache.store(alloc, key, result));
+}
+
 test "persistent cache key includes option hash" {
     const key_a = PersistentCache.cacheKeyFor("manifest", 999, 123, CapabilitySet.build.flags, 111);
     const key_b = PersistentCache.cacheKeyFor("manifest", 999, 123, CapabilitySet.build.flags, 222);
@@ -8298,6 +12805,348 @@ test "persistent cache key includes function identity hash" {
     try testing.expect(key_a != key_b);
 }
 
+fn persistentCacheKeyForEvalTest(interp: *Interpreter, func: *const ir.Function, args: []const CtValue) !u64 {
+    const args_hash = try interp.hashArgs(args);
+    return PersistentCache.cacheKeyFor(
+        func.name,
+        hashFunctionIdentity(func),
+        args_hash,
+        interp.capabilities.flags,
+        hashEvaluationOptions(interp.compile_options_hash, interp.build_opts),
+    );
+}
+
+const FreedAllocationTracker = struct {
+    const FreedRange = struct {
+        start: usize,
+        len: usize,
+    };
+
+    backing_allocator: std.mem.Allocator,
+    freed_ranges: [4096]FreedRange = undefined,
+    freed_range_count: usize = 0,
+    overflowed: bool = false,
+
+    fn init(backing_allocator: std.mem.Allocator) FreedAllocationTracker {
+        return .{ .backing_allocator = backing_allocator };
+    }
+
+    fn allocator(self: *FreedAllocationTracker) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *FreedAllocationTracker = @ptrCast(@alignCast(ctx));
+        const memory = self.backing_allocator.rawAlloc(len, alignment, return_address) orelse return null;
+        self.forgetReallocatedRange(@intFromPtr(memory), len);
+        return memory;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *FreedAllocationTracker = @ptrCast(@alignCast(ctx));
+        const resized = self.backing_allocator.rawResize(memory, alignment, new_len, return_address);
+        if (resized) self.forgetReallocatedRange(@intFromPtr(memory.ptr), new_len);
+        return resized;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *FreedAllocationTracker = @ptrCast(@alignCast(ctx));
+        const remapped = self.backing_allocator.rawRemap(memory, alignment, new_len, return_address) orelse return null;
+        self.forgetReallocatedRange(@intFromPtr(remapped), new_len);
+        return remapped;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *FreedAllocationTracker = @ptrCast(@alignCast(ctx));
+        self.rememberFreedRange(memory);
+        self.backing_allocator.rawFree(memory, alignment, return_address);
+    }
+
+    fn rememberFreedRange(self: *FreedAllocationTracker, memory: []u8) void {
+        if (memory.len == 0) return;
+        if (self.freed_range_count == self.freed_ranges.len) {
+            self.overflowed = true;
+            return;
+        }
+        self.freed_ranges[self.freed_range_count] = .{
+            .start = @intFromPtr(memory.ptr),
+            .len = memory.len,
+        };
+        self.freed_range_count += 1;
+    }
+
+    fn forgetReallocatedRange(self: *FreedAllocationTracker, start: usize, len: usize) void {
+        if (len == 0) return;
+        var index: usize = 0;
+        while (index < self.freed_range_count) {
+            const range = self.freed_ranges[index];
+            if (rangesOverlap(start, len, range.start, range.len)) {
+                self.freed_range_count -= 1;
+                self.freed_ranges[index] = self.freed_ranges[self.freed_range_count];
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn wasFreed(self: *const FreedAllocationTracker, bytes: []const u8) bool {
+        if (bytes.len == 0) return false;
+        const start = @intFromPtr(bytes.ptr);
+        for (self.freed_ranges[0..self.freed_range_count]) |range| {
+            if (rangeContains(range.start, range.len, start, bytes.len)) return true;
+        }
+        return false;
+    }
+
+    fn rangesOverlap(left_start: usize, left_len: usize, right_start: usize, right_len: usize) bool {
+        const left_end = left_start + left_len;
+        const right_end = right_start + right_len;
+        return left_start < right_end and right_start < left_end;
+    }
+
+    fn rangeContains(range_start: usize, range_len: usize, value_start: usize, value_len: usize) bool {
+        const range_end = range_start + range_len;
+        const value_end = value_start + value_len;
+        return range_start <= value_start and value_end <= range_end;
+    }
+};
+
+test "persistent cache: top-level eval stores result" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const cache = PersistentCache.init(cache_dir);
+    const func = ir.Function{
+        .id = 0,
+        .name = "top_level_store",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = 42 } },
+                .{ .ret = .{ .value = 0 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+    const program = makeTestProgram(&.{func});
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.persistent_cache = cache;
+
+    const cache_key = try persistentCacheKeyForEvalTest(&interp, &func, &.{});
+    const result = try interp.evalFunction(0, &.{});
+    try testing.expectEqual(@as(i64, 42), result.int);
+
+    const cached_result = (try cache.load(alloc, cache_key)).?;
+    defer deinitCachedEvalResult(alloc, cached_result);
+    try testing.expectEqual(@as(i64, 42), cached_result.value.int);
+    try testing.expectEqual(@as(usize, 0), cached_result.dependencies.len);
+    try testing.expect(cached_result.result_hash != 0);
+}
+
+test "persistent cache: hit memoizes owned value independent of loaded result" {
+    var tracker = FreedAllocationTracker.init(testing.allocator);
+    const alloc = tracker.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(cache_dir);
+    const cache = PersistentCache.init(cache_dir);
+    const func = ir.Function{
+        .id = 0,
+        .name = "persistent_hit_lifetime",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .any,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_string = .{ .dest = 0, .value = "body-result" } },
+                .{ .ret = .{ .value = 0 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+    const program = makeTestProgram(&.{func});
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.persistent_cache = cache;
+
+    const cache_key = try persistentCacheKeyForEvalTest(&interp, &func, &.{});
+    const cached_fields = [_]ConstValue.ConstFieldValue{
+        .{ .name = "label", .value = .{ .string = "cached-result" } },
+        .{ .name = "state", .value = .{ .atom = "ready" } },
+    };
+    const cached_result = CtEvalResult{
+        .value = .{ .struct_val = .{
+            .type_name = "CachedPersistentValue",
+            .fields = &cached_fields,
+        } },
+        .dependencies = &.{},
+        .result_hash = 0xfeed_beef,
+    };
+    try cache.store(alloc, cache_key, cached_result);
+
+    const result = try interp.evalFunction(0, &.{});
+    try testing.expect(result == .struct_val);
+    try testing.expectEqualStrings("CachedPersistentValue", result.struct_val.type_name);
+    try testing.expectEqualStrings("label", result.struct_val.fields[0].name);
+    try testing.expectEqualStrings("cached-result", result.struct_val.fields[0].value.string);
+    try testing.expectEqualStrings("state", result.struct_val.fields[1].name);
+    try testing.expectEqualStrings("ready", result.struct_val.fields[1].value.atom);
+
+    try testing.expectEqual(@as(u32, 1), interp.memo_cache.count());
+    try testing.expect(!tracker.wasFreed(result.struct_val.type_name));
+    try testing.expect(!tracker.wasFreed(result.struct_val.fields[0].name));
+    try testing.expect(!tracker.wasFreed(result.struct_val.fields[0].value.string));
+    try testing.expect(!tracker.wasFreed(result.struct_val.fields[1].name));
+    try testing.expect(!tracker.wasFreed(result.struct_val.fields[1].value.atom));
+    try testing.expect(!tracker.overflowed);
+}
+
+test "persistent cache: nested eval does not store nested result" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_dir = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const cache = PersistentCache.init(cache_dir);
+    const inner = ir.Function{
+        .id = 0,
+        .name = "nested_store_inner",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = 7 } },
+                .{ .ret = .{ .value = 0 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+    const outer = ir.Function{
+        .id = 1,
+        .name = "nested_store_outer",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .call_direct = .{ .dest = 0, .function = 0, .args = &.{}, .arg_modes = &.{} } },
+                .{ .ret = .{ .value = 0 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+    const functions = [_]ir.Function{ inner, outer };
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.persistent_cache = cache;
+
+    const outer_cache_key = try persistentCacheKeyForEvalTest(&interp, &outer, &.{});
+    const inner_cache_key = try persistentCacheKeyForEvalTest(&interp, &inner, &.{});
+    const result = try interp.evalFunction(1, &.{});
+    try testing.expectEqual(@as(i64, 7), result.int);
+
+    const cached_outer = (try cache.load(alloc, outer_cache_key)).?;
+    defer deinitCachedEvalResult(alloc, cached_outer);
+    try testing.expectEqual(@as(i64, 7), cached_outer.value.int);
+    try testing.expect(try cache.load(alloc, inner_cache_key) == null);
+}
+
+test "persistent cache: top-level store failure propagates from evalFunction" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const func = ir.Function{
+        .id = 0,
+        .name = "top_level_store_failure",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .const_int = .{ .dest = 0, .value = 99 } },
+                .{ .ret = .{ .value = 0 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+    const program = makeTestProgram(&.{func});
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const cache_dir = try std.fs.path.join(alloc, &.{ tmp_path, "ctfe-cache" });
+    const cache = PersistentCache.init(cache_dir);
+    interp.persistent_cache = cache;
+
+    const stale_dependency = CtDependency{ .file = .{ .path = "ctfe-store-failure-missing-dependency", .content_hash = 0 } };
+    const stale_result = CtEvalResult{
+        .value = .{ .int = 1 },
+        .dependencies = &.{stale_dependency},
+        .result_hash = 1,
+    };
+    const cache_key = try persistentCacheKeyForEvalTest(&interp, &func, &.{});
+    try cache.store(alloc, cache_key, stale_result);
+    try std.Io.Dir.cwd().setFilePermissions(std.Options.debug_io, cache_dir, std.Io.File.Permissions.fromMode(0o555), .{});
+    defer std.Io.Dir.cwd().setFilePermissions(std.Options.debug_io, cache_dir, std.Io.File.Permissions.fromMode(0o755), .{}) catch {};
+
+    try testing.expectError(error.CtfeFailure, interp.evalFunction(0, &.{}));
+    try testing.expectEqual(@as(usize, 1), interp.errors.items.len);
+    try testing.expectEqual(CtfeErrorKind.host_io_failure, interp.errors.items[0].kind);
+    try testing.expect(std.mem.indexOf(u8, interp.errors.items[0].message, "persistent CTFE cache store host I/O failed") != null);
+
+    const preserved_result = (try cache.load(alloc, cache_key)).?;
+    defer deinitCachedEvalResult(alloc, preserved_result);
+    try testing.expectEqual(@as(i64, 1), preserved_result.value.int);
+    try testing.expectEqual(@as(u64, 1), preserved_result.result_hash);
+}
+
 test "capability enforcement: File.read without read_file" {
     var arena = testArena();
     defer arena.deinit();
@@ -8324,7 +13173,7 @@ test "capability enforcement: File.read without read_file" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.capabilities = CapabilitySet.pure_only; // NO read_file
 
@@ -8359,7 +13208,7 @@ test "capability enforcement: System.get_env without read_env" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.capabilities = CapabilitySet.pure_only;
 
@@ -8393,7 +13242,7 @@ test "dependency tracking: env read records dependency" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.capabilities = CapabilitySet.build; // has read_env
 
@@ -8401,6 +13250,119 @@ test "dependency tracking: env read records dependency" {
     // Should have recorded an env_var dependency
     try testing.expect(interp.dependencies.items.len > 0);
     try testing.expect(interp.dependencies.items[0] == .env_var);
+}
+
+test "File.read returns nil and records dependency for missing file" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.build;
+
+    const missing_path = ".zig-cache/ctfe-gap9-definitely-missing-file.txt";
+    const result = try interp.builtinFileRead(&.{.{ .string = missing_path }});
+
+    try testing.expect(result == .nil);
+    try testing.expectEqual(@as(usize, 1), interp.dependencies.items.len);
+    try testing.expect(interp.dependencies.items[0] == .file);
+    try testing.expectEqualStrings(missing_path, interp.dependencies.items[0].file.path);
+    try testing.expectEqual(@as(u64, 0), interp.dependencies.items[0].file.content_hash);
+}
+
+test "File.read propagates read allocation OOM" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.build;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_allocator = interp.allocator;
+    interp.allocator = failing_allocator.allocator();
+    defer interp.allocator = original_allocator;
+
+    try testing.expectError(error.OutOfMemory, interp.builtinFileRead(&.{.{ .string = "src/ctfe.zig" }}));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), interp.dependencies.items.len);
+}
+
+test "P4J2: Prim.glob propagates collection OutOfMemory" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.build;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_allocator = interp.allocator;
+    interp.allocator = failing_allocator.allocator();
+    defer interp.allocator = original_allocator;
+
+    try testing.expectError(error.OutOfMemory, interp.builtinPrimitiveGlob(&.{.{ .string = "src/ctfe.zig" }}));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), interp.dependencies.items.len);
+}
+
+test "P4J2: Prim.glob reports filesystem failures as host IO failure" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.symLink(std.Options.debug_io, "loop.zap", "loop.zap", .{});
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const loop_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "loop.zap" });
+    defer testing.allocator.free(loop_path);
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.build;
+
+    try testing.expectError(error.CtfeFailure, interp.builtinPrimitiveGlob(&.{.{ .string = loop_path }}));
+    try testing.expectEqual(@as(usize, 1), interp.errors.items.len);
+    try testing.expectEqual(CtfeErrorKind.host_io_failure, interp.errors.items[0].kind);
+    try testing.expectEqual(@as(usize, 0), interp.dependencies.items.len);
+}
+
+test "dependency tracking propagates append OOM" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const functions = [_]ir.Function{};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(alloc, &program);
+    defer interp.deinit();
+    interp.capabilities = CapabilitySet.build;
+
+    const env_name = "CTFE_GAP9_DEPENDENCY_APPEND_OOM_SHOULD_NOT_EXIST_1D6B7035";
+    if (env.getenvRuntime(env_name) != null) return error.SkipZigTest;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_allocator = interp.allocator;
+    interp.allocator = failing_allocator.allocator();
+    defer interp.allocator = original_allocator;
+
+    try testing.expectError(error.OutOfMemory, interp.builtinGetEnv(&.{.{ .string = env_name }}));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), interp.dependencies.items.len);
 }
 
 test "ownership: use after move fails" {
@@ -8428,7 +13390,7 @@ test "ownership: use after move fails" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -8461,7 +13423,7 @@ test "ownership: use after release fails" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -8495,7 +13457,7 @@ test "ownership: binary_op on moved value fails" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -8529,7 +13491,7 @@ test "ownership: retain on moved value fails" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -8565,7 +13527,7 @@ test "ownership: reset returns reuse token for aggregate and reuse_alloc consume
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -8598,7 +13560,7 @@ test "ownership: reuse_alloc rejects non-token value" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = interp.evalFunction(0, &.{});
@@ -8634,7 +13596,7 @@ test "symbolic memory: reuse preserves alloc id for matching aggregate kind" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -8671,7 +13633,7 @@ test "symbolic memory: reuse falls back to fresh alloc for mismatched kind" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -8706,11 +13668,80 @@ test "symbolic memory: fresh aggregate allocations get distinct alloc ids" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     _ = try interp.evalFunction(0, &.{});
     try testing.expect(interp.allocation_store.count() >= 2);
+}
+
+fn exerciseEvalAndExportAggregateArgAllocationFailures(
+    allocator: std.mem.Allocator,
+    env_name: []const u8,
+    aggregate_arg: ConstValue,
+) !void {
+    const func = ir.Function{
+        .id = 0,
+        .name = "export_aggregate_arg_cleanup_fn",
+        .scope_id = 0,
+        .arity = 2,
+        .params = &.{
+            .{ .name = "env_name", .type_expr = .string },
+            .{ .name = "value", .type_expr = .any },
+        },
+        .return_type = .any,
+        .body = &.{ir.Block{
+            .label = 0,
+            .instructions = &.{
+                .{ .param_get = .{ .dest = 0, .index = 0 } },
+                .{ .call_builtin = .{ .dest = 1, .name = ":zig.get_env", .args = &.{0}, .arg_modes = &.{.share} } },
+                .{ .param_get = .{ .dest = 2, .index = 1 } },
+                .{ .ret = .{ .value = 2 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+    };
+    const functions = [_]ir.Function{func};
+    const program = makeTestProgram(&functions);
+    var interp = try Interpreter.init(allocator, &program);
+    defer interp.deinit();
+
+    const result = try interp.evalAndExport(
+        0,
+        &.{ .{ .string = env_name }, aggregate_arg },
+        CapabilitySet.build,
+    );
+    defer deinitCachedEvalResult(allocator, result);
+
+    try testing.expect(result.value == .tuple);
+    try testing.expectEqual(@as(usize, 2), result.value.tuple.len);
+    try testing.expectEqual(@as(i64, 41), result.value.tuple[0].int);
+    try testing.expect(result.value.tuple[1] == .list);
+    try testing.expectEqual(@as(usize, 1), result.dependencies.len);
+    try testing.expect(result.dependencies[0] == .env_var);
+}
+
+test "evalAndExport frees imported aggregate args on allocation failure" {
+    const env_name = "CTFE_P4J2_EVAL_AND_EXPORT_ARG_CLEANUP_DOES_NOT_EXIST_0D0448E8";
+    if (env.getenvRuntime(env_name) != null) return error.SkipZigTest;
+
+    const list_items = [_]ConstValue{
+        .{ .atom = "nested" },
+        .{ .int = 42 },
+    };
+    const tuple_items = [_]ConstValue{
+        .{ .int = 41 },
+        .{ .list = &list_items },
+    };
+    const aggregate_arg = ConstValue{ .tuple = &tuple_items };
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseEvalAndExportAggregateArgAllocationFailures,
+        .{ env_name, aggregate_arg },
+    );
 }
 
 test "evalAndExport returns CtEvalResult" {
@@ -8737,7 +13768,7 @@ test "evalAndExport returns CtEvalResult" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalAndExport(0, &.{.{ .int = 99 }}, CapabilitySet.pure_only);
@@ -8771,7 +13802,7 @@ test "evalAndExport copies dependency slice out of interpreter storage" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalAndExport(0, &.{}, CapabilitySet.build);
@@ -8801,6 +13832,42 @@ test "rich diagnostics: formatCtfeError" {
     try testing.expect(std.mem.find(u8, formatted, "help:") != null);
 }
 
+fn exerciseCloneCtfeErrorsAllocationFailures(allocator: std.mem.Allocator) !void {
+    const source_errors = [_]CtfeError{
+        .{
+            .message = "first failure",
+            .kind = .type_error,
+            .call_stack = &.{
+                .{ .function_name = "First__run", .function_id = 1, .instruction_index = 2, .source_span = .{ .start = 3, .end = 4 } },
+            },
+            .attribute_context = .{ .attr_name = "doc", .struct_name = "First" },
+        },
+        .{
+            .message = "second failure",
+            .kind = .host_io_failure,
+            .call_stack = &.{
+                .{ .function_name = "Second__run", .function_id = 5, .instruction_index = 8, .source_span = .{ .start = 13, .end = 21 } },
+            },
+            .attribute_context = .{ .attr_name = "config", .struct_name = "Second" },
+        },
+    };
+
+    const cloned_errors = try cloneCtfeErrors(allocator, &source_errors);
+    defer deinitClonedCtfeErrors(allocator, cloned_errors);
+
+    try testing.expectEqual(@as(usize, 2), cloned_errors.len);
+    try testing.expectEqualStrings("first failure", cloned_errors[0].message);
+    try testing.expectEqualStrings("Second", cloned_errors[1].attribute_context.?.struct_name);
+}
+
+test "cloneCtfeErrors frees partial clones on allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseCloneCtfeErrorsAllocationFailures,
+        .{},
+    );
+}
+
 test "cache key includes explicit compile options hash" {
     var build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer build_opts.deinit(testing.allocator);
@@ -8813,7 +13880,7 @@ test "cache key includes explicit compile options hash" {
 
 test "validateDependencies: no deps returns true" {
     const alloc = testing.allocator;
-    try testing.expect(PersistentCache.validateDependencies(alloc, &.{}, null, null));
+    try testing.expect(try PersistentCache.validateDependencies(alloc, &.{}, null, null));
 }
 
 test "validateDependencies: env_var absent stays absent" {
@@ -8822,7 +13889,101 @@ test "validateDependencies: env_var absent stays absent" {
     const deps = [_]CtDependency{
         .{ .env_var = .{ .name = "CTFE_TEST_NONEXISTENT_VAR_12345", .value_hash = 0, .present = false } },
     };
-    try testing.expect(PersistentCache.validateDependencies(alloc, &deps, null, null));
+    try testing.expect(try PersistentCache.validateDependencies(alloc, &deps, null, null));
+}
+
+test "validateDependencies: file read OOM propagates" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "dependency.txt", .data = "current" });
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(tmp_path);
+    const dependency_path = try std.fs.path.join(alloc, &.{ tmp_path, "dependency.txt" });
+    defer alloc.free(dependency_path);
+
+    const deps = [_]CtDependency{
+        .{ .file = .{ .path = dependency_path, .content_hash = std.hash.Wyhash.hash(0, "current") } },
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        PersistentCache.validateDependencies(failing_allocator.allocator(), &deps, null, null),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "validateDependencies: missing file invalidates cached result" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(tmp_path);
+    const dependency_path = try std.fs.path.join(alloc, &.{ tmp_path, "missing.txt" });
+    defer alloc.free(dependency_path);
+
+    const deps = [_]CtDependency{
+        .{ .file = .{ .path = dependency_path, .content_hash = 0 } },
+    };
+    try testing.expect(!try PersistentCache.validateDependencies(alloc, &deps, null, null));
+}
+
+test "P4J2: validateDependencies oversized file dependency propagates StreamTooLong" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var file = try tmp_dir.dir.createFile(std.Options.debug_io, "too-large.txt", .{});
+    errdefer file.close(std.Options.debug_io);
+    try file.setLength(std.Options.debug_io, 10 * 1024 * 1024 + 1);
+    file.close(std.Options.debug_io);
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(tmp_path);
+    const dependency_path = try std.fs.path.join(alloc, &.{ tmp_path, "too-large.txt" });
+    defer alloc.free(dependency_path);
+
+    const deps = [_]CtDependency{
+        .{ .file = .{ .path = dependency_path, .content_hash = 0 } },
+    };
+    try testing.expectError(
+        error.StreamTooLong,
+        PersistentCache.validateDependencies(alloc, &deps, null, null),
+    );
+}
+
+test "validateDependencies: glob collection OOM propagates" {
+    const deps = [_]CtDependency{
+        .{ .glob = .{ .pattern = "build.zig", .result_hash = 0 } },
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        PersistentCache.validateDependencies(failing_allocator.allocator(), &deps, null, null),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: validateDependencies glob collection propagates filesystem errors" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.symLink(std.Options.debug_io, "loop.zap", "loop.zap", .{});
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(tmp_path);
+    const dependency_path = try std.fs.path.join(alloc, &.{ tmp_path, "loop.zap" });
+    defer alloc.free(dependency_path);
+
+    const deps = [_]CtDependency{
+        .{ .glob = .{ .pattern = dependency_path, .result_hash = 0 } },
+    };
+    try testing.expectError(
+        error.SymLinkLoop,
+        PersistentCache.validateDependencies(alloc, &deps, null, null),
+    );
 }
 
 test "validateDependencies: reflected_struct invalidates without graph" {
@@ -8830,7 +13991,7 @@ test "validateDependencies: reflected_struct invalidates without graph" {
     const deps = [_]CtDependency{
         .{ .reflected_struct = .{ .struct_name = "Test", .interface_hash = 0 } },
     };
-    try testing.expect(!PersistentCache.validateDependencies(alloc, &deps, null, null));
+    try testing.expect(!try PersistentCache.validateDependencies(alloc, &deps, null, null));
 }
 
 test "validateDependencies: reflected_struct validates against matching graph" {
@@ -8838,7 +13999,7 @@ test "validateDependencies: reflected_struct validates against matching graph" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const mod_scope = try graph.createScope(0, .struct_scope);
     var interner = ast.StringInterner.init(alloc);
     const test_id = try interner.intern("Test");
@@ -8855,11 +14016,11 @@ test "validateDependencies: reflected_struct validates against matching graph" {
         .decl = mod_decl,
     });
 
-    const iface_hash = computeStructInterfaceHash(&graph, mod_scope, &interner, "Test");
+    const iface_hash = try computeStructInterfaceHash(alloc, &graph, mod_scope, &interner, "Test");
     const deps = [_]CtDependency{
         .{ .reflected_struct = .{ .struct_name = "Test", .interface_hash = iface_hash } },
     };
-    try testing.expect(PersistentCache.validateDependencies(alloc, &deps, &graph, &interner));
+    try testing.expect(try PersistentCache.validateDependencies(alloc, &deps, &graph, &interner));
 }
 
 test "validateDependencies: reflected_struct invalidates on interface change" {
@@ -8867,7 +14028,7 @@ test "validateDependencies: reflected_struct invalidates on interface change" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var graph = scope.ScopeGraph.init(alloc);
+    var graph = try scope.ScopeGraph.init(alloc);
     const mod_scope = try graph.createScope(0, .struct_scope);
     var interner = ast.StringInterner.init(alloc);
     const test_id = try interner.intern("Test");
@@ -8889,13 +14050,56 @@ test "validateDependencies: reflected_struct invalidates on interface change" {
         .computed_value = .{ .int = 1 },
     }) catch {};
 
-    const iface_hash = computeStructInterfaceHash(&graph, mod_scope, &interner, "Test");
+    const iface_hash = try computeStructInterfaceHash(alloc, &graph, mod_scope, &interner, "Test");
     const deps = [_]CtDependency{
         .{ .reflected_struct = .{ .struct_name = "Test", .interface_hash = iface_hash } },
     };
 
     graph.structs.items[0].attributes.items[0].computed_value = .{ .int = 2 };
-    try testing.expect(!PersistentCache.validateDependencies(alloc, &deps, &graph, &interner));
+    try testing.expect(!try PersistentCache.validateDependencies(alloc, &deps, &graph, &interner));
+}
+
+test "validateDependencies: reflected_struct hash OOM propagates" {
+    var arena = testArena();
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var graph = try scope.ScopeGraph.init(alloc);
+    const mod_scope = try graph.createScope(0, .struct_scope);
+    var interner = ast.StringInterner.init(alloc);
+    const test_id = try interner.intern("Test");
+    const attr_id = try interner.intern("large");
+
+    const mod_decl = try alloc.create(ast.StructDecl);
+    mod_decl.* = .{
+        .meta = .{ .span = .{ .start = 0, .end = 0 } },
+        .name = .{ .parts = &.{test_id}, .span = .{ .start = 0, .end = 0 } },
+        .items = &.{},
+    };
+    try graph.structs.append(alloc, .{
+        .name = .{ .parts = &.{test_id}, .span = .{ .start = 0, .end = 0 } },
+        .scope_id = mod_scope,
+        .decl = mod_decl,
+    });
+
+    const tuple_values = try alloc.alloc(ConstValue, VALUE_TRAVERSAL_INLINE_STACK_CAPACITY + 1);
+    for (tuple_values) |*value| {
+        value.* = .{ .int = 1 };
+    }
+    try graph.structs.items[0].attributes.append(alloc, .{
+        .name = attr_id,
+        .computed_value = .{ .tuple = tuple_values },
+    });
+
+    const deps = [_]CtDependency{
+        .{ .reflected_struct = .{ .struct_name = "Test", .interface_hash = 0 } },
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        PersistentCache.validateDependencies(failing_allocator.allocator(), &deps, &graph, &interner),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
 }
 
 test "builtin: string concat" {
@@ -8924,7 +14128,7 @@ test "builtin: string concat" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -8959,7 +14163,7 @@ test "builtin: list concat" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -8994,7 +14198,7 @@ test "builtin: atom_name" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -9026,7 +14230,7 @@ test "builtin: i64_to_string" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -9058,7 +14262,7 @@ test "builtin: to_atom" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -9090,7 +14294,7 @@ test "builtin: println is no-op" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -9323,7 +14527,7 @@ test "builtin: get_build_opt returns value" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.build_opts.put(alloc, "optimize", "release_fast") catch {};
 
@@ -9356,7 +14560,7 @@ test "builtin: get_build_opt returns nil for missing key" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});
@@ -9388,7 +14592,7 @@ test "capability: build caps allow env read" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.capabilities = CapabilitySet.build; // has all caps
 
@@ -9422,7 +14626,7 @@ test "capability: runtime-only builtins fail at compile time" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
     interp.capabilities = CapabilitySet.build;
 
@@ -9496,7 +14700,7 @@ test "GAP-P1-05: comptime union_switch falls into else_instrs on no match" {
     };
     const functions = [_]ir.Function{func};
     const program = makeTestProgram(&functions);
-    var interp = Interpreter.init(alloc, &program);
+    var interp = try Interpreter.init(alloc, &program);
     defer interp.deinit();
 
     const result = try interp.evalFunction(0, &.{});

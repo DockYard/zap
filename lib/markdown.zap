@@ -1,15 +1,15 @@
 @doc = """
   Render the subset of Markdown the Zap documentation generator emits
   into HTML strings. Supports paragraphs, ATX headings (`##`, `###`,
-  `####`), unordered lists (`- item` or `* item`), fenced code blocks
-  with optional language tags, inline `code spans`, and HTML escaping
-  of body text.
+  `####`), unordered lists (`- item` or `* item`), pipe tables,
+  fenced and indented code blocks, inline `code spans`, inline links,
+  and HTML escaping of body text.
 
   The renderer is a small block-then-inline state machine. Block parsing
   walks the input line by line, tracking which block construct is open
-  (`:start`, `:paragraph`, `:list`, `:code`) and emitting close/open
-  tags as the line shape changes. Inline rendering escapes HTML special
-  characters and recognizes backtick-delimited code spans.
+  and emitting close/open tags as the line shape changes. Inline
+  rendering escapes HTML special characters and recognizes
+  backtick-delimited code spans and inline links.
   """
 
 pub struct Markdown {
@@ -29,34 +29,109 @@ pub struct Markdown {
     Walk the input line by line, tracking which block construct is
     currently open and emitting the right close/open tags as the line
     shape changes. `mode` is one of `:start`, `:paragraph`, `:list`,
-    or `:code`. `code_lang` carries the language tag for an open code
-    block; it's the empty string in any other mode.
-    """
+    `:table`, `:code_open`, `:code`, or `:indent_code`. `code_lang`
+    carries the language tag for an open fenced code block; it's the
+    empty string in any other mode.
+  """
 
-  pub fn render_lines(lines :: [String], mode :: Atom, code_lang :: String, acc :: String) -> String {
-    case lines {
-      [] -> close_block(mode, acc)
-      [line | rest] -> render_line(line, rest, mode, code_lang, acc)
-    }
+  fn render_lines(lines :: [String], mode :: Atom, code_lang :: String, acc :: String) -> String {
+    render_lines_loop(lines, mode, code_lang, acc)
   }
 
-  pub fn render_line(line :: String, rest :: [String], mode :: Atom, code_lang :: String, acc :: String) -> String {
-    if mode == :code_open {
-      if String.starts_with?(String.trim(line), "```") {
-        render_lines(rest, :start, "", acc <> "</code></pre>\n")
-      } else {
-        render_lines(rest, :code, code_lang, acc <> render_code_line(line, code_lang))
-      }
-    } else {
-      if mode == :code {
-        if String.starts_with?(String.trim(line), "```") {
-          render_lines(rest, :start, "", acc <> "</code></pre>\n")
+  fn render_lines_loop(lines :: [String], mode :: Atom, code_lang :: String, acc :: String) -> String {
+    case lines {
+      [] -> close_block(mode, acc)
+      [line | rest] ->
+        if mode == :code_open {
+          if String.starts_with?(String.trim(line), "```") {
+            render_lines_loop(rest, :start, "", acc <> "</code></pre>\n")
+          } else {
+            render_lines_loop(rest, :code, code_lang, acc <> render_code_line(line, code_lang))
+          }
         } else {
-          render_lines(rest, :code, code_lang, acc <> "\n" <> render_code_line(line, code_lang))
+          if mode == :code {
+            if String.starts_with?(String.trim(line), "```") {
+              render_lines_loop(rest, :start, "", acc <> "</code></pre>\n")
+            } else {
+              render_lines_loop(rest, :code, code_lang, acc <> "\n" <> render_code_line(line, code_lang))
+            }
+          } else {
+            if is_blank_line?(line) {
+              render_lines_loop(rest, :start, "", close_block(mode, acc))
+            } else {
+              if String.starts_with?(String.trim(line), "```") {
+                trimmed = String.trim(line)
+                lang = String.slice(trimmed, 3, String.length(trimmed))
+                closed = close_block(mode, acc)
+                if String.length(lang) == 0 {
+                  render_lines_loop(rest, :code_open, "", closed <> "<pre><code>")
+                } else {
+                  render_lines_loop(rest, :code_open, lang, closed <> "<pre><code class=\"language-" <> lang <> "\">")
+                }
+              } else {
+                if mode == :indent_code {
+                  if is_indented_code_line?(line) {
+                    render_lines_loop(rest, :indent_code, "", acc <> "\n" <> highlight_zap_line(strip_indent4(line)))
+                  } else {
+                    render_lines_loop(lines, :start, "", close_block(:indent_code, acc))
+                  }
+                } else {
+                  if mode == :start and is_indented_code_line?(line) {
+                    render_lines_loop(rest, :indent_code, "zap", acc <> "<pre><code class=\"language-zap\">" <> highlight_zap_line(strip_indent4(line)))
+                  } else {
+                    if String.starts_with?(line, "#### ") {
+                      render_lines_loop(rest, :start, "", close_block(mode, acc) <> render_heading("h4", String.slice(line, 5, String.length(line))))
+                    } else {
+                      if String.starts_with?(line, "### ") {
+                        render_lines_loop(rest, :start, "", close_block(mode, acc) <> render_heading("h3", String.slice(line, 4, String.length(line))))
+                      } else {
+                        if String.starts_with?(line, "## ") {
+                          render_lines_loop(rest, :start, "", close_block(mode, acc) <> render_heading("h2", String.slice(line, 3, String.length(line))))
+                        } else {
+                          if String.starts_with?(line, "# ") {
+                            render_lines_loop(rest, :start, "", close_block(mode, acc) <> render_heading("h1", String.slice(line, 2, String.length(line))))
+                          } else {
+                            if is_list_item?(line) {
+                              text = list_item_text(line)
+                              if mode == :list {
+                                render_lines_loop(rest, :list, "", acc <> "</li>\n<li>" <> render_inline(text))
+                              } else {
+                                render_lines_loop(rest, :list, "", close_block(mode, acc) <> "<ul>\n<li>" <> render_inline(text))
+                              }
+                            } else {
+                              if is_table_header?(line, rest) {
+                                closed_table = close_block(mode, acc)
+                                head = "<table class=\"markdown-table\">\n<thead>\n" <> render_table_row(line, "th") <> "</thead>\n<tbody>\n"
+                                case rest {
+                                  [] -> close_block(:table, closed_table <> head)
+                                  [_separator | body_lines] -> render_lines_loop(body_lines, :table, "", closed_table <> head)
+                                }
+                              } else {
+                                if mode == :table {
+                                  if is_pipe_row?(line) {
+                                    render_lines_loop(rest, :table, "", acc <> render_table_row(line, "td"))
+                                  } else {
+                                    render_lines_loop(rest, :paragraph, "", close_block(:table, acc) <> "<p>" <> render_inline(line))
+                                  }
+                                } else {
+                                  if mode == :paragraph {
+                                    render_lines_loop(rest, :paragraph, "", acc <> "\n" <> render_inline(line))
+                                  } else {
+                                    render_lines_loop(rest, :paragraph, "", close_block(mode, acc) <> "<p>" <> render_inline(line))
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
-      } else {
-        classify_line(line, rest, mode, acc)
-      }
     }
   }
 
@@ -68,7 +143,7 @@ pub struct Markdown {
     `<pre><code>` reflects the source verbatim.
     """
 
-  pub fn render_code_line(line :: String, code_lang :: String) -> String {
+  fn render_code_line(line :: String, code_lang :: String) -> String {
     if zap_lang?(code_lang) {
       highlight_zap_line(line)
     } else {
@@ -76,81 +151,8 @@ pub struct Markdown {
     }
   }
 
-  pub fn zap_lang?(code_lang :: String) -> Bool {
+  fn zap_lang?(code_lang :: String) -> Bool {
     code_lang == "zap" or code_lang == "elixir"
-  }
-
-  @doc = """
-    Recognize the line's block kind for non-code modes and dispatch.
-    Order matters: code-fence opens before headings, headings before
-    list items, list items before paragraphs.
-    """
-
-  pub fn classify_line(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
-    if is_blank_line?(line) {
-      render_lines(rest, :start, "", close_block(mode, acc))
-    } else {
-      if String.starts_with?(String.trim(line), "```") {
-        open_code_block(line, rest, mode, acc)
-      } else {
-        if mode == :indent_code {
-          if is_indented_code_line?(line) {
-            render_lines(rest, :indent_code, "", acc <> "\n" <> highlight_zap_line(strip_indent4(line)))
-          } else {
-            classify_after_close(line, rest, :start, close_block(:indent_code, acc))
-          }
-        } else {
-          if mode == :start and is_indented_code_line?(line) {
-            render_lines(rest, :indent_code, "zap", acc <> "<pre><code class=\"language-zap\">" <> highlight_zap_line(strip_indent4(line)))
-          } else {
-            classify_after_close(line, rest, mode, acc)
-          }
-        }
-      }
-    }
-  }
-
-  @doc = """
-    Continue line classification after a code-block close. Identical to the
-    inner heading/list/table/paragraph cascade in `classify_line` but without
-    the `is_indented_code_line?` re-check, since the caller has already
-    decided this line ended the indented code run.
-    """
-
-  pub fn classify_after_close(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
-    if String.starts_with?(line, "#### ") {
-      render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h4", String.slice(line, 5, String.length(line))))
-    } else {
-      if String.starts_with?(line, "### ") {
-        render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h3", String.slice(line, 4, String.length(line))))
-      } else {
-        if String.starts_with?(line, "## ") {
-          render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h2", String.slice(line, 3, String.length(line))))
-        } else {
-          if String.starts_with?(line, "# ") {
-            render_lines(rest, :start, "", close_block(mode, acc) <> render_heading("h1", String.slice(line, 2, String.length(line))))
-          } else {
-            if is_list_item?(line) {
-              render_list_item(line, rest, mode, acc)
-            } else {
-              if is_table_header?(line, rest) {
-                open_table(line, rest, mode, acc)
-              } else {
-                if mode == :table {
-                  if is_pipe_row?(line) {
-                    render_lines(rest, :table, "", acc <> render_table_row(line, "td"))
-                  } else {
-                    render_paragraph_line(line, rest, :start, close_block(:table, acc))
-                  }
-                } else {
-                  render_paragraph_line(line, rest, mode, acc)
-                }
-              }
-            }
-          }
-        }
-      }
-    }
   }
 
   @doc = """
@@ -159,7 +161,7 @@ pub struct Markdown {
     rule used to render `@doc` Example blocks as `<pre><code>`.
     """
 
-  pub fn is_indented_code_line?(line :: String) -> Bool {
+  fn is_indented_code_line?(line :: String) -> Bool {
     if String.length(line) < 4 {
       false
     } else {
@@ -167,7 +169,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn strip_indent4(line :: String) -> String {
+  fn strip_indent4(line :: String) -> String {
     if String.starts_with?(line, "    ") {
       String.slice(line, 4, String.length(line))
     } else {
@@ -185,7 +187,7 @@ pub struct Markdown {
     generator emits.
     """
 
-  pub fn is_table_header?(line :: String, rest :: [String]) -> Bool {
+  fn is_table_header?(line :: String, rest :: [String]) -> Bool {
     if is_pipe_row?(line) {
       case rest {
         [] -> false
@@ -196,30 +198,21 @@ pub struct Markdown {
     }
   }
 
-  pub fn is_pipe_row?(line :: String) -> Bool {
+  fn is_pipe_row?(line :: String) -> Bool {
     String.starts_with?(String.trim(line), "|")
   }
 
-  pub fn is_table_separator?(line :: String) -> Bool {
+  fn is_table_separator?(line :: String) -> Bool {
     trimmed = String.trim(line)
     String.starts_with?(trimmed, "|") and String.contains?(trimmed, "---")
   }
 
-  pub fn open_table(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
-    closed = close_block(mode, acc)
-    head = "<table class=\"markdown-table\">\n<thead>\n" <> render_table_row(line, "th") <> "</thead>\n<tbody>\n"
-    case rest {
-      [] -> close_block(:table, closed <> head)
-      [_separator | body_lines] -> render_lines(body_lines, :table, "", closed <> head)
-    }
-  }
-
-  pub fn render_table_row(line :: String, cell_tag :: String) -> String {
+  fn render_table_row(line :: String, cell_tag :: String) -> String {
     cells = parse_pipe_cells(line)
     "<tr>" <> render_table_cells(cells, cell_tag, "") <> "</tr>\n"
   }
 
-  pub fn render_table_cells(cells :: [String], cell_tag :: String, acc :: String) -> String {
+  fn render_table_cells(cells :: [String], cell_tag :: String, acc :: String) -> String {
     case cells {
       [] -> acc
       [cell | rest] -> render_table_cells(rest, cell_tag, acc <> "<" <> cell_tag <> ">" <> render_inline(cell) <> "</" <> cell_tag <> ">")
@@ -232,14 +225,14 @@ pub struct Markdown {
     `| Field | Description |` produces `["Field", "Description"]`.
     """
 
-  pub fn parse_pipe_cells(line :: String) -> [String] {
+  fn parse_pipe_cells(line :: String) -> [String] {
     trimmed = String.trim(line)
     inner = strip_pipes(trimmed)
     parts = String.split(inner, "|")
     trim_each(parts, [])
   }
 
-  pub fn strip_pipes(line :: String) -> String {
+  fn strip_pipes(line :: String) -> String {
     a = if String.starts_with?(line, "|") {
       String.slice(line, 1, String.length(line))
     } else {
@@ -252,42 +245,14 @@ pub struct Markdown {
     }
   }
 
-  pub fn trim_each(parts :: [String], acc :: [String]) -> [String] {
+  fn trim_each(parts :: [String], acc :: [String]) -> [String] {
     case parts {
       [] -> List.reverse(acc)
       [head | tail] -> trim_each(tail, [String.trim(head) | acc])
     }
   }
 
-  pub fn open_code_block(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
-    trimmed = String.trim(line)
-    lang = String.slice(trimmed, 3, String.length(trimmed))
-    closed = close_block(mode, acc)
-    if String.length(lang) == 0 {
-      render_lines(rest, :code_open, "", closed <> "<pre><code>")
-    } else {
-      render_lines(rest, :code_open, lang, closed <> "<pre><code class=\"language-" <> lang <> "\">")
-    }
-  }
-
-  pub fn render_list_item(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
-    text = list_item_text(line)
-    if mode == :list {
-      render_lines(rest, :list, "", acc <> "</li>\n<li>" <> render_inline(text))
-    } else {
-      render_lines(rest, :list, "", close_block(mode, acc) <> "<ul>\n<li>" <> render_inline(text))
-    }
-  }
-
-  pub fn render_paragraph_line(line :: String, rest :: [String], mode :: Atom, acc :: String) -> String {
-    if mode == :paragraph {
-      render_lines(rest, :paragraph, "", acc <> "\n" <> render_inline(line))
-    } else {
-      render_lines(rest, :paragraph, "", close_block(mode, acc) <> "<p>" <> render_inline(line))
-    }
-  }
-
-  pub fn close_block(mode :: Atom, acc :: String) -> String {
+  fn close_block(mode :: Atom, acc :: String) -> String {
     if mode == :paragraph {
       acc <> "</p>\n"
     } else {
@@ -307,34 +272,34 @@ pub struct Markdown {
     }
   }
 
-  pub fn render_heading(tag :: String, text :: String) -> String {
+  fn render_heading(tag :: String, text :: String) -> String {
     "<" <> tag <> ">" <> render_inline(text) <> "</" <> tag <> ">\n"
   }
 
-  pub fn is_blank_line?(line :: String) -> Bool {
+  fn is_blank_line?(line :: String) -> Bool {
     String.length(String.trim(line)) == 0
   }
 
-  pub fn is_list_item?(line :: String) -> Bool {
+  fn is_list_item?(line :: String) -> Bool {
     String.starts_with?(line, "- ") or String.starts_with?(line, "* ")
   }
 
-  pub fn list_item_text(line :: String) -> String {
+  fn list_item_text(line :: String) -> String {
     String.slice(line, 2, String.length(line))
   }
 
   @doc = """
     Render a single inline run: HTML-escape body text, but recognize
-    backtick-delimited code spans and wrap them as `<code>`. Backticks
+    backtick-delimited code spans and `[text](url)` links. Backticks
     nest one level — content between matching pairs is escaped but
     not further parsed for inline syntax.
     """
 
-  pub fn render_inline(text :: String) -> String {
+  fn render_inline(text :: String) -> String {
     inline_walk(text, 0, String.length(text), false, "")
   }
 
-  pub fn inline_walk(text :: String, index :: i64, end :: i64, in_code :: Bool, acc :: String) -> String {
+  fn inline_walk(text :: String, index :: i64, end :: i64, in_code :: Bool, acc :: String) -> String {
     if index >= end {
       acc
     } else {
@@ -349,50 +314,34 @@ pub struct Markdown {
         if in_code {
           inline_walk(text, index + 1, end, in_code, acc <> escape_one(ch))
         } else {
-          inline_try_link(text, index, end, ch, acc)
+          if ch == "[" {
+            close_idx = find_link_text_close(text, index + 1, end)
+            if close_idx < 0 {
+              inline_walk(text, index + 1, end, false, acc <> escape_one(ch))
+            } else {
+              if close_idx + 1 < end and String.byte_at(text, close_idx + 1) == "(" {
+                url_close = find_link_url_close(text, close_idx + 2, end)
+                if url_close < 0 {
+                  inline_walk(text, index + 1, end, false, acc <> escape_one("["))
+                } else {
+                  link_text = String.slice(text, index + 1, close_idx)
+                  link_url = String.slice(text, close_idx + 2, url_close)
+                  link_html = "<a href=\"" <> escape_html(link_url) <> "\">" <> escape_inline(link_text) <> "</a>"
+                  inline_walk(text, url_close + 1, end, false, acc <> link_html)
+                }
+              } else {
+                inline_walk(text, index + 1, end, false, acc <> escape_one("["))
+              }
+            }
+          } else {
+            inline_walk(text, index + 1, end, false, acc <> escape_one(ch))
+          }
         }
       }
     }
   }
 
-  @doc = """
-    When the cursor sits on `[`, scan ahead for a `](...)` close to
-    classify this as a Markdown inline link and emit `<a href=\"url\">text</a>`.
-    Anything else (including a stray `[` with no matching close) falls
-    back to the normal escape-and-advance path so partial bracket
-    syntax in prose doesn't get mangled.
-    """
-
-  pub fn inline_try_link(text :: String, index :: i64, end :: i64, ch :: String, acc :: String) -> String {
-    if ch == "[" {
-      close_idx = find_link_text_close(text, index + 1, end)
-      if close_idx < 0 {
-        inline_walk(text, index + 1, end, false, acc <> escape_one(ch))
-      } else {
-        inline_try_link_paren(text, index, close_idx, end, acc)
-      }
-    } else {
-      inline_walk(text, index + 1, end, false, acc <> escape_one(ch))
-    }
-  }
-
-  pub fn inline_try_link_paren(text :: String, index :: i64, close_idx :: i64, end :: i64, acc :: String) -> String {
-    if close_idx + 1 < end and String.byte_at(text, close_idx + 1) == "(" {
-      url_close = find_link_url_close(text, close_idx + 2, end)
-      if url_close < 0 {
-        inline_walk(text, index + 1, end, false, acc <> escape_one("["))
-      } else {
-        link_text = String.slice(text, index + 1, close_idx)
-        link_url = String.slice(text, close_idx + 2, url_close)
-        link_html = "<a href=\"" <> escape_html(link_url) <> "\">" <> escape_inline(link_text) <> "</a>"
-        inline_walk(text, url_close + 1, end, false, acc <> link_html)
-      }
-    } else {
-      inline_walk(text, index + 1, end, false, acc <> escape_one("["))
-    }
-  }
-
-  pub fn find_link_text_close(text :: String, index :: i64, end :: i64) -> i64 {
+  fn find_link_text_close(text :: String, index :: i64, end :: i64) -> i64 {
     if index >= end {
       -1
     } else {
@@ -409,7 +358,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn find_link_url_close(text :: String, index :: i64, end :: i64) -> i64 {
+  fn find_link_url_close(text :: String, index :: i64, end :: i64) -> i64 {
     if index >= end {
       -1
     } else {
@@ -426,15 +375,15 @@ pub struct Markdown {
     }
   }
 
-  pub fn escape_inline(text :: String) -> String {
+  fn escape_inline(text :: String) -> String {
     escape_chars(text, 0, String.length(text), "")
   }
 
-  pub fn escape_html(text :: String) -> String {
+  fn escape_html(text :: String) -> String {
     escape_chars(text, 0, String.length(text), "")
   }
 
-  pub fn escape_chars(text :: String, index :: i64, end :: i64, acc :: String) -> String {
+  fn escape_chars(text :: String, index :: i64, end :: i64, acc :: String) -> String {
     if index >= end {
       acc
     } else {
@@ -443,7 +392,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn escape_one(ch :: String) -> String {
+  fn escape_one(ch :: String) -> String {
     if ch == "&" {
       "&amp;"
     } else {
@@ -475,11 +424,11 @@ pub struct Markdown {
     so non-Zap fragments still render correctly.
     """
 
-  pub fn highlight_zap_line(line :: String) -> String {
+  fn highlight_zap_line(line :: String) -> String {
     highlight_walk(line, 0, String.length(line), "")
   }
 
-  pub fn highlight_walk(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+  fn highlight_walk(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
     if index >= end_index {
       acc
     } else {
@@ -501,7 +450,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn highlight_after_atom_check(line :: String, index :: i64, end_index :: i64, acc :: String, ch :: String) -> String {
+  fn highlight_after_atom_check(line :: String, index :: i64, end_index :: i64, acc :: String, ch :: String) -> String {
     if is_digit_byte?(ch) {
       highlight_number(line, index, end_index, acc)
     } else {
@@ -513,7 +462,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn highlight_op_or_passthrough(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+  fn highlight_op_or_passthrough(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
     if index + 1 < end_index and two_char_op?(String.byte_at(line, index), String.byte_at(line, index + 1)) {
       op_chars = String.slice(line, index, index + 2)
       highlight_walk(line, index + 2, end_index, acc <> "<span class=\"hl-op\">" <> escape_html(op_chars) <> "</span>")
@@ -527,7 +476,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn highlight_string(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+  fn highlight_string(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
     string_end = find_string_end(line, index + 1, end_index)
     chunk = String.slice(line, index, string_end)
     highlight_walk(line, string_end, end_index, acc <> "<span class=\"hl-string\">" <> escape_html_no_quotes(chunk) <> "</span>")
@@ -543,11 +492,11 @@ pub struct Markdown {
     the source rather than an attribute delimiter.
     """
 
-  pub fn escape_html_no_quotes(text :: String) -> String {
+  fn escape_html_no_quotes(text :: String) -> String {
     escape_no_quotes_walk(text, 0, String.length(text), "")
   }
 
-  pub fn escape_no_quotes_walk(text :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+  fn escape_no_quotes_walk(text :: String, index :: i64, end_index :: i64, acc :: String) -> String {
     if index >= end_index {
       acc
     } else {
@@ -556,7 +505,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn escape_one_no_quote(ch :: String) -> String {
+  fn escape_one_no_quote(ch :: String) -> String {
     if ch == "&" {
       "&amp;"
     } else {
@@ -572,7 +521,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn find_string_end(line :: String, index :: i64, end_index :: i64) -> i64 {
+  fn find_string_end(line :: String, index :: i64, end_index :: i64) -> i64 {
     if index >= end_index {
       end_index
     } else {
@@ -589,13 +538,13 @@ pub struct Markdown {
     }
   }
 
-  pub fn highlight_atom(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+  fn highlight_atom(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
     atom_end = scan_atom_end(line, index + 1, end_index)
     chunk = String.slice(line, index, atom_end)
     highlight_walk(line, atom_end, end_index, acc <> "<span class=\"hl-atom\">" <> escape_html(chunk) <> "</span>")
   }
 
-  pub fn scan_atom_end(line :: String, index :: i64, end_index :: i64) -> i64 {
+  fn scan_atom_end(line :: String, index :: i64, end_index :: i64) -> i64 {
     if index >= end_index {
       end_index
     } else {
@@ -608,13 +557,13 @@ pub struct Markdown {
     }
   }
 
-  pub fn highlight_number(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+  fn highlight_number(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
     num_end = scan_number_end(line, index + 1, end_index)
     chunk = String.slice(line, index, num_end)
     highlight_walk(line, num_end, end_index, acc <> "<span class=\"hl-number\">" <> escape_html(chunk) <> "</span>")
   }
 
-  pub fn scan_number_end(line :: String, index :: i64, end_index :: i64) -> i64 {
+  fn scan_number_end(line :: String, index :: i64, end_index :: i64) -> i64 {
     if index >= end_index {
       end_index
     } else {
@@ -627,7 +576,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn highlight_word(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
+  fn highlight_word(line :: String, index :: i64, end_index :: i64, acc :: String) -> String {
     word_end = scan_word_end(line, index, end_index)
     word = String.slice(line, index, word_end)
     if is_zap_keyword?(word) {
@@ -645,7 +594,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn is_zap_builtin?(word :: String) -> Bool {
+  fn is_zap_builtin?(word :: String) -> Bool {
     word == "true" or word == "false" or word == "nil" or word == "setup" or word == "teardown"
   }
 
@@ -657,7 +606,7 @@ pub struct Markdown {
     them with the type colour rather than as bare identifiers.
     """
 
-  pub fn is_zap_primitive_type?(word :: String) -> Bool {
+  fn is_zap_primitive_type?(word :: String) -> Bool {
     if is_zap_int_type?(word) or is_zap_float_type?(word) {
       true
     } else {
@@ -665,15 +614,15 @@ pub struct Markdown {
     }
   }
 
-  pub fn is_zap_int_type?(word :: String) -> Bool {
+  fn is_zap_int_type?(word :: String) -> Bool {
     word == "i8" or word == "i16" or word == "i32" or word == "i64" or word == "i128" or word == "u8" or word == "u16" or word == "u32" or word == "u64" or word == "u128"
   }
 
-  pub fn is_zap_float_type?(word :: String) -> Bool {
+  fn is_zap_float_type?(word :: String) -> Bool {
     word == "f16" or word == "f32" or word == "f64" or word == "f80" or word == "f128"
   }
 
-  pub fn scan_word_end(line :: String, index :: i64, end_index :: i64) -> i64 {
+  fn scan_word_end(line :: String, index :: i64, end_index :: i64) -> i64 {
     if index >= end_index {
       end_index
     } else {
@@ -686,31 +635,31 @@ pub struct Markdown {
     }
   }
 
-  pub fn is_digit_byte?(ch :: String) -> Bool {
+  fn is_digit_byte?(ch :: String) -> Bool {
     ch == "0" or ch == "1" or ch == "2" or ch == "3" or ch == "4" or ch == "5" or ch == "6" or ch == "7" or ch == "8" or ch == "9"
   }
 
-  pub fn is_atom_start_byte?(ch :: String) -> Bool {
+  fn is_atom_start_byte?(ch :: String) -> Bool {
     is_lower_byte?(ch) or ch == "_"
   }
 
-  pub fn is_lower_byte?(ch :: String) -> Bool {
+  fn is_lower_byte?(ch :: String) -> Bool {
     ch >= "a" and ch <= "z"
   }
 
-  pub fn is_upper_byte?(ch :: String) -> Bool {
+  fn is_upper_byte?(ch :: String) -> Bool {
     ch >= "A" and ch <= "Z"
   }
 
-  pub fn is_alpha_byte?(ch :: String) -> Bool {
+  fn is_alpha_byte?(ch :: String) -> Bool {
     is_lower_byte?(ch) or is_upper_byte?(ch)
   }
 
-  pub fn is_ident_continue?(ch :: String) -> Bool {
+  fn is_ident_continue?(ch :: String) -> Bool {
     is_alpha_byte?(ch) or is_digit_byte?(ch) or ch == "_"
   }
 
-  pub fn two_char_op?(c1 :: String, c2 :: String) -> Bool {
+  fn two_char_op?(c1 :: String, c2 :: String) -> Bool {
     if c1 == "-" and c2 == ">" {
       true
     } else {
@@ -726,7 +675,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn two_char_op_more?(c1 :: String, c2 :: String) -> Bool {
+  fn two_char_op_more?(c1 :: String, c2 :: String) -> Bool {
     if c1 == "~" and c2 == ">" {
       true
     } else {
@@ -742,7 +691,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn two_char_op_compare?(c1 :: String, c2 :: String) -> Bool {
+  fn two_char_op_compare?(c1 :: String, c2 :: String) -> Bool {
     if c1 == "=" and c2 == "=" {
       true
     } else {
@@ -762,11 +711,11 @@ pub struct Markdown {
     }
   }
 
-  pub fn single_char_op?(ch :: String) -> Bool {
+  fn single_char_op?(ch :: String) -> Bool {
     ch == "=" or ch == "+" or ch == "*" or ch == "/" or ch == ">" or ch == "<" or ch == "|"
   }
 
-  pub fn is_zap_keyword?(word :: String) -> Bool {
+  fn is_zap_keyword?(word :: String) -> Bool {
     if word == "pub" or word == "fn" or word == "macro" or word == "struct" or word == "case" {
       true
     } else {
@@ -778,7 +727,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn is_zap_keyword_more?(word :: String) -> Bool {
+  fn is_zap_keyword_more?(word :: String) -> Bool {
     if word == "for" or word == "in" or word == "cond" or word == "do" or word == "end" {
       true
     } else {
@@ -790,7 +739,7 @@ pub struct Markdown {
     }
   }
 
-  pub fn is_zap_keyword_misc?(word :: String) -> Bool {
+  fn is_zap_keyword_misc?(word :: String) -> Bool {
     if word == "alias" or word == "quote" or word == "unquote" or word == "panic" or word == "extends" {
       true
     } else {

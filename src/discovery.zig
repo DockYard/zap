@@ -24,6 +24,21 @@ pub const SourceRoot = struct {
 pub const FileGraph = struct {
     allocator: std.mem.Allocator,
 
+    /// Source path ownership invariant:
+    /// `known_files` owns exactly one source path string per recorded source
+    /// file. Every other FileGraph field that stores source paths borrows those
+    /// buffers unless the field documents a narrower ownership rule.
+    ///
+    /// `canonical_files` is separate: it owns realpath strings used only for
+    /// duplicate detection.
+    ///
+    /// Struct-name strings are owned by `file_to_structs`; maps keyed by struct
+    /// name borrow those same buffers.
+    ///
+    /// Import-name strings are owned by `file_imports`.
+    ///
+    /// Compile-after glob pattern strings are owned by
+    /// `file_compile_after_globs`.
     /// Struct name → file path (absolute)
     struct_to_file: std.StringHashMap([]const u8),
 
@@ -31,6 +46,8 @@ pub const FileGraph = struct {
     file_to_struct: std.StringHashMap([]const u8),
 
     /// File path → all struct names declared by that file.
+    /// The graph owns each struct-name element through this list; other maps
+    /// borrow those same name buffers.
     file_to_structs: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
 
     /// Every source file known to the graph, including files without a
@@ -46,7 +63,8 @@ pub const FileGraph = struct {
     /// already recorded under a different surface path.
     canonical_files: std.StringHashMap(void),
 
-    /// File path → list of struct names it references
+    /// File path → list of struct names it references.
+    /// The graph owns each import-name element through this list.
     file_imports: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
 
     /// File path → list of files that import it
@@ -81,6 +99,7 @@ pub const FileGraph = struct {
     file_compile_after_globs: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
 
     /// File path → matched source files from `@compile_after_glob`.
+    /// Keys and matched-file items borrow source paths owned by `known_files`.
     /// These are order-only dependencies for topological sorting. They
     /// are deliberately separate from `file_imports`/`file_imported_by`
     /// so incremental invalidation does not treat every globbed file as
@@ -90,6 +109,7 @@ pub const FileGraph = struct {
     /// Reverse index of `file_compile_after_files`, used only by
     /// topological sorting to release dependents when an order-only
     /// provider file has been emitted.
+    /// Keys and dependent-file items borrow source paths owned by `known_files`.
     file_compile_after_by: std.StringHashMap(std.ArrayListUnmanaged([]const u8)),
 
     pub fn init(allocator: std.mem.Allocator) FileGraph {
@@ -116,12 +136,12 @@ pub const FileGraph = struct {
     pub fn deinit(self: *FileGraph) void {
         self.struct_to_file.deinit();
         self.file_to_struct.deinit();
+        self.struct_is_private.deinit();
         {
             var it = self.file_to_structs.iterator();
-            while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+            while (it.next()) |entry| freeOwnedStructNameList(self.allocator, entry.value_ptr);
         }
         self.file_to_structs.deinit();
-        self.known_files.deinit();
         {
             var it = self.canonical_files.iterator();
             while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
@@ -129,7 +149,7 @@ pub const FileGraph = struct {
         self.canonical_files.deinit();
         {
             var it = self.file_imports.iterator();
-            while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+            while (it.next()) |entry| freeOwnedImportList(self.allocator, entry.value_ptr);
         }
         self.file_imports.deinit();
         {
@@ -141,10 +161,12 @@ pub const FileGraph = struct {
         self.level_boundaries.deinit(self.allocator);
         self.stdlib_structs.deinit();
         self.file_source_root.deinit();
-        self.struct_is_private.deinit();
         {
             var it = self.file_compile_after_globs.iterator();
-            while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+            while (it.next()) |entry| {
+                for (entry.value_ptr.items) |pattern| self.allocator.free(pattern);
+                entry.value_ptr.deinit(self.allocator);
+            }
         }
         self.file_compile_after_globs.deinit();
         {
@@ -157,6 +179,11 @@ pub const FileGraph = struct {
             while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         }
         self.file_compile_after_by.deinit();
+        {
+            var it = self.known_files.iterator();
+            while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        }
+        self.known_files.deinit();
     }
 
     pub fn structForFile(self: *const FileGraph, file_path: []const u8) ?[]const u8 {
@@ -178,6 +205,154 @@ pub const DiscoveryError = error{
     ReadError,
     ParseFailed,
 };
+
+fn discoveryIoError(err: anyerror) DiscoveryError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ReadError,
+    };
+}
+
+fn isMissingPathError(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound, error.NotDir => true,
+        else => false,
+    };
+}
+
+fn freeOwnedStructNameList(alloc: std.mem.Allocator, names: *std.ArrayListUnmanaged([]const u8)) void {
+    for (names.items) |name| alloc.free(name);
+    names.deinit(alloc);
+}
+
+fn freeOwnedStructNameSliceElements(alloc: std.mem.Allocator, names: []const []const u8) void {
+    for (names) |name| alloc.free(name);
+}
+
+fn freeOwnedImportList(alloc: std.mem.Allocator, imports: *std.ArrayListUnmanaged([]const u8)) void {
+    for (imports.items) |import_name| alloc.free(import_name);
+    imports.deinit(alloc);
+}
+
+fn freeOwnedImportSliceElements(alloc: std.mem.Allocator, imports: []const []const u8) void {
+    for (imports) |import_name| alloc.free(import_name);
+}
+
+fn freeStringHashMapKeys(alloc: std.mem.Allocator, map: *std.StringHashMap(void)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+}
+
+const SourcePathOwnership = union(enum) {
+    borrowed: []const u8,
+    owned: []const u8,
+
+    fn slice(self: SourcePathOwnership) []const u8 {
+        return switch (self) {
+            .borrowed => |path| path,
+            .owned => |path| path,
+        };
+    }
+
+    fn freeIfOwned(self: SourcePathOwnership, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .borrowed => {},
+            .owned => |path| alloc.free(path),
+        }
+    }
+};
+
+const RecordedSourcePath = struct {
+    path: []const u8,
+    inserted: bool,
+};
+
+fn recordKnownSourcePath(
+    alloc: std.mem.Allocator,
+    graph: *FileGraph,
+    source_path: SourcePathOwnership,
+) DiscoveryError!RecordedSourcePath {
+    const candidate_path = switch (source_path) {
+        .borrowed => |path| alloc.dupe(u8, path) catch return error.OutOfMemory,
+        .owned => |path| path,
+    };
+    var candidate_path_needs_free = true;
+    errdefer if (candidate_path_needs_free) alloc.free(candidate_path);
+
+    const entry = graph.known_files.getOrPut(candidate_path) catch return error.OutOfMemory;
+    if (entry.found_existing) {
+        alloc.free(candidate_path);
+        candidate_path_needs_free = false;
+        return .{ .path = entry.key_ptr.*, .inserted = false };
+    }
+
+    entry.value_ptr.* = {};
+    candidate_path_needs_free = false;
+    return .{ .path = entry.key_ptr.*, .inserted = true };
+}
+
+fn removeKnownSourcePath(alloc: std.mem.Allocator, graph: *FileGraph, file_path: []const u8) void {
+    if (graph.known_files.fetchRemove(file_path)) |removed_entry| {
+        alloc.free(removed_entry.key);
+    }
+}
+
+fn graphOwnedSourcePath(graph: *const FileGraph, file_path: []const u8) ?[]const u8 {
+    return graph.known_files.getKey(file_path);
+}
+
+fn putOwnedStructReference(
+    alloc: std.mem.Allocator,
+    refs: *std.StringHashMap(void),
+    struct_name: []const u8,
+) error{OutOfMemory}!void {
+    if (refs.contains(struct_name)) return;
+
+    const owned_struct_name = try alloc.dupe(u8, struct_name);
+    errdefer alloc.free(owned_struct_name);
+    try refs.put(owned_struct_name, {});
+}
+
+fn putOwnedFileImports(
+    alloc: std.mem.Allocator,
+    graph: *FileGraph,
+    file_path: []const u8,
+    imports: std.ArrayListUnmanaged([]const u8),
+) DiscoveryError!void {
+    if (graph.file_imports.fetchPut(file_path, imports) catch return error.OutOfMemory) |displaced_entry| {
+        var displaced_imports = displaced_entry.value;
+        freeOwnedImportList(alloc, &displaced_imports);
+    }
+}
+
+fn removeDeclaredStructMappings(graph: *FileGraph, declared_structs: []const []const u8) void {
+    for (declared_structs) |struct_name| {
+        _ = graph.struct_to_file.remove(struct_name);
+        _ = graph.struct_is_private.remove(struct_name);
+    }
+}
+
+fn removeOwnedFileStructsEntry(alloc: std.mem.Allocator, graph: *FileGraph, file_path: []const u8) void {
+    if (graph.file_to_structs.fetchRemove(file_path)) |removed_entry| {
+        var names = removed_entry.value;
+        freeOwnedStructNameList(alloc, &names);
+    }
+}
+
+fn declaredStructName(declared_structs: []const []const u8, struct_name: []const u8) ?[]const u8 {
+    for (declared_structs) |declared_struct| {
+        if (std.mem.eql(u8, declared_struct, struct_name)) return declared_struct;
+    }
+    return null;
+}
+
+fn graphPrimaryStructName(declared_structs: []const []const u8, primary_struct: ?[]const u8) ?[]const u8 {
+    if (primary_struct) |struct_name| {
+        return declaredStructName(declared_structs, struct_name);
+    }
+    if (declared_structs.len == 0) return null;
+    return declared_structs[0];
+}
 
 /// Error details populated on failure. Caller provides this to discover()
 /// to get human-readable error information without stderr writes.
@@ -238,7 +413,8 @@ pub fn discoverWithSourceFiles(
         graph.stdlib_structs.put(name, {}) catch return error.OutOfMemory;
     }
 
-    const native_type_structs = try discoverNativeTypeStructs(alloc, source_roots);
+    var native_type_structs = try discoverNativeTypeStructs(alloc, source_roots);
+    defer freeNativeTypeStructs(alloc, &native_type_structs);
 
     // Discovery work queue
     var queue: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -265,18 +441,26 @@ pub fn discoverWithSourceFiles(
         // resolve to the same realpath. `recordSourceFile` enforces
         // the same invariant so this pre-check is purely an
         // I/O optimization; correctness still holds without it.
-        const canonical_check = canonicalizeFilePath(alloc, file_path) catch return error.OutOfMemory;
+        const canonical_check = try canonicalizeFilePath(alloc, file_path);
         if (graph.canonical_files.contains(canonical_check)) {
             alloc.free(canonical_check);
             continue;
         }
         alloc.free(canonical_check);
 
-        const source_root_name = sourceRootNameForFile(alloc, file_path, source_roots) orelse "project";
-        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
-            return error.ReadError;
-        const primary_struct = primaryStructName(alloc, source) catch return error.OutOfMemory;
-        try recordSourceFile(alloc, &graph, file_path, source_root_name, source, primary_struct, &queue, &native_type_structs);
+        const source_root_name = (try sourceRootNameForFile(alloc, file_path, source_roots)) orelse "project";
+        const source = try readDiscoveredSourceFile(alloc, file_path);
+        const primary_struct = primaryStructName(alloc, source) catch |err| {
+            alloc.free(source);
+            return err;
+        };
+        recordSourceFile(alloc, &graph, .{ .borrowed = file_path }, source_root_name, source, primary_struct, &queue, &native_type_structs) catch |err| {
+            if (primary_struct) |struct_name| alloc.free(struct_name);
+            alloc.free(source);
+            return err;
+        };
+        if (primary_struct) |struct_name| alloc.free(struct_name);
+        alloc.free(source);
         try drainDiscoveryQueue(alloc, &graph, &queue, source_roots, &native_type_structs);
     }
 
@@ -327,16 +511,31 @@ fn drainDiscoveryQueue(
         if (graph.struct_to_file.contains(struct_name)) continue;
         if (graph.stdlib_structs.contains(struct_name)) continue;
 
-        const resolved = resolveStructToFile(alloc, struct_name, source_roots) orelse continue;
-        const file_path = resolved.path;
-        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
-            return error.ReadError;
+        const resolved = (try resolveStructToFile(alloc, struct_name, source_roots)) orelse continue;
+        const source = readDiscoveredSourceFile(alloc, resolved.path) catch |err| {
+            alloc.free(resolved.path);
+            return err;
+        };
 
-        try recordSourceFile(alloc, graph, file_path, resolved.source_root_name, source, struct_name, queue, native_type_structs);
+        recordSourceFile(alloc, graph, .{ .owned = resolved.path }, resolved.source_root_name, source, struct_name, queue, native_type_structs) catch |err| {
+            alloc.free(source);
+            return err;
+        };
+        alloc.free(source);
     }
 }
 
 const NativeTypeStructs = std.EnumArray(zap.scope.NativeTypeKind, ?[]const u8);
+
+fn freeNativeTypeStructs(alloc: std.mem.Allocator, native_type_structs: *NativeTypeStructs) void {
+    inline for (std.meta.tags(zap.scope.NativeTypeKind)) |kind| {
+        const slot = native_type_structs.getPtr(kind);
+        if (slot.*) |struct_name| {
+            alloc.free(struct_name);
+            slot.* = null;
+        }
+    }
+}
 
 /// Canonicalize a file path to its absolute, fully-resolved form so
 /// duplicate-file detection in the FileGraph can match paths that
@@ -344,24 +543,23 @@ const NativeTypeStructs = std.EnumArray(zap.scope.NativeTypeKind, ?[]const u8);
 /// surface representations (e.g. `./foo.zap` vs `././foo.zap` vs an
 /// absolute path).
 ///
-/// When the path cannot be resolved (e.g. read-only filesystem,
-/// symlink loop) the original path is returned as a best-effort
-/// fallback so discovery stays functional — the duplicate hazard the
-/// canonicalization addresses is unique to paths that successfully
-/// resolve to the same file, and unresolved paths cannot collide on
-/// disk.
-///
 /// The returned slice is owned by `alloc`.
-fn canonicalizeFilePath(alloc: std.mem.Allocator, file_path: []const u8) ![]const u8 {
-    return std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, file_path, alloc) catch {
-        return alloc.dupe(u8, file_path);
-    };
+fn canonicalizeFilePath(alloc: std.mem.Allocator, file_path: []const u8) DiscoveryError![]const u8 {
+    var real_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real_path_len = std.Io.Dir.cwd().realPathFile(std.Options.debug_io, file_path, &real_path_buffer) catch |err|
+        return discoveryIoError(err);
+    return alloc.dupe(u8, real_path_buffer[0..real_path_len]) catch return error.OutOfMemory;
+}
+
+fn readDiscoveredSourceFile(alloc: std.mem.Allocator, file_path: []const u8) DiscoveryError![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch |err|
+        return discoveryIoError(err);
 }
 
 fn recordSourceFile(
     alloc: std.mem.Allocator,
     graph: *FileGraph,
-    file_path: []const u8,
+    source_path: SourcePathOwnership,
     source_root_name: []const u8,
     source: []const u8,
     primary_struct: ?[]const u8,
@@ -378,63 +576,158 @@ fn recordSourceFile(
     // distinct `ir.Function` records with the same name — silently
     // breaking the chain-consistency invariants that arc/uniqueness audits
     // rely on.
-    const canonical = canonicalizeFilePath(alloc, file_path) catch return error.OutOfMemory;
+    var source_path_consumed = false;
+    errdefer if (!source_path_consumed) source_path.freeIfOwned(alloc);
+
+    const canonical = try canonicalizeFilePath(alloc, source_path.slice());
+    var canonical_transferred = false;
+    errdefer {
+        if (canonical_transferred) {
+            if (graph.canonical_files.fetchRemove(canonical)) |removed_entry| {
+                alloc.free(removed_entry.key);
+            }
+        } else {
+            alloc.free(canonical);
+        }
+    }
     if (graph.canonical_files.contains(canonical)) {
         alloc.free(canonical);
+        source_path.freeIfOwned(alloc);
+        source_path_consumed = true;
         return;
     }
     graph.canonical_files.put(canonical, {}) catch return error.OutOfMemory;
+    canonical_transferred = true;
 
-    graph.known_files.put(file_path, {}) catch return error.OutOfMemory;
+    source_path_consumed = true;
+    const recorded_source_path = try recordKnownSourcePath(alloc, graph, source_path);
+    const file_path = recorded_source_path.path;
+    var known_file_recorded = recorded_source_path.inserted;
+    errdefer if (known_file_recorded) removeKnownSourcePath(alloc, graph, file_path);
+
     graph.file_source_root.put(file_path, source_root_name) catch return error.OutOfMemory;
+    var source_root_recorded = true;
+    errdefer if (source_root_recorded) {
+        _ = graph.file_source_root.remove(file_path);
+    };
 
     const declared_structs = structNamesInSource(alloc, source) catch return error.OutOfMemory;
+    defer alloc.free(declared_structs);
+    var graph_owns_declared_structs = false;
+    var file_to_struct_recorded = false;
+    errdefer {
+        if (file_to_struct_recorded) _ = graph.file_to_struct.remove(file_path);
+        removeDeclaredStructMappings(graph, declared_structs);
+        if (graph_owns_declared_structs) {
+            removeOwnedFileStructsEntry(alloc, graph, file_path);
+        } else {
+            freeOwnedStructNameSliceElements(alloc, declared_structs);
+        }
+    }
     if (declared_structs.len > 0) {
         var structs_for_file: std.ArrayListUnmanaged([]const u8) = .empty;
+        var structs_for_file_transferred = false;
+        errdefer if (!structs_for_file_transferred) structs_for_file.deinit(alloc);
+
+        for (declared_structs) |struct_name| {
+            structs_for_file.append(alloc, struct_name) catch return error.OutOfMemory;
+        }
+
         for (declared_structs) |struct_name| {
             graph.struct_to_file.put(struct_name, file_path) catch return error.OutOfMemory;
             graph.struct_is_private.put(struct_name, false) catch return error.OutOfMemory;
-            structs_for_file.append(alloc, struct_name) catch return error.OutOfMemory;
         }
         graph.file_to_structs.put(file_path, structs_for_file) catch return error.OutOfMemory;
+        structs_for_file_transferred = true;
+        graph_owns_declared_structs = true;
     }
 
-    if (primary_struct) |struct_name| {
+    if (graphPrimaryStructName(declared_structs, primary_struct)) |struct_name| {
         graph.struct_to_file.put(struct_name, file_path) catch return error.OutOfMemory;
         graph.file_to_struct.put(file_path, struct_name) catch return error.OutOfMemory;
+        file_to_struct_recorded = true;
         graph.struct_is_private.put(struct_name, isPrivateStruct(source)) catch return error.OutOfMemory;
-    } else if (declared_structs.len > 0) {
-        graph.file_to_struct.put(file_path, declared_structs[0]) catch return error.OutOfMemory;
     }
 
     const refs = extractStructReferences(alloc, source, primary_struct orelse "") catch
         return error.OutOfMemory;
+    defer alloc.free(refs);
 
     var imports_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var imports_list_transferred = false;
+    errdefer if (!imports_list_transferred) freeOwnedImportList(alloc, &imports_list);
     var import_seen = std.StringHashMap(void).init(alloc);
     defer import_seen.deinit();
 
-    for (refs) |ref| {
-        try appendDiscoveredImport(alloc, graph, queue, &imports_list, &import_seen, declared_structs, primary_struct, ref);
+    var next_ref_index: usize = 0;
+    errdefer {
+        for (refs[next_ref_index..]) |unprocessed_ref| alloc.free(unprocessed_ref);
+    }
+    while (next_ref_index < refs.len) {
+        const ref = refs[next_ref_index];
+        next_ref_index += 1;
+        var ref_transferred = false;
+        errdefer if (!ref_transferred) alloc.free(ref);
+        ref_transferred = try appendOwnedDiscoveredImport(alloc, graph, queue, &imports_list, &import_seen, declared_structs, primary_struct, ref);
+        if (!ref_transferred) alloc.free(ref);
     }
 
     const native_refs = nativeTypeReferencesInSource(alloc, source, native_type_structs) catch return error.OutOfMemory;
+    defer alloc.free(native_refs);
     for (native_refs) |ref| {
-        try appendDiscoveredImport(alloc, graph, queue, &imports_list, &import_seen, declared_structs, primary_struct, ref);
+        try appendNativeTypeImport(alloc, graph, queue, &imports_list, &import_seen, declared_structs, primary_struct, ref);
     }
-    graph.file_imports.put(file_path, imports_list) catch return error.OutOfMemory;
 
     const compile_after_globs = extractCompileAfterGlobs(alloc, source) catch return error.OutOfMemory;
+    defer alloc.free(compile_after_globs);
+    var compile_after_globs_recorded = false;
+    errdefer if (compile_after_globs_recorded) {
+        if (graph.file_compile_after_globs.fetchRemove(file_path)) |removed_entry| {
+            var recorded_globs = removed_entry.value;
+            for (recorded_globs.items) |pattern| alloc.free(pattern);
+            recorded_globs.deinit(alloc);
+        }
+    };
     if (compile_after_globs.len > 0) {
         var globs_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        var transferred_glob_count: usize = 0;
+        errdefer {
+            for (globs_list.items) |pattern| alloc.free(pattern);
+            for (compile_after_globs[transferred_glob_count..]) |pattern| alloc.free(pattern);
+            globs_list.deinit(alloc);
+        }
         for (compile_after_globs) |pattern| {
             globs_list.append(alloc, pattern) catch return error.OutOfMemory;
+            transferred_glob_count += 1;
         }
         graph.file_compile_after_globs.put(file_path, globs_list) catch return error.OutOfMemory;
+        compile_after_globs_recorded = true;
     }
+
+    try putOwnedFileImports(alloc, graph, file_path, imports_list);
+    imports_list_transferred = true;
+    compile_after_globs_recorded = false;
+    source_root_recorded = false;
+    known_file_recorded = false;
+    canonical_transferred = false;
 }
 
-fn appendDiscoveredImport(
+fn appendOwnedDiscoveredImport(
+    alloc: std.mem.Allocator,
+    graph: *FileGraph,
+    queue: *std.ArrayListUnmanaged([]const u8),
+    imports_list: *std.ArrayListUnmanaged([]const u8),
+    import_seen: *std.StringHashMap(void),
+    declared_structs: []const []const u8,
+    primary_struct: ?[]const u8,
+    ref: []const u8,
+) DiscoveryError!bool {
+    if (!shouldAppendDiscoveredImport(graph, import_seen, declared_structs, primary_struct, ref)) return false;
+    try recordDiscoveredImport(alloc, graph, queue, imports_list, import_seen, ref);
+    return true;
+}
+
+fn appendNativeTypeImport(
     alloc: std.mem.Allocator,
     graph: *FileGraph,
     queue: *std.ArrayListUnmanaged([]const u8),
@@ -444,19 +737,51 @@ fn appendDiscoveredImport(
     primary_struct: ?[]const u8,
     ref: []const u8,
 ) DiscoveryError!void {
+    if (!shouldAppendDiscoveredImport(graph, import_seen, declared_structs, primary_struct, ref)) return;
+
+    const owned_ref = alloc.dupe(u8, ref) catch return error.OutOfMemory;
+    var owned_ref_transferred = false;
+    errdefer if (!owned_ref_transferred) alloc.free(owned_ref);
+
+    try recordDiscoveredImport(alloc, graph, queue, imports_list, import_seen, owned_ref);
+    owned_ref_transferred = true;
+}
+
+fn shouldAppendDiscoveredImport(
+    graph: *const FileGraph,
+    import_seen: *const std.StringHashMap(void),
+    declared_structs: []const []const u8,
+    primary_struct: ?[]const u8,
+    ref: []const u8,
+) bool {
     if (primary_struct) |struct_name| {
-        if (std.mem.eql(u8, ref, struct_name)) return;
+        if (std.mem.eql(u8, ref, struct_name)) return false;
     }
-    if (structNameDeclaredInFile(declared_structs, ref)) return;
-    if (graph.stdlib_structs.contains(ref)) return;
-    if (import_seen.contains(ref)) return;
+    if (structNameDeclaredInFile(declared_structs, ref)) return false;
+    if (graph.stdlib_structs.contains(ref)) return false;
+    if (import_seen.contains(ref)) return false;
+    return true;
+}
 
-    import_seen.put(ref, {}) catch return error.OutOfMemory;
-    imports_list.append(alloc, ref) catch return error.OutOfMemory;
+fn recordDiscoveredImport(
+    alloc: std.mem.Allocator,
+    graph: *FileGraph,
+    queue: *std.ArrayListUnmanaged([]const u8),
+    imports_list: *std.ArrayListUnmanaged([]const u8),
+    import_seen: *std.StringHashMap(void),
+    ref: []const u8,
+) DiscoveryError!void {
+    const should_queue = !graph.struct_to_file.contains(ref);
 
-    if (!graph.struct_to_file.contains(ref)) {
-        queue.append(alloc, ref) catch return error.OutOfMemory;
+    import_seen.ensureUnusedCapacity(1) catch return error.OutOfMemory;
+    imports_list.ensureUnusedCapacity(alloc, 1) catch return error.OutOfMemory;
+    if (should_queue) {
+        queue.ensureUnusedCapacity(alloc, 1) catch return error.OutOfMemory;
     }
+
+    import_seen.putAssumeCapacity(ref, {});
+    imports_list.appendAssumeCapacity(ref);
+    if (should_queue) queue.appendAssumeCapacity(ref);
 }
 
 fn discoverNativeTypeStructs(
@@ -464,6 +789,7 @@ fn discoverNativeTypeStructs(
     source_roots: []const SourceRoot,
 ) DiscoveryError!NativeTypeStructs {
     var native_type_structs = NativeTypeStructs.initFill(null);
+    errdefer freeNativeTypeStructs(alloc, &native_type_structs);
     for (source_roots) |root| {
         try scanNativeTypesInDir(alloc, root.path, &native_type_structs);
     }
@@ -475,11 +801,12 @@ fn scanNativeTypesInDir(
     dir_path: []const u8,
     native_type_structs: *NativeTypeStructs,
 ) DiscoveryError!void {
-    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true }) catch return;
+    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true }) catch |err|
+        return discoveryIoError(err);
     defer dir.close(std.Options.debug_io);
 
     var iter = dir.iterate();
-    while (iter.next(std.Options.debug_io) catch null) |entry| {
+    while (iter.next(std.Options.debug_io) catch |err| return discoveryIoError(err)) |entry| {
         if (entry.kind == .directory) {
             const child_path = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch return error.OutOfMemory;
             defer alloc.free(child_path);
@@ -491,19 +818,17 @@ fn scanNativeTypesInDir(
 
         const file_path = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch return error.OutOfMemory;
         defer alloc.free(file_path);
-        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
-            continue;
+        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch |err|
+            return discoveryIoError(err);
         defer alloc.free(source);
-        if (nativeTypeDeclarationInSource(alloc, source)) |maybe_declaration| {
-            if (maybe_declaration) |declaration| {
-                const slot = native_type_structs.getPtr(declaration.kind);
-                if (slot.* == null) {
-                    slot.* = declaration.struct_name;
-                } else {
-                    alloc.free(declaration.struct_name);
-                }
+        if (try nativeTypeDeclarationInSource(alloc, source)) |declaration| {
+            const slot = native_type_structs.getPtr(declaration.kind);
+            if (slot.* == null) {
+                slot.* = declaration.struct_name;
+            } else {
+                alloc.free(declaration.struct_name);
             }
-        } else |_| {}
+        }
     }
 }
 
@@ -547,6 +872,7 @@ fn nativeTypeDeclarationInSource(
             const kind = pending_kind orelse continue;
 
             var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer name_buf.deinit(alloc);
             try name_buf.appendSlice(alloc, name_tok.slice(source));
             var peek = struct_lexer;
             while (true) {
@@ -624,6 +950,7 @@ fn nativeTypeReferencesInSource(
     }
 
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer result.deinit(alloc);
     var it = refs.iterator();
     while (it.next()) |entry| {
         try result.append(alloc, entry.key_ptr.*);
@@ -672,6 +999,7 @@ fn enforceDepBoundaries(alloc: std.mem.Allocator, graph: *FileGraph, err_info: ?
 /// Caller owns the returned slice and must free it with the same allocator.
 pub fn structNameToRelPath(alloc: std.mem.Allocator, struct_name: []const u8) ![]const u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(alloc);
 
     var it = std.mem.splitScalar(u8, struct_name, '.');
     var first = true;
@@ -708,13 +1036,18 @@ fn resolveStructToFile(
     alloc: std.mem.Allocator,
     struct_name: []const u8,
     source_roots: []const SourceRoot,
-) ?ResolvedFile {
-    const rel_path = structNameToRelPath(alloc, struct_name) catch return null;
+) DiscoveryError!?ResolvedFile {
+    const rel_path = try structNameToRelPath(alloc, struct_name);
+    defer alloc.free(rel_path);
 
     // Try the full relative path first
     for (source_roots) |root| {
-        const full_path = std.fs.path.join(alloc, &.{ root.path, rel_path }) catch continue;
-        std.Io.Dir.cwd().access(std.Options.debug_io, full_path, .{}) catch continue;
+        const full_path = try std.fs.path.join(alloc, &.{ root.path, rel_path });
+        std.Io.Dir.cwd().access(std.Options.debug_io, full_path, .{}) catch |err| {
+            alloc.free(full_path);
+            if (isMissingPathError(err)) continue;
+            return discoveryIoError(err);
+        };
         return .{ .path = full_path, .source_root_name = root.name };
     }
 
@@ -725,10 +1058,15 @@ fn resolveStructToFile(
     // a subdirectory within it.
     if (std.mem.indexOfScalar(u8, struct_name, '.')) |dot_pos| {
         const suffix = struct_name[dot_pos + 1 ..];
-        const suffix_path = structNameToRelPath(alloc, suffix) catch return null;
+        const suffix_path = try structNameToRelPath(alloc, suffix);
+        defer alloc.free(suffix_path);
         for (source_roots) |root| {
-            const full_path = std.fs.path.join(alloc, &.{ root.path, suffix_path }) catch continue;
-            std.Io.Dir.cwd().access(std.Options.debug_io, full_path, .{}) catch continue;
+            const full_path = try std.fs.path.join(alloc, &.{ root.path, suffix_path });
+            std.Io.Dir.cwd().access(std.Options.debug_io, full_path, .{}) catch |err| {
+                alloc.free(full_path);
+                if (isMissingPathError(err)) continue;
+                return discoveryIoError(err);
+            };
             return .{ .path = full_path, .source_root_name = root.name };
         }
     }
@@ -740,12 +1078,13 @@ fn sourceRootNameForFile(
     alloc: std.mem.Allocator,
     file_path: []const u8,
     source_roots: []const SourceRoot,
-) ?[]const u8 {
+) error{OutOfMemory}!?[]const u8 {
     const normalized_file = if (std.mem.startsWith(u8, file_path, "./")) file_path[2..] else file_path;
     for (source_roots) |root| {
         const normalized_root = if (std.mem.startsWith(u8, root.path, "./")) root.path[2..] else root.path;
         if (std.mem.eql(u8, normalized_file, normalized_root)) return root.name;
-        const root_slash = std.fmt.allocPrint(alloc, "{s}/", .{normalized_root}) catch continue;
+        const root_slash = try std.fmt.allocPrint(alloc, "{s}/", .{normalized_root});
+        defer alloc.free(root_slash);
         if (std.mem.startsWith(u8, normalized_file, root_slash)) return root.name;
     }
     return null;
@@ -753,12 +1092,20 @@ fn sourceRootNameForFile(
 
 pub fn primaryStructName(alloc: std.mem.Allocator, source: []const u8) error{OutOfMemory}!?[]const u8 {
     const declared_structs = try structNamesInSource(alloc, source);
+    defer alloc.free(declared_structs);
     if (declared_structs.len == 0) return null;
-    return declared_structs[0];
+
+    const primary_struct = declared_structs[0];
+    freeOwnedStructNameSliceElements(alloc, declared_structs[1..]);
+    return primary_struct;
 }
 
 fn structNamesInSource(alloc: std.mem.Allocator, source: []const u8) error{OutOfMemory}![]const []const u8 {
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    }
     var lexer = zap.Lexer.init(source);
     while (true) {
         const tok = lexer.next();
@@ -769,6 +1116,8 @@ fn structNamesInSource(alloc: std.mem.Allocator, source: []const u8) error{OutOf
         if (name_tok.tag != .type_identifier) continue;
 
         var name_buf: std.ArrayListUnmanaged(u8) = .empty;
+        var name_buf_transferred = false;
+        errdefer if (!name_buf_transferred) name_buf.deinit(alloc);
         try name_buf.appendSlice(alloc, name_tok.slice(source));
 
         var peek = lexer;
@@ -782,7 +1131,12 @@ fn structNamesInSource(alloc: std.mem.Allocator, source: []const u8) error{OutOf
             lexer = peek;
         }
 
-        try names.append(alloc, try name_buf.toOwnedSlice(alloc));
+        const name = try name_buf.toOwnedSlice(alloc);
+        name_buf_transferred = true;
+        var name_transferred = false;
+        errdefer if (!name_transferred) alloc.free(name);
+        try names.append(alloc, name);
+        name_transferred = true;
     }
 
     return try names.toOwnedSlice(alloc);
@@ -826,6 +1180,8 @@ fn extractStructReferences(
 ) ![]const []const u8 {
     var refs = std.StringHashMap(void).init(alloc);
     defer refs.deinit();
+    var refs_transferred = false;
+    errdefer if (!refs_transferred) freeStringHashMapKeys(alloc, &refs);
 
     var lexer = zap.Lexer.init(source);
 
@@ -859,10 +1215,8 @@ fn extractStructReferences(
             // "error". Match on the slice so this discovery scout stays
             // in sync with the parser's contextual reading.
             if (tok.isErrorIdent(source)) {
-                const option_name = try alloc.dupe(u8, "Option");
-                try refs.put(option_name, {});
-                const error_name = try alloc.dupe(u8, "Error");
-                try refs.put(error_name, {});
+                try putOwnedStructReference(alloc, &refs, "Option");
+                try putOwnedStructReference(alloc, &refs, "Error");
                 break;
             }
         }
@@ -883,12 +1237,9 @@ fn extractStructReferences(
             const tok = scout.next();
             if (tok.tag == .eof) break;
             if (tok.isRaiseIdent(source)) {
-                const runtime_error_name = try alloc.dupe(u8, "RuntimeError");
-                try refs.put(runtime_error_name, {});
-                const option_name = try alloc.dupe(u8, "Option");
-                try refs.put(option_name, {});
-                const error_name = try alloc.dupe(u8, "Error");
-                try refs.put(error_name, {});
+                try putOwnedStructReference(alloc, &refs, "RuntimeError");
+                try putOwnedStructReference(alloc, &refs, "Option");
+                try putOwnedStructReference(alloc, &refs, "Error");
                 break;
             }
         }
@@ -938,6 +1289,19 @@ fn extractStructReferences(
         }
 
         if (tok.tag == .type_identifier) {
+            if (prev_tag == .keyword_struct or prev_tag == .keyword_union) {
+                var declaration_name_peek = lexer;
+                while (true) {
+                    const dot_tok = declaration_name_peek.next();
+                    if (dot_tok.tag != .dot) break;
+                    const next_tok = declaration_name_peek.next();
+                    if (next_tok.tag != .type_identifier) break;
+                    lexer = declaration_name_peek;
+                }
+                prev_tag = tok.tag;
+                continue;
+            }
+
             const name_text = tok.slice(source);
 
             // Skip: bare uppercase identifiers inside union bodies are variants, not structs.
@@ -987,8 +1351,7 @@ fn extractStructReferences(
                 }
             }
 
-            const struct_name = try alloc.dupe(u8, name_buf.items);
-            try refs.put(struct_name, {});
+            try putOwnedStructReference(alloc, &refs, name_buf.items);
         }
 
         prev_tag = tok.tag;
@@ -996,11 +1359,14 @@ fn extractStructReferences(
 
     // Convert to array
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer result.deinit(alloc);
     var it = refs.iterator();
     while (it.next()) |entry| {
         try result.append(alloc, entry.key_ptr.*);
     }
-    return try result.toOwnedSlice(alloc);
+    const owned_refs = try result.toOwnedSlice(alloc);
+    refs_transferred = true;
+    return owned_refs;
 }
 
 /// Topological sort of the file graph using Kahn's algorithm.
@@ -1011,7 +1377,7 @@ fn extractStructReferences(
 ///   `@compile_after_glob = ["a/*.zap", "b/*.zap"]`
 /// Returns a deduplicated, allocator-owned list of pattern strings;
 /// the caller frees each entry plus the outer slice.
-fn extractCompileAfterGlobs(alloc: std.mem.Allocator, source: []const u8) ![]const []const u8 {
+fn extractCompileAfterGlobs(alloc: std.mem.Allocator, source: []const u8) error{OutOfMemory}![]const []const u8 {
     var patterns: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (patterns.items) |p| alloc.free(p);
@@ -1040,7 +1406,10 @@ fn extractCompileAfterGlobs(alloc: std.mem.Allocator, source: []const u8) ![]con
             const end_quote = std.mem.indexOfScalarPos(u8, source, cursor + 1, '"') orelse continue;
             const pattern = source[cursor + 1 .. end_quote];
             const dup = try alloc.dupe(u8, pattern);
-            try patterns.append(alloc, dup);
+            patterns.append(alloc, dup) catch |err| {
+                alloc.free(dup);
+                return err;
+            };
         } else if (ch == '[') {
             // Walk the list, picking out each "..." element. Stops at
             // the first unmatched `]` or end of input.
@@ -1051,7 +1420,10 @@ fn extractCompileAfterGlobs(alloc: std.mem.Allocator, source: []const u8) ![]con
                 const end_quote = std.mem.indexOfScalarPos(u8, source, inner + 1, '"') orelse break;
                 const pattern = source[inner + 1 .. end_quote];
                 const dup = try alloc.dupe(u8, pattern);
-                try patterns.append(alloc, dup);
+                patterns.append(alloc, dup) catch |err| {
+                    alloc.free(dup);
+                    return err;
+                };
                 inner = end_quote + 1;
             }
         }
@@ -1065,24 +1437,28 @@ fn extractCompileAfterGlobs(alloc: std.mem.Allocator, source: []const u8) ![]con
 /// topological sort then orders the declaring file after each matched
 /// peer without exposing those edges as ordinary imports to later
 /// incremental invalidation.
-fn resolveCompileAfterGlobs(alloc: std.mem.Allocator, graph: *FileGraph) !void {
+fn resolveCompileAfterGlobs(alloc: std.mem.Allocator, graph: *FileGraph) DiscoveryError!void {
+    const glob_mod = @import("glob.zig");
     var glob_it = graph.file_compile_after_globs.iterator();
     while (glob_it.next()) |entry| {
         const declaring_file = entry.key_ptr.*;
         for (entry.value_ptr.items) |pattern| {
-            const matches = @import("glob.zig").collect(alloc, std.Options.debug_io, pattern, .{}) catch continue;
-            defer @import("glob.zig").freeMatches(alloc, matches);
+            const matches = glob_mod.collect(alloc, std.Options.debug_io, pattern, .{}) catch |err|
+                return discoveryIoError(err);
+            defer glob_mod.freeMatches(alloc, matches);
             for (matches) |matched_path| {
                 // Normalize so leading `./` (often present on graph keys
                 // because the compiler walks relative paths from the
                 // project root) matches whether the glob produced the
                 // bare or prefixed form.
+                var prefixed_lookup_key: ?[]u8 = null;
+                defer if (prefixed_lookup_key) |key| alloc.free(key);
                 const lookup_key = if (graph.file_to_struct.contains(matched_path))
                     matched_path
                 else blk: {
-                    const prefixed = std.fmt.allocPrint(alloc, "./{s}", .{matched_path}) catch continue;
+                    const prefixed = try std.fmt.allocPrint(alloc, "./{s}", .{matched_path});
+                    prefixed_lookup_key = prefixed;
                     if (graph.file_to_struct.contains(prefixed)) break :blk prefixed;
-                    alloc.free(prefixed);
                     break :blk matched_path;
                 };
                 if (std.mem.eql(u8, lookup_key, declaring_file)) continue;
@@ -1098,29 +1474,29 @@ fn appendCompileAfterFileEdge(
     graph: *FileGraph,
     declaring_file: []const u8,
     matched_file: []const u8,
-) !void {
-    const owned_matched_file = blk: {
-        if (graph.file_compile_after_files.get(declaring_file)) |existing_matches| {
-            for (existing_matches.items) |existing| {
-                if (std.mem.eql(u8, existing, matched_file)) return;
-            }
-        }
-        break :blk try alloc.dupe(u8, matched_file);
-    };
+) DiscoveryError!void {
+    const graph_declaring_file = graphOwnedSourcePath(graph, declaring_file) orelse unreachable;
+    const graph_matched_file = graphOwnedSourcePath(graph, matched_file) orelse unreachable;
 
-    {
-        const entry = try graph.file_compile_after_files.getOrPut(declaring_file);
-        if (!entry.found_existing) entry.value_ptr.* = .empty;
-        try entry.value_ptr.append(alloc, owned_matched_file);
+    if (graph.file_compile_after_files.get(graph_declaring_file)) |existing_matches| {
+        for (existing_matches.items) |existing| {
+            if (std.mem.eql(u8, existing, graph_matched_file)) return;
+        }
     }
 
     {
-        const entry = try graph.file_compile_after_by.getOrPut(owned_matched_file);
+        const entry = try graph.file_compile_after_files.getOrPut(graph_declaring_file);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(alloc, graph_matched_file);
+    }
+
+    {
+        const entry = try graph.file_compile_after_by.getOrPut(graph_matched_file);
         if (!entry.found_existing) entry.value_ptr.* = .empty;
         for (entry.value_ptr.items) |existing| {
-            if (std.mem.eql(u8, existing, declaring_file)) return;
+            if (std.mem.eql(u8, existing, graph_declaring_file)) return;
         }
-        try entry.value_ptr.append(alloc, declaring_file);
+        try entry.value_ptr.append(alloc, graph_declaring_file);
     }
 }
 
@@ -1280,6 +1656,772 @@ test "structNameToRelPath: deeply nested" {
     const result = try structNameToRelPath(alloc, "App.Http.Middleware");
     defer alloc.free(result);
     try std.testing.expectEqualStrings("app/http/middleware.zap", result);
+}
+
+fn exerciseStructNamesInSourceAllocationFailures(alloc: std.mem.Allocator) !void {
+    const names = try structNamesInSource(
+        alloc,
+        "pub struct App {}\npub struct App.Router {}\n",
+    );
+    defer {
+        for (names) |name| alloc.free(name);
+        alloc.free(names);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("App", names[0]);
+    try std.testing.expectEqualStrings("App.Router", names[1]);
+}
+
+test "P4J2: structNamesInSource frees owned name when names append fails" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseStructNamesInSourceAllocationFailures,
+        .{},
+    );
+}
+
+test "P4J2: primaryStructName frees outer slice and unused declared names" {
+    const alloc = std.testing.allocator;
+    const primary_struct = (try primaryStructName(
+        alloc,
+        "pub struct App {}\npub struct Helper {}\n",
+    )) orelse return error.TestExpectedEqual;
+    defer alloc.free(primary_struct);
+
+    try std.testing.expectEqualStrings("App", primary_struct);
+}
+
+fn exerciseRecordSourceFileDeclaredStructOwnership(alloc: std.mem.Allocator, file_path: []const u8) !void {
+    var graph = FileGraph.init(alloc);
+    defer graph.deinit();
+
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer queue.deinit(alloc);
+
+    const native_type_structs = NativeTypeStructs.initFill(null);
+    try recordSourceFile(
+        alloc,
+        &graph,
+        .{ .borrowed = file_path },
+        "project",
+        "pub struct App {}\npub struct Helper {}\n",
+        "App",
+        &queue,
+        &native_type_structs,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), graph.structsForFile(file_path).len);
+    try std.testing.expectEqualStrings("App", graph.structForFile(file_path).?);
+    try std.testing.expect(graph.struct_to_file.contains("Helper"));
+}
+
+test "P4J2: recordSourceFile transfers declared struct names to FileGraph" {
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    try temporary_directory.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "",
+    });
+
+    const alloc = std.testing.allocator;
+    const file_path = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, "app.zap", alloc);
+    defer alloc.free(file_path);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        exerciseRecordSourceFileDeclaredStructOwnership,
+        .{file_path},
+    );
+}
+
+test "P4J2: FileGraph.deinit frees declared struct names exactly once" {
+    const alloc = std.testing.allocator;
+    var graph = FileGraph.init(alloc);
+    errdefer graph.deinit();
+
+    var declared_structs: std.ArrayListUnmanaged([]const u8) = .empty;
+    var graph_owns_declared_structs = false;
+    errdefer if (!graph_owns_declared_structs) freeOwnedStructNameList(alloc, &declared_structs);
+
+    const app_struct = try alloc.dupe(u8, "App");
+    var app_struct_transferred = false;
+    errdefer if (!app_struct_transferred) alloc.free(app_struct);
+    try declared_structs.append(alloc, app_struct);
+    app_struct_transferred = true;
+
+    const helper_struct = try alloc.dupe(u8, "Helper");
+    var helper_struct_transferred = false;
+    errdefer if (!helper_struct_transferred) alloc.free(helper_struct);
+    try declared_structs.append(alloc, helper_struct);
+    helper_struct_transferred = true;
+
+    const graph_file_path = (try recordKnownSourcePath(alloc, &graph, .{ .borrowed = "app.zap" })).path;
+
+    try graph.struct_to_file.put(app_struct, graph_file_path);
+    try graph.struct_to_file.put(helper_struct, graph_file_path);
+    try graph.struct_is_private.put(app_struct, false);
+    try graph.struct_is_private.put(helper_struct, false);
+    try graph.file_to_struct.put(graph_file_path, app_struct);
+    try graph.file_to_structs.put(graph_file_path, declared_structs);
+    graph_owns_declared_structs = true;
+
+    graph.deinit();
+}
+
+fn exerciseExtractStructReferencesOwnedImportCleanup(alloc: std.mem.Allocator) !void {
+    const source =
+        \\pub struct App {
+        \\  pub fn main() {
+        \\    Helper.run()
+        \\    Helper.stop()
+        \\    Config.Parser.parse("data")
+        \\    Config.Parser.render("data")
+        \\  }
+        \\}
+    ;
+    const refs = try extractStructReferences(alloc, source, "App");
+    defer {
+        freeOwnedImportSliceElements(alloc, refs);
+        alloc.free(refs);
+    }
+
+    var helper_count: usize = 0;
+    var found_config_parser = false;
+    for (refs) |ref| {
+        if (std.mem.eql(u8, ref, "Helper")) helper_count += 1;
+        if (std.mem.eql(u8, ref, "Config.Parser")) found_config_parser = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), helper_count);
+    try std.testing.expect(found_config_parser);
+}
+
+test "P4J2: extractStructReferences returns owned refs without leaking duplicates" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseExtractStructReferencesOwnedImportCleanup,
+        .{},
+    );
+}
+
+fn exerciseRecordSourceFileImportOwnership(alloc: std.mem.Allocator, file_path: []const u8) !void {
+    var graph = FileGraph.init(alloc);
+    defer graph.deinit();
+
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer queue.deinit(alloc);
+
+    const native_type_structs = NativeTypeStructs.initFill(null);
+    try recordSourceFile(
+        alloc,
+        &graph,
+        .{ .borrowed = file_path },
+        "project",
+        "pub struct App {\n  pub fn main() {\n    Helper.run()\n    Helper.stop()\n    Util.value()\n  }\n}\n",
+        "App",
+        &queue,
+        &native_type_structs,
+    );
+
+    const imports = graph.file_imports.get(file_path) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), imports.items.len);
+
+    var found_helper = false;
+    var found_util = false;
+    for (imports.items) |import_name| {
+        if (std.mem.eql(u8, import_name, "Helper")) found_helper = true;
+        if (std.mem.eql(u8, import_name, "Util")) found_util = true;
+    }
+    try std.testing.expect(found_helper);
+    try std.testing.expect(found_util);
+}
+
+test "P4J2: recordSourceFile transfers discovered import strings to FileGraph" {
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    try temporary_directory.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "",
+    });
+
+    const alloc = std.testing.allocator;
+    const file_path = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, "app.zap", alloc);
+    defer alloc.free(file_path);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        exerciseRecordSourceFileImportOwnership,
+        .{file_path},
+    );
+}
+
+fn exerciseRecordSourceFileNativeImportOwnership(alloc: std.mem.Allocator, file_path: []const u8) !void {
+    var graph = FileGraph.init(alloc);
+    defer graph.deinit();
+
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer queue.deinit(alloc);
+
+    var native_type_structs = NativeTypeStructs.initFill(null);
+    native_type_structs.getPtr(.list).* = "List";
+    try recordSourceFile(
+        alloc,
+        &graph,
+        .{ .borrowed = file_path },
+        "project",
+        "pub struct App {\n  pub fn main() {\n    []\n  }\n}\n",
+        "App",
+        &queue,
+        &native_type_structs,
+    );
+
+    const imports = graph.file_imports.get(file_path) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), imports.items.len);
+    try std.testing.expectEqualStrings("List", imports.items[0]);
+}
+
+test "P4J2: recordSourceFile transfers native literal import strings to FileGraph" {
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    try temporary_directory.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "",
+    });
+
+    const alloc = std.testing.allocator;
+    const file_path = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, "app.zap", alloc);
+    defer alloc.free(file_path);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        exerciseRecordSourceFileNativeImportOwnership,
+        .{file_path},
+    );
+}
+
+fn exerciseRecordSourceFileImportReplacement(alloc: std.mem.Allocator, file_path: []const u8) !void {
+    var graph = FileGraph.init(alloc);
+    defer graph.deinit();
+
+    var stale_imports: std.ArrayListUnmanaged([]const u8) = .empty;
+    var graph_owns_stale_imports = false;
+    errdefer if (!graph_owns_stale_imports) freeOwnedImportList(alloc, &stale_imports);
+
+    const stale_import = try alloc.dupe(u8, "Stale");
+    var stale_import_transferred = false;
+    errdefer if (!stale_import_transferred) alloc.free(stale_import);
+    try stale_imports.append(alloc, stale_import);
+    stale_import_transferred = true;
+
+    const graph_file_path = (try recordKnownSourcePath(alloc, &graph, .{ .borrowed = file_path })).path;
+    try graph.file_imports.put(graph_file_path, stale_imports);
+    graph_owns_stale_imports = true;
+
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer queue.deinit(alloc);
+
+    const native_type_structs = NativeTypeStructs.initFill(null);
+    try recordSourceFile(
+        alloc,
+        &graph,
+        .{ .borrowed = file_path },
+        "project",
+        "pub struct App {\n  pub fn main() {\n    Fresh.run()\n  }\n}\n",
+        "App",
+        &queue,
+        &native_type_structs,
+    );
+
+    const imports = graph.file_imports.get(file_path) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), imports.items.len);
+    try std.testing.expectEqualStrings("Fresh", imports.items[0]);
+}
+
+test "P4J2: recordSourceFile frees replaced import strings exactly once" {
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    try temporary_directory.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "",
+    });
+
+    const alloc = std.testing.allocator;
+    const file_path = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, "app.zap", alloc);
+    defer alloc.free(file_path);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        exerciseRecordSourceFileImportReplacement,
+        .{file_path},
+    );
+}
+
+test "P4J2: resolveStructToFile propagates OutOfMemory while building relative path" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = "." }};
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        resolveStructToFile(failing_allocator.allocator(), "App", roots),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: resolveStructToFile propagates OutOfMemory while joining source root path" {
+    var fixed_buffer: [128]u8 = undefined;
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+    const roots = &[_]SourceRoot{.{
+        .name = "project",
+        .path = "this/source/root/path/is/long/enough/to/exhaust/the/fixed/buffer/when/resolveStructToFile/joins/it/with/app.zap",
+    }};
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        resolveStructToFile(fixed_allocator.allocator(), "App", roots),
+    );
+}
+
+test "P4J2: resolveStructToFile treats missing probes as semantic absence" {
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    const alloc = std.testing.allocator;
+    const root_path = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(root_path);
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = root_path }};
+
+    const resolved = try resolveStructToFile(alloc, "App", roots);
+    try std.testing.expect(resolved == null);
+}
+
+test "P4J2: resolveStructToFile propagates access failures instead of absence" {
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    try temporary_directory.dir.symLink(std.Options.debug_io, "app.zap", "app.zap", .{});
+
+    const alloc = std.testing.allocator;
+    const root_path = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(root_path);
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = root_path }};
+
+    try std.testing.expectError(
+        error.ReadError,
+        resolveStructToFile(alloc, "App", roots),
+    );
+}
+
+test "P4J2: discovery queue propagates resolver OutOfMemory instead of skipping import" {
+    var fixed_buffer: [128]u8 = undefined;
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+    const fixed_alloc = fixed_allocator.allocator();
+
+    var graph = FileGraph.init(fixed_alloc);
+    defer graph.deinit();
+
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer queue.deinit(std.testing.allocator);
+    try queue.append(std.testing.allocator, "App");
+
+    const roots = &[_]SourceRoot{.{
+        .name = "project",
+        .path = "this/source/root/path/is/long/enough/to/exhaust/the/fixed/buffer/when/drainDiscoveryQueue/joins/it/with/app.zap",
+    }};
+    const native_type_structs = NativeTypeStructs.initFill(null);
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        drainDiscoveryQueue(fixed_alloc, &graph, &queue, roots, &native_type_structs),
+    );
+}
+
+fn exerciseDrainDiscoveryQueueSourcePathOwnership(alloc: std.mem.Allocator, root_path: []const u8) !void {
+    var graph = FileGraph.init(alloc);
+    defer graph.deinit();
+
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer queue.deinit(alloc);
+    try queue.append(alloc, "App");
+
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = root_path }};
+    const native_type_structs = NativeTypeStructs.initFill(null);
+
+    try drainDiscoveryQueue(alloc, &graph, &queue, roots, &native_type_structs);
+
+    const graph_file_path = graph.struct_to_file.get("App") orelse return error.TestExpectedEqual;
+    const known_file_path = graphOwnedSourcePath(&graph, graph_file_path) orelse return error.TestExpectedEqual;
+    try std.testing.expect(known_file_path.ptr == graph_file_path.ptr);
+    try std.testing.expect(graph.file_source_root.get(graph_file_path) != null);
+}
+
+test "P4J2: discovery queue transfers resolved source paths to FileGraph" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {\n}\n",
+    });
+
+    const alloc = std.testing.allocator;
+    const root_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(root_path);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        exerciseDrainDiscoveryQueueSourcePathOwnership,
+        .{root_path},
+    );
+}
+
+fn exerciseRecordSourceFileBorrowedSourcePathOwnership(alloc: std.mem.Allocator, file_path: []const u8) !void {
+    var graph = FileGraph.init(alloc);
+    defer graph.deinit();
+
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer queue.deinit(alloc);
+
+    const native_type_structs = NativeTypeStructs.initFill(null);
+    try recordSourceFile(
+        alloc,
+        &graph,
+        .{ .borrowed = file_path },
+        "project",
+        "pub struct App {\n}\n",
+        "App",
+        &queue,
+        &native_type_structs,
+    );
+
+    const known_file_path = graphOwnedSourcePath(&graph, file_path) orelse return error.TestExpectedEqual;
+    const graph_file_path = graph.struct_to_file.get("App") orelse return error.TestExpectedEqual;
+    try std.testing.expect(known_file_path.ptr == graph_file_path.ptr);
+    try std.testing.expect(known_file_path.ptr != file_path.ptr);
+}
+
+test "P4J2: recordSourceFile stores borrowed source paths as graph-owned keys" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {\n}\n",
+    });
+
+    const alloc = std.testing.allocator;
+    const file_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "app.zap", alloc);
+    defer alloc.free(file_path);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        exerciseRecordSourceFileBorrowedSourcePathOwnership,
+        .{file_path},
+    );
+}
+
+test "P4J2: recordSourceFile frees owned duplicate source path on canonical dedupe" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {\n}\n",
+    });
+
+    const alloc = std.testing.allocator;
+    const file_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "app.zap", alloc);
+    defer alloc.free(file_path);
+
+    var graph = FileGraph.init(alloc);
+    defer graph.deinit();
+
+    var queue: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer queue.deinit(alloc);
+
+    const native_type_structs = NativeTypeStructs.initFill(null);
+    try recordSourceFile(
+        alloc,
+        &graph,
+        .{ .borrowed = file_path },
+        "project",
+        "pub struct App {\n}\n",
+        "App",
+        &queue,
+        &native_type_structs,
+    );
+
+    const duplicate_file_path = try alloc.dupe(u8, file_path);
+    try recordSourceFile(
+        alloc,
+        &graph,
+        .{ .owned = duplicate_file_path },
+        "project",
+        "pub struct App {\n}\n",
+        "App",
+        &queue,
+        &native_type_structs,
+    );
+
+    try std.testing.expectEqual(@as(u32, 1), graph.known_files.count());
+}
+
+fn exerciseCanonicalDedupeKey(alloc: std.mem.Allocator, file_path: []const u8) !void {
+    var canonical_files = std.StringHashMap(void).init(alloc);
+    defer {
+        var it = canonical_files.iterator();
+        while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+        canonical_files.deinit();
+    }
+
+    const recorded_key = try canonicalizeFilePath(alloc, file_path);
+    var recorded_key_inserted = false;
+    errdefer if (!recorded_key_inserted) alloc.free(recorded_key);
+    try canonical_files.put(recorded_key, {});
+    recorded_key_inserted = true;
+
+    const check_key = try canonicalizeFilePath(alloc, file_path);
+    defer alloc.free(check_key);
+
+    try std.testing.expect(canonical_files.contains(check_key));
+}
+
+test "P4J2: canonical dedupe preserves OutOfMemory from canonical path allocation" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {\n  pub fn main() -> i64 {\n    1\n  }\n}\n",
+    });
+
+    const alloc = std.testing.allocator;
+    const file_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "app.zap", alloc);
+    defer alloc.free(file_path);
+
+    try std.testing.checkAllAllocationFailures(alloc, exerciseCanonicalDedupeKey, .{file_path});
+}
+
+test "P4J2: canonical dedupe propagates canonicalization failures" {
+    try std.testing.expectError(
+        error.ReadError,
+        canonicalizeFilePath(std.testing.allocator, "missing/p4j2/canonical/input.zap"),
+    );
+}
+
+test "P4J2: source-file reads preserve OutOfMemory" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {\n}\n",
+    });
+
+    const alloc = std.testing.allocator;
+    const file_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "app.zap", alloc);
+    defer alloc.free(file_path);
+
+    var failing_allocator = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        readDiscoveredSourceFile(failing_allocator.allocator(), file_path),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: source-file reads map non-OOM read failures to ReadError" {
+    try std.testing.expectError(
+        error.ReadError,
+        readDiscoveredSourceFile(std.testing.allocator, "missing/p4j2/source/read.zap"),
+    );
+}
+
+fn exerciseNativeTypeScan(alloc: std.mem.Allocator, root_path: []const u8) !void {
+    var native_type_structs = NativeTypeStructs.initFill(null);
+    errdefer freeNativeTypeStructs(alloc, &native_type_structs);
+
+    try scanNativeTypesInDir(alloc, root_path, &native_type_structs);
+    defer freeNativeTypeStructs(alloc, &native_type_structs);
+
+    const list_struct = native_type_structs.get(.list) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("List", list_struct);
+}
+
+test "P4J2: native-type scan propagates OutOfMemory" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "list.zap",
+        .data =
+        \\@native_type = "list"
+        \\pub struct List {
+        \\}
+        ,
+    });
+
+    const alloc = std.testing.allocator;
+    const root_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(root_path);
+
+    try std.testing.checkAllAllocationFailures(alloc, exerciseNativeTypeScan, .{root_path});
+}
+
+test "P4J2: native-type scan propagates directory read errors" {
+    var native_type_structs = NativeTypeStructs.initFill(null);
+
+    try std.testing.expectError(
+        error.ReadError,
+        scanNativeTypesInDir(
+            std.testing.allocator,
+            "does/not/exist/for/p4j2/native/type/scan",
+            &native_type_structs,
+        ),
+    );
+}
+
+test "P4J2: discoverWithSourceFiles frees native-type scan results on success" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "list.zap",
+        .data =
+        \\@native_type = "list"
+        \\pub struct List {
+        \\}
+        ,
+    });
+
+    const alloc = std.testing.allocator;
+    const root_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(root_path);
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = root_path }};
+
+    var graph = try discoverWithSourceFiles(alloc, "MissingEntry", roots, &BUILTIN_TYPE_NAMES, &.{}, null);
+    defer graph.deinit();
+}
+
+test "P4J2: discoverWithSourceFiles frees native-type scan results on later failure" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "list.zap",
+        .data =
+        \\@native_type = "list"
+        \\pub struct List {
+        \\}
+        ,
+    });
+
+    const alloc = std.testing.allocator;
+    const root_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(root_path);
+    const roots = &[_]SourceRoot{.{ .name = "project", .path = root_path }};
+
+    try std.testing.expectError(
+        error.ReadError,
+        discoverWithSourceFiles(
+            alloc,
+            "MissingEntry",
+            roots,
+            &BUILTIN_TYPE_NAMES,
+            &.{"missing/p4j2/native/type/later_failure.zap"},
+            null,
+        ),
+    );
+}
+
+test "P4J2: source-root classification propagates OutOfMemory" {
+    var fixed_buffer: [8]u8 = undefined;
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+    const roots = &[_]SourceRoot{.{
+        .name = "project",
+        .path = "this/source/root/path/is/too/long/for/the/classification/slash/allocation",
+    }};
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        sourceRootNameForFile(
+            fixed_allocator.allocator(),
+            "this/source/root/path/is/too/long/for/the/classification/slash/allocation/app.zap",
+            roots,
+        ),
+    );
+}
+
+fn exerciseCompileAfterGlobResolution(alloc: std.mem.Allocator) !void {
+    var graph = FileGraph.init(alloc);
+    defer graph.deinit();
+
+    const declaring_file = "./test_runner.zap";
+    const matched_file = "./src/discovery.zig";
+    const graph_declaring_file = (try recordKnownSourcePath(alloc, &graph, .{ .borrowed = declaring_file })).path;
+    const graph_matched_file = (try recordKnownSourcePath(alloc, &graph, .{ .borrowed = matched_file })).path;
+    try graph.file_to_struct.put(graph_matched_file, "Discovery");
+
+    var patterns: std.ArrayListUnmanaged([]const u8) = .empty;
+    var graph_owns_patterns = false;
+    errdefer if (!graph_owns_patterns) patterns.deinit(alloc);
+
+    const pattern = try alloc.dupe(u8, "src/discovery.zig");
+    var graph_owns_pattern = false;
+    errdefer if (!graph_owns_pattern) alloc.free(pattern);
+
+    try patterns.append(alloc, pattern);
+    try graph.file_compile_after_globs.put(graph_declaring_file, patterns);
+    graph_owns_patterns = true;
+    graph_owns_pattern = true;
+
+    try resolveCompileAfterGlobs(alloc, &graph);
+    try std.testing.expect(graph.file_compile_after_by.get(graph_matched_file) != null);
+}
+
+test "P4J2: compile-after glob resolution propagates OutOfMemory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseCompileAfterGlobResolution,
+        .{},
+    );
+}
+
+test "P4J2: compile-after glob resolution propagates glob filesystem errors" {
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    try temporary_directory.dir.symLink(std.Options.debug_io, "loop.zap", "loop.zap", .{});
+
+    const alloc = std.testing.allocator;
+    const root_path = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    defer alloc.free(root_path);
+    const loop_path = try std.fs.path.join(alloc, &.{ root_path, "loop.zap" });
+    defer alloc.free(loop_path);
+
+    var graph = FileGraph.init(alloc);
+    defer graph.deinit();
+
+    const declaring_file = "./test_runner.zap";
+    const graph_declaring_file = (try recordKnownSourcePath(alloc, &graph, .{ .borrowed = declaring_file })).path;
+
+    var patterns: std.ArrayListUnmanaged([]const u8) = .empty;
+    var graph_owns_patterns = false;
+    errdefer if (!graph_owns_patterns) patterns.deinit(alloc);
+
+    const pattern = try alloc.dupe(u8, loop_path);
+    var graph_owns_pattern = false;
+    errdefer if (!graph_owns_pattern) alloc.free(pattern);
+
+    try patterns.append(alloc, pattern);
+    try graph.file_compile_after_globs.put(graph_declaring_file, patterns);
+    graph_owns_patterns = true;
+    graph_owns_pattern = true;
+
+    try std.testing.expectError(error.ReadError, resolveCompileAfterGlobs(alloc, &graph));
 }
 
 test "extractStructReferences: finds qualified calls" {

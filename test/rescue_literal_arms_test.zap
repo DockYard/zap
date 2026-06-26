@@ -115,6 +115,16 @@ pub struct RescueLiteralArmsTest {
       assert(call_classify_raise(0) == 1)
       assert(call_classify_raise(1) == 2)
     }
+
+    test("Callable return keying survives mixed raising and pure i64 closures") {
+      mapped = Enum.map([1, 2, 3], fn(x :: i64) -> i64 { x * 2 })
+
+      assert(List.length(mapped) == 3)
+      assert(List.head(mapped) == 2)
+      assert(List.last(mapped) == 6)
+      assert(call_callable_key_collision(2) == 12)
+      assert(call_callable_key_collision(0) == -30)
+    }
   }
 
   # End-to-end witnesses for audit finding ir-1--04: the IR builder's
@@ -303,6 +313,29 @@ pub struct RescueLiteralArmsTest {
     try { classify_raise(n) } rescue {
       e :: AlphaError -> 1
       e :: BetaError -> 2
+    }
+  }
+
+  # FU-30 / GAP-P3-03: a multi-clause function whose first clause raises and
+  # whose second clause constructs a `fn(i64) -> i64` closure must not collide
+  # with other same-signature callbacks when the runtime derives
+  # `CallableReturn(@TypeOf(callback))`.
+  fn callable_key_collision(0 :: i64) -> i64 {
+    raise %AlphaError{message: "fu30"}
+  }
+
+  fn callable_key_collision(n :: i64) -> i64 {
+    callback = fn(value :: i64) -> i64 { value + n }
+    invoke_i64_callback(callback, 10)
+  }
+
+  fn invoke_i64_callback(callback :: fn(i64) -> i64, value :: i64) -> i64 {
+    callback(value)
+  }
+
+  fn call_callable_key_collision(n :: i64) -> i64 {
+    try { callable_key_collision(n) } rescue {
+      e :: AlphaError -> -30
     }
   }
 

@@ -147,12 +147,18 @@ comprehensions and <code>Enum</code> functions.</p>
 <p>Implementors provide <code>next/1</code> which takes an iteration state
 and returns <code>{:cont, value, next_state}</code> to yield a value,
 or <code>{:done, ignored_value, state}</code> when iteration is complete.</p>
-<p>For lists, the list itself is the state.
-For ranges, the Range struct is the initial state.</p>
+<p>The returned <code>next_state</code> is the value to pass to the next
+<code>Enumerable.next/1</code> call. Implementations may use cursor-backed state
+internally, but the state must continue to satisfy the same public
+collection contract as the implementation's declared return type.</p>
+<p>Implementors also provide <code>dispose/1</code> so callers that intentionally
+stop early can release any resources owned by an unconsumed iteration
+state without walking the rest of the collection.</p>
 </div>
 <h2 id="required-functions">Required Functions</h2>
 <table class="summary">
-<tr><td class="summary-name"><a href="#next-0">next/0</a></td><td class="summary-doc">next(state) -&gt; {Atom, element, any}</td></tr>
+<tr><td class="summary-name"><a href="#next-0">next/0</a></td><td class="summary-doc">next(state) -&gt; {Atom, element, Enumerable(element)}</td></tr>
+<tr><td class="summary-name"><a href="#dispose-0">dispose/0</a></td><td class="summary-doc">dispose(state) -&gt; Nil</td></tr>
 </table>
 </main>
 </div>

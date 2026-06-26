@@ -270,7 +270,7 @@ fn renderSingle(
     // render matches the batch render exactly (sources, line offset, tier).
     // Color is forced OFF for the embedded `rendered` string so the JSON
     // payload is free of ANSI escapes regardless of the parent's TTY state.
-    single.setSources(engine.sources.items);
+    try single.setSources(engine.sources.items);
     single.setLineOffset(engine.line_offset);
     single.tier = engine.tier;
     single.use_color = false;
@@ -446,7 +446,7 @@ test "serialize produces a well-formed schema-versioned document" {
 
     var engine = diagnostics.DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("pub fn foo() {\n  bar()\n}\n", "test.zap");
+    try engine.setSource("pub fn foo() {\n  bar()\n}\n", "test.zap");
 
     try engine.reportDiagnostic(.{
         .severity = .@"error",
@@ -475,7 +475,9 @@ test "serialize produces a well-formed schema-versioned document" {
     try std.testing.expectEqualStrings("undefined function `bar/0`", first.get("message").?.string);
 
     // LSP range is zero-based: line 2 -> 1, col 3 -> char 2.
-    const range = first.get("primary_span").?.object.get("range").?.object;
+    const primary_span = first.get("primary_span").?.object;
+    try std.testing.expectEqualStrings("test.zap", primary_span.get("file").?.string);
+    const range = primary_span.get("range").?.object;
     const start = range.get("start").?.object;
     try std.testing.expectEqual(@as(i64, 1), start.get("line").?.integer);
     try std.testing.expectEqual(@as(i64, 2), start.get("character").?.integer);
@@ -487,6 +489,45 @@ test "serialize produces a well-formed schema-versioned document" {
     // `rendered` mirrors the human text.
     const rendered = first.get("rendered").?.string;
     try std.testing.expect(std.mem.indexOf(u8, rendered, "undefined function `bar/0`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "bar()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "^^^ not found in this scope") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "test.zap:2:3") != null);
+}
+
+test "serialize propagates OOM from rendered source registration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var engine = diagnostics.DiagnosticEngine.init(alloc);
+    defer engine.deinit();
+    try engine.setSource("pub fn foo() {\n  bar()\n}\n", "test.zap");
+
+    try engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .domain = .name,
+        .message = "undefined function `bar/0`",
+        .span = .{ .start = 15, .end = 18, .line = 2, .col = 3 },
+        .label = "not found in this scope",
+        .code = "Z0100",
+    });
+
+    var saw_induced_failure = false;
+    for (0..128) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const failing_alloc = failing_allocator.allocator();
+
+        const json_text = serialize(&engine, failing_alloc) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing_allocator.has_induced_failure);
+            saw_induced_failure = true;
+            continue;
+        };
+        failing_alloc.free(json_text);
+        try std.testing.expect(!failing_allocator.has_induced_failure);
+        break;
+    }
+    try std.testing.expect(saw_induced_failure);
 }
 
 test "serialize projects fixits with applicability and cause chain" {
@@ -496,7 +537,7 @@ test "serialize projects fixits with applicability and cause chain" {
 
     var engine = diagnostics.DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("x = 1\n", "f.zap");
+    try engine.setSource("x = 1\n", "f.zap");
 
     try engine.reportDiagnostic(.{
         .severity = .@"error",
@@ -548,7 +589,7 @@ test "serialize round-trips a multi-diagnostic compile deterministically" {
 
     var engine = diagnostics.DiagnosticEngine.init(alloc);
     defer engine.deinit();
-    engine.setSource("a\nb\nc\nd\n", "multi.zap");
+    try engine.setSource("a\nb\nc\nd\n", "multi.zap");
 
     // Insert OUT OF ORDER; the serializer must canonicalize.
     try engine.reportDiagnostic(.{ .severity = .@"error", .message = "third", .span = .{ .start = 4, .end = 5, .line = 3, .col = 1 } });

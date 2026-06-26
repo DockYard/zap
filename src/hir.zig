@@ -146,6 +146,7 @@ pub const TypedParam = struct {
     name: ?ast.StringId,
     type_id: TypeId,
     ownership: Ownership = .shared,
+    ownership_explicit: bool = false,
     pattern: ?*const MatchPattern,
     default: ?*const Expr = null,
 };
@@ -866,12 +867,209 @@ pub const PatternMatrix = struct {
 /// Maps bind names to their scrutinee IDs for variable unification (pin patterns).
 pub const BoundScrutinees = std.AutoHashMap(ast.StringId, u32);
 
+pub const MAX_PATTERN_MATRIX_DECISION_NODES: u32 = 200_000;
+pub const MAX_PATTERN_MATRIX_DEPTH: u32 = 4096;
+
+/// Bounds used while compiling a pattern matrix into a decision tree.
+pub const PatternMatrixCompileOptions = struct {
+    max_nodes: u32 = MAX_PATTERN_MATRIX_DECISION_NODES,
+    max_depth: u32 = MAX_PATTERN_MATRIX_DEPTH,
+};
+
+pub const PatternMatrixBudget = struct {
+    nodes: u32 = 0,
+    max_nodes: u32 = MAX_PATTERN_MATRIX_DECISION_NODES,
+    max_depth: u32 = MAX_PATTERN_MATRIX_DEPTH,
+
+    fn enter(self: *PatternMatrixBudget, depth: u32) !void {
+        if (depth >= self.max_depth) return error.PatternMatrixDecisionBudgetExceeded;
+        if (self.nodes >= self.max_nodes) return error.PatternMatrixDecisionBudgetExceeded;
+        self.nodes += 1;
+    }
+};
+
+const MAX_HIR_TYPE_EXPR_RESOLUTION_NODES: usize = 1_000_000;
+const MAX_HIR_TYPE_EXPR_RESOLUTION_DEPTH: usize = 1024;
+const MAX_HIR_PIPE_CHAIN_STEPS: usize = 1_000_000;
+const MAX_HIR_PATTERN_LOWERING_NODES: usize = 1_000_000;
+const MAX_HIR_PATTERN_LOWERING_DEPTH: usize = 1024;
+const MAX_HIR_MATCH_PATTERN_BINDING_NODES: usize = 1_000_000;
+const MAX_HIR_MATCH_PATTERN_BINDING_DEPTH: usize = 1024;
+const MAX_HIR_COLLECTION_TYPE_NODES: usize = 1_000_000;
+const MAX_HIR_COLLECTION_TYPE_DEPTH: usize = 1024;
+const MAX_HIR_RAISE_SCAN_NODES: usize = 1_000_000;
+const MAX_HIR_RAISE_SCAN_DEPTH: usize = 1024;
+const MAX_HIR_TYPE_WALK_NODES: usize = 1_000_000;
+const MAX_HIR_TYPE_WALK_DEPTH: usize = 1024;
+
+const HirTypeExprResolveError = error{
+    OutOfMemory,
+    HirTypeExprResolutionBudgetExceeded,
+};
+
+const HirPipeChainFlattenError = error{
+    OutOfMemory,
+    HirPipeChainBudgetExceeded,
+};
+
+const HirCollectionTypeError = error{
+    OutOfMemory,
+    HirCollectionTypeBudgetExceeded,
+};
+
+const HirRaiseScanError = error{
+    OutOfMemory,
+    HirRaiseScanBudgetExceeded,
+};
+
+const HirTypeWalkError = error{
+    OutOfMemory,
+    HirTypeWalkBudgetExceeded,
+};
+
+const HirPatternLoweringBudget = struct {
+    nodes: usize = 0,
+    depth: usize = 0,
+    max_nodes: usize = MAX_HIR_PATTERN_LOWERING_NODES,
+    max_depth: usize = MAX_HIR_PATTERN_LOWERING_DEPTH,
+
+    fn enter(self: *HirPatternLoweringBudget) !void {
+        if (self.nodes >= self.max_nodes or self.depth >= self.max_depth) {
+            return error.HirPatternLoweringBudgetExceeded;
+        }
+        self.nodes += 1;
+        self.depth += 1;
+    }
+
+    fn leave(self: *HirPatternLoweringBudget) void {
+        std.debug.assert(self.depth != 0);
+        self.depth -= 1;
+    }
+};
+
+const HirMatchPatternBindingBudget = struct {
+    nodes: usize = 0,
+    depth: usize = 0,
+    max_nodes: usize = MAX_HIR_MATCH_PATTERN_BINDING_NODES,
+    max_depth: usize = MAX_HIR_MATCH_PATTERN_BINDING_DEPTH,
+
+    fn enter(self: *HirMatchPatternBindingBudget) !void {
+        if (self.nodes >= self.max_nodes or self.depth >= self.max_depth) {
+            return error.HirMatchPatternBindingBudgetExceeded;
+        }
+        self.nodes += 1;
+        self.depth += 1;
+    }
+
+    fn leave(self: *HirMatchPatternBindingBudget) void {
+        std.debug.assert(self.depth != 0);
+        self.depth -= 1;
+    }
+};
+
+const TypeExprResolutionBudget = struct {
+    nodes: usize = 0,
+    depth: usize = 0,
+    max_nodes: usize = MAX_HIR_TYPE_EXPR_RESOLUTION_NODES,
+    max_depth: usize = MAX_HIR_TYPE_EXPR_RESOLUTION_DEPTH,
+
+    fn enter(self: *TypeExprResolutionBudget) !void {
+        if (self.nodes >= self.max_nodes or self.depth >= self.max_depth) {
+            return error.HirTypeExprResolutionBudgetExceeded;
+        }
+        self.nodes += 1;
+        self.depth += 1;
+    }
+
+    fn leave(self: *TypeExprResolutionBudget) void {
+        std.debug.assert(self.depth != 0);
+        self.depth -= 1;
+    }
+};
+
+const HirCollectionTypeBudget = struct {
+    nodes: usize = 0,
+    depth: usize = 0,
+    max_nodes: usize = MAX_HIR_COLLECTION_TYPE_NODES,
+    max_depth: usize = MAX_HIR_COLLECTION_TYPE_DEPTH,
+
+    fn enter(self: *HirCollectionTypeBudget) HirCollectionTypeError!void {
+        if (self.nodes >= self.max_nodes or self.depth >= self.max_depth) {
+            return error.HirCollectionTypeBudgetExceeded;
+        }
+        self.nodes += 1;
+        self.depth += 1;
+    }
+
+    fn leave(self: *HirCollectionTypeBudget) void {
+        std.debug.assert(self.depth != 0);
+        self.depth -= 1;
+    }
+};
+
+const HirRaiseScanBudget = struct {
+    nodes: usize = 0,
+    max_nodes: usize = MAX_HIR_RAISE_SCAN_NODES,
+    max_depth: usize = MAX_HIR_RAISE_SCAN_DEPTH,
+
+    fn enter(self: *HirRaiseScanBudget, depth: usize) !void {
+        if (self.nodes >= self.max_nodes or depth >= self.max_depth) {
+            return error.HirRaiseScanBudgetExceeded;
+        }
+        self.nodes += 1;
+    }
+};
+
+const HirTypeWalkBudget = struct {
+    nodes: usize = 0,
+    max_nodes: usize = MAX_HIR_TYPE_WALK_NODES,
+    max_depth: usize = MAX_HIR_TYPE_WALK_DEPTH,
+
+    fn enter(self: *HirTypeWalkBudget, depth: usize) !void {
+        if (self.nodes >= self.max_nodes or depth >= self.max_depth) {
+            return error.HirTypeWalkBudgetExceeded;
+        }
+        self.nodes += 1;
+    }
+};
+
+threadlocal var active_pattern_matrix_budget: ?*PatternMatrixBudget = null;
+threadlocal var active_pattern_matrix_depth: u32 = 0;
+
 pub fn compilePatternMatrix(
     allocator: std.mem.Allocator,
     matrix: PatternMatrix,
     scrutinee_ids: []const u32,
     next_id: *u32,
 ) anyerror!*const Decision {
+    return compilePatternMatrixWithOptions(allocator, matrix, scrutinee_ids, next_id, .{});
+}
+
+/// Compile a pattern matrix with explicit decision-tree budget bounds.
+pub fn compilePatternMatrixWithOptions(
+    allocator: std.mem.Allocator,
+    matrix: PatternMatrix,
+    scrutinee_ids: []const u32,
+    next_id: *u32,
+    options: PatternMatrixCompileOptions,
+) anyerror!*const Decision {
+    var local_budget = PatternMatrixBudget{
+        .max_nodes = options.max_nodes,
+        .max_depth = options.max_depth,
+    };
+    const previous_budget = active_pattern_matrix_budget;
+    const previous_depth = active_pattern_matrix_depth;
+    if (previous_budget == null) {
+        active_pattern_matrix_budget = &local_budget;
+        active_pattern_matrix_depth = 0;
+    }
+    defer {
+        if (previous_budget == null) {
+            active_pattern_matrix_budget = previous_budget;
+            active_pattern_matrix_depth = previous_depth;
+        }
+    }
+
     var empty_bound: BoundScrutinees = BoundScrutinees.init(allocator);
     return compilePatternMatrixWithBindings(allocator, matrix, scrutinee_ids, next_id, &empty_bound);
 }
@@ -883,6 +1081,11 @@ fn compilePatternMatrixWithBindings(
     next_id: *u32,
     bound_scrutinees: *BoundScrutinees,
 ) anyerror!*const Decision {
+    const budget = active_pattern_matrix_budget orelse return error.PatternMatrixDecisionBudgetExceeded;
+    try budget.enter(active_pattern_matrix_depth);
+    active_pattern_matrix_depth += 1;
+    defer active_pattern_matrix_depth -= 1;
+
     // Base case: no rows → failure
     if (matrix.rows.len == 0) {
         const d = try allocator.create(Decision);
@@ -2504,6 +2707,18 @@ fn literalEquals(a: LiteralValue, b: LiteralValue) bool {
     };
 }
 
+test "pattern matrix budget rejects excessive decision node work" {
+    var budget = PatternMatrixBudget{ .max_nodes = 1, .max_depth = 16 };
+    try budget.enter(0);
+    try std.testing.expectError(error.PatternMatrixDecisionBudgetExceeded, budget.enter(0));
+}
+
+test "pattern matrix budget rejects excessive recursion depth" {
+    var budget = PatternMatrixBudget{ .max_nodes = 16, .max_depth = 2 };
+    try budget.enter(0);
+    try std.testing.expectError(error.PatternMatrixDecisionBudgetExceeded, budget.enter(2));
+}
+
 // ============================================================
 // Operator → protocol mapping
 // ============================================================
@@ -2523,41 +2738,66 @@ fn sameAsOperand(operand_type: types_mod.TypeId) types_mod.TypeId {
     return operand_type;
 }
 
+fn addTupleTypeWithOwnedElements(
+    store: *types_mod.TypeStore,
+    elements: []const types_mod.TypeId,
+) HirCollectionTypeError!types_mod.TypeId {
+    const previous_type_count = store.types.items.len;
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = elements } });
+    if (tuple_type < previous_type_count) {
+        store.allocator.free(elements);
+    }
+    return tuple_type;
+}
+
 /// Unify two type IDs for the purpose of typing a heterogeneous
 /// collection. Equal types unify to themselves. Disagreeing scalar
 /// types collapse to `TERM`. Tuples of identical arity unify
 /// component-wise — each disagreeing slot becomes `TERM`. Differing
 /// arities fall back to the whole element type being `TERM`.
-fn unifyForCollection(store: *types_mod.TypeStore, a: types_mod.TypeId, b: types_mod.TypeId) types_mod.TypeId {
+fn unifyForCollection(
+    store: *types_mod.TypeStore,
+    a: types_mod.TypeId,
+    b: types_mod.TypeId,
+    budget: *HirCollectionTypeBudget,
+) HirCollectionTypeError!types_mod.TypeId {
     if (a == b) return a;
     if (a == types_mod.TypeStore.UNKNOWN) return b;
     if (b == types_mod.TypeStore.UNKNOWN) return a;
     if (a == types_mod.TypeStore.TERM or b == types_mod.TypeStore.TERM) {
         return types_mod.TypeStore.TERM;
     }
+
+    try budget.enter();
+    defer budget.leave();
+
     const ta = store.getType(a);
     const tb = store.getType(b);
     if (ta == .tuple and tb == .tuple and ta.tuple.elements.len == tb.tuple.elements.len) {
         var any_changed = false;
-        const unified = store.allocator.alloc(types_mod.TypeId, ta.tuple.elements.len) catch return types_mod.TypeStore.TERM;
+        const unified = try store.allocator.alloc(types_mod.TypeId, ta.tuple.elements.len);
+        errdefer store.allocator.free(unified);
         for (ta.tuple.elements, tb.tuple.elements, 0..) |ea, eb, i| {
-            const u = unifyForCollection(store, ea, eb);
+            const u = try unifyForCollection(store, ea, eb, budget);
             if (u != ea) any_changed = true;
             unified[i] = u;
         }
-        if (!any_changed) return a;
-        return store.addType(.{ .tuple = .{ .elements = unified } }) catch types_mod.TypeStore.TERM;
+        if (!any_changed) {
+            store.allocator.free(unified);
+            return a;
+        }
+        return try addTupleTypeWithOwnedElements(store, unified);
     }
     if (ta == .list and tb == .list) {
-        const u = unifyForCollection(store, ta.list.element, tb.list.element);
+        const u = try unifyForCollection(store, ta.list.element, tb.list.element, budget);
         if (u == ta.list.element) return a;
-        return store.addType(.{ .list = .{ .element = u } }) catch types_mod.TypeStore.TERM;
+        return try store.addType(.{ .list = .{ .element = u } });
     }
     if (ta == .map and tb == .map) {
-        const uk = unifyForCollection(store, ta.map.key, tb.map.key);
-        const uv = unifyForCollection(store, ta.map.value, tb.map.value);
+        const uk = try unifyForCollection(store, ta.map.key, tb.map.key, budget);
+        const uv = try unifyForCollection(store, ta.map.value, tb.map.value, budget);
         if (uk == ta.map.key and uv == ta.map.value) return a;
-        return store.addType(.{ .map = .{ .key = uk, .value = uv } }) catch types_mod.TypeStore.TERM;
+        return try store.addType(.{ .map = .{ .key = uk, .value = uv } });
     }
     return types_mod.TypeStore.TERM;
 }
@@ -2569,9 +2809,18 @@ fn unifyForCollection(store: *types_mod.TypeStore, a: types_mod.TypeId, b: types
 /// like `[{:name, "x"}, {:age, 42}]` becomes `[{Atom, Term}]` and BOTH
 /// child tuples are re-typed to `{Atom, Term}` so the IR builder can
 /// thread the term-promoted slots into `tuple_init`'s component_types.
-fn propagateUnifiedTypeToElement(store: *types_mod.TypeStore, elem: *Expr, unified: types_mod.TypeId) void {
+fn propagateUnifiedTypeToElement(
+    store: *types_mod.TypeStore,
+    elem: *Expr,
+    unified: types_mod.TypeId,
+    budget: *HirCollectionTypeBudget,
+) HirCollectionTypeError!void {
     if (elem.type_id == unified) return;
     if (unified == types_mod.TypeStore.UNKNOWN) return;
+
+    try budget.enter();
+    defer budget.leave();
+
     const elem_kind = store.getType(elem.type_id);
     const uni_kind = store.getType(unified);
 
@@ -2585,7 +2834,7 @@ fn propagateUnifiedTypeToElement(store: *types_mod.TypeStore, elem: *Expr, unifi
         if (elem.kind == .tuple_init) {
             const children = elem.kind.tuple_init;
             for (children, uni_kind.tuple.elements) |child, child_uni| {
-                propagateUnifiedTypeToElement(store, @constCast(child), child_uni);
+                try propagateUnifiedTypeToElement(store, @constCast(child), child_uni, budget);
             }
         }
         elem.type_id = unified;
@@ -2597,7 +2846,20 @@ fn propagateUnifiedTypeToElement(store: *types_mod.TypeStore, elem: *Expr, unifi
         if (elem.kind == .list_init) {
             const children = elem.kind.list_init;
             for (children) |child| {
-                propagateUnifiedTypeToElement(store, @constCast(child), uni_kind.list.element);
+                try propagateUnifiedTypeToElement(store, @constCast(child), uni_kind.list.element, budget);
+            }
+        }
+        elem.type_id = unified;
+        return;
+    }
+
+    // Map — recurse into each key and value expression.
+    if (elem_kind == .map and uni_kind == .map) {
+        if (elem.kind == .map_init) {
+            const entries = elem.kind.map_init;
+            for (entries) |entry| {
+                try propagateUnifiedTypeToElement(store, @constCast(entry.key), uni_kind.map.key, budget);
+                try propagateUnifiedTypeToElement(store, @constCast(entry.value), uni_kind.map.value, budget);
             }
         }
         elem.type_id = unified;
@@ -2732,8 +2994,7 @@ pub const HirBuilder = struct {
     /// type B = A`) would otherwise recurse forever; pushing before
     /// recursing and checking membership on entry stops the loop. The
     /// type-checker already reports the cycle diagnostic, so HIR resolution
-    /// (which never emits user diagnostics from `resolveTypeExpr`) just
-    /// yields `UNKNOWN` on detection. Empty outside alias resolution.
+    /// just yields `UNKNOWN` on detection. Empty outside alias resolution.
     alias_resolution_stack: std.ArrayListUnmanaged(scope_mod.TypeId) = .empty,
     /// The resolved compilation target as comptime atom names, surfaced to
     /// Zap source through the `@target` intrinsic. Populated by the
@@ -2838,6 +3099,136 @@ pub const HirBuilder = struct {
         });
     }
 
+    fn enterPatternLoweringBudget(
+        self: *HirBuilder,
+        budget: *HirPatternLoweringBudget,
+        span: ast.SourceSpan,
+    ) !void {
+        budget.enter() catch |err| switch (err) {
+            error.HirPatternLoweringBudgetExceeded => {
+                try self.errors.append(self.allocator, .{
+                    .message = "HIR pattern lowering budget exceeded while walking macro-expanded syntax",
+                    .span = span,
+                    .label = "pattern nesting exceeds the HIR lowering budget",
+                    .help = "reduce the nesting produced by this macro or split the generated pattern into smaller shapes",
+                });
+                return err;
+            },
+        };
+    }
+
+    fn enterMatchPatternBindingBudget(
+        self: *HirBuilder,
+        budget: *HirMatchPatternBindingBudget,
+        span: ast.SourceSpan,
+    ) !void {
+        budget.enter() catch |err| switch (err) {
+            error.HirMatchPatternBindingBudgetExceeded => {
+                try self.errors.append(self.allocator, .{
+                    .message = "HIR match-pattern binding budget exceeded while walking macro-expanded syntax",
+                    .span = span,
+                    .label = "match-pattern nesting exceeds the binding collection budget",
+                    .help = "reduce the nesting produced by this macro or split the generated match into smaller shapes",
+                });
+                return err;
+            },
+        };
+    }
+
+    fn enterPipeChainFlattenBudget(
+        self: *HirBuilder,
+        steps_seen: *usize,
+        max_steps: usize,
+        span: ast.SourceSpan,
+    ) HirPipeChainFlattenError!void {
+        if (steps_seen.* >= max_steps) {
+            try self.errors.append(self.allocator, .{
+                .message = "HIR pipe-chain flattening budget exceeded while walking macro-expanded syntax",
+                .span = span,
+                .label = "pipe chain contains more steps than the HIR lowering budget permits",
+                .help = "reduce the nesting produced by this macro or split the generated pipe chain into smaller expressions",
+            });
+            return error.HirPipeChainBudgetExceeded;
+        }
+        steps_seen.* += 1;
+    }
+
+    fn enterTypeExprResolutionBudget(
+        self: *const HirBuilder,
+        budget: *TypeExprResolutionBudget,
+        span: ast.SourceSpan,
+    ) HirTypeExprResolveError!void {
+        budget.enter() catch |err| switch (err) {
+            error.HirTypeExprResolutionBudgetExceeded => {
+                const self_mut: *HirBuilder = @constCast(self);
+                try self_mut.errors.append(self.allocator, .{
+                    .message = "HIR type-expression resolution budget exceeded while walking macro-expanded syntax",
+                    .span = span,
+                    .label = "type expression nesting exceeds the HIR resolution budget",
+                    .help = "reduce the nesting produced by this macro or split the generated type expression into smaller declarations",
+                });
+                return err;
+            },
+        };
+    }
+
+    fn reportCollectionTypeError(
+        self: *HirBuilder,
+        err: HirCollectionTypeError,
+        span: ast.SourceSpan,
+    ) HirCollectionTypeError!void {
+        switch (err) {
+            error.OutOfMemory => return err,
+            error.HirCollectionTypeBudgetExceeded => {
+                try self.errors.append(self.allocator, .{
+                    .message = "HIR collection type traversal budget exceeded while unifying nested collection literals",
+                    .span = span,
+                    .label = "collection type nesting exceeds the HIR lowering budget",
+                    .help = "reduce the nesting produced by this macro or split the generated collection into smaller expressions",
+                });
+                return err;
+            },
+        }
+    }
+
+    fn enterRaiseScanBudget(
+        self: *HirBuilder,
+        budget: *HirRaiseScanBudget,
+        span: ast.SourceSpan,
+        depth: usize,
+    ) HirRaiseScanError!void {
+        budget.enter(depth) catch |err| switch (err) {
+            error.HirRaiseScanBudgetExceeded => {
+                try self.errors.append(self.allocator, .{
+                    .message = "HIR raise scan budget exceeded while walking lowered syntax",
+                    .span = span,
+                    .label = "HIR nesting exceeds the raise validation budget",
+                    .help = "reduce the nesting produced by this macro or split the generated expression into smaller functions",
+                });
+                return err;
+            },
+        };
+    }
+
+    fn enterTypeWalkBudget(
+        self: *HirBuilder,
+        budget: *HirTypeWalkBudget,
+        span: ast.SourceSpan,
+        depth: usize,
+    ) HirTypeWalkError!void {
+        budget.enter(depth) catch |err| switch (err) {
+            error.HirTypeWalkBudgetExceeded => {
+                try self.errors.append(self.allocator, .{
+                    .message = "HIR type walk budget exceeded while scanning lowered types",
+                    .span = span,
+                    .label = "type nesting exceeds the HIR type walk budget",
+                    .help = "reduce the nesting produced by this macro or split the generated type into smaller declarations",
+                });
+                return err;
+            },
+        };
+    }
+
     fn isNativeTypeName(self: *const HirBuilder, kind: scope_mod.NativeTypeKind, name: ast.StringId) bool {
         const registered = self.graph.nativeTypeStructName(kind) orelse return false;
         return registered == name or std.mem.eql(u8, self.interner.get(registered), self.interner.get(name));
@@ -2904,7 +3295,7 @@ pub const HirBuilder = struct {
 
         const protocol_type_args = try self.allocator.alloc(TypeId, impl_d.protocol_type_args.len);
         for (impl_d.protocol_type_args, 0..) |type_arg, index| {
-            protocol_type_args[index] = self.resolveTypeExpr(type_arg);
+            protocol_type_args[index] = try self.resolveTypeExpr(type_arg);
         }
 
         return .{
@@ -2951,7 +3342,7 @@ pub const HirBuilder = struct {
         return prov.type_id;
     }
 
-    fn resolveBindingType(self: *const HirBuilder, name: ast.StringId, reference_scopes: scope_mod.ScopeSet) types_mod.TypeId {
+    fn resolveBindingType(self: *const HirBuilder, name: ast.StringId, reference_scopes: scope_mod.ScopeSet) anyerror!types_mod.TypeId {
         // Elixir-style shadowing: walk assignment bindings in reverse
         // so the most recent rebinding wins over any earlier ones.
         // This must mirror `buildBindingReference`'s ordering — both
@@ -2987,7 +3378,7 @@ pub const HirBuilder = struct {
                 if (pn == name and idx < self.current_param_types.len) {
                     const param_tid = self.current_param_types[idx];
                     if (param_tid != types_mod.TypeStore.UNKNOWN and
-                        self.type_store.containsTypeVars(param_tid))
+                        try self.type_store.containsTypeVars(param_tid))
                     {
                         return param_tid;
                     }
@@ -3044,7 +3435,7 @@ pub const HirBuilder = struct {
         arity: u32,
         call_args: []const CallArg,
         raw_return: types_mod.TypeId,
-    ) types_mod.TypeId {
+    ) anyerror!types_mod.TypeId {
         // Find the target struct's scope, then resolve the family through
         // the scope's `function_families` map. This goes through the
         // public `resolveFamily` API which honours impl-registered
@@ -3068,7 +3459,7 @@ pub const HirBuilder = struct {
             if (first_clause.clause_index >= first_clause.decl.clauses.len) continue;
             const clause = first_clause.decl.clauses[first_clause.clause_index];
             if (clause.params.len != arity) continue;
-            return self.substituteReturnTypeFromArgs(&clause, call_args, raw_return);
+            return try self.substituteReturnTypeFromArgs(&clause, call_args, raw_return);
         }
         return raw_return;
     }
@@ -3083,7 +3474,7 @@ pub const HirBuilder = struct {
         arity: u32,
         call_args: []const CallArg,
         raw_return: types_mod.TypeId,
-    ) types_mod.TypeId {
+    ) anyerror!types_mod.TypeId {
         const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         const fam_id = self.graph.resolveFamily(scope_id, name, arity) orelse return raw_return;
         const family = self.graph.getFamily(fam_id);
@@ -3092,7 +3483,7 @@ pub const HirBuilder = struct {
         if (first_clause.clause_index >= first_clause.decl.clauses.len) return raw_return;
         const clause = first_clause.decl.clauses[first_clause.clause_index];
         if (clause.params.len != arity) return raw_return;
-        return self.substituteReturnTypeFromArgs(&clause, call_args, raw_return);
+        return try self.substituteReturnTypeFromArgs(&clause, call_args, raw_return);
     }
 
     /// Shared inference: walk params, unify with arg types into a substitution
@@ -3108,7 +3499,7 @@ pub const HirBuilder = struct {
         clause: *const ast.FunctionClause,
         call_args: []const CallArg,
         raw_return: types_mod.TypeId,
-    ) types_mod.TypeId {
+    ) anyerror!types_mod.TypeId {
         const self_mut: *HirBuilder = @constCast(self);
         const saved_scope = self_mut.hir_type_var_scope;
         self_mut.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
@@ -3124,37 +3515,93 @@ pub const HirBuilder = struct {
             if (arg_type == types_mod.TypeStore.UNKNOWN) {
                 if (call_args[i].expr.kind == .list_init and call_args[i].expr.kind.list_init.len == 0) {
                     const store_ptr2: *types_mod.TypeStore = @constCast(self.type_store);
-                    arg_type = store_ptr2.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } }) catch types_mod.TypeStore.UNKNOWN;
+                    arg_type = try store_ptr2.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } });
                 }
                 if (arg_type == types_mod.TypeStore.UNKNOWN) continue;
             }
             if (param.type_annotation) |ta| {
-                const param_type = self.resolveTypeExpr(ta);
+                const param_type = try self.resolveTypeExpr(ta);
                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                _ = store_ptr.unify(param_type, arg_type, &subs) catch {};
+                _ = try store_ptr.unify(param_type, arg_type, &subs);
             }
         }
         if (subs.bindings.count() > 0) {
             // Resolve raw_return through the same type var scope, then substitute.
             if (clause.return_type) |rt| {
-                const resolved_return = self.resolveTypeExpr(rt);
+                const resolved_return = try self.resolveTypeExpr(rt);
                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                return subs.applyToType(store_ptr, resolved_return);
+                return try subs.applyToType(store_ptr, resolved_return);
             }
             const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-            return subs.applyToType(store_ptr, raw_return);
+            return try subs.applyToType(store_ptr, raw_return);
         }
         // No inference possible (all args UNKNOWN, e.g. case-clause bindings
         // without propagated types). Return UNKNOWN rather than an unresolved
         // type variable so downstream UNKNOWN-tolerant checks apply.
         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-        if (store_ptr.containsTypeVars(raw_return)) return types_mod.TypeStore.UNKNOWN;
+        if (try store_ptr.containsTypeVars(raw_return)) return types_mod.TypeStore.UNKNOWN;
         return raw_return;
+    }
+
+    fn substituteProtocolReturnTypeFromArgs(
+        self: *const HirBuilder,
+        signature: *const ast.ProtocolFunctionSig,
+        call_args: []const CallArg,
+    ) anyerror!types_mod.TypeId {
+        const return_type_expr = signature.return_type orelse return types_mod.TypeStore.UNKNOWN;
+        const self_mut: *HirBuilder = @constCast(self);
+        const saved_scope = self_mut.hir_type_var_scope;
+        self_mut.hir_type_var_scope = std.StringHashMap(types_mod.TypeId).init(self.allocator);
+        defer {
+            self_mut.hir_type_var_scope.deinit();
+            self_mut.hir_type_var_scope = saved_scope;
+        }
+
+        var subs = types_mod.SubstitutionMap.init(self.allocator);
+        defer subs.deinit();
+
+        for (signature.params, 0..) |param, param_index| {
+            if (param_index >= call_args.len) break;
+            const annotation = param.type_annotation orelse continue;
+            const arg_type = call_args[param_index].expr.type_id;
+            if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
+            const param_type = try self.resolveTypeExpr(annotation);
+            try self.bindProtocolConstraintTypeArgs(param_type, arg_type, &subs);
+            const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+            _ = try store_ptr.unify(param_type, arg_type, &subs);
+        }
+
+        const resolved_return = try self.resolveTypeExpr(return_type_expr);
+        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+        if (subs.bindings.count() > 0) {
+            return try subs.applyToType(store_ptr, resolved_return);
+        }
+        if (try store_ptr.containsTypeVars(resolved_return)) return types_mod.TypeStore.UNKNOWN;
+        return resolved_return;
+    }
+
+    fn bindProtocolConstraintTypeArgs(
+        self: *const HirBuilder,
+        formal_type: types_mod.TypeId,
+        actual_type: types_mod.TypeId,
+        subs: *types_mod.SubstitutionMap,
+    ) anyerror!void {
+        const formal = self.type_store.getType(formal_type);
+        if (formal != .protocol_constraint) return;
+        const actual = self.type_store.getType(actual_type);
+        if (actual != .protocol_constraint) return;
+        if (formal.protocol_constraint.protocol_name != actual.protocol_constraint.protocol_name) return;
+        if (formal.protocol_constraint.type_params.len != actual.protocol_constraint.type_params.len) return;
+
+        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+        for (formal.protocol_constraint.type_params, actual.protocol_constraint.type_params) |formal_arg, actual_arg| {
+            _ = try store_ptr.unify(formal_arg, actual_arg, subs);
+        }
     }
 
     /// Resolve a function's return type within a specific struct
     /// (for cross-struct calls).
-    fn resolveFunctionReturnTypeInStruct(self: *const HirBuilder, struct_simple: []const u8, func_name: []const u8, arity: u32) types_mod.TypeId {
+    fn resolveFunctionReturnTypeInStruct(self: *const HirBuilder, struct_simple: []const u8, func_name: []const u8, arity: u32) anyerror!types_mod.TypeId {
         // Find the matching struct's scope, then look up the family
         // via the scope's `function_families` map. The map covers
         // both functions declared inside the struct AND impl
@@ -3168,7 +3615,7 @@ pub const HirBuilder = struct {
         const key = scope_mod.FamilyKey{ .name = func_name_id, .arity = arity };
         for (self.graph.structs.items) |struct_entry| {
             if (struct_entry.name.parts.len == 0) continue;
-            if (!self.structNameMatchesCallQualifier(struct_entry.name, struct_simple)) continue;
+            if (!(try self.structNameMatchesCallQualifier(struct_entry.name, struct_simple))) continue;
             const struct_scope = self.graph.getScope(struct_entry.scope_id);
             const fam_id = struct_scope.function_families.get(key) orelse continue;
             const family = self.graph.getFamily(fam_id);
@@ -3177,8 +3624,8 @@ pub const HirBuilder = struct {
                 if (first_clause.clause_index < first_clause.decl.clauses.len) {
                     const clause = first_clause.decl.clauses[first_clause.clause_index];
                     if (clause.return_type) |rt| {
-                        const resolved = self.resolveTypeExpr(rt);
-                        return @constCast(self).applyReturnTypeClosureEffectForCallee(resolved, &clause);
+                        const resolved = try self.resolveTypeExpr(rt);
+                        return try @constCast(self).applyReturnTypeClosureEffectForCallee(resolved, &clause);
                     }
                 }
             }
@@ -3186,7 +3633,25 @@ pub const HirBuilder = struct {
         return types_mod.TypeStore.UNKNOWN;
     }
 
-    fn resolveFunctionReturnType(self: *const HirBuilder, name: ast.StringId, arity: u32) types_mod.TypeId {
+    fn resolveProtocolFunctionReturnType(
+        self: *const HirBuilder,
+        protocol_simple: []const u8,
+        func_name: []const u8,
+        arity: u32,
+        call_args: []const CallArg,
+    ) anyerror!types_mod.TypeId {
+        const func_name_id = self.interner.lookupExisting(func_name) orelse return types_mod.TypeStore.UNKNOWN;
+        for (self.graph.protocols.items) |protocol_entry| {
+            if (!(try self.structNameMatchesCallQualifier(protocol_entry.name, protocol_simple))) continue;
+            for (protocol_entry.decl.functions) |*signature| {
+                if (signature.name != func_name_id or signature.params.len != arity) continue;
+                return try self.substituteProtocolReturnTypeFromArgs(signature, call_args);
+            }
+        }
+        return types_mod.TypeStore.UNKNOWN;
+    }
+
+    fn resolveFunctionReturnType(self: *const HirBuilder, name: ast.StringId, arity: u32) anyerror!types_mod.TypeId {
         const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveFamily(scope_id, name, arity)) |fam_id| {
             const family = self.graph.getFamily(fam_id);
@@ -3195,8 +3660,8 @@ pub const HirBuilder = struct {
                 if (first_clause.clause_index < first_clause.decl.clauses.len) {
                     const clause = first_clause.decl.clauses[first_clause.clause_index];
                     if (clause.return_type) |rt| {
-                        const resolved = self.resolveTypeExpr(rt);
-                        return @constCast(self).applyReturnTypeClosureEffectForCallee(resolved, &clause);
+                        const resolved = try self.resolveTypeExpr(rt);
+                        return try @constCast(self).applyReturnTypeClosureEffectForCallee(resolved, &clause);
                     }
                 }
             }
@@ -3225,7 +3690,7 @@ pub const HirBuilder = struct {
     /// Pure variable-binding / wildcard clauses with no guard are always
     /// total — they don't need a `__try` variant and would not benefit from
     /// catch-basin handling.
-    fn isFunctionMultiClause(self: *const HirBuilder, name: ast.StringId, arity: u32) bool {
+    fn isFunctionMultiClause(self: *HirBuilder, name: ast.StringId, arity: u32) !bool {
         const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         if (self.graph.resolveFamily(scope_id, name, arity)) |fam_id| {
             const family = self.graph.getFamily(fam_id);
@@ -3235,7 +3700,7 @@ pub const HirBuilder = struct {
                 const clause = clause_ref.decl.clauses[clause_ref.clause_index];
                 if (clause.refinement != null) return true;
                 for (clause.params) |param| {
-                    if (!isTotalParamPattern(param.pattern)) return true;
+                    if (!(try self.isTotalParamPattern(param.pattern))) return true;
                 }
             }
         }
@@ -3247,10 +3712,22 @@ pub const HirBuilder = struct {
     /// Bare bindings, wildcards, and parenthesised total patterns qualify.
     /// Anything that does runtime structural inspection (literals, tuples,
     /// lists, maps, struct patterns, binaries, pins) is non-total.
-    fn isTotalParamPattern(pattern: *const ast.Pattern) bool {
+    fn isTotalParamPattern(self: *HirBuilder, pattern: *const ast.Pattern) !bool {
+        var budget = HirPatternLoweringBudget{};
+        return try self.isTotalParamPatternBudgeted(pattern, &budget);
+    }
+
+    fn isTotalParamPatternBudgeted(
+        self: *HirBuilder,
+        pattern: *const ast.Pattern,
+        budget: *HirPatternLoweringBudget,
+    ) !bool {
+        try self.enterPatternLoweringBudget(budget, pattern.getMeta().span);
+        defer budget.leave();
+
         return switch (pattern.*) {
             .wildcard, .bind => true,
-            .paren => |p| isTotalParamPattern(p.inner),
+            .paren => |p| try self.isTotalParamPatternBudgeted(p.inner, budget),
             else => false,
         };
     }
@@ -3301,7 +3778,7 @@ pub const HirBuilder = struct {
         };
     }
 
-    fn resolveFunctionParamOwnerships(self: *HirBuilder, name: ast.StringId, arity: u32) ?[]const Ownership {
+    fn resolveFunctionParamOwnerships(self: *HirBuilder, name: ast.StringId, arity: u32) anyerror!?[]const Ownership {
         const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         const family_id = self.graph.resolveFamily(scope_id, name, arity) orelse return null;
         const family = self.graph.getFamily(family_id);
@@ -3310,7 +3787,7 @@ pub const HirBuilder = struct {
         if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
         const clause = clause_ref.decl.clauses[clause_ref.clause_index];
 
-        const ownerships = self.allocator.alloc(Ownership, clause.params.len) catch return null;
+        const ownerships = try self.allocator.alloc(Ownership, clause.params.len);
         for (clause.params, 0..) |param, idx| {
             ownerships[idx] = blk: {
                 if (param.pattern.* == .bind) {
@@ -3322,7 +3799,7 @@ pub const HirBuilder = struct {
                     }
                 }
                 if (param.type_annotation) |ann| {
-                    break :blk self.resolveParamOwnership(param, self.resolveTypeExpr(ann));
+                    break :blk self.resolveParamOwnership(param, try self.resolveTypeExpr(ann));
                 }
                 break :blk .shared;
             };
@@ -3330,9 +3807,53 @@ pub const HirBuilder = struct {
         return ownerships;
     }
 
+    fn resolveProtocolParamOwnerships(
+        self: *HirBuilder,
+        protocol_name: []const u8,
+        function_name: []const u8,
+        arity: u32,
+    ) anyerror!?[]const Ownership {
+        for (self.graph.protocols.items) |entry| {
+            if (!(try self.structNameMatchesText(entry.name, protocol_name))) continue;
+            for (entry.decl.functions) |function_sig| {
+                if (!std.mem.eql(u8, self.interner.get(function_sig.name), function_name)) continue;
+                if (function_sig.params.len != arity) continue;
+                const ownerships = try self.allocator.alloc(Ownership, function_sig.params.len);
+                for (function_sig.params, 0..) |param, index| {
+                    ownerships[index] = mapAstOwnership(param.ownership);
+                }
+                return ownerships;
+            }
+        }
+        return null;
+    }
+
+    fn applyOwnershipsToCallArgs(args: []CallArg, ownerships: []const Ownership) void {
+        const count = @min(args.len, ownerships.len);
+        for (args[0..count], ownerships[0..count]) |*arg, ownership| {
+            arg.mode = switch (ownership) {
+                .shared => .share,
+                .unique => .move,
+                .borrowed => .borrow,
+            };
+        }
+    }
+
+    fn applyExplicitOwnershipsToCallArgs(args: []CallArg, ownerships: []const Ownership, explicit_flags: []const bool) void {
+        const count = @min(@min(args.len, ownerships.len), explicit_flags.len);
+        for (args[0..count], ownerships[0..count], explicit_flags[0..count]) |*arg, ownership, explicit| {
+            if (!explicit) continue;
+            arg.mode = switch (ownership) {
+                .shared => .share,
+                .unique => .move,
+                .borrowed => .borrow,
+            };
+        }
+    }
+
     /// Resolve the declared parameter types for a function by name and arity.
     /// Used to populate CallArg.expected_type for implicit numeric widening.
-    fn resolveFunctionParamTypes(self: *HirBuilder, name: ast.StringId, arity: u32) ?[]const types_mod.TypeId {
+    fn resolveFunctionParamTypes(self: *HirBuilder, name: ast.StringId, arity: u32) anyerror!?[]const types_mod.TypeId {
         const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
         const family_id = self.graph.resolveFamily(scope_id, name, arity) orelse return null;
         const family = self.graph.getFamily(family_id);
@@ -3341,7 +3862,7 @@ pub const HirBuilder = struct {
         if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
         const clause = clause_ref.decl.clauses[clause_ref.clause_index];
 
-        const param_types = self.allocator.alloc(types_mod.TypeId, clause.params.len) catch return null;
+        const param_types = try self.allocator.alloc(types_mod.TypeId, clause.params.len);
         for (clause.params, 0..) |param, idx| {
             param_types[idx] = blk: {
                 if (param.pattern.* == .bind) {
@@ -3353,7 +3874,7 @@ pub const HirBuilder = struct {
                     }
                 }
                 if (param.type_annotation) |ann| {
-                    break :blk self.resolveTypeExpr(ann);
+                    break :blk try self.resolveTypeExpr(ann);
                 }
                 break :blk types_mod.TypeStore.UNKNOWN;
             };
@@ -3364,11 +3885,12 @@ pub const HirBuilder = struct {
     const ResolvedFunctionCall = struct {
         param_types: []const types_mod.TypeId,
         param_ownerships: []const Ownership,
+        param_ownerships_explicit: []const bool,
         return_type: types_mod.TypeId,
         clause_index: u32,
     };
 
-    fn resolveCallInScope(self: *HirBuilder, scope_id: scope_mod.ScopeId, name: ast.StringId, arity: u32, args: []const CallArg) ?ResolvedFunctionCall {
+    fn resolveCallInScope(self: *HirBuilder, scope_id: scope_mod.ScopeId, name: ast.StringId, arity: u32, args: []const CallArg) anyerror!?ResolvedFunctionCall {
         const resolved = self.graph.resolveFamilyAllowingDefaults(scope_id, name, arity) orelse return null;
         const family = self.graph.getFamily(resolved.family_id);
         if (family.clauses.items.len == 0) return null;
@@ -3393,8 +3915,8 @@ pub const HirBuilder = struct {
         var best_cost: u32 = std.math.maxInt(u32);
         var best_rank: u32 = std.math.maxInt(u32);
         for (family.clauses.items, 0..) |clause_ref, idx| {
-            const candidate = self.resolveClauseCallInfo(name, arity, resolved.declared_arity, clause_ref, @intCast(idx), args) orelse continue;
-            const cost = self.callInfoMatchCost(candidate, args) orelse continue;
+            const candidate = (try self.resolveClauseCallInfo(name, arity, resolved.declared_arity, clause_ref, @intCast(idx), args)) orelse continue;
+            const cost = (try self.callInfoMatchCost(candidate, args)) orelse continue;
             if (best == null or cost < best_cost) {
                 best = candidate;
                 best_cost = cost;
@@ -3409,7 +3931,7 @@ pub const HirBuilder = struct {
         }
 
         if (best) |resolved_call| return resolved_call;
-        return self.resolveClauseCallInfo(name, arity, resolved.declared_arity, family.clauses.items[0], 0, args);
+        return try self.resolveClauseCallInfo(name, arity, resolved.declared_arity, family.clauses.items[0], 0, args);
     }
 
     /// Score a candidate by how "canonical" its parameter types are when the
@@ -3445,11 +3967,11 @@ pub const HirBuilder = struct {
         return total;
     }
 
-    fn resolveCallInStruct(self: *HirBuilder, struct_name: []const u8, name: ast.StringId, arity: u32, args: []const CallArg) ?ResolvedFunctionCall {
+    fn resolveCallInStruct(self: *HirBuilder, struct_name: []const u8, name: ast.StringId, arity: u32, args: []const CallArg) anyerror!?ResolvedFunctionCall {
         for (self.graph.structs.items) |struct_entry| {
             if (struct_entry.name.parts.len == 0) continue;
-            if (!self.structNameMatchesCallQualifier(struct_entry.name, struct_name)) continue;
-            return self.resolveCallInScope(struct_entry.scope_id, name, arity, args);
+            if (!(try self.structNameMatchesCallQualifier(struct_entry.name, struct_name))) continue;
+            return try self.resolveCallInScope(struct_entry.scope_id, name, arity, args);
         }
         return null;
     }
@@ -3462,11 +3984,12 @@ pub const HirBuilder = struct {
         clause_ref: scope_mod.FunctionClauseRef,
         family_clause_index: u32,
         call_args: []const CallArg,
-    ) ?ResolvedFunctionCall {
+    ) anyerror!?ResolvedFunctionCall {
         if (clause_ref.clause_index >= clause_ref.decl.clauses.len) return null;
         const clause = clause_ref.decl.clauses[clause_ref.clause_index];
-        const param_types = self.allocator.alloc(types_mod.TypeId, clause.params.len) catch return null;
-        const param_ownerships = self.allocator.alloc(Ownership, clause.params.len) catch return null;
+        const param_types = try self.allocator.alloc(types_mod.TypeId, clause.params.len);
+        const param_ownerships = try self.allocator.alloc(Ownership, clause.params.len);
+        const param_ownerships_explicit = try self.allocator.alloc(bool, clause.params.len);
         for (clause.params, 0..) |param, idx| {
             const param_type = blk: {
                 if (param.pattern.* == .bind) {
@@ -3475,19 +3998,22 @@ pub const HirBuilder = struct {
                         if (self.graph.bindings.items[binding_id].type_id) |prov| break :blk prov.type_id;
                     }
                 }
-                if (param.type_annotation) |ann| break :blk self.resolveTypeExpr(ann);
+                if (param.type_annotation) |ann| break :blk try self.resolveTypeExpr(ann);
                 break :blk types_mod.TypeStore.UNKNOWN;
             };
             param_types[idx] = param_type;
             param_ownerships[idx] = self.resolveParamOwnership(param, param_type);
+            param_ownerships_explicit[idx] = param.ownership_explicit;
         }
         var final_param_types = param_types;
         var final_param_ownerships = param_ownerships;
+        var final_param_ownerships_explicit = param_ownerships_explicit;
         if (declared_arity != arity) {
             final_param_types = param_types[0..arity];
             final_param_ownerships = param_ownerships[0..arity];
+            final_param_ownerships_explicit = param_ownerships_explicit[0..arity];
         }
-        var return_type = if (clause.return_type) |rt| self.resolveTypeExpr(rt) else types_mod.TypeStore.UNKNOWN;
+        var return_type = if (clause.return_type) |rt| try self.resolveTypeExpr(rt) else types_mod.TypeStore.UNKNOWN;
         // A generic container clause whose return type is (or contains) a
         // type variable that binds to a boxed `Callable` existential from a
         // concrete argument — e.g. `List.get(list :: List(t), index) -> t`
@@ -3507,9 +4033,9 @@ pub const HirBuilder = struct {
         // callback params would have their result type var resolved
         // DOWNSTREAM (monomorphize / `local_types`), and where applying the
         // partial unification here mis-binds the callback-derived type var.
-        if (self.type_store.containsTypeVars(return_type) and !self.typeMentionsCallable(return_type)) {
-            const substituted = self.substituteReturnTypeFromArgs(&clause, call_args, return_type);
-            if (self.typeMentionsCallable(substituted)) {
+        if ((try self.type_store.containsTypeVars(return_type)) and !(try self.typeMentionsCallable(return_type, clause.meta.span))) {
+            const substituted = try self.substituteReturnTypeFromArgs(&clause, call_args, return_type);
+            if (try self.typeMentionsCallable(substituted, clause.meta.span)) {
                 return_type = substituted;
             }
         }
@@ -3518,21 +4044,22 @@ pub const HirBuilder = struct {
         // effect so the call result is a raising closure value — which the
         // use-site invocation must unwrap (`ir.closureCalleeRaises`). Keeps the
         // call result in lockstep with the callee's widened emitted signature.
-        return_type = self.applyReturnTypeClosureEffectForCallee(return_type, &clause);
+        return_type = try self.applyReturnTypeClosureEffectForCallee(return_type, &clause);
         _ = name;
         return .{
             .param_types = final_param_types,
             .param_ownerships = final_param_ownerships,
+            .param_ownerships_explicit = final_param_ownerships_explicit,
             .return_type = return_type,
             .clause_index = family_clause_index,
         };
     }
 
-    fn callInfoMatchCost(self: *const HirBuilder, call_info: ResolvedFunctionCall, args: []const CallArg) ?u32 {
+    fn callInfoMatchCost(self: *const HirBuilder, call_info: ResolvedFunctionCall, args: []const CallArg) types_mod.TypeGraphError!?u32 {
         var total: u32 = 0;
         const count = @min(call_info.param_types.len, args.len);
         for (args[0..count], call_info.param_types[0..count]) |arg, expected| {
-            const cost = self.type_store.callMatchCost(arg.expr.type_id, expected) orelse return null;
+            const cost = (try self.type_store.callMatchCost(arg.expr.type_id, expected)) orelse return null;
             total +|= cost;
         }
         return total;
@@ -3560,7 +4087,7 @@ pub const HirBuilder = struct {
         const ownerships = try self.allocator.alloc(Ownership, clause.params.len);
         for (clause.params, 0..) |param, idx| {
             const param_type = if (param.type_annotation) |ann|
-                self.resolveTypeExpr(ann)
+                try self.resolveTypeExpr(ann)
             else
                 types_mod.TypeStore.UNKNOWN;
             params[idx] = param_type;
@@ -3568,7 +4095,7 @@ pub const HirBuilder = struct {
         }
 
         const return_type = if (clause.return_type) |rt|
-            self.resolveTypeExpr(rt)
+            try self.resolveTypeExpr(rt)
         else
             types_mod.TypeStore.UNKNOWN;
 
@@ -4270,7 +4797,7 @@ pub const HirBuilder = struct {
         // propagating `raise` in the body lowers to `ret_raise`. Saved and
         // restored around the clause builds.
         const saved_emits_error_union = self.current_function_emits_error_union;
-        self.current_function_emits_error_union = self.functionEmitsErrorUnion(decls[0], scope_id, arity);
+        self.current_function_emits_error_union = try self.functionEmitsErrorUnion(decls[0], scope_id, arity);
         defer self.current_function_emits_error_union = saved_emits_error_union;
 
         // #201 — a nested function group (anonymous closure or named
@@ -4337,7 +4864,7 @@ pub const HirBuilder = struct {
         // lowers to `ret_raise`. Resolved from the type store via the stable
         // qualified key built from the owning struct prefix + name + arity.
         const saved_emits_error_union = self.current_function_emits_error_union;
-        self.current_function_emits_error_union = self.functionEmitsErrorUnion(func, scope_id, arity);
+        self.current_function_emits_error_union = try self.functionEmitsErrorUnion(func, scope_id, arity);
         // #201 — a nested function is a fresh error-handling boundary;
         // an enclosing `try` body's depth must not leak into it (see
         // `buildMergedFunctionGroup` for the full rationale). Reset to 0
@@ -4423,7 +4950,7 @@ pub const HirBuilder = struct {
                 // ! functions must call raise() or another ! function
                 var has_raise = false;
                 for (clauses.items) |clause| {
-                    if (self.bodyContainsRaise(clause.body)) {
+                    if (try self.bodyContainsRaise(clause.body)) {
                         has_raise = true;
                         break;
                     }
@@ -4497,67 +5024,156 @@ pub const HirBuilder = struct {
     }
 
     /// Check if a HIR block contains a call to raise() or a ! function.
-    fn bodyContainsRaise(self: *const HirBuilder, block: *const Block) bool {
-        for (block.stmts) |stmt| {
-            const expr: ?*const Expr = switch (stmt) {
-                .expr => |e| e,
-                .local_set => |ls| ls.value,
-                .function_group => null,
-            };
-            if (expr) |e| {
-                if (self.exprContainsRaise(e)) return true;
+    fn bodyContainsRaise(self: *HirBuilder, block: *const Block) HirRaiseScanError!bool {
+        var budget = HirRaiseScanBudget{};
+        const diagnostic_span = firstExecutableSpan(block) orelse ast.SourceSpan{ .start = 0, .end = 0 };
+        return self.bodyContainsRaiseBudgeted(block, diagnostic_span, &budget);
+    }
+
+    fn bodyContainsRaiseBudgeted(
+        self: *HirBuilder,
+        block: *const Block,
+        diagnostic_span: ast.SourceSpan,
+        budget: *HirRaiseScanBudget,
+    ) HirRaiseScanError!bool {
+        const BlockFrame = struct {
+            block: Block,
+            depth: usize,
+            span: ast.SourceSpan,
+        };
+        const ExprFrame = struct {
+            expr: *const Expr,
+            depth: usize,
+        };
+        const Frame = union(enum) {
+            block: BlockFrame,
+            expr: ExprFrame,
+        };
+
+        var stack: std.ArrayList(Frame) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, .{ .block = .{
+            .block = block.*,
+            .depth = 0,
+            .span = diagnostic_span,
+        } });
+
+        while (stack.items.len > 0) {
+            const frame = stack.items[stack.items.len - 1];
+            stack.items.len -= 1;
+
+            switch (frame) {
+                .block => |block_frame| {
+                    try self.enterRaiseScanBudget(budget, block_frame.span, block_frame.depth);
+                    var index = block_frame.block.stmts.len;
+                    while (index > 0) {
+                        index -= 1;
+                        const expr: ?*const Expr = switch (block_frame.block.stmts[index]) {
+                            .expr => |expr| expr,
+                            .local_set => |local_set| local_set.value,
+                            .function_group => null,
+                        };
+                        if (expr) |child_expr| {
+                            try stack.append(self.allocator, .{ .expr = .{
+                                .expr = child_expr,
+                                .depth = block_frame.depth,
+                            } });
+                        }
+                    }
+                },
+                .expr => |expr_frame| {
+                    try self.enterRaiseScanBudget(budget, expr_frame.expr.span, expr_frame.depth);
+                    switch (expr_frame.expr.kind) {
+                        .call => |call| {
+                            // Check if this call targets raise() or a ! function.
+                            switch (call.target) {
+                                .named => |named| {
+                                    if (std.mem.eql(u8, named.name, "raise")) return true;
+                                    if (named.name.len > 0 and named.name[named.name.len - 1] == '!') return true;
+                                },
+                                .direct => |direct| {
+                                    // Check if the direct target's name ends with !
+                                    for (self.graph.families.items) |family| {
+                                        if (family.id == direct.function_group_id) {
+                                            const fname = self.interner.get(family.name);
+                                            if (std.mem.eql(u8, fname, "raise")) return true;
+                                            if (fname.len > 0 and fname[fname.len - 1] == '!') return true;
+                                            break;
+                                        }
+                                    }
+                                },
+                                else => {},
+                            }
+                            var arg_index = call.args.len;
+                            while (arg_index > 0) {
+                                arg_index -= 1;
+                                try stack.append(self.allocator, .{ .expr = .{
+                                    .expr = call.args[arg_index].expr,
+                                    .depth = expr_frame.depth + 1,
+                                } });
+                            }
+                        },
+                        .case => |case_expr| {
+                            var arm_index = case_expr.arms.len;
+                            while (arm_index > 0) {
+                                arm_index -= 1;
+                                const arm = case_expr.arms[arm_index];
+                                try stack.append(self.allocator, .{ .block = .{
+                                    .block = arm.body.*,
+                                    .depth = expr_frame.depth + 1,
+                                    .span = firstExecutableSpan(arm.body) orelse expr_frame.expr.span,
+                                } });
+                            }
+                        },
+                        .binary => |binary_expr| {
+                            try stack.append(self.allocator, .{ .expr = .{
+                                .expr = binary_expr.rhs,
+                                .depth = expr_frame.depth + 1,
+                            } });
+                            try stack.append(self.allocator, .{ .expr = .{
+                                .expr = binary_expr.lhs,
+                                .depth = expr_frame.depth + 1,
+                            } });
+                        },
+                        .block => |nested_block| {
+                            try stack.append(self.allocator, .{ .block = .{
+                                .block = nested_block,
+                                .depth = expr_frame.depth + 1,
+                                .span = firstExecutableSpan(&nested_block) orelse expr_frame.expr.span,
+                            } });
+                        },
+                        .branch => |branch_expr| {
+                            if (branch_expr.else_block) |else_block| {
+                                try stack.append(self.allocator, .{ .block = .{
+                                    .block = else_block.*,
+                                    .depth = expr_frame.depth + 1,
+                                    .span = firstExecutableSpan(else_block) orelse expr_frame.expr.span,
+                                } });
+                            }
+                            try stack.append(self.allocator, .{ .block = .{
+                                .block = branch_expr.then_block.*,
+                                .depth = expr_frame.depth + 1,
+                                .span = firstExecutableSpan(branch_expr.then_block) orelse expr_frame.expr.span,
+                            } });
+                        },
+                        else => {},
+                    }
+                },
             }
         }
         return false;
     }
 
-    fn exprContainsRaise(self: *const HirBuilder, expr: *const Expr) bool {
-        return switch (expr.kind) {
-            .call => |call| {
-                // Check if this call targets raise() or a ! function
-                switch (call.target) {
-                    .named => |named| {
-                        if (std.mem.eql(u8, named.name, "raise")) return true;
-                        if (named.name.len > 0 and named.name[named.name.len - 1] == '!') return true;
-                    },
-                    .direct => |direct| {
-                        // Check if the direct target's name ends with !
-                        for (self.graph.families.items) |family| {
-                            if (family.id == direct.function_group_id) {
-                                const fname = self.interner.get(family.name);
-                                if (std.mem.eql(u8, fname, "raise")) return true;
-                                if (fname.len > 0 and fname[fname.len - 1] == '!') return true;
-                                break;
-                            }
-                        }
-                    },
-                    else => {},
-                }
-                // Also check args recursively
-                for (call.args) |arg| {
-                    if (self.exprContainsRaise(arg.expr)) return true;
-                }
-                return false;
-            },
-            .case => |ce| {
-                for (ce.arms) |arm| {
-                    if (self.bodyContainsRaise(arm.body)) return true;
-                }
-                return false;
-            },
-            .binary => |bo| {
-                return self.exprContainsRaise(bo.lhs) or self.exprContainsRaise(bo.rhs);
-            },
-            .block => |blk| {
-                return self.bodyContainsRaise(&blk);
-            },
-            .branch => |br| {
-                if (self.bodyContainsRaise(br.then_block)) return true;
-                if (br.else_block) |eb| return self.bodyContainsRaise(eb);
-                return false;
-            },
-            else => false,
-        };
+    fn prebindCurrentImplTypeVars(self: *HirBuilder) !void {
+        const impl_d = self.current_impl orelse return;
+        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+        for (impl_d.type_params) |tp_name_id| {
+            const tp_name = self.interner.get(tp_name_id);
+            if (!self.hir_type_var_scope.contains(tp_name)) {
+                const fresh = try store_ptr.freshVar();
+                try self.hir_type_var_scope.put(tp_name, fresh);
+            }
+        }
     }
 
     fn buildClause(self: *HirBuilder, clause: *const ast.FunctionClause) !Clause {
@@ -4568,16 +5184,7 @@ pub const HirBuilder = struct {
         // their occurrences in this clause's signatures resolve to the
         // same fresh TypeVar across params and return type. Mirrors the
         // type checker's pre-population in checkFunctionClause.
-        if (self.current_impl) |impl_d| {
-            const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-            for (impl_d.type_params) |tp_name_id| {
-                const tp_name = self.interner.get(tp_name_id);
-                if (!self.hir_type_var_scope.contains(tp_name)) {
-                    const fresh = store_ptr.freshVar() catch continue;
-                    self.hir_type_var_scope.put(tp_name, fresh) catch {};
-                }
-            }
-        }
+        try self.prebindCurrentImplTypeVars();
         const prev_clause_scope = self.current_clause_scope;
         // Resolve the clause's scope. Prefers `meta.scope_id` (set
         // directly by the collector) over `node_scope_map` so macro-
@@ -4600,7 +5207,7 @@ pub const HirBuilder = struct {
         var params: std.ArrayList(TypedParam) = .empty;
         for (clause.params, 0..) |param, param_idx| {
             var type_id = if (param.type_annotation) |ann|
-                self.resolveTypeExpr(ann)
+                try self.resolveTypeExpr(ann)
             else if (inferred_sig) |sig| blk: {
                 // Use type inferred from call-site argument types
                 break :blk if (param_idx < sig.param_types.len)
@@ -4620,64 +5227,7 @@ pub const HirBuilder = struct {
             // specialization.
             type_id = self.preferEffectPolymorphicParamType(param, type_id);
 
-            // When a struct pattern has no struct_name (parsed from %{...} :: Type),
-            // inject the type name from the type annotation
-            const match_pattern = blk: {
-                if (param.pattern.* == .struct_pattern and param.type_annotation != null) {
-                    const sp = param.pattern.struct_pattern;
-                    if (sp.struct_name.parts.len == 0) {
-                        const ann = param.type_annotation.?;
-                        if (ann.* == .name) {
-                            var bindings: std.ArrayList(StructFieldBind) = .empty;
-                            for (sp.fields) |field| {
-                                if (try self.compilePattern(field.pattern)) |p| {
-                                    try bindings.append(self.allocator, .{
-                                        .field_name = field.name,
-                                        .pattern = p,
-                                    });
-                                }
-                            }
-                            break :blk try self.create(MatchPattern, .{
-                                .struct_match = .{
-                                    .type_name = ann.name.name,
-                                    .field_bindings = try bindings.toOwnedSlice(self.allocator),
-                                },
-                            });
-                        }
-                        // The parser routes `%{key: pat, ...}` into
-                        // `.struct_pattern` with empty struct_name (the
-                        // syntax is shared with struct destructure). When
-                        // the annotation is a map type (`%{K -> V}`), build
-                        // a `map_match` so the IR's map-binding extraction
-                        // path runs and the fields are looked up by key
-                        // rather than as positional struct fields.
-                        if (ann.* == .map) {
-                            var bindings: std.ArrayList(MapFieldBind) = .empty;
-                            for (sp.fields) |field| {
-                                if (try self.compilePattern(field.pattern)) |p| {
-                                    // Synthesise an atom-literal key
-                                    // expression matching the field name.
-                                    const key_ast: *ast.Expr = try self.allocator.create(ast.Expr);
-                                    key_ast.* = .{ .atom_literal = .{
-                                        .meta = .{ .span = sp.meta.span },
-                                        .value = field.name,
-                                    } };
-                                    try bindings.append(self.allocator, .{
-                                        .key = key_ast,
-                                        .pattern = p,
-                                    });
-                                }
-                            }
-                            break :blk try self.create(MatchPattern, .{
-                                .map_match = .{
-                                    .field_bindings = try bindings.toOwnedSlice(self.allocator),
-                                },
-                            });
-                        }
-                    }
-                }
-                break :blk try self.compilePattern(param.pattern);
-            };
+            const match_pattern = try self.compileParamPattern(param);
 
             const name = if (param.pattern.* == .bind) param.pattern.bind.name else null;
             const default_expr = if (param.default) |def| try self.buildExpr(def) else null;
@@ -4685,6 +5235,7 @@ pub const HirBuilder = struct {
                 .name = name,
                 .type_id = type_id,
                 .ownership = self.resolveParamOwnership(param, type_id),
+                .ownership_explicit = param.ownership_explicit,
                 .pattern = match_pattern,
                 .default = default_expr,
             });
@@ -4697,7 +5248,7 @@ pub const HirBuilder = struct {
         }
 
         const return_type = if (clause.return_type) |rt|
-            self.resolveTypeExpr(rt)
+            try self.resolveTypeExpr(rt)
         else if (inferred_sig) |sig|
             sig.return_type
         else
@@ -4909,7 +5460,88 @@ pub const HirBuilder = struct {
     // Pattern compilation (spec §17)
     // ============================================================
 
+    fn compileParamPattern(self: *HirBuilder, param: ast.Param) anyerror!?*const MatchPattern {
+        var budget = HirPatternLoweringBudget{};
+
+        // When a struct pattern has no struct_name (parsed from %{...} :: Type),
+        // inject the type name from the type annotation.
+        if (param.pattern.* == .struct_pattern and param.type_annotation != null) {
+            const sp = param.pattern.struct_pattern;
+            if (sp.struct_name.parts.len == 0) {
+                const ann = param.type_annotation.?;
+                if (ann.* == .name) {
+                    try self.enterPatternLoweringBudget(&budget, param.pattern.getMeta().span);
+                    defer budget.leave();
+
+                    var bindings: std.ArrayList(StructFieldBind) = .empty;
+                    errdefer bindings.deinit(self.allocator);
+                    for (sp.fields) |field| {
+                        if (try self.compilePatternBudgeted(field.pattern, &budget)) |compiled_field_pattern| {
+                            try bindings.append(self.allocator, .{
+                                .field_name = field.name,
+                                .pattern = compiled_field_pattern,
+                            });
+                        }
+                    }
+                    return try self.create(MatchPattern, .{
+                        .struct_match = .{
+                            .type_name = ann.name.name,
+                            .field_bindings = try bindings.toOwnedSlice(self.allocator),
+                        },
+                    });
+                }
+                // The parser routes `%{key: pat, ...}` into `.struct_pattern`
+                // with empty struct_name (the syntax is shared with struct
+                // destructure). When the annotation is a map type (`%{K -> V}`),
+                // build a `map_match` so the IR's map-binding extraction path
+                // runs and the fields are looked up by key rather than as
+                // positional struct fields.
+                if (ann.* == .map) {
+                    try self.enterPatternLoweringBudget(&budget, param.pattern.getMeta().span);
+                    defer budget.leave();
+
+                    var bindings: std.ArrayList(MapFieldBind) = .empty;
+                    errdefer bindings.deinit(self.allocator);
+                    for (sp.fields) |field| {
+                        if (try self.compilePatternBudgeted(field.pattern, &budget)) |compiled_field_pattern| {
+                            // Synthesise an atom-literal key expression matching
+                            // the field name.
+                            const key_ast: *ast.Expr = try self.allocator.create(ast.Expr);
+                            key_ast.* = .{ .atom_literal = .{
+                                .meta = .{ .span = sp.meta.span },
+                                .value = field.name,
+                            } };
+                            try bindings.append(self.allocator, .{
+                                .key = key_ast,
+                                .pattern = compiled_field_pattern,
+                            });
+                        }
+                    }
+                    return try self.create(MatchPattern, .{
+                        .map_match = .{
+                            .field_bindings = try bindings.toOwnedSlice(self.allocator),
+                        },
+                    });
+                }
+            }
+        }
+
+        return try self.compilePatternBudgeted(param.pattern, &budget);
+    }
+
     fn compilePattern(self: *HirBuilder, pattern: *const ast.Pattern) anyerror!?*const MatchPattern {
+        var budget = HirPatternLoweringBudget{};
+        return try self.compilePatternBudgeted(pattern, &budget);
+    }
+
+    fn compilePatternBudgeted(
+        self: *HirBuilder,
+        pattern: *const ast.Pattern,
+        budget: *HirPatternLoweringBudget,
+    ) anyerror!?*const MatchPattern {
+        try self.enterPatternLoweringBudget(budget, pattern.getMeta().span);
+        defer budget.leave();
+
         return switch (pattern.*) {
             .wildcard => try self.create(MatchPattern, .wildcard),
             .bind => |b| {
@@ -4952,8 +5584,9 @@ pub const HirBuilder = struct {
             }),
             .tuple => |t| {
                 var elems: std.ArrayList(*const MatchPattern) = .empty;
+                errdefer elems.deinit(self.allocator);
                 for (t.elements) |elem| {
-                    if (try self.compilePattern(elem)) |p| {
+                    if (try self.compilePatternBudgeted(elem, budget)) |p| {
                         try elems.append(self.allocator, p);
                     }
                 }
@@ -4963,8 +5596,9 @@ pub const HirBuilder = struct {
             },
             .list => |l| {
                 var elems: std.ArrayList(*const MatchPattern) = .empty;
+                errdefer elems.deinit(self.allocator);
                 for (l.elements) |elem| {
-                    if (try self.compilePattern(elem)) |p| {
+                    if (try self.compilePatternBudgeted(elem, budget)) |p| {
                         try elems.append(self.allocator, p);
                     }
                 }
@@ -4974,12 +5608,13 @@ pub const HirBuilder = struct {
             },
             .list_cons => |lc| {
                 var heads: std.ArrayList(*const MatchPattern) = .empty;
+                errdefer heads.deinit(self.allocator);
                 for (lc.heads) |h| {
-                    if (try self.compilePattern(h)) |p| {
+                    if (try self.compilePatternBudgeted(h, budget)) |p| {
                         try heads.append(self.allocator, p);
                     }
                 }
-                const tail = try self.compilePattern(lc.tail);
+                const tail = try self.compilePatternBudgeted(lc.tail, budget);
                 return try self.create(MatchPattern, .{
                     .list_cons = .{
                         .heads = try heads.toOwnedSlice(self.allocator),
@@ -4988,7 +5623,7 @@ pub const HirBuilder = struct {
                 });
             },
             .pin => |p| try self.create(MatchPattern, .{ .pin = p.name }),
-            .paren => |p| self.compilePattern(p.inner),
+            .paren => |p| self.compilePatternBudgeted(p.inner, budget),
             .struct_pattern => |sp| {
                 // The parser routes the atom-keyed map shorthand
                 // `%{key: pat, ...}` into `.struct_pattern` with an EMPTY
@@ -5010,8 +5645,9 @@ pub const HirBuilder = struct {
                 // FU-34).
                 if (sp.struct_name.parts.len == 0) {
                     var map_bindings: std.ArrayList(MapFieldBind) = .empty;
+                    errdefer map_bindings.deinit(self.allocator);
                     for (sp.fields) |field| {
-                        if (try self.compilePattern(field.pattern)) |p| {
+                        if (try self.compilePatternBudgeted(field.pattern, budget)) |p| {
                             const key_ast: *ast.Expr = try self.allocator.create(ast.Expr);
                             key_ast.* = .{ .atom_literal = .{
                                 .meta = .{ .span = sp.meta.span },
@@ -5031,8 +5667,9 @@ pub const HirBuilder = struct {
                 }
                 const type_name = sp.struct_name.parts[0];
                 var bindings: std.ArrayList(StructFieldBind) = .empty;
+                errdefer bindings.deinit(self.allocator);
                 for (sp.fields) |field| {
-                    if (try self.compilePattern(field.pattern)) |p| {
+                    if (try self.compilePatternBudgeted(field.pattern, budget)) |p| {
                         try bindings.append(self.allocator, .{
                             .field_name = field.name,
                             .pattern = p,
@@ -5048,8 +5685,9 @@ pub const HirBuilder = struct {
             },
             .map => |mp| {
                 var bindings: std.ArrayList(MapFieldBind) = .empty;
+                errdefer bindings.deinit(self.allocator);
                 for (mp.fields) |field| {
-                    const value_pat = try self.compilePattern(field.value) orelse continue;
+                    const value_pat = try self.compilePatternBudgeted(field.value, budget) orelse continue;
                     try bindings.append(self.allocator, .{
                         .key = field.key,
                         .pattern = value_pat,
@@ -5064,7 +5702,7 @@ pub const HirBuilder = struct {
             .binary => |bin| {
                 return try self.create(MatchPattern, .{
                     .binary_match = .{
-                        .segments = try self.compileBinarySegments(bin.segments),
+                        .segments = try self.compileBinarySegmentsBudgeted(bin.segments, budget),
                     },
                 });
             },
@@ -5075,7 +5713,7 @@ pub const HirBuilder = struct {
                 const variant_name = tuv.qualifier.parts[tuv.qualifier.parts.len - 1];
 
                 const payload: ?*const MatchPattern = if (tuv.payload) |payload_pat|
-                    try self.compilePattern(payload_pat)
+                    try self.compilePatternBudgeted(payload_pat, budget)
                 else
                     null;
 
@@ -5113,10 +5751,20 @@ pub const HirBuilder = struct {
     }
 
     fn compileBinarySegments(self: *HirBuilder, segments: []const ast.BinarySegment) ![]const BinaryMatchSegment {
+        var budget = HirPatternLoweringBudget{};
+        return try self.compileBinarySegmentsBudgeted(segments, &budget);
+    }
+
+    fn compileBinarySegmentsBudgeted(
+        self: *HirBuilder,
+        segments: []const ast.BinarySegment,
+        budget: *HirPatternLoweringBudget,
+    ) ![]const BinaryMatchSegment {
         var result: std.ArrayList(BinaryMatchSegment) = .empty;
+        errdefer result.deinit(self.allocator);
         for (segments) |seg| {
             const pattern: ?*const MatchPattern = switch (seg.value) {
-                .pattern => |pat| try self.compilePattern(pat),
+                .pattern => |pat| try self.compilePatternBudgeted(pat, budget),
                 .expr => null,
                 .string_literal => null,
             };
@@ -5204,8 +5852,8 @@ pub const HirBuilder = struct {
                     // a runtime branch as a bare `comptime_float`.
                     if (apply_expected) {
                         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                        if (!store_ptr.containsTypeVars(expected_tail_type)) {
-                            _ = self.adoptNumericLiteralType(@constCast(hir_expr), expected_tail_type);
+                        if (!(try store_ptr.containsTypeVars(expected_tail_type))) {
+                            _ = try self.adoptNumericLiteralType(@constCast(hir_expr), expected_tail_type);
                         }
                     }
                     try hir_stmts.append(self.allocator, .{ .expr = hir_expr });
@@ -5507,6 +6155,32 @@ pub const HirBuilder = struct {
         return "<field>";
     }
 
+    fn typedZigContainerBuiltinName(
+        self: *HirBuilder,
+        mod_part: []const u8,
+        func_part: []const u8,
+        args: []const CallArg,
+    ) !?[]const u8 {
+        if (args.len == 0) return null;
+        if (!(std.mem.eql(u8, mod_part, "List") or std.mem.eql(u8, mod_part, "Map"))) return null;
+
+        const arg_type = args[0].expr.type_id;
+        if (arg_type == types_mod.TypeStore.UNKNOWN) return null;
+
+        const typ = self.type_store.getType(arg_type);
+        if (std.mem.eql(u8, mod_part, "List") and typ == .list) {
+            const encoded_element = encodeContainerElemName(self.type_store, typ.list.element) orelse return null;
+            return try std.fmt.allocPrint(self.allocator, "List:{s}.{s}", .{ encoded_element, func_part });
+        }
+        if (std.mem.eql(u8, mod_part, "Map") and typ == .map) {
+            const encoded_key = encodeContainerElemName(self.type_store, typ.map.key) orelse return null;
+            const encoded_value = encodeContainerElemName(self.type_store, typ.map.value) orelse return null;
+            return try std.fmt.allocPrint(self.allocator, "Map:{s}:{s}.{s}", .{ encoded_key, encoded_value, func_part });
+        }
+
+        return null;
+    }
+
     // ============================================================
     // Expression building
     // ============================================================
@@ -5565,7 +6239,7 @@ pub const HirBuilder = struct {
                 .span = v.meta.span,
             }),
             .var_ref => |v| {
-                var resolved_type = self.resolveBindingType(v.name, v.meta.scopes);
+                var resolved_type = try self.resolveBindingType(v.name, v.meta.scopes);
                 if (resolved_type == types_mod.TypeStore.UNKNOWN) {
                     resolved_type = try self.resolveFunctionValueType(v.name);
                 }
@@ -5645,12 +6319,12 @@ pub const HirBuilder = struct {
                         rhs_expr.type_id;
                     if (operand_type != types_mod.TypeStore.UNKNOWN) {
                         if (self.type_store.typeToStructName(operand_type, self.interner)) |struct_name| {
-                            if (self.hasImplByText(op_meta.protocol, struct_name) != null) {
+                            if ((try self.hasImplByText(op_meta.protocol, struct_name)) != null) {
                                 var args: std.ArrayList(CallArg) = .empty;
                                 try args.append(self.allocator, .{ .expr = lhs_expr, .mode = .share });
                                 try args.append(self.allocator, .{ .expr = rhs_expr, .mode = .share });
                                 const selected_call_info = if (self.interner.lookupExisting(op_meta.method)) |method_id|
-                                    self.resolveCallInStruct(struct_name, method_id, 2, args.items)
+                                    try self.resolveCallInStruct(struct_name, method_id, 2, args.items)
                                 else
                                     null;
 
@@ -5801,7 +6475,7 @@ pub const HirBuilder = struct {
                                         //      for a non-parametric
                                         //      `Result`).
                                         const explicit_applied = if (type_args.len > 0)
-                                            self.buildAppliedStructLiteralType(tid, type_args)
+                                            try self.buildAppliedStructLiteralType(tid, type_args)
                                         else
                                             null;
                                         const inferred_applied = if (explicit_applied != null)
@@ -5843,8 +6517,8 @@ pub const HirBuilder = struct {
                     const fr = call.callee.function_ref;
                     const lookup_arity = narrowedFunctionArity(fr.arity);
                     if (fr.struct_name) |struct_name| {
-                        const struct_name_text = self.structNameToString(struct_name);
-                        selected_call_info = self.resolveCallInStruct(struct_name_text, fr.function, @intCast(call.args.len), args.items);
+                        const struct_name_text = try self.structNameToString(struct_name);
+                        selected_call_info = try self.resolveCallInStruct(struct_name_text, fr.function, @intCast(call.args.len), args.items);
                         break :blk .{ .named = .{
                             .struct_name = struct_name_text,
                             .name = self.interner.get(fr.function),
@@ -5855,7 +6529,7 @@ pub const HirBuilder = struct {
                     const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
                     if (self.graph.resolveFamilyAllowingDefaults(scope_id, fr.function, lookup_arity)) |resolved| {
                         if (self.family_to_group.get(resolved.family_id)) |group_id| {
-                            selected_call_info = self.resolveCallInScope(scope_id, fr.function, @intCast(call.args.len), args.items);
+                            selected_call_info = try self.resolveCallInScope(scope_id, fr.function, @intCast(call.args.len), args.items);
                             break :blk .{ .direct = .{
                                 .function_group_id = group_id,
                                 .clause_index = if (selected_call_info) |info| info.clause_index else null,
@@ -5870,7 +6544,7 @@ pub const HirBuilder = struct {
                     if (try self.staticFunctionStructValue(call.callee.struct_expr)) |function_value| {
                         const struct_scope = self.graph.findStructScope(function_value.struct_name);
                         if (struct_scope) |scope_id| {
-                            selected_call_info = self.resolveCallInScope(scope_id, function_value.function_name, @intCast(call.args.len), args.items);
+                            selected_call_info = try self.resolveCallInScope(scope_id, function_value.function_name, @intCast(call.args.len), args.items);
                             if (self.graph.resolveFamilyAllowingDefaults(scope_id, function_value.function_name, narrowedFunctionArity(function_value.arity))) |resolved| {
                                 if (self.family_to_group.get(resolved.family_id)) |group_id| {
                                     break :blk .{ .direct = .{
@@ -5881,7 +6555,7 @@ pub const HirBuilder = struct {
                             }
                         }
                         break :blk .{ .named = .{
-                            .struct_name = self.structNameToString(function_value.struct_name),
+                            .struct_name = try self.structNameToString(function_value.struct_name),
                             .name = self.interner.get(function_value.function_name),
                             .clause_index = if (selected_call_info) |info| info.clause_index else null,
                         } };
@@ -5893,7 +6567,7 @@ pub const HirBuilder = struct {
                     if (fa.object.* == .struct_ref) {
                         const func_name = self.interner.get(fa.field);
                         const written_struct_name = fa.object.struct_ref.name;
-                        const initial_mod = self.structNameToString(written_struct_name);
+                        const initial_mod = try self.structNameToString(written_struct_name);
                         // Protocol-call dispatch: rewrite `Protocol.method(arg, ...)`
                         // to `Impl.method(arg, ...)` when the first arg's type has
                         // a matching impl. Mirrors the binary_op dispatch path so
@@ -5902,10 +6576,10 @@ pub const HirBuilder = struct {
                         // name when the call isn't protocol-qualified or the type
                         // is UNKNOWN.
                         const dispatched_mod = if (args.items.len > 0)
-                            self.protocolDispatchStruct(written_struct_name, args.items[0].expr.type_id) orelse initial_mod
+                            (try self.protocolDispatchStruct(written_struct_name, args.items[0].expr.type_id)) orelse initial_mod
                         else
                             initial_mod;
-                        selected_call_info = self.resolveCallInStruct(dispatched_mod, fa.field, @intCast(call.args.len), args.items);
+                        selected_call_info = try self.resolveCallInStruct(dispatched_mod, fa.field, @intCast(call.args.len), args.items);
                         break :blk .{ .named = .{ .struct_name = dispatched_mod, .name = func_name, .clause_index = if (selected_call_info) |info| info.clause_index else null } };
                     }
                     // :zig.function() or :zig.Struct.function() — bridge to Zig runtime
@@ -5931,25 +6605,9 @@ pub const HirBuilder = struct {
                                 // List.* call defaulted to `List(i64)`.
                                 const mod_part = self.interner.get(inner.field);
                                 const func_part = self.interner.get(fa.field);
-                                const typed_qualified: ?[]const u8 = blk_t: {
-                                    if (args.items.len == 0) break :blk_t null;
-                                    if (!(std.mem.eql(u8, mod_part, "List") or std.mem.eql(u8, mod_part, "Map"))) break :blk_t null;
-                                    const arg_type = args.items[0].expr.type_id;
-                                    if (arg_type == types_mod.TypeStore.UNKNOWN) break :blk_t null;
-                                    const t = self.type_store.getType(arg_type);
-                                    if (std.mem.eql(u8, mod_part, "List") and t == .list) {
-                                        const enc = encodeContainerElemName(self.type_store, t.list.element) orelse break :blk_t null;
-                                        break :blk_t std.fmt.allocPrint(self.allocator, "List:{s}.{s}", .{ enc, func_part }) catch null;
-                                    }
-                                    if (std.mem.eql(u8, mod_part, "Map") and t == .map) {
-                                        const k_enc = encodeContainerElemName(self.type_store, t.map.key) orelse break :blk_t null;
-                                        const v_enc = encodeContainerElemName(self.type_store, t.map.value) orelse break :blk_t null;
-                                        break :blk_t std.fmt.allocPrint(self.allocator, "Map:{s}:{s}.{s}", .{ k_enc, v_enc, func_part }) catch null;
-                                    }
-                                    break :blk_t null;
-                                };
+                                const typed_qualified = try self.typedZigContainerBuiltinName(mod_part, func_part, args.items);
                                 if (typed_qualified) |tq| break :blk .{ .builtin = tq };
-                                const qualified = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ mod_part, func_part }) catch break :blk .{ .builtin = func_part };
+                                const qualified = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ mod_part, func_part });
                                 break :blk .{ .builtin = qualified };
                             }
                         }
@@ -5973,7 +6631,8 @@ pub const HirBuilder = struct {
                         break :blk .{ .closure = callee_expr.? };
                     }
                     if (self.current_clause_scope != null) {
-                        if (try self.buildBindingReference(vr.name, self.resolveBindingType(vr.name, vr.meta.scopes), vr.meta.span, vr.meta.scopes)) |binding_ref| {
+                        const binding_type = try self.resolveBindingType(vr.name, vr.meta.scopes);
+                        if (try self.buildBindingReference(vr.name, binding_type, vr.meta.span, vr.meta.scopes)) |binding_ref| {
                             callee_expr = binding_ref;
                             break :blk .{ .closure = callee_expr.? };
                         }
@@ -5981,12 +6640,12 @@ pub const HirBuilder = struct {
                     const scope_id = self.current_clause_scope orelse self.current_struct_scope orelse self.graph.prelude_scope;
                     if (self.graph.resolveFamily(scope_id, vr.name, @intCast(call.args.len))) |family_id| {
                         if (self.family_to_group.get(family_id)) |group_id| {
-                            selected_call_info = self.resolveCallInScope(scope_id, vr.name, @intCast(call.args.len), args.items);
+                            selected_call_info = try self.resolveCallInScope(scope_id, vr.name, @intCast(call.args.len), args.items);
                             break :blk .{ .direct = .{ .function_group_id = group_id, .clause_index = if (selected_call_info) |info| info.clause_index else null } };
                         }
                     }
                     // Check if this bare call resolves to an imported function
-                    const import_struct = self.resolveImport(vr.name, @intCast(call.args.len));
+                    const import_struct = try self.resolveImport(vr.name, @intCast(call.args.len));
                     break :blk .{ .named = .{ .struct_name = import_struct, .name = self.interner.get(vr.name) } };
                 } else blk: {
                     callee_expr = try self.buildExpr(call.callee);
@@ -6005,8 +6664,13 @@ pub const HirBuilder = struct {
                     for (args.items[0..count], info.param_types[0..count]) |*arg, param_type| {
                         arg.expected_type = param_type;
                     }
+                    applyExplicitOwnershipsToCallArgs(args.items, info.param_ownerships, info.param_ownerships_explicit);
+                } else if (target == .named and target.named.struct_name != null) {
+                    if (try self.resolveProtocolParamOwnerships(target.named.struct_name.?, target.named.name, @intCast(call.args.len))) |ownerships| {
+                        applyOwnershipsToCallArgs(args.items, ownerships);
+                    }
                 } else if (call.callee.* == .var_ref) {
-                    if (self.resolveFunctionParamTypes(call.callee.var_ref.name, @intCast(call.args.len))) |param_types| {
+                    if (try self.resolveFunctionParamTypes(call.callee.var_ref.name, @intCast(call.args.len))) |param_types| {
                         const count = @min(args.items.len, param_types.len);
                         for (args.items[0..count], param_types[0..count]) |*arg, param_type| {
                             arg.expected_type = param_type;
@@ -6032,7 +6696,7 @@ pub const HirBuilder = struct {
                     if (arg.expr.type_id == types_mod.TypeStore.UNKNOWN and arg.expected_type != types_mod.TypeStore.UNKNOWN) {
                         // Check if the expected type is concrete (no type variables)
                         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                        if (!store_ptr.containsTypeVars(arg.expected_type)) {
+                        if (!(try store_ptr.containsTypeVars(arg.expected_type))) {
                             @constCast(arg.expr).type_id = arg.expected_type;
                         }
                     }
@@ -6053,8 +6717,8 @@ pub const HirBuilder = struct {
                 for (args.items) |*arg| {
                     if (arg.expected_type == types_mod.TypeStore.UNKNOWN) continue;
                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                    if (store_ptr.containsTypeVars(arg.expected_type)) continue;
-                    _ = self.adoptNumericLiteralType(@constCast(arg.expr), arg.expected_type);
+                    if (try store_ptr.containsTypeVars(arg.expected_type)) continue;
+                    _ = try self.adoptNumericLiteralType(@constCast(arg.expr), arg.expected_type);
                 }
 
                 if (target == .direct) {
@@ -6082,11 +6746,11 @@ pub const HirBuilder = struct {
                 const call_return_type: types_mod.TypeId = if (selected_call_info) |info| info.return_type else switch (target) {
                     .direct => blk: {
                         if (call.callee.* == .var_ref) {
-                            const raw = self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
+                            const raw = try self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
                             if (raw != types_mod.TypeStore.UNKNOWN) {
                                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                                if (store_ptr.containsTypeVars(raw)) {
-                                    break :blk self.resolveGenericReturnTypeLocal(call.callee.var_ref.name, @intCast(call.args.len), args.items, raw);
+                                if (try store_ptr.containsTypeVars(raw)) {
+                                    break :blk try self.resolveGenericReturnTypeLocal(call.callee.var_ref.name, @intCast(call.args.len), args.items, raw);
                                 }
                             }
                             break :blk raw;
@@ -6096,22 +6760,24 @@ pub const HirBuilder = struct {
                     .named => |n| blk: {
                         if (n.struct_name == null) {
                             if (call.callee.* == .var_ref) {
-                                const raw = self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
+                                const raw = try self.resolveFunctionReturnType(call.callee.var_ref.name, @intCast(call.args.len));
                                 if (raw != types_mod.TypeStore.UNKNOWN) {
                                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                                    if (store_ptr.containsTypeVars(raw)) {
-                                        break :blk self.resolveGenericReturnTypeLocal(call.callee.var_ref.name, @intCast(call.args.len), args.items, raw);
+                                    if (try store_ptr.containsTypeVars(raw)) {
+                                        break :blk try self.resolveGenericReturnTypeLocal(call.callee.var_ref.name, @intCast(call.args.len), args.items, raw);
                                     }
                                 }
                                 break :blk raw;
                             }
                         } else {
                             if (call.callee.* == .field_access) {
-                                const raw_return = self.resolveFunctionReturnTypeInStruct(n.struct_name.?, n.name, @intCast(call.args.len));
+                                const protocol_return = try self.resolveProtocolFunctionReturnType(n.struct_name.?, n.name, @intCast(call.args.len), args.items);
+                                if (protocol_return != types_mod.TypeStore.UNKNOWN) break :blk protocol_return;
+                                const raw_return = try self.resolveFunctionReturnTypeInStruct(n.struct_name.?, n.name, @intCast(call.args.len));
                                 if (raw_return != types_mod.TypeStore.UNKNOWN) {
                                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                                    if (store_ptr.containsTypeVars(raw_return)) {
-                                        const resolved = self.resolveGenericReturnType(n.struct_name.?, n.name, @intCast(call.args.len), args.items, raw_return);
+                                    if (try store_ptr.containsTypeVars(raw_return)) {
+                                        const resolved = try self.resolveGenericReturnType(n.struct_name.?, n.name, @intCast(call.args.len), args.items, raw_return);
                                         break :blk resolved;
                                     }
                                 }
@@ -6121,11 +6787,13 @@ pub const HirBuilder = struct {
                             // resolves to an imported struct's function. Same inference
                             // as the field_access case.
                             if (call.callee.* == .var_ref) {
-                                const raw_return = self.resolveFunctionReturnTypeInStruct(n.struct_name.?, n.name, @intCast(call.args.len));
+                                const protocol_return = try self.resolveProtocolFunctionReturnType(n.struct_name.?, n.name, @intCast(call.args.len), args.items);
+                                if (protocol_return != types_mod.TypeStore.UNKNOWN) break :blk protocol_return;
+                                const raw_return = try self.resolveFunctionReturnTypeInStruct(n.struct_name.?, n.name, @intCast(call.args.len));
                                 if (raw_return != types_mod.TypeStore.UNKNOWN) {
                                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                                    if (store_ptr.containsTypeVars(raw_return)) {
-                                        const resolved = self.resolveGenericReturnType(n.struct_name.?, n.name, @intCast(call.args.len), args.items, raw_return);
+                                    if (try store_ptr.containsTypeVars(raw_return)) {
+                                        const resolved = try self.resolveGenericReturnType(n.struct_name.?, n.name, @intCast(call.args.len), args.items, raw_return);
                                         break :blk resolved;
                                     }
                                 }
@@ -6161,29 +6829,15 @@ pub const HirBuilder = struct {
                 if (target == .named and call.callee.* == .var_ref) {
                     const named = target.named;
                     if (named.struct_name == null) {
-                        if (if (selected_call_info) |info| info.param_ownerships else self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
-                            const count = @min(args.items.len, ownerships.len);
-                            for (args.items[0..count], ownerships[0..count]) |*arg, ownership| {
-                                arg.mode = switch (ownership) {
-                                    .shared => .share,
-                                    .unique => .move,
-                                    .borrowed => .borrow,
-                                };
-                            }
+                        if (if (selected_call_info) |info| info.param_ownerships else try self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
+                            applyOwnershipsToCallArgs(args.items, ownerships);
                         }
                     }
                 }
                 if (target == .direct and call.callee.* == .var_ref) {
-                    if (if (selected_call_info) |info| info.param_ownerships else self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
+                    if (if (selected_call_info) |info| info.param_ownerships else try self.resolveFunctionParamOwnerships(call.callee.var_ref.name, @intCast(call.args.len))) |ownerships| {
                         const offset = args.items.len - call.args.len;
-                        const count = @min(call.args.len, ownerships.len);
-                        for (args.items[offset .. offset + count], ownerships[0..count]) |*arg, ownership| {
-                            arg.mode = switch (ownership) {
-                                .shared => .share,
-                                .unique => .move,
-                                .borrowed => .borrow,
-                            };
-                        }
+                        applyOwnershipsToCallArgs(args.items[offset..], ownerships);
                     }
                 }
 
@@ -6232,7 +6886,7 @@ pub const HirBuilder = struct {
                     // and set by a `.bind` decision-tree node. Binary segments use
                     // .binary_element with their segment index.
                     if (pattern) |pat| {
-                        try self.collectCasePatternBindings(pat, true);
+                        try self.collectCasePatternBindings(pat, true, clause.pattern.getMeta().span);
                     }
 
                     // Switch into the clause's scope while building the
@@ -6417,11 +7071,11 @@ pub const HirBuilder = struct {
                 const tuple_type_id: types_mod.TypeId = blk: {
                     if (!all_known) break :blk types_mod.TypeStore.UNKNOWN;
                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                    var elem_type_ids = self.allocator.alloc(types_mod.TypeId, built_elems.len) catch break :blk types_mod.TypeStore.UNKNOWN;
+                    const elem_type_ids = try self.allocator.alloc(types_mod.TypeId, built_elems.len);
                     for (built_elems, 0..) |elem, i| {
                         elem_type_ids[i] = elem.type_id;
                     }
-                    break :blk store_ptr.addType(.{ .tuple = .{ .elements = elem_type_ids } }) catch types_mod.TypeStore.UNKNOWN;
+                    break :blk try store_ptr.addType(.{ .tuple = .{ .elements = elem_type_ids } });
                 };
                 return try self.create(Expr, .{
                     .kind = .{ .tuple_init = built_elems },
@@ -6451,10 +7105,10 @@ pub const HirBuilder = struct {
                 const list_type_id = blk: {
                     if (self.expectedListCallableElementType()) |callable_elem| {
                         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                        break :blk store_ptr.addType(.{ .list = .{ .element = callable_elem } }) catch types_mod.TypeStore.UNKNOWN;
+                        break :blk try store_ptr.addType(.{ .list = .{ .element = callable_elem } });
                     }
                     break :blk if (built_elems.len > 0)
-                        self.inferListElementType(built_elems)
+                        try self.inferListElementType(built_elems, l.meta.span)
                     else
                         types_mod.TypeStore.UNKNOWN;
                 };
@@ -6475,7 +7129,7 @@ pub const HirBuilder = struct {
                 const cons_type_id: types_mod.TypeId = blk: {
                     if (head_expr.type_id != types_mod.TypeStore.UNKNOWN) {
                         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                        break :blk store_ptr.addType(.{ .list = .{ .element = head_expr.type_id } }) catch types_mod.TypeStore.UNKNOWN;
+                        break :blk try store_ptr.addType(.{ .list = .{ .element = head_expr.type_id } });
                     }
                     if (tail_expr.type_id != types_mod.TypeStore.UNKNOWN) {
                         const tail_typ = self.type_store.getType(tail_expr.type_id);
@@ -6513,7 +7167,7 @@ pub const HirBuilder = struct {
                 // boxing wraps each value into the existential. Mirrors the
                 // list-element redirect.
                 for (built_entries) |entry| {
-                    const redirected = self.redirectClosureStructToCallable(entry.value.type_id);
+                    const redirected = try self.redirectClosureStructToCallable(entry.value.type_id);
                     if (redirected != entry.value.type_id) {
                         @constCast(entry.value).type_id = redirected;
                     }
@@ -6527,16 +7181,37 @@ pub const HirBuilder = struct {
                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                     var key_type = built_entries[0].key.type_id;
                     var val_type = built_entries[0].value.type_id;
+                    var collection_budget = HirCollectionTypeBudget{};
                     for (built_entries[1..]) |entry| {
                         if (entry.key.type_id != types_mod.TypeStore.UNKNOWN) {
-                            key_type = unifyForCollection(store_ptr, key_type, entry.key.type_id);
+                            key_type = unifyForCollection(store_ptr, key_type, entry.key.type_id, &collection_budget) catch |err| {
+                                try self.reportCollectionTypeError(err, m.meta.span);
+                                return err;
+                            };
                         }
                         if (entry.value.type_id != types_mod.TypeStore.UNKNOWN) {
-                            val_type = unifyForCollection(store_ptr, val_type, entry.value.type_id);
+                            val_type = unifyForCollection(store_ptr, val_type, entry.value.type_id, &collection_budget) catch |err| {
+                                try self.reportCollectionTypeError(err, m.meta.span);
+                                return err;
+                            };
                         }
                     }
                     if (key_type != types_mod.TypeStore.UNKNOWN and val_type != types_mod.TypeStore.UNKNOWN) {
-                        break :blk store_ptr.addType(.{ .map = .{ .key = key_type, .value = val_type } }) catch types_mod.TypeStore.UNKNOWN;
+                        for (built_entries) |entry| {
+                            if (entry.key.type_id != types_mod.TypeStore.UNKNOWN) {
+                                propagateUnifiedTypeToElement(store_ptr, @constCast(entry.key), key_type, &collection_budget) catch |err| {
+                                    try self.reportCollectionTypeError(err, m.meta.span);
+                                    return err;
+                                };
+                            }
+                            if (entry.value.type_id != types_mod.TypeStore.UNKNOWN) {
+                                propagateUnifiedTypeToElement(store_ptr, @constCast(entry.value), val_type, &collection_budget) catch |err| {
+                                    try self.reportCollectionTypeError(err, m.meta.span);
+                                    return err;
+                                };
+                            }
+                        }
+                        break :blk try store_ptr.addType(.{ .map = .{ .key = key_type, .value = val_type } });
                     }
                     break :blk types_mod.TypeStore.UNKNOWN;
                 } else types_mod.TypeStore.UNKNOWN;
@@ -6586,7 +7261,7 @@ pub const HirBuilder = struct {
                 // missing it would prevent per-instantiation
                 // monomorphization of struct/union types.
                 if (se.type_args.len > 0 and declaration_type_id != types_mod.TypeStore.UNKNOWN) {
-                    literal_type_id = self.buildAppliedStructLiteralType(declaration_type_id, se.type_args);
+                    literal_type_id = try self.buildAppliedStructLiteralType(declaration_type_id, se.type_args);
                 } else if (declaration_type_id != types_mod.TypeStore.UNKNOWN) {
                     // Context-driven inference (Phase 1.1.5.c): if the
                     // current context provides an expected `.applied`
@@ -6611,7 +7286,7 @@ pub const HirBuilder = struct {
                 // `Option(i64)` when the literal is `%Foo(i64){...}`.
                 var hir_fields: std.ArrayList(StructFieldInit) = .empty;
                 for (se.fields) |field| {
-                    const expected_field_type = self.fieldAccessResultType(literal_type_id, field.name);
+                    const expected_field_type = try self.fieldAccessResultType(literal_type_id, field.name);
                     const apply_expected = expected_field_type != types_mod.TypeStore.UNKNOWN;
                     if (apply_expected) try self.expected_type_stack.append(self.allocator, expected_field_type);
                     const value = try self.buildExpr(field.value);
@@ -6659,7 +7334,7 @@ pub const HirBuilder = struct {
                 // Struct-qualified reference (e.g. Math.square without call parens)
                 if (fa.object.* == .struct_ref) {
                     const func_name = self.interner.get(fa.field);
-                    const mod_name = self.structNameToString(fa.object.struct_ref.name);
+                    const mod_name = try self.structNameToString(fa.object.struct_ref.name);
 
                     // Check if this is an enum variant access (e.g. Color.Red
                     // or IO.Mode.Raw for a dotted-name union)
@@ -6667,24 +7342,7 @@ pub const HirBuilder = struct {
 
                     // Try to resolve as a union type. For dotted names like IO.Mode,
                     // build the full dotted name and look it up.
-                    const resolved_tid: ?types_mod.TypeId = blk: {
-                        if (mod_parts.len >= 2) {
-                            // Build full dotted name (e.g., "IO.Mode")
-                            var name_buf: std.ArrayList(u8) = .empty;
-                            for (mod_parts, 0..) |part, i| {
-                                if (i > 0) name_buf.append(self.allocator, '.') catch {};
-                                name_buf.appendSlice(self.allocator, self.interner.get(part)) catch {};
-                            }
-                            const interner_mut = @constCast(self.interner);
-                            const full_name_id = interner_mut.intern(name_buf.items) catch break :blk null;
-                            if (self.type_store.name_to_type.get(full_name_id)) |tid| break :blk tid;
-                            // Fall back to last part only
-                            if (self.type_store.name_to_type.get(mod_parts[mod_parts.len - 1])) |tid| break :blk tid;
-                        } else if (mod_parts.len == 1) {
-                            if (self.type_store.name_to_type.get(mod_parts[0])) |tid| break :blk tid;
-                        }
-                        break :blk null;
-                    };
+                    const resolved_tid = try self.resolveFieldAccessQualifierTypeId(mod_parts);
 
                     if (resolved_tid) |tid| {
                         const typ = self.type_store.getType(tid);
@@ -6747,7 +7405,7 @@ pub const HirBuilder = struct {
                         });
                     }
                 }
-                const field_type = self.fieldAccessResultType(object.type_id, fa.field);
+                const field_type = try self.fieldAccessResultType(object.type_id, fa.field);
                 return try self.create(Expr, .{
                     .kind = .{ .field_get = .{
                         .object = object,
@@ -6776,10 +7434,10 @@ pub const HirBuilder = struct {
             .type_annotated => |ta| {
                 // expr :: Type — lower the inner expression with the annotated type
                 const inner = try self.buildExpr(ta.expr);
-                const annotated_type = self.resolveTypeExpr(ta.type_expr);
+                const annotated_type = try self.resolveTypeExpr(ta.type_expr);
                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                if (!store_ptr.containsTypeVars(annotated_type)) {
-                    _ = self.adoptNumericLiteralType(@constCast(inner), annotated_type);
+                if (!(try store_ptr.containsTypeVars(annotated_type))) {
+                    _ = try self.adoptNumericLiteralType(@constCast(inner), annotated_type);
                 }
                 return try self.create(Expr, .{
                     .kind = inner.kind,
@@ -6829,23 +7487,7 @@ pub const HirBuilder = struct {
                 if (mr.name.parts.len >= 2) {
                     const variant_name = mr.name.parts[mr.name.parts.len - 1];
                     // Build the type name from all parts except the last (the variant)
-                    const type_tid: ?types_mod.TypeId = blk: {
-                        // Try just the penultimate part (e.g., "Color" from Color.Red)
-                        const simple_name = mr.name.parts[mr.name.parts.len - 2];
-                        if (self.type_store.name_to_type.get(simple_name)) |tid| break :blk tid;
-                        // Try the full dotted prefix (e.g., "IO.Mode" from IO.Mode.Raw)
-                        if (mr.name.parts.len >= 3) {
-                            var name_buf: std.ArrayList(u8) = .empty;
-                            for (mr.name.parts[0 .. mr.name.parts.len - 1], 0..) |part, i| {
-                                if (i > 0) name_buf.append(self.allocator, '.') catch {};
-                                name_buf.appendSlice(self.allocator, self.interner.get(part)) catch {};
-                            }
-                            const interner_mut = @constCast(self.interner);
-                            const full_name_id = interner_mut.intern(name_buf.items) catch break :blk null;
-                            if (self.type_store.name_to_type.get(full_name_id)) |tid| break :blk tid;
-                        }
-                        break :blk null;
-                    };
+                    const type_tid = try self.resolveStructRefVariantOwnerTypeId(mr.name.parts);
                     if (type_tid) |tid| {
                         const typ = self.type_store.getType(tid);
                         if (typ == .tagged_union) {
@@ -6888,7 +7530,7 @@ pub const HirBuilder = struct {
                             // without a tag). Case 3 keeps the
                             // legacy `field_get` shape.
                             const explicit_applied = if (mr.type_args.len > 0)
-                                self.buildAppliedStructLiteralType(tid, mr.type_args)
+                                try self.buildAppliedStructLiteralType(tid, mr.type_args)
                             else
                                 null;
                             const inferred_applied = if (explicit_applied != null)
@@ -7030,7 +7672,7 @@ pub const HirBuilder = struct {
             const start_idx = self.current_case_bindings.items.len;
             const pattern = try self.compileArmPattern(clause.pattern);
             if (pattern) |pat| {
-                try self.collectCasePatternBindings(pat, true);
+                try self.collectCasePatternBindings(pat, true, clause.pattern.getMeta().span);
             }
 
             const saved_clause_scope = self.current_clause_scope;
@@ -7240,7 +7882,7 @@ pub const HirBuilder = struct {
         // lookup, and the IR dispatch wires its local to `error_local`.
         const start_idx = self.current_case_bindings.items.len;
         const bind_pattern = try self.create(MatchPattern, .{ .bind = bind_name });
-        try self.collectCasePatternBindings(bind_pattern, true);
+        try self.collectCasePatternBindings(bind_pattern, true, meta.span);
 
         // The body: `raise __rescue_unmatched__`. Build the AST `raise`
         // (whose value is `Kernel.do_raise(<var>)`, exactly what the desugar
@@ -7324,7 +7966,7 @@ pub const HirBuilder = struct {
         func: *const ast.FunctionDecl,
         scope_id: scope_mod.ScopeId,
         arity: u32,
-    ) bool {
+    ) !bool {
         const method_name = self.interner.get(func.name);
         var struct_prefix: ?[]const u8 = null;
         var struct_prefix_buf: ?[]const u8 = null;
@@ -7335,7 +7977,7 @@ pub const HirBuilder = struct {
             // rather than `findStructByScope` (which returns a mutable ptr).
             for (self.graph.structs.items) |entry| {
                 if (entry.scope_id != sid) continue;
-                const joined = entry.name.joinedWith(self.allocator, self.interner, ".") catch break :outer;
+                const joined = try entry.name.joinedWith(self.allocator, self.interner, ".");
                 struct_prefix_buf = joined;
                 struct_prefix = joined;
                 break :outer;
@@ -7354,15 +7996,14 @@ pub const HirBuilder = struct {
             // `error.ZapRaise` for the enclosing `rescue` to discharge.
             for (self.graph.impls.items) |impl_entry| {
                 if (impl_entry.scope_id != sid) continue;
-                const joined = impl_entry.target_type.joinedWith(self.allocator, self.interner, ".") catch break :outer;
+                const joined = try impl_entry.target_type.joinedWith(self.allocator, self.interner, ".");
                 struct_prefix_buf = joined;
                 struct_prefix = joined;
                 break :outer;
             }
             scope_cursor = self.graph.getScope(sid).parent;
         }
-        const result = self.type_store.functionRaises(struct_prefix, method_name, arity);
-        return result;
+        return try self.type_store.functionRaises(struct_prefix, method_name, arity);
     }
 
     /// Phase 4 (effect by inference — RETURN position) — the CALL-SITE
@@ -7389,7 +8030,7 @@ pub const HirBuilder = struct {
         self: *HirBuilder,
         declared_return_type: types_mod.TypeId,
         clause: *const ast.FunctionClause,
-    ) types_mod.TypeId {
+    ) !types_mod.TypeId {
         const declared = self.type_store.getType(declared_return_type);
         if (declared != .function) return declared_return_type;
         if (declared.function.raises) return declared_return_type;
@@ -7399,7 +8040,7 @@ pub const HirBuilder = struct {
         const tail_arity: u32 = @intCast(tail_decl.clauses[0].params.len);
         const closure_scope = self.graph.resolveClauseScope(tail_decl.clauses[0].meta) orelse
             tail_decl.clauses[0].meta.scope_id;
-        if (!self.functionEmitsErrorUnion(tail_decl, closure_scope, tail_arity)) return declared_return_type;
+        if (!(try self.functionEmitsErrorUnion(tail_decl, closure_scope, tail_arity))) return declared_return_type;
 
         return self.type_store.addFunctionTypeWithEffect(
             declared.function.params,
@@ -7408,7 +8049,7 @@ pub const HirBuilder = struct {
             declared.function.return_ownership,
             true,
             declared.function.effect_var,
-        ) catch declared_return_type;
+        );
     }
 
     /// Resolve a callee clause's tail expression to the `FunctionDecl` of the
@@ -7465,7 +8106,7 @@ pub const HirBuilder = struct {
         if (typ.function.raises) return function_type;
         if (decl.clauses.len == 0) return function_type;
         const arity: u32 = @intCast(decl.clauses[0].params.len);
-        if (!self.functionEmitsErrorUnion(decl, scope_id, arity)) return function_type;
+        if (!(try self.functionEmitsErrorUnion(decl, scope_id, arity))) return function_type;
         return try self.type_store.addFunctionTypeWithEffect(
             typ.function.params,
             typ.function.return_type,
@@ -7626,19 +8267,23 @@ pub const HirBuilder = struct {
     fn buildErrorPipe(self: *HirBuilder, ep: ast.ErrorPipeExpr) anyerror!*const Expr {
         // Flatten the AST pipe chain into individual steps
         var ast_steps: std.ArrayList(*const ast.Expr) = .empty;
-        self.flattenAstPipeChain(ep.chain, &ast_steps);
+        defer ast_steps.deinit(self.allocator);
+        try self.flattenAstPipeChain(ep.chain, &ast_steps);
 
         if (ast_steps.items.len == 0) {
-            return try self.create(Expr, .{
-                .kind = .nil_lit,
-                .type_id = types_mod.TypeStore.UNKNOWN,
+            try self.errors.append(self.allocator, .{
+                .message = "HIR error-pipe lowering produced an empty pipe chain",
                 .span = ep.meta.span,
+                .label = "error pipe has no expression steps",
+                .help = "provide at least one expression before the error handler",
             });
+            return error.HirPipeChainBudgetExceeded;
         }
 
         // Build each step as a HIR expression.
         // Step 0 is the base call. Steps 1+ are pipe rhs (need lhs piped in as first arg).
         var hir_steps: std.ArrayList(ErrorPipeStep) = .empty;
+        errdefer hir_steps.deinit(self.allocator);
         for (ast_steps.items) |step| {
             const hir_expr = try self.buildExpr(step);
             // Check if this step calls a multi-clause function (needs __try variant)
@@ -7647,9 +8292,9 @@ pub const HirBuilder = struct {
                     const callee = step.call.callee;
                     const arity: u32 = @intCast(step.call.args.len + 1);
                     if (callee.* == .var_ref) {
-                        break :blk self.isFunctionMultiClause(callee.var_ref.name, arity);
+                        break :blk try self.isFunctionMultiClause(callee.var_ref.name, arity);
                     } else if (callee.* == .field_access) {
-                        break :blk self.isFunctionMultiClause(callee.field_access.field, arity);
+                        break :blk try self.isFunctionMultiClause(callee.field_access.field, arity);
                     }
                 }
                 break :blk false;
@@ -7665,14 +8310,14 @@ pub const HirBuilder = struct {
 
         // Result type is the last step's type (the catch basin handler
         // must return the same type for the expression to be well-typed).
-        const result_type = if (hir_steps.items.len > 0)
-            hir_steps.items[hir_steps.items.len - 1].expr.type_id
-        else
-            types_mod.TypeStore.UNKNOWN;
+        const result_type = hir_steps.items[hir_steps.items.len - 1].expr.type_id;
+
+        const owned_hir_steps = try hir_steps.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned_hir_steps);
 
         return try self.create(Expr, .{
             .kind = .{ .error_pipe = .{
-                .steps = try hir_steps.toOwnedSlice(self.allocator),
+                .steps = owned_hir_steps,
                 .handler = handler_lowering.expr,
                 .err_local = handler_lowering.err_local,
             } },
@@ -7682,15 +8327,47 @@ pub const HirBuilder = struct {
     }
 
     /// Flatten a pipe chain AST expression into individual steps.
-    fn flattenAstPipeChain(self: *HirBuilder, expr: *const ast.Expr, steps: *std.ArrayList(*const ast.Expr)) void {
-        switch (expr.*) {
-            .pipe => |pe| {
-                self.flattenAstPipeChain(pe.lhs, steps);
-                steps.append(self.allocator, pe.rhs) catch {};
-            },
-            else => {
-                steps.append(self.allocator, expr) catch {};
-            },
+    fn flattenAstPipeChain(
+        self: *HirBuilder,
+        expr: *const ast.Expr,
+        steps: *std.ArrayList(*const ast.Expr),
+    ) HirPipeChainFlattenError!void {
+        return self.flattenAstPipeChainBudgeted(expr, steps, MAX_HIR_PIPE_CHAIN_STEPS);
+    }
+
+    fn flattenAstPipeChainBudgeted(
+        self: *HirBuilder,
+        expr: *const ast.Expr,
+        steps: *std.ArrayList(*const ast.Expr),
+        max_steps: usize,
+    ) HirPipeChainFlattenError!void {
+        const original_steps_len = steps.items.len;
+        errdefer steps.shrinkRetainingCapacity(original_steps_len);
+
+        const chain_span = expr.getMeta().span;
+        var rhs_steps: std.ArrayList(*const ast.Expr) = .empty;
+        defer rhs_steps.deinit(self.allocator);
+
+        var current = expr;
+        var steps_seen: usize = 0;
+        while (true) {
+            switch (current.*) {
+                .pipe => |pipe_expr| {
+                    try self.enterPipeChainFlattenBudget(&steps_seen, max_steps, chain_span);
+                    try rhs_steps.append(self.allocator, pipe_expr.rhs);
+                    current = pipe_expr.lhs;
+                },
+                else => break,
+            }
+        }
+
+        try self.enterPipeChainFlattenBudget(&steps_seen, max_steps, chain_span);
+        try steps.append(self.allocator, current);
+
+        var rhs_index = rhs_steps.items.len;
+        while (rhs_index > 0) {
+            rhs_index -= 1;
+            try steps.append(self.allocator, rhs_steps.items[rhs_index]);
         }
     }
 
@@ -7754,7 +8431,7 @@ pub const HirBuilder = struct {
 
                     const pattern = try self.compileArmPattern(clause.pattern);
                     if (pattern) |pat| {
-                        try self.collectCasePatternBindings(pat, true);
+                        try self.collectCasePatternBindings(pat, true, clause.pattern.getMeta().span);
                     }
 
                     const guard_expr = if (clause.guard) |g| try self.buildExpr(g) else null;
@@ -7818,7 +8495,8 @@ pub const HirBuilder = struct {
         self: *const HirBuilder,
         alias_entry_id: scope_mod.TypeId,
         tn: ast.TypeNameExpr,
-    ) TypeId {
+        budget: *TypeExprResolutionBudget,
+    ) HirTypeExprResolveError!TypeId {
         const alias_entry = self.graph.types.items[alias_entry_id];
         const body = alias_entry.kind.type_alias;
         const formal_params = alias_entry.params;
@@ -7828,24 +8506,24 @@ pub const HirBuilder = struct {
         for (self.alias_resolution_stack.items) |in_flight| {
             if (in_flight == alias_entry_id) return types_mod.TypeStore.UNKNOWN;
         }
-        self_mut.alias_resolution_stack.append(self.allocator, alias_entry_id) catch return types_mod.TypeStore.UNKNOWN;
+        try self_mut.alias_resolution_stack.append(self.allocator, alias_entry_id);
         defer _ = self_mut.alias_resolution_stack.pop();
 
         // Non-parameterized alias: resolve the body directly. (Argument-
         // arity mistakes are diagnosed by the type checker; HIR resolution
         // stays total.)
         if (formal_params.len == 0) {
-            return self.resolveTypeExpr(body);
+            return self.resolveTypeExprBudgeted(body, budget);
         }
 
         // Parameterized alias: resolve args in the caller scope, then
         // install the formals in a fresh `hir_type_var_scope` overlay so
         // the body sees only its own parameters.
         const bind_count = @min(formal_params.len, tn.args.len);
-        const resolved_args = self.allocator.alloc(types_mod.TypeId, bind_count) catch return types_mod.TypeStore.UNKNOWN;
+        const resolved_args = try self.allocator.alloc(types_mod.TypeId, bind_count);
         defer self.allocator.free(resolved_args);
         for (0..bind_count) |index| {
-            resolved_args[index] = self.resolveTypeExpr(tn.args[index]);
+            resolved_args[index] = try self.resolveTypeExprBudgeted(tn.args[index], budget);
         }
 
         const saved_scope = self_mut.hir_type_var_scope;
@@ -7856,12 +8534,24 @@ pub const HirBuilder = struct {
         }
         for (0..bind_count) |index| {
             const formal_name = self.interner.get(formal_params[index].name);
-            self_mut.hir_type_var_scope.put(formal_name, resolved_args[index]) catch {};
+            try self_mut.hir_type_var_scope.put(formal_name, resolved_args[index]);
         }
-        return self.resolveTypeExpr(body);
+        return self.resolveTypeExprBudgeted(body, budget);
     }
 
-    fn resolveTypeExpr(self: *const HirBuilder, type_expr: *const ast.TypeExpr) TypeId {
+    fn resolveTypeExpr(self: *const HirBuilder, type_expr: *const ast.TypeExpr) HirTypeExprResolveError!TypeId {
+        var budget = TypeExprResolutionBudget{};
+        return self.resolveTypeExprBudgeted(type_expr, &budget);
+    }
+
+    fn resolveTypeExprBudgeted(
+        self: *const HirBuilder,
+        type_expr: *const ast.TypeExpr,
+        budget: *TypeExprResolutionBudget,
+    ) HirTypeExprResolveError!TypeId {
+        try self.enterTypeExprResolutionBudget(budget, type_expr.getMeta().span);
+        defer budget.leave();
+
         return switch (type_expr.*) {
             .name => |n| {
                 const name_str = self.interner.get(n.name);
@@ -7894,13 +8584,13 @@ pub const HirBuilder = struct {
                         // and TypeChecker resolvers in agreement (the Phase-0
                         // three-paths invariant) for a `Map(K, fn(A) -> R)`
                         // RETURN type. A bare `fn` PARAM is untouched.
-                        const key_t = self.resolveCollectionElementType(n.args[0]);
-                        const value_t = self.resolveCollectionElementType(n.args[1]);
-                        return store_ptr.addType(.{ .map = .{ .key = key_t, .value = value_t } }) catch types_mod.TypeStore.UNKNOWN;
+                        const key_t = try self.resolveCollectionElementType(n.args[0], budget);
+                        const value_t = try self.resolveCollectionElementType(n.args[1], budget);
+                        return try store_ptr.addType(.{ .map = .{ .key = key_t, .value = value_t } });
                     }
                     if (self.isNativeTypeName(.list, n.name) and n.args.len == 1) {
-                        const elem_t = self.resolveCollectionElementType(n.args[0]);
-                        return store_ptr.addType(.{ .list = .{ .element = elem_t } }) catch types_mod.TypeStore.UNKNOWN;
+                        const elem_t = try self.resolveCollectionElementType(n.args[0], budget);
+                        return try store_ptr.addType(.{ .list = .{ .element = elem_t } });
                     }
                 }
 
@@ -7924,14 +8614,14 @@ pub const HirBuilder = struct {
                             const is_parametric_nominal = (stored_typ == .struct_type and stored_typ.struct_type.type_params.len > 0) or
                                 (stored_typ == .tagged_union and stored_typ.tagged_union.type_params.len > 0);
                             if (is_parametric_nominal) {
-                                const resolved_args = self.allocator.alloc(types_mod.TypeId, n.args.len) catch return ts_id;
+                                const resolved_args = try self.allocator.alloc(types_mod.TypeId, n.args.len);
                                 for (n.args, 0..) |arg, idx| {
-                                    resolved_args[idx] = self.resolveTypeExpr(arg);
+                                    resolved_args[idx] = try self.resolveTypeExprBudgeted(arg, budget);
                                 }
-                                return store_ptr.addType(.{ .applied = .{
+                                return try store_ptr.addType(.{ .applied = .{
                                     .base = ts_id,
                                     .args = resolved_args,
-                                } }) catch ts_id;
+                                } });
                             }
                         }
                         return ts_id;
@@ -7941,18 +8631,19 @@ pub const HirBuilder = struct {
                 }
                 // Check if this is a protocol name — create a protocol_constraint type
                 for (self.graph.protocols.items) |proto| {
-                    if (proto.name.parts.len > 0 and self.structNameMatchesText(proto.name, name_str)) {
+                    if (proto.name.parts.len > 0 and (try self.structNameMatchesText(proto.name, name_str))) {
                         // Resolve type parameters (e.g., Enumerable(member) → [type_var_for_member])
                         var type_params: std.ArrayList(types_mod.TypeId) = .empty;
+                        errdefer type_params.deinit(self.allocator);
                         for (n.args) |arg| {
-                            type_params.append(self.allocator, self.resolveTypeExpr(arg)) catch {};
+                            try type_params.append(self.allocator, try self.resolveTypeExprBudgeted(arg, budget));
                         }
-                        return store_ptr.addType(.{
+                        return try store_ptr.addType(.{
                             .protocol_constraint = .{
                                 .protocol_name = n.name,
-                                .type_params = type_params.toOwnedSlice(self.allocator) catch &.{},
+                                .type_params = try type_params.toOwnedSlice(self.allocator),
                             },
-                        }) catch types_mod.TypeStore.UNKNOWN;
+                        });
                     }
                 }
 
@@ -7964,13 +8655,13 @@ pub const HirBuilder = struct {
                 // them; before the UNKNOWN fall-through so a registered
                 // alias resolves instead of degrading to void.
                 if (self.findTypeAliasEntry(n.name)) |alias_entry_id| {
-                    return self.resolveTypeAliasRef(alias_entry_id, n);
+                    return self.resolveTypeAliasRef(alias_entry_id, n, budget);
                 }
 
                 return types_mod.TypeStore.UNKNOWN;
             },
             .never => types_mod.TypeStore.NEVER,
-            .paren => |p| self.resolveTypeExpr(p.inner),
+            .paren => |p| try self.resolveTypeExprBudgeted(p.inner, budget),
             .literal => |lt| {
                 return switch (lt.value) {
                     .int => types_mod.TypeStore.I64,
@@ -7982,10 +8673,11 @@ pub const HirBuilder = struct {
             .union_type => |ut| {
                 // General union type — resolve each member
                 var member_types: std.ArrayList(TypeId) = .empty;
+                errdefer member_types.deinit(self.allocator);
                 for (ut.members) |member| {
-                    member_types.append(self.allocator, self.resolveTypeExpr(member)) catch return types_mod.TypeStore.UNKNOWN;
+                    try member_types.append(self.allocator, try self.resolveTypeExprBudgeted(member, budget));
                 }
-                const members = member_types.toOwnedSlice(self.allocator) catch return types_mod.TypeStore.UNKNOWN;
+                const members = try member_types.toOwnedSlice(self.allocator);
                 for (self.type_store.types.items, 0..) |typ, i| {
                     if (typ == .union_type) {
                         const existing = typ.union_type;
@@ -8005,20 +8697,22 @@ pub const HirBuilder = struct {
             },
             .tuple => |tt| {
                 var elem_types: std.ArrayList(TypeId) = .empty;
+                errdefer elem_types.deinit(self.allocator);
                 for (tt.elements) |elem| {
-                    elem_types.append(self.allocator, self.resolveTypeExpr(elem)) catch return types_mod.TypeStore.UNKNOWN;
+                    try elem_types.append(self.allocator, try self.resolveTypeExprBudgeted(elem, budget));
                 }
-                const elements = elem_types.toOwnedSlice(self.allocator) catch return types_mod.TypeStore.UNKNOWN;
+                const elements = try elem_types.toOwnedSlice(self.allocator);
                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                return store_ptr.addType(.{ .tuple = .{ .elements = elements } }) catch types_mod.TypeStore.UNKNOWN;
+                return try store_ptr.addType(.{ .tuple = .{ .elements = elements } });
             },
             .function => |ft| {
                 var param_types: std.ArrayList(TypeId) = .empty;
+                errdefer param_types.deinit(self.allocator);
                 for (ft.params) |param| {
-                    param_types.append(self.allocator, self.resolveTypeExpr(param)) catch return types_mod.TypeStore.UNKNOWN;
+                    try param_types.append(self.allocator, try self.resolveTypeExprBudgeted(param, budget));
                 }
-                const params = param_types.toOwnedSlice(self.allocator) catch return types_mod.TypeStore.UNKNOWN;
-                const param_ownerships = self.allocator.alloc(Ownership, ft.param_ownerships.len) catch return types_mod.TypeStore.UNKNOWN;
+                const params = try param_types.toOwnedSlice(self.allocator);
+                const param_ownerships = try self.allocator.alloc(Ownership, ft.param_ownerships.len);
                 for (ft.param_ownerships, ft.param_ownerships_explicit, params, 0..) |ownership, explicit, param_type, idx| {
                     param_ownerships[idx] = if (explicit)
                         mapAstOwnership(ownership)
@@ -8027,7 +8721,7 @@ pub const HirBuilder = struct {
                     else
                         mapAstOwnership(ownership);
                 }
-                const return_type = self.resolveTypeExpr(ft.return_type);
+                const return_type = try self.resolveTypeExprBudgeted(ft.return_type, budget);
                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                 const ret_ownership = if (ft.return_ownership_explicit)
                     mapAstOwnership(ft.return_ownership)
@@ -8035,7 +8729,7 @@ pub const HirBuilder = struct {
                     self.defaultOwnershipForType(return_type)
                 else
                     mapAstOwnership(ft.return_ownership);
-                return store_ptr.addFunctionType(params, return_type, param_ownerships, ret_ownership) catch types_mod.TypeStore.UNKNOWN;
+                return try store_ptr.addFunctionType(params, return_type, param_ownerships, ret_ownership);
             },
             .list => |lt| {
                 // A `fn(A) -> B` element type (`[fn(i64) -> i64]`) is a
@@ -8046,9 +8740,9 @@ pub const HirBuilder = struct {
                 // (see the desugar's collection-escape path). A `fn`-type
                 // in a PARAMETER position is untouched (still FunctionType,
                 // the #201 direct path).
-                const elem_type = self.resolveCollectionElementType(lt.element);
+                const elem_type = try self.resolveCollectionElementType(lt.element, budget);
                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                return store_ptr.addType(.{ .list = .{ .element = elem_type } }) catch types_mod.TypeStore.UNKNOWN;
+                return try store_ptr.addType(.{ .list = .{ .element = elem_type } });
             },
             .map => |mt| {
                 if (mt.fields.len > 0) {
@@ -8057,10 +8751,10 @@ pub const HirBuilder = struct {
                     // position and takes the boxed `Callable` existential
                     // (parity with the `Map(..)` name form + the TypeChecker
                     // resolver). A bare `fn` PARAM is untouched.
-                    const key_type = self.resolveCollectionElementType(mt.fields[0].key);
-                    const value_type = self.resolveCollectionElementType(mt.fields[0].value);
+                    const key_type = try self.resolveCollectionElementType(mt.fields[0].key, budget);
+                    const value_type = try self.resolveCollectionElementType(mt.fields[0].value, budget);
                     const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                    return store_ptr.addType(.{ .map = .{ .key = key_type, .value = value_type } }) catch types_mod.TypeStore.UNKNOWN;
+                    return try store_ptr.addType(.{ .map = .{ .key = key_type, .value = value_type } });
                 }
                 return types_mod.TypeStore.UNKNOWN;
             },
@@ -8073,9 +8767,9 @@ pub const HirBuilder = struct {
                     return existing;
                 }
                 const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-                const fresh = store_ptr.freshVar() catch return types_mod.TypeStore.UNKNOWN;
+                const fresh = try store_ptr.freshVar();
                 const self_mut: *HirBuilder = @constCast(self);
-                self_mut.hir_type_var_scope.put(var_name, fresh) catch {};
+                try self_mut.hir_type_var_scope.put(var_name, fresh);
                 return fresh;
             },
             else => types_mod.TypeStore.UNKNOWN,
@@ -8086,39 +8780,48 @@ pub const HirBuilder = struct {
     /// element resolves to the `Callable({A}, B)` boxed existential (so
     /// collection elements share one owning representation); every other
     /// element type resolves normally.
-    fn resolveCollectionElementType(self: *const HirBuilder, type_expr: *const ast.TypeExpr) TypeId {
+    fn resolveCollectionElementType(
+        self: *const HirBuilder,
+        type_expr: *const ast.TypeExpr,
+        budget: *TypeExprResolutionBudget,
+    ) HirTypeExprResolveError!TypeId {
         if (type_expr.* == .function) {
-            return self.callableConstraintFromFnTypeExpr(type_expr.function);
+            return self.callableConstraintFromFnTypeExpr(type_expr.function, budget);
         }
-        return self.resolveTypeExpr(type_expr);
+        return self.resolveTypeExprBudgeted(type_expr, budget);
     }
 
     /// Build the `Callable({params}, ret)` `protocol_constraint` TypeId
     /// for a `fn(params) -> ret` type expression — the existential a
     /// boxed closure of that signature inhabits.
-    fn callableConstraintFromFnTypeExpr(self: *const HirBuilder, ft: ast.TypeFunExpr) TypeId {
+    fn callableConstraintFromFnTypeExpr(
+        self: *const HirBuilder,
+        ft: ast.TypeFunExpr,
+        budget: *TypeExprResolutionBudget,
+    ) HirTypeExprResolveError!TypeId {
         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
         const interner_mut: *ast.StringInterner = @constCast(self.interner);
         var param_types: std.ArrayList(TypeId) = .empty;
+        errdefer param_types.deinit(self.allocator);
         for (ft.params) |param| {
-            param_types.append(self.allocator, self.resolveTypeExpr(param)) catch return types_mod.TypeStore.UNKNOWN;
+            try param_types.append(self.allocator, try self.resolveTypeExprBudgeted(param, budget));
         }
-        const args_tuple = store_ptr.addType(.{ .tuple = .{ .elements = param_types.toOwnedSlice(self.allocator) catch &.{} } }) catch return types_mod.TypeStore.UNKNOWN;
-        const ret_type = self.resolveTypeExpr(ft.return_type);
-        const callable_name = interner_mut.intern("Callable") catch return types_mod.TypeStore.UNKNOWN;
-        const type_params = self.allocator.alloc(TypeId, 2) catch return types_mod.TypeStore.UNKNOWN;
+        const args_tuple = try store_ptr.addType(.{ .tuple = .{ .elements = try param_types.toOwnedSlice(self.allocator) } });
+        const ret_type = try self.resolveTypeExprBudgeted(ft.return_type, budget);
+        const callable_name = try interner_mut.intern("Callable");
+        const type_params = try self.allocator.alloc(TypeId, 2);
         type_params[0] = args_tuple;
         type_params[1] = ret_type;
-        return store_ptr.addType(.{ .protocol_constraint = .{
+        return try store_ptr.addType(.{ .protocol_constraint = .{
             .protocol_name = callable_name,
             .type_params = type_params,
-        } }) catch types_mod.TypeStore.UNKNOWN;
+        } });
     }
 
     /// Resolve a bare call to an imported struct via the current scope's imports.
     /// Returns the struct name string if the function is imported, null otherwise.
     /// Resolution follows Elixir semantics: local struct > imports > Kernel/top-level.
-    fn resolveImport(self: *const HirBuilder, name: ast.StringId, arity: u32) ?[]const u8 {
+    fn resolveImport(self: *const HirBuilder, name: ast.StringId, arity: u32) anyerror!?[]const u8 {
         const mod_scope_id = self.current_struct_scope orelse return null;
         const mod_scope = self.graph.getScope(mod_scope_id);
 
@@ -8129,7 +8832,7 @@ pub const HirBuilder = struct {
         // Check imports on this scope
         for (mod_scope.imports.items) |imp| {
             if (self.importMatchesFunction(imp, name, arity)) {
-                return self.structNameToString(imp.source_struct);
+                return try self.structNameToString(imp.source_struct);
             }
         }
 
@@ -8195,32 +8898,34 @@ pub const HirBuilder = struct {
         return true;
     }
 
-    fn structNameToString(self: *const HirBuilder, name: ast.StructName) []const u8 {
+    fn structNameToString(self: *const HirBuilder, name: ast.StructName) ![]const u8 {
         if (name.parts.len == 1) return self.interner.get(name.parts[0]);
-        return name.joinedWith(self.allocator, self.interner, "_") catch self.interner.get(name.parts[0]);
+        return try name.joinedWith(self.allocator, self.interner, "_");
     }
 
-    fn structNameMatchesText(self: *const HirBuilder, name: ast.StructName, text: []const u8) bool {
+    fn structNameMatchesText(self: *const HirBuilder, name: ast.StructName, text: []const u8) !bool {
         if (name.parts.len == 0) return false;
         if (name.parts.len == 1) {
             return std.mem.eql(u8, self.interner.get(name.parts[0]), text);
         }
 
-        const dotted = name.joinedWith(self.allocator, self.interner, ".") catch return false;
+        const dotted = try name.joinedWith(self.allocator, self.interner, ".");
         defer self.allocator.free(dotted);
         return std.mem.eql(u8, dotted, text);
     }
 
-    fn structNameMatchesCallQualifier(self: *const HirBuilder, name: ast.StructName, qualifier: []const u8) bool {
+    fn structNameMatchesCallQualifier(self: *const HirBuilder, name: ast.StructName, qualifier: []const u8) !bool {
         if (name.parts.len == 0) return false;
 
         const last_part = self.interner.get(name.parts[name.parts.len - 1]);
         if (std.mem.eql(u8, last_part, qualifier)) return true;
+        if (name.parts.len == 1) return false;
 
-        const prefix = self.structNameToString(name);
+        const prefix = try name.joinedWith(self.allocator, self.interner, "_");
+        defer self.allocator.free(prefix);
         if (std.mem.eql(u8, prefix, qualifier)) return true;
 
-        return self.structNameMatchesText(name, qualifier);
+        return try self.structNameMatchesText(name, qualifier);
     }
 
     /// Build the canonical `.applied { base, args }` TypeId for a
@@ -8236,16 +8941,16 @@ pub const HirBuilder = struct {
         self: *HirBuilder,
         declaration_type_id: types_mod.TypeId,
         type_args: []const *const ast.TypeExpr,
-    ) types_mod.TypeId {
+    ) anyerror!types_mod.TypeId {
         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-        const resolved = self.allocator.alloc(types_mod.TypeId, type_args.len) catch return declaration_type_id;
+        const resolved = try self.allocator.alloc(types_mod.TypeId, type_args.len);
         for (type_args, 0..) |type_arg_expr, idx| {
-            resolved[idx] = self.resolveTypeExpr(type_arg_expr);
+            resolved[idx] = try self.resolveTypeExpr(type_arg_expr);
         }
-        return store_ptr.addType(.{ .applied = .{
+        return try store_ptr.addType(.{ .applied = .{
             .base = declaration_type_id,
             .args = resolved,
-        } }) catch declaration_type_id;
+        } });
     }
 
     /// Compute the substituted result type of a field-access `obj.field`
@@ -8262,7 +8967,7 @@ pub const HirBuilder = struct {
         self: *const HirBuilder,
         receiver_type_id: types_mod.TypeId,
         field_name: ast.StringId,
-    ) types_mod.TypeId {
+    ) types_mod.TypeGraphError!types_mod.TypeId {
         if (receiver_type_id == types_mod.TypeStore.UNKNOWN) return types_mod.TypeStore.UNKNOWN;
         if (receiver_type_id >= self.type_store.types.items.len) return types_mod.TypeStore.UNKNOWN;
         const receiver_type = self.type_store.getType(receiver_type_id);
@@ -8295,10 +9000,10 @@ pub const HirBuilder = struct {
             if (formal_id >= self.type_store.types.items.len) continue;
             const formal_typ = self.type_store.getType(formal_id);
             if (formal_typ != .type_var) continue;
-            subs.bind(formal_typ.type_var, arg_id);
+            try subs.bind(formal_typ.type_var, arg_id);
         }
         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-        return subs.applyToType(store_ptr, declared_field_type);
+        return try subs.applyToType(store_ptr, declared_field_type);
     }
 
     /// Context-driven inference for `%Box{...}` (no explicit `(...)`).
@@ -8346,7 +9051,7 @@ pub const HirBuilder = struct {
     /// scope/struct boundary, unlike the bound-local form whose binding
     /// type the type-checker records directly). The element type read here
     /// is exact (the container's resolved element), never a heuristic.
-    fn callableTypeFromContainerAccessor(self: *HirBuilder, callee: *const ast.Expr) ?types_mod.TypeId {
+    fn callableTypeFromContainerAccessor(self: *HirBuilder, callee: *const ast.Expr) anyerror!?types_mod.TypeId {
         if (callee.* != .call) return null;
         const accessor = callee.call;
         // The accessor must be a `List.<method>` field access on a struct.
@@ -8365,7 +9070,7 @@ pub const HirBuilder = struct {
         if (!returns_element) return null;
         if (accessor.args.len == 0) return null;
         // The first argument is the container; resolve its element type.
-        const container = self.buildExpr(accessor.args[0]) catch return null;
+        const container = try self.buildExpr(accessor.args[0]);
         if (container.type_id == types_mod.TypeStore.UNKNOWN) return null;
         if (container.type_id >= self.type_store.types.items.len) return null;
         const container_typ = self.type_store.getType(container.type_id);
@@ -8379,27 +9084,96 @@ pub const HirBuilder = struct {
     /// applied compounds. Used to scope the container-return `Callable`
     /// substitution (`resolveClauseCallInfo`) to exactly the boxed-closure
     /// case so it cannot perturb other generic return-type resolution.
-    fn typeMentionsCallable(self: *const HirBuilder, type_id: types_mod.TypeId) bool {
-        if (type_id >= self.type_store.types.items.len) return false;
-        const typ = self.type_store.getType(type_id);
-        return switch (typ) {
-            .protocol_constraint => |pc| std.mem.eql(u8, self.interner.get(pc.protocol_name), "Callable"),
-            .list => |lt| self.typeMentionsCallable(lt.element),
-            .map => |mt| self.typeMentionsCallable(mt.key) or self.typeMentionsCallable(mt.value),
-            .tuple => |tt| {
-                for (tt.elements) |elem| if (self.typeMentionsCallable(elem)) return true;
-                return false;
-            },
-            .function => |ft| {
-                for (ft.params) |p| if (self.typeMentionsCallable(p)) return true;
-                return self.typeMentionsCallable(ft.return_type);
-            },
-            .applied => |at| {
-                for (at.args) |arg| if (self.typeMentionsCallable(arg)) return true;
-                return false;
-            },
-            else => false,
+    fn typeMentionsCallable(
+        self: *HirBuilder,
+        type_id: types_mod.TypeId,
+        diagnostic_span: ast.SourceSpan,
+    ) HirTypeWalkError!bool {
+        var budget = HirTypeWalkBudget{};
+        return self.typeMentionsCallableBudgeted(type_id, diagnostic_span, &budget);
+    }
+
+    fn typeMentionsCallableBudgeted(
+        self: *HirBuilder,
+        type_id: types_mod.TypeId,
+        diagnostic_span: ast.SourceSpan,
+        budget: *HirTypeWalkBudget,
+    ) HirTypeWalkError!bool {
+        const Frame = struct {
+            type_id: types_mod.TypeId,
+            depth: usize,
         };
+
+        var stack: std.ArrayList(Frame) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, .{ .type_id = type_id, .depth = 0 });
+
+        while (stack.items.len > 0) {
+            const frame = stack.items[stack.items.len - 1];
+            stack.items.len -= 1;
+
+            try self.enterTypeWalkBudget(budget, diagnostic_span, frame.depth);
+            if (frame.type_id >= self.type_store.types.items.len) continue;
+
+            const typ = self.type_store.getType(frame.type_id);
+            switch (typ) {
+                .protocol_constraint => |pc| {
+                    if (std.mem.eql(u8, self.interner.get(pc.protocol_name), "Callable")) return true;
+                },
+                .list => |list_type| {
+                    try stack.append(self.allocator, .{
+                        .type_id = list_type.element,
+                        .depth = frame.depth + 1,
+                    });
+                },
+                .map => |map_type| {
+                    try stack.append(self.allocator, .{
+                        .type_id = map_type.value,
+                        .depth = frame.depth + 1,
+                    });
+                    try stack.append(self.allocator, .{
+                        .type_id = map_type.key,
+                        .depth = frame.depth + 1,
+                    });
+                },
+                .tuple => |tuple_type| {
+                    var index = tuple_type.elements.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try stack.append(self.allocator, .{
+                            .type_id = tuple_type.elements[index],
+                            .depth = frame.depth + 1,
+                        });
+                    }
+                },
+                .function => |function_type| {
+                    try stack.append(self.allocator, .{
+                        .type_id = function_type.return_type,
+                        .depth = frame.depth + 1,
+                    });
+                    var index = function_type.params.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try stack.append(self.allocator, .{
+                            .type_id = function_type.params[index],
+                            .depth = frame.depth + 1,
+                        });
+                    }
+                },
+                .applied => |applied_type| {
+                    var index = applied_type.args.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try stack.append(self.allocator, .{
+                            .type_id = applied_type.args[index],
+                            .depth = frame.depth + 1,
+                        });
+                    }
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     /// If the current expected type is a `List(Callable(...))` — i.e. a
@@ -8439,7 +9213,7 @@ pub const HirBuilder = struct {
     /// literal). Resolving the impl's `protocol_type_args` through
     /// `resolveTypeExpr` renders the `{P...}` args tuple and `R` result
     /// concretely.
-    fn redirectClosureStructToCallable(self: *HirBuilder, type_id: types_mod.TypeId) types_mod.TypeId {
+    fn redirectClosureStructToCallable(self: *HirBuilder, type_id: types_mod.TypeId) anyerror!types_mod.TypeId {
         if (type_id == types_mod.TypeStore.UNKNOWN) return type_id;
         if (type_id >= self.type_store.types.items.len) return type_id;
         const typ = self.type_store.getType(type_id);
@@ -8453,28 +9227,27 @@ pub const HirBuilder = struct {
             if (entry.protocol_name.parts.len != 1) continue;
             if (!std.mem.eql(u8, self.interner.get(entry.protocol_name.parts[0]), "Callable")) continue;
             if (entry.decl.protocol_type_args.len != 2) continue;
-            const args_tuple = self.resolveTypeExpr(entry.decl.protocol_type_args[0]);
-            const result = self.resolveTypeExpr(entry.decl.protocol_type_args[1]);
+            const args_tuple = try self.resolveTypeExpr(entry.decl.protocol_type_args[0]);
+            const result = try self.resolveTypeExpr(entry.decl.protocol_type_args[1]);
             if (args_tuple == types_mod.TypeStore.UNKNOWN or result == types_mod.TypeStore.UNKNOWN) return type_id;
-            const type_params = self.allocator.alloc(types_mod.TypeId, 2) catch return type_id;
+            const type_params = try self.allocator.alloc(types_mod.TypeId, 2);
             type_params[0] = args_tuple;
             type_params[1] = result;
             const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
-            return store_ptr.addType(.{ .protocol_constraint = .{
+            return try store_ptr.addType(.{ .protocol_constraint = .{
                 .protocol_name = entry.protocol_name.parts[0],
                 .type_params = type_params,
-            } }) catch type_id;
+            } });
         }
         return type_id;
     }
 
-    fn internDottedStructName(self: *HirBuilder, name: ast.StructName) !ast.StringId {
-        if (name.parts.len == 0) return 0;
-        if (name.parts.len == 1) return name.parts[0];
-
+    fn internDottedNameParts(self: *HirBuilder, parts: []const ast.StringId) !ast.StringId {
+        if (parts.len == 0) return 0;
+        if (parts.len == 1) return parts[0];
         var name_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer name_buf.deinit(self.allocator);
-        for (name.parts, 0..) |part, index| {
+        for (parts, 0..) |part, index| {
             if (index > 0) try name_buf.append(self.allocator, '.');
             try name_buf.appendSlice(self.allocator, self.interner.get(part));
         }
@@ -8482,18 +9255,48 @@ pub const HirBuilder = struct {
         return try interner_mut.intern(name_buf.items);
     }
 
-    fn hasImpl(self: *const HirBuilder, protocol_name: ast.StructName, target_name: []const u8) ?ast.StructName {
-        for (self.graph.impls.items) |entry| {
-            if (!self.structNamesEqual(entry.protocol_name, protocol_name)) continue;
-            if (self.structNameMatchesText(entry.target_type, target_name)) return entry.target_type;
+    fn internDottedStructName(self: *HirBuilder, name: ast.StructName) !ast.StringId {
+        return try self.internDottedNameParts(name.parts);
+    }
+
+    fn resolveFieldAccessQualifierTypeId(self: *HirBuilder, mod_parts: []const ast.StringId) !?types_mod.TypeId {
+        if (mod_parts.len >= 2) {
+            const full_name_id = try self.internDottedNameParts(mod_parts);
+            if (self.type_store.name_to_type.get(full_name_id)) |tid| return tid;
+            return self.type_store.name_to_type.get(mod_parts[mod_parts.len - 1]);
+        }
+        if (mod_parts.len == 1) {
+            return self.type_store.name_to_type.get(mod_parts[0]);
         }
         return null;
     }
 
-    fn hasImplByText(self: *const HirBuilder, protocol_name: []const u8, target_name: []const u8) ?ast.StructName {
+    fn resolveStructRefVariantOwnerTypeId(self: *HirBuilder, parts: []const ast.StringId) !?types_mod.TypeId {
+        if (parts.len < 2) return null;
+
+        const simple_name = parts[parts.len - 2];
+        if (self.type_store.name_to_type.get(simple_name)) |tid| return tid;
+
+        if (parts.len >= 3) {
+            const full_name_id = try self.internDottedNameParts(parts[0 .. parts.len - 1]);
+            if (self.type_store.name_to_type.get(full_name_id)) |tid| return tid;
+        }
+
+        return null;
+    }
+
+    fn hasImpl(self: *const HirBuilder, protocol_name: ast.StructName, target_name: []const u8) !?ast.StructName {
         for (self.graph.impls.items) |entry| {
-            if (!self.structNameMatchesText(entry.protocol_name, protocol_name)) continue;
-            if (self.structNameMatchesText(entry.target_type, target_name)) return entry.target_type;
+            if (!self.structNamesEqual(entry.protocol_name, protocol_name)) continue;
+            if (try self.structNameMatchesText(entry.target_type, target_name)) return entry.target_type;
+        }
+        return null;
+    }
+
+    fn hasImplByText(self: *const HirBuilder, protocol_name: []const u8, target_name: []const u8) !?ast.StructName {
+        for (self.graph.impls.items) |entry| {
+            if (!(try self.structNameMatchesText(entry.protocol_name, protocol_name))) continue;
+            if (try self.structNameMatchesText(entry.target_type, target_name)) return entry.target_type;
         }
         return null;
     }
@@ -8546,7 +9349,7 @@ pub const HirBuilder = struct {
         // exactly like the bound-local form `f = List.get(ops, i); f(v)`.
         const callee_type_id: types_mod.TypeId = blk: {
             if (self.isCallableType(built_callee.type_id)) break :blk built_callee.type_id;
-            if (self.callableTypeFromContainerAccessor(call.callee)) |t| break :blk t;
+            if (try self.callableTypeFromContainerAccessor(call.callee)) |t| break :blk t;
             break :blk built_callee.type_id;
         };
         if (callee_type_id == types_mod.TypeStore.UNKNOWN) return null;
@@ -8646,7 +9449,7 @@ pub const HirBuilder = struct {
         // stored in a struct field is read into a local first
         // (`f = recv.op; f(x)`), so the `var_ref` case covers it.
         const callee_type_id: types_mod.TypeId = switch (call.callee.*) {
-            .var_ref => |vr| self.resolveBindingType(vr.name, vr.meta.scopes),
+            .var_ref => |vr| try self.resolveBindingType(vr.name, vr.meta.scopes),
             else => return null,
         };
         if (callee_type_id == types_mod.TypeStore.UNKNOWN) return null;
@@ -8699,12 +9502,12 @@ pub const HirBuilder = struct {
         self: *const HirBuilder,
         protocol_name: ast.StructName,
         first_arg_type: types_mod.TypeId,
-    ) ?[]const u8 {
+    ) anyerror!?[]const u8 {
         if (!self.isProtocolName(protocol_name)) return null;
         if (first_arg_type == types_mod.TypeStore.UNKNOWN) return null;
         const target_struct = self.type_store.typeToStructName(first_arg_type, self.interner) orelse return null;
-        const impl_target = self.hasImpl(protocol_name, target_struct) orelse return null;
-        return self.structNameToString(impl_target);
+        const impl_target = (try self.hasImpl(protocol_name, target_struct)) orelse return null;
+        return try self.structNameToString(impl_target);
     }
 
     fn resolveNominalStructRefType(self: *HirBuilder, struct_name: ast.StructName) !?types_mod.TypeId {
@@ -8770,7 +9573,7 @@ pub const HirBuilder = struct {
             // need to know the parametric instantiation up front;
             // this stamps post-build literals that didn't need the
             // stack push to lower correctly.
-            self.propagateExpectedTypeToDefault(value, declared_field.type_id);
+            try self.propagateExpectedTypeToDefault(value, declared_field.type_id);
             try fields.append(self.allocator, .{
                 .name = declared_field.name,
                 .value = value,
@@ -8784,7 +9587,7 @@ pub const HirBuilder = struct {
     /// the same machinery `buildExpr` already runs on user-supplied
     /// call arguments (see the `arg.expected_type` propagation
     /// loop around line 4795).
-    fn propagateExpectedTypeToDefault(self: *const HirBuilder, expr: *const Expr, expected_type: types_mod.TypeId) void {
+    fn propagateExpectedTypeToDefault(self: *const HirBuilder, expr: *const Expr, expected_type: types_mod.TypeId) types_mod.TypeGraphError!void {
         if (expected_type == types_mod.TypeStore.UNKNOWN) return;
         if (expected_type >= self.type_store.types.items.len) return;
         if (self.type_store.getType(expected_type) == .struct_type) {
@@ -8811,7 +9614,7 @@ pub const HirBuilder = struct {
         // (task #361) via `adoptNumericLiteralType`, which range-checks
         // and recurses into container literals.
         const mut: *Expr = @constCast(expr);
-        if (self.adoptNumericLiteralType(mut, expected_type)) return;
+        if (try self.adoptNumericLiteralType(mut, expected_type)) return;
 
         // String literal whose type slot stayed UNKNOWN: same
         // stamping. (String literals normally get STRING from
@@ -8841,10 +9644,10 @@ pub const HirBuilder = struct {
     /// is byte-identical. An `UNKNOWN`/unresolved element type is treated as
     /// satisfying (the TypeChecker handles genuine unknowns), so adoption is
     /// not blocked by an element whose type the HIR could not derive.
-    fn nonAdoptingElementSatisfies(self: *const HirBuilder, element: *const Expr, element_expected: TypeId) bool {
+    fn nonAdoptingElementSatisfies(self: *const HirBuilder, element: *const Expr, element_expected: TypeId) types_mod.TypeGraphError!bool {
         if (element.type_id == types_mod.TypeStore.UNKNOWN) return true;
         if (element_expected == types_mod.TypeStore.UNKNOWN) return true;
-        return self.type_store.callMatchCost(element.type_id, element_expected) != null;
+        return (try self.type_store.callMatchCost(element.type_id, element_expected)) != null;
     }
 
     /// Restamp an untyped numeric literal HIR expression to adopt a concrete
@@ -8877,7 +9680,7 @@ pub const HirBuilder = struct {
     ///     value-producing tail of each arm/block so an `if c {5} else {9}` or
     ///     `case` of untyped literals in argument/element position adopts the
     ///     expected type, the same way it does in return position.
-    fn adoptNumericLiteralType(self: *const HirBuilder, expr: *Expr, expected_type: types_mod.TypeId) bool {
+    fn adoptNumericLiteralType(self: *const HirBuilder, expr: *Expr, expected_type: types_mod.TypeId) types_mod.TypeGraphError!bool {
         if (expected_type == types_mod.TypeStore.UNKNOWN) return false;
         if (expected_type >= self.type_store.types.items.len) return false;
         const expected_kind = self.type_store.getType(expected_type);
@@ -8931,9 +9734,9 @@ pub const HirBuilder = struct {
                 var adopted_any = false;
                 var all_qualify = true;
                 for (elements) |element| {
-                    if (self.adoptNumericLiteralType(@constCast(element), element_expected)) {
+                    if (try self.adoptNumericLiteralType(@constCast(element), element_expected)) {
                         adopted_any = true;
-                    } else if (!self.nonAdoptingElementSatisfies(element, element_expected)) {
+                    } else if (!(try self.nonAdoptingElementSatisfies(element, element_expected))) {
                         // A non-adopting sibling that does NOT already satisfy
                         // the expected element type makes the container
                         // heterogeneous — restamping it to the expected
@@ -8961,9 +9764,9 @@ pub const HirBuilder = struct {
                 var adopted_any = false;
                 var all_qualify = true;
                 for (elements, expected_kind.tuple.elements) |element, element_expected| {
-                    if (self.adoptNumericLiteralType(@constCast(element), element_expected)) {
+                    if (try self.adoptNumericLiteralType(@constCast(element), element_expected)) {
                         adopted_any = true;
-                    } else if (!self.nonAdoptingElementSatisfies(element, element_expected)) {
+                    } else if (!(try self.nonAdoptingElementSatisfies(element, element_expected))) {
                         all_qualify = false;
                     }
                 }
@@ -8980,14 +9783,14 @@ pub const HirBuilder = struct {
                 var adopted_any = false;
                 var all_qualify = true;
                 for (entries) |entry| {
-                    if (self.adoptNumericLiteralType(@constCast(entry.key), key_expected)) {
+                    if (try self.adoptNumericLiteralType(@constCast(entry.key), key_expected)) {
                         adopted_any = true;
-                    } else if (!self.nonAdoptingElementSatisfies(entry.key, key_expected)) {
+                    } else if (!(try self.nonAdoptingElementSatisfies(entry.key, key_expected))) {
                         all_qualify = false;
                     }
-                    if (self.adoptNumericLiteralType(@constCast(entry.value), value_expected)) {
+                    if (try self.adoptNumericLiteralType(@constCast(entry.value), value_expected)) {
                         adopted_any = true;
-                    } else if (!self.nonAdoptingElementSatisfies(entry.value, value_expected)) {
+                    } else if (!(try self.nonAdoptingElementSatisfies(entry.value, value_expected))) {
                         all_qualify = false;
                     }
                 }
@@ -9005,9 +9808,9 @@ pub const HirBuilder = struct {
                 // mismatch when BOTH arms adopt, so by the time we reach here a
                 // one-armed `if` never qualifies.)
                 var adopted_any = false;
-                if (self.adoptNumericLiteralInBlockTail(branch.then_block, expected_type)) adopted_any = true;
+                if (try self.adoptNumericLiteralInBlockTail(branch.then_block, expected_type)) adopted_any = true;
                 if (branch.else_block) |else_block| {
-                    if (self.adoptNumericLiteralInBlockTail(else_block, expected_type)) adopted_any = true;
+                    if (try self.adoptNumericLiteralInBlockTail(else_block, expected_type)) adopted_any = true;
                 }
                 if (adopted_any) expr.type_id = expected_type;
                 return adopted_any;
@@ -9015,13 +9818,13 @@ pub const HirBuilder = struct {
             .case => |case_data| {
                 var adopted_any = false;
                 for (case_data.arms) |arm| {
-                    if (self.adoptNumericLiteralInBlockTail(arm.body, expected_type)) adopted_any = true;
+                    if (try self.adoptNumericLiteralInBlockTail(arm.body, expected_type)) adopted_any = true;
                 }
                 if (adopted_any) expr.type_id = expected_type;
                 return adopted_any;
             },
             .block => {
-                if (self.adoptNumericLiteralInBlockTail(&expr.kind.block, expected_type)) {
+                if (try self.adoptNumericLiteralInBlockTail(&expr.kind.block, expected_type)) {
                     expr.type_id = expected_type;
                     return true;
                 }
@@ -9038,11 +9841,11 @@ pub const HirBuilder = struct {
     /// match so the IR builder lowers the block at the adopted width. The tail
     /// is the last `.expr` statement; a block with no tail expression cannot
     /// adopt.
-    fn adoptNumericLiteralInBlockTail(self: *const HirBuilder, block: *const Block, expected_type: types_mod.TypeId) bool {
+    fn adoptNumericLiteralInBlockTail(self: *const HirBuilder, block: *const Block, expected_type: types_mod.TypeId) types_mod.TypeGraphError!bool {
         if (block.stmts.len == 0) return false;
         const last = block.stmts[block.stmts.len - 1];
         if (last != .expr) return false;
-        if (self.adoptNumericLiteralType(@constCast(last.expr), expected_type)) {
+        if (try self.adoptNumericLiteralType(@constCast(last.expr), expected_type)) {
             @constCast(block).result_type = expected_type;
             return true;
         }
@@ -9208,7 +10011,11 @@ pub const HirBuilder = struct {
     ///   `[1, "x"]`               → `[Term]`
     ///   `[{:a, 1}, {:b, "s"}]`   → `[{Atom, Term}]` (component-wise)
     ///   `[{:a, 1}, {:b, "s", 7}]`→ `[Term]` (different arity → fall back)
-    fn inferListElementType(self: *HirBuilder, built_elems: []const *const Expr) types_mod.TypeId {
+    fn inferListElementType(
+        self: *HirBuilder,
+        built_elems: []const *const Expr,
+        diagnostic_span: ast.SourceSpan,
+    ) anyerror!types_mod.TypeId {
         if (built_elems.len == 0) return types_mod.TypeStore.UNKNOWN;
         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
 
@@ -9220,7 +10027,7 @@ pub const HirBuilder = struct {
         // its `Callable` constraint and stamp it back so the element carries
         // the boxed type the `list_init` lowering wraps.
         for (built_elems) |elem| {
-            const redirected = self.redirectClosureStructToCallable(elem.type_id);
+            const redirected = try self.redirectClosureStructToCallable(elem.type_id);
             if (redirected != elem.type_id) {
                 @constCast(elem).type_id = redirected;
             }
@@ -9248,9 +10055,13 @@ pub const HirBuilder = struct {
         if (element_type == types_mod.TypeStore.UNKNOWN) return types_mod.TypeStore.UNKNOWN;
 
         // Second pass: unify the chosen type with every other element.
+        var collection_budget = HirCollectionTypeBudget{};
         for (built_elems) |elem| {
             if (elem.type_id == types_mod.TypeStore.UNKNOWN) continue;
-            element_type = unifyForCollection(store_ptr, element_type, elem.type_id);
+            element_type = unifyForCollection(store_ptr, element_type, elem.type_id, &collection_budget) catch |err| {
+                try self.reportCollectionTypeError(err, diagnostic_span);
+                return err;
+            };
         }
 
         // Propagate the unified element type back to each child element so
@@ -9260,10 +10071,13 @@ pub const HirBuilder = struct {
         // promoted `Term` slot so `tuple_init` knows to emit `Term.from`).
         for (built_elems) |elem| {
             if (elem.type_id == types_mod.TypeStore.UNKNOWN) continue;
-            propagateUnifiedTypeToElement(store_ptr, @constCast(elem), element_type);
+            propagateUnifiedTypeToElement(store_ptr, @constCast(elem), element_type, &collection_budget) catch |err| {
+                try self.reportCollectionTypeError(err, diagnostic_span);
+                return err;
+            };
         }
 
-        return store_ptr.addType(.{ .list = .{ .element = element_type } }) catch types_mod.TypeStore.UNKNOWN;
+        return try store_ptr.addType(.{ .list = .{ .element = element_type } });
     }
 
     fn patchEmptyContainerTypes(self: *const HirBuilder, block: *const Block, expected_type: types_mod.TypeId) void {
@@ -9303,7 +10117,26 @@ pub const HirBuilder = struct {
     /// `is_top_level` distinguishes a top-level `name -> body` bind (kind=.scrutinee,
     /// emitted by the success leaf) from binds nested inside a compound pattern
     /// (kind=.extracted, emitted by a decision-tree `.bind` node).
-    fn collectCasePatternBindings(self: *HirBuilder, pat: *const MatchPattern, is_top_level: bool) !void {
+    fn collectCasePatternBindings(
+        self: *HirBuilder,
+        pat: *const MatchPattern,
+        is_top_level: bool,
+        diagnostic_span: ast.SourceSpan,
+    ) !void {
+        var budget = HirMatchPatternBindingBudget{};
+        try self.collectCasePatternBindingsBudgeted(pat, is_top_level, diagnostic_span, &budget);
+    }
+
+    fn collectCasePatternBindingsBudgeted(
+        self: *HirBuilder,
+        pat: *const MatchPattern,
+        is_top_level: bool,
+        diagnostic_span: ast.SourceSpan,
+        budget: *HirMatchPatternBindingBudget,
+    ) !void {
+        try self.enterMatchPatternBindingBudget(budget, diagnostic_span);
+        defer budget.leave();
+
         switch (pat.*) {
             .bind => |name| {
                 const name_str = self.interner.get(name);
@@ -9324,28 +10157,28 @@ pub const HirBuilder = struct {
             },
             .tuple => |sub_pats| {
                 for (sub_pats) |sub_pat| {
-                    try self.collectCasePatternBindings(sub_pat, false);
+                    try self.collectCasePatternBindingsBudgeted(sub_pat, false, diagnostic_span, budget);
                 }
             },
             .list => |sub_pats| {
                 for (sub_pats) |sub_pat| {
-                    try self.collectCasePatternBindings(sub_pat, false);
+                    try self.collectCasePatternBindingsBudgeted(sub_pat, false, diagnostic_span, budget);
                 }
             },
             .list_cons => |lc| {
                 for (lc.heads) |head_pat| {
-                    try self.collectCasePatternBindings(head_pat, false);
+                    try self.collectCasePatternBindingsBudgeted(head_pat, false, diagnostic_span, budget);
                 }
-                try self.collectCasePatternBindings(lc.tail, false);
+                try self.collectCasePatternBindingsBudgeted(lc.tail, false, diagnostic_span, budget);
             },
             .struct_match => |sm| {
                 for (sm.field_bindings) |field| {
-                    try self.collectCasePatternBindings(field.pattern, false);
+                    try self.collectCasePatternBindingsBudgeted(field.pattern, false, diagnostic_span, budget);
                 }
             },
             .map_match => |mm| {
                 for (mm.field_bindings) |field| {
-                    try self.collectCasePatternBindings(field.pattern, false);
+                    try self.collectCasePatternBindingsBudgeted(field.pattern, false, diagnostic_span, budget);
                 }
             },
             .binary_match => |bm| {
@@ -9374,7 +10207,7 @@ pub const HirBuilder = struct {
                 // tagged-variant lowering will assign it the payload
                 // local produced by `scrutinee.VariantName` extraction.
                 if (tvm.payload) |payload_pat| {
-                    try self.collectCasePatternBindings(payload_pat, false);
+                    try self.collectCasePatternBindingsBudgeted(payload_pat, false, diagnostic_span, budget);
                 }
             },
             .wildcard, .literal, .pin => {},
@@ -9400,10 +10233,26 @@ pub const HirBuilder = struct {
         span: ast.SourceSpan,
         out_stmts: *std.ArrayList(Stmt),
     ) !void {
+        var budget = HirPatternLoweringBudget{};
+        try self.lowerAssignmentDestructureBudgeted(pat, parent_local, parent_type, span, out_stmts, &budget);
+    }
+
+    fn lowerAssignmentDestructureBudgeted(
+        self: *HirBuilder,
+        pat: *const ast.Pattern,
+        parent_local: u32,
+        parent_type: TypeId,
+        span: ast.SourceSpan,
+        out_stmts: *std.ArrayList(Stmt),
+        budget: *HirPatternLoweringBudget,
+    ) !void {
+        try self.enterPatternLoweringBudget(budget, pat.getMeta().span);
+        defer budget.leave();
+
         switch (pat.*) {
             .wildcard, .literal => {},
             .pin => {},
-            .paren => |inner| try self.lowerAssignmentDestructure(inner.inner, parent_local, parent_type, span, out_stmts),
+            .paren => |inner| try self.lowerAssignmentDestructureBudgeted(inner.inner, parent_local, parent_type, span, out_stmts, budget),
             .bind => |b| {
                 // A bind nested in a compound: alias the parent's local (no
                 // copy, no extraction). The parent extractor already produced
@@ -9426,7 +10275,7 @@ pub const HirBuilder = struct {
                         .object = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
                         .index = @intCast(idx),
                     } }, elem_type, span, out_stmts);
-                    try self.lowerAssignmentDestructure(sub_pat, elem_local, elem_type, span, out_stmts);
+                    try self.lowerAssignmentDestructureBudgeted(sub_pat, elem_local, elem_type, span, out_stmts, budget);
                 }
             },
             .list => |lp| {
@@ -9438,7 +10287,7 @@ pub const HirBuilder = struct {
                         .list = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
                         .index = @intCast(idx),
                     } }, elem_type, span, out_stmts);
-                    try self.lowerAssignmentDestructure(sub_pat, elem_local, elem_type, span, out_stmts);
+                    try self.lowerAssignmentDestructureBudgeted(sub_pat, elem_local, elem_type, span, out_stmts, budget);
                 }
             },
             .list_cons => |lc| {
@@ -9450,7 +10299,7 @@ pub const HirBuilder = struct {
                             .list = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
                             .index = @intCast(head_index),
                         } }, elem_type, span, out_stmts);
-                        try self.lowerAssignmentDestructure(head_pat, head_local, elem_type, span, out_stmts);
+                        try self.lowerAssignmentDestructureBudgeted(head_pat, head_local, elem_type, span, out_stmts, budget);
                     }
                 }
                 if (!(lc.tail.* == .wildcard or lc.tail.* == .literal)) {
@@ -9458,7 +10307,7 @@ pub const HirBuilder = struct {
                         .list = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
                         .start_index = @intCast(lc.heads.len),
                     } }, parent_type, span, out_stmts);
-                    try self.lowerAssignmentDestructure(lc.tail, tail_local, parent_type, span, out_stmts);
+                    try self.lowerAssignmentDestructureBudgeted(lc.tail, tail_local, parent_type, span, out_stmts, budget);
                 }
             },
             .struct_pattern => |sp| {
@@ -9469,7 +10318,7 @@ pub const HirBuilder = struct {
                         .object = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
                         .field = field.name,
                     } }, field_type, span, out_stmts);
-                    try self.lowerAssignmentDestructure(field.pattern, field_local, field_type, span, out_stmts);
+                    try self.lowerAssignmentDestructureBudgeted(field.pattern, field_local, field_type, span, out_stmts, budget);
                 }
             },
             .map => |mp| {
@@ -9482,7 +10331,7 @@ pub const HirBuilder = struct {
                         .map = try self.create(Expr, .{ .kind = .{ .local_get = parent_local }, .type_id = parent_type, .span = span }),
                         .key = key_expr,
                     } }, value_type, span, out_stmts);
-                    try self.lowerAssignmentDestructure(field.value, value_local, value_type, span, out_stmts);
+                    try self.lowerAssignmentDestructureBudgeted(field.value, value_local, value_type, span, out_stmts, budget);
                 }
             },
             .binary => {
@@ -9602,6 +10451,706 @@ fn encodeContainerElemName(store: *const types_mod.TypeStore, type_id: types_mod
 const Parser = @import("parser.zig").Parser;
 const Collector = @import("collector.zig").Collector;
 
+fn makeHirTestMeta() ast.NodeMeta {
+    return .{ .span = .{ .start = 0, .end = 1 } };
+}
+
+const OneShotAllocFailAllocator = struct {
+    backing_allocator: std.mem.Allocator,
+    fail_next_alloc: bool = false,
+    failed: bool = false,
+
+    fn init(backing_allocator: std.mem.Allocator) OneShotAllocFailAllocator {
+        return .{ .backing_allocator = backing_allocator };
+    }
+
+    fn allocator(self: *OneShotAllocFailAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn arm(self: *OneShotAllocFailAllocator) void {
+        self.fail_next_alloc = true;
+        self.failed = false;
+    }
+
+    fn alloc(
+        ctx: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *OneShotAllocFailAllocator = @ptrCast(@alignCast(ctx));
+        if (self.fail_next_alloc) {
+            self.fail_next_alloc = false;
+            self.failed = true;
+            return null;
+        }
+        return self.backing_allocator.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        const self: *OneShotAllocFailAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing_allocator.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(
+        ctx: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *OneShotAllocFailAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing_allocator.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(
+        ctx: *anyopaque,
+        old_mem: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *OneShotAllocFailAllocator = @ptrCast(@alignCast(ctx));
+        self.backing_allocator.rawFree(old_mem, alignment, return_address);
+    }
+};
+
+fn makeHirTestStructName(parts: []const ast.StringId, span: ast.SourceSpan) ast.StructName {
+    return .{ .parts = parts, .span = span };
+}
+
+fn makeHirTestImplDecl(
+    type_params: []const ast.StringId,
+    protocol_parts: []const ast.StringId,
+    target_parts: []const ast.StringId,
+) ast.ImplDecl {
+    const meta = makeHirTestMeta();
+    return .{
+        .meta = meta,
+        .protocol_name = makeHirTestStructName(protocol_parts, meta.span),
+        .target_type = makeHirTestStructName(target_parts, meta.span),
+        .type_params = type_params,
+        .functions = &.{},
+    };
+}
+
+fn makeHirTestEmptyClause() ast.FunctionClause {
+    return .{
+        .meta = makeHirTestMeta(),
+        .params = &.{},
+        .return_type = null,
+        .refinement = null,
+        .body = null,
+    };
+}
+
+fn makeHirDeepParenPattern(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    depth: usize,
+) !*const ast.Pattern {
+    const name = try interner.intern("value");
+    const meta = makeHirTestMeta();
+    var current = try allocator.create(ast.Pattern);
+    current.* = .{ .bind = .{ .meta = meta, .name = name } };
+    for (0..depth) |_| {
+        const wrapper = try allocator.create(ast.Pattern);
+        wrapper.* = .{ .paren = .{ .meta = meta, .inner = current } };
+        current = wrapper;
+    }
+    return current;
+}
+
+fn makeHirDeepMatchTuple(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    depth: usize,
+) !*const MatchPattern {
+    const name = try interner.intern("value");
+    var current = try allocator.create(MatchPattern);
+    current.* = .{ .bind = name };
+    for (0..depth) |_| {
+        const elements = try allocator.alloc(*const MatchPattern, 1);
+        elements[0] = current;
+        const wrapper = try allocator.create(MatchPattern);
+        wrapper.* = .{ .tuple = elements };
+        current = wrapper;
+    }
+    return current;
+}
+
+fn makeHirTestIntExpr(allocator: std.mem.Allocator, value: i64) !*const ast.Expr {
+    const expr = try allocator.create(ast.Expr);
+    expr.* = .{
+        .int_literal = .{
+            .meta = makeHirTestMeta(),
+            .value = value,
+        },
+    };
+    return expr;
+}
+
+fn makeHirDeepPipeChain(
+    allocator: std.mem.Allocator,
+    depth: usize,
+) !*const ast.Expr {
+    var current = try makeHirTestIntExpr(allocator, 0);
+    for (0..depth) |index| {
+        const rhs = try makeHirTestIntExpr(allocator, @intCast(index + 1));
+        const wrapper = try allocator.create(ast.Expr);
+        wrapper.* = .{
+            .pipe = .{
+                .meta = .{ .span = ast.SourceSpan.merge(current.getMeta().span, rhs.getMeta().span) },
+                .lhs = current,
+                .rhs = rhs,
+            },
+        };
+        current = wrapper;
+    }
+    return current;
+}
+
+fn makeHirTestNamedCallExpr(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    span: ast.SourceSpan,
+) !*const Expr {
+    const expr = try allocator.create(Expr);
+    expr.* = .{
+        .kind = .{ .call = .{
+            .target = .{ .named = .{ .struct_name = null, .name = name } },
+            .args = &.{},
+        } },
+        .type_id = types_mod.TypeStore.NEVER,
+        .span = span,
+    };
+    return expr;
+}
+
+fn makeHirDeepBinaryExpr(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    leaf: *const Expr,
+    span: ast.SourceSpan,
+) !*const Expr {
+    var current = leaf;
+    for (0..depth) |index| {
+        const lhs = try allocator.create(Expr);
+        lhs.* = .{
+            .kind = .{ .int_lit = @intCast(index) },
+            .type_id = types_mod.TypeStore.I64,
+            .span = span,
+        };
+        const wrapper = try allocator.create(Expr);
+        wrapper.* = .{
+            .kind = .{ .binary = .{
+                .op = .add,
+                .lhs = lhs,
+                .rhs = current,
+            } },
+            .type_id = types_mod.TypeStore.I64,
+            .span = span,
+        };
+        current = wrapper;
+    }
+    return current;
+}
+
+fn makeHirSingleExprBlock(
+    allocator: std.mem.Allocator,
+    expr: *const Expr,
+    result_type: types_mod.TypeId,
+) !*const Block {
+    const stmts = try allocator.alloc(Stmt, 1);
+    stmts[0] = .{ .expr = expr };
+    const block = try allocator.create(Block);
+    block.* = .{
+        .stmts = stmts,
+        .result_type = result_type,
+    };
+    return block;
+}
+
+fn makeHirNestedListType(
+    store: *types_mod.TypeStore,
+    depth: usize,
+    leaf_type: types_mod.TypeId,
+) !types_mod.TypeId {
+    var current = leaf_type;
+    for (0..depth) |_| {
+        current = try store.addType(.{ .list = .{ .element = current } });
+    }
+    return current;
+}
+
+test "resolveProtocolParamOwnerships distinguishes no match from OutOfMemory" {
+    const meta = makeHirTestMeta();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const protocol_name_id = try interner.intern("Readable");
+    const method_name_id = try interner.intern("read");
+    const value_name_id = try interner.intern("value");
+    const protocol_parts = [_]ast.StringId{protocol_name_id};
+    const protocol_params = [_]ast.ProtocolParam{.{
+        .meta = meta,
+        .name = value_name_id,
+        .type_annotation = null,
+        .ownership = .unique,
+        .ownership_explicit = true,
+    }};
+    const protocol_functions = [_]ast.ProtocolFunctionSig{.{
+        .meta = meta,
+        .name = method_name_id,
+        .params = &protocol_params,
+        .return_type = null,
+    }};
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = meta,
+        .name = makeHirTestStructName(&protocol_parts, meta.span),
+        .functions = &protocol_functions,
+    };
+
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_decl.name,
+        .scope_id = graph.prelude_scope,
+        .decl = &protocol_decl,
+    });
+
+    var builder = HirBuilder.init(std.testing.allocator, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const missing = try builder.resolveProtocolParamOwnerships("Other", "read", 1);
+    try std.testing.expect(missing == null);
+
+    const ownerships = (try builder.resolveProtocolParamOwnerships("Readable", "read", 1)).?;
+    defer std.testing.allocator.free(ownerships);
+    try std.testing.expectEqual(@as(usize, 1), ownerships.len);
+    try std.testing.expectEqual(Ownership.unique, ownerships[0]);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing_builder = HirBuilder.init(failing_allocator.allocator(), &interner, &graph, &store);
+    defer failing_builder.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failing_builder.resolveProtocolParamOwnerships("Readable", "read", 1),
+    );
+}
+
+test "multi-segment struct matching distinguishes no match from OutOfMemory" {
+    const meta = makeHirTestMeta();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const outer_name_id = try interner.intern("Outer");
+    const inner_name_id = try interner.intern("Inner");
+    const parts = [_]ast.StringId{ outer_name_id, inner_name_id };
+    const struct_name = makeHirTestStructName(&parts, meta.span);
+
+    var builder = HirBuilder.init(std.testing.allocator, &interner, &graph, &store);
+    defer builder.deinit();
+
+    try std.testing.expect(!(try builder.structNameMatchesText(struct_name, "Outer.Other")));
+    try std.testing.expect(!(try builder.structNameMatchesCallQualifier(struct_name, "Other")));
+    try std.testing.expect(try builder.structNameMatchesText(struct_name, "Outer.Inner"));
+    try std.testing.expect(try builder.structNameMatchesCallQualifier(struct_name, "Outer_Inner"));
+
+    var text_failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var text_failing_builder = HirBuilder.init(text_failing_allocator.allocator(), &interner, &graph, &store);
+    defer text_failing_builder.deinit();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        text_failing_builder.structNameMatchesText(struct_name, "Outer.Inner"),
+    );
+
+    var qualifier_failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var qualifier_failing_builder = HirBuilder.init(qualifier_failing_allocator.allocator(), &interner, &graph, &store);
+    defer qualifier_failing_builder.deinit();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        qualifier_failing_builder.structNameMatchesCallQualifier(struct_name, "Outer"),
+    );
+}
+
+test "callable accessor recovery distinguishes no accessor from buildExpr failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const meta = makeHirTestMeta();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(std.testing.allocator, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const no_accessor_expr = ast.Expr{ .int_literal = .{ .meta = meta, .value = 1 } };
+    try std.testing.expect((try builder.callableTypeFromContainerAccessor(&no_accessor_expr)) == null);
+
+    const list_name_id = try interner.intern("List");
+    const get_name_id = try interner.intern("get");
+    const list_parts = try alloc.alloc(ast.StringId, 1);
+    list_parts[0] = list_name_id;
+
+    const list_ref = try alloc.create(ast.Expr);
+    list_ref.* = .{ .struct_ref = .{
+        .meta = meta,
+        .name = makeHirTestStructName(list_parts, meta.span),
+    } };
+
+    const get_access = try alloc.create(ast.Expr);
+    get_access.* = .{ .field_access = .{
+        .meta = meta,
+        .object = list_ref,
+        .field = get_name_id,
+    } };
+
+    const container_arg = try alloc.create(ast.Expr);
+    container_arg.* = .{ .int_literal = .{ .meta = meta, .value = 1 } };
+
+    const accessor_args = try alloc.alloc(*const ast.Expr, 1);
+    accessor_args[0] = container_arg;
+    const accessor_call = ast.Expr{ .call = .{
+        .meta = meta,
+        .callee = get_access,
+        .args = accessor_args,
+    } };
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing_builder = HirBuilder.init(failing_allocator.allocator(), &interner, &graph, &store);
+    defer failing_builder.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failing_builder.callableTypeFromContainerAccessor(&accessor_call),
+    );
+}
+
+test "bodyContainsRaise scans deeply nested HIR iteratively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const span = ast.SourceSpan{ .start = 10, .end = 20, .line = 2, .col = 4 };
+    const raise_expr = try makeHirTestNamedCallExpr(alloc, "raise", span);
+    const nested = try makeHirDeepBinaryExpr(alloc, MAX_HIR_RAISE_SCAN_DEPTH - 1, raise_expr, span);
+    const block = try makeHirSingleExprBlock(alloc, nested, types_mod.TypeStore.NEVER);
+
+    try std.testing.expect(try builder.bodyContainsRaise(block));
+    try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
+}
+
+test "bodyContainsRaise records a diagnostic when structural scan budget is exhausted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const span = ast.SourceSpan{ .start = 30, .end = 40, .line = 3, .col = 2 };
+    const leaf = try makeHirTestNamedCallExpr(alloc, "safe", span);
+    const nested = try makeHirDeepBinaryExpr(alloc, 4, leaf, span);
+    const block = try makeHirSingleExprBlock(alloc, nested, types_mod.TypeStore.I64);
+
+    var budget = HirRaiseScanBudget{ .max_nodes = 64, .max_depth = 2 };
+    try std.testing.expectError(
+        error.HirRaiseScanBudgetExceeded,
+        builder.bodyContainsRaiseBudgeted(block, span, &budget),
+    );
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "HIR raise scan budget") != null);
+    try std.testing.expectEqual(span, builder.errors.items[0].span);
+}
+
+test "bodyContainsRaise preserves OutOfMemory from scan stack allocation" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing_allocator.allocator();
+    var builder = HirBuilder.init(failing_alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const span = ast.SourceSpan{ .start = 90, .end = 100, .line = 6, .col = 1 };
+    const expr = Expr{
+        .kind = .{ .int_lit = 1 },
+        .type_id = types_mod.TypeStore.I64,
+        .span = span,
+    };
+    const stmts = [_]Stmt{.{ .expr = &expr }};
+    const block = Block{
+        .stmts = &stmts,
+        .result_type = types_mod.TypeStore.I64,
+    };
+
+    try std.testing.expectError(error.OutOfMemory, builder.bodyContainsRaise(&block));
+    try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
+}
+
+test "HIR impl type-var prebinding preserves OutOfMemory from fresh type variable allocation" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = try types_mod.TypeStore.init(failing_allocator.allocator(), &interner);
+    defer store.deinit();
+    while (store.types.items.len < store.types.capacity) {
+        _ = try store.freshVar();
+    }
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    failing_allocator.resize_fail_index = failing_allocator.resize_index;
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(std.testing.allocator, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const protocol_name = try interner.intern("Enumerable");
+    const target_name = try interner.intern("List");
+    const type_param_name = try interner.intern("element");
+    const protocol_parts = [_]ast.StringId{protocol_name};
+    const target_parts = [_]ast.StringId{target_name};
+    const type_params = [_]ast.StringId{type_param_name};
+    const impl_decl = makeHirTestImplDecl(&type_params, &protocol_parts, &target_parts);
+    const clause = makeHirTestEmptyClause();
+
+    builder.current_impl = &impl_decl;
+    try std.testing.expectError(error.OutOfMemory, builder.buildClause(&clause));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "HIR impl type-var prebinding preserves OutOfMemory from scope insertion" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = OneShotAllocFailAllocator.init(std.testing.allocator);
+    var builder = HirBuilder.init(failing_allocator.allocator(), &interner, &graph, &store);
+    defer builder.deinit();
+
+    const protocol_name = try interner.intern("Enumerable");
+    const target_name = try interner.intern("List");
+    const type_param_name = try interner.intern("element");
+    const protocol_parts = [_]ast.StringId{protocol_name};
+    const target_parts = [_]ast.StringId{target_name};
+    const type_params = [_]ast.StringId{type_param_name};
+    const impl_decl = makeHirTestImplDecl(&type_params, &protocol_parts, &target_parts);
+    const clause = makeHirTestEmptyClause();
+
+    builder.current_impl = &impl_decl;
+    failing_allocator.arm();
+    try std.testing.expectError(error.OutOfMemory, builder.buildClause(&clause));
+    try std.testing.expect(failing_allocator.failed);
+}
+
+test "HIR typed List and Map builtin names preserve OutOfMemory from specialization allocation" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = OneShotAllocFailAllocator.init(std.testing.allocator);
+    var builder = HirBuilder.init(failing_allocator.allocator(), &interner, &graph, &store);
+    defer builder.deinit();
+
+    const span = makeHirTestMeta().span;
+    const list_type = try store.addType(.{ .list = .{ .element = types_mod.TypeStore.STRING } });
+    const list_expr = Expr{
+        .kind = .nil_lit,
+        .type_id = list_type,
+        .span = span,
+    };
+    const list_args = [_]CallArg{.{ .expr = &list_expr }};
+
+    failing_allocator.arm();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.typedZigContainerBuiltinName("List", "next", &list_args),
+    );
+    try std.testing.expect(failing_allocator.failed);
+
+    const map_type = try store.addType(.{ .map = .{
+        .key = types_mod.TypeStore.ATOM,
+        .value = types_mod.TypeStore.STRING,
+    } });
+    const map_expr = Expr{
+        .kind = .nil_lit,
+        .type_id = map_type,
+        .span = span,
+    };
+    const map_args = [_]CallArg{.{ .expr = &map_expr }};
+
+    failing_allocator.arm();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.typedZigContainerBuiltinName("Map", "put", &map_args),
+    );
+    try std.testing.expect(failing_allocator.failed);
+}
+
+test "HIR dotted union lookup preserves OutOfMemory while assembling dotted names" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = OneShotAllocFailAllocator.init(std.testing.allocator);
+    var builder = HirBuilder.init(failing_allocator.allocator(), &interner, &graph, &store);
+    defer builder.deinit();
+
+    const io_name = try interner.intern("IO");
+    const mode_name = try interner.intern("Mode");
+    const raw_name = try interner.intern("Raw");
+    const field_access_parts = [_]ast.StringId{ io_name, mode_name };
+    const variant_parts = [_]ast.StringId{ io_name, mode_name, raw_name };
+
+    failing_allocator.arm();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.resolveFieldAccessQualifierTypeId(&field_access_parts),
+    );
+    try std.testing.expect(failing_allocator.failed);
+
+    failing_allocator.arm();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.resolveStructRefVariantOwnerTypeId(&variant_parts),
+    );
+    try std.testing.expect(failing_allocator.failed);
+}
+
+test "typeMentionsCallable scans deeply nested types iteratively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const callable_name = try interner.intern("Callable");
+    const callable_type = try store.addType(.{ .protocol_constraint = .{
+        .protocol_name = callable_name,
+        .type_params = &.{},
+    } });
+    const nested_type = try makeHirNestedListType(&store, MAX_HIR_TYPE_WALK_DEPTH - 1, callable_type);
+    const span = ast.SourceSpan{ .start = 50, .end = 60, .line = 4, .col = 1 };
+
+    try std.testing.expect(try builder.typeMentionsCallable(nested_type, span));
+    try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
+}
+
+test "typeMentionsCallable records a diagnostic when type walk budget is exhausted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const span = ast.SourceSpan{ .start = 70, .end = 80, .line = 5, .col = 6 };
+    const nested_type = try makeHirNestedListType(&store, 4, types_mod.TypeStore.I64);
+
+    var budget = HirTypeWalkBudget{ .max_nodes = 64, .max_depth = 2 };
+    try std.testing.expectError(
+        error.HirTypeWalkBudgetExceeded,
+        builder.typeMentionsCallableBudgeted(nested_type, span, &budget),
+    );
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "HIR type walk budget") != null);
+    try std.testing.expectEqual(span, builder.errors.items[0].span);
+}
+
+test "typeMentionsCallable preserves OutOfMemory from type walk stack allocation" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing_allocator.allocator();
+    var builder = HirBuilder.init(failing_alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const span = ast.SourceSpan{ .start = 110, .end = 120, .line = 7, .col = 1 };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.typeMentionsCallable(types_mod.TypeStore.I64, span),
+    );
+    try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
+}
+
 test "HIR build simple function" {
     const source =
         \\pub struct Test {
@@ -9615,15 +11164,15 @@ test "HIR build simple function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -9647,15 +11196,15 @@ test "HIR build struct" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -9688,15 +11237,15 @@ test "HIR resolves numeric List applications structurally" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -9739,15 +11288,15 @@ test "HIR lowers numeric tuple field access to tuple_index_get" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -9774,15 +11323,15 @@ test "HIR tuple type annotation narrows numeric literal elements" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -9820,15 +11369,15 @@ test "HIR pattern compilation" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -9838,6 +11387,145 @@ test "HIR pattern compilation" {
     // Should have built the function with case expression
     try std.testing.expectEqual(@as(usize, 1), hir_program.structs[0].functions.len);
     try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
+}
+
+test "compilePattern rejects macro-produced AST patterns beyond lowering budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var type_store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(std.testing.allocator, &interner, &graph, &type_store);
+    defer builder.deinit();
+
+    const pattern = try makeHirDeepParenPattern(allocator, &interner, MAX_HIR_PATTERN_LOWERING_DEPTH + 1);
+
+    try std.testing.expectError(
+        error.HirPatternLoweringBudgetExceeded,
+        builder.compilePattern(pattern),
+    );
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "HIR pattern lowering budget") != null);
+}
+
+test "collectCasePatternBindings rejects macro-produced match patterns beyond binding budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var type_store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(std.testing.allocator, &interner, &graph, &type_store);
+    defer builder.deinit();
+
+    const pattern = try makeHirDeepMatchTuple(allocator, &interner, MAX_HIR_MATCH_PATTERN_BINDING_DEPTH + 1);
+
+    try std.testing.expectError(
+        error.HirMatchPatternBindingBudgetExceeded,
+        builder.collectCasePatternBindings(pattern, true, makeHirTestMeta().span),
+    );
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "HIR match-pattern binding budget") != null);
+}
+
+test "flattenAstPipeChain handles deep left-associated chains without recursion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ast_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var type_store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(std.testing.allocator, &interner, &graph, &type_store);
+    defer builder.deinit();
+
+    const pipe_depth = 32_768;
+    const chain = try makeHirDeepPipeChain(ast_alloc, pipe_depth);
+
+    var steps: std.ArrayList(*const ast.Expr) = .empty;
+    defer steps.deinit(std.testing.allocator);
+
+    try builder.flattenAstPipeChain(chain, &steps);
+
+    try std.testing.expectEqual(@as(usize, pipe_depth + 1), steps.items.len);
+    try std.testing.expect(steps.items[0].* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 0), steps.items[0].int_literal.value);
+    try std.testing.expect(steps.items[steps.items.len - 1].* == .int_literal);
+    try std.testing.expectEqual(@as(i64, pipe_depth), steps.items[steps.items.len - 1].int_literal.value);
+    try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
+}
+
+test "flattenAstPipeChain returns OutOfMemory when appending a step fails" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var type_store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer type_store.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing_allocator.allocator();
+
+    var builder = HirBuilder.init(failing_alloc, &interner, &graph, &type_store);
+    defer builder.deinit();
+
+    const expr = ast.Expr{
+        .int_literal = .{
+            .meta = makeHirTestMeta(),
+            .value = 1,
+        },
+    };
+    var steps: std.ArrayList(*const ast.Expr) = .empty;
+    defer steps.deinit(failing_alloc);
+
+    try std.testing.expectError(error.OutOfMemory, builder.flattenAstPipeChain(&expr, &steps));
+    try std.testing.expectEqual(@as(usize, 0), steps.items.len);
+    try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
+}
+
+test "flattenAstPipeChain budget failure records a span-bearing HIR diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ast_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    var type_store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer type_store.deinit();
+
+    var builder = HirBuilder.init(std.testing.allocator, &interner, &graph, &type_store);
+    defer builder.deinit();
+
+    const chain = try makeHirDeepPipeChain(ast_alloc, 1);
+
+    var steps: std.ArrayList(*const ast.Expr) = .empty;
+    defer steps.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.HirPipeChainBudgetExceeded,
+        builder.flattenAstPipeChainBudgeted(chain, &steps, 1),
+    );
+    try std.testing.expectEqual(@as(usize, 0), steps.items.len);
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "HIR pipe-chain flattening budget") != null);
+    try std.testing.expectEqual(chain.getMeta().span, builder.errors.items[0].span);
 }
 
 test "HIR typed params default to shared ownership" {
@@ -9853,15 +11541,15 @@ test "HIR typed params default to shared ownership" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -9889,15 +11577,15 @@ test "HIR opaque typed params default to unique ownership" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -9926,15 +11614,15 @@ test "HIR respects borrowed param annotation" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -9963,15 +11651,15 @@ test "HIR call args default to share mode" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -9998,15 +11686,15 @@ test "HIR call args adopt function ownership modes" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -10059,15 +11747,15 @@ test "HIR named calls use resolved parameter ownership" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -10096,15 +11784,15 @@ test "HIR closure calls adopt borrowed ownership mode" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10159,15 +11847,15 @@ test "HIR function_ref lowers to first-class Function struct init" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -10226,15 +11914,15 @@ test "HIR bare struct ref lowers to first-class Type struct init" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -10283,15 +11971,15 @@ test "HIR direct function_ref call lowers without closure dispatch" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -10334,15 +12022,15 @@ test "HIR static manual Function struct call lowers without closure dispatch" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -10381,15 +12069,15 @@ test "HIR function_ref arity literal is narrowed to u8" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     _ = checker.checkProgram(&program) catch {};
 
@@ -10439,15 +12127,15 @@ test "HIR assignment rebinding shadows parameter (Elixir-style scope)" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -10497,15 +12185,15 @@ test "HIR chained assignment rebinds resolve most-recent-wins" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -10588,15 +12276,15 @@ test "HIR threads applied TypeId for parametric struct literal with explicit typ
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -10644,15 +12332,15 @@ test "HIR threads distinct applied TypeIds for two instantiations of the same st
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), checker.errors.items.len);
@@ -10693,15 +12381,15 @@ test "HIR infers applied TypeId for %Box{...} from function return type" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10739,15 +12427,15 @@ test "HIR substitutes field-access type for applied parametric struct receiver" 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10782,15 +12470,15 @@ test "HIR keeps declaration TypeId for concrete (non-parametric) struct literals
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -10824,15 +12512,15 @@ const TargetFoldHarness = struct {
         const alloc = arena.allocator();
 
         const parser = try alloc.create(Parser);
-        parser.* = Parser.init(alloc, source);
+        parser.* = try Parser.init(alloc, source);
         const program = try parser.parseProgram();
 
         const collector = try alloc.create(Collector);
-        collector.* = Collector.init(alloc, parser.interner, null);
+        collector.* = try Collector.init(alloc, parser.interner, null);
         try collector.collectProgram(&program);
 
         const type_store = try alloc.create(types_mod.TypeStore);
-        type_store.* = types_mod.TypeStore.init(alloc, parser.interner);
+        type_store.* = try types_mod.TypeStore.init(alloc, parser.interner);
 
         const builder = try alloc.create(HirBuilder);
         builder.* = HirBuilder.init(alloc, parser.interner, &collector.graph, type_store);
@@ -11111,9 +12799,9 @@ test "adoptNumericLiteralType: negating an INT_MIN literal does not panic and is
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var store = types_mod.TypeStore.init(alloc, &interner);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
     defer store.deinit();
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     var builder = HirBuilder.init(alloc, &interner, &graph, &store);
@@ -11134,8 +12822,8 @@ test "adoptNumericLiteralType: negating an INT_MIN literal does not panic and is
 
     // Pre-fix: `-INT_MIN` traps here. Post-fix: clean `false` (no adoption),
     // for every signed target — INT_MIN's magnitude (2^63) fits none of them.
-    try std.testing.expect(!builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I8));
-    try std.testing.expect(!builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I64));
+    try std.testing.expect(!(try builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I8)));
+    try std.testing.expect(!(try builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I64)));
     // The expression type is left untouched when adoption is rejected.
     try std.testing.expectEqual(types_mod.TypeStore.I64, negated.type_id);
 }
@@ -11149,9 +12837,9 @@ test "adoptNumericLiteralType: negating an ordinary literal still adopts a fitti
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var store = types_mod.TypeStore.init(alloc, &interner);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
     defer store.deinit();
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     var builder = HirBuilder.init(alloc, &interner, &graph, &store);
@@ -11169,7 +12857,7 @@ test "adoptNumericLiteralType: negating an ordinary literal still adopts a fitti
         .span = zero_span,
     };
 
-    try std.testing.expect(builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I8));
+    try std.testing.expect(try builder.adoptNumericLiteralType(&negated, types_mod.TypeStore.I8));
     try std.testing.expectEqual(types_mod.TypeStore.I8, negated.type_id);
 }
 
@@ -11205,9 +12893,9 @@ test "adoptNumericLiteralType: list_init with adopting int and incompatible Stri
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var store = types_mod.TypeStore.init(alloc, &interner);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
     defer store.deinit();
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     var builder = HirBuilder.init(alloc, &interner, &graph, &store);
@@ -11226,7 +12914,7 @@ test "adoptNumericLiteralType: list_init with adopting int and incompatible Stri
     const u8_list = try store.addType(.{ .list = .{ .element = types_mod.TypeStore.U8 } });
 
     // The container must NOT adopt: the String sibling is incompatible.
-    try std.testing.expect(!builder.adoptNumericLiteralType(&list_expr, u8_list));
+    try std.testing.expect(!(try builder.adoptNumericLiteralType(&list_expr, u8_list)));
     // The container type is left untouched (UNKNOWN), so the TypeChecker
     // mismatch is not masked by a homogenizing restamp.
     try std.testing.expectEqual(types_mod.TypeStore.UNKNOWN, list_expr.type_id);
@@ -11242,9 +12930,9 @@ test "adoptNumericLiteralType: list_init of adopting int literals still restamps
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var store = types_mod.TypeStore.init(alloc, &interner);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
     defer store.deinit();
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     var builder = HirBuilder.init(alloc, &interner, &graph, &store);
@@ -11258,7 +12946,7 @@ test "adoptNumericLiteralType: list_init of adopting int literals still restamps
 
     const u8_list = try store.addType(.{ .list = .{ .element = types_mod.TypeStore.U8 } });
 
-    try std.testing.expect(builder.adoptNumericLiteralType(&list_expr, u8_list));
+    try std.testing.expect(try builder.adoptNumericLiteralType(&list_expr, u8_list));
     try std.testing.expectEqual(u8_list, list_expr.type_id);
     try std.testing.expectEqual(types_mod.TypeStore.U8, e0.type_id);
     try std.testing.expectEqual(types_mod.TypeStore.U8, e1.type_id);
@@ -11273,9 +12961,9 @@ test "adoptNumericLiteralType: tuple_init with adopting int and assignable non-l
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var store = types_mod.TypeStore.init(alloc, &interner);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
     defer store.deinit();
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     var builder = HirBuilder.init(alloc, &interner, &graph, &store);
@@ -11291,7 +12979,7 @@ test "adoptNumericLiteralType: tuple_init with adopting int and assignable non-l
     const elem_types = [_]TypeId{ types_mod.TypeStore.U8, types_mod.TypeStore.BOOL };
     const tuple_type = try store.addType(.{ .tuple = .{ .elements = &elem_types } });
 
-    try std.testing.expect(builder.adoptNumericLiteralType(&tuple_expr, tuple_type));
+    try std.testing.expect(try builder.adoptNumericLiteralType(&tuple_expr, tuple_type));
     try std.testing.expectEqual(tuple_type, tuple_expr.type_id);
     try std.testing.expectEqual(types_mod.TypeStore.U8, int_elem.type_id);
 }
@@ -11302,9 +12990,9 @@ test "adoptNumericLiteralType: tuple_init with adopting int and incompatible Str
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var store = types_mod.TypeStore.init(alloc, &interner);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
     defer store.deinit();
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     var builder = HirBuilder.init(alloc, &interner, &graph, &store);
@@ -11323,7 +13011,7 @@ test "adoptNumericLiteralType: tuple_init with adopting int and incompatible Str
     const elem_types = [_]TypeId{ types_mod.TypeStore.U8, types_mod.TypeStore.BOOL };
     const tuple_type = try store.addType(.{ .tuple = .{ .elements = &elem_types } });
 
-    try std.testing.expect(!builder.adoptNumericLiteralType(&tuple_expr, tuple_type));
+    try std.testing.expect(!(try builder.adoptNumericLiteralType(&tuple_expr, tuple_type)));
     try std.testing.expectEqual(types_mod.TypeStore.UNKNOWN, tuple_expr.type_id);
 }
 
@@ -11333,9 +13021,9 @@ test "adoptNumericLiteralType: map_init with adopting int value and incompatible
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var store = types_mod.TypeStore.init(alloc, &interner);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
     defer store.deinit();
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     var builder = HirBuilder.init(alloc, &interner, &graph, &store);
@@ -11358,7 +13046,7 @@ test "adoptNumericLiteralType: map_init with adopting int value and incompatible
 
     const map_type = try store.addType(.{ .map = .{ .key = types_mod.TypeStore.U8, .value = types_mod.TypeStore.U8 } });
 
-    try std.testing.expect(!builder.adoptNumericLiteralType(&map_expr, map_type));
+    try std.testing.expect(!(try builder.adoptNumericLiteralType(&map_expr, map_type)));
     try std.testing.expectEqual(types_mod.TypeStore.UNKNOWN, map_expr.type_id);
 }
 
@@ -11385,9 +13073,9 @@ test "buildExpr: an unresolved var_ref records a diagnostic and lowers to a pois
     const alloc = arena.allocator();
 
     var interner = ast.StringInterner.init(alloc);
-    var store = types_mod.TypeStore.init(alloc, &interner);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
     defer store.deinit();
-    var graph = scope_mod.ScopeGraph.init(alloc);
+    var graph = try scope_mod.ScopeGraph.init(alloc);
     defer graph.deinit();
 
     var builder = HirBuilder.init(alloc, &interner, &graph, &store);
@@ -11408,4 +13096,237 @@ test "buildExpr: an unresolved var_ref records a diagnostic and lowers to a pois
     // And a clear diagnostic must have been recorded.
     try std.testing.expect(builder.errors.items.len >= 1);
     try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "cannot find a variable") != null);
+}
+
+test "resolveTypeExpr returns depth error for pathological nested type expressions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ast_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(std.testing.allocator, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const base_type_expr = try ast_alloc.create(ast.TypeExpr);
+    base_type_expr.* = .{
+        .literal = .{
+            .meta = zero_meta,
+            .value = .{ .int = 1 },
+        },
+    };
+
+    var nested_type_expr: *const ast.TypeExpr = base_type_expr;
+    for (0..MAX_HIR_TYPE_EXPR_RESOLUTION_DEPTH) |_| {
+        const wrapper = try ast_alloc.create(ast.TypeExpr);
+        wrapper.* = .{
+            .paren = .{
+                .meta = zero_meta,
+                .inner = nested_type_expr,
+            },
+        };
+        nested_type_expr = wrapper;
+    }
+
+    try std.testing.expectError(
+        error.HirTypeExprResolutionBudgetExceeded,
+        builder.resolveTypeExpr(nested_type_expr),
+    );
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "HIR type-expression resolution budget") != null);
+    try std.testing.expectEqual(zero_meta.span, builder.errors.items[0].span);
+}
+
+test "resolveTypeExpr returns OOM instead of UNKNOWN on tuple allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(failing_alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    const zero_meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const literal_type_expr = ast.TypeExpr{
+        .literal = .{
+            .meta = zero_meta,
+            .value = .{ .int = 1 },
+        },
+    };
+    const tuple_elements = [_]*const ast.TypeExpr{&literal_type_expr};
+    const tuple_type_expr = ast.TypeExpr{
+        .tuple = .{
+            .meta = zero_meta,
+            .elements = &tuple_elements,
+        },
+    };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.resolveTypeExpr(&tuple_type_expr),
+    );
+    try std.testing.expectEqual(@as(usize, 0), builder.errors.items.len);
+}
+
+fn testNestedCollectionType(
+    allocator: std.mem.Allocator,
+    store: *types_mod.TypeStore,
+    depth: usize,
+    leaf_type: types_mod.TypeId,
+) !types_mod.TypeId {
+    var current = leaf_type;
+    for (0..depth) |_| {
+        const tuple_elements = try allocator.alloc(types_mod.TypeId, 2);
+        tuple_elements[0] = types_mod.TypeStore.ATOM;
+        tuple_elements[1] = current;
+        const tuple_type = try store.addType(.{ .tuple = .{ .elements = tuple_elements } });
+        const list_type = try store.addType(.{ .list = .{ .element = tuple_type } });
+        current = try store.addType(.{ .map = .{ .key = types_mod.TypeStore.STRING, .value = list_type } });
+    }
+    return current;
+}
+
+fn expectNestedCollectionLeaf(
+    store: *types_mod.TypeStore,
+    type_id: types_mod.TypeId,
+    depth: usize,
+    expected_leaf_type: types_mod.TypeId,
+) !void {
+    var current = type_id;
+    var remaining = depth;
+    while (remaining > 0) : (remaining -= 1) {
+        const map_type = store.getType(current);
+        try std.testing.expect(map_type == .map);
+        try std.testing.expectEqual(types_mod.TypeStore.STRING, map_type.map.key);
+
+        const list_type = store.getType(map_type.map.value);
+        try std.testing.expect(list_type == .list);
+
+        const tuple_type = store.getType(list_type.list.element);
+        try std.testing.expect(tuple_type == .tuple);
+        try std.testing.expectEqual(@as(usize, 2), tuple_type.tuple.elements.len);
+        try std.testing.expectEqual(types_mod.TypeStore.ATOM, tuple_type.tuple.elements[0]);
+        current = tuple_type.tuple.elements[1];
+    }
+    try std.testing.expectEqual(expected_leaf_type, current);
+}
+
+test "unifyForCollection preserves deep nested tuple list map precision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const depth = 96;
+    const left_type = try testNestedCollectionType(alloc, &store, depth, types_mod.TypeStore.I64);
+    const right_type = try testNestedCollectionType(alloc, &store, depth, types_mod.TypeStore.STRING);
+
+    var budget = HirCollectionTypeBudget{};
+    const unified = try unifyForCollection(&store, left_type, right_type, &budget);
+
+    try std.testing.expect(unified != types_mod.TypeStore.TERM);
+    try expectNestedCollectionLeaf(&store, unified, depth, types_mod.TypeStore.TERM);
+}
+
+test "unifyForCollection returns OutOfMemory instead of Term on tuple allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var store = try types_mod.TypeStore.init(failing_alloc, &interner);
+    defer store.deinit();
+
+    const left_elements = [_]types_mod.TypeId{types_mod.TypeStore.I64};
+    const right_elements = [_]types_mod.TypeId{types_mod.TypeStore.STRING};
+    const left_type = try store.addType(.{ .tuple = .{ .elements = &left_elements } });
+    const right_type = try store.addType(.{ .tuple = .{ .elements = &right_elements } });
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    var budget = HirCollectionTypeBudget{};
+    try std.testing.expectError(
+        error.OutOfMemory,
+        unifyForCollection(&store, left_type, right_type, &budget),
+    );
+}
+
+test "inferListElementType records a span-bearing diagnostic when collection unification exceeds budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    var graph = try scope_mod.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var builder = HirBuilder.init(alloc, &interner, &graph, &store);
+    defer builder.deinit();
+
+    var left_type = types_mod.TypeStore.I64;
+    var right_type = types_mod.TypeStore.STRING;
+    for (0..(MAX_HIR_COLLECTION_TYPE_DEPTH + 1)) |_| {
+        left_type = try store.addType(.{ .list = .{ .element = left_type } });
+        right_type = try store.addType(.{ .list = .{ .element = right_type } });
+    }
+
+    const diagnostic_span = ast.SourceSpan{ .start = 10, .end = 20, .line = 2, .col = 5 };
+    const left_expr = Expr{ .kind = .{ .int_lit = 1 }, .type_id = left_type, .span = diagnostic_span };
+    const right_expr = Expr{ .kind = .{ .string_lit = 0 }, .type_id = right_type, .span = diagnostic_span };
+    const elements = [_]*const Expr{ &left_expr, &right_expr };
+
+    try std.testing.expectError(
+        error.HirCollectionTypeBudgetExceeded,
+        builder.inferListElementType(&elements, diagnostic_span),
+    );
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "HIR collection type") != null);
+    try std.testing.expectEqual(diagnostic_span, builder.errors.items[0].span);
+}
+
+test "propagateUnifiedTypeToElement returns budget error for deeply nested list expressions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    var store = try types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const zero_span = ast.SourceSpan{ .start = 0, .end = 1, .line = 1, .col = 1 };
+    var current_expr = try alloc.create(Expr);
+    current_expr.* = .{ .kind = .{ .int_lit = 1 }, .type_id = types_mod.TypeStore.I64, .span = zero_span };
+    var current_type = types_mod.TypeStore.I64;
+    var current_unified_type = types_mod.TypeStore.TERM;
+    for (0..4) |_| {
+        current_type = try store.addType(.{ .list = .{ .element = current_type } });
+        current_unified_type = try store.addType(.{ .list = .{ .element = current_unified_type } });
+        const children = try alloc.alloc(*const Expr, 1);
+        children[0] = current_expr;
+        const parent = try alloc.create(Expr);
+        parent.* = .{ .kind = .{ .list_init = children }, .type_id = current_type, .span = zero_span };
+        current_expr = parent;
+    }
+
+    var budget = HirCollectionTypeBudget{ .max_nodes = 64, .max_depth = 2 };
+    try std.testing.expectError(
+        error.HirCollectionTypeBudgetExceeded,
+        propagateUnifiedTypeToElement(&store, current_expr, current_unified_type, &budget),
+    );
 }

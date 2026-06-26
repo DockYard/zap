@@ -88,7 +88,7 @@ pub struct ReflectionTest {
     }
 
     test("the required function carries its typed signature") {
-      assert(protocol_required_signature() == "next(state) -> {Atom, element, any}")
+      assert(protocol_required_signature() == "next(state) -> {Atom, element, ReflectionProtocol(element)}")
     }
   }
 

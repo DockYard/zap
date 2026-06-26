@@ -133,10 +133,36 @@ pub const BuildConfig = struct {
     };
 };
 
+/// Owned manifest evaluation result. Callers must either call `deinit`, or
+/// keep all owned fields inside a broader allocator lifetime such as an arena.
 pub const ManifestEval = struct {
     config: BuildConfig,
     dependencies: []const zap.ctfe.CtDependency,
     result_hash: u64,
+    owns_config: bool = true,
+    owns_dependencies: bool = true,
+
+    /// Free owned manifest config and dependency data. Call `takeConfig`
+    /// first when returning only the `BuildConfig` wrapper result.
+    pub fn deinit(self: *ManifestEval, alloc: std.mem.Allocator) void {
+        if (self.owns_config) {
+            freeConstValueBuildConfig(alloc, self.config);
+        }
+        if (self.owns_dependencies) {
+            deinitManifestEvalDependencies(alloc, self.dependencies);
+        }
+        self.owns_config = false;
+        self.owns_dependencies = false;
+        self.dependencies = &.{};
+    }
+
+    /// Transfer config ownership to the caller. The remaining
+    /// `ManifestEval` still owns dependencies until `deinit` is called.
+    pub fn takeConfig(self: *ManifestEval) BuildConfig {
+        std.debug.assert(self.owns_config);
+        self.owns_config = false;
+        return self.config;
+    }
 };
 
 /// Synthesize the `BuildConfig` for single-file script mode
@@ -226,7 +252,9 @@ pub fn ctfeManifest(
     build_opts: std.StringHashMapUnmanaged([]const u8),
     zap_lib_dir: ?[]const u8,
 ) !BuildConfig {
-    return (try ctfeManifestDetailed(alloc, build_source, target_name, cross_target, build_opts, zap_lib_dir)).config;
+    var manifest_eval = try ctfeManifestDetailed(alloc, build_source, target_name, cross_target, build_opts, zap_lib_dir);
+    defer manifest_eval.deinit(alloc);
+    return manifest_eval.takeConfig();
 }
 
 pub fn ctfeManifestDetailed(
@@ -261,11 +289,17 @@ pub fn ctfeManifestDetailedWithProgress(
 
     // Build source units: stdlib lib files + build.zap
     var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    var owned_stdlib_source_unit_count: usize = 0;
+    defer deinitManifestSourceUnitList(alloc, &source_units, owned_stdlib_source_unit_count);
 
     // Read stdlib files from zap lib dir if available
     if (progress) |reporter| reporter.stage("Manifest: reading stdlib sources", .{});
     if (zap_lib_dir) |lib_dir| {
-        try readLibSourceUnits(alloc, lib_dir, &source_units);
+        readLibSourceUnits(alloc, lib_dir, &source_units) catch |err| {
+            owned_stdlib_source_unit_count = source_units.items.len;
+            return err;
+        };
+        owned_stdlib_source_unit_count = source_units.items.len;
     }
 
     // Add build.zap as the final source unit
@@ -279,7 +313,21 @@ pub fn ctfeManifestDetailedWithProgress(
     // execute `:zig.*` builtins. See `dispatchQualifiedComptimeCall` in
     // `macro_eval.zig` for the diagnostic path that surfaces the failure.
     if (progress) |reporter| reporter.stage("Manifest: resolving build graph", .{});
-    const struct_order_data = computeStructOrder(alloc, build_source, source_units.items, zap_lib_dir) catch null;
+    var discovery_err_info: zap.discovery.ErrorInfo = .{};
+    const struct_order_data = computeStructOrder(
+        alloc,
+        build_source,
+        source_units.items,
+        zap_lib_dir,
+        &discovery_err_info,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try emitManifestStructOrderError(err, &discovery_err_info);
+            return error.ManifestDiscoveryFailed;
+        },
+    };
+    defer deinitStructOrderData(alloc, struct_order_data);
 
     var collect_options = compiler.CompileOptions{
         .show_progress = show_progress,
@@ -287,32 +335,29 @@ pub fn ctfeManifestDetailedWithProgress(
         .progress_context = "Manifest",
         .allow_external_static_references = true,
     };
-    if (struct_order_data) |order| {
-        collect_options.struct_order = order.struct_order;
-        collect_options.level_boundaries = order.level_boundaries;
-    }
+    collect_options.struct_order = struct_order_data.struct_order;
+    collect_options.level_boundaries = struct_order_data.level_boundaries;
 
     // Compile through the full frontend pipeline to get IR
     if (progress) |reporter| reporter.stage("Manifest: compiling build.zap", .{});
-    var ctx = compiler.collectAllFromUnits(alloc, source_units.items, collect_options) catch return error.CompileFailed;
-    const result = compiler.compileForCtfe(alloc, &ctx, .{
+    var ctx = try collectManifestFrontend(alloc, source_units.items, collect_options);
+    const result = try compileManifestFrontendForCtfe(alloc, &ctx, .{
         .show_progress = show_progress,
         .progress = progress,
         .progress_context = "Manifest",
         .allow_external_static_references = true,
-    }) catch return error.CompileFailed;
+    });
 
     // Create CTFE interpreter with build capabilities and persistent cache
     if (progress) |reporter| reporter.stage("Manifest: evaluating build.zap", .{});
-    var interp = ctfe.Interpreter.init(alloc, &result.ir_program);
+    var interp = try ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
     interp.interner = ctx.interner;
     interp.capabilities = ctfe.CapabilitySet.build;
     interp.build_opts = build_opts;
     interp.compile_options_hash = ctfe.hashCompileOptions(target_name, build_opts.get("optimize") orelse "release_safe");
-    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, ".zap-cache/ctfe") catch {};
-    interp.persistent_cache = ctfe.PersistentCache.init(".zap-cache/ctfe");
+    try configureManifestPersistentCache(&interp, ".zap-cache/ctfe");
 
     // Find the manifest function by scanning IR functions for one ending in "__manifest"
     const manifest_id = findManifestFunction(&result.ir_program) orelse
@@ -349,31 +394,287 @@ pub fn ctfeManifestDetailedWithProgress(
     } };
 
     // Evaluate manifest/1
-    const manifest_result = interp.evalAndExport(manifest_id, &.{env_const}, ctfe.CapabilitySet.build) catch {
-        // Report CTFE errors through the embedder-owned diagnostic stderr sink
-        // (silent by default in a test build) rather than hardwiring
-        // `std.debug.print` to the global stderr.
-        for (interp.errors.items) |err| {
-            zap.diagnostics.emitStderrFmt("  ctfe error: {s}\n", .{err.message});
-        }
-        return error.CtfeFailed;
-    };
+    const manifest_result = try evalManifestFunction(&interp, manifest_id, &.{env_const});
+    defer manifest_result.deinit(alloc);
 
     var config = try constValueToBuildConfig(alloc, manifest_result.value);
+    var config_transferred = false;
+    errdefer if (!config_transferred) freeConstValueBuildConfig(alloc, config);
     config.memory_manager = try memoryManagerSelectionFromManifest(alloc, manifest_result.value);
 
     const dependencies = try manifestEvalDependencies(
         alloc,
-        if (struct_order_data) |order| order.source_files else null,
+        struct_order_data.source_files,
         source_units.items,
         manifest_result.dependencies,
     );
+    var dependencies_transferred = false;
+    errdefer if (!dependencies_transferred) deinitManifestEvalDependencies(alloc, dependencies);
 
+    config_transferred = true;
+    dependencies_transferred = true;
     return .{
         .config = config,
         .dependencies = dependencies,
         .result_hash = manifest_result.result_hash,
     };
+}
+
+fn collectManifestFrontend(
+    alloc: std.mem.Allocator,
+    source_units: []const compiler.SourceUnit,
+    options: compiler.CompileOptions,
+) error{ OutOfMemory, CompileFailed }!compiler.CompilationContext {
+    return compiler.collectAllFromUnits(alloc, source_units, options) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CompileFailed,
+    };
+}
+
+fn compileManifestFrontendForCtfe(
+    alloc: std.mem.Allocator,
+    ctx: *compiler.CompilationContext,
+    options: compiler.CompileOptions,
+) error{ OutOfMemory, CompileFailed }!compiler.CompileResult {
+    return compiler.compileForCtfe(alloc, ctx, options) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CompileFailed,
+    };
+}
+
+fn evalManifestFunction(
+    interp: *zap.ctfe.Interpreter,
+    manifest_id: zap.ir.FunctionId,
+    args: []const zap.ctfe.ConstValue,
+) error{ OutOfMemory, CtfeFailed }!zap.ctfe.CtEvalResult {
+    return interp.evalAndExport(manifest_id, args, zap.ctfe.CapabilitySet.build) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try emitManifestCtfeErrors(interp.errors.items);
+            return error.CtfeFailed;
+        },
+    };
+}
+
+fn emitManifestCtfeErrors(errors: []const zap.ctfe.CtfeError) std.mem.Allocator.Error!void {
+    // Report CTFE errors through the embedder-owned diagnostic stderr sink
+    // (silent by default in a test build) rather than hardwiring
+    // `std.debug.print` to the global stderr.
+    for (errors) |err| {
+        try zap.diagnostics.emitStderrFmtChecked("  ctfe error: {s}\n", .{err.message});
+    }
+}
+
+fn configureManifestPersistentCache(
+    interp: *zap.ctfe.Interpreter,
+    cache_dir: []const u8,
+) std.Io.Dir.CreateDirPathError!void {
+    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, cache_dir);
+    interp.persistent_cache = zap.ctfe.PersistentCache.init(cache_dir);
+}
+
+test "builder manifest persistent cache setup propagates directory creation failure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "blocked",
+        .data = "not a directory",
+    });
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const blocked_cache_dir = try std.fs.path.join(alloc, &.{ tmp_path, "blocked", "ctfe" });
+
+    const program = testManifestIrProgram();
+    var interp = try zap.ctfe.Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    try testing.expectError(error.NotDir, configureManifestPersistentCache(&interp, blocked_cache_dir));
+    try testing.expect(interp.persistent_cache == null);
+}
+
+test "builder manifest collect preserves OutOfMemory" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const source =
+        \\pub struct App.Builder {
+        \\  pub fn manifest(_env :: Nil) -> Nil {
+        \\    nil
+        \\  }
+        \\}
+    ;
+    const source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+
+    var failing_allocator = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        collectManifestFrontend(
+            failing_allocator.allocator(),
+            &source_units,
+            .{ .show_progress = false },
+        ),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "builder manifest compile preserves OutOfMemory" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub struct App.Builder {
+        \\  pub fn manifest(_env :: Nil) -> Nil {
+        \\    nil
+        \\  }
+        \\}
+    ;
+    const source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+    var ctx = try collectManifestFrontend(alloc, &source_units, .{ .show_progress = false });
+
+    var failing_allocator = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        compileManifestFrontendForCtfe(
+            failing_allocator.allocator(),
+            &ctx,
+            .{ .show_progress = false },
+        ),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "builder manifest compile semantic failure remains CompileFailed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub struct App.Builder {
+        \\  pub fn manifest(_env :: Nil) -> i64 {
+        \\    "not an integer"
+        \\  }
+        \\}
+    ;
+    const source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = source },
+    };
+    var ctx = try collectManifestFrontend(alloc, &source_units, .{ .show_progress = false });
+
+    try testing.expectError(
+        error.CompileFailed,
+        compileManifestFrontendForCtfe(
+            alloc,
+            &ctx,
+            .{ .show_progress = false },
+        ),
+    );
+}
+
+fn testManifestIrProgram() zap.ir.Program {
+    const manifest_function = zap.ir.Function{
+        .id = 0,
+        .name = "App__Builder__manifest__1",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &.{.{ .name = "env", .type_expr = .nil }},
+        .return_type = .nil,
+        .body = &.{.{
+            .label = 0,
+            .instructions = &.{
+                .{ .param_get = .{ .dest = 0, .index = 0 } },
+                .{ .ret = .{ .value = 0 } },
+            },
+        }},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 1,
+    };
+    return .{
+        .functions = &.{manifest_function},
+        .type_defs = &.{},
+        .entry = null,
+    };
+}
+
+test "builder manifest eval preserves OutOfMemory" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const program = testManifestIrProgram();
+    var interp = try zap.ctfe.Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    const original_allocator = interp.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = 0 });
+    interp.allocator = failing_allocator.allocator();
+    defer interp.allocator = original_allocator;
+
+    try testing.expectError(
+        error.OutOfMemory,
+        evalManifestFunction(&interp, 0, &.{.{ .nil = {} }}),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "builder manifest eval semantic failure remains CtfeFailed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const program = testManifestIrProgram();
+    var interp = try zap.ctfe.Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    var captured_stderr: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured_stderr.deinit(alloc);
+    const previous_capture = zap.diagnostics.installStderrCapture(.{
+        .list = &captured_stderr,
+        .allocator = alloc,
+    });
+    defer _ = zap.diagnostics.installStderrCapture(previous_capture);
+
+    try testing.expectError(
+        error.CtfeFailed,
+        evalManifestFunction(&interp, 99, &.{}),
+    );
+    try testing.expect(std.mem.indexOf(
+        u8,
+        captured_stderr.items,
+        "ctfe error: invalid function id",
+    ) != null);
+}
+
+test "builder manifest eval diagnostic reporting preserves OutOfMemory" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const program = testManifestIrProgram();
+    var interp = try zap.ctfe.Interpreter.init(alloc, &program);
+    defer interp.deinit();
+
+    var captured_stderr: std.ArrayListUnmanaged(u8) = .empty;
+    var failing_allocator = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = 0 });
+    const previous_capture = zap.diagnostics.installStderrCapture(.{
+        .list = &captured_stderr,
+        .allocator = failing_allocator.allocator(),
+    });
+    defer _ = zap.diagnostics.installStderrCapture(previous_capture);
+
+    try testing.expectError(
+        error.OutOfMemory,
+        evalManifestFunction(&interp, 99, &.{}),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
 }
 
 const StructOrderData = struct {
@@ -382,6 +683,106 @@ const StructOrderData = struct {
     source_files: [][]const u8,
 };
 
+fn freeOwnedStringSlice(alloc: std.mem.Allocator, strings: []const []const u8) void {
+    for (strings) |string| alloc.free(string);
+    alloc.free(strings);
+}
+
+fn deinitOwnedStringList(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8)) void {
+    for (list.items) |string| alloc.free(string);
+    list.deinit(alloc);
+}
+
+fn freeBuildConfigDep(alloc: std.mem.Allocator, dep: BuildConfig.Dep) void {
+    alloc.free(dep.name);
+    switch (dep.source) {
+        .path => |path| alloc.free(path),
+        .git => |git| {
+            alloc.free(git.url);
+            if (git.tag) |tag| alloc.free(tag);
+            if (git.branch) |branch| alloc.free(branch);
+            if (git.rev) |rev| alloc.free(rev);
+        },
+    }
+    if (dep.local_override) |local_override| alloc.free(local_override);
+}
+
+fn deinitBuildConfigDepList(
+    alloc: std.mem.Allocator,
+    deps: *std.ArrayListUnmanaged(BuildConfig.Dep),
+) void {
+    for (deps.items) |dep| freeBuildConfigDep(alloc, dep);
+    deps.deinit(alloc);
+}
+
+fn freeBuildConfigBuildOpts(
+    alloc: std.mem.Allocator,
+    build_opts: *std.StringHashMapUnmanaged([]const u8),
+) void {
+    var iterator = build_opts.iterator();
+    while (iterator.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+        alloc.free(entry.value_ptr.*);
+    }
+    build_opts.deinit(alloc);
+    build_opts.* = .empty;
+}
+
+fn freeBuildConfigStep(alloc: std.mem.Allocator, step: BuildConfig.Step) void {
+    switch (step) {
+        .compile => {},
+        .run => |run| {
+            for (run.args) |arg| alloc.free(arg);
+            alloc.free(run.args);
+        },
+    }
+}
+
+fn deinitBuildConfigStepList(
+    alloc: std.mem.Allocator,
+    steps: *std.ArrayListUnmanaged(BuildConfig.Step),
+) void {
+    for (steps.items) |step| freeBuildConfigStep(alloc, step);
+    steps.deinit(alloc);
+}
+
+fn freeBuildConfigPipeline(alloc: std.mem.Allocator, pipeline: BuildConfig.Pipeline) void {
+    for (pipeline.steps) |step| freeBuildConfigStep(alloc, step);
+    alloc.free(pipeline.steps);
+}
+
+fn freeConstValueBuildConfig(alloc: std.mem.Allocator, config: BuildConfig) void {
+    alloc.free(config.name);
+    alloc.free(config.version);
+    if (config.root) |root| alloc.free(root);
+    if (config.asset_name) |asset_name| alloc.free(asset_name);
+    if (config.target) |target| alloc.free(target);
+    if (config.cpu) |cpu| alloc.free(cpu);
+    freeOwnedStringSlice(alloc, config.paths);
+    for (config.deps) |dep| freeBuildConfigDep(alloc, dep);
+    alloc.free(config.deps);
+    var build_opts = config.build_opts;
+    freeBuildConfigBuildOpts(alloc, &build_opts);
+    if (config.memory_manager) |memory_manager| {
+        alloc.free(memory_manager.type_name);
+        if (memory_manager.adapter_source_path) |adapter_source_path| {
+            alloc.free(adapter_source_path);
+        }
+    }
+    if (config.error_style) |error_style| alloc.free(error_style);
+    if (config.source_url) |source_url| alloc.free(source_url);
+    if (config.landing_page) |landing_page| alloc.free(landing_page);
+    for (config.doc_groups) |group| freeDocGroup(alloc, group);
+    alloc.free(config.doc_groups);
+    if (config.pipeline) |pipeline| freeBuildConfigPipeline(alloc, pipeline);
+}
+
+fn deinitStructOrderData(alloc: std.mem.Allocator, data: StructOrderData) void {
+    freeOwnedStringSlice(alloc, data.struct_order);
+    alloc.free(data.level_boundaries);
+    freeOwnedStringSlice(alloc, data.source_files);
+}
+
 /// Run import-driven discovery over `build.zap` + the supplied stdlib
 /// source units to produce a topological compilation order. Returns the
 /// ordered list of struct names plus the per-wave boundary indices.
@@ -389,24 +790,27 @@ const StructOrderData = struct {
 /// Used by `ctfeManifestDetailed` to drive the staged macro-expansion
 /// pipeline so a macro `__using__` body that CTFE-calls another stdlib
 /// function (e.g. the glob helper) sees that function's IR by the time
-/// the using struct is expanded. Failure to discover (e.g. missing
-/// primary struct in build.zap) is non-fatal — the caller falls back
-/// to the legacy expansion path and only macros that don't reach into
-/// other structs' compiled bodies will succeed.
+/// the using struct is expanded. Discovery is required for manifest CTFE:
+/// disabling the order would hide graph/read/parse failures and can produce
+/// different compile-time behavior for manifests that rely on staged order.
 fn computeStructOrder(
     alloc: std.mem.Allocator,
     build_source: []const u8,
     source_units: []const compiler.SourceUnit,
     zap_lib_dir: ?[]const u8,
+    err_info: ?*zap.discovery.ErrorInfo,
 ) !StructOrderData {
     const entry = (try zap.discovery.primaryStructName(alloc, build_source)) orelse return error.NoPrimaryStruct;
+    defer alloc.free(entry);
 
     var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
+    defer source_roots.deinit(alloc);
     if (zap_lib_dir) |lib_dir| {
         try source_roots.append(alloc, .{ .name = "stdlib", .path = lib_dir });
     }
 
     var explicit_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer explicit_paths.deinit(alloc);
     for (source_units) |unit| {
         try explicit_paths.append(alloc, unit.file_path);
     }
@@ -417,59 +821,300 @@ fn computeStructOrder(
         source_roots.items,
         &zap.discovery.BUILTIN_TYPE_NAMES,
         explicit_paths.items,
-        null,
+        err_info,
     );
     defer graph.deinit();
 
+    return try structOrderDataFromGraph(alloc, &graph);
+}
+
+fn structOrderDataFromGraph(
+    alloc: std.mem.Allocator,
+    graph: *const zap.discovery.FileGraph,
+) !StructOrderData {
     var order: std.ArrayListUnmanaged([]const u8) = .empty;
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var order_transferred = false;
+    var source_files_transferred = false;
+    errdefer if (!order_transferred) deinitOwnedStringList(alloc, &order);
+    errdefer if (!source_files_transferred) deinitOwnedStringList(alloc, &source_files);
     for (graph.topo_order.items) |file_path| {
-        try source_files.append(alloc, try alloc.dupe(u8, file_path));
+        const source_file = try alloc.dupe(u8, file_path);
+        var source_file_transferred = false;
+        errdefer if (!source_file_transferred) alloc.free(source_file);
+        try source_files.append(alloc, source_file);
+        source_file_transferred = true;
         if (graph.file_to_struct.get(file_path)) |struct_name| {
-            try order.append(alloc, try alloc.dupe(u8, struct_name));
+            const ordered_struct = try alloc.dupe(u8, struct_name);
+            var ordered_struct_transferred = false;
+            errdefer if (!ordered_struct_transferred) alloc.free(ordered_struct);
+            try order.append(alloc, ordered_struct);
+            ordered_struct_transferred = true;
         }
     }
 
     var levels: std.ArrayListUnmanaged(u32) = .empty;
+    var levels_transferred = false;
+    errdefer if (!levels_transferred) levels.deinit(alloc);
     for (graph.level_boundaries.items) |boundary| {
         try levels.append(alloc, boundary);
     }
 
+    const struct_order = try order.toOwnedSlice(alloc);
+    order_transferred = true;
+    var struct_order_transferred = false;
+    errdefer if (!struct_order_transferred) freeOwnedStringSlice(alloc, struct_order);
+
+    const level_boundaries = try levels.toOwnedSlice(alloc);
+    levels_transferred = true;
+    var level_boundaries_transferred = false;
+    errdefer if (!level_boundaries_transferred) alloc.free(level_boundaries);
+
+    const owned_source_files = try source_files.toOwnedSlice(alloc);
+    source_files_transferred = true;
+
+    struct_order_transferred = true;
+    level_boundaries_transferred = true;
     return .{
-        .struct_order = try order.toOwnedSlice(alloc),
-        .level_boundaries = try levels.toOwnedSlice(alloc),
-        .source_files = try source_files.toOwnedSlice(alloc),
+        .struct_order = struct_order,
+        .level_boundaries = level_boundaries,
+        .source_files = owned_source_files,
     };
+}
+
+fn emitManifestStructOrderError(err: anyerror, err_info: *const zap.discovery.ErrorInfo) std.mem.Allocator.Error!void {
+    switch (err) {
+        error.NoPrimaryStruct => {
+            try zap.diagnostics.emitStderrFmtChecked(
+                "Error: manifest discovery failed: build.zap does not declare a primary struct\n",
+                .{},
+            );
+        },
+        error.StructNotFound => {
+            if (err_info.unresolved_struct) |struct_name| {
+                try zap.diagnostics.emitStderrFmtChecked(
+                    "Error: manifest discovery failed: struct `{s}` not found\n",
+                    .{struct_name},
+                );
+            } else if (err_info.boundary_struct) |struct_name| {
+                try zap.diagnostics.emitStderrFmtChecked(
+                    "Error: manifest discovery failed: struct `{s}` is private in {s} and cannot be accessed from {s}\n",
+                    .{
+                        struct_name,
+                        err_info.boundary_dep orelse "?",
+                        err_info.boundary_from orelse "?",
+                    },
+                );
+            } else {
+                try zap.diagnostics.emitStderrFmtChecked(
+                    "Error: manifest discovery failed: struct not found\n",
+                    .{},
+                );
+            }
+        },
+        error.CircularDependency => {
+            try zap.diagnostics.emitStderrFmtChecked(
+                "Error: manifest discovery failed: circular struct dependency detected\n",
+                .{},
+            );
+        },
+        error.ReadError => {
+            try zap.diagnostics.emitStderrFmtChecked(
+                "Error: manifest discovery failed: could not read a source file\n",
+                .{},
+            );
+        },
+        error.ParseFailed => {
+            try zap.diagnostics.emitStderrFmtChecked(
+                "Error: manifest discovery failed: could not parse a source file\n",
+                .{},
+            );
+        },
+        else => {
+            try zap.diagnostics.emitStderrFmtChecked(
+                "Error: manifest discovery failed: {s}\n",
+                .{@errorName(err)},
+            );
+        },
+    }
+}
+
+test "builder manifest struct order propagates discovery failure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var captured_stderr: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured_stderr.deinit(alloc);
+    const previous_capture = zap.diagnostics.installStderrCapture(.{
+        .list = &captured_stderr,
+        .allocator = alloc,
+    });
+    defer _ = zap.diagnostics.installStderrCapture(previous_capture);
+
+    try testing.expectError(
+        error.ManifestDiscoveryFailed,
+        ctfeManifestDetailedWithProgress(
+            alloc,
+            "",
+            "default",
+            null,
+            std.StringHashMapUnmanaged([]const u8).empty,
+            null,
+            null,
+        ),
+    );
+    try testing.expect(std.mem.indexOf(
+        u8,
+        captured_stderr.items,
+        "build.zap does not declare a primary struct",
+    ) != null);
+}
+
+test "builder manifest struct order preserves discovered dependency order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const build_source =
+        \\pub struct App.Builder {
+        \\  pub fn manifest() -> Nil {
+        \\    Helper.value()
+        \\  }
+        \\}
+    ;
+    const helper_source =
+        \\pub struct Helper {
+        \\  pub fn value() -> i64 {
+        \\    1
+        \\  }
+        \\}
+    ;
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "build.zap",
+        .data = build_source,
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "helper.zap",
+        .data = helper_source,
+    });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const build_path = try std.fs.path.join(alloc, &.{ tmp_path, "build.zap" });
+    const helper_path = try std.fs.path.join(alloc, &.{ tmp_path, "helper.zap" });
+
+    const source_units = [_]compiler.SourceUnit{
+        .{ .file_path = build_path, .source = build_source },
+        .{ .file_path = helper_path, .source = helper_source },
+    };
+
+    var discovery_err_info: zap.discovery.ErrorInfo = .{};
+    const struct_order_data = try computeStructOrder(
+        alloc,
+        build_source,
+        &source_units,
+        tmp_path,
+        &discovery_err_info,
+    );
+
+    try testing.expectEqual(@as(usize, 2), struct_order_data.struct_order.len);
+    try testing.expectEqualStrings("Helper", struct_order_data.struct_order[0]);
+    try testing.expectEqualStrings("App.Builder", struct_order_data.struct_order[1]);
+    try testing.expectEqual(@as(usize, 2), struct_order_data.level_boundaries.len);
+    try testing.expectEqual(@as(u32, 1), struct_order_data.level_boundaries[0]);
+    try testing.expectEqual(@as(u32, 2), struct_order_data.level_boundaries[1]);
+    try testing.expectEqual(@as(usize, 2), struct_order_data.source_files.len);
+    try testing.expectEqualStrings(helper_path, struct_order_data.source_files[0]);
+    try testing.expectEqualStrings(build_path, struct_order_data.source_files[1]);
+}
+
+fn exerciseStructOrderDataFromGraphAllocationFailures(
+    alloc: std.mem.Allocator,
+    graph: *const zap.discovery.FileGraph,
+) !void {
+    const struct_order_data = try structOrderDataFromGraph(alloc, graph);
+    defer deinitStructOrderData(alloc, struct_order_data);
+
+    try testing.expectEqual(@as(usize, 2), struct_order_data.struct_order.len);
+    try testing.expectEqualStrings("Helper", struct_order_data.struct_order[0]);
+    try testing.expectEqualStrings("App.Builder", struct_order_data.struct_order[1]);
+}
+
+test "P4J2: struct order graph conversion frees duplicated path and struct names on allocation failure" {
+    const alloc = std.testing.allocator;
+
+    var graph = zap.discovery.FileGraph.init(alloc);
+    defer graph.deinit();
+    try graph.topo_order.append(alloc, "helper.zap");
+    try graph.topo_order.append(alloc, "build.zap");
+    try graph.file_to_struct.put("helper.zap", "Helper");
+    try graph.file_to_struct.put("build.zap", "App.Builder");
+    try graph.level_boundaries.append(alloc, 1);
+    try graph.level_boundaries.append(alloc, 2);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        exerciseStructOrderDataFromGraphAllocationFailures,
+        .{&graph},
+    );
 }
 
 fn manifestEvalDependencies(
     alloc: std.mem.Allocator,
-    maybe_reachable_source_files: ?[]const []const u8,
+    reachable_source_files: []const []const u8,
     source_units: []const compiler.SourceUnit,
     runtime_dependencies: []const zap.ctfe.CtDependency,
 ) ![]const zap.ctfe.CtDependency {
     var dependencies: std.ArrayListUnmanaged(zap.ctfe.CtDependency) = .empty;
+    var dependencies_transferred = false;
+    errdefer if (!dependencies_transferred) deinitManifestEvalDependencyList(alloc, &dependencies);
 
-    if (maybe_reachable_source_files) |reachable_source_files| {
-        for (reachable_source_files) |source_file| {
-            const source = sourceForManifestDependency(source_units, source_file) orelse
-                try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, source_file, alloc, .limited(10 * 1024 * 1024));
-            try appendManifestFileDependency(alloc, &dependencies, source_file, source);
-        }
-    } else {
-        // Discovery failure falls back to the legacy manifest compile path.
-        // In that mode we cannot prove reachability, so cache validation
-        // must conservatively cover every source unit that entered CTFE.
-        for (source_units) |source_unit| {
-            try appendManifestFileDependency(alloc, &dependencies, source_unit.file_path, source_unit.source);
-        }
+    for (reachable_source_files) |source_file| {
+        var owned_source: ?[]u8 = null;
+        defer if (owned_source) |source| alloc.free(source);
+        const source = sourceForManifestDependency(source_units, source_file) orelse blk: {
+            const read_source = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, source_file, alloc, .limited(10 * 1024 * 1024));
+            owned_source = read_source;
+            break :blk read_source;
+        };
+        try appendManifestFileDependency(alloc, &dependencies, source_file, source);
     }
 
     for (runtime_dependencies) |dependency| {
-        try dependencies.append(alloc, dependency);
+        const owned_dependency = try dependency.cloneOwned(alloc);
+        var dependency_transferred = false;
+        errdefer if (!dependency_transferred) owned_dependency.deinitOwned(alloc);
+        try dependencies.append(alloc, owned_dependency);
+        dependency_transferred = true;
     }
 
-    return dependencies.toOwnedSlice(alloc);
+    const owned_dependencies = try dependencies.toOwnedSlice(alloc);
+    dependencies_transferred = true;
+    return owned_dependencies;
+}
+
+fn deinitManifestEvalDependencies(
+    alloc: std.mem.Allocator,
+    dependencies: []const zap.ctfe.CtDependency,
+) void {
+    for (dependencies) |dependency| {
+        dependency.deinitOwned(alloc);
+    }
+    alloc.free(dependencies);
+}
+
+fn deinitManifestEvalDependencyList(
+    alloc: std.mem.Allocator,
+    dependencies: *std.ArrayListUnmanaged(zap.ctfe.CtDependency),
+) void {
+    for (dependencies.items) |dependency| {
+        dependency.deinitOwned(alloc);
+    }
+    dependencies.deinit(alloc);
 }
 
 fn sourceForManifestDependency(
@@ -491,16 +1136,18 @@ fn appendManifestFileDependency(
     for (dependencies.items) |existing| {
         if (existing == .file and std.mem.eql(u8, existing.file.path, path)) return;
     }
+    const owned_path = try alloc.dupe(u8, path);
+    var path_transferred = false;
+    errdefer if (!path_transferred) alloc.free(owned_path);
     try dependencies.append(alloc, .{ .file = .{
-        .path = try alloc.dupe(u8, path),
+        .path = owned_path,
         .content_hash = std.hash.Wyhash.hash(0, source),
     } });
+    path_transferred = true;
 }
 
 test "manifestEvalDependencies uses reachable compile inputs when discovery succeeds" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    const alloc = std.testing.allocator;
 
     const source_units = [_]compiler.SourceUnit{
         .{ .file_path = "build.zap", .source = "manifest" },
@@ -521,6 +1168,7 @@ test "manifestEvalDependencies uses reachable compile inputs when discovery succ
         &source_units,
         &runtime_dependencies,
     );
+    defer deinitManifestEvalDependencies(alloc, dependencies);
 
     try std.testing.expectEqual(@as(usize, 3), dependencies.len);
     try std.testing.expectEqualStrings("build.zap", dependencies[0].file.path);
@@ -533,6 +1181,151 @@ test "manifestEvalDependencies uses reachable compile inputs when discovery succ
     }
 }
 
+test "manifestEvalDependencies deep-clones runtime dependencies" {
+    const alloc = testing.allocator;
+
+    var runtime_name = try alloc.dupe(u8, "ZAP_ENV");
+    defer alloc.free(runtime_name);
+    const runtime_dependencies = [_]zap.ctfe.CtDependency{
+        .{ .env_var = .{ .name = runtime_name, .value_hash = 123, .present = true } },
+    };
+
+    const dependencies = try manifestEvalDependencies(
+        alloc,
+        &.{},
+        &.{},
+        &runtime_dependencies,
+    );
+    defer deinitManifestEvalDependencies(alloc, dependencies);
+
+    try testing.expectEqual(@as(usize, 1), dependencies.len);
+    try testing.expectEqualStrings("ZAP_ENV", dependencies[0].env_var.name);
+    runtime_name[0] = 'X';
+    try testing.expectEqualStrings("ZAP_ENV", dependencies[0].env_var.name);
+    try testing.expect(@intFromPtr(dependencies[0].env_var.name.ptr) != @intFromPtr(runtime_name.ptr));
+}
+
+fn exerciseManifestEvalDependenciesRuntimeCloneAllocationFailures(alloc: std.mem.Allocator) !void {
+    const source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = "manifest" },
+    };
+    const reachable_source_files = [_][]const u8{"build.zap"};
+    const reflected_source_paths = [_][]const u8{ "lib/config.zap", "lib/runtime.zap" };
+    const runtime_dependencies = [_]zap.ctfe.CtDependency{
+        .{ .env_var = .{ .name = "ZAP_ENV", .value_hash = 123, .present = true } },
+        .{ .reflected_source = .{ .paths = &reflected_source_paths, .graph_hash = 456 } },
+    };
+
+    const dependencies = try manifestEvalDependencies(
+        alloc,
+        &reachable_source_files,
+        &source_units,
+        &runtime_dependencies,
+    );
+    defer deinitManifestEvalDependencies(alloc, dependencies);
+
+    try testing.expectEqual(@as(usize, 3), dependencies.len);
+}
+
+test "P4J2: manifestEvalDependencies frees cloned runtime dependencies on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseManifestEvalDependenciesRuntimeCloneAllocationFailures,
+        .{},
+    );
+}
+
+fn exerciseAppendManifestFileDependencyAllocationFailures(alloc: std.mem.Allocator) !void {
+    var dependencies: std.ArrayListUnmanaged(zap.ctfe.CtDependency) = .empty;
+    defer deinitManifestEvalDependencyList(alloc, &dependencies);
+
+    try appendManifestFileDependency(alloc, &dependencies, "build.zap", "pub struct Build {}");
+
+    try testing.expectEqual(@as(usize, 1), dependencies.items.len);
+    try testing.expect(dependencies.items[0] == .file);
+    try testing.expectEqualStrings("build.zap", dependencies.items[0].file.path);
+}
+
+test "P4J2: appendManifestFileDependency frees path duplicate when dependency append fails" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseAppendManifestFileDependencyAllocationFailures,
+        .{},
+    );
+}
+
+fn p4j2OwnedManifestConfigValue() zap.ctfe.ConstValue {
+    return .{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "paths", .value = .{ .list = &.{
+                .{ .string = "lib" },
+            } } },
+        },
+    } };
+}
+
+fn makeP4J2OwnedManifestEval(alloc: std.mem.Allocator) !ManifestEval {
+    const config = try constValueToBuildConfig(alloc, p4j2OwnedManifestConfigValue());
+    var config_transferred = false;
+    errdefer if (!config_transferred) freeConstValueBuildConfig(alloc, config);
+
+    const source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "build.zap", .source = "manifest" },
+    };
+    const reachable_source_files = [_][]const u8{"build.zap"};
+    const runtime_dependencies = [_]zap.ctfe.CtDependency{
+        .{ .env_var = .{ .name = "ZAP_ENV", .value_hash = 123, .present = true } },
+    };
+    const dependencies = try manifestEvalDependencies(
+        alloc,
+        &reachable_source_files,
+        &source_units,
+        &runtime_dependencies,
+    );
+    var dependencies_transferred = false;
+    errdefer if (!dependencies_transferred) deinitManifestEvalDependencies(alloc, dependencies);
+
+    config_transferred = true;
+    dependencies_transferred = true;
+    return .{
+        .config = config,
+        .dependencies = dependencies,
+        .result_hash = 0x1234,
+    };
+}
+
+fn exerciseManifestEvalDeinitAllocationFailures(alloc: std.mem.Allocator) !void {
+    var manifest_eval = try makeP4J2OwnedManifestEval(alloc);
+    manifest_eval.deinit(alloc);
+}
+
+test "P4J2: ManifestEval.deinit frees owned config and dependencies" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseManifestEvalDeinitAllocationFailures,
+        .{},
+    );
+}
+
+fn exerciseManifestEvalConfigTransferAllocationFailures(alloc: std.mem.Allocator) !void {
+    var manifest_eval = try makeP4J2OwnedManifestEval(alloc);
+    const config = manifest_eval.takeConfig();
+    defer freeConstValueBuildConfig(alloc, config);
+    manifest_eval.deinit(alloc);
+}
+
+test "P4J2: ManifestEval.deinit preserves transferred config ownership" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseManifestEvalConfigTransferAllocationFailures,
+        .{},
+    );
+}
+
 /// Read all .zap files from a directory and its subdirectories recursively,
 /// adding them as source units.
 fn readLibSourceUnits(
@@ -540,19 +1333,22 @@ fn readLibSourceUnits(
     dir_path: []const u8,
     source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
 ) !void {
-    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true }) catch return;
+    var dir = try std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true });
     defer dir.close(std.Options.debug_io);
     var iter = dir.iterate();
-    while (iter.next(std.Options.debug_io) catch null) |entry| {
+    while (try iter.next(std.Options.debug_io)) |entry| {
         if (entry.kind == .directory) {
             const subdir_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+            defer alloc.free(subdir_path);
             try readLibSourceUnits(alloc, subdir_path, source_units);
             continue;
         }
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
         const file_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
-        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch continue;
+        errdefer alloc.free(file_path);
+        const source = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024));
+        errdefer alloc.free(source);
         try source_units.append(alloc, .{ .file_path = file_path, .source = source });
     }
 }
@@ -562,42 +1358,181 @@ fn readLibSourceUnitsUnique(
     dir_path: []const u8,
     source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
 ) !void {
-    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true }) catch return;
+    var dir = try std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true });
     defer dir.close(std.Options.debug_io);
     var iter = dir.iterate();
-    while (iter.next(std.Options.debug_io) catch null) |entry| {
+    while (try iter.next(std.Options.debug_io)) |entry| {
         if (entry.kind == .directory) {
             const subdir_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+            defer alloc.free(subdir_path);
             try readLibSourceUnitsUnique(alloc, subdir_path, source_units);
             continue;
         }
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
         const file_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
-        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch continue;
+        const source = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024));
         try appendUniqueSourceUnit(alloc, source_units, .{ .file_path = file_path, .source = source });
     }
+}
+
+fn deinitSourceUnitList(
+    alloc: std.mem.Allocator,
+    source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
+) void {
+    for (source_units.items) |source_unit| {
+        alloc.free(source_unit.file_path);
+        alloc.free(source_unit.source);
+    }
+    source_units.deinit(alloc);
+}
+
+fn deinitManifestSourceUnitList(
+    alloc: std.mem.Allocator,
+    source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
+    owned_stdlib_source_unit_count: usize,
+) void {
+    std.debug.assert(owned_stdlib_source_unit_count <= source_units.items.len);
+    for (source_units.items[0..owned_stdlib_source_unit_count]) |source_unit| {
+        alloc.free(source_unit.file_path);
+        alloc.free(source_unit.source);
+    }
+    source_units.deinit(alloc);
+}
+
+fn exerciseManifestSourceUnitListCleanupAllocationFailures(alloc: std.mem.Allocator) !void {
+    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    var owned_stdlib_source_unit_count: usize = 0;
+    defer deinitManifestSourceUnitList(alloc, &source_units, owned_stdlib_source_unit_count);
+
+    const stdlib_path = try alloc.dupe(u8, "lib/kernel.zap");
+    var stdlib_path_transferred = false;
+    errdefer if (!stdlib_path_transferred) alloc.free(stdlib_path);
+    const stdlib_source = try alloc.dupe(u8, "pub struct Kernel {}");
+    var stdlib_source_transferred = false;
+    errdefer if (!stdlib_source_transferred) alloc.free(stdlib_source);
+    try source_units.append(alloc, .{
+        .file_path = stdlib_path,
+        .source = stdlib_source,
+    });
+    stdlib_path_transferred = true;
+    stdlib_source_transferred = true;
+    owned_stdlib_source_unit_count = source_units.items.len;
+
+    try source_units.append(alloc, .{
+        .file_path = "build.zap",
+        .source = "pub struct App.Builder {}",
+    });
+
+    try testing.expectEqual(@as(usize, 2), source_units.items.len);
+}
+
+test "P4J2: manifest source-unit cleanup frees owned stdlib units only" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseManifestSourceUnitListCleanupAllocationFailures,
+        .{},
+    );
+}
+
+fn exerciseReadLibSourceUnitsAllocationFailures(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+) !void {
+    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    defer deinitSourceUnitList(alloc, &source_units);
+
+    try readLibSourceUnits(alloc, root_path, &source_units);
+    try std.testing.expectEqual(@as(usize, 2), source_units.items.len);
+}
+
+test "P4J2: readLibSourceUnits frees recursive paths and unappended source units on allocation failure" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(std.Options.debug_io, "stdlib/nested");
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "stdlib/kernel.zap",
+        .data = "pub struct Kernel {}",
+    });
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "stdlib/nested/list.zap",
+        .data = "pub struct List {}",
+    });
+
+    const root_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "stdlib", std.testing.allocator);
+    defer std.testing.allocator.free(root_path);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseReadLibSourceUnitsAllocationFailures,
+        .{root_path},
+    );
+}
+
+test "readStdlibSourceUnits propagates missing required directory" {
+    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    try std.testing.expectError(
+        error.FileNotFound,
+        readStdlibSourceUnits(std.testing.allocator, "missing-required-zap-stdlib-root", &source_units),
+    );
+}
+
+test "readStdlibSourceUnits propagates allocator failure during discovery" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "kernel.zap",
+        .data = "pub struct Kernel {}",
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", arena.allocator());
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        readStdlibSourceUnits(failing_allocator.allocator(), root_path, &source_units),
+    );
+}
+
+test "P4J2: canonicalSourcePath propagates canonicalization failures" {
+    try std.testing.expectError(
+        error.FileNotFound,
+        canonicalSourcePath(std.testing.allocator, "missing/p4j2/canonical/source.zap"),
+    );
+}
+
+test "P4J2: appendUniqueSourceUnit propagates canonicalization failures" {
+    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    try std.testing.expectError(
+        error.FileNotFound,
+        appendUniqueSourceUnit(std.testing.allocator, &source_units, .{
+            .file_path = "missing/p4j2/source-unit.zap",
+            .source = "",
+        }),
+    );
 }
 
 fn appendUniqueSourceUnit(
     alloc: std.mem.Allocator,
     source_units: *std.ArrayListUnmanaged(compiler.SourceUnit),
     source_unit: compiler.SourceUnit,
-) !void {
-    const source_key = canonicalSourcePath(alloc, source_unit.file_path) catch try alloc.dupe(u8, source_unit.file_path);
+) std.Io.Dir.RealPathFileAllocError!void {
+    const source_key = try canonicalSourcePath(alloc, source_unit.file_path);
     defer alloc.free(source_key);
     for (source_units.items) |existing| {
-        const existing_key = canonicalSourcePath(alloc, existing.file_path) catch try alloc.dupe(u8, existing.file_path);
+        const existing_key = try canonicalSourcePath(alloc, existing.file_path);
         defer alloc.free(existing_key);
         if (std.mem.eql(u8, existing_key, source_key)) return;
     }
     try source_units.append(alloc, source_unit);
 }
 
-fn canonicalSourcePath(alloc: std.mem.Allocator, file_path: []const u8) ![]const u8 {
-    return std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, file_path, alloc) catch {
-        return std.fs.path.resolve(alloc, &.{file_path});
-    };
+fn canonicalSourcePath(alloc: std.mem.Allocator, file_path: []const u8) std.Io.Dir.RealPathFileAllocError![:0]u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, file_path, alloc);
 }
 
 fn findManifestFunction(program: *const zap.ir.Program) ?zap.ir.FunctionId {
@@ -641,8 +1576,14 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                 .version = "",
                 .kind = .bin,
             };
+            var config_transferred = false;
+            errdefer if (!config_transferred) freeConstValueBuildConfig(alloc, config);
             var paths_list: std.ArrayListUnmanaged([]const u8) = .empty;
+            var paths_list_transferred = false;
+            errdefer if (!paths_list_transferred) deinitOwnedStringList(alloc, &paths_list);
             var deps_list: std.ArrayListUnmanaged(BuildConfig.Dep) = .empty;
+            var deps_list_transferred = false;
+            errdefer if (!deps_list_transferred) deinitBuildConfigDepList(alloc, &deps_list);
 
             for (sv.fields) |field| {
                 if (std.mem.eql(u8, field.name, "name")) {
@@ -701,7 +1642,13 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                         .list => |items| {
                             for (items) |item| {
                                 switch (item) {
-                                    .string => |s| try paths_list.append(alloc, try alloc.dupe(u8, s)),
+                                    .string => |s| {
+                                        const path = try alloc.dupe(u8, s);
+                                        var path_transferred = false;
+                                        errdefer if (!path_transferred) alloc.free(path);
+                                        try paths_list.append(alloc, path);
+                                        path_transferred = true;
+                                    },
                                     else => {},
                                 }
                             }
@@ -712,7 +1659,11 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                     switch (field.value) {
                         .list => |items| {
                             for (items) |item| {
-                                try deps_list.append(alloc, try constValueToDep(alloc, item));
+                                const dep = try constValueToDep(alloc, item);
+                                var dep_transferred = false;
+                                errdefer if (!dep_transferred) freeBuildConfigDep(alloc, dep);
+                                try deps_list.append(alloc, dep);
+                                dep_transferred = true;
                             }
                         },
                         else => {},
@@ -733,12 +1684,18 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                     switch (field.value) {
                         .list => |items| {
                             var groups_list: std.ArrayListUnmanaged(BuildConfig.DocGroup) = .empty;
+                            var groups_list_transferred = false;
+                            errdefer if (!groups_list_transferred) deinitDocGroupList(alloc, &groups_list);
                             for (items) |item| {
                                 if (try constValueToDocGroup(alloc, item)) |group| {
+                                    var group_transferred = false;
+                                    errdefer if (!group_transferred) freeDocGroup(alloc, group);
                                     try groups_list.append(alloc, group);
+                                    group_transferred = true;
                                 }
                             }
                             config.doc_groups = try groups_list.toOwnedSlice(alloc);
+                            groups_list_transferred = true;
                         },
                         else => {},
                     }
@@ -747,8 +1704,13 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                 }
             }
 
-            config.paths = try paths_list.toOwnedSlice(alloc);
-            config.deps = try deps_list.toOwnedSlice(alloc);
+            const paths = try paths_list.toOwnedSlice(alloc);
+            paths_list_transferred = true;
+            config.paths = paths;
+            const deps = try deps_list.toOwnedSlice(alloc);
+            deps_list_transferred = true;
+            config.deps = deps;
+            config_transferred = true;
             return config;
         },
         else => return error.ManifestNotFound,
@@ -775,7 +1737,8 @@ pub fn evaluateMemoryManagerAdapterFromSources(
     defer graph.deinit();
     if (!graph.struct_to_file.contains(selected.type_name)) return error.InvalidMemoryManagerAdapter;
 
-    var collect_source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    var collect_source_units: AdapterSourceUnitCollection = .{};
+    defer collect_source_units.deinit(alloc);
     try appendDiscoveredSourceUnits(alloc, &collect_source_units, graph.topo_order.items, source_units, &graph);
 
     var struct_order: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -806,7 +1769,7 @@ pub fn evaluateMemoryManagerAdapterFromSources(
     collect_options.struct_order = struct_order.items;
     collect_options.level_boundaries = graph.level_boundaries.items;
 
-    var ctx = compiler.collectAllFromUnits(alloc, collect_source_units.items, collect_options) catch return error.CompileFailed;
+    var ctx = try collectMemoryManagerAdapterFrontend(alloc, collect_source_units.units.items, collect_options);
 
     const source_path = try resolveMemoryManagerBackendFromSourceGraph(
         alloc,
@@ -815,6 +1778,17 @@ pub fn evaluateMemoryManagerAdapterFromSources(
         selected.type_name,
     );
     return buildMemoryAdapterEval(alloc, selected.type_name, source_path);
+}
+
+fn collectMemoryManagerAdapterFrontend(
+    alloc: std.mem.Allocator,
+    source_units: []const compiler.SourceUnit,
+    options: compiler.CompileOptions,
+) error{ OutOfMemory, CompileFailed }!compiler.CompilationContext {
+    return compiler.collectAllFromUnits(alloc, source_units, options) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CompileFailed,
+    };
 }
 
 fn discoverMemoryAdapterGraph(
@@ -836,6 +1810,7 @@ fn discoverMemoryAdapterGraph(
     graph.deinit();
 
     const explicit_source_files = try explicitSourceFilesDeclaringStruct(alloc, source_units, adapter_type_name);
+    defer alloc.free(explicit_source_files);
     var explicit_graph = try zap.discovery.discoverWithSourceFiles(
         alloc,
         adapter_type_name,
@@ -854,6 +1829,7 @@ fn explicitSourceFilesDeclaringStruct(
     struct_name: []const u8,
 ) ![]const []const u8 {
     var file_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer file_paths.deinit(alloc);
     for (source_units) |unit| {
         if (!try sourceDeclaresStructName(alloc, unit.source, struct_name)) continue;
         try file_paths.append(alloc, unit.file_path);
@@ -894,27 +1870,87 @@ fn sourceDeclaresStructName(
     }
 }
 
+const AdapterSourceUnitCollection = struct {
+    units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty,
+    owned_sources: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *AdapterSourceUnitCollection, alloc: std.mem.Allocator) void {
+        for (self.owned_sources.items) |source| {
+            alloc.free(source);
+        }
+        self.owned_sources.deinit(alloc);
+        self.units.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn appendBorrowedUnique(
+        self: *AdapterSourceUnitCollection,
+        alloc: std.mem.Allocator,
+        source_unit: compiler.SourceUnit,
+    ) std.Io.Dir.RealPathFileAllocError!void {
+        try appendUniqueSourceUnit(alloc, &self.units, source_unit);
+    }
+
+    fn appendOwnedUnique(
+        self: *AdapterSourceUnitCollection,
+        alloc: std.mem.Allocator,
+        source_unit: compiler.SourceUnit,
+    ) std.Io.Dir.RealPathFileAllocError!void {
+        const previous_len = self.units.items.len;
+        var source_tracked = false;
+        errdefer {
+            if (!source_tracked) {
+                alloc.free(source_unit.source);
+                if (self.units.items.len > previous_len) {
+                    self.units.items.len = previous_len;
+                }
+            }
+        }
+
+        try appendUniqueSourceUnit(alloc, &self.units, source_unit);
+        if (self.units.items.len == previous_len) {
+            alloc.free(source_unit.source);
+            source_tracked = true;
+            return;
+        }
+
+        try self.owned_sources.append(alloc, source_unit.source);
+        source_tracked = true;
+    }
+};
+
 fn appendDiscoveredSourceUnits(
     alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(compiler.SourceUnit),
+    out: *AdapterSourceUnitCollection,
     file_paths: []const []const u8,
     provided_units: []const compiler.SourceUnit,
     graph: *const zap.discovery.FileGraph,
-) !void {
+) error{ OutOfMemory, ReadError }!void {
     for (file_paths) |file_path| {
-        const provided = try findProvidedSourceUnit(alloc, provided_units, file_path);
+        const provided = findProvidedSourceUnit(alloc, provided_units, file_path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ReadError,
+        };
         if (provided) |unit| {
-            try appendUniqueSourceUnit(alloc, out, unit);
+            out.appendBorrowedUnique(alloc, unit) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.ReadError,
+            };
             continue;
         }
 
-        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch
-            return error.ReadError;
-        try appendUniqueSourceUnit(alloc, out, .{
+        const source = std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, file_path, alloc, .limited(10 * 1024 * 1024)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ReadError,
+        };
+        out.appendOwnedUnique(alloc, .{
             .file_path = file_path,
             .source = source,
             .primary_struct_name = graph.file_to_struct.get(file_path),
-        });
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ReadError,
+        };
     }
 }
 
@@ -922,12 +1958,14 @@ fn findProvidedSourceUnit(
     alloc: std.mem.Allocator,
     provided_units: []const compiler.SourceUnit,
     file_path: []const u8,
-) !?compiler.SourceUnit {
-    const target_key = canonicalSourcePath(alloc, file_path) catch try alloc.dupe(u8, file_path);
+) std.Io.Dir.RealPathFileAllocError!?compiler.SourceUnit {
+    if (provided_units.len == 0) return null;
+
+    const target_key = try canonicalSourcePath(alloc, file_path);
     defer alloc.free(target_key);
 
     for (provided_units) |unit| {
-        const unit_key = canonicalSourcePath(alloc, unit.file_path) catch try alloc.dupe(u8, unit.file_path);
+        const unit_key = try canonicalSourcePath(alloc, unit.file_path);
         defer alloc.free(unit_key);
         if (std.mem.eql(u8, unit_key, target_key)) return unit;
     }
@@ -1027,13 +2065,16 @@ fn buildMemoryAdapterEval(
     manager_type_name: []const u8,
     source_path: []const u8,
 ) !MemoryAdapterEval {
+    errdefer alloc.free(source_path);
+
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(manager_type_name);
     hasher.update(source_path);
 
+    const owned_type_name = try alloc.dupe(u8, manager_type_name);
     return .{
         .manager = .{
-            .type_name = try alloc.dupe(u8, manager_type_name),
+            .type_name = owned_type_name,
             .adapter_source_path = source_path,
         },
         .result_hash = hasher.final(),
@@ -1115,11 +2156,19 @@ fn constValueToPipeline(
     };
 
     var steps: std.ArrayListUnmanaged(BuildConfig.Step) = .empty;
+    var steps_transferred = false;
+    errdefer if (!steps_transferred) deinitBuildConfigStepList(alloc, &steps);
     for (step_values) |step_value| {
-        try steps.append(alloc, try constValueToPipelineStep(alloc, step_value));
+        const step = try constValueToPipelineStep(alloc, step_value);
+        var step_transferred = false;
+        errdefer if (!step_transferred) freeBuildConfigStep(alloc, step);
+        try steps.append(alloc, step);
+        step_transferred = true;
     }
     if (steps.items.len == 0) return error.InvalidManifestPipeline;
-    return BuildConfig.Pipeline{ .steps = try steps.toOwnedSlice(alloc) };
+    const owned_steps = try steps.toOwnedSlice(alloc);
+    steps_transferred = true;
+    return BuildConfig.Pipeline{ .steps = owned_steps };
 }
 
 fn constValueToPipelineStep(
@@ -1129,6 +2178,7 @@ fn constValueToPipelineStep(
     if (val != .struct_val) return error.InvalidManifestPipeline;
 
     var parsed_step: ?BuildConfig.Step = null;
+    errdefer if (parsed_step) |step| freeBuildConfigStep(alloc, step);
     for (val.struct_val.fields) |field| {
         if (std.mem.eql(u8, field.name, "compile")) {
             if (field.value == .nil) continue;
@@ -1169,7 +2219,13 @@ fn constValueToPipelineRun(
             };
             for (arg_values) |arg_value| {
                 switch (arg_value) {
-                    .string => |arg| try args.append(alloc, try alloc.dupe(u8, arg)),
+                    .string => |arg| {
+                        const owned_arg = try alloc.dupe(u8, arg);
+                        var owned_arg_transferred = false;
+                        errdefer if (!owned_arg_transferred) alloc.free(owned_arg);
+                        try args.append(alloc, owned_arg);
+                        owned_arg_transferred = true;
+                    },
                     else => return error.InvalidManifestPipeline,
                 }
             }
@@ -1184,6 +2240,20 @@ fn constValueToPipelineRun(
     return run;
 }
 
+fn freeDocGroup(alloc: std.mem.Allocator, group: BuildConfig.DocGroup) void {
+    alloc.free(group.name);
+    for (group.pages) |page| alloc.free(page);
+    alloc.free(group.pages);
+}
+
+fn deinitDocGroupList(
+    alloc: std.mem.Allocator,
+    groups: *std.ArrayListUnmanaged(BuildConfig.DocGroup),
+) void {
+    for (groups.items) |group| freeDocGroup(alloc, group);
+    groups.deinit(alloc);
+}
+
 fn constValueToDocGroup(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?BuildConfig.DocGroup {
     // Expecting a tuple: {group_name, [page_paths]}
     switch (val) {
@@ -1193,19 +2263,32 @@ fn constValueToDocGroup(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !?Bu
                 .string => |s| try alloc.dupe(u8, s),
                 else => return null,
             };
+            var name_transferred = false;
+            errdefer if (!name_transferred) alloc.free(name);
             const pages = switch (fields[1]) {
                 .list => |items| blk: {
                     var page_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                    var page_list_transferred = false;
+                    errdefer if (!page_list_transferred) deinitOwnedStringList(alloc, &page_list);
                     for (items) |item| {
                         switch (item) {
-                            .string => |s| try page_list.append(alloc, try alloc.dupe(u8, s)),
+                            .string => |s| {
+                                const page = try alloc.dupe(u8, s);
+                                var page_transferred = false;
+                                errdefer if (!page_transferred) alloc.free(page);
+                                try page_list.append(alloc, page);
+                                page_transferred = true;
+                            },
                             else => {},
                         }
                     }
-                    break :blk try page_list.toOwnedSlice(alloc);
+                    const owned_pages = try page_list.toOwnedSlice(alloc);
+                    page_list_transferred = true;
+                    break :blk owned_pages;
                 },
                 else => return null,
             };
+            name_transferred = true;
             return .{ .name = name, .pages = pages };
         },
         else => return null,
@@ -1219,22 +2302,42 @@ fn constValueToDep(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !BuildCon
     var git_tag: ?[]const u8 = null;
     var git_branch: ?[]const u8 = null;
     var git_rev: ?[]const u8 = null;
+    errdefer {
+        if (name) |owned_name| alloc.free(owned_name);
+        if (path) |owned_path| alloc.free(owned_path);
+        if (git_url) |owned_url| alloc.free(owned_url);
+        if (git_tag) |owned_tag| alloc.free(owned_tag);
+        if (git_branch) |owned_branch| alloc.free(owned_branch);
+        if (git_rev) |owned_rev| alloc.free(owned_rev);
+    }
 
     switch (val) {
         .struct_val => |sv| {
             for (sv.fields) |field| {
                 if (std.mem.eql(u8, field.name, "name")) {
-                    name = try constStringField(alloc, field.value);
+                    const owned_name = try constStringField(alloc, field.value);
+                    if (name) |previous| alloc.free(previous);
+                    name = owned_name;
                 } else if (std.mem.eql(u8, field.name, "path")) {
-                    path = try constOptionalStringField(alloc, field.value);
+                    const owned_path = try constOptionalStringField(alloc, field.value);
+                    if (path) |previous| alloc.free(previous);
+                    path = owned_path;
                 } else if (std.mem.eql(u8, field.name, "git_url")) {
-                    git_url = try constOptionalStringField(alloc, field.value);
+                    const owned_url = try constOptionalStringField(alloc, field.value);
+                    if (git_url) |previous| alloc.free(previous);
+                    git_url = owned_url;
                 } else if (std.mem.eql(u8, field.name, "git_tag")) {
-                    git_tag = try constOptionalStringField(alloc, field.value);
+                    const owned_tag = try constOptionalStringField(alloc, field.value);
+                    if (git_tag) |previous| alloc.free(previous);
+                    git_tag = owned_tag;
                 } else if (std.mem.eql(u8, field.name, "git_branch")) {
-                    git_branch = try constOptionalStringField(alloc, field.value);
+                    const owned_branch = try constOptionalStringField(alloc, field.value);
+                    if (git_branch) |previous| alloc.free(previous);
+                    git_branch = owned_branch;
                 } else if (std.mem.eql(u8, field.name, "git_rev")) {
-                    git_rev = try constOptionalStringField(alloc, field.value);
+                    const owned_rev = try constOptionalStringField(alloc, field.value);
+                    if (git_rev) |previous| alloc.free(previous);
+                    git_rev = owned_rev;
                 }
             }
         },
@@ -1242,17 +2345,29 @@ fn constValueToDep(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !BuildCon
             for (entries) |entry| {
                 const key = constKeyName(entry.key) orelse continue;
                 if (std.mem.eql(u8, key, "name")) {
-                    name = try constStringField(alloc, entry.value);
+                    const owned_name = try constStringField(alloc, entry.value);
+                    if (name) |previous| alloc.free(previous);
+                    name = owned_name;
                 } else if (std.mem.eql(u8, key, "path")) {
-                    path = try constOptionalStringField(alloc, entry.value);
+                    const owned_path = try constOptionalStringField(alloc, entry.value);
+                    if (path) |previous| alloc.free(previous);
+                    path = owned_path;
                 } else if (std.mem.eql(u8, key, "git_url")) {
-                    git_url = try constOptionalStringField(alloc, entry.value);
+                    const owned_url = try constOptionalStringField(alloc, entry.value);
+                    if (git_url) |previous| alloc.free(previous);
+                    git_url = owned_url;
                 } else if (std.mem.eql(u8, key, "git_tag")) {
-                    git_tag = try constOptionalStringField(alloc, entry.value);
+                    const owned_tag = try constOptionalStringField(alloc, entry.value);
+                    if (git_tag) |previous| alloc.free(previous);
+                    git_tag = owned_tag;
                 } else if (std.mem.eql(u8, key, "git_branch")) {
-                    git_branch = try constOptionalStringField(alloc, entry.value);
+                    const owned_branch = try constOptionalStringField(alloc, entry.value);
+                    if (git_branch) |previous| alloc.free(previous);
+                    git_branch = owned_branch;
                 } else if (std.mem.eql(u8, key, "git_rev")) {
-                    git_rev = try constOptionalStringField(alloc, entry.value);
+                    const owned_rev = try constOptionalStringField(alloc, entry.value);
+                    if (git_rev) |previous| alloc.free(previous);
+                    git_rev = owned_rev;
                 }
             }
         },
@@ -1262,8 +2377,16 @@ fn constValueToDep(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !BuildCon
             if (elems.len >= 2) {
                 // First element: dep name (atom)
                 switch (elems[0]) {
-                    .atom => |a| name = try alloc.dupe(u8, a),
-                    .string => |s| name = try alloc.dupe(u8, s),
+                    .atom => |a| {
+                        const owned_name = try alloc.dupe(u8, a);
+                        if (name) |previous| alloc.free(previous);
+                        name = owned_name;
+                    },
+                    .string => |s| {
+                        const owned_name = try alloc.dupe(u8, s);
+                        if (name) |previous| alloc.free(previous);
+                        name = owned_name;
+                    },
                     else => {},
                 }
                 // Second element: source spec tuple {:path, "..."} or {:git, "..."}
@@ -1280,16 +2403,24 @@ fn constValueToDep(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !BuildCon
                             };
                             if (source_val) |sv| {
                                 if (std.mem.eql(u8, source_type, "path")) {
+                                    if (path) |previous| alloc.free(previous);
                                     path = sv;
                                 } else if (std.mem.eql(u8, source_type, "git")) {
+                                    if (git_url) |previous| alloc.free(previous);
                                     git_url = sv;
                                     // Optional extra fields: tag, branch, rev
                                     if (source_elems.len >= 3) {
                                         switch (source_elems[2]) {
-                                            .string => |s| git_tag = try alloc.dupe(u8, s),
+                                            .string => |s| {
+                                                const owned_tag = try alloc.dupe(u8, s);
+                                                if (git_tag) |previous| alloc.free(previous);
+                                                git_tag = owned_tag;
+                                            },
                                             else => {},
                                         }
                                     }
+                                } else {
+                                    alloc.free(sv);
                                 }
                             }
                         }
@@ -1303,17 +2434,68 @@ fn constValueToDep(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !BuildCon
 
     const dep_name = name orelse return error.ManifestNotFound;
     if (path) |dep_path| {
+        if (git_url) |unused_url| alloc.free(unused_url);
+        if (git_tag) |unused_tag| alloc.free(unused_tag);
+        if (git_branch) |unused_branch| alloc.free(unused_branch);
+        if (git_rev) |unused_rev| alloc.free(unused_rev);
+        name = null;
+        path = null;
+        git_url = null;
+        git_tag = null;
+        git_branch = null;
+        git_rev = null;
         return .{ .name = dep_name, .source = .{ .path = dep_path } };
     }
     if (git_url) |url| {
+        const tag = git_tag;
+        const branch = git_branch;
+        const rev = git_rev;
+        name = null;
+        git_url = null;
+        git_tag = null;
+        git_branch = null;
+        git_rev = null;
         return .{ .name = dep_name, .source = .{ .git = .{
             .url = url,
-            .tag = git_tag,
-            .branch = git_branch,
-            .rev = git_rev,
+            .tag = tag,
+            .branch = branch,
+            .rev = rev,
         } } };
     }
     return error.ManifestNotFound;
+}
+
+fn putOwnedBuildOpt(
+    alloc: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged([]const u8),
+    owned_key: []const u8,
+    owned_value: []const u8,
+) !void {
+    const entry = try map.getOrPut(alloc, owned_key);
+    if (entry.found_existing) {
+        alloc.free(owned_key);
+        alloc.free(entry.value_ptr.*);
+    }
+    entry.value_ptr.* = owned_value;
+}
+
+fn putBuildOptFromBorrowedKey(
+    alloc: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged([]const u8),
+    key: []const u8,
+    value: zap.ctfe.ConstValue,
+) !void {
+    const owned_value = try constStringField(alloc, value);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(owned_value);
+
+    const owned_key = try alloc.dupe(u8, key);
+    var key_transferred = false;
+    errdefer if (!key_transferred) alloc.free(owned_key);
+
+    try putOwnedBuildOpt(alloc, map, owned_key, owned_value);
+    key_transferred = true;
+    value_transferred = true;
 }
 
 fn loadBuildOpts(
@@ -1325,8 +2507,7 @@ fn loadBuildOpts(
         .map => |entries| {
             for (entries) |entry| {
                 const key = constKeyName(entry.key) orelse continue;
-                const value = try constStringField(alloc, entry.value);
-                try map.put(alloc, try alloc.dupe(u8, key), value);
+                try putBuildOptFromBorrowedKey(alloc, map, key, entry.value);
             }
         },
         .list => |items| {
@@ -1335,18 +2516,31 @@ fn loadBuildOpts(
                     .tuple => |elems| {
                         if (elems.len != 2) continue;
                         const key = constKeyName(elems[0]) orelse continue;
-                        const value = try constStringField(alloc, elems[1]);
-                        try map.put(alloc, try alloc.dupe(u8, key), value);
+                        try putBuildOptFromBorrowedKey(alloc, map, key, elems[1]);
                     },
                     .struct_val => |sv| {
                         var key: ?[]const u8 = null;
                         var value: ?[]const u8 = null;
+                        defer {
+                            if (key) |owned_key| alloc.free(owned_key);
+                            if (value) |owned_value| alloc.free(owned_value);
+                        }
                         for (sv.fields) |field| {
-                            if (std.mem.eql(u8, field.name, "key")) key = try constStringField(alloc, field.value);
-                            if (std.mem.eql(u8, field.name, "value")) value = try constStringField(alloc, field.value);
+                            if (std.mem.eql(u8, field.name, "key")) {
+                                const owned_key = try constStringField(alloc, field.value);
+                                if (key) |previous| alloc.free(previous);
+                                key = owned_key;
+                            }
+                            if (std.mem.eql(u8, field.name, "value")) {
+                                const owned_value = try constStringField(alloc, field.value);
+                                if (value) |previous| alloc.free(previous);
+                                value = owned_value;
+                            }
                         }
                         if (key != null and value != null) {
-                            try map.put(alloc, key.?, value.?);
+                            try putOwnedBuildOpt(alloc, map, key.?, value.?);
+                            key = null;
+                            value = null;
                         }
                     },
                     else => {},
@@ -1430,6 +2624,67 @@ fn constKeyName(val: zap.ctfe.ConstValue) ?[]const u8 {
 }
 
 const testing = std.testing;
+
+fn exerciseLoadBuildOptsAllocationFailures(alloc: std.mem.Allocator) !void {
+    var map: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer freeBuildConfigBuildOpts(alloc, &map);
+
+    const map_val = zap.ctfe.ConstValue{ .map = &.{
+        .{
+            .key = .{ .atom = "from_map" },
+            .value = .{ .string = "enabled" },
+        },
+    } };
+    try loadBuildOpts(alloc, &map, map_val);
+
+    const list_val = zap.ctfe.ConstValue{ .list = &.{
+        .{ .tuple = &.{ .{ .atom = "from_tuple" }, .{ .string = "yes" } } },
+        .{ .struct_val = .{
+            .type_name = "Zap.Build.Option",
+            .fields = &.{
+                .{ .name = "key", .value = .{ .string = "from_struct" } },
+                .{ .name = "value", .value = .{ .string = "ok" } },
+            },
+        } },
+        .{ .struct_val = .{
+            .type_name = "Zap.Build.Option",
+            .fields = &.{
+                .{ .name = "key", .value = .{ .string = "partial_struct" } },
+            },
+        } },
+    } };
+    try loadBuildOpts(alloc, &map, list_val);
+
+    try testing.expectEqual(@as(u32, 3), map.count());
+    try testing.expectEqualStrings("enabled", map.get("from_map").?);
+    try testing.expectEqualStrings("yes", map.get("from_tuple").?);
+    try testing.expectEqualStrings("ok", map.get("from_struct").?);
+    try testing.expect(map.get("partial_struct") == null);
+}
+
+test "P4J2: loadBuildOpts rolls back owned key value pairs on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseLoadBuildOptsAllocationFailures,
+        .{},
+    );
+}
+
+test "P4J2: loadBuildOpts frees replaced values for duplicate keys" {
+    const alloc = testing.allocator;
+    var map: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer freeBuildConfigBuildOpts(alloc, &map);
+
+    const val = zap.ctfe.ConstValue{ .list = &.{
+        .{ .tuple = &.{ .{ .atom = "optimize" }, .{ .string = "debug" } } },
+        .{ .tuple = &.{ .{ .atom = "optimize" }, .{ .string = "release_fast" } } },
+    } };
+
+    try loadBuildOpts(alloc, &map, val);
+
+    try testing.expectEqual(@as(u32, 1), map.count());
+    try testing.expectEqualStrings("release_fast", map.get("optimize").?);
+}
 
 test "constValueToBuildConfig parses deps and build opts" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1545,6 +2800,181 @@ test "constValueToBuildConfig parses compile and run pipeline steps" {
     try testing.expectEqualStrings("--only", pipeline.steps[1].run.args[0]);
     try testing.expectEqualStrings("math", pipeline.steps[1].run.args[1]);
     try testing.expect(pipeline.steps[1].run.forward_args);
+}
+
+test "P4J2: constValueToBuildConfig frees path duplicate when paths append fails" {
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "paths", .value = .{ .list = &.{
+                .{ .string = "src/**/*.zap" },
+            } } },
+        },
+    } };
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    try testing.expectError(
+        error.OutOfMemory,
+        constValueToBuildConfig(failing_allocator.allocator(), val),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+fn exerciseConstValueToBuildConfigDependencyAllocationFailures(alloc: std.mem.Allocator) !void {
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap_Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "app" } },
+            .{ .name = "version", .value = .{ .string = "0.1.0" } },
+            .{ .name = "deps", .value = .{ .list = &.{
+                .{ .struct_val = .{
+                    .type_name = "Zap_Dep",
+                    .fields = &.{
+                        .{ .name = "name", .value = .{ .string = "local_dep" } },
+                        .{ .name = "path", .value = .{ .string = "../local_dep" } },
+                    },
+                } },
+                .{ .struct_val = .{
+                    .type_name = "Zap_Dep",
+                    .fields = &.{
+                        .{ .name = "name", .value = .{ .string = "git_dep" } },
+                        .{ .name = "git_url", .value = .{ .string = "https://example.com/repo.git" } },
+                        .{ .name = "git_tag", .value = .{ .string = "v1.2.3" } },
+                    },
+                } },
+            } } },
+            .{ .name = "build_opts", .value = .{ .list = &.{
+                .{ .tuple = &.{ .{ .atom = "feature_x" }, .{ .string = "true" } } },
+            } } },
+            .{ .name = "source_url", .value = .{ .string = "https://example.com/app" } },
+        },
+    } };
+
+    const config = try constValueToBuildConfig(alloc, val);
+    defer freeConstValueBuildConfig(alloc, config);
+
+    try testing.expectEqual(@as(usize, 2), config.deps.len);
+    try testing.expect(config.deps[0].source == .path);
+    try testing.expectEqualStrings("../local_dep", config.deps[0].source.path);
+    try testing.expect(config.deps[1].source == .git);
+    try testing.expectEqualStrings("v1.2.3", config.deps[1].source.git.tag.?);
+    try testing.expectEqualStrings("true", config.build_opts.get("feature_x").?);
+    try testing.expectEqualStrings("https://example.com/app", config.source_url.?);
+}
+
+test "P4J2: constValueToBuildConfig frees dependency records on append and later failures" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseConstValueToBuildConfigDependencyAllocationFailures,
+        .{},
+    );
+}
+
+fn exerciseConstValueToPipelineRunAllocationFailures(alloc: std.mem.Allocator) !void {
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Build.Run",
+        .fields = &.{
+            .{ .name = "args", .value = .{ .list = &.{
+                .{ .string = "--only" },
+                .{ .string = "math" },
+            } } },
+            .{ .name = "forward_args", .value = .{ .bool_val = false } },
+        },
+    } };
+
+    const run = try constValueToPipelineRun(alloc, val);
+    defer {
+        for (run.args) |arg| alloc.free(arg);
+        alloc.free(run.args);
+    }
+
+    try testing.expectEqual(@as(usize, 2), run.args.len);
+    try testing.expectEqualStrings("--only", run.args[0]);
+    try testing.expect(!run.forward_args);
+}
+
+test "P4J2: constValueToPipelineRun frees duplicated arg when args append fails" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseConstValueToPipelineRunAllocationFailures,
+        .{},
+    );
+}
+
+fn exerciseConstValueToPipelineAllocationFailures(alloc: std.mem.Allocator) !void {
+    const val = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Build.Pipeline",
+        .fields = &.{
+            .{ .name = "steps", .value = .{ .list = &.{
+                .{ .struct_val = .{
+                    .type_name = "Zap.Build.Step",
+                    .fields = &.{
+                        .{ .name = "run", .value = .{ .struct_val = .{
+                            .type_name = "Zap.Build.Run",
+                            .fields = &.{
+                                .{ .name = "args", .value = .{ .list = &.{
+                                    .{ .string = "--only" },
+                                    .{ .string = "math" },
+                                } } },
+                            },
+                        } } },
+                    },
+                } },
+                .{ .struct_val = .{
+                    .type_name = "Zap.Build.Step",
+                    .fields = &.{
+                        .{ .name = "compile", .value = .{ .struct_val = .{
+                            .type_name = "Zap.Build.Compile",
+                            .fields = &.{},
+                        } } },
+                    },
+                } },
+            } } },
+        },
+    } };
+
+    const maybe_pipeline = try constValueToPipeline(alloc, val);
+    const pipeline = maybe_pipeline orelse return error.ExpectedPipeline;
+    defer freeBuildConfigPipeline(alloc, pipeline);
+
+    try testing.expectEqual(@as(usize, 2), pipeline.steps.len);
+    try testing.expect(pipeline.steps[0] == .run);
+    try testing.expectEqualStrings("--only", pipeline.steps[0].run.args[0]);
+    try testing.expect(pipeline.steps[1] == .compile);
+}
+
+test "P4J2: constValueToPipeline frees run step args on step append and slice failures" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseConstValueToPipelineAllocationFailures,
+        .{},
+    );
+}
+
+fn exerciseConstValueToDocGroupAllocationFailures(alloc: std.mem.Allocator) !void {
+    const val = zap.ctfe.ConstValue{ .tuple = &.{
+        .{ .string = "Guides" },
+        .{ .list = &.{
+            .{ .string = "docs/intro.md" },
+            .{ .string = "docs/install.md" },
+        } },
+    } };
+
+    const maybe_group = try constValueToDocGroup(alloc, val);
+    const group = maybe_group orelse return error.ExpectedDocGroup;
+    defer freeDocGroup(alloc, group);
+
+    try testing.expectEqualStrings("Guides", group.name);
+    try testing.expectEqual(@as(usize, 2), group.pages.len);
+    try testing.expectEqualStrings("docs/intro.md", group.pages[0]);
+}
+
+test "P4J2: constValueToDocGroup frees duplicated page when page append fails" {
+    try std.testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseConstValueToDocGroupAllocationFailures,
+        .{},
+    );
 }
 
 test "constValueToBuildConfig rejects an empty pipeline override" {
@@ -1755,7 +3185,7 @@ test "ctfe manifest extracts root Function reference" {
     var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
     const result = try compiler.compileForCtfe(alloc, &ctx, .{ .show_progress = false });
 
-    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    var interp = try zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
     interp.interner = ctx.interner;
@@ -1824,7 +3254,7 @@ test "ctfe manifest permits target-source Type and Function references" {
         .allow_external_static_references = true,
     });
 
-    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    var interp = try zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
     interp.interner = ctx.interner;
@@ -1904,7 +3334,7 @@ test "ctfe manifest staged discovery permits target-source Type and Function ref
         .allow_external_static_references = true,
     });
 
-    var interp = zap.ctfe.Interpreter.init(alloc, &ctfe_result.ir_program);
+    var interp = try zap.ctfe.Interpreter.init(alloc, &ctfe_result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
     interp.interner = ctx.interner;
@@ -1923,6 +3353,63 @@ test "ctfe manifest staged discovery permits target-source Type and Function ref
     try testing.expectEqualStrings("TestProg.main/0", config.root.?);
     try testing.expect(selected_memory != null);
     try testing.expectEqualStrings("ThirdParty.ProjectArena", selected_memory.?.type_name);
+}
+
+test "ctfe manifest evaluates minimal valid manifest with real stdlib" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source =
+        \\pub struct Zap.Builder {
+        \\  pub fn manifest(_env :: Zap.Env) -> Zap.Manifest {
+        \\    %Zap.Manifest{
+        \\      name: "manifest_daemon_valid",
+        \\      version: "0.1.0",
+        \\      kind: :bin,
+        \\      root: &Main.main/1,
+        \\      paths: ["lib/**/*.zap"],
+        \\      optimize: :debug
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var captured_stderr: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured_stderr.deinit(alloc);
+    const previous_capture = zap.diagnostics.installStderrCapture(.{
+        .list = &captured_stderr,
+        .allocator = alloc,
+    });
+    defer _ = zap.diagnostics.installStderrCapture(previous_capture);
+
+    const build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var manifest_eval = ctfeManifestDetailedWithProgress(
+        alloc,
+        source,
+        "default",
+        null,
+        build_opts,
+        "lib",
+        null,
+    ) catch |err| {
+        std.debug.print(
+            "manifest CTFE failed with {s}\n--- captured stderr ---\n{s}\n--- end captured stderr ---\n",
+            .{ @errorName(err), captured_stderr.items },
+        );
+        return err;
+    };
+    defer manifest_eval.deinit(alloc);
+
+    try testing.expectEqualStrings("manifest_daemon_valid", manifest_eval.config.name);
+    try testing.expectEqualStrings("0.1.0", manifest_eval.config.version);
+    try testing.expectEqual(BuildConfig.Kind.bin, manifest_eval.config.kind);
+    try testing.expectEqualStrings("Main.main/1", manifest_eval.config.root.?);
+    try testing.expectEqual(BuildConfig.Optimize.debug, manifest_eval.config.optimize);
+    try testing.expectEqual(@as(usize, 1), manifest_eval.config.paths.len);
+    try testing.expectEqualStrings("lib/**/*.zap", manifest_eval.config.paths[0]);
+    try testing.expect(manifest_eval.config.memory_manager != null);
+    try testing.expectEqualStrings("Memory.ARC", manifest_eval.config.memory_manager.?.type_name);
 }
 
 test "memoryManagerSelectionFromManifest parses memory Type value" {
@@ -2013,7 +3500,7 @@ test "ctfe manifest evaluates third-party Memory.Manager backend through protoco
     var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
     const result = try compiler.compileForCtfe(alloc, &ctx, .{ .show_progress = false });
 
-    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    var interp = try zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
     interp.interner = ctx.interner;
@@ -2133,7 +3620,7 @@ test "ctfe manifest evaluates default Memory.Manager backend when memory omitted
     var ctx = try compiler.collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
     const result = try compiler.compileForCtfe(alloc, &ctx, .{ .show_progress = false });
 
-    var interp = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    var interp = try zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interp.deinit();
     interp.scope_graph = &ctx.collector.graph;
     interp.interner = ctx.interner;
@@ -2177,6 +3664,234 @@ test "memoryManagerSelectionFromManifest preserves underscores in Type names" {
     } };
     const selected = (try memoryManagerSelectionFromManifest(alloc, val)) orelse return error.UnexpectedNull;
     try testing.expectEqualStrings("Foo_Bar.Manager", selected.type_name);
+}
+
+test "memory adapter source collection preserves OutOfMemory" {
+    const source =
+        \\pub protocol Memory.Manager {
+        \\}
+    ;
+    const source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/memory/manager.zap", .source = source },
+    };
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        collectMemoryManagerAdapterFrontend(
+            failing_allocator.allocator(),
+            &source_units,
+            .{ .show_progress = false },
+        ),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: memory adapter eval frees owned source path when type-name duplication fails" {
+    const source_path = try testing.allocator.dupe(u8, "lib/memory/arc.zap");
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        buildMemoryAdapterEval(
+            failing_allocator.allocator(),
+            "Memory.ARC",
+            source_path,
+        ),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: discoverMemoryAdapterGraph frees explicit source-file slice on later failure" {
+    const source_units = &[_]compiler.SourceUnit{
+        .{
+            .file_path = "missing/p4j2/memory/adapter.zap",
+            .source =
+            \\pub struct ThirdParty.ProjectArena {
+            \\}
+            ,
+        },
+    };
+
+    try testing.expectError(
+        error.ReadError,
+        discoverMemoryAdapterGraph(
+            testing.allocator,
+            "ThirdParty.ProjectArena",
+            &.{},
+            source_units,
+        ),
+    );
+}
+
+fn countExplicitSourceFilesDeclaringStructAllocations(
+    source_units: []const compiler.SourceUnit,
+    struct_name: []const u8,
+) !usize {
+    var counting_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = counting_allocator.allocator();
+
+    const file_paths = try explicitSourceFilesDeclaringStruct(alloc, source_units, struct_name);
+    alloc.free(file_paths);
+
+    return counting_allocator.alloc_index;
+}
+
+test "P4J2: explicitSourceFilesDeclaringStruct frees partial list on allocation failure" {
+    const source_units = &[_]compiler.SourceUnit{
+        .{
+            .file_path = "first_adapter.zap",
+            .source =
+            \\pub struct ThirdParty.ProjectArena {
+            \\}
+            ,
+        },
+        .{
+            .file_path = "second_adapter.zap",
+            .source =
+            \\pub struct ThirdParty.ProjectArena {
+            \\}
+            ,
+        },
+    };
+
+    const allocation_count = try countExplicitSourceFilesDeclaringStructAllocations(
+        source_units,
+        "ThirdParty.ProjectArena",
+    );
+    try testing.expect(allocation_count > 1);
+
+    for (0..allocation_count) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        const alloc = failing_allocator.allocator();
+
+        const file_paths = explicitSourceFilesDeclaringStruct(
+            alloc,
+            source_units,
+            "ThirdParty.ProjectArena",
+        ) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try testing.expect(failing_allocator.has_induced_failure);
+                continue;
+            },
+        };
+
+        try testing.expect(!failing_allocator.has_induced_failure);
+        alloc.free(file_paths);
+    }
+}
+
+test "memory adapter source collection maps diagnosed frontend failure to CompileFailed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var captured_stderr: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured_stderr.deinit(alloc);
+    const previous_capture = zap.diagnostics.installStderrCapture(.{
+        .list = &captured_stderr,
+        .allocator = alloc,
+    });
+    defer _ = zap.diagnostics.installStderrCapture(previous_capture);
+
+    const source =
+        \\pub struct Broken {
+        \\  pub fn bad() -> i64 {
+        \\    1
+    ;
+    const source_units = [_]compiler.SourceUnit{
+        .{ .file_path = "lib/broken.zap", .source = source },
+    };
+
+    try testing.expectError(
+        error.CompileFailed,
+        collectMemoryManagerAdapterFrontend(
+            alloc,
+            &source_units,
+            .{ .show_progress = false },
+        ),
+    );
+    try testing.expect(captured_stderr.items.len > 0);
+}
+
+test "appendDiscoveredSourceUnits preserves read OutOfMemory" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "manager.zap",
+        .data = "pub struct Project.Manager {}",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", alloc);
+    const manager_path = try std.fs.path.join(alloc, &.{ tmp_path, "manager.zap" });
+
+    var graph = zap.discovery.FileGraph.init(testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var collected: AdapterSourceUnitCollection = .{};
+    defer collected.deinit(failing_allocator.allocator());
+
+    try testing.expectError(
+        error.OutOfMemory,
+        appendDiscoveredSourceUnits(
+            failing_allocator.allocator(),
+            &collected,
+            &.{manager_path},
+            &.{},
+            &graph,
+        ),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: adapter source-unit collection frees owned read sources after later allocation failure" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "manager.zap",
+        .data = "pub struct Project.Manager {}",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path_alloc = arena.allocator();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", path_alloc);
+    const manager_path = try std.fs.path.join(path_alloc, &.{ tmp_path, "manager.zap" });
+
+    var graph = zap.discovery.FileGraph.init(testing.allocator);
+    defer graph.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+    var collected: AdapterSourceUnitCollection = .{};
+    defer collected.deinit(alloc);
+
+    try appendDiscoveredSourceUnits(
+        alloc,
+        &collected,
+        &.{manager_path},
+        &.{},
+        &graph,
+    );
+    try testing.expectEqual(@as(usize, 1), collected.units.items.len);
+    try testing.expectEqual(@as(usize, 1), collected.owned_sources.items.len);
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    const later_allocation = alloc.dupe(u8, "later adapter frontend allocation") catch |err| {
+        try testing.expectEqual(error.OutOfMemory, err);
+        try testing.expect(failing_allocator.has_induced_failure);
+        return;
+    };
+    defer alloc.free(later_allocation);
+    return error.TestExpectedError;
 }
 
 test "memory adapter source evaluation ignores unrelated project sources" {

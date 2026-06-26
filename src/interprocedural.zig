@@ -2,6 +2,8 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const lattice = @import("escape_lattice.zig");
 
+const MAX_INTERPROCEDURAL_INSTRUCTION_NESTING_DEPTH: u32 = 4096;
+
 // ============================================================
 // Interprocedural Analysis (Research Plan Phase 3)
 //
@@ -120,87 +122,58 @@ pub const CallGraph = struct {
     }
 
     fn scanInstructions(self: *CallGraph, caller: ir.FunctionId, instructions: []const ir.Instruction) !void {
-        for (instructions) |instr| {
-            switch (instr) {
-                .call_direct => |cd| {
-                    try self.addEdge(caller, cd.function);
-                },
-                .call_named => |cn| {
-                    if (self.name_to_id.get(cn.name)) |callee_id| {
-                        try self.addEdge(caller, callee_id);
-                    }
-                },
-                .make_closure => |mc| {
-                    try self.closure_creators.put(mc.function, caller);
-                    try self.addEdge(caller, mc.function);
-                },
-                .tail_call => |tc| {
-                    if (self.name_to_id.get(tc.name)) |callee_id| {
-                        try self.addEdge(caller, callee_id);
-                    }
-                },
-                // Walk into nested instruction lists
-                .if_expr => |ie| {
-                    try self.scanInstructions(caller, ie.then_instrs);
-                    try self.scanInstructions(caller, ie.else_instrs);
-                },
-                .case_block => |cb| {
-                    try self.scanInstructions(caller, cb.pre_instrs);
-                    for (cb.arms) |arm| {
-                        try self.scanInstructions(caller, arm.cond_instrs);
-                        try self.scanInstructions(caller, arm.body_instrs);
-                    }
-                    try self.scanInstructions(caller, cb.default_instrs);
-                },
-                .guard_block => |gb| {
-                    try self.scanInstructions(caller, gb.body);
-                },
-                .switch_literal => |sl| {
-                    for (sl.cases) |c| {
-                        try self.scanInstructions(caller, c.body_instrs);
-                    }
-                    try self.scanInstructions(caller, sl.default_instrs);
-                },
-                .switch_return => |sr| {
-                    for (sr.cases) |c| {
-                        try self.scanInstructions(caller, c.body_instrs);
-                    }
-                    try self.scanInstructions(caller, sr.default_instrs);
-                },
-                .union_switch_return => |usr| {
-                    for (usr.cases) |c| {
-                        try self.scanInstructions(caller, c.body_instrs);
-                    }
-                },
-                .union_switch => |us| {
-                    for (us.cases) |c| {
-                        try self.scanInstructions(caller, c.body_instrs);
-                    }
-                    // The catch-all `_` prong can itself contain calls; a
-                    // callee invoked only from the else arm must still
-                    // register a call-graph edge.
-                    if (us.has_else) {
-                        try self.scanInstructions(caller, us.else_instrs);
-                    }
-                },
-                .try_call_named => |tcn| {
-                    // Register the edge to the try call's own target (the
-                    // `__try` callee), then descend into the handler and
-                    // success continuation bodies so calls nested inside
-                    // them are not missed. Previously this variant fell into
-                    // `else => {}`, so neither the target edge nor edges
-                    // from the bodies were recorded.
-                    if (self.name_to_id.get(tcn.name)) |callee_id| {
-                        try self.addEdge(caller, callee_id);
-                    }
-                    try self.scanInstructions(caller, tcn.handler_instrs);
-                    try self.scanInstructions(caller, tcn.success_instrs);
-                },
-                .optional_dispatch => |od| {
-                    try self.scanInstructions(caller, od.nil_instrs);
-                    try self.scanInstructions(caller, od.struct_instrs);
-                },
-                else => {},
+        var stack: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, instructions);
+
+        const ChildCollector = struct {
+            allocator: std.mem.Allocator,
+            stack: *std.ArrayListUnmanaged([]const ir.Instruction),
+            err: ?anyerror = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                ctx.stack.append(ctx.allocator, child.stream) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        while (stack.pop()) |stream| {
+            for (stream) |instr| {
+                switch (instr) {
+                    .call_direct => |cd| {
+                        try self.addEdge(caller, cd.function);
+                    },
+                    .call_named => |cn| {
+                        if (self.name_to_id.get(cn.name)) |callee_id| {
+                            try self.addEdge(caller, callee_id);
+                        }
+                    },
+                    .make_closure => |mc| {
+                        try self.closure_creators.put(mc.function, caller);
+                        try self.addEdge(caller, mc.function);
+                    },
+                    .tail_call => |tc| {
+                        if (self.name_to_id.get(tc.name)) |callee_id| {
+                            try self.addEdge(caller, callee_id);
+                        }
+                    },
+                    .try_call_named => |tcn| {
+                        // Register the edge to the try call's own target (the
+                        // `__try` callee), then descend into the handler and
+                        // success continuation bodies so calls nested inside
+                        // them are not missed. Previously this variant fell into
+                        // `else => {}`, so neither the target edge nor edges
+                        // from the bodies were recorded.
+                        if (self.name_to_id.get(tcn.name)) |callee_id| {
+                            try self.addEdge(caller, callee_id);
+                        }
+                    },
+                    else => {},
+                }
+                var child_collector = ChildCollector{ .allocator = self.allocator, .stack = &stack };
+                ir.forEachChildStream(&instr, &child_collector, ChildCollector.onStream);
+                if (child_collector.err) |err| return err;
             }
         }
     }
@@ -345,53 +318,85 @@ const TarjanState = struct {
     index_counter: u32,
 
     fn strongConnect(self: *TarjanState, v: ir.FunctionId) !void {
-        const v_node = self.nodes.getPtr(v).?;
-        v_node.index = self.index_counter;
-        v_node.lowlink = self.index_counter;
-        self.index_counter += 1;
-        self.stack_items[self.stack_len] = v;
-        self.stack_len += 1;
-        v_node.on_stack = true;
+        const Frame = struct {
+            node: ir.FunctionId,
+            next_successor: usize,
+        };
 
-        // Consider successors
-        const successors = self.graph.getCallees(v);
-        for (successors) |w| {
-            if (self.nodes.getPtr(w)) |w_node| {
-                if (w_node.index == null) {
-                    try self.strongConnect(w);
-                    const v_node_after = self.nodes.getPtr(v).?;
-                    const w_node_after = self.nodes.getPtr(w).?;
-                    v_node_after.lowlink = @min(v_node_after.lowlink, w_node_after.lowlink);
-                } else if (w_node.on_stack) {
-                    const v_node_after = self.nodes.getPtr(v).?;
-                    v_node_after.lowlink = @min(v_node_after.lowlink, w_node.index.?);
+        var frames: std.ArrayListUnmanaged(Frame) = .empty;
+        defer frames.deinit(self.allocator);
+
+        try self.enterNode(v);
+        try frames.append(self.allocator, .{ .node = v, .next_successor = 0 });
+
+        while (frames.items.len > 0) {
+            const frame_index = frames.items.len - 1;
+            var frame = &frames.items[frame_index];
+            const current = frame.node;
+            const successors = self.graph.getCallees(current);
+
+            if (frame.next_successor < successors.len) {
+                const successor = successors[frame.next_successor];
+                frame.next_successor += 1;
+
+                if (self.nodes.getPtr(successor)) |successor_node| {
+                    if (successor_node.index == null) {
+                        try self.enterNode(successor);
+                        try frames.append(self.allocator, .{ .node = successor, .next_successor = 0 });
+                        continue;
+                    }
+                    if (successor_node.on_stack) {
+                        const current_node = self.nodes.getPtr(current).?;
+                        current_node.lowlink = @min(current_node.lowlink, successor_node.index.?);
+                    }
                 }
-            }
-        }
-
-        // If v is a root, pop the SCC
-        const v_final = self.nodes.getPtr(v).?;
-        if (v_final.lowlink == v_final.index.?) {
-            // Count how many nodes in this SCC
-            var count: usize = 0;
-            var i = self.stack_len;
-            while (i > 0) {
-                i -= 1;
-                count += 1;
-                if (self.stack_items[i] == v) break;
+                continue;
             }
 
-            const scc = try self.allocator.alloc(ir.FunctionId, count);
-            var idx: usize = 0;
-            while (idx < count) : (idx += 1) {
-                self.stack_len -= 1;
-                const w = self.stack_items[self.stack_len];
-                self.nodes.getPtr(w).?.on_stack = false;
-                scc[idx] = w;
+            try self.finishNode(current);
+            _ = frames.pop();
+
+            if (frames.items.len > 0) {
+                const parent = frames.items[frames.items.len - 1].node;
+                const current_lowlink = self.nodes.getPtr(current).?.lowlink;
+                const parent_node = self.nodes.getPtr(parent).?;
+                parent_node.lowlink = @min(parent_node.lowlink, current_lowlink);
             }
-            self.scc_list[self.scc_count] = scc;
-            self.scc_count += 1;
         }
+    }
+
+    fn enterNode(self: *TarjanState, node_id: ir.FunctionId) !void {
+        const node = self.nodes.getPtr(node_id).?;
+        node.index = self.index_counter;
+        node.lowlink = self.index_counter;
+        self.index_counter += 1;
+        self.stack_items[self.stack_len] = node_id;
+        self.stack_len += 1;
+        node.on_stack = true;
+    }
+
+    fn finishNode(self: *TarjanState, node_id: ir.FunctionId) !void {
+        const node = self.nodes.getPtr(node_id).?;
+        if (node.lowlink != node.index.?) return;
+
+        var count: usize = 0;
+        var i = self.stack_len;
+        while (i > 0) {
+            i -= 1;
+            count += 1;
+            if (self.stack_items[i] == node_id) break;
+        }
+
+        const scc = try self.allocator.alloc(ir.FunctionId, count);
+        var idx: usize = 0;
+        while (idx < count) : (idx += 1) {
+            self.stack_len -= 1;
+            const popped = self.stack_items[self.stack_len];
+            self.nodes.getPtr(popped).?.on_stack = false;
+            scc[idx] = popped;
+        }
+        self.scc_list[self.scc_count] = scc;
+        self.scc_count += 1;
     }
 };
 
@@ -406,6 +411,7 @@ pub const InterproceduralAnalyzer = struct {
     call_graph: CallGraph,
     summaries: std.AutoHashMap(ir.FunctionId, lattice.FunctionSummary),
     program: *const ir.Program,
+    instruction_analysis_depth: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, program: *const ir.Program) !InterproceduralAnalyzer {
         return .{
@@ -479,6 +485,10 @@ pub const InterproceduralAnalyzer = struct {
 
         const num_params = func.params.len;
 
+        var param_set_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer param_set_arena.deinit();
+        const param_set_allocator = param_set_arena.allocator();
+
         const param_summaries = try self.allocator.alloc(lattice.ParamSummary, num_params);
         errdefer self.allocator.free(param_summaries);
         for (param_summaries) |*ps| {
@@ -509,13 +519,14 @@ pub const InterproceduralAnalyzer = struct {
             try self.analyzeInstructions(
                 block.instructions,
                 num_params,
+                param_set_allocator,
                 param_summaries,
                 &aliases,
                 &fresh_locals,
                 &return_sources,
             );
             // Also track deref depths through field_get chains.
-            self.trackDerefDepths(block.instructions, &aliases, &deref_depths, num_params, param_summaries);
+            try self.trackDerefDepths(block.instructions, &aliases, &deref_depths, num_params, param_summaries);
         }
 
         // Infer read-only: a param is read_only if it doesn't escape at all
@@ -531,7 +542,7 @@ pub const InterproceduralAnalyzer = struct {
         // Also check if the function has no ret instruction (infinite loop).
         const has_ret = blk: {
             for (func.body) |block| {
-                if (hasRetInstruction(block.instructions)) break :blk true;
+                if (try hasRetInstruction(self.allocator, block.instructions)) break :blk true;
             }
             break :blk false;
         };
@@ -559,24 +570,34 @@ pub const InterproceduralAnalyzer = struct {
     }
 
     /// Check if an instruction list contains a ret instruction (possibly nested).
-    fn hasRetInstruction(instrs: []const ir.Instruction) bool {
-        for (instrs) |instr| {
-            switch (instr) {
-                .ret => return true,
-                .cond_return => return true,
-                .if_expr => |ie| {
-                    if (hasRetInstruction(ie.then_instrs)) return true;
-                    if (hasRetInstruction(ie.else_instrs)) return true;
-                },
-                .case_block => |cb| {
-                    if (hasRetInstruction(cb.pre_instrs)) return true;
-                    for (cb.arms) |arm| {
-                        if (hasRetInstruction(arm.body_instrs)) return true;
-                    }
-                    if (hasRetInstruction(cb.default_instrs)) return true;
-                },
-                .switch_return, .union_switch_return, .union_switch, .optional_dispatch => return true,
-                else => {},
+    fn hasRetInstruction(allocator: std.mem.Allocator, instrs: []const ir.Instruction) std.mem.Allocator.Error!bool {
+        var stack: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+        defer stack.deinit(allocator);
+        try stack.append(allocator, instrs);
+
+        const ChildCollector = struct {
+            allocator: std.mem.Allocator,
+            stack: *std.ArrayListUnmanaged([]const ir.Instruction),
+            err: ?std.mem.Allocator.Error = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null) return;
+                ctx.stack.append(ctx.allocator, child.stream) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        while (stack.pop()) |stream| {
+            for (stream) |instr| {
+                switch (instr) {
+                    .ret, .cond_return => return true,
+                    .switch_return, .union_switch_return, .union_switch, .optional_dispatch => return true,
+                    else => {},
+                }
+                var collector = ChildCollector{ .allocator = allocator, .stack = &stack };
+                ir.forEachChildStream(&instr, &collector, ChildCollector.onStream);
+                if (collector.err) |err| return err;
             }
         }
         return false;
@@ -592,18 +613,18 @@ pub const InterproceduralAnalyzer = struct {
         deref_depths: *std.AutoHashMap(ir.LocalId, i8),
         num_params: usize,
         param_summaries: []lattice.ParamSummary,
-    ) void {
+    ) std.mem.Allocator.Error!void {
         _ = self;
         for (instrs) |instr| {
             switch (instr) {
                 .field_get => |fg| {
                     // If source is param-derived, loaded value has depth+1.
                     if (deref_depths.get(fg.object)) |src_depth| {
-                        deref_depths.put(fg.dest, src_depth + 1) catch {};
+                        try deref_depths.put(fg.dest, src_depth + 1);
                     } else if (aliases.get(fg.object)) |param_set| {
                         // Source is an alias of params — start at depth 1.
                         _ = param_set;
-                        deref_depths.put(fg.dest, 1) catch {};
+                        try deref_depths.put(fg.dest, 1);
                     }
                 },
                 .ret => |r| {
@@ -613,7 +634,7 @@ pub const InterproceduralAnalyzer = struct {
                             // Find which params it derives from and set escape_deref_depth.
                             if (aliases.get(v)) |param_set| {
                                 for (0..num_params) |i| {
-                                    if (param_set.contains(@intCast(i))) {
+                                    if (param_set.containsIndex(i)) {
                                         param_summaries[i].escape_deref_depth = @max(param_summaries[i].escape_deref_depth, depth);
                                     }
                                 }
@@ -631,16 +652,23 @@ pub const InterproceduralAnalyzer = struct {
         self: *InterproceduralAnalyzer,
         instructions: []const ir.Instruction,
         num_params: usize,
+        param_set_allocator: std.mem.Allocator,
         param_summaries: []lattice.ParamSummary,
         aliases: *std.AutoHashMap(ir.LocalId, ParamSet),
         fresh_locals: *std.AutoHashMap(ir.LocalId, void),
         return_sources: *ReturnSourceCollector,
     ) !void {
+        if (self.instruction_analysis_depth >= MAX_INTERPROCEDURAL_INSTRUCTION_NESTING_DEPTH) {
+            return error.InterproceduralInstructionNestingLimitExceeded;
+        }
+        self.instruction_analysis_depth += 1;
+        defer self.instruction_analysis_depth -= 1;
+
         for (instructions) |instr| {
             switch (instr) {
                 .param_get => |pg| {
                     if (pg.index < num_params) {
-                        try aliases.put(pg.dest, ParamSet.singleton(pg.index));
+                        try aliases.put(pg.dest, try ParamSet.singleton(pg.index, num_params, param_set_allocator));
                     }
                 },
 
@@ -857,17 +885,17 @@ pub const InterproceduralAnalyzer = struct {
                     // both bodies (so nested calls/returns/escapes inside
                     // them contribute to the summary) and merge the two
                     // branch results into `dest`, exactly like `if_expr`.
-                    try self.analyzeInstructions(tcn.handler_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
-                    try self.analyzeInstructions(tcn.success_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(tcn.handler_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(tcn.success_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                     {
-                        var merged = ParamSet.empty();
+                        var merged = ParamSet.empty(num_params);
                         var any_fresh = false;
                         if (tcn.handler_result) |hr| {
-                            if (aliases.get(hr)) |ps| merged = merged.merge(ps);
+                            if (aliases.get(hr)) |ps| merged = try merged.merge(ps, param_set_allocator);
                             if (fresh_locals.get(hr) != null) any_fresh = true;
                         }
                         if (tcn.success_result) |sr| {
-                            if (aliases.get(sr)) |ps| merged = merged.merge(ps);
+                            if (aliases.get(sr)) |ps| merged = try merged.merge(ps, param_set_allocator);
                             if (fresh_locals.get(sr) != null) any_fresh = true;
                         }
                         if (!merged.isEmpty()) try aliases.put(tcn.dest, merged);
@@ -924,11 +952,11 @@ pub const InterproceduralAnalyzer = struct {
                 },
 
                 .phi => |p| {
-                    var merged = ParamSet.empty();
+                    var merged = ParamSet.empty(num_params);
                     var any_fresh = false;
                     for (p.sources) |src| {
                         if (aliases.get(src.value)) |param_set| {
-                            merged = merged.merge(param_set);
+                            merged = try merged.merge(param_set, param_set_allocator);
                         }
                         if (fresh_locals.get(src.value) != null) {
                             any_fresh = true;
@@ -959,9 +987,9 @@ pub const InterproceduralAnalyzer = struct {
                 },
                 .error_catch => |ec| {
                     // dest may come from source or catch_value; merge both alias sets.
-                    var merged = ParamSet.empty();
-                    if (aliases.get(ec.source)) |ps| merged = merged.merge(ps);
-                    if (aliases.get(ec.catch_value)) |ps| merged = merged.merge(ps);
+                    var merged = ParamSet.empty(num_params);
+                    if (aliases.get(ec.source)) |ps| merged = try merged.merge(ps, param_set_allocator);
+                    if (aliases.get(ec.catch_value)) |ps| merged = try merged.merge(ps, param_set_allocator);
                     if (!merged.isEmpty()) {
                         try aliases.put(ec.dest, merged);
                     } else if (fresh_locals.get(ec.source) != null or fresh_locals.get(ec.catch_value) != null) {
@@ -1009,17 +1037,17 @@ pub const InterproceduralAnalyzer = struct {
 
                 // Nested control flow
                 .if_expr => |ie| {
-                    try self.analyzeInstructions(ie.then_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
-                    try self.analyzeInstructions(ie.else_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(ie.then_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(ie.else_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                     // Merge result aliases from both branches
-                    var merged = ParamSet.empty();
+                    var merged = ParamSet.empty(num_params);
                     var any_fresh = false;
                     if (ie.then_result) |tr| {
-                        if (aliases.get(tr)) |ps| merged = merged.merge(ps);
+                        if (aliases.get(tr)) |ps| merged = try merged.merge(ps, param_set_allocator);
                         if (fresh_locals.get(tr) != null) any_fresh = true;
                     }
                     if (ie.else_result) |er| {
-                        if (aliases.get(er)) |ps| merged = merged.merge(ps);
+                        if (aliases.get(er)) |ps| merged = try merged.merge(ps, param_set_allocator);
                         if (fresh_locals.get(er) != null) any_fresh = true;
                     }
                     if (!merged.isEmpty()) try aliases.put(ie.dest, merged);
@@ -1027,20 +1055,20 @@ pub const InterproceduralAnalyzer = struct {
                 },
 
                 .case_block => |cb| {
-                    try self.analyzeInstructions(cb.pre_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
-                    var merged = ParamSet.empty();
+                    try self.analyzeInstructions(cb.pre_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
+                    var merged = ParamSet.empty(num_params);
                     var any_fresh = false;
                     for (cb.arms) |arm| {
-                        try self.analyzeInstructions(arm.cond_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
-                        try self.analyzeInstructions(arm.body_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                        try self.analyzeInstructions(arm.cond_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
+                        try self.analyzeInstructions(arm.body_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                         if (arm.result) |res| {
-                            if (aliases.get(res)) |ps| merged = merged.merge(ps);
+                            if (aliases.get(res)) |ps| merged = try merged.merge(ps, param_set_allocator);
                             if (fresh_locals.get(res) != null) any_fresh = true;
                         }
                     }
-                    try self.analyzeInstructions(cb.default_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(cb.default_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                     if (cb.default_result) |dr| {
-                        if (aliases.get(dr)) |ps| merged = merged.merge(ps);
+                        if (aliases.get(dr)) |ps| merged = try merged.merge(ps, param_set_allocator);
                         if (fresh_locals.get(dr) != null) any_fresh = true;
                     }
                     if (!merged.isEmpty()) try aliases.put(cb.dest, merged);
@@ -1048,22 +1076,22 @@ pub const InterproceduralAnalyzer = struct {
                 },
 
                 .guard_block => |gb| {
-                    try self.analyzeInstructions(gb.body, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(gb.body, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                 },
 
                 .switch_literal => |sl| {
-                    var merged = ParamSet.empty();
+                    var merged = ParamSet.empty(num_params);
                     var any_fresh = false;
                     for (sl.cases) |c| {
-                        try self.analyzeInstructions(c.body_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                        try self.analyzeInstructions(c.body_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                         if (c.result) |res| {
-                            if (aliases.get(res)) |ps| merged = merged.merge(ps);
+                            if (aliases.get(res)) |ps| merged = try merged.merge(ps, param_set_allocator);
                             if (fresh_locals.get(res) != null) any_fresh = true;
                         }
                     }
-                    try self.analyzeInstructions(sl.default_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(sl.default_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                     if (sl.default_result) |dr| {
-                        if (aliases.get(dr)) |ps| merged = merged.merge(ps);
+                        if (aliases.get(dr)) |ps| merged = try merged.merge(ps, param_set_allocator);
                         if (fresh_locals.get(dr) != null) any_fresh = true;
                     }
                     if (!merged.isEmpty()) try aliases.put(sl.dest, merged);
@@ -1072,12 +1100,12 @@ pub const InterproceduralAnalyzer = struct {
 
                 .switch_return => |sr| {
                     for (sr.cases) |c| {
-                        try self.analyzeInstructions(c.body_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                        try self.analyzeInstructions(c.body_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                         if (c.return_value) |rv| {
                             try self.recordReturnValue(rv, param_summaries, aliases, fresh_locals, return_sources);
                         }
                     }
-                    try self.analyzeInstructions(sr.default_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(sr.default_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                     if (sr.default_result) |dr| {
                         try self.recordReturnValue(dr, param_summaries, aliases, fresh_locals, return_sources);
                     }
@@ -1085,7 +1113,7 @@ pub const InterproceduralAnalyzer = struct {
 
                 .union_switch_return => |usr| {
                     for (usr.cases) |c| {
-                        try self.analyzeInstructions(c.body_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                        try self.analyzeInstructions(c.body_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                         if (c.return_value) |rv| {
                             try self.recordReturnValue(rv, param_summaries, aliases, fresh_locals, return_sources);
                         }
@@ -1094,7 +1122,7 @@ pub const InterproceduralAnalyzer = struct {
 
                 .union_switch => |us| {
                     for (us.cases) |c| {
-                        try self.analyzeInstructions(c.body_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                        try self.analyzeInstructions(c.body_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                         if (c.return_value) |rv| {
                             try self.recordReturnValue(rv, param_summaries, aliases, fresh_locals, return_sources);
                         }
@@ -1104,7 +1132,7 @@ pub const InterproceduralAnalyzer = struct {
                     // `return_value`, so nested calls/returns inside the
                     // else arm contribute to the summary.
                     if (us.has_else) {
-                        try self.analyzeInstructions(us.else_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                        try self.analyzeInstructions(us.else_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                         if (us.else_result) |er| {
                             try self.recordReturnValue(er, param_summaries, aliases, fresh_locals, return_sources);
                         }
@@ -1112,11 +1140,11 @@ pub const InterproceduralAnalyzer = struct {
                 },
 
                 .optional_dispatch => |od| {
-                    try self.analyzeInstructions(od.nil_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(od.nil_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                     if (od.nil_result) |nr| {
                         try self.recordReturnValue(nr, param_summaries, aliases, fresh_locals, return_sources);
                     }
-                    try self.analyzeInstructions(od.struct_instrs, num_params, param_summaries, aliases, fresh_locals, return_sources);
+                    try self.analyzeInstructions(od.struct_instrs, num_params, param_set_allocator, param_summaries, aliases, fresh_locals, return_sources);
                     if (od.struct_result) |sr| {
                         try self.recordReturnValue(sr, param_summaries, aliases, fresh_locals, return_sources);
                     }
@@ -1301,48 +1329,119 @@ pub const InterproceduralAnalyzer = struct {
 // Section 4: Helper Types
 // ============================================================
 
-/// Compact bitset for tracking which parameters a local aliases.
-/// Supports up to 64 parameters.
+/// Immutable bitset for tracking which parameters a local aliases.
+///
+/// The common case stays allocation-free in a `u64`. Functions with more than
+/// 64 parameters use arena-owned word slices, so copies through alias maps are
+/// cheap value copies and no parameter slot is silently under-approximated.
 const ParamSet = struct {
-    bits: u64,
+    storage: Storage,
+    param_count: usize,
 
-    fn empty() ParamSet {
-        return .{ .bits = 0 };
+    const Storage = union(enum) {
+        small: u64,
+        large: []const u64,
+    };
+
+    fn empty(param_count: usize) ParamSet {
+        return .{ .storage = .{ .small = 0 }, .param_count = param_count };
     }
 
-    fn singleton(idx: u32) ParamSet {
-        if (idx >= 64) return .{ .bits = 0 };
-        return .{ .bits = @as(u64, 1) << @intCast(idx) };
+    fn singleton(idx: u32, param_count: usize, allocator: std.mem.Allocator) !ParamSet {
+        if (idx >= param_count) return empty(param_count);
+        if (param_count <= 64) {
+            return .{
+                .storage = .{ .small = bitMask(@intCast(idx)) },
+                .param_count = param_count,
+            };
+        }
+
+        const words = try allocWords(allocator, param_count);
+        words[wordIndex(@intCast(idx))] = bitMask(@intCast(idx));
+        return .{ .storage = .{ .large = words }, .param_count = param_count };
     }
 
     fn isEmpty(self: ParamSet) bool {
-        return self.bits == 0;
+        return switch (self.storage) {
+            .small => |bits| bits == 0,
+            .large => |words| blk: {
+                for (words) |word| {
+                    if (word != 0) break :blk false;
+                }
+                break :blk true;
+            },
+        };
     }
 
     fn contains(self: ParamSet, idx: u32) bool {
-        if (idx >= 64) return false;
-        return (self.bits & (@as(u64, 1) << @intCast(idx))) != 0;
+        return self.containsIndex(@intCast(idx));
     }
 
-    fn merge(self: ParamSet, other: ParamSet) ParamSet {
-        return .{ .bits = self.bits | other.bits };
+    fn containsIndex(self: ParamSet, idx: usize) bool {
+        if (idx >= self.param_count) return false;
+        return switch (self.storage) {
+            .small => |bits| (bits & bitMask(idx)) != 0,
+            .large => |words| (words[wordIndex(idx)] & bitMask(idx)) != 0,
+        };
+    }
+
+    fn merge(self: ParamSet, other: ParamSet, allocator: std.mem.Allocator) !ParamSet {
+        std.debug.assert(self.param_count == other.param_count);
+        if (self.isEmpty()) return other;
+        if (other.isEmpty()) return self;
+
+        if (self.param_count <= 64) {
+            return .{
+                .storage = .{ .small = self.wordAt(0) | other.wordAt(0) },
+                .param_count = self.param_count,
+            };
+        }
+
+        const words = try allocWords(allocator, self.param_count);
+        for (words, 0..) |*word, index| {
+            word.* = self.wordAt(index) | other.wordAt(index);
+        }
+        return .{ .storage = .{ .large = words }, .param_count = self.param_count };
     }
 
     fn iterator(self: ParamSet) ParamSetIterator {
-        return .{ .bits = self.bits, .current = 0 };
+        return .{ .set = self, .current = 0 };
+    }
+
+    fn wordAt(self: ParamSet, index: usize) u64 {
+        return switch (self.storage) {
+            .small => |bits| if (index == 0) bits else 0,
+            .large => |words| if (index < words.len) words[index] else 0,
+        };
+    }
+
+    fn allocWords(allocator: std.mem.Allocator, param_count: usize) ![]u64 {
+        const word_count = (param_count + 63) / 64;
+        const words = try allocator.alloc(u64, word_count);
+        @memset(words, 0);
+        return words;
+    }
+
+    fn wordIndex(idx: usize) usize {
+        return idx / 64;
+    }
+
+    fn bitMask(idx: usize) u64 {
+        return @as(u64, 1) << @intCast(idx % 64);
     }
 };
 
 const ParamSetIterator = struct {
-    bits: u64,
-    current: u32,
+    set: ParamSet,
+    current: usize,
 
     fn next(self: *ParamSetIterator) ?u32 {
-        while (self.current < 64) {
+        while (self.current < self.set.param_count) {
             const idx = self.current;
             self.current += 1;
-            if ((self.bits & (@as(u64, 1) << @intCast(idx))) != 0) {
-                return idx;
+            if (idx > std.math.maxInt(u32)) return null;
+            if (self.set.containsIndex(idx)) {
+                return @intCast(idx);
             }
         }
         return null;
@@ -1877,6 +1976,62 @@ test "analyzer: function with no params produces empty summary" {
     try std.testing.expect(!summary.may_diverge);
 }
 
+test "hasRetInstruction: detects return in nested child stream" {
+    const allocator = std.testing.allocator;
+
+    const ret_instr = ir.Instruction{ .ret = .{ .value = null } };
+    const if_instr = ir.Instruction{ .if_expr = .{
+        .dest = 1,
+        .condition = 0,
+        .then_instrs = @constCast(&[_]ir.Instruction{ret_instr}),
+        .then_result = null,
+        .else_instrs = &.{},
+        .else_result = null,
+    } };
+    const instructions = [_]ir.Instruction{if_instr};
+
+    try std.testing.expect(try InterproceduralAnalyzer.hasRetInstruction(allocator, &instructions));
+}
+
+test "hasRetInstruction: initial stack append OOM propagates" {
+    const instr = ir.Instruction{ .const_nil = 0 };
+    const instructions = [_]ir.Instruction{instr};
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        InterproceduralAnalyzer.hasRetInstruction(failing_allocator.allocator(), &instructions),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "hasRetInstruction: child stack append OOM propagates" {
+    const empty_arm = ir.IrCaseArm{
+        .cond_instrs = &.{},
+        .condition = 0,
+        .body_instrs = &.{},
+        .result = null,
+    };
+    const arms = [_]ir.IrCaseArm{empty_arm} ** 128;
+    const case_instr = ir.Instruction{ .case_block = .{
+        .dest = 0,
+        .pre_instrs = &.{},
+        .arms = &arms,
+        .default_instrs = &.{},
+        .default_result = null,
+    } };
+    const instructions = [_]ir.Instruction{case_instr};
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        InterproceduralAnalyzer.hasRetInstruction(failing_allocator.allocator(), &instructions),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
 test "analyzer: function that returns its param" {
     const allocator = std.testing.allocator;
 
@@ -2238,14 +2393,19 @@ test "analyzer: fresh return allocation" {
 }
 
 test "ParamSet operations" {
-    const empty_set = ParamSet.empty();
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const set_allocator = arena.allocator();
+
+    const empty_set = ParamSet.empty(2);
     try std.testing.expect(empty_set.isEmpty());
 
-    const s0 = ParamSet.singleton(0);
+    const s0 = try ParamSet.singleton(0, 2, set_allocator);
     try std.testing.expect(!s0.isEmpty());
 
-    const s1 = ParamSet.singleton(1);
-    const merged = s0.merge(s1);
+    const s1 = try ParamSet.singleton(1, 2, set_allocator);
+    const merged = try s0.merge(s1, set_allocator);
 
     var count: u32 = 0;
     var iter = merged.iterator();
@@ -2253,6 +2413,122 @@ test "ParamSet operations" {
         count += 1;
     }
     try std.testing.expectEqual(@as(u32, 2), count);
+
+    const low_large_param = try ParamSet.singleton(0, 65, set_allocator);
+    const high_param = try ParamSet.singleton(64, 65, set_allocator);
+    try std.testing.expect(!high_param.isEmpty());
+    try std.testing.expect(high_param.contains(64));
+    try std.testing.expect(!high_param.contains(63));
+
+    const mixed = try low_large_param.merge(high_param, set_allocator);
+    try std.testing.expect(mixed.contains(0));
+    try std.testing.expect(mixed.contains(64));
+}
+
+test "analyzer: parameter aliases above 63 are tracked exactly" {
+    const allocator = std.testing.allocator;
+
+    const param_count = 65;
+    const params = try allocator.alloc(ir.Param, param_count);
+    defer allocator.free(params);
+    for (params, 0..) |*param, index| {
+        param.* = .{
+            .name = try std.fmt.allocPrint(allocator, "p{d}", .{index}),
+            .type_expr = .any,
+        };
+    }
+    defer {
+        for (params) |param| allocator.free(param.name);
+    }
+
+    const pg_instr = ir.Instruction{ .param_get = .{ .dest = 100, .index = 64 } };
+    const ret_instr = ir.Instruction{ .ret = .{ .value = 100 } };
+    const block0 = ir.Block{
+        .label = 0,
+        .instructions = @constCast(&[_]ir.Instruction{ pg_instr, ret_instr }),
+    };
+    const func0 = ir.Function{
+        .id = 0,
+        .name = "return_high_param",
+        .scope_id = 0,
+        .arity = param_count,
+        .params = params,
+        .return_type = .any,
+        .body = @constCast(&[_]ir.Block{block0}),
+        .is_closure = false,
+        .captures = &.{},
+    };
+
+    const functions = [_]ir.Function{func0};
+    const program = ir.Program{
+        .functions = &functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    var analyzer = try InterproceduralAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    try analyzer.analyze();
+
+    const summary = analyzer.getSummary(0).?;
+    try std.testing.expectEqual(@as(usize, param_count), summary.param_summaries.len);
+    try std.testing.expect(summary.param_summaries[64].returned);
+    try std.testing.expectEqual(@as(usize, 1), summary.return_summary.param_sources.len);
+    try std.testing.expectEqual(@as(u32, 64), summary.return_summary.param_sources[0]);
+}
+
+test "trackDerefDepths: records field_get depth" {
+    var aliases = std.AutoHashMap(ir.LocalId, ParamSet).init(std.testing.allocator);
+    defer aliases.deinit();
+
+    var deref_depths = std.AutoHashMap(ir.LocalId, i8).init(std.testing.allocator);
+    defer deref_depths.deinit();
+    try deref_depths.put(0, 0);
+
+    var param_summaries = [_]lattice.ParamSummary{lattice.ParamSummary.safe()};
+    const field_get = ir.Instruction{ .field_get = .{ .dest = 1, .object = 0, .field = "name" } };
+    const instructions = [_]ir.Instruction{field_get};
+    const program = ir.Program{
+        .functions = &.{},
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    var analyzer = try InterproceduralAnalyzer.init(std.testing.allocator, &program);
+    defer analyzer.deinit();
+
+    try analyzer.trackDerefDepths(&instructions, &aliases, &deref_depths, 1, &param_summaries);
+    try std.testing.expectEqual(@as(?i8, 1), deref_depths.get(1));
+}
+
+test "trackDerefDepths: propagates deref depth map allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    var aliases = std.AutoHashMap(ir.LocalId, ParamSet).init(std.testing.allocator);
+    defer aliases.deinit();
+    try aliases.put(0, try ParamSet.singleton(0, 1, std.testing.allocator));
+
+    var deref_depths = std.AutoHashMap(ir.LocalId, i8).init(failing_allocator.allocator());
+    defer deref_depths.deinit();
+
+    var param_summaries = [_]lattice.ParamSummary{lattice.ParamSummary.safe()};
+    const field_get = ir.Instruction{ .field_get = .{ .dest = 1, .object = 0, .field = "name" } };
+    const instructions = [_]ir.Instruction{field_get};
+    const program = ir.Program{
+        .functions = &.{},
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    var analyzer = try InterproceduralAnalyzer.init(std.testing.allocator, &program);
+    defer analyzer.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        analyzer.trackDerefDepths(&instructions, &aliases, &deref_depths, 1, &param_summaries),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
 }
 
 test "summariesEqual: identical summaries" {

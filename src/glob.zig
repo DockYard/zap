@@ -102,13 +102,18 @@ pub fn collect(
 
     const clean_pattern = stripLeadingCurrentDir(pattern);
     var results: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer freeMatches(allocator, results.items);
+    errdefer {
+        for (results.items) |item| allocator.free(item);
+        results.deinit(allocator);
+    }
 
     if (!hasMagic(clean_pattern)) {
         const access_path = try pathForAccess(temporary_allocator, options.root, clean_pattern);
-        if (std.Io.Dir.cwd().access(io, access_path, .{})) |_| {
-            try results.append(allocator, try allocator.dupe(u8, clean_pattern));
-        } else |_| {}
+        std.Io.Dir.cwd().access(io, access_path, .{}) catch |err| {
+            if (isMissingPathError(err)) return results.toOwnedSlice(allocator);
+            return err;
+        };
+        try appendOwnedMatch(allocator, &results, clean_pattern);
         return results.toOwnedSlice(allocator);
     }
 
@@ -129,6 +134,7 @@ pub fn collect(
         clean_pattern,
         options,
         &results,
+        true,
     );
 
     sort(results.items);
@@ -149,12 +155,16 @@ fn walk(
     pattern: []const u8,
     options: CollectOptions,
     results: *std.ArrayListUnmanaged([]const u8),
+    missing_path_is_empty: bool,
 ) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| {
+        if (missing_path_is_empty and isMissingPathError(err)) return;
+        return err;
+    };
     defer dir.close(io);
 
     var iterator = dir.iterate();
-    while (iterator.next(io) catch null) |entry| {
+    while (try iterator.next(io)) |entry| {
         const full_path = try std.fs.path.join(temporary_allocator, &.{ dir_path, entry.name });
         const relative_path = if (relative_prefix.len == 0)
             try temporary_allocator.dupe(u8, entry.name)
@@ -163,7 +173,7 @@ fn walk(
 
         if (entry.kind == .directory) {
             if (options.include_directories and match(pattern, relative_path)) {
-                try results.append(result_allocator, try result_allocator.dupe(u8, relative_path));
+                try appendOwnedMatch(result_allocator, results, relative_path);
             }
             try walk(
                 result_allocator,
@@ -174,14 +184,25 @@ fn walk(
                 pattern,
                 options,
                 results,
+                false,
             );
             continue;
         }
 
         if (entry.kind == .file and options.include_files and match(pattern, relative_path)) {
-            try results.append(result_allocator, try result_allocator.dupe(u8, relative_path));
+            try appendOwnedMatch(result_allocator, results, relative_path);
         }
     }
+}
+
+fn appendOwnedMatch(
+    allocator: std.mem.Allocator,
+    results: *std.ArrayListUnmanaged([]const u8),
+    path: []const u8,
+) !void {
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    try results.append(allocator, owned_path);
 }
 
 fn sort(items: [][]const u8) void {
@@ -213,6 +234,13 @@ fn hasMagic(pattern: []const u8) bool {
         if (character == '*' or character == '?') return true;
     }
     return false;
+}
+
+fn isMissingPathError(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound, error.NotDir => true,
+        else => false,
+    };
 }
 
 fn stripLeadingCurrentDir(path: []const u8) []const u8 {
@@ -268,4 +296,48 @@ test "collect returns sorted relative matches" {
     try std.testing.expectEqual(@as(usize, 2), matches.len);
     try std.testing.expectEqualStrings("fixture/a.zap", matches[0]);
     try std.testing.expectEqualStrings("fixture/b.zap", matches[1]);
+}
+
+test "collect treats genuinely missing literal pattern as empty" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    const root = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
+    defer allocator.free(root);
+
+    const matches = try collect(allocator, std.Options.debug_io, "missing.zap", .{ .root = root });
+    defer freeMatches(allocator, matches);
+
+    try std.testing.expectEqual(@as(usize, 0), matches.len);
+}
+
+test "P4J2: collect propagates literal access filesystem errors" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    try temporary_directory.dir.symLink(std.Options.debug_io, "loop.zap", "loop.zap", .{});
+    const root = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
+    defer allocator.free(root);
+
+    try std.testing.expectError(
+        error.SymLinkLoop,
+        collect(allocator, std.Options.debug_io, "loop.zap", .{ .root = root }),
+    );
+}
+
+test "P4J2: collect propagates glob base directory filesystem errors" {
+    const allocator = std.testing.allocator;
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    try temporary_directory.dir.symLink(std.Options.debug_io, "loop", "loop", .{ .is_directory = true });
+    const root = try temporary_directory.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator);
+    defer allocator.free(root);
+
+    try std.testing.expectError(
+        error.SymLinkLoop,
+        collect(allocator, std.Options.debug_io, "loop/*.zap", .{ .root = root }),
+    );
 }

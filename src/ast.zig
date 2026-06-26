@@ -300,6 +300,7 @@ pub const StructName = struct {
         if (self.parts.len == 0) return alloc.alloc(u8, 0);
         if (self.parts.len == 1) return alloc.dupe(u8, interner.get(self.parts[0]));
         var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(alloc);
         for (self.parts, 0..) |part, i| {
             if (i > 0) try buf.appendSlice(alloc, separator);
             try buf.appendSlice(alloc, interner.get(part));
@@ -331,6 +332,8 @@ pub const ProtocolParam = struct {
     meta: NodeMeta,
     name: StringId,
     type_annotation: ?*const TypeExpr,
+    ownership: Ownership = .shared,
+    ownership_explicit: bool = false,
 };
 
 // ============================================================

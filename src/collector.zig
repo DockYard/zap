@@ -2,6 +2,29 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const scope = @import("scope.zig");
 
+const MAX_COLLECTOR_AST_WALK_NODES: usize = 1_000_000;
+const MAX_COLLECTOR_AST_WALK_DEPTH: usize = 1024;
+
+const CollectorAstWalkBudget = struct {
+    nodes: usize = 0,
+    depth: usize = 0,
+    max_nodes: usize = MAX_COLLECTOR_AST_WALK_NODES,
+    max_depth: usize = MAX_COLLECTOR_AST_WALK_DEPTH,
+
+    fn enter(self: *CollectorAstWalkBudget) !void {
+        if (self.nodes >= self.max_nodes or self.depth >= self.max_depth) {
+            return error.CollectorAstWalkBudgetExceeded;
+        }
+        self.nodes += 1;
+        self.depth += 1;
+    }
+
+    fn leave(self: *CollectorAstWalkBudget) void {
+        std.debug.assert(self.depth != 0);
+        self.depth -= 1;
+    }
+};
+
 // ============================================================
 // Declaration collector
 //
@@ -29,10 +52,14 @@ pub const Collector = struct {
         span: ast.SourceSpan,
     };
 
-    pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner, kernel_name_id: ?ast.StringId) Collector {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        interner: *const ast.StringInterner,
+        kernel_name_id: ?ast.StringId,
+    ) std.mem.Allocator.Error!Collector {
         return .{
             .allocator = allocator,
-            .graph = scope.ScopeGraph.init(allocator),
+            .graph = try scope.ScopeGraph.init(allocator),
             .interner = interner,
             .errors = .empty,
             .kernel_name_id = kernel_name_id,
@@ -64,6 +91,18 @@ pub const Collector = struct {
 
     fn addError(self: *Collector, message: []const u8, span: ast.SourceSpan) !void {
         try self.errors.append(self.allocator, .{ .message = message, .span = span });
+    }
+
+    fn enterAstWalkBudget(self: *Collector, budget: *CollectorAstWalkBudget, span: ast.SourceSpan) !void {
+        budget.enter() catch |err| switch (err) {
+            error.CollectorAstWalkBudgetExceeded => {
+                try self.addError(
+                    "collector AST traversal budget exceeded while walking macro-expanded syntax",
+                    span,
+                );
+                return err;
+            },
+        };
     }
 
     /// True for identifiers that begin with a single underscore (`_foo`)
@@ -304,12 +343,13 @@ pub const Collector = struct {
                     if (all_equal) {
                         // Build the full qualified name for the error message
                         var name_parts: std.ArrayListUnmanaged(u8) = .empty;
+                        defer name_parts.deinit(self.allocator);
                         for (mod.name.parts, 0..) |part, i| {
-                            if (i > 0) name_parts.appendSlice(self.allocator, ".") catch {};
-                            name_parts.appendSlice(self.allocator, self.interner.get(part)) catch {};
+                            if (i > 0) try name_parts.appendSlice(self.allocator, ".");
+                            try name_parts.appendSlice(self.allocator, self.interner.get(part));
                         }
                         const full_name = name_parts.items;
-                        const msg = std.fmt.allocPrint(self.allocator, "struct '{s}' is already defined", .{full_name}) catch return error.OutOfMemory;
+                        const msg = try std.fmt.allocPrint(self.allocator, "struct '{s}' is already defined", .{full_name});
                         try self.addError(msg, mod.meta.span);
                         return;
                     }
@@ -357,8 +397,10 @@ pub const Collector = struct {
             if (!is_kernel and !self.hasExplicitKernelImport(mod, kid)) {
                 const parts = try self.allocator.alloc(ast.StringId, 1);
                 parts[0] = kid;
-                try self.graph.getScopeMut(mod_scope).imports.append(self.allocator, .{
+
+                var imported_scope = scope.ImportedScope{
                     .source_struct = .{ .parts = parts, .span = mod.meta.span },
+                    .owns_source_struct_parts = true,
                     .filter = .all,
                     .imported_families = std.AutoHashMap(scope.FamilyKey, scope.FunctionFamilyId).init(self.allocator),
                     .imported_types = std.AutoHashMap(ast.StringId, scope.TypeId).init(self.allocator),
@@ -366,7 +408,12 @@ pub const Collector = struct {
                     // declarations in the struct body shadow it for same-named
                     // macros/symbols (see ImportedScope.is_implicit).
                     .is_implicit = true,
-                });
+                };
+                var imported_scope_transferred = false;
+                errdefer if (!imported_scope_transferred) imported_scope.deinit(self.allocator);
+
+                try self.graph.getScopeMut(mod_scope).imports.append(self.allocator, imported_scope);
+                imported_scope_transferred = true;
             }
         }
 
@@ -704,8 +751,9 @@ pub const Collector = struct {
         for (self.graph.impls.items) |impl_entry| {
             const impl_d = impl_entry.decl;
             const proto_entry = self.graph.findProtocol(impl_d.protocol_name) orelse {
-                const proto_name = self.formatStructName(impl_d.protocol_name);
-                const msg = std.fmt.allocPrint(self.allocator, "protocol '{s}' is not defined", .{proto_name}) catch continue;
+                const proto_name = try self.formatStructName(impl_d.protocol_name);
+                defer self.allocator.free(proto_name);
+                const msg = try std.fmt.allocPrint(self.allocator, "protocol '{s}' is not defined", .{proto_name});
                 try self.addError(msg, impl_d.meta.span);
                 continue;
             };
@@ -721,13 +769,15 @@ pub const Collector = struct {
                         const impl_arity = func.clauses[0].params.len;
                         if (impl_arity != sig.params.len) {
                             const fn_name = self.interner.get(sig.name);
-                            const target_name = self.formatStructName(impl_d.target_type);
-                            const proto_name = self.formatStructName(impl_d.protocol_name);
-                            const msg = std.fmt.allocPrint(
+                            const target_name = try self.formatStructName(impl_d.target_type);
+                            defer self.allocator.free(target_name);
+                            const proto_name = try self.formatStructName(impl_d.protocol_name);
+                            defer self.allocator.free(proto_name);
+                            const msg = try std.fmt.allocPrint(
                                 self.allocator,
                                 "impl {s} for {s}: function '{s}' has arity {d}, protocol requires {d}",
                                 .{ proto_name, target_name, fn_name, impl_arity, sig.params.len },
-                            ) catch continue;
+                            );
                             try self.addError(msg, func.meta.span);
                         }
                     }
@@ -735,13 +785,15 @@ pub const Collector = struct {
                 }
                 if (!found) {
                     const fn_name = self.interner.get(sig.name);
-                    const target_name = self.formatStructName(impl_d.target_type);
-                    const proto_name = self.formatStructName(impl_d.protocol_name);
-                    const msg = std.fmt.allocPrint(
+                    const target_name = try self.formatStructName(impl_d.target_type);
+                    defer self.allocator.free(target_name);
+                    const proto_name = try self.formatStructName(impl_d.protocol_name);
+                    defer self.allocator.free(proto_name);
+                    const msg = try std.fmt.allocPrint(
                         self.allocator,
                         "impl {s} for {s} is missing required function '{s}/{d}'",
                         .{ proto_name, target_name, fn_name, sig.params.len },
-                    ) catch continue;
+                    );
                     try self.addError(msg, impl_d.meta.span);
                 }
             }
@@ -859,17 +911,28 @@ pub const Collector = struct {
         }
     }
 
-    fn formatStructName(self: *const Collector, name: ast.StructName) []const u8 {
-        if (name.parts.len == 1) return self.interner.get(name.parts[0]);
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        for (name.parts, 0..) |part, i| {
-            if (i > 0) buf.appendSlice(self.allocator, ".") catch return self.interner.get(name.parts[0]);
-            buf.appendSlice(self.allocator, self.interner.get(part)) catch return self.interner.get(name.parts[0]);
-        }
-        return buf.toOwnedSlice(self.allocator) catch return self.interner.get(name.parts[0]);
+    fn formatStructName(self: *const Collector, name: ast.StructName) ![]const u8 {
+        return try name.toDottedString(self.allocator, self.interner);
     }
 
     pub fn collectFunction(self: *Collector, func: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
+        var budget = CollectorAstWalkBudget{};
+        try self.collectFunctionBudgeted(func, parent_scope, &budget);
+    }
+
+    fn collectFunctionBudgeted(
+        self: *Collector,
+        func: *const ast.FunctionDecl,
+        parent_scope: scope.ScopeId,
+        budget: *CollectorAstWalkBudget,
+    ) !void {
+        const diagnostic_span = if (func.clauses.len > 0)
+            func.clauses[0].meta.span
+        else
+            ast.SourceSpan{ .start = 0, .end = 0 };
+        try self.enterAstWalkBudget(budget, diagnostic_span);
+        defer budget.leave();
+
         // Reject `pub fn _name` / `fn _name` at definition time. Single
         // underscore names are reserved for intentionally-unused bindings
         // (parameters, locals); they aren't legal function names.
@@ -910,13 +973,13 @@ pub const Collector = struct {
 
             // Collect parameter bindings
             for (clause.params) |param| {
-                try self.collectPatternBindings(param.pattern, fn_scope);
+                try self.collectPatternBindingsBudgeted(param.pattern, fn_scope, budget);
             }
 
             // Collect body statements (hoisting local defs).
             // Bodyless declarations (protocol sigs, forward decls) have no body to collect.
             if (clause.body) |body| {
-                try self.collectBlock(body, fn_scope);
+                try self.collectBlockBudgeted(body, fn_scope, budget);
             }
         }
     }
@@ -926,6 +989,23 @@ pub const Collector = struct {
     // ============================================================
 
     fn collectMacro(self: *Collector, mac: *const ast.FunctionDecl, parent_scope: scope.ScopeId) !void {
+        var budget = CollectorAstWalkBudget{};
+        try self.collectMacroBudgeted(mac, parent_scope, &budget);
+    }
+
+    fn collectMacroBudgeted(
+        self: *Collector,
+        mac: *const ast.FunctionDecl,
+        parent_scope: scope.ScopeId,
+        budget: *CollectorAstWalkBudget,
+    ) !void {
+        const diagnostic_span = if (mac.clauses.len > 0)
+            mac.clauses[0].meta.span
+        else
+            ast.SourceSpan{ .start = 0, .end = 0 };
+        try self.enterAstWalkBudget(budget, diagnostic_span);
+        defer budget.leave();
+
         // Same definition-time rule as `collectFunction`: single-`_`
         // macro names are reserved. Double-underscore stays legal so
         // language-hook macros (`__using__`, `__before_compile__`) can
@@ -953,11 +1033,11 @@ pub const Collector = struct {
             @constCast(&clause.meta).scope_id = fn_scope;
 
             for (clause.params) |param| {
-                try self.collectPatternBindings(param.pattern, fn_scope);
+                try self.collectPatternBindingsBudgeted(param.pattern, fn_scope, budget);
             }
 
             if (clause.body) |body| {
-                try self.collectBlock(body, fn_scope);
+                try self.collectBlockBudgeted(body, fn_scope, budget);
             }
         }
     }
@@ -1025,15 +1105,18 @@ pub const Collector = struct {
             // Detect cycles: walk the parent chain and check for self-reference
             if (sd.name.parts.len == 0) continue;
             const child_name = sd.name.parts[0];
+            var visited_parents = std.AutoHashMap(ast.StringId, void).init(self.allocator);
+            defer visited_parents.deinit();
             var current_parent: ?ast.StringId = parent_name;
             while (current_parent) |cp| {
-                if (cp == child_name) {
+                if (cp == child_name or visited_parents.contains(cp)) {
                     try self.addError(
                         "circular struct inheritance detected",
                         sd.meta.span,
                     );
                     break;
                 }
+                try visited_parents.put(cp, {});
                 // Walk up to grandparent
                 if (self.graph.resolveTypeByName(cp)) |cp_tid| {
                     const cp_entry = self.graph.types.items[cp_tid];
@@ -1086,7 +1169,9 @@ pub const Collector = struct {
             // Copy public function families from parent to child
             // First collect family keys to avoid iterator invalidation
             var family_keys: std.ArrayList(scope.FamilyKey) = .empty;
+            defer family_keys.deinit(self.allocator);
             var family_ids: std.ArrayList(scope.FunctionFamilyId) = .empty;
+            defer family_ids.deinit(self.allocator);
             {
                 const parent_scope_data = self.graph.getScope(parent_sid);
                 var iter = parent_scope_data.function_families.iterator();
@@ -1108,6 +1193,7 @@ pub const Collector = struct {
 
                 // Collect clause refs before creating new family (avoids stale pointer)
                 var clause_refs: std.ArrayList(scope.FunctionClauseRef) = .empty;
+                defer clause_refs.deinit(self.allocator);
                 for (parent_family.clauses.items) |clause_ref| {
                     try clause_refs.append(self.allocator, clause_ref);
                 }
@@ -1139,59 +1225,87 @@ pub const Collector = struct {
     }
 
     fn collectImport(self: *Collector, id_decl: *const ast.ImportDecl, parent_scope: scope.ScopeId) !void {
-        const filter: scope.ImportFilter = if (id_decl.filter) |f| switch (f) {
-            .only => |entries| blk: {
-                var import_entries: std.ArrayList(scope.ImportEntry) = .empty;
-                for (entries) |e| {
-                    switch (e) {
-                        .function => |func| try import_entries.append(self.allocator, .{
-                            .name = func.name,
-                            .arity = func.arity,
-                        }),
-                        .type_import => |name| try import_entries.append(self.allocator, .{
-                            .name = name,
-                            .arity = null,
-                        }),
-                    }
-                }
-                break :blk .{ .only = try import_entries.toOwnedSlice(self.allocator) };
-            },
-            .except => |entries| blk: {
-                var import_entries: std.ArrayList(scope.ImportEntry) = .empty;
-                for (entries) |e| {
-                    switch (e) {
-                        .function => |func| try import_entries.append(self.allocator, .{
-                            .name = func.name,
-                            .arity = func.arity,
-                        }),
-                        .type_import => |name| try import_entries.append(self.allocator, .{
-                            .name = name,
-                            .arity = null,
-                        }),
-                    }
-                }
-                break :blk .{ .except = try import_entries.toOwnedSlice(self.allocator) };
-            },
-        } else .all;
-
-        try self.graph.getScopeMut(parent_scope).imports.append(self.allocator, .{
+        var imported_scope = scope.ImportedScope{
             .source_struct = id_decl.struct_path,
-            .filter = filter,
+            .filter = try self.collectImportFilter(id_decl.filter),
             .imported_families = std.AutoHashMap(scope.FamilyKey, scope.FunctionFamilyId).init(self.allocator),
             .imported_types = std.AutoHashMap(ast.StringId, scope.TypeId).init(self.allocator),
-        });
+        };
+        var imported_scope_transferred = false;
+        errdefer if (!imported_scope_transferred) imported_scope.deinit(self.allocator);
+
+        try self.graph.getScopeMut(parent_scope).imports.append(self.allocator, imported_scope);
+        imported_scope_transferred = true;
+    }
+
+    fn collectImportFilter(self: *Collector, filter: ?ast.ImportFilter) !scope.ImportFilter {
+        const import_filter = filter orelse return .all;
+        return switch (import_filter) {
+            .only => |entries| .{ .only = try self.collectImportEntries(entries) },
+            .except => |entries| .{ .except = try self.collectImportEntries(entries) },
+        };
+    }
+
+    fn collectImportEntries(self: *Collector, entries: []const ast.ImportEntry) ![]const scope.ImportEntry {
+        var import_entries: std.ArrayList(scope.ImportEntry) = .empty;
+        errdefer import_entries.deinit(self.allocator);
+
+        for (entries) |entry| {
+            switch (entry) {
+                .function => |function| try import_entries.append(self.allocator, .{
+                    .name = function.name,
+                    .arity = function.arity,
+                }),
+                .type_import => |name| try import_entries.append(self.allocator, .{
+                    .name = name,
+                    .arity = null,
+                }),
+            }
+        }
+        return try import_entries.toOwnedSlice(self.allocator);
     }
 
     // ============================================================
     // Block collection — handles local def hoisting
     // ============================================================
 
+    fn stmtDiagnosticSpan(stmt: ast.Stmt) ast.SourceSpan {
+        return switch (stmt) {
+            .expr => |expr| expr.getMeta().span,
+            .assignment => |assignment| assignment.meta.span,
+            .function_decl, .macro_decl => |function| if (function.clauses.len > 0)
+                function.clauses[0].meta.span
+            else
+                ast.SourceSpan{ .start = 0, .end = 0 },
+            .import_decl => |import_decl| import_decl.meta.span,
+            .attribute => |attribute| attribute.meta.span,
+        };
+    }
+
+    fn blockDiagnosticSpan(stmts: []const ast.Stmt) ast.SourceSpan {
+        if (stmts.len == 0) return .{ .start = 0, .end = 0 };
+        return stmtDiagnosticSpan(stmts[0]);
+    }
+
     fn collectBlock(self: *Collector, stmts: []const ast.Stmt, parent_scope: scope.ScopeId) anyerror!void {
+        var budget = CollectorAstWalkBudget{};
+        try self.collectBlockBudgeted(stmts, parent_scope, &budget);
+    }
+
+    fn collectBlockBudgeted(
+        self: *Collector,
+        stmts: []const ast.Stmt,
+        parent_scope: scope.ScopeId,
+        budget: *CollectorAstWalkBudget,
+    ) anyerror!void {
+        try self.enterAstWalkBudget(budget, blockDiagnosticSpan(stmts));
+        defer budget.leave();
+
         // First pass: hoist local function declarations
         for (stmts) |stmt| {
             switch (stmt) {
-                .function_decl => |func| try self.collectFunction(func, parent_scope),
-                .macro_decl => |mac| try self.collectMacro(mac, parent_scope),
+                .function_decl => |func| try self.collectFunctionBudgeted(func, parent_scope, budget),
+                .macro_decl => |mac| try self.collectMacroBudgeted(mac, parent_scope, budget),
                 else => {},
             }
         }
@@ -1200,17 +1314,17 @@ pub const Collector = struct {
         for (stmts) |stmt| {
             switch (stmt) {
                 .assignment => |assign| {
-                    try self.collectPatternBindings(assign.pattern, parent_scope);
-                    try self.collectExprScopes(assign.value, parent_scope);
+                    try self.collectPatternBindingsBudgeted(assign.pattern, parent_scope, budget);
+                    try self.collectExprScopesBudgeted(assign.value, parent_scope, budget);
                 },
                 .expr => |expr| {
-                    try self.collectExprScopes(expr, parent_scope);
+                    try self.collectExprScopesBudgeted(expr, parent_scope, budget);
                 },
                 .import_decl => |id_decl| {
                     try self.collectImport(id_decl, parent_scope);
                 },
                 .attribute => |attr| {
-                    if (attr.value) |value| try self.collectExprScopes(value, parent_scope);
+                    if (attr.value) |value| try self.collectExprScopesBudgeted(value, parent_scope, budget);
                 },
                 .function_decl, .macro_decl => {},
             }
@@ -1222,6 +1336,19 @@ pub const Collector = struct {
     // ============================================================
 
     fn collectPatternBindings(self: *Collector, pattern: *const ast.Pattern, scope_id: scope.ScopeId) !void {
+        var budget = CollectorAstWalkBudget{};
+        try self.collectPatternBindingsBudgeted(pattern, scope_id, &budget);
+    }
+
+    fn collectPatternBindingsBudgeted(
+        self: *Collector,
+        pattern: *const ast.Pattern,
+        scope_id: scope.ScopeId,
+        budget: *CollectorAstWalkBudget,
+    ) !void {
+        try self.enterAstWalkBudget(budget, pattern.getMeta().span);
+        defer budget.leave();
+
         switch (pattern.*) {
             .bind => |bind| {
                 // Copy the binder's hygiene scope set into the Binding row
@@ -1241,37 +1368,37 @@ pub const Collector = struct {
             },
             .tuple => |tup| {
                 for (tup.elements) |elem| {
-                    try self.collectPatternBindings(elem, scope_id);
+                    try self.collectPatternBindingsBudgeted(elem, scope_id, budget);
                 }
             },
             .list => |lst| {
                 for (lst.elements) |elem| {
-                    try self.collectPatternBindings(elem, scope_id);
+                    try self.collectPatternBindingsBudgeted(elem, scope_id, budget);
                 }
             },
             .list_cons => |lc| {
                 for (lc.heads) |head| {
-                    try self.collectPatternBindings(head, scope_id);
+                    try self.collectPatternBindingsBudgeted(head, scope_id, budget);
                 }
-                try self.collectPatternBindings(lc.tail, scope_id);
+                try self.collectPatternBindingsBudgeted(lc.tail, scope_id, budget);
             },
             .map => |m| {
                 for (m.fields) |field| {
-                    try self.collectPatternBindings(field.value, scope_id);
+                    try self.collectPatternBindingsBudgeted(field.value, scope_id, budget);
                 }
             },
             .struct_pattern => |sp| {
                 for (sp.fields) |field| {
-                    try self.collectPatternBindings(field.pattern, scope_id);
+                    try self.collectPatternBindingsBudgeted(field.pattern, scope_id, budget);
                 }
             },
             .paren => |p| {
-                try self.collectPatternBindings(p.inner, scope_id);
+                try self.collectPatternBindingsBudgeted(p.inner, scope_id, budget);
             },
             .binary => |bin| {
                 for (bin.segments) |seg| {
                     switch (seg.value) {
-                        .pattern => |pat| try self.collectPatternBindings(pat, scope_id),
+                        .pattern => |pat| try self.collectPatternBindingsBudgeted(pat, scope_id, budget),
                         .expr, .string_literal => {},
                     }
                 }
@@ -1284,7 +1411,7 @@ pub const Collector = struct {
                 // bindings. The qualifier and type-args carry no
                 // pattern-bound names.
                 if (tuv.payload) |payload| {
-                    try self.collectPatternBindings(payload, scope_id);
+                    try self.collectPatternBindingsBudgeted(payload, scope_id, budget);
                 }
             },
             .wildcard, .literal, .pin => {},
@@ -1296,17 +1423,30 @@ pub const Collector = struct {
     // ============================================================
 
     fn collectExprScopes(self: *Collector, expr: *const ast.Expr, parent_scope: scope.ScopeId) anyerror!void {
+        var budget = CollectorAstWalkBudget{};
+        try self.collectExprScopesBudgeted(expr, parent_scope, &budget);
+    }
+
+    fn collectExprScopesBudgeted(
+        self: *Collector,
+        expr: *const ast.Expr,
+        parent_scope: scope.ScopeId,
+        budget: *CollectorAstWalkBudget,
+    ) anyerror!void {
+        try self.enterAstWalkBudget(budget, expr.getMeta().span);
+        defer budget.leave();
+
         switch (expr.*) {
             .if_expr => |ie| {
                 const then_scope = try self.graph.createScope(parent_scope, .block);
-                try self.collectBlock(ie.then_block, then_scope);
+                try self.collectBlockBudgeted(ie.then_block, then_scope, budget);
                 if (ie.else_block) |else_block| {
                     const else_scope = try self.graph.createScope(parent_scope, .block);
-                    try self.collectBlock(else_block, else_scope);
+                    try self.collectBlockBudgeted(else_block, else_scope, budget);
                 }
             },
             .case_expr => |ce| {
-                try self.collectExprScopes(ce.scrutinee, parent_scope);
+                try self.collectExprScopesBudgeted(ce.scrutinee, parent_scope, budget);
                 // Iterate by pointer: `for |clause|` copies each element so
                 // any mutation through `&clause.meta` would land on the
                 // local copy and never reach the AST stored in the slice.
@@ -1319,14 +1459,14 @@ pub const Collector = struct {
                     const clause_scope = try self.graph.createScope(parent_scope, .case_clause);
                     try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), clause_scope);
                     @constCast(&clause.meta).scope_id = clause_scope;
-                    try self.collectPatternBindings(clause.pattern, clause_scope);
-                    try self.collectBlock(clause.body, clause_scope);
+                    try self.collectPatternBindingsBudgeted(clause.pattern, clause_scope, budget);
+                    try self.collectBlockBudgeted(clause.body, clause_scope, budget);
                 }
             },
             .cond_expr => |cond| {
                 for (cond.clauses) |clause| {
                     const clause_scope = try self.graph.createScope(parent_scope, .block);
-                    try self.collectBlock(clause.body, clause_scope);
+                    try self.collectBlockBudgeted(clause.body, clause_scope, budget);
                 }
             },
             .try_rescue => |tr| {
@@ -1336,17 +1476,17 @@ pub const Collector = struct {
                 // scope discovery the type checker and HIR rely on is in place.
                 // `after` is a block scope.
                 const body_scope = try self.graph.createScope(parent_scope, .block);
-                try self.collectBlock(tr.body, body_scope);
+                try self.collectBlockBudgeted(tr.body, body_scope, budget);
                 for (tr.rescue_clauses) |*clause| {
                     const clause_scope = try self.graph.createScope(parent_scope, .case_clause);
                     try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), clause_scope);
                     @constCast(&clause.meta).scope_id = clause_scope;
-                    try self.collectPatternBindings(clause.pattern, clause_scope);
-                    try self.collectBlock(clause.body, clause_scope);
+                    try self.collectPatternBindingsBudgeted(clause.pattern, clause_scope, budget);
+                    try self.collectBlockBudgeted(clause.body, clause_scope, budget);
                 }
                 if (tr.after_block) |cleanup| {
                     const after_scope = try self.graph.createScope(parent_scope, .block);
-                    try self.collectBlock(cleanup, after_scope);
+                    try self.collectBlockBudgeted(cleanup, after_scope, budget);
                 }
             },
             .block => |blk| {
@@ -1355,8 +1495,8 @@ pub const Collector = struct {
                 // macros that produce {function_decl, call} blocks at expression level.
                 for (blk.stmts) |stmt| {
                     switch (stmt) {
-                        .function_decl => |func| try self.collectFunction(func, parent_scope),
-                        .macro_decl => |mac| try self.collectMacro(mac, parent_scope),
+                        .function_decl => |func| try self.collectFunctionBudgeted(func, parent_scope, budget),
+                        .macro_decl => |mac| try self.collectMacroBudgeted(mac, parent_scope, budget),
                         else => {},
                     }
                 }
@@ -1366,37 +1506,37 @@ pub const Collector = struct {
                 try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(blk.meta.span), blk_scope);
                 const expr_mut: *ast.Expr = @constCast(expr);
                 expr_mut.block.meta.scope_id = blk_scope;
-                try self.collectBlock(blk.stmts, blk_scope);
+                try self.collectBlockBudgeted(blk.stmts, blk_scope, budget);
             },
             .anonymous_function => |anon| {
-                try self.collectFunction(anon.decl, parent_scope);
+                try self.collectFunctionBudgeted(anon.decl, parent_scope, budget);
             },
             .call => |c| {
                 // Recurse into call arguments to find anonymous functions
                 for (c.args) |arg| {
-                    try self.collectExprScopes(arg, parent_scope);
+                    try self.collectExprScopesBudgeted(arg, parent_scope, budget);
                 }
-                try self.collectExprScopes(c.callee, parent_scope);
+                try self.collectExprScopesBudgeted(c.callee, parent_scope, budget);
             },
             .binary_op => |bo| {
-                try self.collectExprScopes(bo.lhs, parent_scope);
-                try self.collectExprScopes(bo.rhs, parent_scope);
+                try self.collectExprScopesBudgeted(bo.lhs, parent_scope, budget);
+                try self.collectExprScopesBudgeted(bo.rhs, parent_scope, budget);
             },
             .unary_op => |uo| {
-                try self.collectExprScopes(uo.operand, parent_scope);
+                try self.collectExprScopesBudgeted(uo.operand, parent_scope, budget);
             },
             .tuple => |tup| {
                 for (tup.elements) |elem| {
-                    try self.collectExprScopes(elem, parent_scope);
+                    try self.collectExprScopesBudgeted(elem, parent_scope, budget);
                 }
             },
             .list => |ll| {
                 for (ll.elements) |elem| {
-                    try self.collectExprScopes(elem, parent_scope);
+                    try self.collectExprScopesBudgeted(elem, parent_scope, budget);
                 }
             },
             .field_access => |fa| {
-                try self.collectExprScopes(fa.object, parent_scope);
+                try self.collectExprScopesBudgeted(fa.object, parent_scope, budget);
             },
             // For other expressions, we don't create new scopes
             else => {},
@@ -1409,6 +1549,290 @@ pub const Collector = struct {
 // ============================================================
 
 const Parser = @import("parser.zig").Parser;
+
+fn makeCollectorTestMeta() ast.NodeMeta {
+    return .{ .span = .{ .start = 0, .end = 1 } };
+}
+
+fn makeCollectorDeepParenPattern(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    depth: usize,
+) !*const ast.Pattern {
+    const name = try interner.intern("value");
+    const meta = makeCollectorTestMeta();
+    var current = try allocator.create(ast.Pattern);
+    current.* = .{ .bind = .{ .meta = meta, .name = name } };
+    for (0..depth) |_| {
+        const wrapper = try allocator.create(ast.Pattern);
+        wrapper.* = .{ .paren = .{ .meta = meta, .inner = current } };
+        current = wrapper;
+    }
+    return current;
+}
+
+fn makeCollectorDeepUnaryExpr(allocator: std.mem.Allocator, depth: usize) !*const ast.Expr {
+    const meta = makeCollectorTestMeta();
+    var current = try allocator.create(ast.Expr);
+    current.* = .{ .int_literal = .{ .meta = meta, .value = 1 } };
+    for (0..depth) |_| {
+        const wrapper = try allocator.create(ast.Expr);
+        wrapper.* = .{ .unary_op = .{ .meta = meta, .op = .not_op, .operand = current } };
+        current = wrapper;
+    }
+    return current;
+}
+
+const CollectorImportFilterMode = enum {
+    only,
+    except,
+};
+
+fn collectFilteredImportAllocationFailureImpl(
+    allocator: std.mem.Allocator,
+    filter_mode: CollectorImportFilterMode,
+) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    var collector = try Collector.init(allocator, &interner, null);
+    defer collector.deinit();
+
+    const source_parts = [_]ast.StringId{10};
+    const filter_entries = [_]ast.ImportEntry{
+        .{ .function = .{ .name = 20, .arity = 1 } },
+        .{ .type_import = 30 },
+    };
+    const import_filter: ast.ImportFilter = switch (filter_mode) {
+        .only => .{ .only = &filter_entries },
+        .except => .{ .except = &filter_entries },
+    };
+    const import_decl = ast.ImportDecl{
+        .meta = makeCollectorTestMeta(),
+        .struct_path = .{
+            .parts = &source_parts,
+            .span = .{ .start = 0, .end = 6 },
+        },
+        .filter = import_filter,
+    };
+
+    try collector.collectImport(&import_decl, collector.graph.prelude_scope);
+
+    const imports = collector.graph.getScope(collector.graph.prelude_scope).imports.items;
+    try std.testing.expectEqual(@as(usize, 1), imports.len);
+    try std.testing.expectEqualSlices(ast.StringId, &source_parts, imports[0].source_struct.parts);
+
+    const entries = switch (filter_mode) {
+        .only => switch (imports[0].filter) {
+            .only => |entries| entries,
+            else => return error.ExpectedOnlyImportFilter,
+        },
+        .except => switch (imports[0].filter) {
+            .except => |entries| entries,
+            else => return error.ExpectedExceptImportFilter,
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(ast.StringId, 20), entries[0].name);
+    try std.testing.expectEqual(@as(?u32, 1), entries[0].arity);
+    try std.testing.expectEqual(@as(ast.StringId, 30), entries[1].name);
+    try std.testing.expectEqual(@as(?u32, null), entries[1].arity);
+}
+
+fn collectImplicitKernelImportAllocationFailureImpl(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const kernel_name = try interner.intern("Kernel");
+    const user_name = try interner.intern("User");
+    const kernel_parts = [_]ast.StringId{kernel_name};
+    const user_parts = [_]ast.StringId{user_name};
+    const test_meta = makeCollectorTestMeta();
+
+    var structs = [_]ast.StructDecl{
+        .{
+            .meta = test_meta,
+            .name = .{ .parts = &kernel_parts, .span = test_meta.span },
+        },
+        .{
+            .meta = test_meta,
+            .name = .{ .parts = &user_parts, .span = test_meta.span },
+        },
+    };
+    const program = ast.Program{
+        .structs = &structs,
+        .top_items = &.{},
+    };
+
+    var collector = try Collector.init(allocator, &interner, kernel_name);
+    defer collector.deinit();
+
+    try collector.collectProgram(&program);
+
+    const user_scope_id = collector.graph.findStructScope(structs[1].name) orelse return error.ExpectedUserStructScope;
+    const imports = collector.graph.getScope(user_scope_id).imports.items;
+    try std.testing.expectEqual(@as(usize, 1), imports.len);
+    try std.testing.expect(imports[0].is_implicit);
+    try std.testing.expect(imports[0].owns_source_struct_parts);
+    try std.testing.expectEqual(@as(usize, 1), imports[0].source_struct.parts.len);
+    try std.testing.expectEqual(kernel_name, imports[0].source_struct.parts[0]);
+}
+
+fn collectStructExtendsAllocationFailureImpl(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const parent_name = try interner.intern("Parent");
+    const child_name = try interner.intern("Child");
+    const inherited_name = try interner.intern("inherited");
+
+    const parent_parts = [_]ast.StringId{parent_name};
+    const child_parts = [_]ast.StringId{child_name};
+    var inherited_clauses = [_]ast.FunctionClause{
+        .{
+            .meta = .{ .span = .{ .start = 10, .end = 20 } },
+            .params = &.{},
+            .return_type = null,
+            .refinement = null,
+            .body = null,
+        },
+    };
+    var inherited_function = ast.FunctionDecl{
+        .meta = .{ .span = .{ .start = 10, .end = 20 } },
+        .name = inherited_name,
+        .clauses = &inherited_clauses,
+        .visibility = .public,
+    };
+    const parent_items = [_]ast.StructItem{
+        .{ .function = &inherited_function },
+    };
+    var structs = [_]ast.StructDecl{
+        .{
+            .meta = .{ .span = .{ .start = 0, .end = 30 } },
+            .name = .{ .parts = &parent_parts, .span = .{ .start = 0, .end = 6 } },
+            .items = &parent_items,
+        },
+        .{
+            .meta = .{ .span = .{ .start = 31, .end = 60 } },
+            .name = .{ .parts = &child_parts, .span = .{ .start = 31, .end = 36 } },
+            .parent = parent_name,
+        },
+    };
+    const program = ast.Program{
+        .structs = &structs,
+        .top_items = &.{},
+    };
+
+    var collector = try Collector.init(allocator, &interner, null);
+    defer collector.deinit();
+
+    try collector.collectProgram(&program);
+
+    const parent_scope_id = collector.graph.findStructScope(structs[0].name) orelse return error.ExpectedParentStructScope;
+    const child_scope_id = collector.graph.findStructScope(structs[1].name) orelse return error.ExpectedChildStructScope;
+    const family_key = scope.FamilyKey{ .name = inherited_name, .arity = 0 };
+    const parent_family_id = collector.graph.getScope(parent_scope_id).function_families.get(family_key) orelse return error.ExpectedParentFamily;
+    const child_family_id = collector.graph.getScope(child_scope_id).function_families.get(family_key) orelse return error.ExpectedInheritedFamily;
+
+    try std.testing.expect(parent_family_id != child_family_id);
+    const child_family = collector.graph.getFamily(child_family_id);
+    try std.testing.expectEqual(ast.FunctionDecl.Visibility.public, child_family.visibility);
+    try std.testing.expectEqual(@as(usize, 1), child_family.clauses.items.len);
+    try std.testing.expectEqual(&inherited_function, child_family.clauses.items[0].decl);
+    try std.testing.expectEqual(@as(u32, 0), child_family.clauses.items[0].clause_index);
+}
+
+test "Collector.init propagates ScopeGraph prelude allocation OutOfMemory" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Collector.init(failing_allocator.allocator(), &interner, null),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "collectImport cleans owned filters when any allocation fails" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        collectFilteredImportAllocationFailureImpl,
+        .{CollectorImportFilterMode.only},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        collectFilteredImportAllocationFailureImpl,
+        .{CollectorImportFilterMode.except},
+    );
+}
+
+test "collectProgram cleans synthesized Kernel import when any allocation fails" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        collectImplicitKernelImportAllocationFailureImpl,
+        .{},
+    );
+}
+
+test "resolveStructExtends cleans temporary lists when any allocation fails" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        collectStructExtendsAllocationFailureImpl,
+        .{},
+    );
+}
+
+fn expectImplConformanceValidationOutOfMemory(source: []const u8, fail_index: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+    try collector.errors.ensureTotalCapacity(alloc, collector.errors.items.len + 1);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+    const original_allocator = collector.allocator;
+    collector.allocator = failing_allocator.allocator();
+    defer collector.allocator = original_allocator;
+
+    try std.testing.expectError(error.OutOfMemory, collector.validateImplConformance());
+}
+
+fn expectDuplicateStructDiagnosticNameAssemblyOutOfMemory(source: []const u8, fail_index: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    try std.testing.expectEqual(@as(usize, 2), program.structs.len);
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectStruct(&program.structs[0], collector.graph.prelude_scope);
+    try collector.errors.ensureTotalCapacity(alloc, collector.errors.items.len + 1);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+    const original_allocator = collector.allocator;
+    collector.allocator = failing_allocator.allocator();
+    defer collector.allocator = original_allocator;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        collector.collectStruct(&program.structs[1], collector.graph.prelude_scope),
+    );
+    try std.testing.expectEqual(@as(usize, 0), collector.errors.items.len);
+}
 
 test "collect simple function" {
     const source =
@@ -1423,11 +1847,11 @@ test "collect simple function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1458,11 +1882,11 @@ test "collect struct with functions" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1485,11 +1909,11 @@ test "collect type declaration" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1515,11 +1939,11 @@ test "collect function family grouping" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1554,11 +1978,11 @@ test "duplicate @doc on same function family produces error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1593,11 +2017,11 @@ test "duplicate @doc on same macro family produces error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1623,11 +2047,11 @@ test "collect case expression creates scopes" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1653,11 +2077,11 @@ test "collect local def hoisting" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1679,11 +2103,11 @@ test "collect struct declaration" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1702,11 +2126,11 @@ test "collect empty struct declaration registers nominal type" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1725,11 +2149,11 @@ test "collect protocol declaration" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1751,11 +2175,11 @@ test "collect impl declaration" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1781,11 +2205,11 @@ test "collect protocol and impl together" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -1799,6 +2223,71 @@ test "collect protocol and impl together" {
     // Verify impl lookup works
     const impl_target = collector.graph.impls.items[0].target_type;
     try std.testing.expect(collector.graph.findImpl(proto_name, impl_target) != null);
+}
+
+test "validateImplConformance propagates OutOfMemory while formatting undefined protocol diagnostic" {
+    const source =
+        \\pub impl MissingProtocol for List {
+        \\  pub fn each(list :: [member]) -> [member] {
+        \\    list
+        \\  }
+        \\}
+    ;
+
+    try expectImplConformanceValidationOutOfMemory(source, 1);
+}
+
+test "validateImplConformance propagates OutOfMemory while formatting arity mismatch diagnostic" {
+    const source =
+        \\pub protocol Printable {
+        \\  fn to_string(value, options) -> String
+        \\}
+        \\pub impl Printable for List {
+        \\  pub fn to_string(list :: [member]) -> String {
+        \\    "list"
+        \\  }
+        \\}
+    ;
+
+    try expectImplConformanceValidationOutOfMemory(source, 2);
+}
+
+test "validateImplConformance propagates OutOfMemory while formatting missing function diagnostic" {
+    const source =
+        \\pub protocol Printable {
+        \\  fn to_string(value) -> String
+        \\}
+        \\pub impl Printable for List {
+        \\  pub fn other(list :: [member]) -> String {
+        \\    "list"
+        \\  }
+        \\}
+    ;
+
+    try expectImplConformanceValidationOutOfMemory(source, 2);
+}
+
+test "formatStructName propagates OutOfMemory for dotted names" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const outer = try interner.intern("Outer");
+    const inner = try interner.intern("Inner");
+    const parts = [_]ast.StringId{ outer, inner };
+    const name = ast.StructName{
+        .parts = &parts,
+        .span = .{ .start = 0, .end = 11 },
+    };
+
+    var collector = try Collector.init(std.testing.allocator, &interner, null);
+    defer collector.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_allocator = collector.allocator;
+    collector.allocator = failing_allocator.allocator();
+    defer collector.allocator = original_allocator;
+
+    try std.testing.expectError(error.OutOfMemory, collector.formatStructName(name));
 }
 
 test "duplicate struct declaration produces error" {
@@ -1819,15 +2308,136 @@ test "duplicate struct declaration produces error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     collector.collectProgram(&program) catch {};
 
     try std.testing.expect(collector.errors.items.len > 0);
     const err_msg = collector.errors.items[0].message;
     try std.testing.expect(std.mem.indexOf(u8, err_msg, "already defined") != null);
+}
+
+test "duplicate dotted struct declaration reports full diagnostic name" {
+    const source =
+        \\pub struct Foo.Bar {
+        \\  pub fn bar() -> String {
+        \\    "hello"
+        \\  }
+        \\}
+        \\pub struct Foo.Bar {
+        \\  pub fn baz() -> String {
+        \\    "world"
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    collector.collectProgram(&program) catch {};
+
+    try std.testing.expect(collector.errors.items.len > 0);
+    const err_msg = collector.errors.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, err_msg, "struct 'Foo.Bar' is already defined") != null);
+}
+
+test "duplicate dotted struct diagnostic name assembly propagates OutOfMemory" {
+    const source =
+        \\pub struct Foo.Bar {
+        \\  pub fn bar() -> String {
+        \\    "hello"
+        \\  }
+        \\}
+        \\pub struct Foo.Bar {
+        \\  pub fn baz() -> String {
+        \\    "world"
+        \\  }
+        \\}
+    ;
+
+    try expectDuplicateStructDiagnosticNameAssemblyOutOfMemory(source, 0);
+}
+
+test "extends cycle through parent chain produces circular inheritance diagnostic" {
+    const source =
+        \\pub struct A extends B {
+        \\}
+        \\pub struct B extends C {
+        \\}
+        \\pub struct C extends B {
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    collector.collectProgram(&program) catch {};
+
+    var saw_cycle = false;
+    for (collector.errors.items) |collect_error| {
+        if (std.mem.indexOf(u8, collect_error.message, "circular struct inheritance detected") != null) {
+            saw_cycle = true;
+        }
+    }
+    try std.testing.expect(saw_cycle);
+}
+
+test "collectPatternBindings rejects macro-produced patterns beyond traversal budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var collector = try Collector.init(std.testing.allocator, &interner, null);
+    defer collector.deinit();
+
+    const pattern = try makeCollectorDeepParenPattern(allocator, &interner, MAX_COLLECTOR_AST_WALK_DEPTH + 1);
+
+    try std.testing.expectError(
+        error.CollectorAstWalkBudgetExceeded,
+        collector.collectPatternBindings(pattern, collector.graph.prelude_scope),
+    );
+    try std.testing.expectEqual(@as(usize, 1), collector.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, collector.errors.items[0].message, "collector AST traversal budget") != null);
+}
+
+test "collectExprScopes rejects macro-produced expressions beyond traversal budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var collector = try Collector.init(std.testing.allocator, &interner, null);
+    defer collector.deinit();
+
+    const expr = try makeCollectorDeepUnaryExpr(allocator, MAX_COLLECTOR_AST_WALK_DEPTH + 1);
+
+    try std.testing.expectError(
+        error.CollectorAstWalkBudgetExceeded,
+        collector.collectExprScopes(expr, collector.graph.prelude_scope),
+    );
+    try std.testing.expectEqual(@as(usize, 1), collector.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, collector.errors.items[0].message, "collector AST traversal budget") != null);
 }

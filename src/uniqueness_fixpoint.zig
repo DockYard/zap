@@ -276,65 +276,69 @@ fn walkStreamForCallees(
     name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
     edges: *std.ArrayListUnmanaged(CallEdge),
 ) error{OutOfMemory}!void {
-    for (stream) |*instr| {
-        switch (instr.*) {
-            .call_named => |cn| {
-                if (name_to_id.get(cn.name)) |target| {
-                    try edges.append(allocator, .{
-                        .callee = target,
-                        .args = cn.args,
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
+        edges: *std.ArrayListUnmanaged(CallEdge),
+        err: ?std.mem.Allocator.Error = null,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (self.err != null) return;
+            switch (instr.*) {
+                .call_named => |cn| {
+                    if (self.name_to_id.get(cn.name)) |target| {
+                        self.edges.append(self.allocator, .{
+                            .callee = target,
+                            .args = cn.args,
+                            .is_tail_call = false,
+                        }) catch |err| {
+                            self.err = err;
+                        };
+                    }
+                },
+                .call_direct => |cd| {
+                    self.edges.append(self.allocator, .{
+                        .callee = cd.function,
+                        .args = cd.args,
                         .is_tail_call = false,
-                    });
-                }
-            },
-            .call_direct => |cd| {
-                try edges.append(allocator, .{
-                    .callee = cd.function,
-                    .args = cd.args,
-                    .is_tail_call = false,
-                });
-            },
-            .try_call_named => |tcn| {
-                if (name_to_id.get(tcn.name)) |target| {
-                    try edges.append(allocator, .{
-                        .callee = target,
-                        .args = tcn.args,
-                        .is_tail_call = false,
-                    });
-                }
-            },
-            .tail_call => |tc| {
-                if (name_to_id.get(tc.name)) |target| {
-                    try edges.append(allocator, .{
-                        .callee = target,
-                        .args = tc.args,
-                        .is_tail_call = true,
-                    });
-                }
-            },
-            else => {},
-        }
-        // Recurse into every nested sub-stream via the canonical
-        // enumerator (covers union_switch.else_instrs, previously
-        // skipped, so call-graph edges from a catch-all body are no
-        // longer lost). Leaf call instructions have no child streams,
-        // so this is a no-op for them.
-        const Ctx = struct {
-            allocator: std.mem.Allocator,
-            name_to_id: *const std.StringHashMapUnmanaged(ir.FunctionId),
-            edges: *std.ArrayListUnmanaged(CallEdge),
-            err: ?error{OutOfMemory} = null,
-            fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
-                if (self_ctx.err != null) return;
-                walkStreamForCallees(self_ctx.allocator, child.stream, self_ctx.name_to_id, self_ctx.edges) catch |e| {
-                    self_ctx.err = e;
-                };
+                    }) catch |err| {
+                        self.err = err;
+                    };
+                },
+                .try_call_named => |tcn| {
+                    if (self.name_to_id.get(tcn.name)) |target| {
+                        self.edges.append(self.allocator, .{
+                            .callee = target,
+                            .args = tcn.args,
+                            .is_tail_call = false,
+                        }) catch |err| {
+                            self.err = err;
+                        };
+                    }
+                },
+                .tail_call => |tc| {
+                    if (self.name_to_id.get(tc.name)) |target| {
+                        self.edges.append(self.allocator, .{
+                            .callee = target,
+                            .args = tc.args,
+                            .is_tail_call = true,
+                        }) catch |err| {
+                            self.err = err;
+                        };
+                    }
+                },
+                else => {},
             }
-        };
-        var ctx = Ctx{ .allocator = allocator, .name_to_id = name_to_id, .edges = edges };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
-    }
+        }
+    };
+
+    var collector = Collector{
+        .allocator = allocator,
+        .name_to_id = name_to_id,
+        .edges = edges,
+    };
+    try ir.forEachInstructionInStream(allocator, stream, &collector, Collector.visit);
+    if (collector.err) |err| return err;
 }
 
 // ============================================================
@@ -707,7 +711,7 @@ fn analyzeFunctionBody(
         // observes a wider tuple than we pre-allocated, fall back to
         // a fresh allocation in the signatures arena.
         const arena_alloc_local = signatures.arena.allocator();
-        const new_components = arena_alloc_local.alloc(?u8, walker.observed_return_components.items.len) catch return;
+        const new_components = try arena_alloc_local.alloc(?u8, walker.observed_return_components.items.len);
         for (new_components, 0..) |*slot, i| slot.* = if (i < sig_entry.return_components.len) sig_entry.return_components[i] else null;
         sig_entry.return_components = new_components;
     }
@@ -758,11 +762,15 @@ fn analyzeFunctionBody(
 const ParamGetSeeder = struct {
     carrier_of: *std.AutoHashMapUnmanaged(ir.LocalId, u32),
     allocator: std.mem.Allocator,
+    err: ?std.mem.Allocator.Error = null,
 
     fn visit(self: *ParamGetSeeder, instr: *const ir.Instruction) void {
+        if (self.err != null) return;
         switch (instr.*) {
             .param_get => |pg| {
-                self.carrier_of.put(self.allocator, pg.dest, pg.index) catch {};
+                self.carrier_of.put(self.allocator, pg.dest, pg.index) catch |err| {
+                    self.err = err;
+                };
             },
             else => {},
         }
@@ -773,7 +781,8 @@ fn seedParamGets(
     function: *const ir.Function,
     visitor: *ParamGetSeeder,
 ) !void {
-    ir.forEachInstruction(function, visitor, ParamGetSeeder.visit);
+    try ir.forEachInstruction(visitor.allocator, function, visitor, ParamGetSeeder.visit);
+    if (visitor.err) |err| return err;
 }
 
 /// A `tuple_init` deferred record. One entry per component of a
@@ -827,20 +836,100 @@ const FlowWalker = struct {
         self.observed_return_components.deinit(self.allocator);
     }
 
+    const WalkStreamFrame = struct {
+        stream: []const ir.Instruction,
+        next_index: usize = 0,
+    };
+
+    const MergeArmResultAction = struct {
+        dest: ir.LocalId,
+        result: ir.LocalId,
+    };
+
+    const WalkFrame = union(enum) {
+        stream: WalkStreamFrame,
+        merge_arm_result: MergeArmResultAction,
+        classify_return: ir.LocalId,
+    };
+
     fn walkStream(
         self: *FlowWalker,
         stream: []const ir.Instruction,
     ) error{OutOfMemory}!void {
-        for (stream) |*instr| {
-            const id = self.next_instr_id;
-            self.next_instr_id += 1;
-            try self.classifyAndPropagate(instr, id);
-            try self.walkChildren(instr);
+        if (stream.len == 0) return;
+
+        var stack: std.ArrayListUnmanaged(WalkFrame) = .empty;
+        defer stack.deinit(self.allocator);
+        try self.pushStreamFrame(&stack, stream);
+
+        while (stack.items.len != 0) {
+            const frame = &stack.items[stack.items.len - 1];
+            switch (frame.*) {
+                .stream => {
+                    const stream_frame = &frame.stream;
+                    if (stream_frame.next_index >= stream_frame.stream.len) {
+                        _ = stack.pop().?;
+                        continue;
+                    }
+
+                    const instr = &stream_frame.stream[stream_frame.next_index];
+                    stream_frame.next_index += 1;
+
+                    const id = self.next_instr_id;
+                    self.next_instr_id += 1;
+                    try self.classifyAndPropagate(instr, id);
+                    try self.pushChildren(&stack, instr);
+                },
+                .merge_arm_result => {
+                    const action = frame.merge_arm_result;
+                    _ = stack.pop().?;
+                    try self.mergeArmResultIntoDest(action.dest, action.result);
+                },
+                .classify_return => {
+                    const value = frame.classify_return;
+                    _ = stack.pop().?;
+                    try self.classifyReturnValue(value);
+                },
+            }
         }
     }
 
-    fn walkChildren(
+    fn pushStreamFrame(
         self: *FlowWalker,
+        stack: *std.ArrayListUnmanaged(WalkFrame),
+        stream: []const ir.Instruction,
+    ) error{OutOfMemory}!void {
+        if (stream.len == 0) return;
+        try stack.append(self.allocator, .{ .stream = .{ .stream = stream } });
+    }
+
+    fn pushMergeArmResultFrame(
+        self: *FlowWalker,
+        stack: *std.ArrayListUnmanaged(WalkFrame),
+        dest: ir.LocalId,
+        result: ?ir.LocalId,
+    ) error{OutOfMemory}!void {
+        if (result) |value| {
+            try stack.append(self.allocator, .{ .merge_arm_result = .{
+                .dest = dest,
+                .result = value,
+            } });
+        }
+    }
+
+    fn pushClassifyReturnFrame(
+        self: *FlowWalker,
+        stack: *std.ArrayListUnmanaged(WalkFrame),
+        value: ?ir.LocalId,
+    ) error{OutOfMemory}!void {
+        if (value) |return_value| {
+            try stack.append(self.allocator, .{ .classify_return = return_value });
+        }
+    }
+
+    fn pushChildren(
+        self: *FlowWalker,
+        stack: *std.ArrayListUnmanaged(WalkFrame),
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!void {
         switch (instr.*) {
@@ -855,28 +944,34 @@ const FlowWalker = struct {
             // (possibly demoted) per-component witness.
             // -----------------------------------------------------
             .if_expr => |ie| {
-                try self.walkStream(ie.then_instrs);
-                if (ie.then_result) |tr| try self.mergeArmResultIntoDest(ie.dest, tr);
-                try self.walkStream(ie.else_instrs);
-                if (ie.else_result) |er| try self.mergeArmResultIntoDest(ie.dest, er);
+                try self.pushMergeArmResultFrame(stack, ie.dest, ie.else_result);
+                try self.pushStreamFrame(stack, ie.else_instrs);
+                try self.pushMergeArmResultFrame(stack, ie.dest, ie.then_result);
+                try self.pushStreamFrame(stack, ie.then_instrs);
             },
             .case_block => |cb| {
-                try self.walkStream(cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    try self.walkStream(arm.cond_instrs);
-                    try self.walkStream(arm.body_instrs);
-                    if (arm.result) |ar| try self.mergeArmResultIntoDest(cb.dest, ar);
+                try self.pushMergeArmResultFrame(stack, cb.dest, cb.default_result);
+                try self.pushStreamFrame(stack, cb.default_instrs);
+                var arm_index = cb.arms.len;
+                while (arm_index > 0) {
+                    arm_index -= 1;
+                    const arm = cb.arms[arm_index];
+                    try self.pushMergeArmResultFrame(stack, cb.dest, arm.result);
+                    try self.pushStreamFrame(stack, arm.body_instrs);
+                    try self.pushStreamFrame(stack, arm.cond_instrs);
                 }
-                try self.walkStream(cb.default_instrs);
-                if (cb.default_result) |dr| try self.mergeArmResultIntoDest(cb.dest, dr);
+                try self.pushStreamFrame(stack, cb.pre_instrs);
             },
             .switch_literal => |sl| {
-                for (sl.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    if (c.result) |r| try self.mergeArmResultIntoDest(sl.dest, r);
+                try self.pushMergeArmResultFrame(stack, sl.dest, sl.default_result);
+                try self.pushStreamFrame(stack, sl.default_instrs);
+                var case_index = sl.cases.len;
+                while (case_index > 0) {
+                    case_index -= 1;
+                    const case = sl.cases[case_index];
+                    try self.pushMergeArmResultFrame(stack, sl.dest, case.result);
+                    try self.pushStreamFrame(stack, case.body_instrs);
                 }
-                try self.walkStream(sl.default_instrs);
-                if (sl.default_result) |dr| try self.mergeArmResultIntoDest(sl.dest, dr);
             },
             // -----------------------------------------------------
             // Phase 2.6.1 — `switch_return` / `union_switch_return` /
@@ -893,48 +988,57 @@ const FlowWalker = struct {
             // tuple to the uniqueness site.
             // -----------------------------------------------------
             .switch_return => |sr| {
-                for (sr.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    if (c.return_value) |rv| try self.classifyReturnValue(rv);
+                try self.pushClassifyReturnFrame(stack, sr.default_result);
+                try self.pushStreamFrame(stack, sr.default_instrs);
+                var case_index = sr.cases.len;
+                while (case_index > 0) {
+                    case_index -= 1;
+                    const case = sr.cases[case_index];
+                    try self.pushClassifyReturnFrame(stack, case.return_value);
+                    try self.pushStreamFrame(stack, case.body_instrs);
                 }
-                try self.walkStream(sr.default_instrs);
-                if (sr.default_result) |dr| try self.classifyReturnValue(dr);
             },
             .union_switch => |us| {
-                for (us.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    if (c.return_value) |rv| try self.mergeArmResultIntoDest(us.dest, rv);
-                }
                 // The catch-all `_` prong merges its result into the
                 // union_switch's dest exactly like a case arm; walking it
                 // also keeps the id space aligned and lets its tuple_pending
                 // witnesses participate in the arm merge. See audit finding
                 // uniqueness--01.
                 if (us.has_else) {
-                    try self.walkStream(us.else_instrs);
-                    if (us.else_result) |er| try self.mergeArmResultIntoDest(us.dest, er);
+                    try self.pushMergeArmResultFrame(stack, us.dest, us.else_result);
+                    try self.pushStreamFrame(stack, us.else_instrs);
+                }
+                var case_index = us.cases.len;
+                while (case_index > 0) {
+                    case_index -= 1;
+                    const case = us.cases[case_index];
+                    try self.pushMergeArmResultFrame(stack, us.dest, case.return_value);
+                    try self.pushStreamFrame(stack, case.body_instrs);
                 }
             },
             .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    if (c.return_value) |rv| try self.classifyReturnValue(rv);
+                var case_index = usr.cases.len;
+                while (case_index > 0) {
+                    case_index -= 1;
+                    const case = usr.cases[case_index];
+                    try self.pushClassifyReturnFrame(stack, case.return_value);
+                    try self.pushStreamFrame(stack, case.body_instrs);
                 }
             },
             .try_call_named => |tcn| {
-                try self.walkStream(tcn.handler_instrs);
-                if (tcn.handler_result) |hr| try self.mergeArmResultIntoDest(tcn.dest, hr);
-                try self.walkStream(tcn.success_instrs);
-                if (tcn.success_result) |sr_local| try self.mergeArmResultIntoDest(tcn.dest, sr_local);
+                try self.pushMergeArmResultFrame(stack, tcn.dest, tcn.success_result);
+                try self.pushStreamFrame(stack, tcn.success_instrs);
+                try self.pushMergeArmResultFrame(stack, tcn.dest, tcn.handler_result);
+                try self.pushStreamFrame(stack, tcn.handler_instrs);
             },
             .guard_block => |gb| {
-                try self.walkStream(gb.body);
+                try self.pushStreamFrame(stack, gb.body);
             },
             .optional_dispatch => |od| {
-                try self.walkStream(od.nil_instrs);
-                if (od.nil_result) |nr| try self.classifyReturnValue(nr);
-                try self.walkStream(od.struct_instrs);
-                if (od.struct_result) |sr_local| try self.classifyReturnValue(sr_local);
+                try self.pushClassifyReturnFrame(stack, od.struct_result);
+                try self.pushStreamFrame(stack, od.struct_instrs);
+                try self.pushClassifyReturnFrame(stack, od.nil_result);
+                try self.pushStreamFrame(stack, od.nil_instrs);
             },
             else => {},
         }
@@ -1004,7 +1108,7 @@ const FlowWalker = struct {
             } else {
                 // First arm to contribute — install the arm's slice
                 // directly under dest.
-                try self.tuple_pending.put(self.allocator, dest, arm_components);
+                self.tuple_pending.putAssumeCapacity(dest, arm_components);
             }
         } else if (self.tuple_pending.fetchRemove(dest)) |existing| {
             // This arm contributes NO pending entry, but a previous arm
@@ -1307,6 +1411,24 @@ const FlowWalker = struct {
         }
     }
 
+    /// Install a freshly-owned tuple component table under `dest`.
+    /// If `dest` already has a pending entry, the old table is freed
+    /// only after any allocation needed for a new map slot has
+    /// succeeded. On error, the caller still owns `components`.
+    fn putTuplePendingOwned(
+        self: *FlowWalker,
+        dest: ir.LocalId,
+        components: []TupleComponent,
+    ) !void {
+        if (!self.tuple_pending.contains(dest)) {
+            try self.tuple_pending.ensureUnusedCapacity(self.allocator, 1);
+        }
+        if (self.tuple_pending.fetchRemove(dest)) |existing| {
+            self.allocator.free(existing.value);
+        }
+        self.tuple_pending.putAssumeCapacity(dest, components);
+    }
+
     /// Phase 2.1 — propagate a `tuple_pending` membership through an
     /// alias-form instruction. When `source` is a tuple_pending dest,
     /// the alias's `dest` becomes a new tuple_pending entry pointing
@@ -1330,7 +1452,7 @@ const FlowWalker = struct {
         if (self.tuple_pending.fetchRemove(dest)) |existing| {
             self.allocator.free(existing.value);
         }
-        try self.tuple_pending.put(self.allocator, dest, entry.value);
+        self.tuple_pending.putAssumeCapacity(dest, entry.value);
     }
 
     /// Phase 2.1 — record a fresh `tuple_init` deferral. Builds a
@@ -1348,17 +1470,9 @@ const FlowWalker = struct {
         dest: ir.LocalId,
         elements: []const ir.LocalId,
     ) !void {
-        // Allocate the component table eagerly. If allocation fails
-        // we fall back to the legacy AL-per-element behaviour for the
-        // current tuple_init, preserving correctness under OOM.
-        const components = self.allocator.alloc(TupleComponent, elements.len) catch {
-            for (elements) |elem| {
-                if (self.carrier_of.get(elem)) |slot| {
-                    try self.upgradeParam(slot, ParamSig.aliasesOut());
-                }
-            }
-            return;
-        };
+        const components = try self.allocator.alloc(TupleComponent, elements.len);
+        var components_owned_by_map = false;
+        errdefer if (!components_owned_by_map) self.allocator.free(components);
         for (components, elements) |*comp, elem| {
             comp.* = .{ .slot = self.carrier_of.get(elem) };
             // Nested tuple — flatten by AL'ing the nested carriers
@@ -1370,11 +1484,10 @@ const FlowWalker = struct {
             try self.resolveTuplePendingAsAL(elem);
         }
         // If `dest` already has a pending entry (e.g. overwritten by a
-        // re-binding through `local_set`), free the old slice first.
-        if (self.tuple_pending.fetchRemove(dest)) |existing| {
-            self.allocator.free(existing.value);
-        }
-        try self.tuple_pending.put(self.allocator, dest, components);
+        // re-binding through `local_set`), replace it after any map
+        // growth has succeeded.
+        try self.putTuplePendingOwned(dest, components);
+        components_owned_by_map = true;
     }
 
     /// Phase 2.1 — resolve a deferred tuple-construction record as AL.
@@ -1418,16 +1531,24 @@ const FlowWalker = struct {
             }
             for (entry.value, 0..) |comp, idx| {
                 if (comp.slot) |slot| {
-                    try self.upgradeParam(slot, ParamSig.preservesUniqueness(@intCast(idx)));
+                    if (std.math.cast(u8, idx)) |component_witness| {
+                        try self.upgradeParam(slot, ParamSig.preservesUniqueness(component_witness));
+                    } else {
+                        try self.upgradeParam(slot, ParamSig.unknown());
+                    }
                     // Record the per-component witness for this
                     // observed return. The merge phase later joins
                     // across all observations and stores the meet on
                     // the signature's `return_components` slice.
                     if (idx < self.observed_return_components.items.len) {
+                        const slot_witness = std.math.cast(u8, slot) orelse {
+                            self.observed_return_components.items[idx] = null;
+                            continue;
+                        };
                         const existing = self.observed_return_components.items[idx];
                         const merged: ?u8 = if (existing == null)
-                            @as(?u8, @intCast(slot))
-                        else if (existing.? == @as(u8, @intCast(slot)))
+                            @as(?u8, slot_witness)
+                        else if (existing.? == slot_witness)
                             existing
                         else
                             null;
@@ -1726,24 +1847,22 @@ const FlowWalker = struct {
                 }
             }
             if (has_per_component_witness) {
-                const components = self.allocator.alloc(TupleComponent, callee_sig.return_components.len) catch null;
-                if (components) |comps| {
-                    for (comps, callee_sig.return_components) |*comp, witness_opt| {
-                        comp.* = .{ .slot = null };
-                        if (witness_opt) |arg_idx_u8| {
-                            const arg_idx_in: usize = @intCast(arg_idx_u8);
-                            if (arg_idx_in < args.len) {
-                                if (self.carrier_of.get(args[arg_idx_in])) |slot| {
-                                    comp.slot = slot;
-                                }
+                const components = try self.allocator.alloc(TupleComponent, callee_sig.return_components.len);
+                var components_owned_by_map = false;
+                errdefer if (!components_owned_by_map) self.allocator.free(components);
+                for (components, callee_sig.return_components) |*comp, witness_opt| {
+                    comp.* = .{ .slot = null };
+                    if (witness_opt) |arg_idx_u8| {
+                        const arg_idx_in: usize = @intCast(arg_idx_u8);
+                        if (arg_idx_in < args.len) {
+                            if (self.carrier_of.get(args[arg_idx_in])) |slot| {
+                                comp.slot = slot;
                             }
                         }
                     }
-                    if (self.tuple_pending.fetchRemove(dest)) |existing| {
-                        self.allocator.free(existing.value);
-                    }
-                    self.tuple_pending.put(self.allocator, dest, comps) catch self.allocator.free(comps);
                 }
+                try self.putTuplePendingOwned(dest, components);
+                components_owned_by_map = true;
             }
 
             if (preserves_carrier_from_arg) |arg_idx| {
@@ -1809,6 +1928,298 @@ fn buildTestFunction(
         .local_ownership = ownership,
         .result_convention = result_convention,
     };
+}
+
+fn buildNestedGuardStream(
+    arena: std.mem.Allocator,
+    depth: usize,
+    leaf: ir.Instruction,
+) ![]const ir.Instruction {
+    var stream = try arena.dupe(ir.Instruction, &[_]ir.Instruction{leaf});
+    for (0..depth) |_| {
+        const wrapper = try arena.alloc(ir.Instruction, 1);
+        wrapper[0] = .{ .guard_block = .{
+            .condition = 0,
+            .body = stream,
+        } };
+        stream = wrapper;
+    }
+    return stream;
+}
+
+test "uniqueness_fixpoint: call graph walker traverses deep child streams iteratively" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const stream = try buildNestedGuardStream(arena, 256, .{ .call_direct = .{
+        .dest = 0,
+        .function = 42,
+        .args = &.{},
+        .arg_modes = &.{},
+    } });
+
+    var name_to_id: std.StringHashMapUnmanaged(ir.FunctionId) = .empty;
+    defer name_to_id.deinit(testing.allocator);
+
+    var edges: std.ArrayListUnmanaged(CallEdge) = .empty;
+    defer edges.deinit(testing.allocator);
+
+    try walkStreamForCallees(testing.allocator, stream, &name_to_id, &edges);
+    try testing.expectEqual(@as(usize, 1), edges.items.len);
+    try testing.expectEqual(@as(ir.FunctionId, 42), edges.items[0].callee);
+    try testing.expect(!edges.items[0].is_tail_call);
+}
+
+test "uniqueness_fixpoint: call graph walker propagates explicit-stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const stream = try buildNestedGuardStream(arena, 96, .{ .const_bool = .{
+        .dest = 0,
+        .value = true,
+    } });
+
+    var name_to_id: std.StringHashMapUnmanaged(ir.FunctionId) = .empty;
+    defer name_to_id.deinit(testing.allocator);
+
+    var edges: std.ArrayListUnmanaged(CallEdge) = .empty;
+    defer edges.deinit(testing.allocator);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        walkStreamForCallees(failing_allocator.allocator(), stream, &name_to_id, &edges),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "uniqueness_fixpoint: FlowWalker preserves empty-arm merge actions iteratively" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .const_bool = .{ .dest = 1, .value = true } },
+        .{ .if_expr = .{
+            .dest = 2,
+            .condition = 1,
+            .then_instrs = &.{},
+            .then_result = 0,
+            .else_instrs = &.{},
+            .else_result = 0,
+        } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    var function = try buildTestFunction(arena, "empty_arm_merge", &instrs, 3, &.{.owned}, .owned);
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[0].class);
+}
+
+test "uniqueness_fixpoint: FlowWalker propagates explicit-stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const stream = try buildNestedGuardStream(arena, 96, .{ .ret = .{ .value = null } });
+    var function = try buildTestFunction(arena, "deep_flow_stack", stream, 1, &.{}, .trivial);
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var name_to_id: std.StringHashMapUnmanaged(ir.FunctionId) = .empty;
+    defer name_to_id.deinit(testing.allocator);
+
+    var signatures = ProgramSignatures.init(testing.allocator);
+    defer signatures.deinit(testing.allocator);
+
+    var accumulators: std.ArrayListUnmanaged(ParamAccumulator) = .empty;
+    defer accumulators.deinit(testing.allocator);
+
+    var carrier_of: std.AutoHashMapUnmanaged(ir.LocalId, u32) = .empty;
+    defer carrier_of.deinit(testing.allocator);
+
+    var tuple_pending: std.AutoHashMapUnmanaged(ir.LocalId, []TupleComponent) = .empty;
+    defer tuple_pending.deinit(testing.allocator);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var walker = FlowWalker{
+        .allocator = failing_allocator.allocator(),
+        .program = &program,
+        .name_to_id = &name_to_id,
+        .function = &functions[0],
+        .signatures = &signatures,
+        .accumulators = &accumulators,
+        .carrier_of = &carrier_of,
+        .tuple_pending = &tuple_pending,
+    };
+    defer walker.deinit();
+
+    try testing.expectError(error.OutOfMemory, walker.walkStream(functions[0].body[0].instructions));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "uniqueness_fixpoint: param_get seed insertion propagates OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+    };
+    const function = try buildTestFunction(arena, "seed_oom", &instrs, 1, &.{.owned}, .owned);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing_allocator.allocator();
+
+    var carrier_of: std.AutoHashMapUnmanaged(ir.LocalId, u32) = .empty;
+    defer carrier_of.deinit(failing_alloc);
+
+    var visitor = ParamGetSeeder{ .carrier_of = &carrier_of, .allocator = failing_alloc };
+    try testing.expectError(error.OutOfMemory, seedParamGets(&function, &visitor));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), carrier_of.count());
+}
+
+test "uniqueness_fixpoint: return-component expansion propagates OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const component_count = 512;
+    const tuple_elems = try arena.alloc(ir.LocalId, component_count);
+    for (tuple_elems) |*elem| elem.* = 0;
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var function = try buildTestFunction(arena, "return_component_oom", &instrs, 2, &.{.owned}, .owned);
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var signatures = ProgramSignatures.init(failing_alloc);
+    defer signatures.deinit(testing.allocator);
+
+    const arena_alloc = signatures.arena.allocator();
+    const params = try arena_alloc.alloc(ParamSig, 1);
+    params[0] = ParamSig.initial();
+    const return_components = try arena_alloc.alloc(?u8, 1);
+    return_components[0] = null;
+    try signatures.by_function.put(testing.allocator, 0, .{
+        .params = params,
+        .return_components = return_components,
+    });
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    var name_to_id: std.StringHashMapUnmanaged(ir.FunctionId) = .empty;
+    defer name_to_id.deinit(testing.allocator);
+
+    var changed = false;
+    try testing.expectError(error.OutOfMemory, analyzeFunctionBody(
+        testing.allocator,
+        &program,
+        &name_to_id,
+        &function,
+        &signatures,
+        null,
+        &changed,
+    ));
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+fn expectSynthesizedTupleWitnessOutOfMemory(fail_index: usize) !void {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const callee_instrs = [_]ir.Instruction{
+        .{ .ret = .{ .value = null } },
+    };
+    var callee = try buildTestFunction(arena, "tuple_callee", &callee_instrs, 1, &.{.owned}, .owned);
+    callee.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = callee;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var signatures = ProgramSignatures.init(testing.allocator);
+    defer signatures.deinit(testing.allocator);
+    const sig_arena = signatures.arena.allocator();
+    const params = try sig_arena.alloc(ParamSig, 1);
+    params[0] = ParamSig.preservesUniqueness(0);
+    const return_components = try sig_arena.alloc(?u8, 1);
+    return_components[0] = 0;
+    try signatures.by_function.put(testing.allocator, 0, .{
+        .params = params,
+        .return_components = return_components,
+    });
+
+    var accumulators: std.ArrayListUnmanaged(ParamAccumulator) = .empty;
+    defer accumulators.deinit(testing.allocator);
+    try accumulators.resize(testing.allocator, 1);
+    accumulators.items[0] = .{};
+
+    var carrier_of: std.AutoHashMapUnmanaged(ir.LocalId, u32) = .empty;
+    defer carrier_of.deinit(testing.allocator);
+    try carrier_of.put(testing.allocator, 10, 0);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+    const failing_alloc = failing_allocator.allocator();
+
+    var tuple_pending: std.AutoHashMapUnmanaged(ir.LocalId, []TupleComponent) = .empty;
+    defer {
+        var value_iter = tuple_pending.valueIterator();
+        while (value_iter.next()) |components| failing_alloc.free(components.*);
+        tuple_pending.deinit(failing_alloc);
+    }
+
+    var name_to_id: std.StringHashMapUnmanaged(ir.FunctionId) = .empty;
+    defer name_to_id.deinit(testing.allocator);
+
+    var walker = FlowWalker{
+        .allocator = failing_alloc,
+        .program = &program,
+        .name_to_id = &name_to_id,
+        .function = &functions[0],
+        .signatures = &signatures,
+        .accumulators = &accumulators,
+        .carrier_of = &carrier_of,
+        .tuple_pending = &tuple_pending,
+    };
+    defer walker.deinit();
+
+    const args = [_]ir.LocalId{10};
+    try testing.expectError(error.OutOfMemory, walker.classifyCallToFunction(0, &args, 20, false));
+    try testing.expect(failing_allocator.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), tuple_pending.count());
+}
+
+test "uniqueness_fixpoint: synthesized tuple-return witness allocation propagates OOM" {
+    try expectSynthesizedTupleWitnessOutOfMemory(0);
+}
+
+test "uniqueness_fixpoint: synthesized tuple-return witness insert propagates OOM" {
+    try expectSynthesizedTupleWitnessOutOfMemory(1);
 }
 
 test "uniqueness_fixpoint: empty program produces empty signatures" {
@@ -2273,6 +2684,149 @@ test "uniqueness_fixpoint: tuple-return mixed components classify each carrier a
     try testing.expectEqual(@as(?u8, null), sig.return_components[2]);
 }
 
+test "uniqueness_fixpoint: tuple-return witness from callee survives call destructuring" {
+    // Callee returns `{p, q}` and records return_components=[0, 1].
+    // Caller receives that tuple through a call, projects each
+    // component, and returns `{left, right}`. The synthesized
+    // tuple_pending entry on the call dest must let `index_get`
+    // recover the original caller parameter carriers.
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const callee_tuple_elems = try arena.alloc(ir.LocalId, 2);
+    callee_tuple_elems[0] = 0;
+    callee_tuple_elems[1] = 1;
+    const callee_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .tuple_init = .{ .dest = 2, .elements = callee_tuple_elems } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    var callee = try buildTestFunction(
+        arena,
+        "pair",
+        &callee_instrs,
+        3,
+        &[_]ir.ParamConvention{ .owned, .owned },
+        .owned,
+    );
+    callee.id = 0;
+
+    const caller_args = try arena.alloc(ir.LocalId, 2);
+    caller_args[0] = 0;
+    caller_args[1] = 1;
+    const caller_arg_modes = try arena.alloc(ir.ValueMode, 2);
+    caller_arg_modes[0] = .move;
+    caller_arg_modes[1] = .move;
+    const caller_tuple_elems = try arena.alloc(ir.LocalId, 2);
+    caller_tuple_elems[0] = 3;
+    caller_tuple_elems[1] = 4;
+    const caller_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .call_direct = .{
+            .dest = 2,
+            .function = 0,
+            .args = caller_args,
+            .arg_modes = caller_arg_modes,
+        } },
+        .{ .index_get = .{ .dest = 3, .object = 2, .index = 0 } },
+        .{ .index_get = .{ .dest = 4, .object = 2, .index = 1 } },
+        .{ .tuple_init = .{ .dest = 5, .elements = caller_tuple_elems } },
+        .{ .ret = .{ .value = 5 } },
+    };
+    var caller = try buildTestFunction(
+        arena,
+        "repack_pair",
+        &caller_instrs,
+        6,
+        &[_]ir.ParamConvention{ .owned, .owned },
+        .owned,
+    );
+    caller.id = 1;
+
+    const functions = try arena.alloc(ir.Function, 2);
+    functions[0] = callee;
+    functions[1] = caller;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const caller_sig = sigs.forFunction(1).?;
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, caller_sig.params[0].class);
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, caller_sig.params[1].class);
+    try testing.expect(caller_sig.return_components.len >= 2);
+    try testing.expectEqual(@as(?u8, 0), caller_sig.return_components[0]);
+    try testing.expectEqual(@as(?u8, 1), caller_sig.return_components[1]);
+}
+
+test "uniqueness_fixpoint: tuple component index above u8 range is conservative" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const component_count = 257;
+    const tuple_elems = try arena.alloc(ir.LocalId, component_count);
+    for (tuple_elems) |*elem| elem.* = 10;
+    tuple_elems[256] = 0;
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var function = try buildTestFunction(arena, "wide_tuple_component", &instrs, 300, &.{.owned}, .owned);
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    try testing.expectEqual(UniquenessClass.top, sig.params[0].class);
+    try testing.expect(sig.return_components.len >= component_count);
+    try testing.expectEqual(@as(?u8, 0), sig.return_components[256]);
+}
+
+test "uniqueness_fixpoint: parameter slot above u8 range leaves component witness empty" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const param_count = 257;
+    const param_conventions = try arena.alloc(ir.ParamConvention, param_count);
+    for (param_conventions) |*convention| convention.* = .owned;
+
+    const tuple_elems = try arena.alloc(ir.LocalId, 1);
+    tuple_elems[0] = 0;
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 256 } },
+        .{ .tuple_init = .{ .dest = 1, .elements = tuple_elems } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var function = try buildTestFunction(arena, "wide_param_slot", &instrs, 2, param_conventions, .owned);
+    function.id = 0;
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = function;
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var sigs = try computeSignatures(testing.allocator, &program);
+    defer sigs.deinit(testing.allocator);
+
+    const sig = sigs.forFunction(0).?;
+    try testing.expectEqual(UniquenessClass.preserves_uniqueness, sig.params[256].class);
+    try testing.expectEqual(@as(?u8, 0), sig.params[256].preserves_to_return_component);
+    try testing.expect(sig.return_components.len >= 1);
+    try testing.expectEqual(@as(?u8, null), sig.return_components[0]);
+}
+
 test "uniqueness_fixpoint: multi-arm merge demotes tuple_pending witness when one arm omits it (uniqueness--06)" {
     // Regression for audit finding uniqueness--06: a `tuple_pending`
     // witness present in only ONE arm of a multi-arm construct must NOT
@@ -2309,14 +2863,16 @@ test "uniqueness_fixpoint: multi-arm merge demotes tuple_pending witness when on
         .{ .param_get = .{ .dest = 1, .index = 1 } }, // q
         .{ .param_get = .{ .dest = 2, .index = 2 } }, // fallback (tuple param, no pending)
         .{ .const_bool = .{ .dest = 3, .value = true } }, // condition
-        .{ .if_expr = .{
-            .dest = 4,
-            .condition = 3,
-            .then_instrs = then_instrs,
-            .then_result = 5,
-            .else_instrs = &.{},
-            .else_result = 2, // else arm yields `fallback` — no witness
-        } },
+        .{
+            .if_expr = .{
+                .dest = 4,
+                .condition = 3,
+                .then_instrs = then_instrs,
+                .then_result = 5,
+                .else_instrs = &.{},
+                .else_result = 2, // else arm yields `fallback` — no witness
+            },
+        },
         .{ .ret = .{ .value = 4 } },
     };
     var function = try buildTestFunction(

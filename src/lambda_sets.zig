@@ -2,6 +2,9 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const lattice = @import("escape_lattice.zig");
 
+const DEFAULT_LAMBDA_FIXPOINT_ITERATION_BUDGET: usize = 100_000;
+const DEFAULT_ZIG_TYPE_CLOSURE_WALK_BUDGET: usize = 65_536;
+
 // ============================================================
 // Lambda Set Specialization (Research Plan Phase 6)
 //
@@ -187,6 +190,11 @@ const WorkItem = struct {
     local: ir.LocalId,
 };
 
+const InstructionStreamFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+};
+
 // ============================================================
 // LambdaSetAnalyzer
 // ============================================================
@@ -212,6 +220,7 @@ pub const LambdaSetAnalyzer = struct {
 
     /// Worklist for fixpoint iteration.
     worklist: std.ArrayList(WorkItem),
+    fixpoint_iteration_budget: usize = DEFAULT_LAMBDA_FIXPOINT_ITERATION_BUDGET,
 
     /// Tracks which (function, local) pairs are already on the worklist.
     on_worklist: std.AutoHashMap(lattice.ValueKey, void),
@@ -325,18 +334,68 @@ pub const LambdaSetAnalyzer = struct {
     fn seedAndCollectUsage(self: *LambdaSetAnalyzer) !void {
         for (self.program.functions) |func| {
             for (func.body) |block| {
-                for (block.instructions) |instr| {
-                    try self.seedInstruction(func.id, instr);
-                }
+                try self.seedInstructionStream(func.id, block.instructions);
             }
         }
         // Second pass: register all call-site return edges so return
         // propagation can find callers during fixpoint iteration.
         for (self.program.functions) |func| {
             for (func.body) |block| {
-                for (block.instructions) |instr| {
-                    try self.registerCallReturnSites(func.id, instr);
-                }
+                try self.registerCallReturnSitesInStream(func.id, block.instructions);
+            }
+        }
+    }
+
+    fn seedInstructionStream(self: *LambdaSetAnalyzer, func_id: ir.FunctionId, instructions: []const ir.Instruction) !void {
+        var stack: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, instructions);
+
+        const ChildCollector = struct {
+            allocator: std.mem.Allocator,
+            stack: *std.ArrayListUnmanaged([]const ir.Instruction),
+            err: ?anyerror = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                ctx.stack.append(ctx.allocator, child.stream) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        while (stack.pop()) |stream| {
+            for (stream) |instr| {
+                try self.seedInstruction(func_id, instr);
+                var child_collector = ChildCollector{ .allocator = self.allocator, .stack = &stack };
+                ir.forEachChildStream(&instr, &child_collector, ChildCollector.onStream);
+                if (child_collector.err) |err| return err;
+            }
+        }
+    }
+
+    fn registerCallReturnSitesInStream(self: *LambdaSetAnalyzer, func_id: ir.FunctionId, instructions: []const ir.Instruction) !void {
+        var stack: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, instructions);
+
+        const ChildCollector = struct {
+            allocator: std.mem.Allocator,
+            stack: *std.ArrayListUnmanaged([]const ir.Instruction),
+            err: ?anyerror = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                ctx.stack.append(ctx.allocator, child.stream) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        while (stack.pop()) |stream| {
+            for (stream) |instr| {
+                try self.registerCallReturnSites(func_id, instr);
+                var child_collector = ChildCollector{ .allocator = self.allocator, .stack = &stack };
+                ir.forEachChildStream(&instr, &child_collector, ChildCollector.onStream);
+                if (child_collector.err) |err| return err;
             }
         }
     }
@@ -356,90 +415,6 @@ pub const LambdaSetAnalyzer = struct {
                 // For call_closure, we register return sites lazily during
                 // propagation once we know which closures may be called.
                 _ = cc;
-            },
-            .if_expr => |ie| {
-                for (ie.then_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-                for (ie.else_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-            },
-            .case_block => |cb| {
-                for (cb.pre_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-                for (cb.arms) |arm| {
-                    for (arm.cond_instrs) |sub| {
-                        try self.registerCallReturnSites(func_id, sub);
-                    }
-                    for (arm.body_instrs) |sub| {
-                        try self.registerCallReturnSites(func_id, sub);
-                    }
-                }
-                for (cb.default_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-            },
-            .guard_block => |gb| {
-                for (gb.body) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.registerCallReturnSites(func_id, sub);
-                    }
-                }
-                for (sl.default_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.registerCallReturnSites(func_id, sub);
-                    }
-                }
-                for (sr.default_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.registerCallReturnSites(func_id, sub);
-                    }
-                }
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.registerCallReturnSites(func_id, sub);
-                    }
-                }
-                if (us.has_else) {
-                    for (us.else_instrs) |sub| {
-                        try self.registerCallReturnSites(func_id, sub);
-                    }
-                }
-            },
-            .try_call_named => |tcn| {
-                for (tcn.handler_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-                for (tcn.success_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-            },
-            .optional_dispatch => |od| {
-                for (od.nil_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
-                for (od.struct_instrs) |sub| {
-                    try self.registerCallReturnSites(func_id, sub);
-                }
             },
             else => {},
         }
@@ -489,74 +464,6 @@ pub const LambdaSetAnalyzer = struct {
                 // (because local_set is a write to a mutable binding)
                 try self.markClosuresEscaped(func_id, ls.value);
             },
-            .if_expr => |ie| {
-                for (ie.then_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-                for (ie.else_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-            },
-            .case_block => |cb| {
-                for (cb.pre_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-                for (cb.arms) |arm| {
-                    for (arm.cond_instrs) |sub| {
-                        try self.seedInstruction(func_id, sub);
-                    }
-                    for (arm.body_instrs) |sub| {
-                        try self.seedInstruction(func_id, sub);
-                    }
-                }
-                for (cb.default_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-            },
-            .guard_block => |gb| {
-                for (gb.body) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.seedInstruction(func_id, sub);
-                    }
-                }
-                for (sl.default_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.seedInstruction(func_id, sub);
-                    }
-                }
-                for (sr.default_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.seedInstruction(func_id, sub);
-                    }
-                }
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.seedInstruction(func_id, sub);
-                    }
-                }
-                if (us.has_else) {
-                    for (us.else_instrs) |sub| {
-                        try self.seedInstruction(func_id, sub);
-                    }
-                }
-            },
             .call_dispatch => |cd| {
                 // GAP-P2R-02 — a `call_dispatch` resolves at runtime to one of
                 // a clause group's member functions, any of which can RETURN a
@@ -591,24 +498,8 @@ pub const LambdaSetAnalyzer = struct {
                 for (cb.args) |arg| {
                     try self.markClosuresEscaped(func_id, arg);
                 }
-                if (zigTypeCanCarryClosure(cb.result_type)) {
+                if (try zigTypeCanCarryClosure(self.allocator, cb.result_type)) {
                     try self.markValueTop(func_id, cb.dest);
-                }
-            },
-            .try_call_named => |tcn| {
-                for (tcn.handler_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-                for (tcn.success_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-            },
-            .optional_dispatch => |od| {
-                for (od.nil_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
-                }
-                for (od.struct_instrs) |sub| {
-                    try self.seedInstruction(func_id, sub);
                 }
             },
             else => {},
@@ -653,8 +544,7 @@ pub const LambdaSetAnalyzer = struct {
 
         // Process worklist until empty
         var iterations: usize = 0;
-        const max_iterations: usize = 100_000; // safety bound
-        while (self.worklist.items.len > 0 and iterations < max_iterations) {
+        while (self.worklist.items.len > 0 and iterations < self.fixpoint_iteration_budget) {
             iterations += 1;
             const item = self.worklist.orderedRemove(0);
             const key = lattice.ValueKey{ .function = item.function, .local = item.local };
@@ -663,6 +553,10 @@ pub const LambdaSetAnalyzer = struct {
             // Propagate through all instructions in this function that use this local
             try self.propagateFromLocal(item.function, item.local);
         }
+
+        if (self.worklist.items.len > 0) {
+            return error.LambdaSetFixpointBudgetExceeded;
+        }
     }
 
     /// Propagate lambda set changes from a specific local through all instructions
@@ -670,21 +564,44 @@ pub const LambdaSetAnalyzer = struct {
     fn propagateFromLocal(self: *LambdaSetAnalyzer, func_id: ir.FunctionId, local: ir.LocalId) !void {
         const func = self.getFunction(func_id) orelse return;
         for (func.body) |block| {
-            for (block.instructions, 0..) |instr, instr_idx| {
-                try self.propagateInstruction(func_id, block.label, @intCast(instr_idx), instr, local);
+            try self.propagateInstructionStream(func_id, block.instructions, local);
+        }
+    }
+
+    fn propagateInstructionStream(
+        self: *LambdaSetAnalyzer,
+        func_id: ir.FunctionId,
+        instructions: []const ir.Instruction,
+        changed_local: ir.LocalId,
+    ) !void {
+        var stack: std.ArrayListUnmanaged(InstructionStreamFrame) = .empty;
+        defer stack.deinit(self.allocator);
+        var child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+        defer child_streams.deinit(self.allocator);
+
+        try stack.append(self.allocator, .{ .stream = instructions });
+        while (stack.items.len > 0) {
+            const frame_index = stack.items.len - 1;
+            if (stack.items[frame_index].next_index >= stack.items[frame_index].stream.len) {
+                _ = stack.pop();
+                continue;
             }
+
+            const instr_index = stack.items[frame_index].next_index;
+            stack.items[frame_index].next_index += 1;
+            const instr = &stack.items[frame_index].stream[instr_index];
+            try self.propagateInstruction(func_id, instr, changed_local);
+            try self.pushInstructionChildren(instr, &stack, &child_streams);
         }
     }
 
     fn propagateInstruction(
         self: *LambdaSetAnalyzer,
         func_id: ir.FunctionId,
-        block_label: ir.LabelId,
-        instr_index: u32,
-        instr: ir.Instruction,
+        instr: *const ir.Instruction,
         changed_local: ir.LocalId,
     ) !void {
-        switch (instr) {
+        switch (instr.*) {
             .local_get => |lg| {
                 // lambda_set[dest] |= lambda_set[source]
                 if (lg.source == changed_local) {
@@ -759,13 +676,6 @@ pub const LambdaSetAnalyzer = struct {
                 }
             },
             .if_expr => |ie| {
-                // Propagate through sub-instructions
-                for (ie.then_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                }
-                for (ie.else_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                }
                 // Propagate result locals to dest
                 if (ie.then_result) |tr| {
                     if (tr == changed_local) {
@@ -779,24 +689,12 @@ pub const LambdaSetAnalyzer = struct {
                 }
             },
             .case_block => |cb| {
-                for (cb.pre_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                }
                 for (cb.arms) |arm| {
-                    for (arm.cond_instrs, 0..) |sub, idx| {
-                        try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                    }
-                    for (arm.body_instrs, 0..) |sub, idx| {
-                        try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                    }
                     if (arm.result) |r| {
                         if (r == changed_local) {
                             try self.propagateUnion(func_id, cb.dest, func_id, r);
                         }
                     }
-                }
-                for (cb.default_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
                 }
                 if (cb.default_result) |dr| {
                     if (dr == changed_local) {
@@ -804,24 +702,13 @@ pub const LambdaSetAnalyzer = struct {
                     }
                 }
             },
-            .guard_block => |gb| {
-                for (gb.body, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                }
-            },
             .switch_literal => |sl| {
                 for (sl.cases) |c| {
-                    for (c.body_instrs, 0..) |sub, idx| {
-                        try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                    }
                     if (c.result) |r| {
                         if (r == changed_local) {
                             try self.propagateUnion(func_id, sl.dest, func_id, r);
                         }
                     }
-                }
-                for (sl.default_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
                 }
                 if (sl.default_result) |dr| {
                     if (dr == changed_local) {
@@ -831,17 +718,11 @@ pub const LambdaSetAnalyzer = struct {
             },
             .switch_return => |sr| {
                 for (sr.cases) |c| {
-                    for (c.body_instrs, 0..) |sub, idx| {
-                        try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                    }
                     if (c.return_value) |rv| {
                         if (rv == changed_local) {
                             try self.propagateReturn(func_id, rv);
                         }
                     }
-                }
-                for (sr.default_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
                 }
                 if (sr.default_result) |dr| {
                     if (dr == changed_local) {
@@ -851,9 +732,6 @@ pub const LambdaSetAnalyzer = struct {
             },
             .union_switch_return => |usr| {
                 for (usr.cases) |c| {
-                    for (c.body_instrs, 0..) |sub, idx| {
-                        try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                    }
                     if (c.return_value) |rv| {
                         if (rv == changed_local) {
                             try self.propagateReturn(func_id, rv);
@@ -861,37 +739,11 @@ pub const LambdaSetAnalyzer = struct {
                     }
                 }
             },
-            .union_switch => |us| {
-                for (us.cases) |c| {
-                    for (c.body_instrs, 0..) |sub, idx| {
-                        try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                    }
-                }
-                if (us.has_else) {
-                    for (us.else_instrs, 0..) |sub, idx| {
-                        try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                    }
-                }
-            },
-            .try_call_named => |tcn| {
-                for (tcn.handler_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                }
-                for (tcn.success_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                }
-            },
             .optional_dispatch => |od| {
-                for (od.nil_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
-                }
                 if (od.nil_result) |nr| {
                     if (nr == changed_local) {
                         try self.propagateReturn(func_id, nr);
                     }
-                }
-                for (od.struct_instrs, 0..) |sub, idx| {
-                    try self.propagateInstruction(func_id, block_label, @intCast(instr_index + idx), sub, changed_local);
                 }
                 if (od.struct_result) |sr| {
                     if (sr == changed_local) {
@@ -1125,20 +977,46 @@ pub const LambdaSetAnalyzer = struct {
         const param_set = self.param_lambda_sets.getPtr(param_key) orelse return;
 
         for (func.body) |block| {
-            for (block.instructions) |instr| {
-                try self.propagateParamInstr(callee_func, instr, param_index, param_set);
+            try self.propagateParamInstructionStream(callee_func, block.instructions, param_index, param_set);
+        }
+    }
+
+    fn propagateParamInstructionStream(
+        self: *LambdaSetAnalyzer,
+        func_id: ir.FunctionId,
+        instructions: []const ir.Instruction,
+        param_index: u32,
+        param_set: *const FunctionIdSet,
+    ) !void {
+        var stack: std.ArrayListUnmanaged(InstructionStreamFrame) = .empty;
+        defer stack.deinit(self.allocator);
+        var child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+        defer child_streams.deinit(self.allocator);
+
+        try stack.append(self.allocator, .{ .stream = instructions });
+        while (stack.items.len > 0) {
+            const frame_index = stack.items.len - 1;
+            if (stack.items[frame_index].next_index >= stack.items[frame_index].stream.len) {
+                _ = stack.pop();
+                continue;
             }
+
+            const instr_index = stack.items[frame_index].next_index;
+            stack.items[frame_index].next_index += 1;
+            const instr = &stack.items[frame_index].stream[instr_index];
+            try self.propagateParamInstr(func_id, instr, param_index, param_set);
+            try self.pushInstructionChildren(instr, &stack, &child_streams);
         }
     }
 
     fn propagateParamInstr(
         self: *LambdaSetAnalyzer,
         func_id: ir.FunctionId,
-        instr: ir.Instruction,
+        instr: *const ir.Instruction,
         param_index: u32,
         param_set: *const FunctionIdSet,
     ) !void {
-        switch (instr) {
+        switch (instr.*) {
             .param_get => |pg| {
                 if (pg.index == param_index) {
                     const dest_key = lattice.ValueKey{ .function = func_id, .local = pg.dest };
@@ -1147,90 +1025,6 @@ pub const LambdaSetAnalyzer = struct {
                     if (try dest_set.addAll(param_set)) {
                         try self.enqueue(func_id, pg.dest);
                     }
-                }
-            },
-            .if_expr => |ie| {
-                for (ie.then_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-                for (ie.else_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-            },
-            .case_block => |cb| {
-                for (cb.pre_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-                for (cb.arms) |arm| {
-                    for (arm.cond_instrs) |sub| {
-                        try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                    }
-                    for (arm.body_instrs) |sub| {
-                        try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                    }
-                }
-                for (cb.default_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-            },
-            .guard_block => |gb| {
-                for (gb.body) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                    }
-                }
-                for (sl.default_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                    }
-                }
-                for (sr.default_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                    }
-                }
-            },
-            .union_switch => |us| {
-                for (us.cases) |c| {
-                    for (c.body_instrs) |sub| {
-                        try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                    }
-                }
-                if (us.has_else) {
-                    for (us.else_instrs) |sub| {
-                        try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                    }
-                }
-            },
-            .try_call_named => |tcn| {
-                for (tcn.handler_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-                for (tcn.success_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-            },
-            .optional_dispatch => |od| {
-                for (od.nil_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
-                }
-                for (od.struct_instrs) |sub| {
-                    try self.propagateParamInstr(func_id, sub, param_index, param_set);
                 }
             },
             else => {},
@@ -1337,15 +1131,13 @@ pub const LambdaSetAnalyzer = struct {
     fn computeDecisions(self: *LambdaSetAnalyzer) !void {
         for (self.program.functions) |func| {
             for (func.body) |block| {
-                for (block.instructions) |instr| {
-                    try self.computeInstrDecision(func.id, instr);
-                }
+                try self.computeInstrDecisionStream(func.id, block.instructions);
             }
         }
     }
 
     /// Record the specialization decision for every `call_closure` reachable
-    /// from `instr` (itself plus every nested sub-stream). The decision is
+    /// from `instructions` (including every nested sub-stream). The decision is
     /// keyed solely by `(func_id, cc.callee)` — the stable, position-free
     /// call-site identity (audit escape--03 / zirb-1--01). No `instr_index`
     /// is computed or recorded, eliminating the broken `outer_index +
@@ -1354,60 +1146,67 @@ pub const LambdaSetAnalyzer = struct {
     /// reproduce). Nested sub-streams are visited via the canonical
     /// `ir.forEachChildStream` enumerator so coverage cannot drift from the
     /// IR's actual child-stream set.
+    fn computeInstrDecisionStream(
+        self: *LambdaSetAnalyzer,
+        func_id: ir.FunctionId,
+        instructions: []const ir.Instruction,
+    ) !void {
+        var stack: std.ArrayListUnmanaged(InstructionStreamFrame) = .empty;
+        defer stack.deinit(self.allocator);
+        var child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+        defer child_streams.deinit(self.allocator);
+
+        try stack.append(self.allocator, .{ .stream = instructions });
+        while (stack.items.len > 0) {
+            const frame_index = stack.items.len - 1;
+            if (stack.items[frame_index].next_index >= stack.items[frame_index].stream.len) {
+                _ = stack.pop();
+                continue;
+            }
+
+            const instr_index = stack.items[frame_index].next_index;
+            stack.items[frame_index].next_index += 1;
+            const instr = &stack.items[frame_index].stream[instr_index];
+            try self.computeInstrDecision(func_id, instr);
+            try self.pushInstructionChildren(instr, &stack, &child_streams);
+        }
+    }
+
+    /// Record the specialization decision for a single `call_closure`
+    /// instruction. Structural descent is owned by `computeInstrDecisionStream`.
     fn computeInstrDecision(
         self: *LambdaSetAnalyzer,
         func_id: ir.FunctionId,
-        instr: ir.Instruction,
+        instr: *const ir.Instruction,
     ) error{OutOfMemory}!void {
-        if (instr == .call_closure) {
-            const cc = instr.call_closure;
-            const callee_key = lattice.ValueKey{ .function = func_id, .local = cc.callee };
-            const set = self.lambda_sets.getPtr(callee_key);
+        switch (instr.*) {
+            .call_closure => |cc| {
+                const callee_key = lattice.ValueKey{ .function = func_id, .local = cc.callee };
+                const set = self.lambda_sets.getPtr(callee_key);
 
-            var ls: lattice.LambdaSet = undefined;
-            var is_contifiable = false;
+                var ls: lattice.LambdaSet = undefined;
+                var is_contifiable = false;
 
-            if (set) |s| {
-                ls = try s.toLambdaSet(self.allocator);
-                // Check contifiability: singleton must be contifiable
-                if (s.isSingleton()) {
-                    is_contifiable = self.isContifiable(s.members.items[0]);
+                if (set) |s| {
+                    ls = try s.toLambdaSet(self.allocator);
+                    // Check contifiability: singleton must be contifiable
+                    if (s.isSingleton()) {
+                        is_contifiable = self.isContifiable(s.members.items[0]);
+                    }
+                } else {
+                    ls = lattice.LambdaSet.empty();
                 }
-            } else {
-                ls = lattice.LambdaSet.empty();
-            }
 
-            const decision = lattice.specializationForLambdaSet(ls, is_contifiable);
-            try self.call_site_decisions.append(self.allocator, .{
-                .function = func_id,
-                .callee_local = cc.callee,
-                .decision = decision,
-                .lambda_set = ls,
-            });
+                const decision = lattice.specializationForLambdaSet(ls, is_contifiable);
+                try self.call_site_decisions.append(self.allocator, .{
+                    .function = func_id,
+                    .callee_local = cc.callee,
+                    .decision = decision,
+                    .lambda_set = ls,
+                });
+            },
+            else => {},
         }
-
-        // Recurse into every nested sub-stream (if/case/switch/guard/try/
-        // optional-dispatch arms, including `union_switch.else_instrs`) via the
-        // canonical enumerator, so child-stream coverage cannot drift from the
-        // IR's actual set. The enumerator's callback cannot return an error, so
-        // capture the first allocation failure in the adapter and re-raise it.
-        const Ctx = struct {
-            analyzer: *LambdaSetAnalyzer,
-            func_id: ir.FunctionId,
-            err: ?error{OutOfMemory} = null,
-            fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
-                if (self_ctx.err != null) return;
-                for (child.stream) |sub| {
-                    self_ctx.analyzer.computeInstrDecision(self_ctx.func_id, sub) catch |e| {
-                        self_ctx.err = e;
-                        return;
-                    };
-                }
-            }
-        };
-        var ctx = Ctx{ .analyzer = self, .func_id = func_id };
-        ir.forEachChildStream(&instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
     }
 
     // --------------------------------------------------------
@@ -1480,6 +1279,38 @@ pub const LambdaSetAnalyzer = struct {
     // Helpers
     // --------------------------------------------------------
 
+    fn pushInstructionChildren(
+        self: *LambdaSetAnalyzer,
+        instr: *const ir.Instruction,
+        stack: *std.ArrayListUnmanaged(InstructionStreamFrame),
+        scratch: *std.ArrayListUnmanaged([]const ir.Instruction),
+    ) !void {
+        scratch.clearRetainingCapacity();
+
+        const ChildCollector = struct {
+            allocator: std.mem.Allocator,
+            streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+            err: ?anyerror = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (child.stream.len == 0) return;
+                ctx.streams.append(ctx.allocator, child.stream) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        var child_collector = ChildCollector{ .allocator = self.allocator, .streams = scratch };
+        ir.forEachChildStream(instr, &child_collector, ChildCollector.onStream);
+        if (child_collector.err) |err| return err;
+
+        var stream_index = scratch.items.len;
+        while (stream_index > 0) {
+            stream_index -= 1;
+            try stack.append(self.allocator, .{ .stream = scratch.items[stream_index] });
+        }
+    }
+
     fn ensureSet(self: *LambdaSetAnalyzer, key: lattice.ValueKey) !void {
         const result = try self.lambda_sets.getOrPut(key);
         if (!result.found_existing) {
@@ -1517,28 +1348,62 @@ pub const LambdaSetAnalyzer = struct {
 /// string, struct_ref, …) return false, so non-closure builtins are never
 /// pessimized. Returning a false positive only enlarges a set to top (sound);
 /// a false negative would be the unsound direction, hence the bias.
-fn zigTypeCanCarryClosure(t: ir.ZigType) bool {
-    return switch (t) {
-        .function => true,
-        .any => true,
-        // A protocol existential is an opaque fat pointer; its inner value
-        // could be a callable. Treat conservatively without naming protocols.
-        .protocol_box => true,
-        // `term` is the heterogeneous runtime wrapper — it can hold anything,
-        // including a callable.
-        .term => true,
-        .tuple => |elems| {
-            for (elems) |elem| {
-                if (zigTypeCanCarryClosure(elem)) return true;
-            }
-            return false;
-        },
-        .list => |elem| zigTypeCanCarryClosure(elem.*),
-        .map => |m| zigTypeCanCarryClosure(m.key.*) or zigTypeCanCarryClosure(m.value.*),
-        .optional => |inner| zigTypeCanCarryClosure(inner.*),
-        .ptr => |inner| zigTypeCanCarryClosure(inner.*),
-        else => false,
-    };
+fn zigTypeCanCarryClosure(
+    allocator: std.mem.Allocator,
+    t: ir.ZigType,
+) (std.mem.Allocator.Error || error{LambdaSetTypeWalkBudgetExceeded})!bool {
+    return zigTypeCanCarryClosureWithBudget(
+        allocator,
+        t,
+        DEFAULT_ZIG_TYPE_CLOSURE_WALK_BUDGET,
+    );
+}
+
+fn zigTypeCanCarryClosureWithBudget(
+    allocator: std.mem.Allocator,
+    t: ir.ZigType,
+    node_budget: usize,
+) (std.mem.Allocator.Error || error{LambdaSetTypeWalkBudgetExceeded})!bool {
+    var stack: std.ArrayListUnmanaged(ir.ZigType) = .empty;
+    defer stack.deinit(allocator);
+
+    try stack.append(allocator, t);
+    var visited_nodes: usize = 0;
+
+    while (stack.pop()) |current| {
+        if (visited_nodes >= node_budget) {
+            return error.LambdaSetTypeWalkBudgetExceeded;
+        }
+        visited_nodes += 1;
+
+        switch (current) {
+            .function => return true,
+            .any => return true,
+            // A protocol existential is an opaque fat pointer; its inner value
+            // could be a callable. Treat conservatively without naming protocols.
+            .protocol_box => return true,
+            // `term` is the heterogeneous runtime wrapper — it can hold anything,
+            // including a callable.
+            .term => return true,
+            .tuple => |elems| {
+                var elem_index = elems.len;
+                while (elem_index > 0) {
+                    elem_index -= 1;
+                    try stack.append(allocator, elems[elem_index]);
+                }
+            },
+            .list => |elem| try stack.append(allocator, elem.*),
+            .map => |m| {
+                try stack.append(allocator, m.value.*);
+                try stack.append(allocator, m.key.*);
+            },
+            .optional => |inner| try stack.append(allocator, inner.*),
+            .ptr => |inner| try stack.append(allocator, inner.*),
+            else => {},
+        }
+    }
+
+    return false;
 }
 
 // ============================================================
@@ -1546,6 +1411,232 @@ fn zigTypeCanCarryClosure(t: ir.ZigType) bool {
 // ============================================================
 
 const testing = std.testing;
+
+fn buildNestedGuardChain(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    terminal: ir.Instruction,
+) ![]ir.Instruction {
+    const instructions = try allocator.alloc(ir.Instruction, depth + 1);
+    errdefer allocator.free(instructions);
+
+    instructions[depth] = terminal;
+    var guard_index = depth;
+    while (guard_index > 0) {
+        guard_index -= 1;
+        instructions[guard_index] = .{
+            .guard_block = .{
+                .condition = 0,
+                .body = instructions[guard_index + 1 .. guard_index + 2],
+            },
+        };
+    }
+
+    return instructions;
+}
+
+fn buildLambdaAliasChain(
+    allocator: std.mem.Allocator,
+    alias_depth: usize,
+    closure_function: ir.FunctionId,
+) ![]ir.Instruction {
+    const instructions = try allocator.alloc(ir.Instruction, alias_depth + 1);
+    errdefer allocator.free(instructions);
+
+    instructions[0] = .{
+        .make_closure = .{
+            .dest = 0,
+            .function = closure_function,
+            .captures = &.{},
+        },
+    };
+    var alias_index: usize = 1;
+    while (alias_index <= alias_depth) : (alias_index += 1) {
+        instructions[alias_index] = .{
+            .local_get = .{
+                .dest = @intCast(alias_index),
+                .source = @intCast(alias_index - 1),
+            },
+        };
+    }
+
+    return instructions;
+}
+
+fn buildOptionalZigTypeChain(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    terminal: ir.ZigType,
+) ![]ir.ZigType {
+    const nodes = try allocator.alloc(ir.ZigType, depth + 1);
+    errdefer allocator.free(nodes);
+
+    nodes[depth] = terminal;
+    var node_index = depth;
+    while (node_index > 0) {
+        node_index -= 1;
+        nodes[node_index] = .{ .optional = &nodes[node_index + 1] };
+    }
+
+    return nodes;
+}
+
+test "propagateToFixpoint reports budget exhaustion when lambda work remains pending" {
+    const allocator = testing.allocator;
+
+    const main_instrs = try buildLambdaAliasChain(allocator, 4, 1);
+    defer allocator.free(main_instrs);
+
+    const main_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = main_instrs },
+    };
+    const closure_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const closure_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &closure_instrs },
+    };
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .void, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "closure_fn", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &closure_blocks, .is_closure = true, .captures = &.{} },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var analyzer = try LambdaSetAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+    analyzer.fixpoint_iteration_budget = 1;
+
+    try testing.expectError(error.LambdaSetFixpointBudgetExceeded, analyzer.analyze());
+}
+
+test "zigTypeCanCarryClosure traverses deeply nested wrapper types without native recursion" {
+    const allocator = testing.allocator;
+    const deep_type_depth: usize = 16_384;
+    const void_type: ir.ZigType = .void;
+
+    const type_nodes = try buildOptionalZigTypeChain(
+        allocator,
+        deep_type_depth,
+        .{ .function = .{ .params = &.{}, .return_type = &void_type } },
+    );
+    defer allocator.free(type_nodes);
+
+    try testing.expect(try zigTypeCanCarryClosure(allocator, type_nodes[0]));
+}
+
+test "zigTypeCanCarryClosure reports type-walk budget exhaustion" {
+    const allocator = testing.allocator;
+
+    const type_nodes = try buildOptionalZigTypeChain(allocator, 4, .i64);
+    defer allocator.free(type_nodes);
+
+    try testing.expectError(
+        error.LambdaSetTypeWalkBudgetExceeded,
+        zigTypeCanCarryClosureWithBudget(allocator, type_nodes[0], 2),
+    );
+}
+
+test "zigTypeCanCarryClosure preserves OutOfMemory from walk stack allocation" {
+    var failing_allocator = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    try testing.expectError(
+        error.OutOfMemory,
+        zigTypeCanCarryClosure(failing_allocator.allocator(), .i64),
+    );
+}
+
+test "propagateInstruction - traverses deeply nested child streams without native recursion" {
+    const allocator = testing.allocator;
+    const deep_nesting_depth: usize = 16_384;
+
+    const nested_chain = try buildNestedGuardChain(
+        allocator,
+        deep_nesting_depth,
+        .{ .local_get = .{ .dest = 1, .source = 0 } },
+    );
+    defer allocator.free(nested_chain);
+
+    const main_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 1, .captures = &.{} } },
+        nested_chain[0],
+    };
+    const main_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &main_instrs },
+    };
+    const closure_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const closure_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &closure_instrs },
+    };
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "closure_fn", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &closure_blocks, .is_closure = true, .captures = &.{} },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var analyzer = try LambdaSetAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+    try analyzer.analyze();
+
+    const propagated = analyzer.getLambdaSet(.{ .function = 0, .local = 1 }).?;
+    try testing.expect(propagated.isSingleton());
+    try testing.expect(propagated.contains(1));
+}
+
+test "propagateParamInstr - traverses deeply nested child streams without native recursion" {
+    const allocator = testing.allocator;
+    const deep_nesting_depth: usize = 16_384;
+
+    const nested_chain = try buildNestedGuardChain(
+        allocator,
+        deep_nesting_depth,
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+    );
+    defer allocator.free(nested_chain);
+
+    const main_args = [_]ir.LocalId{0};
+    const main_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 2, .captures = &.{} } },
+        .{ .call_named = .{ .dest = 1, .name = "callee", .args = &main_args, .arg_modes = &.{} } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    const main_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &main_instrs },
+    };
+    const callee_params = [_]ir.Param{
+        .{ .name = "callback", .type_expr = .any },
+    };
+    const callee_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = nested_chain[0..1] },
+    };
+    const closure_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const closure_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &closure_instrs },
+    };
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "callee", .scope_id = 0, .arity = 1, .params = &callee_params, .return_type = .i64, .body = &callee_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 2, .name = "closure_fn", .scope_id = 0, .arity = 0, .params = &.{}, .return_type = .i64, .body = &closure_blocks, .is_closure = true, .captures = &.{} },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var analyzer = try LambdaSetAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+    try analyzer.analyze();
+
+    const propagated = analyzer.getLambdaSet(.{ .function = 1, .local = 0 }).?;
+    try testing.expect(propagated.isSingleton());
+    try testing.expect(propagated.contains(2));
+}
 
 // Test 1: Single closure flows to single call site -> singleton lambda set -> direct_call
 test "singleton lambda set yields direct_call" {

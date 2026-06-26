@@ -9,12 +9,189 @@ const TypeStore = types_mod.TypeStore;
 const SubstitutionMap = types_mod.SubstitutionMap;
 const Allocator = std.mem.Allocator;
 
+const MAX_TOTAL_SPECIALIZATIONS: u32 = 8192;
+const MAX_SPECIALIZATIONS_PER_GENERIC: u32 = 1024;
+const MAX_TYPE_STRUCTURE_DEPTH: u32 = 128;
+const MAX_TYPE_STRUCTURE_NODES: u32 = 512;
+const MAX_HIR_STRUCTURE_DEPTH: u32 = 1024;
+const MAX_HIR_STRUCTURE_NODES: u32 = 200_000;
+
+pub const MonomorphError = struct {
+    message: []const u8,
+    span: ast.SourceSpan,
+};
+
+const TypeWalkError = types_mod.TypeGraphError || error{
+    TypeStructureTooDeep,
+    TypeStructureTooLarge,
+};
+
+const TypeMangleError = types_mod.TypeMangleError;
+
+const HirWalkError = error{
+    OutOfMemory,
+    HirStructureTooDeep,
+    HirStructureTooLarge,
+};
+
+const MonomorphWalkError = HirWalkError || TypeWalkError;
+const NameMangleError = TypeWalkError || TypeMangleError;
+const CloneGroupError = MonomorphWalkError || TypeMangleError;
+
+const RuntimeTypePredicate = enum {
+    concrete,
+    monomorphization_ready,
+};
+
+const TypeTransformMode = union(enum) {
+    default_unbound: TypeId,
+    active_protocol_params,
+};
+
+const TypeTransformFrame = struct {
+    type_id: TypeId,
+    depth: u32,
+    phase: enum { enter, exit },
+};
+
+const HirWalkBudget = struct {
+    nodes_seen: u32 = 0,
+
+    fn enter(self: *HirWalkBudget, depth: u32) HirWalkError!void {
+        if (depth > MAX_HIR_STRUCTURE_DEPTH) return error.HirStructureTooDeep;
+        self.nodes_seen += 1;
+        if (self.nodes_seen > MAX_HIR_STRUCTURE_NODES) return error.HirStructureTooLarge;
+    }
+};
+
+const TypeWalkItem = struct {
+    type_id: TypeId,
+    paired_type_id: ?TypeId = null,
+    depth: u32,
+    scalar_position: bool = false,
+};
+
+const TypeWalker = struct {
+    allocator: Allocator,
+    work: std.ArrayListUnmanaged(TypeWalkItem) = .empty,
+    visited: std.AutoHashMap(u64, void),
+    nodes_seen: u32 = 0,
+
+    fn init(allocator: Allocator) TypeWalker {
+        return .{
+            .allocator = allocator,
+            .visited = std.AutoHashMap(u64, void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *TypeWalker) void {
+        self.work.deinit(self.allocator);
+        self.visited.deinit();
+    }
+
+    fn pushRoot(self: *TypeWalker, type_id: TypeId) TypeWalkError!void {
+        try self.pushType(type_id, 0, false);
+    }
+
+    fn pushScalarRoot(self: *TypeWalker, type_id: TypeId) TypeWalkError!void {
+        try self.pushType(type_id, 0, true);
+    }
+
+    fn pushPairRoot(self: *TypeWalker, left: TypeId, right: TypeId) TypeWalkError!void {
+        try self.pushPair(left, right, 0);
+    }
+
+    fn pushType(self: *TypeWalker, type_id: TypeId, depth: u32, scalar_position: bool) TypeWalkError!void {
+        try self.work.append(self.allocator, .{
+            .type_id = type_id,
+            .depth = depth,
+            .scalar_position = scalar_position,
+        });
+    }
+
+    fn pushPair(self: *TypeWalker, left: TypeId, right: TypeId, depth: u32) TypeWalkError!void {
+        try self.work.append(self.allocator, .{
+            .type_id = left,
+            .paired_type_id = right,
+            .depth = depth,
+        });
+    }
+
+    fn next(self: *TypeWalker) TypeWalkError!?TypeWalkItem {
+        while (self.work.pop()) |item| {
+            if (item.depth > MAX_TYPE_STRUCTURE_DEPTH) return error.TypeStructureTooDeep;
+
+            const key = visitKey(item);
+            if (self.visited.contains(key)) continue;
+            try self.visited.put(key, {});
+
+            self.nodes_seen += 1;
+            if (self.nodes_seen > MAX_TYPE_STRUCTURE_NODES) return error.TypeStructureTooLarge;
+
+            return item;
+        }
+        return null;
+    }
+
+    fn pushStructuralChildren(self: *TypeWalker, store: *const TypeStore, item: TypeWalkItem) TypeWalkError!void {
+        std.debug.assert(item.paired_type_id == null);
+        const next_depth = item.depth + 1;
+        switch (store.getType(item.type_id)) {
+            .tuple => |tuple| for (tuple.elements) |child| {
+                try self.pushType(child, next_depth, false);
+            },
+            .list => |list| try self.pushType(list.element, next_depth, false),
+            .map => |map| {
+                try self.pushType(map.key, next_depth, false);
+                try self.pushType(map.value, next_depth, false);
+            },
+            .struct_type => |struct_type| {
+                for (struct_type.type_params) |child| try self.pushType(child, next_depth, false);
+                for (struct_type.fields) |field| try self.pushType(field.type_id, next_depth, false);
+            },
+            .union_type => |union_type| for (union_type.members) |child| {
+                try self.pushType(child, next_depth, false);
+            },
+            .function => |function_type| {
+                for (function_type.params) |child| try self.pushType(child, next_depth, false);
+                try self.pushType(function_type.return_type, next_depth, false);
+                if (function_type.effect_var) |effect_var| try self.pushType(effect_var, next_depth, false);
+                for (function_type.raises_row) |child| try self.pushType(child, next_depth, false);
+            },
+            .applied => |applied| {
+                try self.pushType(applied.base, next_depth, false);
+                for (applied.args) |child| try self.pushType(child, next_depth, false);
+            },
+            .tagged_union => |tagged_union| {
+                for (tagged_union.type_params) |child| try self.pushType(child, next_depth, false);
+                for (tagged_union.variants) |variant| {
+                    if (variant.type_id) |payload| try self.pushType(payload, next_depth, false);
+                }
+            },
+            .opaque_type => |opaque_type| try self.pushType(opaque_type.inner, next_depth, false),
+            .protocol_constraint => |constraint| for (constraint.type_params) |child| {
+                try self.pushType(child, next_depth, false);
+            },
+            else => {},
+        }
+    }
+
+    fn visitKey(item: TypeWalkItem) u64 {
+        if (item.paired_type_id) |paired_type_id| {
+            return (@as(u64, item.type_id) << 32) | @as(u64, paired_type_id);
+        }
+        return (@as(u64, item.type_id) << 1) | @intFromBool(item.scalar_position);
+    }
+};
+
 /// Result of the monomorphization pass.
 pub const MonomorphResult = struct {
     /// The transformed program with specialized function groups added.
     program: hir.Program,
     /// Number of specializations created.
     specialization_count: u32,
+    /// Compile errors collected while refusing unbounded specialization growth.
+    errors: []const MonomorphError = &.{},
 };
 
 /// Run the monomorphization pass on a HIR program.
@@ -38,12 +215,15 @@ pub fn monomorphize(
         .program = program,
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
+        .specialization_counts = std.AutoHashMap(u32, u32).init(allocator),
         .new_groups = .empty,
         .call_rewrites = std.AutoHashMap(u64, u32).init(allocator),
         .local_types = std.AutoHashMap(u32, TypeId).init(allocator),
+        .errors = .empty,
     };
     defer ctx.generic_groups.deinit();
     defer ctx.specializations.deinit();
+    defer ctx.specialization_counts.deinit();
     defer ctx.new_groups.deinit(allocator);
     defer ctx.call_rewrites.deinit();
     defer ctx.local_types.deinit();
@@ -51,15 +231,23 @@ pub fn monomorphize(
     // Phase A: Identify generic function groups (those with type_var params)
     for (program.structs) |mod| {
         for (mod.functions) |*group| {
-            if (isGenericGroup(store, group)) {
+            if (try ctx.isGenericGroup(group)) {
                 try ctx.generic_groups.put(group.id, group);
             }
         }
     }
     for (program.top_functions) |*group| {
-        if (isGenericGroup(store, group)) {
+        if (try ctx.isGenericGroup(group)) {
             try ctx.generic_groups.put(group.id, group);
         }
+    }
+
+    if (ctx.errors.items.len > 0) {
+        return .{
+            .program = program.*,
+            .specialization_count = @intCast(ctx.new_groups.items.len),
+            .errors = try ctx.errors.toOwnedSlice(allocator),
+        };
     }
 
     // If no generic functions, return the program unchanged
@@ -105,12 +293,8 @@ pub fn monomorphize(
             const scan_end = ctx.new_groups.items.len;
             // Copy entries to scan since scanning may append to new_groups,
             // which can reallocate and invalidate the items slice.
-            var entries_to_scan: std.ArrayListUnmanaged(NewGroupEntry) = .empty;
-            for (ctx.new_groups.items[scan_start..scan_end]) |entry| {
-                if (!isGenericGroup(store, &entry.group)) {
-                    entries_to_scan.append(allocator, entry) catch break;
-                }
-            }
+            var entries_to_scan = try ctx.collectTransitiveScanEntries(ctx.new_groups.items[scan_start..scan_end]);
+            defer entries_to_scan.deinit(allocator);
             for (entries_to_scan.items) |entry| {
                 ctx.current_scan_struct_idx = entry.target_struct_idx;
                 for (entry.group.clauses) |clause| {
@@ -120,11 +304,19 @@ pub fn monomorphize(
                     ctx.current_scan_params = null;
                 }
             }
-            entries_to_scan.deinit(allocator);
             scan_start = scan_end;
         }
         ctx.current_scan_struct_idx = null;
     }
+
+    if (ctx.errors.items.len > 0) {
+        return .{
+            .program = program.*,
+            .specialization_count = @intCast(ctx.new_groups.items.len),
+            .errors = try ctx.errors.toOwnedSlice(allocator),
+        };
+    }
+
     // Phase C: Build new program with specialized groups added.
     // Specializations are placed in the CALLING struct (target_struct_idx)
     // so that cross-struct direct calls resolve within the same struct's IR.
@@ -175,13 +367,13 @@ pub fn monomorphize(
     for (new_structs.items) |*mod| {
         for (mod.functions) |*group| {
             for (group.clauses) |clause| {
-                ctx.rewriteBlock(clause.body);
+                try ctx.rewriteBlock(clause.body);
             }
         }
     }
     for (new_top_fns.items) |*group| {
         for (group.clauses) |clause| {
-            ctx.rewriteBlock(clause.body);
+            try ctx.rewriteBlock(clause.body);
         }
     }
 
@@ -193,6 +385,7 @@ pub fn monomorphize(
             .impls = program.impls,
         },
         .specialization_count = @intCast(ctx.new_groups.items.len),
+        .errors = try ctx.errors.toOwnedSlice(allocator),
     };
 }
 
@@ -242,6 +435,330 @@ const MonomorphContext = struct {
     new_groups: std.ArrayListUnmanaged(NewGroupEntry),
     /// Map from (call_site_hash) → new_group_id for rewriting
     call_rewrites: std.AutoHashMap(u64, u32),
+    /// Specializations created per source generic group.
+    specialization_counts: std.AutoHashMap(u32, u32),
+    /// Refusal diagnostics for unbounded specialization growth.
+    errors: std.ArrayListUnmanaged(MonomorphError),
+
+    fn appendError(self: *MonomorphContext, span: ast.SourceSpan, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+        const message = try std.fmt.allocPrint(self.allocator, fmt, args);
+        errdefer self.allocator.free(message);
+        try self.errors.append(self.allocator, .{ .message = message, .span = span });
+    }
+
+    fn appendHirBudgetError(
+        self: *MonomorphContext,
+        span: ast.SourceSpan,
+        operation: []const u8,
+        err: HirWalkError,
+    ) error{OutOfMemory}!void {
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.HirStructureTooDeep => try self.appendError(
+                span,
+                "monomorphization {s} exceeds maximum HIR nesting depth ({d})",
+                .{ operation, MAX_HIR_STRUCTURE_DEPTH },
+            ),
+            error.HirStructureTooLarge => try self.appendError(
+                span,
+                "monomorphization {s} contains more than {d} HIR nodes",
+                .{ operation, MAX_HIR_STRUCTURE_NODES },
+            ),
+        }
+    }
+
+    fn appendTypeBudgetError(
+        self: *MonomorphContext,
+        span: ast.SourceSpan,
+        operation: []const u8,
+        err: TypeWalkError,
+    ) error{OutOfMemory}!void {
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TypeStructureTooDeep => try self.appendError(
+                span,
+                "monomorphization {s} exceeds maximum type nesting depth ({d})",
+                .{ operation, MAX_TYPE_STRUCTURE_DEPTH },
+            ),
+            error.TypeStructureTooLarge => try self.appendError(
+                span,
+                "monomorphization {s} contains more than {d} unique type nodes",
+                .{ operation, MAX_TYPE_STRUCTURE_NODES },
+            ),
+            error.TypeGraphDepthLimitExceeded => try self.appendError(
+                span,
+                "monomorphization {s} exceeds the type graph traversal depth budget",
+                .{operation},
+            ),
+            error.TypeGraphNodeLimitExceeded => try self.appendError(
+                span,
+                "monomorphization {s} exceeds the type graph traversal node budget",
+                .{operation},
+            ),
+        }
+    }
+
+    fn appendWalkBudgetError(
+        self: *MonomorphContext,
+        span: ast.SourceSpan,
+        operation: []const u8,
+        err: MonomorphWalkError,
+    ) error{OutOfMemory}!void {
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.HirStructureTooDeep => try self.appendError(
+                span,
+                "monomorphization {s} exceeds maximum HIR nesting depth ({d})",
+                .{ operation, MAX_HIR_STRUCTURE_DEPTH },
+            ),
+            error.HirStructureTooLarge => try self.appendError(
+                span,
+                "monomorphization {s} contains more than {d} HIR nodes",
+                .{ operation, MAX_HIR_STRUCTURE_NODES },
+            ),
+            error.TypeStructureTooDeep => try self.appendError(
+                span,
+                "monomorphization {s} exceeds maximum type nesting depth ({d})",
+                .{ operation, MAX_TYPE_STRUCTURE_DEPTH },
+            ),
+            error.TypeStructureTooLarge => try self.appendError(
+                span,
+                "monomorphization {s} contains more than {d} unique type nodes",
+                .{ operation, MAX_TYPE_STRUCTURE_NODES },
+            ),
+            error.TypeGraphDepthLimitExceeded => try self.appendError(
+                span,
+                "monomorphization {s} exceeds the type graph traversal depth budget",
+                .{operation},
+            ),
+            error.TypeGraphNodeLimitExceeded => try self.appendError(
+                span,
+                "monomorphization {s} exceeds the type graph traversal node budget",
+                .{operation},
+            ),
+        }
+    }
+
+    fn typeStructureWithinBudget(self: *MonomorphContext, root: TypeId) TypeWalkError!void {
+        var walker = TypeWalker.init(self.allocator);
+        defer walker.deinit();
+
+        try walker.pushRoot(root);
+        while (try walker.next()) |item| {
+            try walker.pushStructuralChildren(self.store, item);
+        }
+    }
+
+    fn isGenericGroup(self: *MonomorphContext, group: *const hir.FunctionGroup) error{OutOfMemory}!bool {
+        return genericGroupContainsTypeVar(self.store, group, self.allocator) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.TypeStructureTooDeep => {
+                try self.appendError(
+                    genericGroupSpan(group),
+                    "monomorphization could not inspect generic `{s}/{d}` because its type signature exceeds maximum type nesting depth ({d})",
+                    .{ self.interner.get(group.name), group.arity, MAX_TYPE_STRUCTURE_DEPTH },
+                );
+                return false;
+            },
+            error.TypeStructureTooLarge => {
+                try self.appendError(
+                    genericGroupSpan(group),
+                    "monomorphization could not inspect generic `{s}/{d}` because its type signature contains more than {d} unique type nodes",
+                    .{ self.interner.get(group.name), group.arity, MAX_TYPE_STRUCTURE_NODES },
+                );
+                return false;
+            },
+            error.TypeGraphDepthLimitExceeded => {
+                try self.appendError(
+                    genericGroupSpan(group),
+                    "monomorphization could not inspect generic `{s}/{d}` because its type signature exceeds the type graph traversal depth budget",
+                    .{ self.interner.get(group.name), group.arity },
+                );
+                return false;
+            },
+            error.TypeGraphNodeLimitExceeded => {
+                try self.appendError(
+                    genericGroupSpan(group),
+                    "monomorphization could not inspect generic `{s}/{d}` because its type signature exceeds the type graph traversal node budget",
+                    .{ self.interner.get(group.name), group.arity },
+                );
+                return false;
+            },
+        };
+    }
+
+    fn scalarTypeVarSetForReturn(
+        self: *MonomorphContext,
+        generic_group: *const hir.FunctionGroup,
+        return_type: TypeId,
+        span: ast.SourceSpan,
+    ) error{OutOfMemory}!?std.AutoHashMap(types_mod.TypeVarId, void) {
+        return scalarTypeVarSet(self.store, return_type, self.allocator) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.TypeStructureTooDeep => {
+                try self.appendError(
+                    span,
+                    "monomorphization return type walk for generic `{s}/{d}` exceeds maximum type nesting depth ({d})",
+                    .{ self.interner.get(generic_group.name), generic_group.arity, MAX_TYPE_STRUCTURE_DEPTH },
+                );
+                return null;
+            },
+            error.TypeStructureTooLarge => {
+                try self.appendError(
+                    span,
+                    "monomorphization return type walk for generic `{s}/{d}` contains more than {d} unique type nodes",
+                    .{ self.interner.get(generic_group.name), generic_group.arity, MAX_TYPE_STRUCTURE_NODES },
+                );
+                return null;
+            },
+            error.TypeGraphDepthLimitExceeded => {
+                try self.appendError(
+                    span,
+                    "monomorphization return type walk for generic `{s}/{d}` exceeds the type graph traversal depth budget",
+                    .{ self.interner.get(generic_group.name), generic_group.arity },
+                );
+                return null;
+            },
+            error.TypeGraphNodeLimitExceeded => {
+                try self.appendError(
+                    span,
+                    "monomorphization return type walk for generic `{s}/{d}` exceeds the type graph traversal node budget",
+                    .{ self.interner.get(generic_group.name), generic_group.arity },
+                );
+                return null;
+            },
+        };
+    }
+
+    fn promoteContainerVarsForCall(
+        self: *MonomorphContext,
+        generic_group: *const hir.FunctionGroup,
+        param_type: TypeId,
+        arg_type: TypeId,
+        scalar_return_vars: *const std.AutoHashMap(types_mod.TypeVarId, void),
+        subs: *types_mod.SubstitutionMap,
+        span: ast.SourceSpan,
+    ) error{OutOfMemory}!bool {
+        promoteContainerVarsExceptScalarReturn(self.store, param_type, arg_type, scalar_return_vars, subs, self.allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TypeStructureTooDeep => {
+                try self.appendError(
+                    span,
+                    "monomorphization parameter/argument type walk for generic `{s}/{d}` exceeds maximum type nesting depth ({d})",
+                    .{ self.interner.get(generic_group.name), generic_group.arity, MAX_TYPE_STRUCTURE_DEPTH },
+                );
+                return false;
+            },
+            error.TypeStructureTooLarge => {
+                try self.appendError(
+                    span,
+                    "monomorphization parameter/argument type walk for generic `{s}/{d}` contains more than {d} unique type nodes",
+                    .{ self.interner.get(generic_group.name), generic_group.arity, MAX_TYPE_STRUCTURE_NODES },
+                );
+                return false;
+            },
+            error.TypeGraphDepthLimitExceeded => {
+                try self.appendError(
+                    span,
+                    "monomorphization parameter/argument type walk for generic `{s}/{d}` exceeds the type graph traversal depth budget",
+                    .{ self.interner.get(generic_group.name), generic_group.arity },
+                );
+                return false;
+            },
+            error.TypeGraphNodeLimitExceeded => {
+                try self.appendError(
+                    span,
+                    "monomorphization parameter/argument type walk for generic `{s}/{d}` exceeds the type graph traversal node budget",
+                    .{ self.interner.get(generic_group.name), generic_group.arity },
+                );
+                return false;
+            },
+        };
+        return true;
+    }
+
+    fn specializationWithinBudget(
+        self: *MonomorphContext,
+        generic_group: *const hir.FunctionGroup,
+        type_args: []const TypeId,
+        span: ast.SourceSpan,
+    ) error{OutOfMemory}!bool {
+        for (type_args) |type_arg| {
+            self.typeStructureWithinBudget(type_arg) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.TypeStructureTooDeep => {
+                    try self.appendError(
+                        span,
+                        "monomorphization type argument for generic `{s}/{d}` exceeds maximum type nesting depth ({d})",
+                        .{ self.interner.get(generic_group.name), generic_group.arity, MAX_TYPE_STRUCTURE_DEPTH },
+                    );
+                    return false;
+                },
+                error.TypeStructureTooLarge => {
+                    try self.appendError(
+                        span,
+                        "monomorphization type argument for generic `{s}/{d}` contains more than {d} unique type nodes",
+                        .{ self.interner.get(generic_group.name), generic_group.arity, MAX_TYPE_STRUCTURE_NODES },
+                    );
+                    return false;
+                },
+                error.TypeGraphDepthLimitExceeded => {
+                    try self.appendError(
+                        span,
+                        "monomorphization type argument for generic `{s}/{d}` exceeds the type graph traversal depth budget",
+                        .{ self.interner.get(generic_group.name), generic_group.arity },
+                    );
+                    return false;
+                },
+                error.TypeGraphNodeLimitExceeded => {
+                    try self.appendError(
+                        span,
+                        "monomorphization type argument for generic `{s}/{d}` exceeds the type graph traversal node budget",
+                        .{ self.interner.get(generic_group.name), generic_group.arity },
+                    );
+                    return false;
+                },
+            };
+        }
+
+        if (self.new_groups.items.len >= MAX_TOTAL_SPECIALIZATIONS) {
+            try self.appendError(
+                span,
+                "monomorphization exceeded the total specialization limit while specializing `{s}/{d}`",
+                .{ self.interner.get(generic_group.name), generic_group.arity },
+            );
+            return false;
+        }
+
+        const result = try self.specialization_counts.getOrPut(generic_group.id);
+        if (!result.found_existing) result.value_ptr.* = 0;
+        if (result.value_ptr.* >= MAX_SPECIALIZATIONS_PER_GENERIC) {
+            try self.appendError(
+                span,
+                "monomorphization exceeded the per-generic specialization limit for `{s}/{d}`",
+                .{ self.interner.get(generic_group.name), generic_group.arity },
+            );
+            return false;
+        }
+        result.value_ptr.* += 1;
+        return true;
+    }
+
+    fn collectTransitiveScanEntries(
+        self: *MonomorphContext,
+        entries: []const NewGroupEntry,
+    ) error{OutOfMemory}!std.ArrayListUnmanaged(NewGroupEntry) {
+        var entries_to_scan: std.ArrayListUnmanaged(NewGroupEntry) = .empty;
+        errdefer entries_to_scan.deinit(self.allocator);
+
+        for (entries) |entry| {
+            if (!try self.isGenericGroup(&entry.group)) {
+                try entries_to_scan.append(self.allocator, entry);
+            }
+        }
+
+        return entries_to_scan;
+    }
 
     fn sameName(self: *const MonomorphContext, left: ast.StringId, right: ast.StringId) bool {
         return left == right or std.mem.eql(u8, self.interner.get(left), self.interner.get(right));
@@ -329,7 +846,7 @@ const MonomorphContext = struct {
         self: *const MonomorphContext,
         param_type: TypeId,
         arg_type: TypeId,
-    ) ?TypeId {
+    ) TypeWalkError!?TypeId {
         // A collection whose element is a boxed `Callable` existential
         // (`[fn(i64) -> i64]` = `List(ProtocolBox)`) is a fully-defined
         // runtime type, so a parametric protocol parameter like
@@ -343,7 +860,7 @@ const MonomorphContext = struct {
         // `[i64]` already takes; only the readiness predicate widens, so the
         // `Enumerable` devirtualization contract for non-closure lists is
         // untouched (the bound `element` stays `i64`/`String` there).
-        if (!self.typeArgIsMonomorphizationReady(arg_type)) return null;
+        if (!(try self.typeArgIsMonomorphizationReady(arg_type))) return null;
 
         const param_typ = self.store.getType(param_type);
         if (param_typ != .protocol_constraint) return null;
@@ -360,7 +877,7 @@ const MonomorphContext = struct {
         constraint_type: TypeId,
         concrete_arg_type: TypeId,
         subs: *SubstitutionMap,
-    ) !void {
+    ) TypeWalkError!void {
         const constraint = self.store.getType(constraint_type);
         if (constraint != .protocol_constraint) return;
         if (constraint.protocol_constraint.type_params.len == 0) return;
@@ -378,101 +895,260 @@ const MonomorphContext = struct {
             if (!unified) continue;
 
             for (constraint.protocol_constraint.type_params, impl_info.protocol_type_args) |constraint_arg, impl_arg| {
-                const concrete_protocol_arg = impl_subs.applyToType(self.store, impl_arg);
+                const concrete_protocol_arg = try impl_subs.applyToType(self.store, impl_arg);
                 // A boxed `Callable` element is monomorphization-ready (it is a
                 // `ProtocolBox` at runtime), so bind it as the protocol's
                 // `element` type-arg just like a concrete `i64`. See
                 // `protocolParamConcreteType` for why the widened predicate
                 // preserves the `Enumerable`-devirtualization contract.
-                if (!self.typeArgIsMonomorphizationReady(concrete_protocol_arg)) continue;
+                if (!(try self.typeArgIsMonomorphizationReady(concrete_protocol_arg))) continue;
                 _ = try self.store.unify(constraint_arg, concrete_protocol_arg, subs);
             }
             return;
         }
     }
 
-    fn defaultUnboundTypeVars(self: *const MonomorphContext, type_id: TypeId, default_type: TypeId) TypeId {
-        const typ = self.store.getType(type_id);
-        return switch (typ) {
-            .type_var => default_type,
+    fn bindProtocolTypeArgsFromConstraintArg(
+        self: *const MonomorphContext,
+        constraint_type: TypeId,
+        arg_type: TypeId,
+        subs: *SubstitutionMap,
+    ) TypeWalkError!void {
+        const constraint = self.store.getType(constraint_type);
+        if (constraint != .protocol_constraint) return;
+        if (constraint.protocol_constraint.type_params.len == 0) return;
+
+        const arg = self.store.getType(arg_type);
+        if (arg != .protocol_constraint) return;
+        if (!self.sameName(constraint.protocol_constraint.protocol_name, arg.protocol_constraint.protocol_name)) return;
+        if (constraint.protocol_constraint.type_params.len != arg.protocol_constraint.type_params.len) return;
+
+        for (constraint.protocol_constraint.type_params, arg.protocol_constraint.type_params) |constraint_arg, actual_arg| {
+            if (try containsTypeVar(self.store, actual_arg, self.allocator)) continue;
+            _ = try self.store.unify(constraint_arg, actual_arg, subs);
+        }
+    }
+
+    fn defaultUnboundTypeVars(self: *const MonomorphContext, type_id: TypeId, default_type: TypeId) TypeWalkError!TypeId {
+        return self.transformType(type_id, .{ .default_unbound = default_type });
+    }
+
+    fn transformType(
+        self: *const MonomorphContext,
+        root: TypeId,
+        mode: TypeTransformMode,
+    ) TypeWalkError!TypeId {
+        var work: std.ArrayListUnmanaged(TypeTransformFrame) = .empty;
+        defer work.deinit(self.allocator);
+        var transformed = std.AutoHashMap(TypeId, TypeId).init(self.allocator);
+        defer transformed.deinit();
+        var visiting = std.AutoHashMap(TypeId, void).init(self.allocator);
+        defer visiting.deinit();
+
+        var nodes_seen: u32 = 0;
+        try work.append(self.allocator, .{ .type_id = root, .depth = 0, .phase = .enter });
+        while (work.pop()) |frame| {
+            if (frame.depth > MAX_TYPE_STRUCTURE_DEPTH) return error.TypeStructureTooDeep;
+            switch (frame.phase) {
+                .enter => {
+                    if (transformed.contains(frame.type_id)) continue;
+                    if (visiting.contains(frame.type_id)) continue;
+                    try visiting.put(frame.type_id, {});
+
+                    nodes_seen += 1;
+                    if (nodes_seen > MAX_TYPE_STRUCTURE_NODES) return error.TypeStructureTooLarge;
+
+                    switch (self.store.getType(frame.type_id)) {
+                        .type_var => {
+                            const replacement = switch (mode) {
+                                .default_unbound => |default_type| default_type,
+                                .active_protocol_params => frame.type_id,
+                            };
+                            try transformed.put(frame.type_id, replacement);
+                            _ = visiting.remove(frame.type_id);
+                        },
+                        .list, .tuple, .function, .map, .applied, .protocol_constraint => {
+                            try work.append(self.allocator, .{ .type_id = frame.type_id, .depth = frame.depth, .phase = .exit });
+                            try self.pushTypeTransformChildren(&work, frame.type_id, frame.depth + 1);
+                        },
+                        else => {
+                            try transformed.put(frame.type_id, frame.type_id);
+                            _ = visiting.remove(frame.type_id);
+                        },
+                    }
+                },
+                .exit => {
+                    _ = visiting.remove(frame.type_id);
+                    try transformed.put(frame.type_id, try self.finishTypeTransform(frame.type_id, mode, &transformed));
+                },
+            }
+        }
+
+        return transformed.get(root) orelse root;
+    }
+
+    fn pushTypeTransformChildren(
+        self: *const MonomorphContext,
+        work: *std.ArrayListUnmanaged(TypeTransformFrame),
+        type_id: TypeId,
+        depth: u32,
+    ) TypeWalkError!void {
+        switch (self.store.getType(type_id)) {
+            .list => |list_type| try work.append(self.allocator, .{ .type_id = list_type.element, .depth = depth, .phase = .enter }),
+            .tuple => |tuple_type| for (tuple_type.elements) |element| {
+                try work.append(self.allocator, .{ .type_id = element, .depth = depth, .phase = .enter });
+            },
+            .function => |function_type| {
+                for (function_type.params) |param| {
+                    try work.append(self.allocator, .{ .type_id = param, .depth = depth, .phase = .enter });
+                }
+                try work.append(self.allocator, .{ .type_id = function_type.return_type, .depth = depth, .phase = .enter });
+            },
+            .map => |map_type| {
+                try work.append(self.allocator, .{ .type_id = map_type.key, .depth = depth, .phase = .enter });
+                try work.append(self.allocator, .{ .type_id = map_type.value, .depth = depth, .phase = .enter });
+            },
+            .applied => |applied_type| {
+                try work.append(self.allocator, .{ .type_id = applied_type.base, .depth = depth, .phase = .enter });
+                for (applied_type.args) |arg| {
+                    try work.append(self.allocator, .{ .type_id = arg, .depth = depth, .phase = .enter });
+                }
+            },
+            .protocol_constraint => |protocol_constraint| for (protocol_constraint.type_params) |type_param| {
+                try work.append(self.allocator, .{ .type_id = type_param, .depth = depth, .phase = .enter });
+            },
+            else => {},
+        }
+    }
+
+    fn transformedChild(transformed: *const std.AutoHashMap(TypeId, TypeId), type_id: TypeId) TypeId {
+        return transformed.get(type_id) orelse type_id;
+    }
+
+    fn finishTypeTransform(
+        self: *const MonomorphContext,
+        type_id: TypeId,
+        mode: TypeTransformMode,
+        transformed: *const std.AutoHashMap(TypeId, TypeId),
+    ) TypeWalkError!TypeId {
+        return switch (self.store.getType(type_id)) {
             .list => |list_type| blk: {
-                const element = self.defaultUnboundTypeVars(list_type.element, default_type);
+                const element = transformedChild(transformed, list_type.element);
                 if (element == list_type.element) break :blk type_id;
-                break :blk self.store.addType(.{ .list = .{ .element = element } }) catch type_id;
+                break :blk try self.store.addType(.{ .list = .{ .element = element } });
             },
             .tuple => |tuple_type| blk: {
                 var changed = false;
-                const elements = self.allocator.alloc(TypeId, tuple_type.elements.len) catch break :blk type_id;
+                for (tuple_type.elements) |element| {
+                    if (transformedChild(transformed, element) != element) {
+                        changed = true;
+                        break;
+                    }
+                }
+                if (!changed) break :blk type_id;
+
+                const elements = try self.allocator.alloc(TypeId, tuple_type.elements.len);
+                errdefer self.allocator.free(elements);
                 for (tuple_type.elements, 0..) |element, index| {
-                    const new_element = self.defaultUnboundTypeVars(element, default_type);
-                    elements[index] = new_element;
-                    if (new_element != element) changed = true;
+                    elements[index] = transformedChild(transformed, element);
                 }
-                if (!changed) {
-                    self.allocator.free(elements);
-                    break :blk type_id;
-                }
-                break :blk self.store.addType(.{ .tuple = .{ .elements = elements } }) catch type_id;
+                const type_count_before_insert = self.store.types.items.len;
+                const new_type_id = try self.store.addType(.{ .tuple = .{ .elements = elements } });
+                if (new_type_id < type_count_before_insert) self.allocator.free(elements);
+                break :blk new_type_id;
             },
             .function => |function_type| blk: {
-                var changed = false;
-                const params = self.allocator.alloc(TypeId, function_type.params.len) catch break :blk type_id;
-                for (function_type.params, 0..) |param, index| {
-                    const new_param = self.defaultUnboundTypeVars(param, default_type);
-                    params[index] = new_param;
-                    if (new_param != param) changed = true;
+                var params_changed = false;
+                for (function_type.params) |param| {
+                    if (transformedChild(transformed, param) != param) {
+                        params_changed = true;
+                        break;
+                    }
                 }
-                const return_type = self.defaultUnboundTypeVars(function_type.return_type, default_type);
-                if (return_type != function_type.return_type) changed = true;
-                if (!changed) {
-                    self.allocator.free(params);
-                    break :blk type_id;
-                }
-                break :blk self.store.addType(.{ .function = .{
+                const return_type = transformedChild(transformed, function_type.return_type);
+                if (!params_changed and return_type == function_type.return_type) break :blk type_id;
+
+                var owned_params: ?[]TypeId = null;
+                errdefer if (owned_params) |params| self.allocator.free(params);
+                const params = if (params_changed) params_blk: {
+                    const new_params = try self.allocator.alloc(TypeId, function_type.params.len);
+                    owned_params = new_params;
+                    for (function_type.params, 0..) |param, index| {
+                        new_params[index] = transformedChild(transformed, param);
+                    }
+                    break :params_blk new_params;
+                } else function_type.params;
+
+                const type_count_before_insert = self.store.types.items.len;
+                const new_type_id = try self.store.addType(.{ .function = .{
                     .params = params,
                     .return_type = return_type,
                     .param_ownerships = function_type.param_ownerships,
                     .return_ownership = function_type.return_ownership,
-                } }) catch type_id;
+                    .raises = function_type.raises,
+                    .effect_var = function_type.effect_var,
+                    .raises_row = function_type.raises_row,
+                } });
+                if (new_type_id < type_count_before_insert) {
+                    if (owned_params) |owned| self.allocator.free(owned);
+                }
+                break :blk new_type_id;
             },
             .map => |map_type| blk: {
-                const key = self.defaultUnboundTypeVars(map_type.key, default_type);
-                const value = self.defaultUnboundTypeVars(map_type.value, default_type);
+                const key = transformedChild(transformed, map_type.key);
+                const value = transformedChild(transformed, map_type.value);
                 if (key == map_type.key and value == map_type.value) break :blk type_id;
-                break :blk self.store.addType(.{ .map = .{ .key = key, .value = value } }) catch type_id;
+                break :blk try self.store.addType(.{ .map = .{ .key = key, .value = value } });
             },
             .applied => |applied_type| blk: {
-                var changed = false;
-                const base = self.defaultUnboundTypeVars(applied_type.base, default_type);
-                if (base != applied_type.base) changed = true;
-                const args = self.allocator.alloc(TypeId, applied_type.args.len) catch break :blk type_id;
+                const base = transformedChild(transformed, applied_type.base);
+                var args_changed = base != applied_type.base;
+                for (applied_type.args) |arg| {
+                    if (transformedChild(transformed, arg) != arg) {
+                        args_changed = true;
+                        break;
+                    }
+                }
+                if (!args_changed) break :blk type_id;
+
+                const args = try self.allocator.alloc(TypeId, applied_type.args.len);
+                errdefer self.allocator.free(args);
                 for (applied_type.args, 0..) |arg, index| {
-                    const new_arg = self.defaultUnboundTypeVars(arg, default_type);
-                    args[index] = new_arg;
-                    if (new_arg != arg) changed = true;
+                    args[index] = transformedChild(transformed, arg);
                 }
-                if (!changed) {
-                    self.allocator.free(args);
-                    break :blk type_id;
-                }
-                break :blk self.store.addType(.{ .applied = .{ .base = base, .args = args } }) catch type_id;
+                const type_count_before_insert = self.store.types.items.len;
+                const new_type_id = try self.store.addType(.{ .applied = .{ .base = base, .args = args } });
+                if (new_type_id < type_count_before_insert) self.allocator.free(args);
+                break :blk new_type_id;
             },
             .protocol_constraint => |protocol_constraint| blk: {
-                var changed = false;
-                const type_params = self.allocator.alloc(TypeId, protocol_constraint.type_params.len) catch break :blk type_id;
-                for (protocol_constraint.type_params, 0..) |type_param, index| {
-                    const new_type_param = self.defaultUnboundTypeVars(type_param, default_type);
-                    type_params[index] = new_type_param;
-                    if (new_type_param != type_param) changed = true;
+                var params_changed = false;
+                for (protocol_constraint.type_params) |type_param| {
+                    if (transformedChild(transformed, type_param) != type_param) {
+                        params_changed = true;
+                        break;
+                    }
                 }
-                if (!changed) {
-                    self.allocator.free(type_params);
-                    break :blk type_id;
-                }
-                break :blk self.store.addType(.{ .protocol_constraint = .{
-                    .protocol_name = protocol_constraint.protocol_name,
-                    .type_params = type_params,
-                } }) catch type_id;
+
+                const candidate_type = if (params_changed) candidate_blk: {
+                    const type_params = try self.allocator.alloc(TypeId, protocol_constraint.type_params.len);
+                    errdefer self.allocator.free(type_params);
+                    for (protocol_constraint.type_params, 0..) |type_param, index| {
+                        type_params[index] = transformedChild(transformed, type_param);
+                    }
+                    const type_count_before_insert = self.store.types.items.len;
+                    const new_type_id = try self.store.addType(.{ .protocol_constraint = .{
+                        .protocol_name = protocol_constraint.protocol_name,
+                        .type_params = type_params,
+                    } });
+                    if (new_type_id < type_count_before_insert) self.allocator.free(type_params);
+                    break :candidate_blk new_type_id;
+                } else type_id;
+
+                break :blk switch (mode) {
+                    .active_protocol_params => (try self.protocolConstraintReplacement(candidate_type)) orelse candidate_type,
+                    .default_unbound => candidate_type,
+                };
             },
             else => type_id,
         };
@@ -483,8 +1159,8 @@ const MonomorphContext = struct {
         constraint: types_mod.Type.ProtocolConstraintType,
         subs: ?*const SubstitutionMap,
         allow_default: bool,
-    ) TypeId {
-        const list_default = self.store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } }) catch return types_mod.TypeStore.UNKNOWN;
+    ) TypeWalkError!TypeId {
+        const list_default = try self.store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } });
         const list_struct = self.store.typeToStructName(list_default, self.interner) orelse return types_mod.TypeStore.UNKNOWN;
 
         for (self.program.impls) |impl_info| {
@@ -497,18 +1173,18 @@ const MonomorphContext = struct {
 
             for (impl_info.protocol_type_args, constraint.type_params) |impl_arg, constraint_arg| {
                 const effective_constraint_arg = if (subs) |active_subs|
-                    active_subs.applyToType(self.store, constraint_arg)
+                    try active_subs.applyToType(self.store, constraint_arg)
                 else
                     constraint_arg;
-                if (!self.isConcreteRuntimeType(effective_constraint_arg)) continue;
-                _ = self.store.unify(impl_arg, effective_constraint_arg, &impl_subs) catch {};
+                if (!(try self.isConcreteRuntimeType(effective_constraint_arg))) continue;
+                _ = try self.store.unify(impl_arg, effective_constraint_arg, &impl_subs);
             }
 
-            var inferred = impl_subs.applyToType(self.store, impl_info.target_type_pattern);
-            if (!self.isConcreteRuntimeType(inferred) and allow_default) {
-                inferred = self.defaultUnboundTypeVars(inferred, types_mod.TypeStore.I64);
+            var inferred = try impl_subs.applyToType(self.store, impl_info.target_type_pattern);
+            if (!(try self.isConcreteRuntimeType(inferred)) and allow_default) {
+                inferred = try self.defaultUnboundTypeVars(inferred, types_mod.TypeStore.I64);
             }
-            if (self.isConcreteRuntimeType(inferred)) return inferred;
+            if (try self.isConcreteRuntimeType(inferred)) return inferred;
             if (allow_default and self.typeImplementsProtocol(constraint.protocol_name, list_default)) return list_default;
         }
 
@@ -518,36 +1194,48 @@ const MonomorphContext = struct {
             types_mod.TypeStore.UNKNOWN;
     }
 
-    fn isConcreteRuntimeType(self: *const MonomorphContext, type_id: TypeId) bool {
+    fn isConcreteRuntimeType(self: *const MonomorphContext, type_id: TypeId) TypeWalkError!bool {
+        return self.runtimeTypePredicate(type_id, .concrete);
+    }
+
+    fn runtimeTypePredicate(
+        self: *const MonomorphContext,
+        type_id: TypeId,
+        predicate: RuntimeTypePredicate,
+    ) TypeWalkError!bool {
         if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return false;
-        const typ = self.store.getType(type_id);
-        return switch (typ) {
-            .unknown, .error_type, .type_var, .protocol_constraint => false,
-            .list => |list_type| self.isConcreteRuntimeType(list_type.element),
-            .tuple => |tuple_type| {
-                for (tuple_type.elements) |element| {
-                    if (!self.isConcreteRuntimeType(element)) return false;
-                }
-                return true;
-            },
-            .function => |function_type| {
-                for (function_type.params) |param| {
-                    if (!self.isConcreteRuntimeType(param)) return false;
-                }
-                return self.isConcreteRuntimeType(function_type.return_type);
-            },
-            .map => |map_type| self.isConcreteRuntimeType(map_type.key) and
-                self.isConcreteRuntimeType(map_type.value),
-            .applied => |applied_type| {
-                if (!self.isConcreteRuntimeType(applied_type.base)) return false;
-                for (applied_type.args) |arg| {
-                    if (!self.isConcreteRuntimeType(arg)) return false;
-                }
-                return true;
-            },
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .term_type => true,
-            .struct_type, .union_type, .tagged_union, .opaque_type => true,
-        };
+        var walker = TypeWalker.init(self.allocator);
+        defer walker.deinit();
+
+        try walker.pushRoot(type_id);
+        while (try walker.next()) |item| {
+            const next_depth = item.depth + 1;
+            switch (self.store.getType(item.type_id)) {
+                .unknown, .error_type, .type_var => return false,
+                .protocol_constraint => {
+                    if (predicate == .concrete) return false;
+                },
+                .list => |list_type| try walker.pushType(list_type.element, next_depth, false),
+                .tuple => |tuple_type| {
+                    for (tuple_type.elements) |element| try walker.pushType(element, next_depth, false);
+                },
+                .function => |function_type| {
+                    for (function_type.params) |param| try walker.pushType(param, next_depth, false);
+                    try walker.pushType(function_type.return_type, next_depth, false);
+                },
+                .map => |map_type| {
+                    try walker.pushType(map_type.key, next_depth, false);
+                    try walker.pushType(map_type.value, next_depth, false);
+                },
+                .applied => |applied_type| {
+                    try walker.pushType(applied_type.base, next_depth, false);
+                    for (applied_type.args) |arg| try walker.pushType(arg, next_depth, false);
+                },
+                .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .term_type => {},
+                .struct_type, .union_type, .tagged_union, .opaque_type => {},
+            }
+        }
+        return true;
     }
 
     /// Like `isConcreteRuntimeType`, but a `protocol_constraint` existential
@@ -567,38 +1255,8 @@ const MonomorphContext = struct {
     /// it (otherwise the call resolves to an un-emitted generic
     /// `List__get__2`). Containers recurse so `[fn(i64) -> i64]`'s element is
     /// recognized as ready. A free `type_var` is still NOT ready.
-    fn typeArgIsMonomorphizationReady(self: *const MonomorphContext, type_id: TypeId) bool {
-        if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return false;
-        const typ = self.store.getType(type_id);
-        return switch (typ) {
-            .unknown, .error_type, .type_var => false,
-            // A boxed existential is concrete at runtime (ProtocolBox).
-            .protocol_constraint => true,
-            .list => |list_type| self.typeArgIsMonomorphizationReady(list_type.element),
-            .tuple => |tuple_type| {
-                for (tuple_type.elements) |element| {
-                    if (!self.typeArgIsMonomorphizationReady(element)) return false;
-                }
-                return true;
-            },
-            .function => |function_type| {
-                for (function_type.params) |param| {
-                    if (!self.typeArgIsMonomorphizationReady(param)) return false;
-                }
-                return self.typeArgIsMonomorphizationReady(function_type.return_type);
-            },
-            .map => |map_type| self.typeArgIsMonomorphizationReady(map_type.key) and
-                self.typeArgIsMonomorphizationReady(map_type.value),
-            .applied => |applied_type| {
-                if (!self.typeArgIsMonomorphizationReady(applied_type.base)) return false;
-                for (applied_type.args) |arg| {
-                    if (!self.typeArgIsMonomorphizationReady(arg)) return false;
-                }
-                return true;
-            },
-            .int, .float, .bool_type, .string_type, .atom_type, .nil_type, .never, .term_type => true,
-            .struct_type, .union_type, .tagged_union, .opaque_type => true,
-        };
+    fn typeArgIsMonomorphizationReady(self: *const MonomorphContext, type_id: TypeId) TypeWalkError!bool {
+        return self.runtimeTypePredicate(type_id, .monomorphization_ready);
     }
 
     fn resolveCallArgumentType(
@@ -607,19 +1265,19 @@ const MonomorphContext = struct {
         param_type: ?TypeId,
         subs: ?*const SubstitutionMap,
         allow_default_empty_protocol_list: bool,
-    ) TypeId {
+    ) TypeWalkError!TypeId {
         var arg_type = arg.expr.type_id;
 
         // If the argument is a call that was already specialized, use
         // the specialization's return type as the arg type. This handles
         // nested calls like List.empty?(Enum.map([], f)) where the inner
         // call has a concrete return type.
-        if (!self.isConcreteRuntimeType(arg_type) and arg.expr.kind == .call) {
+        if (!(try self.isConcreteRuntimeType(arg_type)) and arg.expr.kind == .call) {
             if (self.call_rewrites.get(@intFromPtr(arg.expr))) |spec_id| {
                 for (self.new_groups.items) |entry| {
                     if (entry.group.id == spec_id and entry.group.clauses.len > 0) {
                         const spec_ret = entry.group.clauses[0].return_type;
-                        if (self.isConcreteRuntimeType(spec_ret)) {
+                        if (try self.isConcreteRuntimeType(spec_ret)) {
                             arg_type = spec_ret;
                         }
                         break;
@@ -654,7 +1312,7 @@ const MonomorphContext = struct {
             const pidx = arg.expr.kind.param_get;
             if (pidx < self.current_scan_params.?.len) {
                 const scan_param_type = self.current_scan_params.?[pidx].type_id;
-                if (self.typeArgIsMonomorphizationReady(scan_param_type)) {
+                if (try self.typeArgIsMonomorphizationReady(scan_param_type)) {
                     arg_type = scan_param_type;
                 }
             }
@@ -676,9 +1334,9 @@ const MonomorphContext = struct {
         // leaving the higher-order callee unspecialized (the call site then
         // references a dropped generic group). The boxed existential's own
         // type is the truth; keep it.
-        if (!self.isConcreteRuntimeType(arg_type) and
+        if (!(try self.isConcreteRuntimeType(arg_type)) and
             self.store.getType(arg_type) != .protocol_constraint and
-            self.isConcreteRuntimeType(arg.expected_type))
+            (try self.isConcreteRuntimeType(arg.expected_type)))
         {
             arg_type = arg.expected_type;
         }
@@ -690,39 +1348,39 @@ const MonomorphContext = struct {
         // specialized as `[i64]`). We only do this when the parameter is
         // fully concrete; if it still has type variables (generic context),
         // let the unifier handle it.
-        if (!self.isConcreteRuntimeType(arg_type)) {
+        if (!(try self.isConcreteRuntimeType(arg_type))) {
             if (param_type) |pt| {
-                const effective_param_type = if (subs) |active_subs| active_subs.applyToType(self.store, pt) else pt;
+                const effective_param_type = if (subs) |active_subs| try active_subs.applyToType(self.store, pt) else pt;
                 const param_typ = self.store.getType(effective_param_type);
                 switch (param_typ) {
                     .list => |list_t| {
-                        if (arg.expr.kind == .list_init and self.isConcreteRuntimeType(list_t.element)) {
+                        if (arg.expr.kind == .list_init and (try self.isConcreteRuntimeType(list_t.element))) {
                             arg_type = effective_param_type;
                         } else if (arg.expr.kind == .list_init and
                             arg.expr.kind.list_init.len == 0 and
                             allow_default_empty_protocol_list)
                         {
-                            const inferred = self.defaultUnboundTypeVars(effective_param_type, types_mod.TypeStore.I64);
-                            if (self.isConcreteRuntimeType(inferred)) arg_type = inferred;
+                            const inferred = try self.defaultUnboundTypeVars(effective_param_type, types_mod.TypeStore.I64);
+                            if (try self.isConcreteRuntimeType(inferred)) arg_type = inferred;
                         }
                     },
                     .map => |map_t| {
                         if (arg.expr.kind == .map_init and
-                            self.isConcreteRuntimeType(map_t.key) and
-                            self.isConcreteRuntimeType(map_t.value))
+                            (try self.isConcreteRuntimeType(map_t.key)) and
+                            (try self.isConcreteRuntimeType(map_t.value)))
                         {
                             arg_type = effective_param_type;
                         } else if (arg.expr.kind == .map_init and
                             arg.expr.kind.map_init.len == 0 and
                             allow_default_empty_protocol_list)
                         {
-                            const inferred = self.defaultUnboundTypeVars(effective_param_type, types_mod.TypeStore.I64);
-                            if (self.isConcreteRuntimeType(inferred)) arg_type = inferred;
+                            const inferred = try self.defaultUnboundTypeVars(effective_param_type, types_mod.TypeStore.I64);
+                            if (try self.isConcreteRuntimeType(inferred)) arg_type = inferred;
                         }
                     },
                     .protocol_constraint => |protocol_constraint| {
                         if (arg.expr.kind == .list_init and arg.expr.kind.list_init.len == 0) {
-                            const inferred = self.inferEmptyListProtocolReceiverType(
+                            const inferred = try self.inferEmptyListProtocolReceiverType(
                                 protocol_constraint,
                                 subs,
                                 allow_default_empty_protocol_list,
@@ -738,7 +1396,7 @@ const MonomorphContext = struct {
         return arg_type;
     }
 
-    fn effectiveExprType(self: *const MonomorphContext, expr: *const hir.Expr) TypeId {
+    fn effectiveExprType(self: *const MonomorphContext, expr: *const hir.Expr) TypeWalkError!TypeId {
         var type_id = expr.type_id;
 
         switch (expr.kind) {
@@ -753,13 +1411,13 @@ const MonomorphContext = struct {
                     // monomorphization-ready type that is not narrowly
                     // `isConcreteRuntimeType` — so a specialized combinator's
                     // boxed-`Callable` parameter type flows for nested calls.
-                    if (param_index < params.len and self.typeArgIsMonomorphizationReady(params[param_index].type_id)) {
+                    if (param_index < params.len and (try self.typeArgIsMonomorphizationReady(params[param_index].type_id))) {
                         type_id = params[param_index].type_id;
                     }
                 }
             },
             .call => {
-                if (!self.isConcreteRuntimeType(type_id)) {
+                if (!(try self.isConcreteRuntimeType(type_id))) {
                     if (self.call_rewrites.get(@intFromPtr(expr))) |rewritten_group_id| {
                         if (self.findFunctionGroupById(rewritten_group_id)) |group| {
                             // FCC unified model: a devirtualized `Enumerable.next`
@@ -772,7 +1430,7 @@ const MonomorphContext = struct {
                             // recursive combinator call re-specializes for the
                             // boxed element. `typeArgIsMonomorphizationReady`
                             // accepts the boxed-element tuple, rejects free vars.
-                            if (group.clauses.len > 0 and self.typeArgIsMonomorphizationReady(group.clauses[0].return_type)) {
+                            if (group.clauses.len > 0 and (try self.typeArgIsMonomorphizationReady(group.clauses[0].return_type))) {
                                 type_id = group.clauses[0].return_type;
                             }
                         }
@@ -805,7 +1463,7 @@ const MonomorphContext = struct {
         bindings: []const hir.CaseBinding,
         binding_index: *usize,
         type_id: TypeId,
-    ) !void {
+    ) MonomorphWalkError!void {
         if (binding_index.* >= bindings.len) return;
         defer binding_index.* += 1;
 
@@ -816,17 +1474,20 @@ const MonomorphContext = struct {
         // it (`map_next(next_state, ...)`) re-specializes for the boxed element.
         // `typeArgIsMonomorphizationReady` accepts it while rejecting genuine
         // free type variables (a generic-context binding stays untracked).
-        if (!self.typeArgIsMonomorphizationReady(type_id)) return;
+        if (!(try self.typeArgIsMonomorphizationReady(type_id))) return;
         try self.local_types.put(bindings[binding_index.*].local_index, type_id);
     }
 
-    fn recordCasePatternLocalTypes(
+    fn recordCasePatternLocalTypesBudgeted(
         self: *MonomorphContext,
         pattern: *const hir.MatchPattern,
         parent_type: TypeId,
         bindings: []const hir.CaseBinding,
         binding_index: *usize,
-    ) !void {
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) MonomorphWalkError!void {
+        try budget.enter(depth);
         switch (pattern.*) {
             .wildcard, .literal, .pin => {},
             .bind => |name| {
@@ -840,23 +1501,23 @@ const MonomorphContext = struct {
                         parent_typ.tuple.elements[element_index]
                     else
                         types_mod.TypeStore.UNKNOWN;
-                    try self.recordCasePatternLocalTypes(element, element_type, bindings, binding_index);
+                    try self.recordCasePatternLocalTypesBudgeted(element, element_type, bindings, binding_index, budget, depth + 1);
                 }
             },
             .list => |elements| {
                 const parent_typ = self.store.getType(parent_type);
                 const element_type = if (parent_typ == .list) parent_typ.list.element else types_mod.TypeStore.UNKNOWN;
                 for (elements) |element| {
-                    try self.recordCasePatternLocalTypes(element, element_type, bindings, binding_index);
+                    try self.recordCasePatternLocalTypesBudgeted(element, element_type, bindings, binding_index, budget, depth + 1);
                 }
             },
             .list_cons => |list_cons| {
                 const parent_typ = self.store.getType(parent_type);
                 const element_type = if (parent_typ == .list) parent_typ.list.element else types_mod.TypeStore.UNKNOWN;
                 for (list_cons.heads) |head| {
-                    try self.recordCasePatternLocalTypes(head, element_type, bindings, binding_index);
+                    try self.recordCasePatternLocalTypesBudgeted(head, element_type, bindings, binding_index, budget, depth + 1);
                 }
-                try self.recordCasePatternLocalTypes(list_cons.tail, parent_type, bindings, binding_index);
+                try self.recordCasePatternLocalTypesBudgeted(list_cons.tail, parent_type, bindings, binding_index, budget, depth + 1);
             },
             .struct_match => |struct_match| {
                 const parent_typ = self.store.getType(parent_type);
@@ -882,7 +1543,7 @@ const MonomorphContext = struct {
                         for (decl_struct.type_params[0..pair_count], parent_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
                             const formal_typ = self.store.getType(formal_id);
                             if (formal_typ != .type_var) continue;
-                            subs.bind(formal_typ.type_var, arg_id);
+                            try subs.bind(formal_typ.type_var, arg_id);
                         }
                         break :blk .{ decl_struct, @as(?SubstitutionMap, subs) };
                     }
@@ -900,17 +1561,17 @@ const MonomorphContext = struct {
                     }
                     if (subs_mut) |*subs| {
                         if (field_type != types_mod.TypeStore.UNKNOWN) {
-                            field_type = subs.applyToType(self.store, field_type);
+                            field_type = try subs.applyToType(self.store, field_type);
                         }
                     }
-                    try self.recordCasePatternLocalTypes(field.pattern, field_type, bindings, binding_index);
+                    try self.recordCasePatternLocalTypesBudgeted(field.pattern, field_type, bindings, binding_index, budget, depth + 1);
                 }
             },
             .map_match => |map_match| {
                 const parent_typ = self.store.getType(parent_type);
                 const value_type = if (parent_typ == .map) parent_typ.map.value else types_mod.TypeStore.UNKNOWN;
                 for (map_match.field_bindings) |field| {
-                    try self.recordCasePatternLocalTypes(field.pattern, value_type, bindings, binding_index);
+                    try self.recordCasePatternLocalTypesBudgeted(field.pattern, value_type, bindings, binding_index, budget, depth + 1);
                 }
             },
             .binary_match => |binary_match| {
@@ -948,7 +1609,7 @@ const MonomorphContext = struct {
                         for (decl_union.type_params[0..pair_count], parent_typ.applied.args[0..pair_count]) |formal_id, arg_id| {
                             const formal_typ = self.store.getType(formal_id);
                             if (formal_typ != .type_var) continue;
-                            subs.bind(formal_typ.type_var, arg_id);
+                            try subs.bind(formal_typ.type_var, arg_id);
                         }
                         break :blk .{ decl_union, @as(?SubstitutionMap, subs) };
                     }
@@ -967,10 +1628,10 @@ const MonomorphContext = struct {
                 }
                 if (subs_mut) |*subs| {
                     if (payload_type != types_mod.TypeStore.UNKNOWN) {
-                        payload_type = subs.applyToType(self.store, payload_type);
+                        payload_type = try subs.applyToType(self.store, payload_type);
                     }
                 }
-                try self.recordCasePatternLocalTypes(payload_pat, payload_type, bindings, binding_index);
+                try self.recordCasePatternLocalTypesBudgeted(payload_pat, payload_type, bindings, binding_index, budget, depth + 1);
             },
         }
     }
@@ -1004,7 +1665,7 @@ const MonomorphContext = struct {
     /// as `Zap_Foo.method` never matches `mod.name.parts == ["Zap", "Foo"]`
     /// (whose last segment is `Foo`), so the call is never specialized and the
     /// caller emits a reference to a function that is never produced.
-    fn structNameMatchesQualifier(self: *const MonomorphContext, mod_name: ast.StructName, qualifier: []const u8) bool {
+    fn structNameMatchesQualifier(self: *const MonomorphContext, mod_name: ast.StructName, qualifier: []const u8) Allocator.Error!bool {
         if (mod_name.parts.len == 0) return false;
 
         const last_part = self.interner.get(mod_name.parts[mod_name.parts.len - 1]);
@@ -1013,18 +1674,18 @@ const MonomorphContext = struct {
         // Single-segment names are fully covered by the last-part check above.
         if (mod_name.parts.len == 1) return false;
 
-        const underscore_joined = mod_name.joinedWith(self.allocator, self.interner, "_") catch return false;
+        const underscore_joined = try mod_name.joinedWith(self.allocator, self.interner, "_");
         defer self.allocator.free(underscore_joined);
         if (std.mem.eql(u8, underscore_joined, qualifier)) return true;
 
-        const dotted = mod_name.joinedWith(self.allocator, self.interner, ".") catch return false;
+        const dotted = try mod_name.joinedWith(self.allocator, self.interner, ".");
         defer self.allocator.free(dotted);
         if (std.mem.eql(u8, dotted, qualifier)) return true;
 
         return false;
     }
 
-    fn resolveNamedCall(self: *const MonomorphContext, nc: hir.NamedCall, arity: u32) ?u32 {
+    fn resolveNamedCall(self: *const MonomorphContext, nc: hir.NamedCall, arity: u32) Allocator.Error!?u32 {
         const target_struct = nc.struct_name orelse return null;
         for (self.program.structs) |mod| {
             // Check if this struct's name matches the target. The qualifier may
@@ -1032,7 +1693,7 @@ const MonomorphContext = struct {
             // `structNameToString` output for cross-struct calls), or the
             // canonical dotted form — match all three for multi-segment user
             // structs (e.g. `Zap.CombinatorFactory`).
-            if (!self.structNameMatchesQualifier(mod.name, target_struct)) continue;
+            if (!try self.structNameMatchesQualifier(mod.name, target_struct)) continue;
             // Search for the function by name and arity
             for (mod.functions) |*group| {
                 const group_name = self.interner.get(group.name);
@@ -1057,11 +1718,11 @@ const MonomorphContext = struct {
         target: hir.CallTarget,
         arity: usize,
         arg_index: usize,
-    ) ?TypeId {
+    ) Allocator.Error!?TypeId {
         const group_id = switch (target) {
             .direct => |direct| direct.function_group_id,
             .dispatch => |dispatch| dispatch.function_group_id,
-            .named => |named| self.resolveNamedCall(named, @intCast(arity)) orelse return null,
+            .named => |named| (try self.resolveNamedCall(named, @intCast(arity))) orelse return null,
             else => return null,
         };
         const group = self.findFunctionGroupById(group_id) orelse return null;
@@ -1072,24 +1733,66 @@ const MonomorphContext = struct {
         return group.clauses[clause_index].params[arg_index].type_id;
     }
 
+    fn callTargetGroupId(self: *const MonomorphContext, target: hir.CallTarget, arity: usize) Allocator.Error!?u32 {
+        return switch (target) {
+            .direct => |direct| direct.function_group_id,
+            .dispatch => |dispatch| dispatch.function_group_id,
+            .named => |named| (try self.resolveNamedCall(named, @intCast(arity))) orelse return null,
+            else => null,
+        };
+    }
+
+    fn modeForOwnership(ownership: hir.Ownership) hir.ValueMode {
+        return switch (ownership) {
+            .shared => .share,
+            .unique => .move,
+            .borrowed => .borrow,
+        };
+    }
+
+    fn applyTargetArgModes(self: *const MonomorphContext, target: hir.CallTarget, args: []hir.CallArg) Allocator.Error!void {
+        const group_id = (try self.callTargetGroupId(target, args.len)) orelse return;
+        const group = self.findFunctionGroupById(group_id) orelse return;
+        if (group.clauses.len == 0) return;
+        const clause_index = callTargetClauseIndex(target);
+        if (clause_index >= group.clauses.len) return;
+        const params = group.clauses[clause_index].params;
+        const count = @min(args.len, params.len);
+        for (args[0..count], params[0..count]) |*arg, param| {
+            if (!param.ownership_explicit) continue;
+            arg.mode = modeForOwnership(param.ownership);
+        }
+    }
+
     fn scanBlock(self: *MonomorphContext, block: *const hir.Block) error{OutOfMemory}!void {
+        var budget = HirWalkBudget{};
+        self.scanBlockBudgeted(block, &budget, 0) catch |err| {
+            try self.appendWalkBudgetError(blockSpan(block), "HIR scan", err);
+        };
+    }
+
+    fn scanBlockBudgeted(
+        self: *MonomorphContext,
+        block: *const hir.Block,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) MonomorphWalkError!void {
+        try budget.enter(depth);
         for (block.stmts) |stmt| {
             switch (stmt) {
-                .expr => |e| try self.scanExpr(e),
+                .expr => |e| try self.scanExprBudgeted(e, budget, depth + 1),
                 .local_set => |ls| {
-                    try self.scanExpr(ls.value);
-                    const val_type = self.effectiveExprType(ls.value);
-                    if (!self.store.containsTypeVars(val_type) and val_type != types_mod.TypeStore.UNKNOWN) {
+                    try self.scanExprBudgeted(ls.value, budget, depth + 1);
+                    const val_type = try self.effectiveExprType(ls.value);
+                    if (!(try self.store.containsTypeVars(val_type)) and val_type != types_mod.TypeStore.UNKNOWN) {
                         try self.local_types.put(ls.index, val_type);
                     }
                     // Also track the type when the value is a list_init with known element types
                     if (val_type == types_mod.TypeStore.UNKNOWN and ls.value.kind == .list_init) {
                         const elems = ls.value.kind.list_init;
                         if (elems.len > 0 and elems[0].type_id != types_mod.TypeStore.UNKNOWN) {
-                            const inferred = self.store.addType(.{ .list = .{ .element = elems[0].type_id } }) catch types_mod.TypeStore.UNKNOWN;
-                            if (inferred != types_mod.TypeStore.UNKNOWN) {
-                                try self.local_types.put(ls.index, inferred);
-                            }
+                            const inferred = try self.store.addType(.{ .list = .{ .element = elems[0].type_id } });
+                            try self.local_types.put(ls.index, inferred);
                         }
                     }
                 },
@@ -1110,7 +1813,7 @@ const MonomorphContext = struct {
                         var snapshot = try self.cloneLocalTypes();
                         defer snapshot.deinit();
                         self.local_types.clearRetainingCapacity();
-                        try self.scanBlock(clause.body);
+                        try self.scanBlockBudgeted(clause.body, budget, depth + 1);
                         self.restoreLocalTypes(&snapshot);
                     }
                 },
@@ -1119,11 +1822,24 @@ const MonomorphContext = struct {
     }
 
     fn scanExpr(self: *MonomorphContext, expr: *const hir.Expr) error{OutOfMemory}!void {
+        var budget = HirWalkBudget{};
+        self.scanExprBudgeted(expr, &budget, 0) catch |err| {
+            try self.appendWalkBudgetError(expr.span, "HIR expression scan", err);
+        };
+    }
+
+    fn scanExprBudgeted(
+        self: *MonomorphContext,
+        expr: *const hir.Expr,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) MonomorphWalkError!void {
+        try budget.enter(depth);
         switch (expr.kind) {
             .call => |call| {
                 // Scan args first (may contain nested calls)
                 for (call.args) |arg| {
-                    try self.scanExpr(arg.expr);
+                    try self.scanExprBudgeted(arg.expr, budget, depth + 1);
                 }
 
                 // An implicit value-call (`expr(args)`) carries its callee as a
@@ -1141,7 +1857,7 @@ const MonomorphContext = struct {
                 // bound-local / param callee (`g = List.get(..); g(v)`) is
                 // already covered because its producing `local_set` was scanned.
                 if (call.target == .closure) {
-                    try self.scanExpr(call.target.closure);
+                    try self.scanExprBudgeted(call.target.closure, budget, depth + 1);
                 }
 
                 // Check if this calls a generic function or a protocol function
@@ -1165,8 +1881,8 @@ const MonomorphContext = struct {
                             // `typeArgIsMonomorphizationReady` accepts the boxed-
                             // element collection while rejecting free type vars.
                             if (call.args.len > 0) {
-                                const arg_type = self.resolveCallArgumentType(call.args[0], null, null, true);
-                                if (self.typeArgIsMonomorphizationReady(arg_type)) {
+                                const arg_type = try self.resolveCallArgumentType(call.args[0], null, null, true);
+                                if (try self.typeArgIsMonomorphizationReady(arg_type)) {
                                     if (self.resolveProtocolDispatch(proto_name, nc.name, arg_type, @intCast(call.args.len))) |impl_gid| {
                                         protocol_resolved_target = true;
                                         break :blk impl_gid;
@@ -1175,7 +1891,7 @@ const MonomorphContext = struct {
                             }
                             return; // Can't resolve protocol dispatch — skip
                         }
-                        const resolved = self.resolveNamedCall(nc, @intCast(call.args.len)) orelse return;
+                        const resolved = (try self.resolveNamedCall(nc, @intCast(call.args.len))) orelse return;
                         break :blk resolved;
                     },
                     else => return,
@@ -1210,18 +1926,19 @@ const MonomorphContext = struct {
                 for (0..2) |pass| {
                     const allow_default_empty_protocol_list = pass == 1;
                     for (selected_clause.params, call.args, 0..) |param, arg, param_index| {
-                        const arg_type = self.resolveCallArgumentType(
+                        const arg_type = try self.resolveCallArgumentType(
                             arg,
                             param.type_id,
                             &subs,
                             allow_default_empty_protocol_list,
                         );
                         if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
-                        if (self.protocolParamConcreteType(param.type_id, arg_type)) |concrete_protocol_type| {
+                        if (try self.protocolParamConcreteType(param.type_id, arg_type)) |concrete_protocol_type| {
                             protocol_param_types[param_index] = concrete_protocol_type;
                             try self.bindProtocolTypeArgsFromImpl(param.type_id, concrete_protocol_type, &subs);
                         }
-                        _ = self.store.unify(param.type_id, arg_type, &subs) catch {};
+                        try self.bindProtocolTypeArgsFromConstraintArg(param.type_id, arg_type, &subs);
+                        _ = try self.store.unify(param.type_id, arg_type, &subs);
                     }
                 }
 
@@ -1240,9 +1957,9 @@ const MonomorphContext = struct {
                 // against the generic return before deciding whether this call
                 // has enough type arguments to specialize.
                 {
-                    const contextual_return = self.effectiveExprType(expr);
-                    if (self.isConcreteRuntimeType(contextual_return)) {
-                        _ = self.store.unify(selected_clause.return_type, contextual_return, &subs) catch {};
+                    const contextual_return = try self.effectiveExprType(expr);
+                    if (try self.isConcreteRuntimeType(contextual_return)) {
+                        _ = try self.store.unify(selected_clause.return_type, contextual_return, &subs);
                     }
                 }
 
@@ -1281,13 +1998,13 @@ const MonomorphContext = struct {
                 // (Map.get-style) is the only configuration left
                 // untouched, preserving its narrow-binding behaviour.
                 {
-                    const return_uses_var_as_scalar = scalarTypeVarSet(self.store, selected_clause.return_type, self.allocator) catch null;
-                    var return_scalar_set = return_uses_var_as_scalar orelse std.AutoHashMap(types_mod.TypeVarId, void).init(self.allocator);
+                    const return_uses_var_as_scalar = try self.scalarTypeVarSetForReturn(generic_group, selected_clause.return_type, expr.span);
+                    var return_scalar_set = return_uses_var_as_scalar orelse return;
                     defer return_scalar_set.deinit();
                     for (selected_clause.params, call.args) |param, arg| {
-                        const arg_type = self.resolveCallArgumentType(arg, param.type_id, &subs, true);
+                        const arg_type = try self.resolveCallArgumentType(arg, param.type_id, &subs, true);
                         if (arg_type == types_mod.TypeStore.UNKNOWN or arg_type == types_mod.TypeStore.ERROR) continue;
-                        promoteContainerVarsExceptScalarReturn(self.store, param.type_id, arg_type, &return_scalar_set, &subs);
+                        if (!try self.promoteContainerVarsForCall(generic_group, param.type_id, arg_type, &return_scalar_set, &subs, expr.span)) return;
                     }
                 }
 
@@ -1311,7 +2028,7 @@ const MonomorphContext = struct {
                         try type_args.append(self.allocator, protocol_type);
                     }
                 }
-                if (self.hasUnboundProtocolParams(selected_clause.params, protocol_param_types)) return;
+                if (try self.hasUnboundProtocolParams(selected_clause.params, protocol_param_types, &subs)) return;
 
                 if (type_args.items.len == 0) return;
 
@@ -1326,7 +2043,7 @@ const MonomorphContext = struct {
                 {
                     var has_unresolved_type = false;
                     for (type_args.items) |ta| {
-                        if (!self.typeArgIsMonomorphizationReady(ta)) {
+                        if (!(try self.typeArgIsMonomorphizationReady(ta))) {
                             has_unresolved_type = true;
                             break;
                         }
@@ -1347,20 +2064,87 @@ const MonomorphContext = struct {
                     // Apply subs to the GENERIC GROUP's return type (which uses the
                     // same type var IDs as the subs), NOT expr.type_id (which uses
                     // different type var IDs from the HIR builder's scope).
-                    if (!self.isConcreteRuntimeType(expr.type_id)) {
-                        const concrete_return = subs.applyToType(self.store, selected_clause.return_type);
-                        if (self.isConcreteRuntimeType(concrete_return)) {
+                    if (!(try self.isConcreteRuntimeType(expr.type_id))) {
+                        const concrete_return = try subs.applyToType(self.store, selected_clause.return_type);
+                        if (try self.isConcreteRuntimeType(concrete_return)) {
                             @constCast(expr).type_id = concrete_return;
                         }
                     }
                     return;
                 }
 
+                if (!try self.specializationWithinBudget(generic_group, type_args.items, expr.span)) return;
+
                 // Create specialized clone
                 const new_id = self.next_group_id.*;
+                const specialized = self.cloneGroupWithSubs(generic_group, &subs, protocol_param_types, type_args.items, new_id, selected_clause_index) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.HirStructureTooDeep => {
+                        try self.appendError(
+                            expr.span,
+                            "monomorphization clone for generic `{s}/{d}` exceeds maximum HIR nesting depth ({d})",
+                            .{ self.interner.get(generic_group.name), generic_group.arity, MAX_HIR_STRUCTURE_DEPTH },
+                        );
+                        return;
+                    },
+                    error.HirStructureTooLarge => {
+                        try self.appendError(
+                            expr.span,
+                            "monomorphization clone for generic `{s}/{d}` contains more than {d} HIR nodes",
+                            .{ self.interner.get(generic_group.name), generic_group.arity, MAX_HIR_STRUCTURE_NODES },
+                        );
+                        return;
+                    },
+                    error.TypeStructureTooDeep => {
+                        try self.appendError(
+                            expr.span,
+                            "monomorphization type substitution for generic `{s}/{d}` exceeds maximum type nesting depth ({d})",
+                            .{ self.interner.get(generic_group.name), generic_group.arity, MAX_TYPE_STRUCTURE_DEPTH },
+                        );
+                        return;
+                    },
+                    error.TypeStructureTooLarge => {
+                        try self.appendError(
+                            expr.span,
+                            "monomorphization type substitution for generic `{s}/{d}` contains more than {d} unique type nodes",
+                            .{ self.interner.get(generic_group.name), generic_group.arity, MAX_TYPE_STRUCTURE_NODES },
+                        );
+                        return;
+                    },
+                    error.TypeGraphDepthLimitExceeded => {
+                        try self.appendError(
+                            expr.span,
+                            "monomorphization type graph traversal for generic `{s}/{d}` exceeds the substitution depth budget",
+                            .{ self.interner.get(generic_group.name), generic_group.arity },
+                        );
+                        return;
+                    },
+                    error.TypeGraphNodeLimitExceeded => {
+                        try self.appendError(
+                            expr.span,
+                            "monomorphization type graph traversal for generic `{s}/{d}` exceeds the substitution node budget",
+                            .{ self.interner.get(generic_group.name), generic_group.arity },
+                        );
+                        return;
+                    },
+                    error.TypeMangleDepthLimitExceeded => {
+                        try self.appendError(
+                            expr.span,
+                            "monomorphization could not build a specialization name for generic `{s}/{d}` because a type argument's canonical name exceeds the structural depth budget",
+                            .{ self.interner.get(generic_group.name), generic_group.arity },
+                        );
+                        return;
+                    },
+                    error.TypeMangleNodeLimitExceeded => {
+                        try self.appendError(
+                            expr.span,
+                            "monomorphization could not build a specialization name for generic `{s}/{d}` because a type argument's canonical name exceeds the structural node budget",
+                            .{ self.interner.get(generic_group.name), generic_group.arity },
+                        );
+                        return;
+                    },
+                };
                 self.next_group_id.* += 1;
-
-                const specialized = try self.cloneGroupWithSubs(generic_group, &subs, protocol_param_types, type_args.items, new_id, selected_clause_index);
                 try self.new_groups.append(self.allocator, .{
                     .group = specialized,
                     .source_group_id = target_id,
@@ -1375,102 +2159,108 @@ const MonomorphContext = struct {
                 // which uses the same type var IDs as the subs map. Do NOT use
                 // expr.type_id because the HIR builder resolves type vars in a separate
                 // scope, producing different type var IDs that aren't in the subs.
-                if (!self.isConcreteRuntimeType(expr.type_id)) {
-                    const concrete_return = subs.applyToType(self.store, selected_clause.return_type);
-                    if (self.isConcreteRuntimeType(concrete_return)) {
+                if (!(try self.isConcreteRuntimeType(expr.type_id))) {
+                    const concrete_return = try subs.applyToType(self.store, selected_clause.return_type);
+                    if (try self.isConcreteRuntimeType(concrete_return)) {
                         @constCast(expr).type_id = concrete_return;
                     }
                 }
             },
             // Recurse into sub-expressions
             .binary => |b| {
-                try self.scanExpr(b.lhs);
-                try self.scanExpr(b.rhs);
+                try self.scanExprBudgeted(b.lhs, budget, depth + 1);
+                try self.scanExprBudgeted(b.rhs, budget, depth + 1);
             },
-            .unary => |u| try self.scanExpr(u.operand),
+            .unary => |u| try self.scanExprBudgeted(u.operand, budget, depth + 1),
             .tuple_init => |elems| {
-                for (elems) |e| try self.scanExpr(e);
+                for (elems) |e| try self.scanExprBudgeted(e, budget, depth + 1);
             },
             .list_init => |elems| {
-                for (elems) |e| try self.scanExpr(e);
+                for (elems) |e| try self.scanExprBudgeted(e, budget, depth + 1);
             },
             .list_cons => |lc| {
-                try self.scanExpr(lc.head);
-                try self.scanExpr(lc.tail);
+                try self.scanExprBudgeted(lc.head, budget, depth + 1);
+                try self.scanExprBudgeted(lc.tail, budget, depth + 1);
             },
             .map_init => |entries| {
                 for (entries) |entry| {
-                    try self.scanExpr(entry.key);
-                    try self.scanExpr(entry.value);
+                    try self.scanExprBudgeted(entry.key, budget, depth + 1);
+                    try self.scanExprBudgeted(entry.value, budget, depth + 1);
                 }
             },
             .struct_init => |si| {
                 for (si.fields) |field| {
-                    try self.scanExpr(field.value);
+                    try self.scanExprBudgeted(field.value, budget, depth + 1);
                 }
             },
-            .field_get => |fg| try self.scanExpr(fg.object),
-            .tuple_index_get => |tig| try self.scanExpr(tig.object),
-            .list_index_get => |lig| try self.scanExpr(lig.list),
-            .list_head_get => |lhg| try self.scanExpr(lhg.list),
-            .list_tail_get => |ltg| try self.scanExpr(ltg.list),
+            .field_get => |fg| try self.scanExprBudgeted(fg.object, budget, depth + 1),
+            .tuple_index_get => |tig| try self.scanExprBudgeted(tig.object, budget, depth + 1),
+            .list_index_get => |lig| try self.scanExprBudgeted(lig.list, budget, depth + 1),
+            .list_head_get => |lhg| try self.scanExprBudgeted(lhg.list, budget, depth + 1),
+            .list_tail_get => |ltg| try self.scanExprBudgeted(ltg.list, budget, depth + 1),
             .map_value_get => |mvg| {
-                try self.scanExpr(mvg.map);
-                try self.scanExpr(mvg.key);
+                try self.scanExprBudgeted(mvg.map, budget, depth + 1);
+                try self.scanExprBudgeted(mvg.key, budget, depth + 1);
             },
             .branch => |br| {
-                try self.scanExpr(br.condition);
-                try self.scanBlock(br.then_block);
-                if (br.else_block) |eb| try self.scanBlock(eb);
+                try self.scanExprBudgeted(br.condition, budget, depth + 1);
+                try self.scanBlockBudgeted(br.then_block, budget, depth + 1);
+                if (br.else_block) |eb| try self.scanBlockBudgeted(eb, budget, depth + 1);
             },
-            .block => |b| try self.scanBlock(&b),
-            .panic => |e| try self.scanExpr(e),
-            .unwrap => |e| try self.scanExpr(e),
-            .ret_raise => |rr| try self.scanExpr(rr.stash_call),
-            .union_init => |ui| try self.scanExpr(ui.value),
+            .block => |b| try self.scanBlockBudgeted(&b, budget, depth + 1),
+            .panic => |e| try self.scanExprBudgeted(e, budget, depth + 1),
+            .unwrap => |e| try self.scanExprBudgeted(e, budget, depth + 1),
+            .ret_raise => |rr| try self.scanExprBudgeted(rr.stash_call, budget, depth + 1),
+            .union_init => |ui| try self.scanExprBudgeted(ui.value, budget, depth + 1),
             .error_pipe => |ep| {
                 for (ep.steps) |step| {
-                    try self.scanExpr(step.expr);
+                    try self.scanExprBudgeted(step.expr, budget, depth + 1);
                 }
-                try self.scanExpr(ep.handler);
+                try self.scanExprBudgeted(ep.handler, budget, depth + 1);
             },
             .case => |cd| {
-                try self.scanExpr(cd.scrutinee);
-                const scrutinee_type = self.effectiveExprType(cd.scrutinee);
+                try self.scanExprBudgeted(cd.scrutinee, budget, depth + 1);
+                const scrutinee_type = try self.effectiveExprType(cd.scrutinee);
                 for (cd.arms) |arm| {
                     var local_type_snapshot = try self.cloneLocalTypes();
                     defer local_type_snapshot.deinit();
 
                     if (arm.pattern) |pattern| {
                         var binding_index: usize = 0;
-                        try self.recordCasePatternLocalTypes(pattern, scrutinee_type, arm.bindings, &binding_index);
+                        self.recordCasePatternLocalTypesBudgeted(pattern, scrutinee_type, arm.bindings, &binding_index, budget, depth + 1) catch |err| {
+                            try self.appendWalkBudgetError(expr.span, "case pattern local type recording", err);
+                            return;
+                        };
                     }
-                    if (arm.guard) |g| try self.scanExpr(g);
-                    try self.scanBlock(arm.body);
+                    if (arm.guard) |g| try self.scanExprBudgeted(g, budget, depth + 1);
+                    try self.scanBlockBudgeted(arm.body, budget, depth + 1);
                     self.restoreLocalTypes(&local_type_snapshot);
                 }
             },
             .try_rescue => |tr| {
-                try self.scanBlock(tr.body);
-                try self.scanExpr(tr.raise_occurred_call);
-                try self.scanExpr(tr.take_raise_call);
-                const error_type = self.effectiveExprType(tr.take_raise_call);
+                try self.scanBlockBudgeted(tr.body, budget, depth + 1);
+                try self.scanExprBudgeted(tr.raise_occurred_call, budget, depth + 1);
+                try self.scanExprBudgeted(tr.take_raise_call, budget, depth + 1);
+                const error_type = try self.effectiveExprType(tr.take_raise_call);
                 for (tr.arms) |arm| {
                     var local_type_snapshot = try self.cloneLocalTypes();
                     defer local_type_snapshot.deinit();
                     if (arm.pattern) |pattern| {
                         var binding_index: usize = 0;
-                        try self.recordCasePatternLocalTypes(pattern, error_type, arm.bindings, &binding_index);
+                        self.recordCasePatternLocalTypesBudgeted(pattern, error_type, arm.bindings, &binding_index, budget, depth + 1) catch |err| {
+                            try self.appendWalkBudgetError(expr.span, "rescue pattern local type recording", err);
+                            return;
+                        };
                     }
-                    if (arm.guard) |g| try self.scanExpr(g);
-                    try self.scanBlock(arm.body);
+                    if (arm.guard) |g| try self.scanExprBudgeted(g, budget, depth + 1);
+                    try self.scanBlockBudgeted(arm.body, budget, depth + 1);
                     self.restoreLocalTypes(&local_type_snapshot);
                 }
-                if (tr.after_block) |cleanup| try self.scanBlock(cleanup);
+                if (tr.after_block) |cleanup| try self.scanBlockBudgeted(cleanup, budget, depth + 1);
             },
-            .match => |m| try self.scanExpr(m.scrutinee),
+            .match => |m| try self.scanExprBudgeted(m.scrutinee, budget, depth + 1),
             .closure_create => |cc| {
-                for (cc.captures) |cap| try self.scanExpr(cap.expr);
+                for (cc.captures) |cap| try self.scanExprBudgeted(cap.expr, budget, depth + 1);
             },
             // Literals and refs — no sub-expressions
             .int_lit, .float_lit, .string_lit, .atom_lit, .bool_lit, .nil_lit => {},
@@ -1483,24 +2273,34 @@ const MonomorphContext = struct {
         self: *const MonomorphContext,
         params: []const hir.TypedParam,
         protocol_param_types: []const TypeId,
-    ) bool {
+        subs: *const SubstitutionMap,
+    ) TypeWalkError!bool {
         for (params, 0..) |param, param_index| {
             if (self.store.getType(param.type_id) != .protocol_constraint) continue;
             // Bare/existential protocol constraints (`e :: Error`) are
             // intentionally box-dispatched and carry no concrete substitution;
             // they must not block specialization driven by OTHER generic
             // params (e.g. `fn f(e :: Error, xs :: [t])` still specializes on
-            // `t` while `e` stays a `ProtocolBox`). Only a *parametric*
-            // protocol constraint that failed to resolve a concrete type is a
-            // genuinely unbound specialization input.
+            // `t` while `e` stays a `ProtocolBox`). A parametric protocol
+            // constraint blocks specialization only while its own type
+            // arguments remain unresolved. `Enumerable(i64)` is already a
+            // concrete protocol-box ABI shape; requiring a concrete impl type
+            // there drops helper specializations such as
+            // `Enum.dispose_and_return(state :: Enumerable(i64), value :: Bool)`.
             if (self.isExistentialProtocolConstraint(param.type_id)) continue;
-            if (param_index >= protocol_param_types.len) return true;
-            if (protocol_param_types[param_index] == types_mod.TypeStore.UNKNOWN) return true;
+            if (param_index < protocol_param_types.len and protocol_param_types[param_index] != types_mod.TypeStore.UNKNOWN) {
+                continue;
+            }
+            const substituted_param_type = try subs.applyToType(self.store, param.type_id);
+            if (self.store.getType(substituted_param_type) == .protocol_constraint) {
+                continue;
+            }
+            if (try containsTypeVar(self.store, substituted_param_type, self.allocator)) return true;
         }
         return false;
     }
 
-    fn protocolConstraintReplacement(self: *const MonomorphContext, constraint_type: TypeId) ?TypeId {
+    fn protocolConstraintReplacement(self: *const MonomorphContext, constraint_type: TypeId) TypeWalkError!?TypeId {
         const source_params = self.current_protocol_source_param_types orelse return null;
         const concrete_params = self.current_protocol_param_types orelse return null;
         const constraint = self.store.getType(constraint_type);
@@ -1511,7 +2311,11 @@ const MonomorphContext = struct {
         for (source_params, 0..) |source_param, param_index| {
             if (param_index >= concrete_params.len) continue;
             if (concrete_params[param_index] == types_mod.TypeStore.UNKNOWN) continue;
-            const source_type = self.store.getType(source_param.type_id);
+            const source_param_type = if (self.current_subs) |subs|
+                try subs.applyToType(self.store, source_param.type_id)
+            else
+                source_param.type_id;
+            const source_type = self.store.getType(source_param_type);
             if (source_type != .protocol_constraint) continue;
             if (!self.sameName(source_type.protocol_constraint.protocol_name, constraint.protocol_constraint.protocol_name)) continue;
             if (!std.mem.eql(TypeId, source_type.protocol_constraint.type_params, constraint.protocol_constraint.type_params)) continue;
@@ -1522,95 +2326,9 @@ const MonomorphContext = struct {
         return if (replacement_count == 1) replacement else null;
     }
 
-    fn applyActiveProtocolParamTypes(self: *MonomorphContext, type_id: TypeId) error{OutOfMemory}!TypeId {
+    fn applyActiveProtocolParamTypes(self: *MonomorphContext, type_id: TypeId) TypeWalkError!TypeId {
         if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return type_id;
-        const typ = self.store.getType(type_id);
-        return switch (typ) {
-            .protocol_constraint => |pc| blk: {
-                var changed_params = false;
-                const new_params = try self.allocator.alloc(TypeId, pc.type_params.len);
-                for (pc.type_params, 0..) |type_param, index| {
-                    const new_type_param = try self.applyActiveProtocolParamTypes(type_param);
-                    new_params[index] = new_type_param;
-                    if (new_type_param != type_param) changed_params = true;
-                }
-
-                const candidate_type = if (changed_params)
-                    try self.store.addType(.{ .protocol_constraint = .{
-                        .protocol_name = pc.protocol_name,
-                        .type_params = new_params,
-                    } })
-                else blk2: {
-                    self.allocator.free(new_params);
-                    break :blk2 type_id;
-                };
-
-                break :blk self.protocolConstraintReplacement(candidate_type) orelse candidate_type;
-            },
-            .list => |list_type| blk: {
-                const element = try self.applyActiveProtocolParamTypes(list_type.element);
-                if (element == list_type.element) break :blk type_id;
-                break :blk try self.store.addType(.{ .list = .{ .element = element } });
-            },
-            .tuple => |tuple_type| blk: {
-                var changed = false;
-                const elements = try self.allocator.alloc(TypeId, tuple_type.elements.len);
-                for (tuple_type.elements, 0..) |element, index| {
-                    const new_element = try self.applyActiveProtocolParamTypes(element);
-                    elements[index] = new_element;
-                    if (new_element != element) changed = true;
-                }
-                if (!changed) {
-                    self.allocator.free(elements);
-                    break :blk type_id;
-                }
-                break :blk try self.store.addType(.{ .tuple = .{ .elements = elements } });
-            },
-            .function => |function_type| blk: {
-                var changed = false;
-                const params = try self.allocator.alloc(TypeId, function_type.params.len);
-                for (function_type.params, 0..) |param, index| {
-                    const new_param = try self.applyActiveProtocolParamTypes(param);
-                    params[index] = new_param;
-                    if (new_param != param) changed = true;
-                }
-                const return_type = try self.applyActiveProtocolParamTypes(function_type.return_type);
-                if (return_type != function_type.return_type) changed = true;
-                if (!changed) {
-                    self.allocator.free(params);
-                    break :blk type_id;
-                }
-                break :blk try self.store.addType(.{ .function = .{
-                    .params = params,
-                    .return_type = return_type,
-                    .param_ownerships = function_type.param_ownerships,
-                    .return_ownership = function_type.return_ownership,
-                } });
-            },
-            .map => |map_type| blk: {
-                const key = try self.applyActiveProtocolParamTypes(map_type.key);
-                const value = try self.applyActiveProtocolParamTypes(map_type.value);
-                if (key == map_type.key and value == map_type.value) break :blk type_id;
-                break :blk try self.store.addType(.{ .map = .{ .key = key, .value = value } });
-            },
-            .applied => |applied_type| blk: {
-                var changed = false;
-                const base = try self.applyActiveProtocolParamTypes(applied_type.base);
-                if (base != applied_type.base) changed = true;
-                const args = try self.allocator.alloc(TypeId, applied_type.args.len);
-                for (applied_type.args, 0..) |arg, index| {
-                    const new_arg = try self.applyActiveProtocolParamTypes(arg);
-                    args[index] = new_arg;
-                    if (new_arg != arg) changed = true;
-                }
-                if (!changed) {
-                    self.allocator.free(args);
-                    break :blk type_id;
-                }
-                break :blk try self.store.addType(.{ .applied = .{ .base = base, .args = args } });
-            },
-            else => type_id,
-        };
+        return self.transformType(type_id, .active_protocol_params);
     }
 
     /// FCC unified model: if `param_type` is a higher-order `fn(A) -> R`
@@ -1626,11 +2344,11 @@ const MonomorphContext = struct {
         self: *const MonomorphContext,
         param_type: TypeId,
         subs: *const SubstitutionMap,
-    ) TypeId {
+    ) TypeWalkError!TypeId {
         const typ = self.store.getType(param_type);
         if (typ != .function) return param_type;
         const effect_var = typ.function.effect_var orelse return param_type;
-        const resolved_effect = subs.applyToType(self.store, effect_var);
+        const resolved_effect = try subs.applyToType(self.store, effect_var);
         const resolved_typ = self.store.getType(resolved_effect);
         if (resolved_typ != .protocol_constraint) return param_type;
         if (!std.mem.eql(u8, self.interner.get(resolved_typ.protocol_constraint.protocol_name), "Callable")) return param_type;
@@ -1703,10 +2421,10 @@ const MonomorphContext = struct {
         params: []const hir.TypedParam,
         args: []const hir.CallArg,
         subs: *const SubstitutionMap,
-    ) error{OutOfMemory}!void {
+    ) TypeWalkError!void {
         const pair_count = @min(params.len, args.len);
         for (params[0..pair_count], args[0..pair_count]) |param, arg| {
-            const expected = try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, param.type_id));
+            const expected = try self.applyActiveProtocolParamTypes(try subs.applyToType(self.store, param.type_id));
             const expected_typ = self.store.getType(expected);
             if (expected_typ != .function) continue;
 
@@ -1732,7 +2450,7 @@ const MonomorphContext = struct {
         type_args: []const TypeId,
         new_id: u32,
         source_clause_index: usize,
-    ) !hir.FunctionGroup {
+    ) CloneGroupError!hir.FunctionGroup {
         const saved_subs = self.current_subs;
         const saved_protocol_param_types = self.current_protocol_param_types;
         const saved_protocol_source_param_types = self.current_protocol_source_param_types;
@@ -1743,6 +2461,7 @@ const MonomorphContext = struct {
         defer self.current_protocol_param_types = saved_protocol_param_types;
         defer self.current_protocol_source_param_types = saved_protocol_source_param_types;
 
+        var clone_budget = HirWalkBudget{};
         var new_clauses: std.ArrayListUnmanaged(hir.Clause) = .empty;
         for (group.clauses) |clause| {
             // Substitute types in params
@@ -1752,7 +2471,7 @@ const MonomorphContext = struct {
                 const substituted_param_type = if (protocol_param_type != types_mod.TypeStore.UNKNOWN)
                     protocol_param_type
                 else
-                    try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, param.type_id));
+                    try self.applyActiveProtocolParamTypes(try subs.applyToType(self.store, param.type_id));
                 new_params[i] = .{
                     .name = param.name,
                     // FCC unified model: a higher-order parameter whose declared
@@ -1768,19 +2487,20 @@ const MonomorphContext = struct {
                     // with an effect_var that still mentions the (now-bound)
                     // type variable would make `isGenericGroup` re-classify the
                     // clone as generic and drop it.
-                    .type_id = self.boxedCallableRepresentationForParam(substituted_param_type, subs),
+                    .type_id = try self.boxedCallableRepresentationForParam(substituted_param_type, subs),
                     .ownership = param.ownership,
+                    .ownership_explicit = param.ownership_explicit,
                     .pattern = param.pattern,
-                    .default = if (param.default) |d| try self.cloneExpr(d) else null,
+                    .default = if (param.default) |d| try self.cloneExprBudgeted(d, &clone_budget, 0) else null,
                 };
             }
 
             try new_clauses.append(self.allocator, .{
                 .params = new_params,
-                .return_type = try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, clause.return_type)),
-                .decision = try self.cloneDecision(clause.decision),
-                .body = try self.cloneBlock(clause.body),
-                .refinement = if (clause.refinement) |r| try self.cloneExpr(r) else null,
+                .return_type = try self.applyActiveProtocolParamTypes(try subs.applyToType(self.store, clause.return_type)),
+                .decision = try self.cloneDecisionBudgeted(clause.decision, &clone_budget, 0),
+                .body = try self.cloneBlockBudgeted(clause.body, &clone_budget, 0),
+                .refinement = if (clause.refinement) |r| try self.cloneExprBudgeted(r, &clone_budget, 0) else null,
                 .tuple_bindings = clause.tuple_bindings,
                 .struct_bindings = clause.struct_bindings,
                 .list_bindings = clause.list_bindings,
@@ -1808,11 +2528,14 @@ const MonomorphContext = struct {
             break :blk "";
         };
         const qualified_base = if (source_struct_prefix.len > 0)
-            std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ source_struct_prefix, base_name }) catch base_name
+            try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ source_struct_prefix, base_name })
         else
             base_name;
-        const mangled_str = mangleName(self.allocator, qualified_base, self.store, type_args) catch qualified_base;
-        const mangled_name = self.interner.intern(mangled_str) catch group.name;
+        defer if (source_struct_prefix.len > 0) self.allocator.free(qualified_base);
+
+        const mangled_str = try mangleName(self.allocator, qualified_base, self.store, type_args);
+        defer self.allocator.free(mangled_str);
+        const mangled_name = try self.interner.intern(mangled_str);
 
         return .{
             .id = new_id,
@@ -1828,34 +2551,62 @@ const MonomorphContext = struct {
 
     // -- Deep cloning for specialized copies -----------------------------------
 
-    fn cloneBlock(self: *MonomorphContext, block: *const hir.Block) !*const hir.Block {
+    fn cloneBlock(self: *MonomorphContext, block: *const hir.Block) MonomorphWalkError!*const hir.Block {
+        var budget = HirWalkBudget{};
+        return self.cloneBlockBudgeted(block, &budget, 0);
+    }
+
+    fn cloneBlockBudgeted(
+        self: *MonomorphContext,
+        block: *const hir.Block,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) MonomorphWalkError!*const hir.Block {
+        try budget.enter(depth);
         var new_stmts: std.ArrayListUnmanaged(hir.Stmt) = .empty;
         for (block.stmts) |stmt| {
-            try new_stmts.append(self.allocator, try self.cloneStmt(stmt));
+            try new_stmts.append(self.allocator, try self.cloneStmtBudgeted(stmt, budget, depth + 1));
         }
         const result = try self.allocator.create(hir.Block);
         result.* = .{
             .stmts = try new_stmts.toOwnedSlice(self.allocator),
             .result_type = if (self.current_subs) |subs|
-                try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, block.result_type))
+                try self.applyActiveProtocolParamTypes(try subs.applyToType(self.store, block.result_type))
             else
                 try self.applyActiveProtocolParamTypes(block.result_type),
         };
         return result;
     }
 
-    fn cloneStmt(self: *MonomorphContext, stmt: hir.Stmt) !hir.Stmt {
+    fn cloneStmtBudgeted(
+        self: *MonomorphContext,
+        stmt: hir.Stmt,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) MonomorphWalkError!hir.Stmt {
+        try budget.enter(depth);
         return switch (stmt) {
-            .expr => |e| .{ .expr = try self.cloneExpr(e) },
+            .expr => |e| .{ .expr = try self.cloneExprBudgeted(e, budget, depth + 1) },
             .local_set => |ls| .{ .local_set = .{
                 .index = ls.index,
-                .value = try self.cloneExpr(ls.value),
+                .value = try self.cloneExprBudgeted(ls.value, budget, depth + 1),
             } },
             .function_group => |fg| .{ .function_group = fg }, // local fns: share, not specialized
         };
     }
 
-    fn cloneExpr(self: *MonomorphContext, expr: *const hir.Expr) error{OutOfMemory}!*const hir.Expr {
+    fn cloneExpr(self: *MonomorphContext, expr: *const hir.Expr) MonomorphWalkError!*const hir.Expr {
+        var budget = HirWalkBudget{};
+        return self.cloneExprBudgeted(expr, &budget, 0);
+    }
+
+    fn cloneExprBudgeted(
+        self: *MonomorphContext,
+        expr: *const hir.Expr,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) MonomorphWalkError!*const hir.Expr {
+        try budget.enter(depth);
         const result = try self.allocator.create(hir.Expr);
         const substituted_type = blk: {
             if (expr.kind == .param_get) {
@@ -1869,19 +2620,25 @@ const MonomorphContext = struct {
                 }
             }
             if (self.current_subs) |subs| {
-                break :blk try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, expr.type_id));
+                break :blk try self.applyActiveProtocolParamTypes(try subs.applyToType(self.store, expr.type_id));
             }
             break :blk try self.applyActiveProtocolParamTypes(expr.type_id);
         };
         result.* = .{
-            .kind = try self.cloneExprKind(expr.kind),
+            .kind = try self.cloneExprKindBudgeted(expr.kind, budget, depth),
             .type_id = substituted_type,
             .span = expr.span,
+            .expansion = expr.expansion,
         };
         return result;
     }
 
-    fn cloneExprKind(self: *MonomorphContext, kind: hir.ExprKind) error{OutOfMemory}!hir.ExprKind {
+    fn cloneExprKindBudgeted(
+        self: *MonomorphContext,
+        kind: hir.ExprKind,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) MonomorphWalkError!hir.ExprKind {
         return switch (kind) {
             // Literals and refs — no heap pointers to clone
             .int_lit, .float_lit, .string_lit, .atom_lit, .bool_lit, .nil_lit => kind,
@@ -1890,22 +2647,22 @@ const MonomorphContext = struct {
 
             .binary => |b| .{ .binary = .{
                 .op = b.op,
-                .lhs = try self.cloneExpr(b.lhs),
-                .rhs = try self.cloneExpr(b.rhs),
+                .lhs = try self.cloneExprBudgeted(b.lhs, budget, depth + 1),
+                .rhs = try self.cloneExprBudgeted(b.rhs, budget, depth + 1),
             } },
             .unary => |u| .{ .unary = .{
                 .op = u.op,
-                .operand = try self.cloneExpr(u.operand),
+                .operand = try self.cloneExprBudgeted(u.operand, budget, depth + 1),
             } },
             .call => |c| blk: {
                 var new_args = try self.allocator.alloc(hir.CallArg, c.args.len);
                 for (c.args, 0..) |arg, i| {
-                    const expected_type = self.callTargetParamType(c.target, c.args.len, i) orelse arg.expected_type;
+                    const expected_type = (try self.callTargetParamType(c.target, c.args.len, i)) orelse arg.expected_type;
                     new_args[i] = .{
-                        .expr = try self.cloneExpr(arg.expr),
+                        .expr = try self.cloneExprBudgeted(arg.expr, budget, depth + 1),
                         .mode = arg.mode,
                         .expected_type = if (self.current_subs) |subs|
-                            try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, expected_type))
+                            try self.applyActiveProtocolParamTypes(try subs.applyToType(self.store, expected_type))
                         else
                             try self.applyActiveProtocolParamTypes(expected_type),
                     };
@@ -1920,31 +2677,32 @@ const MonomorphContext = struct {
                 // polymorphic type and the `call_closure` lowering can't
                 // tell whether to unwrap the closure's error union.
                 const new_target: hir.CallTarget = switch (c.target) {
-                    .closure => |callee| .{ .closure = try self.cloneExpr(callee) },
+                    .closure => |callee| .{ .closure = try self.cloneExprBudgeted(callee, budget, depth + 1) },
                     else => c.target,
                 };
+                try self.applyTargetArgModes(new_target, new_args);
                 break :blk .{ .call = .{ .target = new_target, .args = new_args } };
             },
             .tuple_init => |elems| blk: {
                 var new_elems = try self.allocator.alloc(*const hir.Expr, elems.len);
-                for (elems, 0..) |e, i| new_elems[i] = try self.cloneExpr(e);
+                for (elems, 0..) |e, i| new_elems[i] = try self.cloneExprBudgeted(e, budget, depth + 1);
                 break :blk .{ .tuple_init = new_elems };
             },
             .list_init => |elems| blk: {
                 var new_elems = try self.allocator.alloc(*const hir.Expr, elems.len);
-                for (elems, 0..) |e, i| new_elems[i] = try self.cloneExpr(e);
+                for (elems, 0..) |e, i| new_elems[i] = try self.cloneExprBudgeted(e, budget, depth + 1);
                 break :blk .{ .list_init = new_elems };
             },
             .list_cons => |lc| .{ .list_cons = .{
-                .head = try self.cloneExpr(lc.head),
-                .tail = try self.cloneExpr(lc.tail),
+                .head = try self.cloneExprBudgeted(lc.head, budget, depth + 1),
+                .tail = try self.cloneExprBudgeted(lc.tail, budget, depth + 1),
             } },
             .map_init => |entries| blk: {
                 var new_entries = try self.allocator.alloc(hir.MapEntry, entries.len);
                 for (entries, 0..) |entry, i| {
                     new_entries[i] = .{
-                        .key = try self.cloneExpr(entry.key),
-                        .value = try self.cloneExpr(entry.value),
+                        .key = try self.cloneExprBudgeted(entry.key, budget, depth + 1),
+                        .value = try self.cloneExprBudgeted(entry.value, budget, depth + 1),
                     };
                 }
                 break :blk .{ .map_init = new_entries };
@@ -1952,73 +2710,73 @@ const MonomorphContext = struct {
             .struct_init => |si| blk: {
                 var new_fields = try self.allocator.alloc(hir.StructFieldInit, si.fields.len);
                 for (si.fields, 0..) |f, i| {
-                    new_fields[i] = .{ .name = f.name, .value = try self.cloneExpr(f.value) };
+                    new_fields[i] = .{ .name = f.name, .value = try self.cloneExprBudgeted(f.value, budget, depth + 1) };
                 }
                 const substituted_struct_type = if (self.current_subs) |subs|
-                    try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, si.type_id))
+                    try self.applyActiveProtocolParamTypes(try subs.applyToType(self.store, si.type_id))
                 else
                     try self.applyActiveProtocolParamTypes(si.type_id);
                 break :blk .{ .struct_init = .{ .type_id = substituted_struct_type, .fields = new_fields } };
             },
             .field_get => |fg| .{ .field_get = .{
-                .object = try self.cloneExpr(fg.object),
+                .object = try self.cloneExprBudgeted(fg.object, budget, depth + 1),
                 .field = fg.field,
             } },
             .tuple_index_get => |tig| .{ .tuple_index_get = .{
-                .object = try self.cloneExpr(tig.object),
+                .object = try self.cloneExprBudgeted(tig.object, budget, depth + 1),
                 .index = tig.index,
             } },
             .list_index_get => |lig| .{ .list_index_get = .{
-                .list = try self.cloneExpr(lig.list),
+                .list = try self.cloneExprBudgeted(lig.list, budget, depth + 1),
                 .index = lig.index,
             } },
             .list_head_get => |lhg| .{ .list_head_get = .{
-                .list = try self.cloneExpr(lhg.list),
+                .list = try self.cloneExprBudgeted(lhg.list, budget, depth + 1),
             } },
             .list_tail_get => |ltg| .{ .list_tail_get = .{
-                .list = try self.cloneExpr(ltg.list),
+                .list = try self.cloneExprBudgeted(ltg.list, budget, depth + 1),
                 .start_index = ltg.start_index,
             } },
             .map_value_get => |mvg| .{ .map_value_get = .{
-                .map = try self.cloneExpr(mvg.map),
-                .key = try self.cloneExpr(mvg.key),
+                .map = try self.cloneExprBudgeted(mvg.map, budget, depth + 1),
+                .key = try self.cloneExprBudgeted(mvg.key, budget, depth + 1),
             } },
             .branch => |br| .{ .branch = .{
-                .condition = try self.cloneExpr(br.condition),
-                .then_block = try self.cloneBlock(br.then_block),
-                .else_block = if (br.else_block) |eb| try self.cloneBlock(eb) else null,
+                .condition = try self.cloneExprBudgeted(br.condition, budget, depth + 1),
+                .then_block = try self.cloneBlockBudgeted(br.then_block, budget, depth + 1),
+                .else_block = if (br.else_block) |eb| try self.cloneBlockBudgeted(eb, budget, depth + 1) else null,
             } },
             .case => |cd| blk: {
                 var new_arms = try self.allocator.alloc(hir.CaseArm, cd.arms.len);
                 for (cd.arms, 0..) |arm, i| {
                     new_arms[i] = .{
                         .pattern = arm.pattern,
-                        .guard = if (arm.guard) |g| try self.cloneExpr(g) else null,
-                        .body = try self.cloneBlock(arm.body),
+                        .guard = if (arm.guard) |g| try self.cloneExprBudgeted(g, budget, depth + 1) else null,
+                        .body = try self.cloneBlockBudgeted(arm.body, budget, depth + 1),
                         .bindings = arm.bindings,
                     };
                 }
-                break :blk .{ .case = .{ .scrutinee = try self.cloneExpr(cd.scrutinee), .arms = new_arms } };
+                break :blk .{ .case = .{ .scrutinee = try self.cloneExprBudgeted(cd.scrutinee, budget, depth + 1), .arms = new_arms } };
             },
-            .block => |b| .{ .block = (try self.cloneBlock(&b)).* },
-            .panic => |e| .{ .panic = try self.cloneExpr(e) },
-            .unwrap => |e| .{ .unwrap = try self.cloneExpr(e) },
-            .ret_raise => |rr| .{ .ret_raise = .{ .stash_call = try self.cloneExpr(rr.stash_call) } },
+            .block => |b| .{ .block = (try self.cloneBlockBudgeted(&b, budget, depth + 1)).* },
+            .panic => |e| .{ .panic = try self.cloneExprBudgeted(e, budget, depth + 1) },
+            .unwrap => |e| .{ .unwrap = try self.cloneExprBudgeted(e, budget, depth + 1) },
+            .ret_raise => |rr| .{ .ret_raise = .{ .stash_call = try self.cloneExprBudgeted(rr.stash_call, budget, depth + 1) } },
             .union_init => |ui| .{ .union_init = .{
                 .union_type_id = if (self.current_subs) |subs|
-                    try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, ui.union_type_id))
+                    try self.applyActiveProtocolParamTypes(try subs.applyToType(self.store, ui.union_type_id))
                 else
                     try self.applyActiveProtocolParamTypes(ui.union_type_id),
                 .variant_name = ui.variant_name,
-                .value = try self.cloneExpr(ui.value),
+                .value = try self.cloneExprBudgeted(ui.value, budget, depth + 1),
             } },
             .try_rescue => |tr| blk: {
                 var new_arms = try self.allocator.alloc(hir.CaseArm, tr.arms.len);
                 for (tr.arms, 0..) |arm, i| {
                     new_arms[i] = .{
                         .pattern = arm.pattern,
-                        .guard = if (arm.guard) |g| try self.cloneExpr(g) else null,
-                        .body = try self.cloneBlock(arm.body),
+                        .guard = if (arm.guard) |g| try self.cloneExprBudgeted(g, budget, depth + 1) else null,
+                        .body = try self.cloneBlockBudgeted(arm.body, budget, depth + 1),
                         .bindings = arm.bindings,
                     };
                 }
@@ -2039,14 +2797,14 @@ const MonomorphContext = struct {
                     };
                 }
                 break :blk .{ .try_rescue = .{
-                    .body = try self.cloneBlock(tr.body),
+                    .body = try self.cloneBlockBudgeted(tr.body, budget, depth + 1),
                     .arms = new_arms,
                     .error_local = tr.error_local,
-                    .raise_occurred_call = try self.cloneExpr(tr.raise_occurred_call),
-                    .take_raise_call = try self.cloneExpr(tr.take_raise_call),
-                    .after_block = if (tr.after_block) |cleanup| try self.cloneBlock(cleanup) else null,
+                    .raise_occurred_call = try self.cloneExprBudgeted(tr.raise_occurred_call, budget, depth + 1),
+                    .take_raise_call = try self.cloneExprBudgeted(tr.take_raise_call, budget, depth + 1),
+                    .after_block = if (tr.after_block) |cleanup| try self.cloneBlockBudgeted(cleanup, budget, depth + 1) else null,
                     .result_type_id = if (self.current_subs) |subs|
-                        try self.applyActiveProtocolParamTypes(subs.applyToType(self.store, tr.result_type_id))
+                        try self.applyActiveProtocolParamTypes(try subs.applyToType(self.store, tr.result_type_id))
                     else
                         try self.applyActiveProtocolParamTypes(tr.result_type_id),
                     .arm_discriminators = new_discriminators,
@@ -2056,26 +2814,26 @@ const MonomorphContext = struct {
                 var new_steps = try self.allocator.alloc(hir.ErrorPipeStep, ep.steps.len);
                 for (ep.steps, 0..) |step, i| {
                     new_steps[i] = .{
-                        .expr = try self.cloneExpr(step.expr),
+                        .expr = try self.cloneExprBudgeted(step.expr, budget, depth + 1),
                         .is_dispatched = step.is_dispatched,
                     };
                 }
                 break :blk .{ .error_pipe = .{
                     .steps = new_steps,
-                    .handler = try self.cloneExpr(ep.handler),
+                    .handler = try self.cloneExprBudgeted(ep.handler, budget, depth + 1),
                     .err_local = ep.err_local,
                 } };
             },
             .match => |m| .{ .match = .{
-                .scrutinee = try self.cloneExpr(m.scrutinee),
-                .decision = try self.cloneDecision(m.decision),
+                .scrutinee = try self.cloneExprBudgeted(m.scrutinee, budget, depth + 1),
+                .decision = try self.cloneDecisionBudgeted(m.decision, budget, depth + 1),
             } },
             .closure_create => |cc| blk: {
                 if (cc.captures.len == 0) break :blk kind;
                 var new_captures = try self.allocator.alloc(hir.CaptureValue, cc.captures.len);
                 for (cc.captures, 0..) |cap, i| {
                     new_captures[i] = .{
-                        .expr = try self.cloneExpr(cap.expr),
+                        .expr = try self.cloneExprBudgeted(cap.expr, budget, depth + 1),
                         .ownership = cap.ownership,
                     };
                 }
@@ -2089,15 +2847,26 @@ const MonomorphContext = struct {
 
     // -- Decision tree deep cloning -------------------------------------------
 
-    fn cloneDecision(self: *MonomorphContext, decision: *const hir.Decision) error{OutOfMemory}!*const hir.Decision {
+    fn cloneDecision(self: *MonomorphContext, decision: *const hir.Decision) MonomorphWalkError!*const hir.Decision {
+        var budget = HirWalkBudget{};
+        return self.cloneDecisionBudgeted(decision, &budget, 0);
+    }
+
+    fn cloneDecisionBudgeted(
+        self: *MonomorphContext,
+        decision: *const hir.Decision,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) MonomorphWalkError!*const hir.Decision {
+        try budget.enter(depth);
         const result = try self.allocator.create(hir.Decision);
         result.* = switch (decision.*) {
             .success => |leaf| .{ .success = leaf },
             .failure => .failure,
             .guard => |g| .{ .guard = .{
-                .condition = try self.cloneExpr(g.condition),
-                .success = try self.cloneDecision(g.success),
-                .failure = try self.cloneDecision(g.failure),
+                .condition = try self.cloneExprBudgeted(g.condition, budget, depth + 1),
+                .success = try self.cloneDecisionBudgeted(g.success, budget, depth + 1),
+                .failure = try self.cloneDecisionBudgeted(g.failure, budget, depth + 1),
             } },
             .switch_tag => |s| blk: {
                 var new_cases = try self.allocator.alloc(hir.SwitchCase, s.cases.len);
@@ -2105,13 +2874,13 @@ const MonomorphContext = struct {
                     new_cases[i] = .{
                         .tag = case.tag,
                         .bindings = case.bindings,
-                        .next = try self.cloneDecision(case.next),
+                        .next = try self.cloneDecisionBudgeted(case.next, budget, depth + 1),
                     };
                 }
                 break :blk .{ .switch_tag = .{
-                    .scrutinee = try self.cloneExpr(s.scrutinee),
+                    .scrutinee = try self.cloneExprBudgeted(s.scrutinee, budget, depth + 1),
                     .cases = new_cases,
-                    .default = try self.cloneDecision(s.default),
+                    .default = try self.cloneDecisionBudgeted(s.default, budget, depth + 1),
                 } };
             },
             .switch_literal => |s| blk: {
@@ -2119,61 +2888,61 @@ const MonomorphContext = struct {
                 for (s.cases, 0..) |case, i| {
                     new_cases[i] = .{
                         .value = case.value,
-                        .next = try self.cloneDecision(case.next),
+                        .next = try self.cloneDecisionBudgeted(case.next, budget, depth + 1),
                     };
                 }
                 break :blk .{ .switch_literal = .{
-                    .scrutinee = try self.cloneExpr(s.scrutinee),
+                    .scrutinee = try self.cloneExprBudgeted(s.scrutinee, budget, depth + 1),
                     .cases = new_cases,
-                    .default = try self.cloneDecision(s.default),
+                    .default = try self.cloneDecisionBudgeted(s.default, budget, depth + 1),
                 } };
             },
             .check_tuple => |ct| .{ .check_tuple = .{
-                .scrutinee = try self.cloneExpr(ct.scrutinee),
+                .scrutinee = try self.cloneExprBudgeted(ct.scrutinee, budget, depth + 1),
                 .expected_arity = ct.expected_arity,
                 .element_scrutinee_ids = ct.element_scrutinee_ids,
-                .success = try self.cloneDecision(ct.success),
-                .failure = try self.cloneDecision(ct.failure),
+                .success = try self.cloneDecisionBudgeted(ct.success, budget, depth + 1),
+                .failure = try self.cloneDecisionBudgeted(ct.failure, budget, depth + 1),
             } },
             .check_list => |cl| .{ .check_list = .{
-                .scrutinee = try self.cloneExpr(cl.scrutinee),
+                .scrutinee = try self.cloneExprBudgeted(cl.scrutinee, budget, depth + 1),
                 .expected_length = cl.expected_length,
                 .element_scrutinee_ids = cl.element_scrutinee_ids,
-                .success = try self.cloneDecision(cl.success),
-                .failure = try self.cloneDecision(cl.failure),
+                .success = try self.cloneDecisionBudgeted(cl.success, budget, depth + 1),
+                .failure = try self.cloneDecisionBudgeted(cl.failure, budget, depth + 1),
             } },
             .check_list_cons => |clc| .{ .check_list_cons = .{
-                .scrutinee = try self.cloneExpr(clc.scrutinee),
+                .scrutinee = try self.cloneExprBudgeted(clc.scrutinee, budget, depth + 1),
                 .head_count = clc.head_count,
                 .head_scrutinee_ids = clc.head_scrutinee_ids,
                 .tail_scrutinee_id = clc.tail_scrutinee_id,
-                .success = try self.cloneDecision(clc.success),
-                .failure = try self.cloneDecision(clc.failure),
+                .success = try self.cloneDecisionBudgeted(clc.success, budget, depth + 1),
+                .failure = try self.cloneDecisionBudgeted(clc.failure, budget, depth + 1),
             } },
             .check_binary => |cb| .{ .check_binary = .{
-                .scrutinee = try self.cloneExpr(cb.scrutinee),
+                .scrutinee = try self.cloneExprBudgeted(cb.scrutinee, budget, depth + 1),
                 .min_byte_size = cb.min_byte_size,
                 .segments = cb.segments,
-                .success = try self.cloneDecision(cb.success),
-                .failure = try self.cloneDecision(cb.failure),
+                .success = try self.cloneDecisionBudgeted(cb.success, budget, depth + 1),
+                .failure = try self.cloneDecisionBudgeted(cb.failure, budget, depth + 1),
             } },
             .bind => |b| .{ .bind = .{
                 .name = b.name,
                 .local_index = b.local_index,
-                .source = try self.cloneExpr(b.source),
-                .next = try self.cloneDecision(b.next),
+                .source = try self.cloneExprBudgeted(b.source, budget, depth + 1),
+                .next = try self.cloneDecisionBudgeted(b.next, budget, depth + 1),
             } },
             .extract_struct => |es| .{ .extract_struct = .{
-                .scrutinee = try self.cloneExpr(es.scrutinee),
+                .scrutinee = try self.cloneExprBudgeted(es.scrutinee, budget, depth + 1),
                 .fields = es.fields,
-                .success = try self.cloneDecision(es.success),
-                .failure = try self.cloneDecision(es.failure),
+                .success = try self.cloneDecisionBudgeted(es.success, budget, depth + 1),
+                .failure = try self.cloneDecisionBudgeted(es.failure, budget, depth + 1),
             } },
             .extract_map => |em| .{ .extract_map = .{
-                .scrutinee = try self.cloneExpr(em.scrutinee),
+                .scrutinee = try self.cloneExprBudgeted(em.scrutinee, budget, depth + 1),
                 .keys = em.keys,
-                .success = try self.cloneDecision(em.success),
-                .failure = try self.cloneDecision(em.failure),
+                .success = try self.cloneDecisionBudgeted(em.success, budget, depth + 1),
+                .failure = try self.cloneDecisionBudgeted(em.failure, budget, depth + 1),
             } },
             .switch_variant => |sw| blk: {
                 var new_cases = try self.allocator.alloc(hir.SwitchVariantCase, sw.cases.len);
@@ -2182,14 +2951,14 @@ const MonomorphContext = struct {
                         .variant_name = case.variant_name,
                         .has_payload = case.has_payload,
                         .payload_scrutinee_id = case.payload_scrutinee_id,
-                        .next = try self.cloneDecision(case.next),
+                        .next = try self.cloneDecisionBudgeted(case.next, budget, depth + 1),
                     };
                 }
                 break :blk .{ .switch_variant = .{
-                    .scrutinee = try self.cloneExpr(sw.scrutinee),
+                    .scrutinee = try self.cloneExprBudgeted(sw.scrutinee, budget, depth + 1),
                     .receiver_name = sw.receiver_name,
                     .cases = new_cases,
-                    .default = try self.cloneDecision(sw.default),
+                    .default = try self.cloneDecisionBudgeted(sw.default, budget, depth + 1),
                 } };
             },
         };
@@ -2198,21 +2967,47 @@ const MonomorphContext = struct {
 
     // -- Rewriting call sites -------------------------------------------------
 
-    fn rewriteBlock(self: *MonomorphContext, block: *const hir.Block) void {
+    fn rewriteBlock(self: *MonomorphContext, block: *const hir.Block) error{OutOfMemory}!void {
+        var budget = HirWalkBudget{};
+        self.rewriteBlockBudgeted(block, &budget, 0) catch |err| {
+            try self.appendHirBudgetError(blockSpan(block), "call-site rewrite", err);
+        };
+    }
+
+    fn rewriteBlockBudgeted(
+        self: *MonomorphContext,
+        block: *const hir.Block,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) HirWalkError!void {
+        try budget.enter(depth);
         for (block.stmts) |stmt| {
             switch (stmt) {
-                .expr => |e| self.rewriteExpr(e),
-                .local_set => |ls| self.rewriteExpr(ls.value),
+                .expr => |e| try self.rewriteExprBudgeted(e, budget, depth + 1),
+                .local_set => |ls| try self.rewriteExprBudgeted(ls.value, budget, depth + 1),
                 .function_group => |fg| {
                     for (fg.clauses) |clause| {
-                        self.rewriteBlock(clause.body);
+                        try self.rewriteBlockBudgeted(clause.body, budget, depth + 1);
                     }
                 },
             }
         }
     }
 
-    fn rewriteExpr(self: *MonomorphContext, expr: *const hir.Expr) void {
+    fn rewriteExpr(self: *MonomorphContext, expr: *const hir.Expr) error{OutOfMemory}!void {
+        var budget = HirWalkBudget{};
+        self.rewriteExprBudgeted(expr, &budget, 0) catch |err| {
+            try self.appendHirBudgetError(expr.span, "HIR expression rewrite", err);
+        };
+    }
+
+    fn rewriteExprBudgeted(
+        self: *MonomorphContext,
+        expr: *const hir.Expr,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) HirWalkError!void {
+        try budget.enter(depth);
         switch (expr.kind) {
             .call => |call| {
                 // Check if this specific call expression was recorded for rewriting
@@ -2233,13 +3028,15 @@ const MonomorphContext = struct {
                                 },
                                 else => {},
                             }
+                            const mutable_args: []hir.CallArg = @constCast(c.args);
+                            try self.applyTargetArgModes(c.target, mutable_args);
                         },
                         else => {},
                     }
                 }
 
                 // Recurse into args
-                for (call.args) |arg| self.rewriteExpr(arg.expr);
+                for (call.args) |arg| try self.rewriteExprBudgeted(arg.expr, budget, depth + 1);
 
                 // Recurse into the callee of an implicit value-call
                 // (`expr(args)` — a `.closure` target). The callee expression
@@ -2251,72 +3048,72 @@ const MonomorphContext = struct {
                 // to the un-produced generic specialization. Mirrors the
                 // callee-scan in `scanExpr`.
                 if (call.target == .closure) {
-                    self.rewriteExpr(call.target.closure);
+                    try self.rewriteExprBudgeted(call.target.closure, budget, depth + 1);
                 }
             },
             .binary => |b| {
-                self.rewriteExpr(b.lhs);
-                self.rewriteExpr(b.rhs);
+                try self.rewriteExprBudgeted(b.lhs, budget, depth + 1);
+                try self.rewriteExprBudgeted(b.rhs, budget, depth + 1);
             },
-            .unary => |u| self.rewriteExpr(u.operand),
+            .unary => |u| try self.rewriteExprBudgeted(u.operand, budget, depth + 1),
             .tuple_init => |elems| {
-                for (elems) |e| self.rewriteExpr(e);
+                for (elems) |e| try self.rewriteExprBudgeted(e, budget, depth + 1);
             },
             .list_init => |elems| {
-                for (elems) |e| self.rewriteExpr(e);
+                for (elems) |e| try self.rewriteExprBudgeted(e, budget, depth + 1);
             },
             .list_cons => |lc| {
-                self.rewriteExpr(lc.head);
-                self.rewriteExpr(lc.tail);
+                try self.rewriteExprBudgeted(lc.head, budget, depth + 1);
+                try self.rewriteExprBudgeted(lc.tail, budget, depth + 1);
             },
             .branch => |br| {
-                self.rewriteExpr(br.condition);
-                self.rewriteBlock(br.then_block);
-                if (br.else_block) |eb| self.rewriteBlock(eb);
+                try self.rewriteExprBudgeted(br.condition, budget, depth + 1);
+                try self.rewriteBlockBudgeted(br.then_block, budget, depth + 1);
+                if (br.else_block) |eb| try self.rewriteBlockBudgeted(eb, budget, depth + 1);
             },
             .map_init => |entries| {
                 for (entries) |entry| {
-                    self.rewriteExpr(entry.key);
-                    self.rewriteExpr(entry.value);
+                    try self.rewriteExprBudgeted(entry.key, budget, depth + 1);
+                    try self.rewriteExprBudgeted(entry.value, budget, depth + 1);
                 }
             },
             .struct_init => |si| {
-                for (si.fields) |field| self.rewriteExpr(field.value);
+                for (si.fields) |field| try self.rewriteExprBudgeted(field.value, budget, depth + 1);
             },
-            .field_get => |fg| self.rewriteExpr(fg.object),
-            .block => |b| self.rewriteBlock(&b),
-            .panic => |e| self.rewriteExpr(e),
-            .unwrap => |e| self.rewriteExpr(e),
-            .union_init => |ui| self.rewriteExpr(ui.value),
+            .field_get => |fg| try self.rewriteExprBudgeted(fg.object, budget, depth + 1),
+            .block => |b| try self.rewriteBlockBudgeted(&b, budget, depth + 1),
+            .panic => |e| try self.rewriteExprBudgeted(e, budget, depth + 1),
+            .unwrap => |e| try self.rewriteExprBudgeted(e, budget, depth + 1),
+            .union_init => |ui| try self.rewriteExprBudgeted(ui.value, budget, depth + 1),
             .error_pipe => |ep| {
-                for (ep.steps) |step| self.rewriteExpr(step.expr);
-                self.rewriteExpr(ep.handler);
+                for (ep.steps) |step| try self.rewriteExprBudgeted(step.expr, budget, depth + 1);
+                try self.rewriteExprBudgeted(ep.handler, budget, depth + 1);
             },
             .case => |cd| {
-                self.rewriteExpr(cd.scrutinee);
+                try self.rewriteExprBudgeted(cd.scrutinee, budget, depth + 1);
                 for (cd.arms) |arm| {
-                    if (arm.guard) |g| self.rewriteExpr(g);
-                    self.rewriteBlock(arm.body);
+                    if (arm.guard) |g| try self.rewriteExprBudgeted(g, budget, depth + 1);
+                    try self.rewriteBlockBudgeted(arm.body, budget, depth + 1);
                 }
             },
-            .match => |m| self.rewriteExpr(m.scrutinee),
+            .match => |m| try self.rewriteExprBudgeted(m.scrutinee, budget, depth + 1),
             .closure_create => |cc| {
-                for (cc.captures) |cap| self.rewriteExpr(cap.expr);
+                for (cc.captures) |cap| try self.rewriteExprBudgeted(cap.expr, budget, depth + 1);
             },
             // Destructuring projections and the propagating-raise/`?` lowerings
             // each wrap a sub-expression that may itself be a generic call
             // (e.g. `(Enum.map(list, &f/1))[0]`, or `Worker.run()?` whose
             // `ret_raise` stash call forwards a specialized result). Mirror the
             // `scanExpr` traversal so their call sites are rewired too.
-            .tuple_index_get => |tig| self.rewriteExpr(tig.object),
-            .list_index_get => |lig| self.rewriteExpr(lig.list),
-            .list_head_get => |lhg| self.rewriteExpr(lhg.list),
-            .list_tail_get => |ltg| self.rewriteExpr(ltg.list),
+            .tuple_index_get => |tig| try self.rewriteExprBudgeted(tig.object, budget, depth + 1),
+            .list_index_get => |lig| try self.rewriteExprBudgeted(lig.list, budget, depth + 1),
+            .list_head_get => |lhg| try self.rewriteExprBudgeted(lhg.list, budget, depth + 1),
+            .list_tail_get => |ltg| try self.rewriteExprBudgeted(ltg.list, budget, depth + 1),
             .map_value_get => |mvg| {
-                self.rewriteExpr(mvg.map);
-                self.rewriteExpr(mvg.key);
+                try self.rewriteExprBudgeted(mvg.map, budget, depth + 1);
+                try self.rewriteExprBudgeted(mvg.key, budget, depth + 1);
             },
-            .ret_raise => |rr| self.rewriteExpr(rr.stash_call),
+            .ret_raise => |rr| try self.rewriteExprBudgeted(rr.stash_call, budget, depth + 1),
             .try_rescue => |tr| {
                 // Mirror the scan-phase traversal (`scanBlock` over the same
                 // sub-expressions): a generic call inside a `try` body, a
@@ -2330,14 +3127,14 @@ const MonomorphContext = struct {
                 // specialization exists under its mangled name but the call
                 // site never points at it. This is the rewrite-path analogue
                 // of the `.try_rescue` arm in `scanExpr`/`cloneExpr`.
-                self.rewriteBlock(tr.body);
+                try self.rewriteBlockBudgeted(tr.body, budget, depth + 1);
                 for (tr.arms) |arm| {
-                    if (arm.guard) |g| self.rewriteExpr(g);
-                    self.rewriteBlock(arm.body);
+                    if (arm.guard) |g| try self.rewriteExprBudgeted(g, budget, depth + 1);
+                    try self.rewriteBlockBudgeted(arm.body, budget, depth + 1);
                 }
-                self.rewriteExpr(tr.raise_occurred_call);
-                self.rewriteExpr(tr.take_raise_call);
-                if (tr.after_block) |cleanup| self.rewriteBlock(cleanup);
+                try self.rewriteExprBudgeted(tr.raise_occurred_call, budget, depth + 1);
+                try self.rewriteExprBudgeted(tr.take_raise_call, budget, depth + 1);
+                if (tr.after_block) |cleanup| try self.rewriteBlockBudgeted(cleanup, budget, depth + 1);
             },
             else => {},
         }
@@ -2345,74 +3142,77 @@ const MonomorphContext = struct {
 };
 
 /// Check if a function group has type variable parameters (is generic).
-fn isGenericGroup(store: *const TypeStore, group: *const hir.FunctionGroup) bool {
+fn genericGroupContainsTypeVar(store: *const TypeStore, group: *const hir.FunctionGroup, allocator: Allocator) TypeWalkError!bool {
     if (group.clauses.len == 0) return false;
     const first_clause = &group.clauses[0];
     for (first_clause.params) |param| {
-        if (containsTypeVar(store, param.type_id)) return true;
+        if (try containsTypeVar(store, param.type_id, allocator)) return true;
     }
     // Also check return type
-    if (containsTypeVar(store, first_clause.return_type)) return true;
+    if (try containsTypeVar(store, first_clause.return_type, allocator)) return true;
     return false;
 }
 
-/// Check if a TypeId contains any type variables (recursively).
-fn containsTypeVar(store: *const TypeStore, type_id: TypeId) bool {
-    const typ = store.getType(type_id);
-    return switch (typ) {
-        .type_var => true,
-        .protocol_constraint => |pc| {
-            // FCC unified model: a fully-applied `Callable({i64}, i64)`
-            // existential is a CONCRETE runtime type (a `ProtocolBox`), so a
-            // specialization clone whose parameter/return is a boxed `Callable`
-            // (`Enum.map` over a `[fn(..) -> ..]`) must be treated as NON-generic
-            // — otherwise `isGenericGroup` re-classifies the clone as generic
-            // and the transitive re-scan drops it, leaving its recursive helper
-            // (`map_next`) unspecialized (`mapped` collapses to `void`). Recurse
-            // into the `Callable` type args so a still-parametric `Callable(T, R)`
-            // remains generic. Every OTHER parametric protocol constraint —
-            // crucially `Enumerable(element)` / `Enumerable(i64)` — stays
-            // "generic-marking" (returns true): it devirtualizes per-impl at HIR
-            // build and must NEVER be lowered as a `ProtocolBox` body (the V11 /
-            // `Z9101` Enumerable-devirtualization contract). Keyed precisely on
-            // the `Callable` protocol name.
-            if (std.mem.eql(u8, store.interner.get(pc.protocol_name), "Callable")) {
-                for (pc.type_params) |tp| {
-                    if (containsTypeVar(store, tp)) return true;
-                }
-                return false;
-            }
-            return true;
-        },
-        .list => |lt| containsTypeVar(store, lt.element),
-        .tuple => |tt| {
-            for (tt.elements) |elem| {
-                if (containsTypeVar(store, elem)) return true;
-            }
-            return false;
-        },
-        .function => |ft| {
-            for (ft.params) |param| {
-                if (containsTypeVar(store, param)) return true;
-            }
-            if (containsTypeVar(store, ft.return_type)) return true;
-            // A polymorphic effect marker is a free type variable (#201),
-            // making the enclosing function type generic so it specializes
-            // per closure-argument effect.
-            if (ft.effect_var) |ev| {
-                if (containsTypeVar(store, ev)) return true;
-            }
-            return false;
-        },
-        .map => |mt| containsTypeVar(store, mt.key) or containsTypeVar(store, mt.value),
-        .applied => |at| {
-            for (at.args) |arg| {
-                if (containsTypeVar(store, arg)) return true;
-            }
-            return false;
-        },
-        else => false,
-    };
+/// Check if a TypeId contains any type variables.
+fn containsTypeVar(store: *const TypeStore, type_id: TypeId, allocator: Allocator) TypeWalkError!bool {
+    var walker = TypeWalker.init(allocator);
+    defer walker.deinit();
+
+    try walker.pushRoot(type_id);
+    while (try walker.next()) |item| {
+        const next_depth = item.depth + 1;
+        switch (store.getType(item.type_id)) {
+            .type_var => return true,
+            .protocol_constraint => |pc| {
+                // Protocol constraints lower to a protocol-box ABI shape once
+                // their type arguments are concrete. Treat the constraint as
+                // generic only when those arguments still contain free type
+                // variables; otherwise transitive monomorphization must scan
+                // the clone and emit helper specializations reachable from it.
+                for (pc.type_params) |type_param| try walker.pushType(type_param, next_depth, false);
+            },
+            .list => |list_type| try walker.pushType(list_type.element, next_depth, false),
+            .tuple => |tuple_type| {
+                for (tuple_type.elements) |element| try walker.pushType(element, next_depth, false);
+            },
+            .function => |function_type| {
+                for (function_type.params) |param| try walker.pushType(param, next_depth, false);
+                try walker.pushType(function_type.return_type, next_depth, false);
+                // A polymorphic effect marker is a free type variable (#201),
+                // making the enclosing function type generic so it specializes
+                // per closure-argument effect.
+                if (function_type.effect_var) |effect_var| try walker.pushType(effect_var, next_depth, false);
+            },
+            .map => |map_type| {
+                try walker.pushType(map_type.key, next_depth, false);
+                try walker.pushType(map_type.value, next_depth, false);
+            },
+            .applied => |applied_type| {
+                for (applied_type.args) |arg| try walker.pushType(arg, next_depth, false);
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn genericGroupSpan(group: *const hir.FunctionGroup) ast.SourceSpan {
+    if (group.debug_span.start != group.debug_span.end) return group.debug_span;
+    if (group.clauses.len > 0 and group.clauses[0].debug_span.start != group.clauses[0].debug_span.end) {
+        return group.clauses[0].debug_span;
+    }
+    return .{ .start = 0, .end = 0 };
+}
+
+fn blockSpan(block: *const hir.Block) ast.SourceSpan {
+    for (block.stmts) |stmt| {
+        switch (stmt) {
+            .expr => |expr| return expr.span,
+            .local_set => |local_set| return local_set.value.span,
+            .function_group => |group| return genericGroupSpan(group),
+        }
+    }
+    return .{ .start = 0, .end = 0 };
 }
 
 /// Collect typevars that appear at a SCALAR (top-level, not inside a
@@ -2425,40 +3225,36 @@ fn scalarTypeVarSet(
     store: *const TypeStore,
     type_id: TypeId,
     allocator: Allocator,
-) !std.AutoHashMap(types_mod.TypeVarId, void) {
+) TypeWalkError!std.AutoHashMap(types_mod.TypeVarId, void) {
     var out = std.AutoHashMap(types_mod.TypeVarId, void).init(allocator);
     errdefer out.deinit();
-    try collectScalarTypeVars(store, type_id, true, &out);
-    return out;
-}
 
-fn collectScalarTypeVars(
-    store: *const TypeStore,
-    type_id: TypeId,
-    is_scalar_position: bool,
-    out: *std.AutoHashMap(types_mod.TypeVarId, void),
-) error{OutOfMemory}!void {
-    const typ = store.getType(type_id);
-    switch (typ) {
-        .type_var => |var_id| {
-            if (is_scalar_position) try out.put(var_id, {});
-        },
-        .list => |lt| try collectScalarTypeVars(store, lt.element, false, out),
-        .map => |mt| {
-            try collectScalarTypeVars(store, mt.key, false, out);
-            try collectScalarTypeVars(store, mt.value, false, out);
-        },
-        .tuple => |tt| {
-            for (tt.elements) |elem| {
-                try collectScalarTypeVars(store, elem, false, out);
-            }
-        },
-        .function => |ft| {
-            for (ft.params) |p| try collectScalarTypeVars(store, p, false, out);
-            try collectScalarTypeVars(store, ft.return_type, false, out);
-        },
-        else => {},
+    var walker = TypeWalker.init(allocator);
+    defer walker.deinit();
+
+    try walker.pushScalarRoot(type_id);
+    while (try walker.next()) |item| {
+        const next_depth = item.depth + 1;
+        switch (store.getType(item.type_id)) {
+            .type_var => |var_id| {
+                if (item.scalar_position) try out.put(var_id, {});
+            },
+            .list => |list_type| try walker.pushType(list_type.element, next_depth, false),
+            .map => |map_type| {
+                try walker.pushType(map_type.key, next_depth, false);
+                try walker.pushType(map_type.value, next_depth, false);
+            },
+            .tuple => |tuple_type| {
+                for (tuple_type.elements) |element| try walker.pushType(element, next_depth, false);
+            },
+            .function => |function_type| {
+                for (function_type.params) |param| try walker.pushType(param, next_depth, false);
+                try walker.pushType(function_type.return_type, next_depth, false);
+            },
+            else => {},
+        }
     }
+    return out;
 }
 
 /// Walk param/arg types in lock-step. For every typevar position in
@@ -2475,45 +3271,54 @@ fn promoteContainerVarsExceptScalarReturn(
     arg_type: TypeId,
     scalar_return_vars: *const std.AutoHashMap(types_mod.TypeVarId, void),
     subs: *types_mod.SubstitutionMap,
-) void {
-    const param_typ = store.getType(param_type);
-    const arg_typ = store.getType(arg_type);
-    switch (param_typ) {
-        .type_var => |var_id| {
-            if (arg_typ == .term_type and !scalar_return_vars.contains(var_id)) {
-                if (subs.bindings.get(var_id)) |existing| {
-                    if (store.getType(existing) == .term_type) return;
+    allocator: Allocator,
+) TypeWalkError!void {
+    var walker = TypeWalker.init(allocator);
+    defer walker.deinit();
+
+    try walker.pushPairRoot(param_type, arg_type);
+    while (try walker.next()) |item| {
+        const paired_type_id = item.paired_type_id orelse unreachable;
+        const param_typ = store.getType(item.type_id);
+        const arg_typ = store.getType(paired_type_id);
+        const next_depth = item.depth + 1;
+        switch (param_typ) {
+            .type_var => |var_id| {
+                if (arg_typ == .term_type and !scalar_return_vars.contains(var_id)) {
+                    if (subs.bindings.get(var_id)) |existing| {
+                        if (store.getType(existing) == .term_type) continue;
+                    }
+                    try subs.bindings.put(var_id, types_mod.TypeStore.TERM);
                 }
-                subs.bind(var_id, types_mod.TypeStore.TERM);
-            }
-        },
-        .list => |pt_list| {
-            if (arg_typ == .list) {
-                promoteContainerVarsExceptScalarReturn(store, pt_list.element, arg_typ.list.element, scalar_return_vars, subs);
-            }
-        },
-        .map => |pt_map| {
-            if (arg_typ == .map) {
-                promoteContainerVarsExceptScalarReturn(store, pt_map.key, arg_typ.map.key, scalar_return_vars, subs);
-                promoteContainerVarsExceptScalarReturn(store, pt_map.value, arg_typ.map.value, scalar_return_vars, subs);
-            }
-        },
-        .tuple => |pt_tup| {
-            if (arg_typ == .tuple and pt_tup.elements.len == arg_typ.tuple.elements.len) {
-                for (pt_tup.elements, arg_typ.tuple.elements) |pe, ae| {
-                    promoteContainerVarsExceptScalarReturn(store, pe, ae, scalar_return_vars, subs);
+            },
+            .list => |param_list| {
+                if (arg_typ == .list) {
+                    try walker.pushPair(param_list.element, arg_typ.list.element, next_depth);
                 }
-            }
-        },
-        .function => |pt_fn| {
-            if (arg_typ == .function and pt_fn.params.len == arg_typ.function.params.len) {
-                for (pt_fn.params, arg_typ.function.params) |pp, ap| {
-                    promoteContainerVarsExceptScalarReturn(store, pp, ap, scalar_return_vars, subs);
+            },
+            .map => |param_map| {
+                if (arg_typ == .map) {
+                    try walker.pushPair(param_map.key, arg_typ.map.key, next_depth);
+                    try walker.pushPair(param_map.value, arg_typ.map.value, next_depth);
                 }
-                promoteContainerVarsExceptScalarReturn(store, pt_fn.return_type, arg_typ.function.return_type, scalar_return_vars, subs);
-            }
-        },
-        else => {},
+            },
+            .tuple => |param_tuple| {
+                if (arg_typ == .tuple and param_tuple.elements.len == arg_typ.tuple.elements.len) {
+                    for (param_tuple.elements, arg_typ.tuple.elements) |param_element, arg_element| {
+                        try walker.pushPair(param_element, arg_element, next_depth);
+                    }
+                }
+            },
+            .function => |param_function| {
+                if (arg_typ == .function and param_function.params.len == arg_typ.function.params.len) {
+                    for (param_function.params, arg_typ.function.params) |param_child, arg_child| {
+                        try walker.pushPair(param_child, arg_child, next_depth);
+                    }
+                    try walker.pushPair(param_function.return_type, arg_typ.function.return_type, next_depth);
+                }
+            },
+            else => {},
+        }
     }
 }
 
@@ -2529,20 +3334,37 @@ fn hashInstantiation(group_id: u32, type_args: []const TypeId) u64 {
 
 /// Generate a mangled name for a specialized function.
 /// E.g. "length" with type args [String] → "length__String"
-fn mangleName(allocator: Allocator, base_name: []const u8, store: *const TypeStore, type_args: []const TypeId) ![]const u8 {
-    if (type_args.len == 0) return base_name;
+fn mangleName(allocator: Allocator, base_name: []const u8, store: *const TypeStore, type_args: []const TypeId) NameMangleError![]u8 {
+    for (type_args) |concrete_type| {
+        try typeStructureWithinMangleBudget(allocator, store, concrete_type);
+    }
 
     var parts: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer parts.deinit(allocator);
+
     try parts.appendSlice(allocator, base_name);
-    try parts.appendSlice(allocator, "__");
+    if (type_args.len > 0) {
+        try parts.appendSlice(allocator, "__");
+    }
 
     for (type_args, 0..) |concrete_type, i| {
         if (i > 0) try parts.append(allocator, '_');
-        const type_name = typeIdToMangledName(store, concrete_type);
+        const type_name = try typeIdToMangledName(allocator, store, concrete_type);
+        defer allocator.free(type_name);
         try parts.appendSlice(allocator, type_name);
     }
 
     return try parts.toOwnedSlice(allocator);
+}
+
+fn typeStructureWithinMangleBudget(allocator: Allocator, store: *const TypeStore, root: TypeId) TypeWalkError!void {
+    var walker = TypeWalker.init(allocator);
+    defer walker.deinit();
+
+    try walker.pushRoot(root);
+    while (try walker.next()) |item| {
+        try walker.pushStructuralChildren(store, item);
+    }
 }
 
 // ============================================================
@@ -2552,6 +3374,1074 @@ fn mangleName(allocator: Allocator, base_name: []const u8, store: *const TypeSto
 const Parser = @import("parser.zig").Parser;
 const Collector = @import("collector.zig").Collector;
 const HirBuilder = hir.HirBuilder;
+
+fn initTestMonomorphContext(
+    allocator: Allocator,
+    store: *TypeStore,
+    interner: *ast.StringInterner,
+    program: *const hir.Program,
+    next_group_id: *u32,
+) MonomorphContext {
+    return .{
+        .allocator = allocator,
+        .store = store,
+        .next_group_id = next_group_id,
+        .interner = interner,
+        .program = program,
+        .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
+        .specializations = std.AutoHashMap(u64, u32).init(allocator),
+        .specialization_counts = std.AutoHashMap(u32, u32).init(allocator),
+        .new_groups = .empty,
+        .call_rewrites = std.AutoHashMap(u64, u32).init(allocator),
+        .local_types = std.AutoHashMap(u32, TypeId).init(allocator),
+        .errors = .empty,
+    };
+}
+
+fn deinitTestMonomorphContext(ctx: *MonomorphContext) void {
+    ctx.generic_groups.deinit();
+    ctx.specializations.deinit();
+    ctx.specialization_counts.deinit();
+    ctx.new_groups.deinit(ctx.allocator);
+    ctx.call_rewrites.deinit();
+    ctx.local_types.deinit();
+    ctx.errors.deinit(ctx.allocator);
+}
+
+fn testExpr(
+    allocator: Allocator,
+    kind: hir.ExprKind,
+    type_id: TypeId,
+    span: ast.SourceSpan,
+) !*const hir.Expr {
+    const expr = try allocator.create(hir.Expr);
+    expr.* = .{ .kind = kind, .type_id = type_id, .span = span };
+    return expr;
+}
+
+fn deepUnaryExpr(
+    allocator: Allocator,
+    depth: u32,
+    span: ast.SourceSpan,
+) !*const hir.Expr {
+    var current = try testExpr(allocator, .{ .bool_lit = true }, TypeStore.BOOL, span);
+    for (0..depth) |_| {
+        current = try testExpr(allocator, .{ .unary = .{
+            .op = .not_op,
+            .operand = current,
+        } }, TypeStore.BOOL, span);
+    }
+    return current;
+}
+
+fn blockWithExpr(allocator: Allocator, expr: *const hir.Expr) !*const hir.Block {
+    const stmts = try allocator.alloc(hir.Stmt, 1);
+    stmts[0] = .{ .expr = expr };
+    const block = try allocator.create(hir.Block);
+    block.* = .{ .stmts = stmts, .result_type = expr.type_id };
+    return block;
+}
+
+fn emptyBlock(allocator: Allocator) !*const hir.Block {
+    const block = try allocator.create(hir.Block);
+    block.* = .{ .stmts = &.{}, .result_type = TypeStore.NIL };
+    return block;
+}
+
+fn deepTuplePattern(
+    allocator: Allocator,
+    depth: u32,
+    bind_name: ast.StringId,
+) !*const hir.MatchPattern {
+    var current = try allocator.create(hir.MatchPattern);
+    current.* = .{ .bind = bind_name };
+    for (0..depth) |_| {
+        const elements = try allocator.alloc(*const hir.MatchPattern, 1);
+        elements[0] = current;
+        const next = try allocator.create(hir.MatchPattern);
+        next.* = .{ .tuple = elements };
+        current = next;
+    }
+    return current;
+}
+
+fn deepBindDecision(
+    allocator: Allocator,
+    depth: u32,
+    bind_name: ast.StringId,
+    source_expr: *const hir.Expr,
+) !*const hir.Decision {
+    var current = try allocator.create(hir.Decision);
+    current.* = .{ .success = .{ .bindings = &.{}, .body_index = 0 } };
+    for (0..depth) |_| {
+        const next = try allocator.create(hir.Decision);
+        next.* = .{ .bind = .{
+            .name = bind_name,
+            .local_index = 0,
+            .source = source_expr,
+            .next = current,
+        } };
+        current = next;
+    }
+    return current;
+}
+
+fn deepListType(store: *TypeStore, depth: u32, leaf: TypeId) !TypeId {
+    var current = leaf;
+    for (0..depth) |_| {
+        current = try store.addType(.{ .list = .{ .element = current } });
+    }
+    return current;
+}
+
+fn cyclicListType(store: *TypeStore, allocator: Allocator) !TypeId {
+    const type_id: TypeId = @intCast(store.types.items.len);
+    try store.types.append(allocator, .{ .list = .{ .element = type_id } });
+    return type_id;
+}
+
+test "structNameMatchesQualifier preserves multi-segment match and no-match semantics" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const struct_name = try interner.intern("CombinatorFactory");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(std.testing.allocator, &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const parts = [_]ast.StringId{ namespace_name, struct_name };
+    const qualified_name = ast.StructName{
+        .parts = &parts,
+        .span = .{ .start = 0, .end = 0 },
+    };
+
+    try std.testing.expect(try ctx.structNameMatchesQualifier(qualified_name, "CombinatorFactory"));
+    try std.testing.expect(try ctx.structNameMatchesQualifier(qualified_name, "Zap_CombinatorFactory"));
+    try std.testing.expect(try ctx.structNameMatchesQualifier(qualified_name, "Zap.CombinatorFactory"));
+    try std.testing.expect(!try ctx.structNameMatchesQualifier(qualified_name, "Zap.Other"));
+}
+
+test "structNameMatchesQualifier propagates multi-segment allocation failure" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const struct_name = try interner.intern("CombinatorFactory");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(failing_allocator.allocator(), &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const parts = [_]ast.StringId{ namespace_name, struct_name };
+    const qualified_name = ast.StructName{
+        .parts = &parts,
+        .span = .{ .start = 0, .end = 0 },
+    };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ctx.structNameMatchesQualifier(qualified_name, "Zap.Other"),
+    );
+}
+
+test "resolveNamedCall propagates qualifier allocation failure" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const namespace_name = try interner.intern("Zap");
+    const struct_name = try interner.intern("CombinatorFactory");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const parts = [_]ast.StringId{ namespace_name, struct_name };
+    const structs = [_]hir.Struct{.{
+        .name = .{
+            .parts = &parts,
+            .span = .{ .start = 0, .end = 0 },
+        },
+        .scope_id = 0,
+        .functions = &.{},
+        .types = &.{},
+    }};
+    const program = hir.Program{
+        .structs = &structs,
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(failing_allocator.allocator(), &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ctx.resolveNamedCall(.{ .struct_name = "Zap.Other", .name = "make" }, 0),
+    );
+}
+
+test "cloneGroupWithSubs propagates source-qualified name allocation OOM" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const struct_name = try interner.intern("Source");
+    const function_name = try interner.intern("identity");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const group = hir.FunctionGroup{
+        .id = 1,
+        .scope_id = 0,
+        .name = function_name,
+        .arity = 0,
+        .clauses = &.{},
+        .fallback_parent = null,
+    };
+    const functions = [_]hir.FunctionGroup{group};
+    const name_parts = [_]ast.StringId{struct_name};
+    const structs = [_]hir.Struct{.{
+        .name = .{ .parts = &name_parts, .span = .{ .start = 0, .end = 0 } },
+        .scope_id = 0,
+        .functions = &functions,
+        .types = &.{},
+    }};
+    const program = hir.Program{
+        .structs = &structs,
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+
+    var subs = SubstitutionMap.init(std.testing.allocator);
+    defer subs.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var next_group_id: u32 = 2;
+    var ctx = initTestMonomorphContext(failing_allocator.allocator(), &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const type_args = [_]TypeId{TypeStore.I64};
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ctx.cloneGroupWithSubs(&functions[0], &subs, &.{}, &type_args, next_group_id, 0),
+    );
+}
+
+test "typeIdToMangledName propagates allocation failure instead of T" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        typeIdToMangledName(failing_allocator.allocator(), &store, TypeStore.I64),
+    );
+}
+
+test "typeIdToMangledName includes anonymous union member identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const union_members = [_]TypeId{ TypeStore.I64, TypeStore.STRING };
+    const union_type = try store.addType(.{ .union_type = .{ .members = &union_members } });
+
+    const union_name = try typeIdToMangledName(alloc, &store, union_type);
+    try std.testing.expectEqualStrings("Union_i64_String", union_name);
+}
+
+test "typeIdToMangledName includes type variable identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const box_name = try interner.intern("Box");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const box_decl = try store.addType(.{ .struct_type = .{
+        .name = box_name,
+        .fields = &.{},
+        .type_params = &.{},
+    } });
+    const type_var = try store.freshVar();
+    const applied_args = try alloc.alloc(TypeId, 1);
+    applied_args[0] = type_var;
+    const box_type_var = try store.addType(.{ .applied = .{ .base = box_decl, .args = applied_args } });
+
+    const box_type_var_name = try typeIdToMangledName(alloc, &store, box_type_var);
+    try std.testing.expectEqualStrings("Box_TypeVar0", box_type_var_name);
+}
+
+test "mangleName rejects oversized type arguments before emitting partial names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const oversized_type = try deepListType(&store, MAX_TYPE_STRUCTURE_DEPTH + 2, TypeStore.I64);
+    const type_args = [_]TypeId{oversized_type};
+
+    try std.testing.expectError(
+        error.TypeStructureTooDeep,
+        mangleName(alloc, "identity", &store, &type_args),
+    );
+}
+
+test "cloneGroupWithSubs does not fall back to base group name on mangle OOM" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const function_name = try interner.intern("identity");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const group = hir.FunctionGroup{
+        .id = 1,
+        .scope_id = 0,
+        .name = function_name,
+        .arity = 0,
+        .clauses = &.{},
+        .fallback_parent = null,
+    };
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{group},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+
+    var subs = SubstitutionMap.init(std.testing.allocator);
+    defer subs.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var next_group_id: u32 = 2;
+    var ctx = initTestMonomorphContext(failing_allocator.allocator(), &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const type_args = [_]TypeId{TypeStore.I64};
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ctx.cloneGroupWithSubs(&group, &subs, &.{}, &type_args, next_group_id, 0),
+    );
+}
+
+test "monomorphizer propagates transitive scan copy OOM" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const function_name = try interner.intern("ready");
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var next_group_id: u32 = 2;
+    var ctx = initTestMonomorphContext(failing_allocator.allocator(), &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const group = hir.FunctionGroup{
+        .id = 1,
+        .scope_id = 0,
+        .name = function_name,
+        .arity = 0,
+        .clauses = &.{},
+        .fallback_parent = null,
+    };
+    const entries = [_]NewGroupEntry{.{
+        .group = group,
+        .source_group_id = group.id,
+        .target_struct_idx = null,
+    }};
+
+    try std.testing.expectError(error.OutOfMemory, ctx.collectTransitiveScanEntries(&entries));
+}
+
+test "monomorphizer checked type walkers report depth exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(alloc, &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const deep_concrete = try deepListType(&store, MAX_TYPE_STRUCTURE_DEPTH + 2, TypeStore.I64);
+    try std.testing.expectError(error.TypeStructureTooDeep, ctx.isConcreteRuntimeType(deep_concrete));
+    try std.testing.expectError(error.TypeStructureTooDeep, ctx.typeArgIsMonomorphizationReady(deep_concrete));
+
+    const type_var = try store.freshVar();
+    const deep_unbound = try deepListType(&store, MAX_TYPE_STRUCTURE_DEPTH + 2, type_var);
+    try std.testing.expectError(error.TypeStructureTooDeep, ctx.defaultUnboundTypeVars(deep_unbound, TypeStore.I64));
+}
+
+test "defaultUnboundTypeVars returns OOM instead of original type on allocation failure" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var store = try TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+
+    const type_var = try store.freshVar();
+    const tuple_elements = try std.testing.allocator.alloc(TypeId, 1);
+    defer std.testing.allocator.free(tuple_elements);
+    tuple_elements[0] = type_var;
+    const tuple_type = try store.addType(.{ .tuple = .{ .elements = tuple_elements } });
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(failing_allocator.allocator(), &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    try std.testing.expectError(error.OutOfMemory, ctx.defaultUnboundTypeVars(tuple_type, TypeStore.I64));
+}
+
+test "protocol constraint replacement compares substituted source params" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const enumerable_name = try interner.intern("Enumerable");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const element_var = try store.freshVar();
+    const element_var_id = store.getType(element_var).type_var;
+
+    const formal_args = try alloc.alloc(TypeId, 1);
+    formal_args[0] = element_var;
+    const enumerable_element = try store.addType(.{ .protocol_constraint = .{
+        .protocol_name = enumerable_name,
+        .type_params = formal_args,
+    } });
+
+    const concrete_args = try alloc.alloc(TypeId, 1);
+    concrete_args[0] = TypeStore.I64;
+    const enumerable_i64 = try store.addType(.{ .protocol_constraint = .{
+        .protocol_name = enumerable_name,
+        .type_params = concrete_args,
+    } });
+    const list_i64 = try store.addType(.{ .list = .{ .element = TypeStore.I64 } });
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+    try subs.bind(element_var_id, TypeStore.I64);
+
+    var next_group_id: u32 = 1;
+    const source_params = [_]hir.TypedParam{
+        .{ .name = null, .type_id = enumerable_element, .pattern = null },
+    };
+    const concrete_protocol_params = [_]TypeId{list_i64};
+    const empty_program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+    };
+
+    var ctx = MonomorphContext{
+        .allocator = alloc,
+        .store = &store,
+        .next_group_id = &next_group_id,
+        .interner = &interner,
+        .program = &empty_program,
+        .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(alloc),
+        .specializations = std.AutoHashMap(u64, u32).init(alloc),
+        .specialization_counts = std.AutoHashMap(u32, u32).init(alloc),
+        .new_groups = .empty,
+        .call_rewrites = std.AutoHashMap(u64, u32).init(alloc),
+        .local_types = std.AutoHashMap(u32, TypeId).init(alloc),
+        .errors = .empty,
+        .current_subs = &subs,
+        .current_protocol_param_types = &concrete_protocol_params,
+        .current_protocol_source_param_types = &source_params,
+    };
+    defer ctx.generic_groups.deinit();
+    defer ctx.specializations.deinit();
+    defer ctx.specialization_counts.deinit();
+    defer ctx.new_groups.deinit(alloc);
+    defer ctx.call_rewrites.deinit();
+    defer ctx.local_types.deinit();
+    defer ctx.errors.deinit(alloc);
+
+    try std.testing.expectEqual(list_i64, (try ctx.protocolConstraintReplacement(enumerable_i64)).?);
+}
+
+test "monomorphizer rejects structurally oversized specialization type arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const function_name = try interner.intern("grow");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var nested_type = TypeStore.I64;
+    for (0..MAX_TYPE_STRUCTURE_DEPTH + 2) |_| {
+        nested_type = try store.addType(.{ .list = .{ .element = nested_type } });
+    }
+
+    const empty_program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var next_group_id: u32 = 1;
+    var ctx = MonomorphContext{
+        .allocator = alloc,
+        .store = &store,
+        .next_group_id = &next_group_id,
+        .interner = &interner,
+        .program = &empty_program,
+        .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(alloc),
+        .specializations = std.AutoHashMap(u64, u32).init(alloc),
+        .specialization_counts = std.AutoHashMap(u32, u32).init(alloc),
+        .new_groups = .empty,
+        .call_rewrites = std.AutoHashMap(u64, u32).init(alloc),
+        .local_types = std.AutoHashMap(u32, TypeId).init(alloc),
+        .errors = .empty,
+    };
+    defer ctx.generic_groups.deinit();
+    defer ctx.specializations.deinit();
+    defer ctx.specialization_counts.deinit();
+    defer ctx.new_groups.deinit(alloc);
+    defer ctx.call_rewrites.deinit();
+    defer ctx.local_types.deinit();
+    defer ctx.errors.deinit(alloc);
+
+    const generic_group = hir.FunctionGroup{
+        .id = 7,
+        .scope_id = 0,
+        .name = function_name,
+        .arity = 1,
+        .clauses = &.{},
+        .fallback_parent = null,
+    };
+    const type_args = [_]TypeId{nested_type};
+
+    const within_budget = try ctx.specializationWithinBudget(&generic_group, &type_args, .{ .start = 0, .end = 1 });
+    try std.testing.expect(!within_budget);
+    try std.testing.expect(ctx.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.errors.items[0].message, "exceeds maximum type nesting depth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.errors.items[0].message, "grow/1") != null);
+}
+
+test "monomorphizer reports oversized generic signatures during discovery" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const function_name = try interner.intern("pathological");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    var nested_type = try store.freshVar();
+    for (0..MAX_TYPE_STRUCTURE_DEPTH + 2) |_| {
+        nested_type = try store.addType(.{ .list = .{ .element = nested_type } });
+    }
+
+    const decision = try alloc.create(hir.Decision);
+    decision.* = .{ .success = .{ .bindings = &.{}, .body_index = 0 } };
+    const body = try alloc.create(hir.Block);
+    body.* = .{ .stmts = &.{}, .result_type = TypeStore.NIL };
+
+    const params = try alloc.alloc(hir.TypedParam, 1);
+    params[0] = .{
+        .name = null,
+        .type_id = nested_type,
+        .pattern = null,
+    };
+    const clauses = try alloc.alloc(hir.Clause, 1);
+    clauses[0] = .{
+        .params = params,
+        .return_type = TypeStore.NIL,
+        .debug_span = .{ .start = 11, .end = 19 },
+        .decision = decision,
+        .body = body,
+        .refinement = null,
+        .tuple_bindings = &.{},
+    };
+    const groups = try alloc.alloc(hir.FunctionGroup, 1);
+    groups[0] = .{
+        .id = 17,
+        .scope_id = 0,
+        .name = function_name,
+        .arity = 1,
+        .debug_span = .{ .start = 10, .end = 20 },
+        .clauses = clauses,
+        .fallback_parent = null,
+    };
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = groups,
+        .protocols = &.{},
+        .impls = &.{},
+    };
+
+    var next_group_id: u32 = 18;
+    const result = try monomorphize(alloc, &program, &store, &next_group_id, &interner);
+
+    try std.testing.expectEqual(@as(usize, 1), result.errors.len);
+    try std.testing.expectEqual(@as(usize, 10), result.errors[0].span.start);
+    try std.testing.expect(std.mem.indexOf(u8, result.errors[0].message, "type signature exceeds maximum type nesting depth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.errors[0].message, "pathological/1") != null);
+}
+
+test "monomorphizer type walkers terminate on cyclic type graphs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const cyclic_list = try cyclicListType(&store, alloc);
+
+    try std.testing.expect(!try containsTypeVar(&store, cyclic_list, alloc));
+
+    var scalar_vars = try scalarTypeVarSet(&store, cyclic_list, alloc);
+    defer scalar_vars.deinit();
+    try std.testing.expectEqual(@as(u32, 0), scalar_vars.count());
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+    try promoteContainerVarsExceptScalarReturn(&store, cyclic_list, cyclic_list, &scalar_vars, &subs, alloc);
+    try std.testing.expectEqual(@as(u32, 0), subs.bindings.count());
+}
+
+test "protocol impl binding propagates TypeStore.unify OOM" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const protocol_name = try interner.intern("Enumerable");
+    const integer_name = try interner.intern("Integer");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const constraint_arg = try store.freshVar();
+    const constraint_args = try alloc.alloc(TypeId, 1);
+    constraint_args[0] = constraint_arg;
+    const constraint_type = try store.addType(.{ .protocol_constraint = .{
+        .protocol_name = protocol_name,
+        .type_params = constraint_args,
+    } });
+
+    const impl_arg = try store.freshVar();
+    const impl_args = try alloc.alloc(TypeId, 1);
+    impl_args[0] = impl_arg;
+    const target_pattern = try store.freshVar();
+    const impls = try alloc.alloc(hir.ImplInfo, 1);
+    impls[0] = .{
+        .protocol_name = protocol_name,
+        .protocol_type_args = impl_args,
+        .target_struct = integer_name,
+        .target_type_pattern = target_pattern,
+        .impl_scope_id = 0,
+        .function_group_ids = &.{},
+    };
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = impls,
+    };
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(failing_allocator.allocator(), &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    var subs = SubstitutionMap.init(alloc);
+    defer subs.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ctx.bindProtocolTypeArgsFromImpl(constraint_type, TypeStore.I64, &subs),
+    );
+}
+
+test "generic call scan reports TypeStore.unify graph budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const function_name = try interner.intern("cycle");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const param_type = try cyclicListType(&store, alloc);
+    const arg_type = try cyclicListType(&store, alloc);
+    const span = ast.SourceSpan{ .start = 81, .end = 82 };
+
+    const arg_expr = try testExpr(alloc, .nil_lit, arg_type, span);
+    const args = try alloc.alloc(hir.CallArg, 1);
+    args[0] = .{ .expr = arg_expr };
+    const call_expr = try testExpr(alloc, .{ .call = .{
+        .target = .{ .direct = .{ .function_group_id = 41 } },
+        .args = args,
+    } }, TypeStore.NIL, span);
+    const block = try blockWithExpr(alloc, call_expr);
+
+    const decision = try alloc.create(hir.Decision);
+    decision.* = .{ .success = .{ .bindings = &.{}, .body_index = 0 } };
+    const body = try emptyBlock(alloc);
+    const params = try alloc.alloc(hir.TypedParam, 1);
+    params[0] = .{
+        .name = null,
+        .type_id = param_type,
+        .pattern = null,
+    };
+    const clauses = try alloc.alloc(hir.Clause, 1);
+    clauses[0] = .{
+        .params = params,
+        .return_type = TypeStore.NIL,
+        .decision = decision,
+        .body = body,
+        .refinement = null,
+        .tuple_bindings = &.{},
+    };
+    const groups = try alloc.alloc(hir.FunctionGroup, 1);
+    groups[0] = .{
+        .id = 41,
+        .scope_id = 0,
+        .name = function_name,
+        .arity = 1,
+        .clauses = clauses,
+        .fallback_parent = null,
+    };
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = groups,
+        .protocols = &.{},
+        .impls = &.{},
+    };
+
+    var next_group_id: u32 = 42;
+    var ctx = initTestMonomorphContext(alloc, &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+    try ctx.generic_groups.put(groups[0].id, &groups[0]);
+
+    try ctx.scanBlock(block);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 81), ctx.errors.items[0].span.start);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.errors.items[0].message, "type graph traversal depth budget") != null);
+}
+
+test "monomorphizer reports deep HIR expression scan budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(alloc, &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const span = ast.SourceSpan{ .start = 41, .end = 42 };
+    const expr = try deepUnaryExpr(alloc, MAX_HIR_STRUCTURE_DEPTH + 2, span);
+    const block = try blockWithExpr(alloc, expr);
+
+    try ctx.scanBlock(block);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 41), ctx.errors.items[0].span.start);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.errors.items[0].message, "HIR scan exceeds maximum HIR nesting depth") != null);
+}
+
+test "monomorphizer reports deep pattern local type recording budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const bind_name = try interner.intern("value");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(alloc, &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const span = ast.SourceSpan{ .start = 51, .end = 52 };
+    const scrutinee = try testExpr(alloc, .{ .int_lit = 1 }, TypeStore.I64, span);
+    const pattern = try deepTuplePattern(alloc, MAX_HIR_STRUCTURE_DEPTH + 2, bind_name);
+    const bindings = try alloc.alloc(hir.CaseBinding, 1);
+    bindings[0] = .{
+        .name = bind_name,
+        .local_index = 0,
+        .kind = .extracted,
+        .element_index = 0,
+    };
+    const arm_body = try emptyBlock(alloc);
+    const arms = try alloc.alloc(hir.CaseArm, 1);
+    arms[0] = .{
+        .pattern = pattern,
+        .guard = null,
+        .body = arm_body,
+        .bindings = bindings,
+    };
+    const case_expr = try testExpr(alloc, .{ .case = .{
+        .scrutinee = scrutinee,
+        .arms = arms,
+    } }, TypeStore.I64, span);
+    const block = try blockWithExpr(alloc, case_expr);
+
+    try ctx.scanBlock(block);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 51), ctx.errors.items[0].span.start);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.errors.items[0].message, "case pattern local type recording exceeds maximum HIR nesting depth") != null);
+}
+
+test "monomorphizer bounds deep decision cloning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const bind_name = try interner.intern("value");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(alloc, &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const source_expr = try testExpr(alloc, .{ .int_lit = 1 }, TypeStore.I64, .{ .start = 61, .end = 62 });
+    const decision = try deepBindDecision(alloc, MAX_HIR_STRUCTURE_DEPTH + 2, bind_name, source_expr);
+
+    try std.testing.expectError(error.HirStructureTooDeep, ctx.cloneDecision(decision));
+}
+
+test "monomorphizer reports deep clone budget failure with generic context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const generic_name = try interner.intern("identity");
+    const caller_name = try interner.intern("caller");
+    const bind_name = try interner.intern("value");
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const type_var = try store.freshVar();
+    const source_expr = try testExpr(alloc, .{ .int_lit = 1 }, TypeStore.I64, .{ .start = 70, .end = 71 });
+    const deep_decision = try deepBindDecision(alloc, MAX_HIR_STRUCTURE_DEPTH + 2, bind_name, source_expr);
+
+    const generic_body_expr = try testExpr(alloc, .{ .param_get = 0 }, type_var, .{ .start = 72, .end = 73 });
+    const generic_body = try blockWithExpr(alloc, generic_body_expr);
+    const generic_params = try alloc.alloc(hir.TypedParam, 1);
+    generic_params[0] = .{
+        .name = null,
+        .type_id = type_var,
+        .pattern = null,
+    };
+    const generic_clauses = try alloc.alloc(hir.Clause, 1);
+    generic_clauses[0] = .{
+        .params = generic_params,
+        .return_type = type_var,
+        .debug_span = .{ .start = 70, .end = 80 },
+        .decision = deep_decision,
+        .body = generic_body,
+        .refinement = null,
+        .tuple_bindings = &.{},
+    };
+
+    const call_arg_expr = try testExpr(alloc, .{ .int_lit = 1 }, TypeStore.I64, .{ .start = 81, .end = 82 });
+    const call_args = try alloc.alloc(hir.CallArg, 1);
+    call_args[0] = .{ .expr = call_arg_expr, .expected_type = TypeStore.I64 };
+    const call_expr = try testExpr(alloc, .{ .call = .{
+        .target = .{ .direct = .{ .function_group_id = 1 } },
+        .args = call_args,
+    } }, TypeStore.I64, .{ .start = 81, .end = 82 });
+    const caller_body = try blockWithExpr(alloc, call_expr);
+    const caller_decision = try alloc.create(hir.Decision);
+    caller_decision.* = .{ .success = .{ .bindings = &.{}, .body_index = 0 } };
+    const caller_clauses = try alloc.alloc(hir.Clause, 1);
+    caller_clauses[0] = .{
+        .params = &.{},
+        .return_type = TypeStore.I64,
+        .debug_span = .{ .start = 81, .end = 90 },
+        .decision = caller_decision,
+        .body = caller_body,
+        .refinement = null,
+        .tuple_bindings = &.{},
+    };
+
+    const groups = try alloc.alloc(hir.FunctionGroup, 2);
+    groups[0] = .{
+        .id = 1,
+        .scope_id = 0,
+        .name = generic_name,
+        .arity = 1,
+        .debug_span = .{ .start = 70, .end = 80 },
+        .clauses = generic_clauses,
+        .fallback_parent = null,
+    };
+    groups[1] = .{
+        .id = 2,
+        .scope_id = 0,
+        .name = caller_name,
+        .arity = 0,
+        .debug_span = .{ .start = 81, .end = 90 },
+        .clauses = caller_clauses,
+        .fallback_parent = null,
+    };
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = groups,
+        .protocols = &.{},
+        .impls = &.{},
+    };
+
+    var next_group_id: u32 = 3;
+    const result = try monomorphize(alloc, &program, &store, &next_group_id, &interner);
+
+    try std.testing.expectEqual(@as(usize, 1), result.errors.len);
+    try std.testing.expectEqual(@as(usize, 81), result.errors[0].span.start);
+    try std.testing.expect(std.mem.indexOf(u8, result.errors[0].message, "clone for generic `identity/1` exceeds maximum HIR nesting depth") != null);
+}
+
+test "monomorphizer reports deep rewrite budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var store = try TypeStore.init(alloc, &interner);
+    defer store.deinit();
+
+    const program = hir.Program{
+        .structs = &.{},
+        .top_functions = &.{},
+        .protocols = &.{},
+        .impls = &.{},
+    };
+    var next_group_id: u32 = 1;
+    var ctx = initTestMonomorphContext(alloc, &store, &interner, &program, &next_group_id);
+    defer deinitTestMonomorphContext(&ctx);
+
+    const span = ast.SourceSpan{ .start = 91, .end = 92 };
+    const expr = try deepUnaryExpr(alloc, MAX_HIR_STRUCTURE_DEPTH + 2, span);
+    const block = try blockWithExpr(alloc, expr);
+
+    try ctx.rewriteBlock(block);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 91), ctx.errors.items[0].span.start);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.errors.items[0].message, "call-site rewrite exceeds maximum HIR nesting depth") != null);
+}
 
 test "monomorphizer specializes generic helper on distinct parametric struct args" {
     // `unbox` is a generic helper taking `Box(T)` and returning `T`.
@@ -2581,15 +4471,15 @@ test "monomorphizer specializes generic helper on distinct parametric struct arg
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -2653,15 +4543,15 @@ test "monomorphizer dedupes specializations for identical parametric args" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -2680,6 +4570,256 @@ test "monomorphizer dedupes specializations for identical parametric args" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), unbox_specializations);
+}
+
+test "monomorphizer transitively scans concrete protocol-constrained helper clones" {
+    const source =
+        \\pub protocol Enumerable(element) {
+        \\  fn next(state :: unique Enumerable(element)) -> {Atom, element, Enumerable(element)}
+        \\  fn dispose(state :: unique Enumerable(element)) -> Nil
+        \\}
+        \\
+        \\pub struct Demo {
+        \\  pub fn run(collection :: unique Enumerable(i64), expected :: i64) -> Bool {
+        \\    member_next(collection, expected)
+        \\  }
+        \\
+        \\  fn member_next(state :: unique Enumerable(element), expected :: element) -> Bool {
+        \\    case Enumerable.next(state) {
+        \\      {:done, _, _} -> false
+        \\      {:cont, value, next_state} ->
+        \\        case value == expected {
+        \\          true -> dispose_and_return(next_state, true)
+        \\          false -> member_next(next_state, expected)
+        \\        }
+        \\    }
+        \\  }
+        \\
+        \\  fn dispose_and_return(state :: unique Enumerable(element), value :: result) -> result {
+        \\    Enumerable.dispose(state)
+        \\    value
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var desugarer = @import("desugar.zig").Desugarer.init(alloc, parser.interner, &collector.graph);
+    const desugared = try desugarer.desugarProgram(&program);
+
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&desugared);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&desugared);
+
+    var next_id: u32 = builder.next_group_id;
+    const result = try monomorphize(alloc, &hir_program, checker.store, &next_id, @constCast(parser.interner));
+
+    var saw_member_next_specialization = false;
+    var saw_dispose_and_return_specialization = false;
+    for (result.program.structs) |module| {
+        for (module.functions) |group| {
+            const name = parser.interner.get(group.name);
+            if (group.id < builder.next_group_id) continue;
+            if (std.mem.indexOf(u8, name, "member_next") != null) {
+                saw_member_next_specialization = true;
+            }
+            if (std.mem.indexOf(u8, name, "dispose_and_return") != null) {
+                saw_dispose_and_return_specialization = true;
+            }
+        }
+    }
+
+    try std.testing.expect(saw_member_next_specialization);
+    try std.testing.expect(saw_dispose_and_return_specialization);
+}
+
+fn hirBlockContainsDirectCallTo(block: *const hir.Block, target_group_id: u32) bool {
+    for (block.stmts) |statement| {
+        switch (statement) {
+            .expr => |expression| if (hirExprContainsDirectCallTo(expression, target_group_id)) return true,
+            .local_set => |local_set| if (hirExprContainsDirectCallTo(local_set.value, target_group_id)) return true,
+            .function_group => |function_group| {
+                for (function_group.clauses) |clause| {
+                    if (hirBlockContainsDirectCallTo(clause.body, target_group_id)) return true;
+                }
+            },
+        }
+    }
+    return false;
+}
+
+fn hirExprContainsDirectCallTo(expression: *const hir.Expr, target_group_id: u32) bool {
+    switch (expression.kind) {
+        .call => |call| {
+            if (call.target == .direct and call.target.direct.function_group_id == target_group_id) return true;
+            for (call.args) |argument| {
+                if (hirExprContainsDirectCallTo(argument.expr, target_group_id)) return true;
+            }
+            if (call.target == .closure) {
+                if (hirExprContainsDirectCallTo(call.target.closure, target_group_id)) return true;
+            }
+        },
+        .tuple_init => |elements| for (elements) |element| {
+            if (hirExprContainsDirectCallTo(element, target_group_id)) return true;
+        },
+        .list_init => |elements| for (elements) |element| {
+            if (hirExprContainsDirectCallTo(element, target_group_id)) return true;
+        },
+        .list_cons => |list_cons| {
+            if (hirExprContainsDirectCallTo(list_cons.head, target_group_id)) return true;
+            if (hirExprContainsDirectCallTo(list_cons.tail, target_group_id)) return true;
+        },
+        .map_init => |entries| for (entries) |entry| {
+            if (hirExprContainsDirectCallTo(entry.key, target_group_id)) return true;
+            if (hirExprContainsDirectCallTo(entry.value, target_group_id)) return true;
+        },
+        .struct_init => |struct_init| for (struct_init.fields) |field| {
+            if (hirExprContainsDirectCallTo(field.value, target_group_id)) return true;
+        },
+        .binary => |binary| {
+            if (hirExprContainsDirectCallTo(binary.lhs, target_group_id)) return true;
+            if (hirExprContainsDirectCallTo(binary.rhs, target_group_id)) return true;
+        },
+        .unary => |unary| if (hirExprContainsDirectCallTo(unary.operand, target_group_id)) return true,
+        .field_get => |field_get| if (hirExprContainsDirectCallTo(field_get.object, target_group_id)) return true,
+        .tuple_index_get => |tuple_index_get| if (hirExprContainsDirectCallTo(tuple_index_get.object, target_group_id)) return true,
+        .list_index_get => |list_index_get| if (hirExprContainsDirectCallTo(list_index_get.list, target_group_id)) return true,
+        .list_head_get => |list_head_get| if (hirExprContainsDirectCallTo(list_head_get.list, target_group_id)) return true,
+        .list_tail_get => |list_tail_get| if (hirExprContainsDirectCallTo(list_tail_get.list, target_group_id)) return true,
+        .map_value_get => |map_value_get| {
+            if (hirExprContainsDirectCallTo(map_value_get.map, target_group_id)) return true;
+            if (hirExprContainsDirectCallTo(map_value_get.key, target_group_id)) return true;
+        },
+        .branch => |branch| {
+            if (hirExprContainsDirectCallTo(branch.condition, target_group_id)) return true;
+            if (hirBlockContainsDirectCallTo(branch.then_block, target_group_id)) return true;
+            if (branch.else_block) |else_block| {
+                if (hirBlockContainsDirectCallTo(else_block, target_group_id)) return true;
+            }
+        },
+        .case => |case_data| {
+            if (hirExprContainsDirectCallTo(case_data.scrutinee, target_group_id)) return true;
+            for (case_data.arms) |arm| {
+                if (arm.guard) |guard| {
+                    if (hirExprContainsDirectCallTo(guard, target_group_id)) return true;
+                }
+                if (hirBlockContainsDirectCallTo(arm.body, target_group_id)) return true;
+            }
+        },
+        .block => |block| if (hirBlockContainsDirectCallTo(&block, target_group_id)) return true,
+        .panic => |panic_expression| if (hirExprContainsDirectCallTo(panic_expression, target_group_id)) return true,
+        .unwrap => |unwrap_expression| if (hirExprContainsDirectCallTo(unwrap_expression, target_group_id)) return true,
+        .union_init => |union_init| if (hirExprContainsDirectCallTo(union_init.value, target_group_id)) return true,
+        .error_pipe => |error_pipe| {
+            for (error_pipe.steps) |step| {
+                if (hirExprContainsDirectCallTo(step.expr, target_group_id)) return true;
+            }
+            if (hirExprContainsDirectCallTo(error_pipe.handler, target_group_id)) return true;
+        },
+        .try_rescue => |try_rescue| {
+            if (hirBlockContainsDirectCallTo(try_rescue.body, target_group_id)) return true;
+            for (try_rescue.arms) |arm| {
+                if (arm.guard) |guard| {
+                    if (hirExprContainsDirectCallTo(guard, target_group_id)) return true;
+                }
+                if (hirBlockContainsDirectCallTo(arm.body, target_group_id)) return true;
+            }
+            if (hirExprContainsDirectCallTo(try_rescue.raise_occurred_call, target_group_id)) return true;
+            if (hirExprContainsDirectCallTo(try_rescue.take_raise_call, target_group_id)) return true;
+            if (try_rescue.after_block) |after_block| {
+                if (hirBlockContainsDirectCallTo(after_block, target_group_id)) return true;
+            }
+        },
+        .ret_raise => |ret_raise| if (hirExprContainsDirectCallTo(ret_raise.stash_call, target_group_id)) return true,
+        .match => |match| if (hirExprContainsDirectCallTo(match.scrutinee, target_group_id)) return true,
+        .closure_create => |closure_create| for (closure_create.captures) |capture| {
+            if (hirExprContainsDirectCallTo(capture.expr, target_group_id)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+test "monomorphizer rewrites erased protocol helper with concrete result type" {
+    const source =
+        \\pub protocol Enumerable(element) {
+        \\  fn next(state :: unique Enumerable(element)) -> {Atom, element, Enumerable(element)}
+        \\  fn dispose(state :: unique Enumerable(element)) -> Nil
+        \\}
+        \\
+        \\pub struct Demo {
+        \\  pub fn empty?(collection :: unique Enumerable(element)) -> Bool {
+        \\    case Enumerable.next(collection) {
+        \\      {:done, _, _} -> true
+        \\      {:cont, _, next_state} -> dispose_and_return(next_state, false)
+        \\    }
+        \\  }
+        \\
+        \\  fn dispose_and_return(state :: unique Enumerable(element), value :: result) -> result {
+        \\    Enumerable.dispose(state)
+        \\    value
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var desugarer = @import("desugar.zig").Desugarer.init(alloc, parser.interner, &collector.graph);
+    const desugared = try desugarer.desugarProgram(&program);
+
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&desugared);
+
+    var builder = HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer builder.deinit();
+    const hir_program = try builder.buildProgram(&desugared);
+
+    var next_id: u32 = builder.next_group_id;
+    const result = try monomorphize(alloc, &hir_program, checker.store, &next_id, @constCast(parser.interner));
+
+    var dispose_specialization_id: ?u32 = null;
+    var empty_group: ?*const hir.FunctionGroup = null;
+    for (result.program.structs) |module| {
+        for (module.functions) |*group| {
+            const name = parser.interner.get(group.name);
+            if (std.mem.eql(u8, name, "empty?")) {
+                empty_group = group;
+            }
+            if (group.id >= builder.next_group_id and std.mem.indexOf(u8, name, "dispose_and_return") != null) {
+                dispose_specialization_id = group.id;
+            }
+        }
+    }
+
+    const target_id = dispose_specialization_id orelse return error.TestUnexpectedResult;
+    const group = empty_group orelse return error.TestUnexpectedResult;
+    try std.testing.expect(group.clauses.len > 0);
+    try std.testing.expect(hirBlockContainsDirectCallTo(group.clauses[0].body, target_id));
 }
 
 test "monomorphizer substitutes field-access type through cloned body" {
@@ -2708,15 +4848,15 @@ test "monomorphizer substitutes field-access type through cloned body" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -2759,7 +4899,7 @@ test "typeIdToMangledName encodes applied parametric types" {
     const box_name = try interner.intern("Box");
     const pair_name = try interner.intern("Pair");
 
-    var store = TypeStore.init(alloc, &interner);
+    var store = try TypeStore.init(alloc, &interner);
     defer store.deinit();
 
     const box_decl = try store.addType(.{ .struct_type = .{
@@ -2776,18 +4916,21 @@ test "typeIdToMangledName encodes applied parametric types" {
     const i64_args = try alloc.alloc(TypeId, 1);
     i64_args[0] = TypeStore.I64;
     const box_i64 = try store.addType(.{ .applied = .{ .base = box_decl, .args = i64_args } });
-    try std.testing.expectEqualStrings("Box_i64", typeIdToMangledName(&store, box_i64));
+    const box_i64_name = try typeIdToMangledName(alloc, &store, box_i64);
+    try std.testing.expectEqualStrings("Box_i64", box_i64_name);
 
     const string_args = try alloc.alloc(TypeId, 1);
     string_args[0] = TypeStore.STRING;
     const box_string = try store.addType(.{ .applied = .{ .base = box_decl, .args = string_args } });
-    try std.testing.expectEqualStrings("Box_String", typeIdToMangledName(&store, box_string));
+    const box_string_name = try typeIdToMangledName(alloc, &store, box_string);
+    try std.testing.expectEqualStrings("Box_String", box_string_name);
 
     const pair_args = try alloc.alloc(TypeId, 2);
     pair_args[0] = TypeStore.I64;
     pair_args[1] = TypeStore.STRING;
     const pair_i64_string = try store.addType(.{ .applied = .{ .base = pair_decl, .args = pair_args } });
-    try std.testing.expectEqualStrings("Pair_i64_String", typeIdToMangledName(&store, pair_i64_string));
+    const pair_i64_string_name = try typeIdToMangledName(alloc, &store, pair_i64_string);
+    try std.testing.expectEqualStrings("Pair_i64_String", pair_i64_string_name);
 }
 
 /// Convert a TypeId to a short mangled name for function
@@ -2795,14 +4938,8 @@ test "typeIdToMangledName encodes applied parametric types" {
 /// so the monomorphizer's specialization keys and the IR/ZIR
 /// per-instantiation struct/union names stay in lockstep.
 ///
-/// The borrowed-string API is preserved for legacy call sites that
-/// embed the result into a longer composed name (`Demo_unbox__i64`):
-/// each invocation produces a fresh allocation from
-/// `store.allocator`, but the caller appends it into its own
-/// `ArrayList` and never observes the raw pointer afterwards. The
-/// returned slice therefore aliases freshly-allocated memory that
-/// outlives the immediate `appendSlice` call but is otherwise
-/// abandoned — same lifetime contract as before.
-fn typeIdToMangledName(store: *const TypeStore, type_id: TypeId) []const u8 {
-    return types_mod.typeIdMangledName(@constCast(store).allocator, store, type_id) catch "T";
+/// The caller owns the returned slice. Allocation failure is propagated
+/// instead of being collapsed to a placeholder type name.
+fn typeIdToMangledName(allocator: Allocator, store: *const TypeStore, type_id: TypeId) TypeMangleError![]u8 {
+    return try types_mod.typeIdMangledName(allocator, store, type_id);
 }

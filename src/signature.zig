@@ -16,10 +16,10 @@ const ast = @import("ast.zig");
 const scope = @import("scope.zig");
 
 /// Append-only string buffer. Mirrors the small helper used elsewhere
-/// in the compiler for HTML and signature emission. Errors from the
-/// underlying allocator are intentionally swallowed — signature
-/// rendering must never bring a build down because of an OOM during
-/// formatting; partial output is acceptable in that pathological case.
+/// in the compiler for HTML and signature emission. Append errors from
+/// the underlying allocator are propagated so callers never observe
+/// successful truncated signatures. Callers that need to retain the
+/// rendered bytes must use `toOwnedSlice`; `toSlice` is borrowed.
 pub const Buffer = struct {
     list: std.ArrayListUnmanaged(u8),
     alloc: Allocator,
@@ -28,23 +28,48 @@ pub const Buffer = struct {
         return .{ .list = .empty, .alloc = alloc };
     }
 
-    pub fn str(self: *Buffer, s: []const u8) void {
-        self.list.appendSlice(self.alloc, s) catch {};
+    pub fn deinit(self: *Buffer) void {
+        self.list.deinit(self.alloc);
     }
 
-    pub fn char(self: *Buffer, c: u8) void {
-        self.list.append(self.alloc, c) catch {};
+    pub fn str(self: *Buffer, s: []const u8) Allocator.Error!void {
+        try self.list.appendSlice(self.alloc, s);
     }
 
-    pub fn fmt(self: *Buffer, comptime f: []const u8, args: anytype) void {
-        const s = std.fmt.allocPrint(self.alloc, f, args) catch return;
-        self.list.appendSlice(self.alloc, s) catch {};
+    pub fn char(self: *Buffer, c: u8) Allocator.Error!void {
+        try self.list.append(self.alloc, c);
+    }
+
+    pub fn fmt(self: *Buffer, comptime f: []const u8, args: anytype) Allocator.Error!void {
+        try self.list.print(self.alloc, f, args);
     }
 
     pub fn toSlice(self: *Buffer) []const u8 {
         return self.list.items;
     }
+
+    pub fn toOwnedSlice(self: *Buffer) Allocator.Error![]const u8 {
+        return self.list.toOwnedSlice(self.alloc);
+    }
 };
+
+fn appendOwnedSignature(
+    alloc: Allocator,
+    signatures: *std.ArrayListUnmanaged([]const u8),
+    rendered: []const u8,
+) Allocator.Error!void {
+    errdefer alloc.free(rendered);
+    try signatures.append(alloc, rendered);
+}
+
+fn appendOwnershipQualifier(buf: *Buffer, ownership: ast.Ownership, explicit: bool) Allocator.Error!void {
+    if (!explicit) return;
+    switch (ownership) {
+        .shared => try buf.str("shared "),
+        .unique => try buf.str("unique "),
+        .borrowed => try buf.str("borrowed "),
+    }
+}
 
 /// Build one signature string per function clause. The output is the
 /// reverse of the Zap parser's input: `name(p1 :: T1, p2 :: T2) -> R`,
@@ -57,17 +82,22 @@ pub fn buildClauseSignatures(
     clauses: []const scope.FunctionClauseRef,
     interner: *const ast.StringInterner,
     graph: *const scope.ScopeGraph,
-) []const []const u8 {
+) Allocator.Error![]const []const u8 {
     var signatures: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (signatures.items) |signature| alloc.free(signature);
+        signatures.deinit(alloc);
+    }
+
     for (clauses) |clause_ref| {
         if (clause_ref.clause_index >= clause_ref.decl.clauses.len) continue;
         const clause = clause_ref.decl.clauses[clause_ref.clause_index];
-        signatures.append(alloc, buildClauseSignature(alloc, function_name, clause, interner, graph)) catch {};
+        try appendOwnedSignature(alloc, &signatures, try buildClauseSignature(alloc, function_name, clause, interner, graph));
     }
     if (signatures.items.len == 0) {
-        signatures.append(alloc, std.fmt.allocPrint(alloc, "{s}()", .{function_name}) catch function_name) catch {};
+        try appendOwnedSignature(alloc, &signatures, try std.fmt.allocPrint(alloc, "{s}()", .{function_name}));
     }
-    return signatures.toOwnedSlice(alloc) catch &.{};
+    return signatures.toOwnedSlice(alloc);
 }
 
 pub fn buildClauseSignature(
@@ -76,111 +106,132 @@ pub fn buildClauseSignature(
     clause: ast.FunctionClause,
     interner: *const ast.StringInterner,
     graph: *const scope.ScopeGraph,
-) []const u8 {
+) Allocator.Error![]const u8 {
     var buf = Buffer.init(alloc);
-    buf.str(function_name);
-    buf.char('(');
+    errdefer buf.deinit();
+
+    try buf.str(function_name);
+    try buf.char('(');
     for (clause.params, 0..) |param, i| {
-        if (i > 0) buf.str(", ");
-        appendPattern(&buf, param.pattern, interner, graph);
+        if (i > 0) try buf.str(", ");
+        try appendPattern(&buf, param.pattern, interner, graph);
         if (param.type_annotation) |type_ann| {
-            buf.str(" :: ");
-            appendTypeExpr(&buf, type_ann, interner);
+            try buf.str(" :: ");
+            try appendOwnershipQualifier(&buf, param.ownership, param.ownership_explicit);
+            try appendTypeExpr(&buf, type_ann, interner);
         }
         if (param.default) |default_expr| {
-            buf.str(" = ");
-            appendExpr(&buf, default_expr, interner, graph);
+            try buf.str(" = ");
+            try appendExpr(&buf, default_expr, interner, graph);
         }
     }
-    buf.char(')');
+    try buf.char(')');
     if (clause.return_type) |ret| {
-        buf.str(" -> ");
-        appendTypeExpr(&buf, ret, interner);
+        try buf.str(" -> ");
+        try appendTypeExpr(&buf, ret, interner);
     }
     if (clause.refinement) |refinement| {
-        buf.str(" if ");
-        appendExpr(&buf, refinement, interner, graph);
+        try buf.str(" if ");
+        try appendExpr(&buf, refinement, interner, graph);
     }
-    return buf.toSlice();
+    return buf.toOwnedSlice();
 }
 
 pub fn buildProtocolFunctionSignature(
     alloc: Allocator,
     function_sig: ast.ProtocolFunctionSig,
     interner: *const ast.StringInterner,
-) []const u8 {
+) Allocator.Error![]const u8 {
     var buf = Buffer.init(alloc);
-    buf.str(interner.get(function_sig.name));
-    buf.char('(');
+    errdefer buf.deinit();
+
+    try buf.str(interner.get(function_sig.name));
+    try buf.char('(');
     for (function_sig.params, 0..) |param, i| {
-        if (i > 0) buf.str(", ");
-        buf.str(interner.get(param.name));
+        if (i > 0) try buf.str(", ");
+        try buf.str(interner.get(param.name));
         if (param.type_annotation) |type_annotation| {
-            buf.str(" :: ");
-            appendTypeExpr(&buf, type_annotation, interner);
+            try buf.str(" :: ");
+            try appendOwnershipQualifier(&buf, param.ownership, param.ownership_explicit);
+            try appendTypeExpr(&buf, type_annotation, interner);
         }
     }
-    buf.char(')');
+    try buf.char(')');
     if (function_sig.return_type) |return_type| {
-        buf.str(" -> ");
-        appendTypeExpr(&buf, return_type, interner);
+        try buf.str(" -> ");
+        try appendTypeExpr(&buf, return_type, interner);
     }
-    return buf.toSlice();
+    return buf.toOwnedSlice();
 }
 
 pub fn buildUnionVariantSignature(
     alloc: Allocator,
     variant: ast.UnionVariant,
     interner: *const ast.StringInterner,
-) []const u8 {
+) Allocator.Error![]const u8 {
     var buf = Buffer.init(alloc);
-    buf.str(interner.get(variant.name));
+    errdefer buf.deinit();
+
+    try buf.str(interner.get(variant.name));
     if (variant.type_expr) |type_expr| {
-        buf.str(" :: ");
-        appendTypeExpr(&buf, type_expr, interner);
+        try buf.str(" :: ");
+        try appendTypeExpr(&buf, type_expr, interner);
     }
-    return buf.toSlice();
+    return buf.toOwnedSlice();
 }
 
-pub fn appendStructName(buf: *Buffer, name: ast.StructName, interner: *const ast.StringInterner) void {
+pub fn appendStructName(buf: *Buffer, name: ast.StructName, interner: *const ast.StringInterner) Allocator.Error!void {
     for (name.parts, 0..) |part, i| {
-        if (i > 0) buf.char('.');
-        buf.str(interner.get(part));
+        if (i > 0) try buf.char('.');
+        try buf.str(interner.get(part));
     }
 }
 
-pub fn appendTypeExpr(buf: *Buffer, type_expr: *const ast.TypeExpr, interner: *const ast.StringInterner) void {
+pub fn appendTypeExpr(buf: *Buffer, type_expr: *const ast.TypeExpr, interner: *const ast.StringInterner) Allocator.Error!void {
     switch (type_expr.*) {
-        .name => |n| buf.str(interner.get(n.name)),
-        .variable => |v| buf.str(interner.get(v.name)),
+        .name => |n| {
+            try buf.str(interner.get(n.name));
+            try appendTypeArgs(buf, n.args, interner);
+        },
+        .variable => |v| try buf.str(interner.get(v.name)),
         .list => |l| {
-            buf.char('[');
-            appendTypeExpr(buf, l.element, interner);
-            buf.char(']');
+            try buf.char('[');
+            try appendTypeExpr(buf, l.element, interner);
+            try buf.char(']');
         },
         .tuple => |t| {
-            buf.char('{');
+            try buf.char('{');
             for (t.elements, 0..) |elem, i| {
-                if (i > 0) buf.str(", ");
-                appendTypeExpr(buf, elem, interner);
+                if (i > 0) try buf.str(", ");
+                try appendTypeExpr(buf, elem, interner);
             }
-            buf.char('}');
+            try buf.char('}');
         },
         .function => |f| {
             // A function-TYPE annotation renders in the current surface
             // syntax `fn(P...) -> R` (the form the parser accepts), NOT the
             // legacy `(P... -> R)`. Distinct from a function DECLARATION
             // signature `name(P...) -> R` built by `buildFunctionSignature`.
-            buf.str("fn(");
+            try buf.str("fn(");
             for (f.params, 0..) |param, i| {
-                if (i > 0) buf.str(", ");
-                appendTypeExpr(buf, param, interner);
+                if (i > 0) try buf.str(", ");
+                try appendTypeExpr(buf, param, interner);
             }
-            buf.str(") -> ");
-            appendTypeExpr(buf, f.return_type, interner);
+            try buf.str(") -> ");
+            try appendTypeExpr(buf, f.return_type, interner);
         },
-        else => buf.char('?'),
+        else => try buf.char('?'),
     }
+}
+
+fn appendTypeArgs(buf: *Buffer, args: []const *const ast.TypeExpr, interner: *const ast.StringInterner) Allocator.Error!void {
+    if (args.len == 0) return;
+    try buf.char('(');
+    for (args, 0..) |arg, i| {
+        if (i > 0) try buf.str(", ");
+        try appendTypeExpr(buf, arg, interner);
+    }
+    try buf.char(')');
 }
 
 fn sourceSlice(meta: ast.NodeMeta, graph: *const scope.ScopeGraph) ?[]const u8 {
@@ -192,32 +243,32 @@ fn sourceSlice(meta: ast.NodeMeta, graph: *const scope.ScopeGraph) ?[]const u8 {
     return std.mem.trim(u8, source[meta.span.start..meta.span.end], " \t\r\n");
 }
 
-fn appendZapStringLiteral(buf: *Buffer, value: []const u8) void {
-    buf.char('"');
+fn appendZapStringLiteral(buf: *Buffer, value: []const u8) Allocator.Error!void {
+    try buf.char('"');
     for (value) |c| {
         switch (c) {
-            '\\' => buf.str("\\\\"),
-            '"' => buf.str("\\\""),
-            '\n' => buf.str("\\n"),
-            '\r' => buf.str("\\r"),
-            '\t' => buf.str("\\t"),
-            else => buf.char(c),
+            '\\' => try buf.str("\\\\"),
+            '"' => try buf.str("\\\""),
+            '\n' => try buf.str("\\n"),
+            '\r' => try buf.str("\\r"),
+            '\t' => try buf.str("\\t"),
+            else => try buf.char(c),
         }
     }
-    buf.char('"');
+    try buf.char('"');
 }
 
-fn appendLiteralPattern(buf: *Buffer, literal: ast.LiteralPattern, interner: *const ast.StringInterner) void {
+fn appendLiteralPattern(buf: *Buffer, literal: ast.LiteralPattern, interner: *const ast.StringInterner) Allocator.Error!void {
     switch (literal) {
-        .int => |v| buf.fmt("{d}", .{v.value}),
-        .float => |v| buf.fmt("{d}", .{v.value}),
-        .string => |v| appendZapStringLiteral(buf, interner.get(v.value)),
+        .int => |v| try buf.fmt("{d}", .{v.value}),
+        .float => |v| try buf.fmt("{d}", .{v.value}),
+        .string => |v| try appendZapStringLiteral(buf, interner.get(v.value)),
         .atom => |v| {
-            buf.char(':');
-            buf.str(interner.get(v.value));
+            try buf.char(':');
+            try buf.str(interner.get(v.value));
         },
-        .bool_lit => |v| buf.str(if (v.value) "true" else "false"),
-        .nil => buf.str("nil"),
+        .bool_lit => |v| try buf.str(if (v.value) "true" else "false"),
+        .nil => try buf.str("nil"),
     }
 }
 
@@ -226,90 +277,90 @@ pub fn appendPattern(
     pattern: *const ast.Pattern,
     interner: *const ast.StringInterner,
     graph: *const scope.ScopeGraph,
-) void {
+) Allocator.Error!void {
     if (sourceSlice(pattern.getMeta(), graph)) |text| {
-        buf.str(text);
+        try buf.str(text);
         return;
     }
     switch (pattern.*) {
-        .wildcard => buf.char('_'),
-        .bind => |v| buf.str(interner.get(v.name)),
+        .wildcard => try buf.char('_'),
+        .bind => |v| try buf.str(interner.get(v.name)),
         .pin => |v| {
-            buf.char('^');
-            buf.str(interner.get(v.name));
+            try buf.char('^');
+            try buf.str(interner.get(v.name));
         },
-        .literal => |literal| appendLiteralPattern(buf, literal, interner),
+        .literal => |literal| try appendLiteralPattern(buf, literal, interner),
         .paren => |v| {
-            buf.char('(');
-            appendPattern(buf, v.inner, interner, graph);
-            buf.char(')');
+            try buf.char('(');
+            try appendPattern(buf, v.inner, interner, graph);
+            try buf.char(')');
         },
         .tuple => |v| {
-            buf.char('{');
+            try buf.char('{');
             for (v.elements, 0..) |element, i| {
-                if (i > 0) buf.str(", ");
-                appendPattern(buf, element, interner, graph);
+                if (i > 0) try buf.str(", ");
+                try appendPattern(buf, element, interner, graph);
             }
-            buf.char('}');
+            try buf.char('}');
         },
         .list => |v| {
-            buf.char('[');
+            try buf.char('[');
             for (v.elements, 0..) |element, i| {
-                if (i > 0) buf.str(", ");
-                appendPattern(buf, element, interner, graph);
+                if (i > 0) try buf.str(", ");
+                try appendPattern(buf, element, interner, graph);
             }
-            buf.char(']');
+            try buf.char(']');
         },
         .list_cons => |v| {
-            buf.char('[');
+            try buf.char('[');
             for (v.heads, 0..) |head, i| {
-                if (i > 0) buf.str(", ");
-                appendPattern(buf, head, interner, graph);
+                if (i > 0) try buf.str(", ");
+                try appendPattern(buf, head, interner, graph);
             }
-            if (v.heads.len > 0) buf.str(" | ");
-            appendPattern(buf, v.tail, interner, graph);
-            buf.char(']');
+            if (v.heads.len > 0) try buf.str(" | ");
+            try appendPattern(buf, v.tail, interner, graph);
+            try buf.char(']');
         },
         .map => |v| {
-            buf.str("%{");
+            try buf.str("%{");
             for (v.fields, 0..) |field, i| {
-                if (i > 0) buf.str(", ");
-                appendExpr(buf, field.key, interner, graph);
-                buf.str(" => ");
-                appendPattern(buf, field.value, interner, graph);
+                if (i > 0) try buf.str(", ");
+                try appendExpr(buf, field.key, interner, graph);
+                try buf.str(" => ");
+                try appendPattern(buf, field.value, interner, graph);
             }
-            buf.char('}');
+            try buf.char('}');
         },
         .struct_pattern => |v| {
-            buf.char('%');
-            appendStructName(buf, v.struct_name, interner);
-            buf.char('{');
+            try buf.char('%');
+            try appendStructName(buf, v.struct_name, interner);
+            try buf.char('{');
             for (v.fields, 0..) |field, i| {
-                if (i > 0) buf.str(", ");
-                buf.str(interner.get(field.name));
-                buf.str(": ");
-                appendPattern(buf, field.pattern, interner, graph);
+                if (i > 0) try buf.str(", ");
+                try buf.str(interner.get(field.name));
+                try buf.str(": ");
+                try appendPattern(buf, field.pattern, interner, graph);
             }
-            buf.char('}');
+            try buf.char('}');
         },
         .binary => |v| {
-            buf.str("<<");
+            try buf.str("<<");
             for (v.segments, 0..) |segment, i| {
-                if (i > 0) buf.str(", ");
+                if (i > 0) try buf.str(", ");
                 switch (segment.value) {
-                    .pattern => |segment_pattern| appendPattern(buf, segment_pattern, interner, graph),
-                    .string_literal => |string_id| appendZapStringLiteral(buf, interner.get(string_id)),
-                    .expr => |expr| appendExpr(buf, expr, interner, graph),
+                    .pattern => |segment_pattern| try appendPattern(buf, segment_pattern, interner, graph),
+                    .string_literal => |string_id| try appendZapStringLiteral(buf, interner.get(string_id)),
+                    .expr => |expr| try appendExpr(buf, expr, interner, graph),
                 }
             }
-            buf.str(">>");
+            try buf.str(">>");
         },
         .tagged_union_variant => |v| {
-            appendStructName(buf, v.qualifier, interner);
+            try appendStructName(buf, v.qualifier, interner);
             if (v.payload) |payload| {
-                buf.char('(');
-                appendPattern(buf, payload, interner, graph);
-                buf.char(')');
+                try buf.char('(');
+                try appendPattern(buf, payload, interner, graph);
+                try buf.char(')');
             }
         },
     }
@@ -341,42 +392,173 @@ pub fn appendExpr(
     expr: *const ast.Expr,
     interner: *const ast.StringInterner,
     graph: *const scope.ScopeGraph,
-) void {
+) Allocator.Error!void {
     if (sourceSlice(expr.getMeta(), graph)) |text| {
-        buf.str(text);
+        try buf.str(text);
         return;
     }
     switch (expr.*) {
-        .int_literal => |v| buf.fmt("{d}", .{v.value}),
-        .float_literal => |v| buf.fmt("{d}", .{v.value}),
-        .string_literal => |v| appendZapStringLiteral(buf, interner.get(v.value)),
+        .int_literal => |v| try buf.fmt("{d}", .{v.value}),
+        .float_literal => |v| try buf.fmt("{d}", .{v.value}),
+        .string_literal => |v| try appendZapStringLiteral(buf, interner.get(v.value)),
         .atom_literal => |v| {
-            buf.char(':');
-            buf.str(interner.get(v.value));
+            try buf.char(':');
+            try buf.str(interner.get(v.value));
         },
-        .bool_literal => |v| buf.str(if (v.value) "true" else "false"),
-        .nil_literal => buf.str("nil"),
-        .var_ref => |v| buf.str(interner.get(v.name)),
-        .struct_ref => |v| appendStructName(buf, v.name, interner),
+        .bool_literal => |v| try buf.str(if (v.value) "true" else "false"),
+        .nil_literal => try buf.str("nil"),
+        .var_ref => |v| try buf.str(interner.get(v.name)),
+        .struct_ref => |v| try appendStructName(buf, v.name, interner),
         .type_annotated => |v| {
-            appendExpr(buf, v.expr, interner, graph);
-            buf.str(" :: ");
-            appendTypeExpr(buf, v.type_expr, interner);
+            try appendExpr(buf, v.expr, interner, graph);
+            try buf.str(" :: ");
+            try appendTypeExpr(buf, v.type_expr, interner);
         },
         .unary_op => |v| {
-            buf.str(switch (v.op) {
+            try buf.str(switch (v.op) {
                 .negate => "-",
                 .not_op => "not ",
             });
-            appendExpr(buf, v.operand, interner, graph);
+            try appendExpr(buf, v.operand, interner, graph);
         },
         .binary_op => |v| {
-            appendExpr(buf, v.lhs, interner, graph);
-            buf.char(' ');
-            buf.str(binaryOpString(v.op));
-            buf.char(' ');
-            appendExpr(buf, v.rhs, interner, graph);
+            try appendExpr(buf, v.lhs, interner, graph);
+            try buf.char(' ');
+            try buf.str(binaryOpString(v.op));
+            try buf.char(' ');
+            try appendExpr(buf, v.rhs, interner, graph);
         },
-        else => buf.char('?'),
+        else => try buf.char('?'),
     }
+}
+
+test "Buffer append operations propagate allocation failure" {
+    var str_failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var str_buffer = Buffer.init(str_failing_allocator.allocator());
+    defer str_buffer.deinit();
+    try std.testing.expectError(error.OutOfMemory, str_buffer.str("signature"));
+
+    var char_failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var char_buffer = Buffer.init(char_failing_allocator.allocator());
+    defer char_buffer.deinit();
+    try std.testing.expectError(error.OutOfMemory, char_buffer.char('('));
+
+    var fmt_failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var fmt_buffer = Buffer.init(fmt_failing_allocator.allocator());
+    defer fmt_buffer.deinit();
+    try std.testing.expectError(error.OutOfMemory, fmt_buffer.fmt("{d}", .{42}));
+}
+
+test "union variant signatures propagate allocation failure after partial render" {
+    const allocator = std.testing.allocator;
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const payload_type = ast.TypeExpr{ .name = .{
+        .meta = meta,
+        .name = try interner.intern("PayloadTypeNameLongEnoughToRequireBufferGrowth"),
+        .args = &.{},
+    } };
+    const variant = ast.UnionVariant{
+        .meta = meta,
+        .name = try interner.intern("V"),
+        .type_expr = &payload_type,
+    };
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{
+        .fail_index = 1,
+        .resize_fail_index = 0,
+    });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        buildUnionVariantSignature(failing_allocator.allocator(), variant, &interner),
+    );
+}
+
+test "protocol function signatures retain named type arguments" {
+    const allocator = std.testing.allocator;
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const element_type = ast.TypeExpr{ .variable = .{
+        .meta = meta,
+        .name = try interner.intern("element"),
+    } };
+    const atom_type = ast.TypeExpr{ .name = .{
+        .meta = meta,
+        .name = try interner.intern("Atom"),
+        .args = &.{},
+    } };
+    const enumerable_args = [_]*const ast.TypeExpr{&element_type};
+    const enumerable_type = ast.TypeExpr{ .name = .{
+        .meta = meta,
+        .name = try interner.intern("Enumerable"),
+        .args = &enumerable_args,
+    } };
+    const return_elements = [_]*const ast.TypeExpr{
+        &atom_type,
+        &element_type,
+        &enumerable_type,
+    };
+    const return_type = ast.TypeExpr{ .tuple = .{
+        .meta = meta,
+        .elements = &return_elements,
+    } };
+    const params = [_]ast.ProtocolParam{.{
+        .meta = meta,
+        .name = try interner.intern("state"),
+        .type_annotation = null,
+    }};
+    const function_sig = ast.ProtocolFunctionSig{
+        .meta = meta,
+        .name = try interner.intern("next"),
+        .params = &params,
+        .return_type = &return_type,
+    };
+
+    const rendered = try buildProtocolFunctionSignature(allocator, function_sig, &interner);
+    defer allocator.free(rendered);
+    try std.testing.expectEqualStrings("next(state) -> {Atom, element, Enumerable(element)}", rendered);
+}
+
+test "protocol function signatures render explicit ownership qualifiers" {
+    const allocator = std.testing.allocator;
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const element_type = ast.TypeExpr{ .variable = .{
+        .meta = meta,
+        .name = try interner.intern("element"),
+    } };
+    const enumerable_args = [_]*const ast.TypeExpr{&element_type};
+    const enumerable_type = ast.TypeExpr{ .name = .{
+        .meta = meta,
+        .name = try interner.intern("Enumerable"),
+        .args = &enumerable_args,
+    } };
+    const nil_type = ast.TypeExpr{ .name = .{
+        .meta = meta,
+        .name = try interner.intern("Nil"),
+        .args = &.{},
+    } };
+    const params = [_]ast.ProtocolParam{.{
+        .meta = meta,
+        .name = try interner.intern("state"),
+        .type_annotation = &enumerable_type,
+        .ownership = .unique,
+        .ownership_explicit = true,
+    }};
+    const function_sig = ast.ProtocolFunctionSig{
+        .meta = meta,
+        .name = try interner.intern("dispose"),
+        .params = &params,
+        .return_type = &nil_type,
+    };
+
+    const rendered = try buildProtocolFunctionSignature(allocator, function_sig, &interner);
+    defer allocator.free(rendered);
+    try std.testing.expectEqualStrings("dispose(state :: unique Enumerable(element)) -> Nil", rendered);
 }

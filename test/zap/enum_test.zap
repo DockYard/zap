@@ -61,12 +61,24 @@ pub struct Zap.EnumTest {
       assert(Enum.find([1, 2, 3, 4], 0, greater_than_two) == 3)
     }
 
+    test("find list exits early leak-free") {
+      assert_no_leaks {
+        assert(Enum.find([1, 2, 3, 4], 0, greater_than_one) == 2)
+      }
+    }
+
     test("find no match returns default") {
       assert(Enum.find([1, 2], 99, greater_than_ten) == 99)
     }
 
     test("any? with match") {
       assert(Enum.any?([1, 2, 3], greater_than_two))
+    }
+
+    test("any? list exits early leak-free") {
+      assert_no_leaks {
+        assert(Enum.any?([1, 2, 3], greater_than_one))
+      }
     }
 
     test("any? without match") {
@@ -79,6 +91,12 @@ pub struct Zap.EnumTest {
 
     test("all? false") {
       reject(Enum.all?([2, 4, 6], greater_than_three))
+    }
+
+    test("all? list exits early leak-free") {
+      assert_no_leaks {
+        reject(Enum.all?([1, 2, 3], greater_than_one))
+      }
     }
 
     test("count matching") {
@@ -117,6 +135,12 @@ pub struct Zap.EnumTest {
       assert(Enum.first([10, 20, 30]) == 10)
     }
 
+    test("first list abandons iterator state leak-free") {
+      assert_no_leaks {
+        assert(Enum.first([10, 20, 30]) == 10)
+      }
+    }
+
     test("first range") {
       assert(Enum.first(5..15) == 5)
     }
@@ -152,6 +176,20 @@ pub struct Zap.EnumTest {
 
     test("count list") {
       assert(Enum.count([10, 20, 30]) == 3)
+    }
+
+    test("count larger list through Enumerable") {
+      assert(Enum.count([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]) == 32)
+    }
+
+    test("shared list iterator state advances independently") {
+      assert(shared_list_iterator_state_advances_independently())
+    }
+
+    test("list iterator state satisfies List API") {
+      assert_no_leaks {
+        assert(list_iterator_state_satisfies_list_api())
+      }
     }
 
     test("count range step 1") {
@@ -194,6 +232,23 @@ pub struct Zap.EnumTest {
       result = Enum.sort([3, 1, 4, 1, 5], greater_than)
       assert(List.head(result) == 5)
       assert(List.last(result) == 1)
+    }
+
+    test("sort handles larger unsorted input with duplicates") {
+      result = Enum.sort([9, 1, 8, 2, 7, 3, 6, 4, 5, 0, 9, 2], less_than)
+      assert(List.length(result) == 12)
+      assert(List.head(result) == 0)
+      assert(List.at(result, 1) == 1)
+      assert(List.at(result, 2) == 2)
+      assert(List.at(result, 3) == 2)
+      assert(List.last(result) == 9)
+    }
+
+    test("each walks larger ranges and returns Nil") {
+      assert_no_leaks {
+        assert(enum_each_i64_callback_returns_nil())
+        assert(enum_each_nil_callback_returns_nil())
+      }
     }
 
     test("map with anonymous function") {
@@ -246,6 +301,52 @@ pub struct Zap.EnumTest {
       assert(result == 60)
     }
 
+    test("count map through Enumerable") {
+      assert(Enum.count(%{a: 1, b: 2, c: 3}) == 3)
+    }
+
+    test("first map abandons iterator state") {
+      entry = Enum.first(%{a: 10, b: 20})
+
+      case entry {
+        {key, value} -> assert((key == :a and value == 10) or (key == :b and value == 20))
+      }
+    }
+
+    test("first map abandons iterator state leak-free") {
+      assert_no_leaks {
+        entry = Enum.first(%{a: 10, b: 20})
+
+        case entry {
+          {key, value} -> assert((key == :a and value == 10) or (key == :b and value == 20))
+        }
+      }
+    }
+
+    test("find map exits early leak-free") {
+      assert_no_leaks {
+        entry = Enum.find(%{a: 10, b: 20}, {:none, 0}, fn(entry :: {Atom, i64}) -> Bool {
+          case entry {
+            {_key, value} -> value > 0
+          }
+        })
+
+        case entry {
+          {key, value} -> assert((key == :a and value == 10) or (key == :b and value == 20))
+        }
+      }
+    }
+
+    test("shared map iterator state advances independently") {
+      assert(shared_map_iterator_state_advances_independently())
+    }
+
+    test("map iterator state satisfies Map API") {
+      assert_no_leaks {
+        assert(map_iterator_state_satisfies_map_api())
+      }
+    }
+
     test("sort with anonymous comparator") {
       result = Enum.sort([3, 1, 2], fn(a :: i64, b :: i64) -> Bool { a < b })
       assert(List.head(result) == 1)
@@ -257,6 +358,13 @@ pub struct Zap.EnumTest {
       assert(List.length(result) == 3)
       assert(List.head(result) == 1)
       assert(List.last(result) == 3)
+    }
+
+    test("take list exits early leak-free") {
+      assert_no_leaks {
+        result = Enum.take([1, 2, 3, 4, 5], 2)
+        assert(List.length(result) == 2)
+      }
     }
 
     test("take works with ranges through Enumerable") {
@@ -304,6 +412,12 @@ pub struct Zap.EnumTest {
       assert(Enum.member?([1, 2, 3], 2))
     }
 
+    test("member? list exits early leak-free") {
+      assert_no_leaks {
+        assert(Enum.member?([1, 2, 3], 2))
+      }
+    }
+
     test("member? not found") {
       reject(Enum.member?([1, 2, 3], 5))
     }
@@ -318,6 +432,12 @@ pub struct Zap.EnumTest {
 
     test("at first") {
       assert(Enum.at([10, 20, 30], 0, 0) == 10)
+    }
+
+    test("at list exits early leak-free") {
+      assert_no_leaks {
+        assert(Enum.at([10, 20, 30], 0, 0) == 10)
+      }
     }
 
     test("at last") {
@@ -375,6 +495,137 @@ pub struct Zap.EnumTest {
     }
   }
 
+  fn shared_list_iterator_state_advances_independently() -> Bool {
+    case Enumerable.next([10, 20, 30]) {
+      {:cont, _, state} -> shared_list_iterator_state_values_match(state)
+      {:done, _, _} -> false
+    }
+  }
+
+  fn shared_list_iterator_state_values_match(state :: unique Enumerable(i64)) -> Bool {
+    state_alias = state
+    first_value = next_list_iterator_value(state)
+    alias_value = next_list_iterator_value(state_alias)
+
+    first_value == 20 and alias_value == 20
+  }
+
+  fn next_list_iterator_value(state :: unique Enumerable(i64)) -> i64 {
+    case Enumerable.next(state) {
+      {:cont, value, next_state} -> dispose_enumerable_and_return(next_state, value)
+      {:done, _, _} -> -1
+    }
+  }
+
+  fn list_iterator_state_satisfies_list_api() -> Bool {
+    case Enumerable.next([10, 20, 30, 40]) {
+      {:cont, 10, state} -> list_iterator_state_satisfies_list_api_state(state)
+      {:cont, _, _} -> false
+      {:done, _, _} -> false
+    }
+  }
+
+  fn list_iterator_state_satisfies_list_api_state(state :: List(i64)) -> Bool {
+    tail = List.tail(state)
+    pushed = List.push(state, 50)
+    replaced = List.set(state, 1, 99)
+
+    state_ok = List.length(state) == 3 and List.head(state) == 20 and List.get(state, 1) == 30 and List.last(state) == 40
+    tail_ok = List.length(tail) == 2 and List.head(tail) == 30 and List.last(tail) == 40
+    pushed_ok = List.length(pushed) == 4 and List.last(pushed) == 50
+    replaced_ok = List.length(replaced) == 3 and List.get(replaced, 1) == 99 and List.get(state, 1) == 30
+
+    state_ok and tail_ok and pushed_ok and replaced_ok
+  }
+
+  fn shared_map_iterator_state_advances_independently() -> Bool {
+    case Enumerable.next(%{a: 10, b: 20, c: 30}) {
+      {:cont, _, state} -> shared_map_iterator_state_entries_match(state)
+      {:done, _, _} -> false
+    }
+  }
+
+  fn shared_map_iterator_state_entries_match(state :: unique Enumerable({Atom, i64})) -> Bool {
+    state_alias = state
+    first_entry = next_map_iterator_entry(state)
+    alias_entry = next_map_iterator_entry(state_alias)
+
+    case first_entry {
+      {first_key, first_value} -> case alias_entry {
+        {alias_key, alias_value} -> first_key == alias_key and first_value == alias_value and (first_value == 20 or first_value == 30)
+      }
+    }
+  }
+
+  fn next_map_iterator_entry(state :: unique Enumerable({Atom, i64})) -> {Atom, i64} {
+    case Enumerable.next(state) {
+      {:cont, entry, next_state} -> dispose_enumerable_and_return(next_state, entry)
+      {:done, _, _} -> {:nil, 0}
+    }
+  }
+
+  fn dispose_enumerable_and_return(state :: unique Enumerable(element), value :: result) -> result {
+    Enumerable.dispose(state)
+    value
+  }
+
+  fn map_iterator_state_satisfies_map_api() -> Bool {
+    case Enumerable.next(%{a: 10, b: 20, c: 30}) {
+      {:cont, first_entry, state} -> map_iterator_state_satisfies_map_api_state(first_entry, state)
+      {:done, _, _} -> false
+    }
+  }
+
+  fn map_iterator_state_satisfies_map_api_state(first_entry :: {Atom, i64}, state :: %{Atom -> i64}) -> Bool {
+    inserted = Map.put(state, :z, 99)
+    merged = Map.merge(state, %{z: 99})
+
+    case first_entry {
+      {first_key, _} ->
+        map_iterator_state_satisfies_map_api_result(first_key, state, inserted, merged)
+    }
+  }
+
+  fn map_iterator_state_satisfies_map_api_result(first_key :: Atom, state :: %{Atom -> i64}, inserted :: %{Atom -> i64}, merged :: %{Atom -> i64}) -> Bool {
+    state_ok = Map.size(state) == 2 and map_iterator_remaining_keys_match(first_key, state)
+    lists_ok = List.length(Map.keys(state)) == 2 and List.length(Map.values(state)) == 2
+    inserted_ok = Map.size(inserted) == 3 and Map.has_key?(inserted, :z) and reject_key_from_state(:z, state)
+    merged_ok = Map.size(merged) == 3 and Map.has_key?(merged, :z)
+
+    state_ok and lists_ok and inserted_ok and merged_ok
+  }
+
+  fn map_iterator_remaining_keys_match(first_key :: Atom, state :: %{Atom -> i64}) -> Bool {
+    case first_key {
+      :a -> reject_key_from_state(:a, state) and Map.get(state, :b, 0) == 20 and Map.get(state, :c, 0) == 30
+      :b -> Map.get(state, :a, 0) == 10 and reject_key_from_state(:b, state) and Map.get(state, :c, 0) == 30
+      :c -> Map.get(state, :a, 0) == 10 and Map.get(state, :b, 0) == 20 and reject_key_from_state(:c, state)
+      _ -> false
+    }
+  }
+
+  fn reject_key_from_state(key :: Atom, state :: %{Atom -> i64}) -> Bool {
+    not Map.has_key?(state, key)
+  }
+
+  fn enum_each_i64_callback_returns_nil() -> Bool {
+    enum_each_result_is_nil(Enum.each(1..128, fn(value :: i64) -> i64 { value + 1 }))
+  }
+
+  fn enum_each_nil_callback_returns_nil() -> Bool {
+    enum_each_result_is_nil(Enum.each(1..128, assert_enum_each_value_in_range))
+  }
+
+  fn enum_each_result_is_nil(_ignored_enum_each_result :: Nil) -> Bool {
+    true
+  }
+
+  fn assert_enum_each_value_in_range(value :: i64) -> Nil {
+    assert(value >= 1)
+    assert(value <= 128)
+    nil
+  }
+
   fn double(x :: i64) -> i64 {
     x * 2
   }
@@ -389,6 +640,10 @@ pub struct Zap.EnumTest {
 
   fn greater_than_two(x :: i64) -> Bool {
     x > 2
+  }
+
+  fn greater_than_one(x :: i64) -> Bool {
+    x > 1
   }
 
   fn greater_than_three(x :: i64) -> Bool {

@@ -372,15 +372,15 @@ test "dispatch resolve simple function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
@@ -428,15 +428,15 @@ test "dispatch scope fallback" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
@@ -475,15 +475,15 @@ test "dispatch no match" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);
@@ -527,15 +527,15 @@ test "dispatch specificity — literal pattern beats bind" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var engine = DispatchEngine.init(alloc, &collector.graph, &type_store, parser.interner);

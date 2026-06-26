@@ -177,6 +177,7 @@ test {
     _ = @import("capability_inference.zig");
     _ = @import("monomorphize.zig");
     _ = @import("env.zig");
+    _ = @import("signature.zig");
     _ = @import("wyhash.zig");
     _ = @import("progress.zig");
     // Crash-reporter offline-symbolization pair: `addr2line.zig` resolves a

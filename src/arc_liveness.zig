@@ -302,6 +302,18 @@ pub const ArcOwnership = struct {
     /// owns-set just before the terminator executes.
     owned_at_ret: std.AutoHashMapUnmanaged(InstructionId, ArcLocalSet) = .empty,
 
+    /// Owned locals at an implicit return edge inside a multi-arm
+    /// return terminator. `switch_return` and `union_switch_return`
+    /// arm bodies do not contain a real `.ret`; the parent terminator
+    /// records the return value. A parent-level `owned_at_ret`
+    /// snapshot is therefore only a fallback seed and must not be
+    /// released before the selected arm executes. This table gives
+    /// drop insertion the arm-local state after the arm body has run
+    /// so releases can be appended at the implicit return edge.
+    ///
+    /// Keyed by `returnArmKey(parent_id, arm_index, is_default)`.
+    owned_at_return_arm: std.AutoHashMapUnmanaged(u64, ArcLocalSet) = .empty,
+
     /// Owned locals that must be released immediately before a
     /// branch-local `.case_break`. `case_break` is not a function
     /// return: its value flows into the enclosing `case_block.dest`.
@@ -324,7 +336,7 @@ pub const ArcOwnership = struct {
     /// consumer (drop insertion, ownership rewriters, uniqueness,
     /// verifier) must walk EXACTLY this many instructions; a mismatch
     /// means the consumer's structural traversal diverged from the
-    /// analyzer's `flattenChildren` and its InstructionId keys are
+    /// analyzer's flatten traversal and its InstructionId keys are
     /// desynchronized. `assertConsumerWalkMatches` checks this in debug
     /// builds so any future drift fails loudly. (Audit R1.)
     ///
@@ -349,6 +361,11 @@ pub const ArcOwnership = struct {
             set_ptr.deinit(allocator);
         }
         self.owned_at_ret.deinit(allocator);
+        var return_arm_iter = self.owned_at_return_arm.valueIterator();
+        while (return_arm_iter.next()) |set_ptr| {
+            set_ptr.deinit(allocator);
+        }
+        self.owned_at_return_arm.deinit(allocator);
         var case_break_iter = self.owned_at_case_break.valueIterator();
         while (case_break_iter.next()) |set_ptr| {
             set_ptr.deinit(allocator);
@@ -365,6 +382,13 @@ pub const ArcOwnership = struct {
         return (@as(u64, @intCast(local)) << 32) | @as(u64, @intCast(id));
     }
 
+    /// Pack a multi-arm return terminator id and arm selector into a
+    /// stable key for `owned_at_return_arm`.
+    pub fn returnArmKey(parent_id: InstructionId, arm_index: u32, is_default: bool) u64 {
+        const arm_part = (@as(u64, arm_index) << 1) | @intFromBool(is_default);
+        return (@as(u64, parent_id) << 32) | arm_part;
+    }
+
     /// Path-sensitive last-use predicate. Returns true iff `local` was
     /// alive immediately before instruction `id` and dead immediately
     /// after — i.e. instruction `id` is one of the (possibly multiple)
@@ -379,9 +403,12 @@ pub const ArcOwnership = struct {
 
 /// Count every instruction (top-level and nested, in canonical flatten
 /// order) in `function`, using `ir.forEachChildStream` — the single
-/// source of truth the analyzer's `flattenChildren` also uses. This is
+/// source of truth the analyzer's flatten traversal also uses. This is
 /// the count an id-mirroring consumer's structural walk MUST reproduce.
-pub fn countInstructionRecords(function: *const ir.Function) usize {
+pub fn countInstructionRecords(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+) std.mem.Allocator.Error!usize {
     const Counter = struct {
         count: usize = 0,
         fn visit(self: *@This(), instr: *const ir.Instruction) void {
@@ -390,7 +417,7 @@ pub fn countInstructionRecords(function: *const ir.Function) usize {
         }
     };
     var counter = Counter{};
-    ir.forEachInstruction(function, &counter, Counter.visit);
+    try ir.forEachInstruction(allocator, function, &counter, Counter.visit);
     return counter.count;
 }
 
@@ -405,7 +432,7 @@ pub fn countInstructionRecords(function: *const ir.Function) usize {
 /// A `false` result has two distinct root causes, both fatal to the
 /// consumer's InstructionId keys:
 ///   1. Structural traversal drift — the consumer recurses into a
-///      different sub-stream set than `flattenChildren` (the historical
+///      different sub-stream set than the analyzer flatten traversal (the historical
 ///      `union_switch.else_instrs` skip; Audit R1 / arc-own-1--01).
 ///   2. Stale ownership table — the table was computed against an IR
 ///      shape with a different instruction count than the one the
@@ -427,7 +454,7 @@ pub fn consumerWalkMatches(
 /// must have visited exactly as many instructions as the analyzer
 /// recorded into the ownership table it is consuming. A mismatch proves
 /// either that the consumer's structural traversal diverged from
-/// `flattenChildren` (the historical `union_switch.else_instrs` skip) or
+/// the analyzer flatten traversal (the historical `union_switch.else_instrs` skip) or
 /// that the ownership table is stale relative to the current IR (a
 /// count-mutating rewrite ran without an intervening recompute). In
 /// both cases the consumer's InstructionId keys are desynchronized and
@@ -704,9 +731,16 @@ const Analyzer = struct {
     /// Per-alias bits with a "consume one, consume all" rule keeps
     /// the reconstruction faithful to per-control-flow-path liveness.
     ///
-    /// Lifetime: each value slice is allocated from the analyzer's
-    /// allocator and freed in `deinit`.
+    /// Lifetime: map values are non-owning views. Each unique slice is
+    /// owned exactly once by `param_alias_group_slices`, which `deinit`
+    /// frees directly without allocating during cleanup.
     param_alias_group: std.AutoHashMapUnmanaged(ir.LocalId, []const ir.LocalId) = .empty,
+
+    /// Owns each unique alias-group slice referenced by
+    /// `param_alias_group`. Kept separately so cleanup never has to
+    /// allocate a temporary dedupe table to avoid double-freeing slices
+    /// shared by multiple alias keys.
+    param_alias_group_slices: std.ArrayListUnmanaged([]const ir.LocalId) = .empty,
 
     /// Maps each `param_get` dest of an `.owned` parameter slot back
     /// to that slot. The forward ownership pass uses this to remember
@@ -720,18 +754,10 @@ const Analyzer = struct {
         self.pointer_to_id.deinit(self.allocator);
         self.arc_locals.deinit(self.allocator);
         self.local_to_arc_index.deinit(self.allocator);
-        // Free each alias group's slice. Multiple keys may point at
-        // the same slice (members of one group share the alias list);
-        // dedupe by tracking pointers we've already freed.
-        var freed: std.AutoHashMapUnmanaged(usize, void) = .empty;
-        defer freed.deinit(self.allocator);
-        var alias_iter = self.param_alias_group.valueIterator();
-        while (alias_iter.next()) |slice_ptr| {
-            const ptr_addr: usize = @intFromPtr(slice_ptr.*.ptr);
-            if (freed.contains(ptr_addr)) continue;
-            freed.put(self.allocator, ptr_addr, {}) catch {};
-            self.allocator.free(slice_ptr.*);
+        for (self.param_alias_group_slices.items) |slice| {
+            self.allocator.free(slice);
         }
+        self.param_alias_group_slices.deinit(self.allocator);
         self.param_alias_group.deinit(self.allocator);
         self.owned_param_slot_by_local.deinit(self.allocator);
         for (self.live_after.items) |*set| {
@@ -744,11 +770,24 @@ const Analyzer = struct {
     // Step 1: flatten instructions to the records array.
     // ----------------------------------------------------------
 
+    const FlattenFrame = struct {
+        stream: []const ir.Instruction,
+        parent_link: ParentLink,
+        next_index: usize = 0,
+    };
+
     fn flattenInstructions(self: *Analyzer) !void {
+        var stack: std.ArrayListUnmanaged(FlattenFrame) = .empty;
+        defer stack.deinit(self.allocator);
+        var child_frames: std.ArrayListUnmanaged(FlattenFrame) = .empty;
+        defer child_frames.deinit(self.allocator);
+
         for (self.function.body, 0..) |block, block_idx| {
             try self.flattenStream(
                 block.instructions,
                 .{ .function_body = @intCast(block_idx) },
+                &stack,
+                &child_frames,
             );
         }
     }
@@ -757,51 +796,84 @@ const Analyzer = struct {
         self: *Analyzer,
         stream: []const ir.Instruction,
         parent_link: ParentLink,
+        stack: *std.ArrayListUnmanaged(FlattenFrame),
+        child_frames: *std.ArrayListUnmanaged(FlattenFrame),
     ) error{OutOfMemory}!void {
-        const stream_len: u32 = @intCast(stream.len);
-        for (stream, 0..) |*instr, idx| {
+        stack.clearRetainingCapacity();
+        child_frames.clearRetainingCapacity();
+        if (stream.len == 0) return;
+
+        try stack.append(self.allocator, .{
+            .stream = stream,
+            .parent_link = parent_link,
+        });
+
+        while (stack.items.len != 0) {
+            const frame = &stack.items[stack.items.len - 1];
+            if (frame.next_index >= frame.stream.len) {
+                _ = stack.pop().?;
+                continue;
+            }
+
+            const idx = frame.next_index;
+            frame.next_index += 1;
+            const instr = &frame.stream[idx];
             const my_id: InstructionId = @intCast(self.records.items.len);
             try self.records.append(self.allocator, .{
                 .instr = instr,
-                .parent_link = parent_link,
+                .parent_link = frame.parent_link,
                 .index_in_parent = @intCast(idx),
-                .parent_stream_len = stream_len,
+                .parent_stream_len = @intCast(frame.stream.len),
             });
             try self.pointer_to_id.put(self.allocator, instr, my_id);
-            try self.flattenChildren(instr, my_id);
+            try self.pushFlattenChildren(stack, child_frames, instr, my_id);
         }
     }
 
     /// Assign `InstructionId`s to every nested sub-stream of `instr`, in
-    /// canonical flatten order, via `ir.forEachChildStream` — the single
-    /// source of truth for structural recursion. This is the AUTHORITY
-    /// the drop-insertion / ownership / uniqueness / verifier walkers must
-    /// mirror; routing it through `forEachChildStream` (which itself yields
-    /// `union_switch.else_instrs` when `has_else` and both
+    /// canonical flatten order by collecting `ir.forEachChildStream` output
+    /// and pushing it onto the explicit stack in reverse. This is the
+    /// AUTHORITY the drop-insertion / ownership / uniqueness / verifier
+    /// walkers must mirror; routing it through `forEachChildStream` (which
+    /// itself yields `union_switch.else_instrs` when `has_else` and both
     /// `optional_dispatch` arms) guarantees every consumer that also routes
     /// through the enumerator numbers identically.
-    fn flattenChildren(
+    fn pushFlattenChildren(
         self: *Analyzer,
+        stack: *std.ArrayListUnmanaged(FlattenFrame),
+        child_frames: *std.ArrayListUnmanaged(FlattenFrame),
         instr: *const ir.Instruction,
         parent_id: InstructionId,
     ) error{OutOfMemory}!void {
+        child_frames.clearRetainingCapacity();
         const Ctx = struct {
             analyzer: *Analyzer,
             parent_id: InstructionId,
+            child_frames: *std.ArrayListUnmanaged(FlattenFrame),
             err: ?error{OutOfMemory} = null,
             fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
-                if (self_ctx.err != null) return;
-                self_ctx.analyzer.flattenStream(
-                    child.stream,
-                    parentLinkForChildKind(child.kind, self_ctx.parent_id),
-                ) catch |e| {
-                    self_ctx.err = e;
+                if (self_ctx.err != null or child.stream.len == 0) return;
+                self_ctx.child_frames.append(self_ctx.analyzer.allocator, .{
+                    .stream = child.stream,
+                    .parent_link = parentLinkForChildKind(child.kind, self_ctx.parent_id),
+                }) catch |err| {
+                    self_ctx.err = err;
                 };
             }
         };
-        var ctx = Ctx{ .analyzer = self, .parent_id = parent_id };
+        var ctx = Ctx{
+            .analyzer = self,
+            .parent_id = parent_id,
+            .child_frames = child_frames,
+        };
         ir.forEachChildStream(instr, &ctx, Ctx.onStream);
         if (ctx.err) |e| return e;
+
+        var child_index = child_frames.items.len;
+        while (child_index > 0) {
+            child_index -= 1;
+            try stack.append(self.allocator, child_frames.items[child_index]);
+        }
     }
 
     /// Map a canonical `ChildStreamKind` to the analyzer's `ParentLink`
@@ -973,15 +1045,18 @@ const Analyzer = struct {
             for (self.records.items) |rec| {
                 const dest = aggregateDest(rec.instr.*) orelse continue;
                 if (seen.contains(dest)) continue;
-                var arm_results: [16]ir.LocalId = undefined;
-                const n = collectArmResults(rec.instr.*, &arm_results);
                 var any_arc = false;
-                for (arm_results[0..n]) |arm_local| {
-                    if (seen.contains(arm_local)) {
-                        any_arc = true;
-                        break;
+                const ArmArcProbe = struct {
+                    seen: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
+                    any_arc: *bool,
+                    fn visit(ctx: *@This(), arm_local: ir.LocalId) void {
+                        if (ctx.seen.contains(arm_local)) {
+                            ctx.any_arc.* = true;
+                        }
                     }
-                }
+                };
+                var probe = ArmArcProbe{ .seen = &seen, .any_arc = &any_arc };
+                forEachArmResult(rec.instr.*, &probe, ArmArcProbe.visit);
                 if (any_arc) {
                     try seen.put(self.allocator, dest, {});
                     changed = true;
@@ -1013,7 +1088,11 @@ const Analyzer = struct {
             const dests_list = entry.value_ptr.*;
             if (dests_list.items.len < 2) continue;
             const slice = try self.allocator.alloc(ir.LocalId, dests_list.items.len);
+            var slice_registered = false;
+            errdefer if (!slice_registered) self.allocator.free(slice);
             @memcpy(slice, dests_list.items);
+            try self.param_alias_group_slices.append(self.allocator, slice);
+            slice_registered = true;
             for (slice) |dest| {
                 try self.param_alias_group.put(self.allocator, dest, slice);
             }
@@ -1354,7 +1433,8 @@ const Analyzer = struct {
 
     fn applyUses(self: *Analyzer, instr: ir.Instruction, set: *LiveSet) !void {
         var buf = UseList{};
-        collectUses(instr, &buf);
+        defer buf.deinit(self.allocator);
+        try collectUses(self.allocator, instr, &buf);
         for (buf.slice()) |use| {
             if (self.local_to_arc_index.get(use)) |idx| set.set(idx);
         }
@@ -1374,7 +1454,8 @@ const Analyzer = struct {
             // We just need to know: which ARC-uses of this instr are
             // last uses (∈ live_before, ∉ live_after).
             var buf = UseList{};
-            collectUses(rec.instr.*, &buf);
+            defer buf.deinit(self.allocator);
+            try collectUses(self.allocator, rec.instr.*, &buf);
             for (buf.slice()) |use_local| {
                 const arc_idx = self.local_to_arc_index.get(use_local) orelse continue;
                 if (!live_after.contains(arc_idx)) {
@@ -1520,8 +1601,8 @@ const Analyzer = struct {
             for (self.analyzer.records.items, 0..) |rec, idx| {
                 const id: InstructionId = @intCast(idx);
                 var uses = UseList{};
-                defer uses.deinit(std.heap.page_allocator);
-                collectUses(rec.instr.*, &uses);
+                defer uses.deinit(self.analyzer.allocator);
+                try collectUses(self.analyzer.allocator, rec.instr.*, &uses);
                 for (uses.slice()) |local| {
                     const bit_index = self.local_to_index.get(local) orelse continue;
                     if (self.live_after.items[id].contains(bit_index)) continue;
@@ -1560,7 +1641,7 @@ const Analyzer = struct {
 
                 var next_live = try self.live_after.items[id].clone(self.analyzer.allocator);
                 self.applyDefs(instr.*, &next_live);
-                self.applyUses(instr.*, &next_live);
+                try self.applyUses(instr.*, &next_live);
 
                 current_live.deinit(self.analyzer.allocator);
                 current_live = next_live;
@@ -1662,10 +1743,10 @@ const Analyzer = struct {
             }
         }
 
-        fn applyUses(self: *NonArcAggregateLiveness, instr: ir.Instruction, set: *LiveSet) void {
+        fn applyUses(self: *NonArcAggregateLiveness, instr: ir.Instruction, set: *LiveSet) error{OutOfMemory}!void {
             var uses = UseList{};
-            defer uses.deinit(std.heap.page_allocator);
-            collectUses(instr, &uses);
+            defer uses.deinit(self.analyzer.allocator);
+            try collectUses(self.analyzer.allocator, instr, &uses);
             for (uses.slice()) |local| {
                 if (self.local_to_index.get(local)) |bit_index| set.set(bit_index);
             }
@@ -1835,25 +1916,57 @@ const Analyzer = struct {
     /// `return_source_locals`, `false` when it must NOT be (the
     /// retain-on-ret discipline must fire, the destroy is genuine).
     ///
-    /// Today the only rejection case is "this local was loaded from
-    /// a borrowed param via `param_get`". When per-callee borrow /
-    /// consume metadata lands (Phase H+), more rejections may apply.
+    /// Today the rejection case is "this local is a non-owning alias
+    /// of a borrowed param". Canonical parameter lowering emits one
+    /// `param_get` per formal and later reads flow through alias
+    /// instructions, so checking only the returned local's defining
+    /// instruction would miss `local_get` / `local_set` chains. When
+    /// per-callee borrow / consume metadata lands (Phase H+), more
+    /// rejections may apply.
     fn canElideReturnSource(self: *const Analyzer, local: ir.LocalId) bool {
-        // Walk the records list looking for a `param_get` whose
-        // dest is `local`. If found and the matching param is
-        // borrowed, refuse to elide.
+        return !self.localAliasesBorrowedParameter(local);
+    }
+
+    fn localAliasesBorrowedParameter(self: *const Analyzer, local: ir.LocalId) bool {
+        var current = local;
+        var remaining_steps = self.records.items.len + 1;
+        while (remaining_steps > 0) : (remaining_steps -= 1) {
+            if (self.borrowedParameterIndexForLocal(current) != null) return true;
+            const source = self.nonOwningAliasSource(current) orelse return false;
+            if (source == current) return false;
+            current = source;
+        }
+        return false;
+    }
+
+    fn borrowedParameterIndexForLocal(self: *const Analyzer, local: ir.LocalId) ?u32 {
+        for (self.records.items) |rec| {
+            if (rec.instr.* != .param_get) continue;
+            const pg = rec.instr.param_get;
+            if (pg.dest != local) continue;
+            if (pg.index >= self.function.param_conventions.len) return null;
+            if (self.function.param_conventions[pg.index] != .borrowed) return null;
+            return pg.index;
+        }
+        return null;
+    }
+
+    fn nonOwningAliasSource(self: *const Analyzer, local: ir.LocalId) ?ir.LocalId {
         for (self.records.items) |rec| {
             switch (rec.instr.*) {
-                .param_get => |pg| {
-                    if (pg.dest == local) {
-                        if (pg.index >= self.function.param_conventions.len) return true;
-                        return self.function.param_conventions[pg.index] != .borrowed;
-                    }
+                .local_get => |local_get| {
+                    if (local_get.dest == local) return local_get.source;
+                },
+                .local_set => |local_set| {
+                    if (local_set.dest == local) return local_set.value;
+                },
+                .borrow_value => |borrow_value| {
+                    if (borrow_value.dest == local) return borrow_value.source;
                 },
                 else => {},
             }
         }
-        return true;
+        return null;
     }
 
     /// Phase-5 prep: when a `ret v` returns a local that is itself
@@ -1879,21 +1992,36 @@ const Analyzer = struct {
             for (self.records.items) |rec| {
                 const dest = aggregateDest(rec.instr.*) orelse continue;
                 if (!ownership.return_source_locals.contains(dest)) continue;
-                var arm_results: [16]ir.LocalId = undefined;
-                const n = collectArmResults(rec.instr.*, &arm_results);
-                for (arm_results[0..n]) |arm_local| {
-                    if (!self.local_to_arc_index.contains(arm_local)) continue;
-                    if (ownership.return_source_locals.contains(arm_local)) continue;
-                    // Phase E.5 Gap 4: refuse to elide when an arm
-                    // result is a borrowed-param dest. The whole
-                    // aggregate's return-source elision must back off
-                    // (the verifier and drop-insertion treat the
-                    // aggregate dest as a return source, but the arm
-                    // local's own retain-on-ret must fire).
-                    if (!self.canElideReturnSource(arm_local)) continue;
-                    try ownership.return_source_locals.put(self.allocator, arm_local, {});
-                    changed = true;
-                }
+                const ArmReturnSourcePropagator = struct {
+                    analyzer: *Analyzer,
+                    ownership: *ArcOwnership,
+                    changed: *bool,
+                    err: ?std.mem.Allocator.Error = null,
+                    fn visit(ctx: *@This(), arm_local: ir.LocalId) void {
+                        if (ctx.err != null) return;
+                        if (!ctx.analyzer.local_to_arc_index.contains(arm_local)) return;
+                        if (ctx.ownership.return_source_locals.contains(arm_local)) return;
+                        // Phase E.5 Gap 4: refuse to elide when an arm
+                        // result is a borrowed-param dest. The whole
+                        // aggregate's return-source elision must back off
+                        // (the verifier and drop-insertion treat the
+                        // aggregate dest as a return source, but the arm
+                        // local's own retain-on-ret must fire).
+                        if (!ctx.analyzer.canElideReturnSource(arm_local)) return;
+                        ctx.ownership.return_source_locals.put(ctx.analyzer.allocator, arm_local, {}) catch |err| {
+                            ctx.err = err;
+                            return;
+                        };
+                        ctx.changed.* = true;
+                    }
+                };
+                var propagator = ArmReturnSourcePropagator{
+                    .analyzer = self,
+                    .ownership = ownership,
+                    .changed = &changed,
+                };
+                forEachArmResult(rec.instr.*, &propagator, ArmReturnSourcePropagator.visit);
+                if (propagator.err) |err| return err;
             }
         }
     }
@@ -1948,7 +2076,7 @@ const Analyzer = struct {
             // Recurse into nested regions FIRST. Each sub-stream sees
             // the parent's `owns` as its starting set; the post-region
             // `owns` becomes the intersection of arm-end `owns` sets.
-            try self.forwardOwnsChildren(instr, owns, consumed_owned_param_slots, ownership);
+            try self.forwardOwnsChildren(instr, id, owns, consumed_owned_param_slots, ownership);
 
             // Apply the instruction's effect on `owns`.
             try self.applyOwnsEffect(instr.*, owns, consumed_owned_param_slots, ownership);
@@ -1970,12 +2098,13 @@ const Analyzer = struct {
 
     /// Recurse forward into every sub-stream of `instr`, accumulating
     /// the post-region `owns` as the intersection of arm-end states.
-    /// Ordering MUST mirror the analyzer's `flattenChildren` so the
+    /// Ordering MUST mirror the analyzer's flatten traversal so the
     /// InstructionId numbering used by `idForStreamInstruction` (and
     /// hence the `live_before_ret` lookup downstream) lines up.
     fn forwardOwnsChildren(
         self: *Analyzer,
         instr: *const ir.Instruction,
+        id: InstructionId,
         owns: *LiveSet,
         consumed_owned_param_slots: *LiveSet,
         ownership: *ArcOwnership,
@@ -2052,18 +2181,36 @@ const Analyzer = struct {
                 // ends with an implicit ret on the arm's return_value.
                 // We propagate owns into each arm but the parent join
                 // is unreachable (control leaves the function).
-                for (sr.cases) |case| {
+                for (sr.cases, 0..) |case, arm_index| {
                     var arm_owns = try owns.clone(self.allocator);
                     defer arm_owns.deinit(self.allocator);
                     var arm_consumed = try consumed_owned_param_slots.clone(self.allocator);
                     defer arm_consumed.deinit(self.allocator);
                     try self.forwardOwnsStream(case.body_instrs, &arm_owns, &arm_consumed, ownership);
+                    if (streamFallsThrough(case.body_instrs)) {
+                        try self.snapshotOwnedAtReturnArm(
+                            ownership,
+                            id,
+                            @intCast(arm_index),
+                            false,
+                            &arm_owns,
+                        );
+                    }
                 }
                 var def_owns = try owns.clone(self.allocator);
                 defer def_owns.deinit(self.allocator);
                 var def_consumed = try consumed_owned_param_slots.clone(self.allocator);
                 defer def_consumed.deinit(self.allocator);
                 try self.forwardOwnsStream(sr.default_instrs, &def_owns, &def_consumed, ownership);
+                if (streamFallsThrough(sr.default_instrs)) {
+                    try self.snapshotOwnedAtReturnArm(
+                        ownership,
+                        id,
+                        @intCast(sr.cases.len),
+                        true,
+                        &def_owns,
+                    );
+                }
             },
             .union_switch => |us| {
                 var has_join: bool = false;
@@ -2121,16 +2268,25 @@ const Analyzer = struct {
                 }
             },
             .union_switch_return => |usr| {
-                for (usr.cases) |case| {
+                for (usr.cases, 0..) |case, arm_index| {
                     var arm_owns = try owns.clone(self.allocator);
                     defer arm_owns.deinit(self.allocator);
                     var arm_consumed = try consumed_owned_param_slots.clone(self.allocator);
                     defer arm_consumed.deinit(self.allocator);
                     try self.forwardOwnsStream(case.body_instrs, &arm_owns, &arm_consumed, ownership);
+                    if (streamFallsThrough(case.body_instrs)) {
+                        try self.snapshotOwnedAtReturnArm(
+                            ownership,
+                            id,
+                            @intCast(arm_index),
+                            false,
+                            &arm_owns,
+                        );
+                    }
                 }
             },
             .try_call_named => |tc| {
-                // Order mirrors flattenChildren: handler_instrs first,
+                // Order mirrors the analyzer flatten traversal: handler_instrs first,
                 // then success_instrs.
                 var handler_owns = try owns.clone(self.allocator);
                 defer handler_owns.deinit(self.allocator);
@@ -2338,7 +2494,7 @@ const Analyzer = struct {
                 else => {},
             }
 
-            try self.forwardOwnsChildren(instr, owns, consumed_owned_param_slots, ownership);
+            try self.forwardOwnsChildren(instr, id, owns, consumed_owned_param_slots, ownership);
             try self.applyOwnsEffect(instr.*, owns, consumed_owned_param_slots, ownership);
             if (isReturnEquivalentTerminator(instr.*)) {
                 try self.snapshotOwnedAtRet(ownership, id, owns);
@@ -2639,27 +2795,26 @@ const Analyzer = struct {
                 // the dedicated `.move_value` branch above.
                 self.applyCallDestEffect(cdsp.dest, owns);
             },
-            // Phase 4 (dense Map): `call_builtin` invocations of the
-            // curated owned-mutating intrinsics (`Map.put`/`.delete`/
-            // `.merge` — see `ownedMutatingBuiltinSlot`) consume their
-            // receiver. The codegen pass
-            // `arc_ownership.rewriteOwnedConsumeBuiltinSites` rewrites
-            // the share_value at the call site into a move_value and
-            // drops the post-call release; the dataflow must clear
-            // the receiver arg's owns bit so it doesn't carry through
-            // to a ret terminator and trigger a stale scope-exit
-            // release on top of the runtime's consume (double-free).
-            // For every other builtin the default borrow convention
-            // stays in effect — owns bits flow through unchanged and
-            // the dest gets +1 via the generic def handling.
+            // Consuming `call_builtin` arguments transfer their owner into the
+            // runtime primitive. The codegen pass
+            // `arc_ownership.rewriteOwnedConsumeBuiltinSites` rewrites those
+            // slots to either a last-use move or an independent COW owner and
+            // drops the stale post-call release. The ownership dataflow must
+            // mirror that transfer by clearing the argument's owns bit;
+            // otherwise `live_before_ret` carries the consumed state to a
+            // terminator and drop insertion emits a second release. This
+            // includes iterator-state transitions (`List.next` / `Map.next`):
+            // they are not `alwaysConsumingBuiltinArg` for rewrite planning,
+            // but once the call receives an owned state, the runtime consumes
+            // it and either returns the next state owner or releases it.
+            // Non-consuming builtins keep the default borrow convention: owns
+            // bits flow through unchanged and the dest gets +1 via generic
+            // def handling.
             .call_builtin => |cb| {
-                if (ownedMutatingBuiltinSlot(cb.name)) |slot| {
-                    if (slot < cb.args.len) {
-                        self.clearOwnsForLocalAndAliases(cb.args[slot], owns, consumed_owned_param_slots);
-                    }
-                }
                 for (cb.args, 0..) |arg, slot| {
-                    if (alwaysConsumingBuiltinArg(cb.name, slot)) {
+                    if (builtinArgCanMoveAtLastUse(cb.name, slot) or
+                        alwaysConsumingBuiltinArg(cb.name, slot))
+                    {
                         self.clearOwnsForLocalAndAliases(arg, owns, consumed_owned_param_slots);
                     }
                 }
@@ -2842,6 +2997,36 @@ const Analyzer = struct {
         try ownership.owned_at_ret.putNoClobber(self.allocator, id, local_set);
     }
 
+    /// Materialise the `owns` bitset at a fallthrough arm's implicit
+    /// return edge. Multi-arm return terminators do not carry real
+    /// `.ret` instructions in their arm bodies, so `owned_at_ret`
+    /// cannot represent this path-sensitive state without a separate
+    /// arm key.
+    fn snapshotOwnedAtReturnArm(
+        self: *Analyzer,
+        ownership: *ArcOwnership,
+        parent_id: InstructionId,
+        arm_index: u32,
+        is_default: bool,
+        owns: *const LiveSet,
+    ) error{OutOfMemory}!void {
+        var local_set: ArcLocalSet = .empty;
+        errdefer local_set.deinit(self.allocator);
+        var bit_index: u32 = 0;
+        const bit_count: u32 = @intCast(self.arc_locals.items.len);
+        while (bit_index < bit_count) : (bit_index += 1) {
+            if (owns.contains(bit_index)) {
+                const local_id = self.arc_locals.items[bit_index];
+                try local_set.put(self.allocator, local_id, {});
+            }
+        }
+        try ownership.owned_at_return_arm.putNoClobber(
+            self.allocator,
+            ArcOwnership.returnArmKey(parent_id, arm_index, is_default),
+            local_set,
+        );
+    }
+
     // ----------------------------------------------------------
     // Step 6: soundness assertions (debug only).
     // ----------------------------------------------------------
@@ -2997,10 +3182,10 @@ pub fn runProgramArcOwnership(
         // so a future refactor that silently relaxes the analyzer
         // assertion still trips here in debug builds.
         if (std.debug.runtime_safety) {
-            assertConsumeReturnDisjoint(function, &ownership);
+            try assertConsumeReturnDisjoint(allocator, function, &ownership);
         }
 
-        const consumes_marked = writeBackConsumeModes(function, &ownership);
+        const consumes_marked = try writeBackConsumeModes(allocator, function, &ownership);
         table.consumes_marked += consumes_marked;
         table.return_sources_recorded += ownership.return_source_locals.size;
 
@@ -3036,15 +3221,16 @@ pub fn runProgramArcOwnership(
 /// and verify the write-back without going through the orchestration
 /// wrapper. Phase 5+ tests benefit from the same surface.
 pub fn writeBackConsumeModes(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     ownership: *const ArcOwnership,
-) u64 {
+) std.mem.Allocator.Error!u64 {
     var walker = WriteBackWalker{
         .next_id = 0,
         .consumes_marked = 0,
         .ownership = ownership,
     };
-    walker.walkFunction(function);
+    try walker.walkFunction(allocator, function);
     return walker.consumes_marked;
 }
 
@@ -3053,19 +3239,18 @@ const WriteBackWalker = struct {
     consumes_marked: u64,
     ownership: *const ArcOwnership,
 
-    fn walkFunction(self: *WriteBackWalker, function: *const ir.Function) void {
-        for (function.body) |block| {
-            self.walkStream(block.instructions);
-        }
+    fn walkFunction(
+        self: *WriteBackWalker,
+        allocator: std.mem.Allocator,
+        function: *const ir.Function,
+    ) std.mem.Allocator.Error!void {
+        try ir.forEachInstruction(allocator, function, self, WriteBackWalker.visit);
     }
 
-    fn walkStream(self: *WriteBackWalker, stream: []const ir.Instruction) void {
-        for (stream) |*instr| {
-            const my_id = self.next_id;
-            self.next_id += 1;
-            self.maybeUpgradeShareValue(instr, my_id);
-            self.walkChildren(instr);
-        }
+    fn visit(self: *WriteBackWalker, instr: *const ir.Instruction) void {
+        const my_id = self.next_id;
+        self.next_id += 1;
+        self.maybeUpgradeShareValue(instr, my_id);
     }
 
     fn maybeUpgradeShareValue(self: *WriteBackWalker, instr: *const ir.Instruction, id: InstructionId) void {
@@ -3085,20 +3270,6 @@ const WriteBackWalker = struct {
         }
         mutable_instr.share_value.mode = .consume;
         self.consumes_marked += 1;
-    }
-
-    /// Recurse into every child stream via the canonical enumerator so
-    /// the InstructionId numbering matches `flattenChildren` exactly —
-    /// including `union_switch.else_instrs` and `optional_dispatch` arms,
-    /// both previously skipped here (masked only because
-    /// `consume_share_sites` is empty under the borrow ABI; audit
-    /// finding arc-liveness--01).
-    fn walkChildren(self: *WriteBackWalker, instr: *const ir.Instruction) void {
-        ir.forEachChildStream(instr, self, onChildStream);
-    }
-
-    fn onChildStream(self: *WriteBackWalker, child: ir.ChildStream) void {
-        self.walkStream(child.stream);
     }
 };
 
@@ -3238,6 +3409,8 @@ pub fn ownedMutatingBuiltinSlot(name: []const u8) ?usize {
 /// and values are intentionally excluded because `Map.put` retains
 /// them for persistent entry ownership.
 pub fn builtinArgCanMoveAtLastUse(name: []const u8, slot: usize) bool {
+    if (iteratorNextConsumesState(name, slot)) return true;
+    if (containerReleaseConsumesState(name, slot)) return true;
     if (ownedMutatingBuiltinSlot(name)) |owned_slot| {
         if (owned_slot == slot) return true;
     }
@@ -3276,6 +3449,8 @@ pub fn alwaysConsumingBuiltinArg(name: []const u8, slot: usize) bool {
 
     if (listElementConsumingBuiltinArgWithParts(prefix, method, slot)) return true;
 
+    if (containerReleaseConsumesStateWithParts(prefix, method, slot)) return true;
+
     if (sideChannelStashBuiltinArg(name, slot)) return true;
 
     return false;
@@ -3290,10 +3465,57 @@ pub fn alwaysConsumingBuiltinArg(name: []const u8, slot: usize) bool {
 /// intentionally narrower than `builtinArgCanMoveAtLastUse`: List element
 /// stores have their own always-consuming temporary-retain path.
 pub fn builtinArgRequiresOwnedInput(name: []const u8, slot: usize) bool {
+    if (iteratorNextConsumesState(name, slot)) return true;
+    if (containerReleaseConsumesState(name, slot)) return true;
+    if (listConsArgRequiresOwnedInput(name, slot)) return true;
     if (ownedMutatingBuiltinSlot(name)) |owned_slot| {
         if (owned_slot == slot) return true;
     }
     return mapMergeConsumesRightOperand(name, slot);
+}
+
+fn listConsArgRequiresOwnedInput(name: []const u8, slot: usize) bool {
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const method = stripOwnedUncheckedSuffix(name[dot_index + 1 ..]);
+    if (!std.mem.eql(u8, method, "cons")) return false;
+    return isListBuiltinPrefix(name[0..dot_index]) and (slot == 0 or slot == 1);
+}
+
+/// Does `name`/`slot` name a cursor-state transition primitive that consumes
+/// the current iteration state and either returns the owner as `next_state` or
+/// releases it when iteration reaches the end?
+///
+/// List/Map Enumerable iteration uses cursor-backed states typed as the public
+/// collection. The runtime advances unique cursors in place for O(1) per-step
+/// work, so the call site must move/COW the receiver into `next` rather than
+/// treating it as an ordinary borrowed argument with a post-call release. A
+/// borrowed call would release the same cursor pointer that `next` just returned
+/// as `next_state` under `Memory.Tracking`.
+fn iteratorNextConsumesState(name: []const u8, slot: usize) bool {
+    if (slot != 0) return false;
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const method = stripOwnedUncheckedSuffix(name[dot_index + 1 ..]);
+    if (!std.mem.eql(u8, method, "next")) return false;
+    const prefix = name[0..dot_index];
+    return isListBuiltinPrefix(prefix) or
+        std.mem.eql(u8, prefix, "Map") or
+        std.mem.startsWith(u8, prefix, "Map:") or
+        std.mem.startsWith(u8, prefix, "MapNested:");
+}
+
+fn containerReleaseConsumesState(name: []const u8, slot: usize) bool {
+    if (slot != 0) return false;
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const method = stripOwnedUncheckedSuffix(name[dot_index + 1 ..]);
+    return containerReleaseConsumesStateWithParts(name[0..dot_index], method, slot);
+}
+
+fn containerReleaseConsumesStateWithParts(prefix: []const u8, method: []const u8, slot: usize) bool {
+    if (slot != 0 or !std.mem.eql(u8, method, "release")) return false;
+    return isListBuiltinPrefix(prefix) or
+        std.mem.eql(u8, prefix, "Map") or
+        std.mem.startsWith(u8, prefix, "Map:") or
+        std.mem.startsWith(u8, prefix, "MapNested:");
 }
 
 /// Returns the argument slot of a `List.cons`-family builtin that is the
@@ -3384,18 +3606,21 @@ pub fn sideChannelStashBuiltinArg(name: []const u8, slot: usize) bool {
 /// `move_value`/`local_get`/`borrow_value`/`share_value` copies to a fixed
 /// point, then checks whether any alias is passed in the stash builtin's
 /// consuming slot. Structural (forwards-into-stash), never keyed on the
-/// wrapper's mangled name. Uses `page_allocator` for the transient alias
-/// set (freed before return); the program is small per-function so the
-/// allocation cost is negligible and confined to convention inference.
+/// wrapper's mangled name. Uses the caller-provided allocator for the
+/// transient alias set and propagates allocation failure so convention
+/// inference cannot silently miss a required ownership-transfer promotion.
 pub fn functionForwardsParamIntoSideChannelStash(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     param_index: usize,
-) bool {
+) std.mem.Allocator.Error!bool {
     var alias_set: std.ArrayListUnmanaged(ir.LocalId) = .empty;
-    defer alias_set.deinit(std.heap.page_allocator);
+    defer alias_set.deinit(allocator);
+    var walker = SideChannelStreamWalker.init(allocator);
+    defer walker.deinit();
 
     for (function.body) |block| {
-        sideChannelSeedParamAliases(block.instructions, param_index, &alias_set);
+        try sideChannelSeedParamAliases(&walker, block.instructions, param_index, &alias_set);
     }
     if (alias_set.items.len == 0) return false;
 
@@ -3403,12 +3628,12 @@ pub fn functionForwardsParamIntoSideChannelStash(
     while (changed) {
         changed = false;
         for (function.body) |block| {
-            if (sideChannelExtendParamAliases(block.instructions, &alias_set)) changed = true;
+            if (try sideChannelExtendParamAliases(&walker, block.instructions, &alias_set)) changed = true;
         }
     }
 
     for (function.body) |block| {
-        if (sideChannelStreamConsumesAlias(block.instructions, alias_set.items)) return true;
+        if (try sideChannelStreamConsumesAlias(&walker, block.instructions, alias_set.items)) return true;
     }
     return false;
 }
@@ -3420,117 +3645,205 @@ fn sideChannelAliasContains(set: []const ir.LocalId, local: ir.LocalId) bool {
     return false;
 }
 
-fn sideChannelAppendAlias(set: *std.ArrayListUnmanaged(ir.LocalId), local: ir.LocalId) bool {
+fn sideChannelAppendAlias(
+    allocator: std.mem.Allocator,
+    set: *std.ArrayListUnmanaged(ir.LocalId),
+    local: ir.LocalId,
+) std.mem.Allocator.Error!bool {
     if (sideChannelAliasContains(set.items, local)) return false;
-    set.append(std.heap.page_allocator, local) catch return false;
+    try set.append(allocator, local);
     return true;
 }
 
+const SideChannelWalkControl = enum {
+    keep_walking,
+    stop,
+};
+
+const SideChannelStreamFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+};
+
+const SideChannelStreamWalker = struct {
+    allocator: std.mem.Allocator,
+    stack: std.ArrayListUnmanaged(SideChannelStreamFrame) = .empty,
+    child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty,
+
+    fn init(allocator: std.mem.Allocator) SideChannelStreamWalker {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *SideChannelStreamWalker) void {
+        self.stack.deinit(self.allocator);
+        self.child_streams.deinit(self.allocator);
+    }
+
+    fn walk(
+        self: *SideChannelStreamWalker,
+        root_stream: []const ir.Instruction,
+        context: anytype,
+        comptime visitFn: fn (
+            ctx: @TypeOf(context),
+            instr: *const ir.Instruction,
+        ) std.mem.Allocator.Error!SideChannelWalkControl,
+    ) std.mem.Allocator.Error!SideChannelWalkControl {
+        self.stack.clearRetainingCapacity();
+        self.child_streams.clearRetainingCapacity();
+        if (root_stream.len == 0) return .keep_walking;
+
+        try self.stack.append(self.allocator, .{ .stream = root_stream });
+        while (self.stack.items.len != 0) {
+            const frame = &self.stack.items[self.stack.items.len - 1];
+            if (frame.next_index >= frame.stream.len) {
+                _ = self.stack.pop().?;
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            frame.next_index += 1;
+
+            switch (try visitFn(context, instr)) {
+                .keep_walking => {},
+                .stop => return .stop,
+            }
+            try self.pushInstructionChildren(instr);
+        }
+
+        return .keep_walking;
+    }
+
+    fn pushInstructionChildren(
+        self: *SideChannelStreamWalker,
+        instr: *const ir.Instruction,
+    ) std.mem.Allocator.Error!void {
+        self.child_streams.clearRetainingCapacity();
+
+        const ChildStreamCollector = struct {
+            walker: *SideChannelStreamWalker,
+            err: ?std.mem.Allocator.Error = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null or child.stream.len == 0) return;
+                ctx.walker.child_streams.append(ctx.walker.allocator, child.stream) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        var child_collector = ChildStreamCollector{ .walker = self };
+        ir.forEachChildStream(instr, &child_collector, ChildStreamCollector.onStream);
+        if (child_collector.err) |err| return err;
+
+        var child_index = self.child_streams.items.len;
+        while (child_index > 0) {
+            child_index -= 1;
+            try self.stack.append(self.allocator, .{ .stream = self.child_streams.items[child_index] });
+        }
+    }
+};
+
 fn sideChannelSeedParamAliases(
+    walker: *SideChannelStreamWalker,
     stream: []const ir.Instruction,
     param_index: usize,
     alias_set: *std.ArrayListUnmanaged(ir.LocalId),
-) void {
-    for (stream) |*instr| {
-        if (instr.* == .param_get) {
-            const pg = instr.param_get;
-            if (pg.index == param_index) _ = sideChannelAppendAlias(alias_set, pg.dest);
-        }
-        // Recurse into every nested sub-stream via the canonical
-        // enumerator (covers union_switch.else_instrs, try_call_named,
-        // optional_dispatch, etc. that the old hand-rolled switch omitted).
-        const Seed = struct {
-            param_index: usize,
-            alias_set: *std.ArrayListUnmanaged(ir.LocalId),
-            fn onStream(self: *@This(), child: ir.ChildStream) void {
-                sideChannelSeedParamAliases(child.stream, self.param_index, self.alias_set);
+) std.mem.Allocator.Error!void {
+    const Seed = struct {
+        allocator: std.mem.Allocator,
+        param_index: usize,
+        alias_set: *std.ArrayListUnmanaged(ir.LocalId),
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) std.mem.Allocator.Error!SideChannelWalkControl {
+            if (instr.* == .param_get) {
+                const pg = instr.param_get;
+                if (pg.index == self.param_index) {
+                    _ = try sideChannelAppendAlias(self.allocator, self.alias_set, pg.dest);
+                }
             }
-        };
-        var seed = Seed{ .param_index = param_index, .alias_set = alias_set };
-        ir.forEachChildStream(instr, &seed, Seed.onStream);
-    }
+            return .keep_walking;
+        }
+    };
+    var seed = Seed{
+        .allocator = walker.allocator,
+        .param_index = param_index,
+        .alias_set = alias_set,
+    };
+    _ = try walker.walk(stream, &seed, Seed.visit);
 }
 
 fn sideChannelExtendParamAliases(
+    walker: *SideChannelStreamWalker,
     stream: []const ir.Instruction,
     alias_set: *std.ArrayListUnmanaged(ir.LocalId),
-) bool {
-    var changed = false;
-    for (stream) |*instr| {
-        switch (instr.*) {
-            .move_value => |mv| {
-                if (sideChannelAliasContains(alias_set.items, mv.source)) {
-                    if (sideChannelAppendAlias(alias_set, mv.dest)) changed = true;
-                }
-            },
-            .local_get => |lg| {
-                if (sideChannelAliasContains(alias_set.items, lg.source)) {
-                    if (sideChannelAppendAlias(alias_set, lg.dest)) changed = true;
-                }
-            },
-            .borrow_value => |bv| {
-                if (sideChannelAliasContains(alias_set.items, bv.source)) {
-                    if (sideChannelAppendAlias(alias_set, bv.dest)) changed = true;
-                }
-            },
-            .share_value => |sv| {
-                if (sideChannelAliasContains(alias_set.items, sv.source)) {
-                    if (sideChannelAppendAlias(alias_set, sv.dest)) changed = true;
-                }
-            },
-            else => {},
-        }
-        // Recurse into every nested sub-stream via the canonical
-        // enumerator so aliases created inside ANY control-flow construct
-        // (including union_switch.else_instrs, try_call_named, and
-        // optional_dispatch arms — previously not walked here at all) are
-        // tracked. Keeps the Gap-4 return-source-elision gate from
-        // under-approximating the alias set.
-        const Ext = struct {
-            alias_set: *std.ArrayListUnmanaged(ir.LocalId),
-            changed: bool = false,
-            fn onStream(self: *@This(), child: ir.ChildStream) void {
-                if (sideChannelExtendParamAliases(child.stream, self.alias_set)) self.changed = true;
+) std.mem.Allocator.Error!bool {
+    const Ext = struct {
+        allocator: std.mem.Allocator,
+        alias_set: *std.ArrayListUnmanaged(ir.LocalId),
+        changed: bool = false,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) std.mem.Allocator.Error!SideChannelWalkControl {
+            switch (instr.*) {
+                .move_value => |mv| {
+                    if (sideChannelAliasContains(self.alias_set.items, mv.source)) {
+                        if (try sideChannelAppendAlias(self.allocator, self.alias_set, mv.dest)) self.changed = true;
+                    }
+                },
+                .local_get => |lg| {
+                    if (sideChannelAliasContains(self.alias_set.items, lg.source)) {
+                        if (try sideChannelAppendAlias(self.allocator, self.alias_set, lg.dest)) self.changed = true;
+                    }
+                },
+                .borrow_value => |bv| {
+                    if (sideChannelAliasContains(self.alias_set.items, bv.source)) {
+                        if (try sideChannelAppendAlias(self.allocator, self.alias_set, bv.dest)) self.changed = true;
+                    }
+                },
+                .share_value => |sv| {
+                    if (sideChannelAliasContains(self.alias_set.items, sv.source)) {
+                        if (try sideChannelAppendAlias(self.allocator, self.alias_set, sv.dest)) self.changed = true;
+                    }
+                },
+                else => {},
             }
-        };
-        var ext = Ext{ .alias_set = alias_set };
-        ir.forEachChildStream(instr, &ext, Ext.onStream);
-        if (ext.changed) changed = true;
-    }
-    return changed;
+            return .keep_walking;
+        }
+    };
+    var ext = Ext{
+        .allocator = walker.allocator,
+        .alias_set = alias_set,
+    };
+    _ = try walker.walk(stream, &ext, Ext.visit);
+    return ext.changed;
 }
 
 fn sideChannelStreamConsumesAlias(
+    walker: *SideChannelStreamWalker,
     stream: []const ir.Instruction,
     alias_set: []const ir.LocalId,
-) bool {
-    for (stream) |*instr| {
-        if (instr.* == .call_builtin) {
-            const cb = instr.call_builtin;
-            for (cb.args, 0..) |arg, slot| {
-                if (sideChannelStashBuiltinArg(cb.name, slot) and
-                    sideChannelAliasContains(alias_set, arg))
-                {
-                    return true;
+) std.mem.Allocator.Error!bool {
+    const Consumes = struct {
+        alias_set: []const ir.LocalId,
+        found: bool = false,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) std.mem.Allocator.Error!SideChannelWalkControl {
+            if (instr.* == .call_builtin) {
+                const cb = instr.call_builtin;
+                for (cb.args, 0..) |arg, slot| {
+                    if (sideChannelStashBuiltinArg(cb.name, slot) and
+                        sideChannelAliasContains(self.alias_set, arg))
+                    {
+                        self.found = true;
+                        return .stop;
+                    }
                 }
             }
+            return .keep_walking;
         }
-        // Recurse into every nested sub-stream via the canonical
-        // enumerator (covers union_switch.else_instrs, try_call_named,
-        // optional_dispatch, switch_* that the old switch omitted).
-        const Consumes = struct {
-            alias_set: []const ir.LocalId,
-            found: bool = false,
-            fn onStream(self: *@This(), child: ir.ChildStream) void {
-                if (self.found) return;
-                if (sideChannelStreamConsumesAlias(child.stream, self.alias_set)) self.found = true;
-            }
-        };
-        var consumes = Consumes{ .alias_set = alias_set };
-        ir.forEachChildStream(instr, &consumes, Consumes.onStream);
-        if (consumes.found) return true;
-    }
-    return false;
+    };
+    var consumes = Consumes{ .alias_set = alias_set };
+    _ = try walker.walk(stream, &consumes, Consumes.visit);
+    return consumes.found;
 }
 
 fn isListBuiltinPrefix(prefix: []const u8) bool {
@@ -3726,6 +4039,136 @@ test "arc_liveness: alwaysConsumingBuiltinArg recognizes List.cons argument slot
     try std.testing.expect(!alwaysConsumingBuiltinArg("cons", 0));
 }
 
+test "arc_liveness: List.next and Map.next consume iterator state at last use" {
+    const list_names = [_][]const u8{
+        "List.next",
+        "List:i64.next",
+        "ListNested:i64.next",
+    };
+    for (list_names) |name| {
+        try std.testing.expect(builtinArgCanMoveAtLastUse(name, 0));
+        try std.testing.expect(builtinArgRequiresOwnedInput(name, 0));
+        try std.testing.expect(!alwaysConsumingBuiltinArg(name, 0));
+        try std.testing.expect(!builtinArgCanMoveAtLastUse(name, 1));
+    }
+
+    const map_names = [_][]const u8{
+        "Map.next",
+        "Map:i64:i64.next",
+        "MapNested:u32:list.next",
+    };
+    for (map_names) |name| {
+        try std.testing.expect(builtinArgCanMoveAtLastUse(name, 0));
+        try std.testing.expect(builtinArgRequiresOwnedInput(name, 0));
+        try std.testing.expect(!alwaysConsumingBuiltinArg(name, 0));
+        try std.testing.expect(!builtinArgCanMoveAtLastUse(name, 1));
+    }
+
+    try std.testing.expect(!builtinArgCanMoveAtLastUse("String.next", 0));
+    try std.testing.expect(!builtinArgCanMoveAtLastUse("List.length", 0));
+    try std.testing.expect(!builtinArgCanMoveAtLastUse("Map.get", 0));
+}
+
+test "arc_liveness: List.release and Map.release consume iterator state" {
+    const list_names = [_][]const u8{
+        "List.release",
+        "List:i64.release",
+        "ListNested:i64.release",
+    };
+    for (list_names) |name| {
+        try std.testing.expect(builtinArgCanMoveAtLastUse(name, 0));
+        try std.testing.expect(builtinArgRequiresOwnedInput(name, 0));
+        try std.testing.expect(alwaysConsumingBuiltinArg(name, 0));
+        try std.testing.expect(!builtinArgCanMoveAtLastUse(name, 1));
+    }
+
+    const map_names = [_][]const u8{
+        "Map.release",
+        "Map:i64:i64.release",
+        "MapNested:u32:list.release",
+    };
+    for (map_names) |name| {
+        try std.testing.expect(builtinArgCanMoveAtLastUse(name, 0));
+        try std.testing.expect(builtinArgRequiresOwnedInput(name, 0));
+        try std.testing.expect(alwaysConsumingBuiltinArg(name, 0));
+        try std.testing.expect(!builtinArgCanMoveAtLastUse(name, 1));
+    }
+
+    try std.testing.expect(!builtinArgCanMoveAtLastUse("String.release", 0));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("List.length", 0));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("Map.get", 0));
+}
+
+test "arc_liveness: iterator next call_builtin clears consumed state owner" {
+    const cases = [_][]const u8{ "List.next", "Map.next" };
+
+    for (cases, 0..) |builtin_name, case_index| {
+        var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_obj.deinit();
+        const arena = arena_obj.allocator();
+
+        const args = try arena.alloc(ir.LocalId, 1);
+        args[0] = 1;
+
+        const arg_modes = try arena.alloc(ir.ValueMode, 1);
+        arg_modes[0] = .move;
+
+        const stream = try arena.alloc(ir.Instruction, 4);
+        stream[0] = .{ .param_get = .{ .dest = 0, .index = 0 } };
+        stream[1] = .{ .move_value = .{ .dest = 1, .source = 0 } };
+        stream[2] = .{ .call_builtin = .{
+            .dest = 2,
+            .name = builtin_name,
+            .args = args,
+            .arg_modes = arg_modes,
+        } };
+        stream[3] = .{ .ret = .{ .value = 2 } };
+
+        const blocks = try arena.alloc(ir.Block, 1);
+        blocks[0] = .{ .label = 0, .instructions = stream };
+
+        const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+            .owned, .owned, .owned,
+        });
+        const param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{.owned});
+        const params = try arena.alloc(ir.Param, 1);
+        params[0] = .{ .name = "state", .type_expr = .void, .type_id = 0 };
+
+        const function = ir.Function{
+            .id = @intCast(300 + case_index),
+            .name = "iterator_next_consume_test",
+            .scope_id = 0,
+            .arity = 1,
+            .params = params,
+            .return_type = .void,
+            .body = blocks,
+            .is_closure = false,
+            .captures = &.{},
+            .local_count = 3,
+            .param_conventions = param_conventions,
+            .local_ownership = local_ownership,
+            .result_convention = .owned,
+        };
+
+        var ownership = try computeArcOwnership(
+            std.testing.allocator,
+            &function,
+            suite_dummy_type_store_for_h6,
+            arc_managed_for_h6,
+        );
+        defer ownership.deinit(std.testing.allocator);
+
+        var saw_ret_snapshot = false;
+        var live_iter = ownership.live_before_ret.valueIterator();
+        while (live_iter.next()) |set_ptr| {
+            saw_ret_snapshot = true;
+            try std.testing.expect(!set_ptr.contains(1));
+            try std.testing.expect(set_ptr.contains(2));
+        }
+        try std.testing.expect(saw_ret_snapshot);
+    }
+}
+
 test "arc_liveness: recoverable-raise side-channel stash consumes its boxed-Error arg" {
     // `Kernel.recoverable_raise(box)` transfers the boxed `Error` into the
     // thread-local side-channel (recovered later by `take_recoverable_raise`).
@@ -3752,6 +4195,157 @@ test "arc_liveness: recoverable-raise side-channel stash consumes its boxed-Erro
     try std.testing.expect(!sideChannelStashBuiltinArg("KernelAlt.recoverable_raise", 0));
     try std.testing.expect(!sideChannelStashBuiltinArg("recoverable_raise", 0));
     try std.testing.expect(!sideChannelStashBuiltinArg("", 0));
+}
+
+fn makeSideChannelForwardingTestFunction(arena: std.mem.Allocator) !ir.Function {
+    const args = try arena.alloc(ir.LocalId, 1);
+    args[0] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 1);
+    arg_modes[0] = .move;
+
+    const stream = try arena.alloc(ir.Instruction, 5);
+    stream[0] = .{ .param_get = .{ .dest = 0, .index = 0 } };
+    stream[1] = .{ .move_value = .{ .dest = 1, .source = 0 } };
+    stream[2] = .{ .share_value = .{ .dest = 2, .source = 1, .mode = .retain } };
+    stream[3] = .{ .call_builtin = .{
+        .dest = 3,
+        .name = "Kernel.recoverable_raise",
+        .args = args,
+        .arg_modes = arg_modes,
+    } };
+    stream[4] = .{ .ret = .{ .value = 3 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 4);
+    for (local_ownership) |*ownership_class| ownership_class.* = .owned;
+
+    const param_conventions = try arena.alloc(ir.ParamConvention, 1);
+    param_conventions[0] = .borrowed;
+
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "box", .type_expr = .void };
+
+    return .{
+        .id = 0,
+        .name = "recoverable_raise_wrapper",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+}
+
+test "arc_liveness: side-channel stash forwarding detector follows alias chain" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const function = try makeSideChannelForwardingTestFunction(arena_obj.allocator());
+
+    try std.testing.expect(try functionForwardsParamIntoSideChannelStash(std.testing.allocator, &function, 0));
+    try std.testing.expect(!try functionForwardsParamIntoSideChannelStash(std.testing.allocator, &function, 1));
+}
+
+test "arc_liveness: side-channel stash forwarding detector propagates alias append OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const function = try makeSideChannelForwardingTestFunction(arena_obj.allocator());
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        functionForwardsParamIntoSideChannelStash(failing_allocator.allocator(), &function, 0),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+fn makeNestedSideChannelForwardingTestFunction(
+    arena: std.mem.Allocator,
+    depth: usize,
+) !ir.Function {
+    const args = try arena.alloc(ir.LocalId, 1);
+    args[0] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 1);
+    arg_modes[0] = .move;
+
+    const leaf_stream = try arena.alloc(ir.Instruction, 5);
+    leaf_stream[0] = .{ .param_get = .{ .dest = 0, .index = 0 } };
+    leaf_stream[1] = .{ .move_value = .{ .dest = 1, .source = 0 } };
+    leaf_stream[2] = .{ .share_value = .{ .dest = 2, .source = 1, .mode = .retain } };
+    leaf_stream[3] = .{ .call_builtin = .{
+        .dest = 3,
+        .name = "Kernel.recoverable_raise",
+        .args = args,
+        .arg_modes = arg_modes,
+    } };
+    leaf_stream[4] = .{ .ret = .{ .value = 3 } };
+
+    var root_stream: []const ir.Instruction = leaf_stream;
+    for (0..depth) |_| {
+        const wrapper = try arena.alloc(ir.Instruction, 1);
+        wrapper[0] = .{ .guard_block = .{
+            .condition = 0,
+            .body = root_stream,
+        } };
+        root_stream = wrapper;
+    }
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = root_stream };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 4);
+    for (local_ownership) |*ownership_class| ownership_class.* = .owned;
+
+    const param_conventions = try arena.alloc(ir.ParamConvention, 1);
+    param_conventions[0] = .borrowed;
+
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "box", .type_expr = .void };
+
+    return .{
+        .id = 0,
+        .name = "nested_recoverable_raise_wrapper",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+}
+
+test "arc_liveness: side-channel stash forwarding detector visits deep child streams iteratively" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const function = try makeNestedSideChannelForwardingTestFunction(arena_obj.allocator(), 256);
+
+    try std.testing.expect(try functionForwardsParamIntoSideChannelStash(std.testing.allocator, &function, 0));
+    try std.testing.expect(!try functionForwardsParamIntoSideChannelStash(std.testing.allocator, &function, 1));
+}
+
+test "arc_liveness: side-channel stash forwarding detector propagates explicit-stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const function = try makeNestedSideChannelForwardingTestFunction(arena_obj.allocator(), 8);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        functionForwardsParamIntoSideChannelStash(failing_allocator.allocator(), &function, 0),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
 }
 
 test "arc_liveness: List.set and List.push element slots are consumed by builtin ABI" {
@@ -3791,9 +4385,14 @@ test "arc_liveness: builtinArgRequiresOwnedInput covers mutating receivers and M
     try std.testing.expect(builtinArgRequiresOwnedInput("Map.merge", 0));
     try std.testing.expect(builtinArgRequiresOwnedInput("Map.merge", 1));
     try std.testing.expect(builtinArgRequiresOwnedInput("List.push", 0));
+    try std.testing.expect(builtinArgRequiresOwnedInput("List.cons", 0));
+    try std.testing.expect(builtinArgRequiresOwnedInput("List.cons", 1));
+    try std.testing.expect(builtinArgRequiresOwnedInput("List:i64.cons", 1));
+    try std.testing.expect(builtinArgRequiresOwnedInput("ListNested:list.cons", 1));
 
     try std.testing.expect(!builtinArgRequiresOwnedInput("Map.put", 1));
     try std.testing.expect(!builtinArgRequiresOwnedInput("List.push", 1));
+    try std.testing.expect(!builtinArgRequiresOwnedInput("List.cons", 2));
     try std.testing.expect(!builtinArgRequiresOwnedInput("Map.merge", 2));
 }
 
@@ -3951,33 +4550,33 @@ test "arc_liveness: isUncheckedOwnedMutatingBuiltin distinguishes checked and un
 /// duplicate check guards against future refactors that might relax
 /// the analyzer-side check or skip it.
 fn assertConsumeReturnDisjoint(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     ownership: *const ArcOwnership,
-) void {
+) std.mem.Allocator.Error!void {
     var checker = DisjointChecker{
         .next_id = 0,
         .ownership = ownership,
     };
-    checker.walkFunction(function);
+    try checker.walkFunction(allocator, function);
 }
 
 const DisjointChecker = struct {
     next_id: InstructionId,
     ownership: *const ArcOwnership,
 
-    fn walkFunction(self: *DisjointChecker, function: *const ir.Function) void {
-        for (function.body) |block| {
-            self.walkStream(block.instructions);
-        }
+    fn walkFunction(
+        self: *DisjointChecker,
+        allocator: std.mem.Allocator,
+        function: *const ir.Function,
+    ) std.mem.Allocator.Error!void {
+        try ir.forEachInstruction(allocator, function, self, DisjointChecker.visit);
     }
 
-    fn walkStream(self: *DisjointChecker, stream: []const ir.Instruction) void {
-        for (stream) |*instr| {
-            const my_id = self.next_id;
-            self.next_id += 1;
-            self.checkInstr(instr, my_id);
-            self.walkChildren(instr);
-        }
+    fn visit(self: *DisjointChecker, instr: *const ir.Instruction) void {
+        const my_id = self.next_id;
+        self.next_id += 1;
+        self.checkInstr(instr, my_id);
     }
 
     fn checkInstr(self: *DisjointChecker, instr: *const ir.Instruction, id: InstructionId) void {
@@ -3985,18 +4584,6 @@ const DisjointChecker = struct {
         if (!self.ownership.consume_share_sites.contains(id)) return;
         const sv = instr.share_value;
         std.debug.assert(!self.ownership.return_source_locals.contains(sv.source));
-    }
-
-    /// Recurse into every child stream via the canonical enumerator so
-    /// the InstructionId numbering matches `flattenChildren` (including
-    /// `union_switch.else_instrs` and `optional_dispatch` arms; audit
-    /// finding arc-liveness--01).
-    fn walkChildren(self: *DisjointChecker, instr: *const ir.Instruction) void {
-        ir.forEachChildStream(instr, self, onChildStream);
-    }
-
-    fn onChildStream(self: *DisjointChecker, child: ir.ChildStream) void {
-        self.walkStream(child.stream);
     }
 };
 
@@ -4073,7 +4660,7 @@ pub const UseList = struct {
     len: usize = 0,
     use_overflow: bool = false,
 
-    pub fn append(self: *UseList, allocator: std.mem.Allocator, local: ir.LocalId) !void {
+    pub fn append(self: *UseList, allocator: std.mem.Allocator, local: ir.LocalId) error{OutOfMemory}!void {
         if (self.len < self.buf.len) {
             self.buf[self.len] = local;
             self.len += 1;
@@ -4106,7 +4693,7 @@ pub const UseList = struct {
 /// `switch_literal`/`switch_return` `default_result`,
 /// `union_switch.else_result`, `optional_dispatch.nil_result`). It
 /// exists because the catch-all result was historically enumerated
-/// independently in `collectUses` and `collectArmResults`, and those
+/// independently in `collectUses` and the aggregate-propagation passes, and those
 /// hand-rolled lists drifted apart — `collectUses` silently dropped
 /// `union_switch.else_result` (audit class S1). Routing both through
 /// this one walker makes that drift structurally impossible: a new
@@ -4165,117 +4752,127 @@ fn forEachArmResult(
 /// Sub-streams of nested instructions are NOT included — the
 /// dataflow visits them separately. Only the immediate uses by the
 /// instruction's own opcode are collected.
-pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
-    const allocator = std.heap.page_allocator; // overflow only
+pub fn collectUses(
+    allocator: std.mem.Allocator,
+    instr: ir.Instruction,
+    buf: *UseList,
+) error{OutOfMemory}!void {
     // Arm-result locals of aggregating control-flow opcodes (if_expr,
     // case_block, switch_literal, switch_return, union_switch[_return],
     // optional_dispatch) are direct uses by the merge/join point: they
     // materialise the opcode's `dest`. Collect them through the single
-    // shared walker so this list cannot drift from `collectArmResults`
+    // shared walker so this list cannot drift from the aggregate-propagation
     // again (GAP-P1R2-01: the catch-all `union_switch.else_result` was
     // previously dropped here). The aggregating arms below only append
     // the scrutinee / condition, which are uses but not arm results.
     const ArmResultAppender = struct {
         buf: *UseList,
         allocator: std.mem.Allocator,
-        fn visit(ctx: @This(), result_local: ir.LocalId) void {
-            ctx.buf.append(ctx.allocator, result_local) catch {};
+        err: ?error{OutOfMemory} = null,
+
+        fn visit(ctx: *@This(), result_local: ir.LocalId) void {
+            if (ctx.err != null) return;
+            ctx.buf.append(ctx.allocator, result_local) catch |err| {
+                ctx.err = err;
+            };
         }
     };
+    var arm_result_appender = ArmResultAppender{ .buf = buf, .allocator = allocator };
     forEachArmResult(
         instr,
-        ArmResultAppender{ .buf = buf, .allocator = allocator },
+        &arm_result_appender,
         ArmResultAppender.visit,
     );
+    if (arm_result_appender.err) |err| return err;
     switch (instr) {
         .const_int, .const_float, .const_string, .const_bool, .const_atom => {},
         .const_nil => {},
-        .local_get => |x| buf.append(allocator, x.source) catch {},
-        .borrow_value => |x| buf.append(allocator, x.source) catch {},
-        .copy_value => |x| buf.append(allocator, x.source) catch {},
-        .local_set => |x| buf.append(allocator, x.value) catch {},
-        .move_value => |x| buf.append(allocator, x.source) catch {},
-        .share_value => |x| buf.append(allocator, x.source) catch {},
+        .local_get => |x| try buf.append(allocator, x.source),
+        .borrow_value => |x| try buf.append(allocator, x.source),
+        .copy_value => |x| try buf.append(allocator, x.source),
+        .local_set => |x| try buf.append(allocator, x.value),
+        .move_value => |x| try buf.append(allocator, x.source),
+        .share_value => |x| try buf.append(allocator, x.source),
         .param_get => {},
-        .tuple_init => |x| for (x.elements) |l| buf.append(allocator, l) catch {},
-        .list_init => |x| for (x.elements) |l| buf.append(allocator, l) catch {},
+        .tuple_init => |x| for (x.elements) |l| try buf.append(allocator, l),
+        .list_init => |x| for (x.elements) |l| try buf.append(allocator, l),
         .list_cons => |x| {
-            buf.append(allocator, x.head) catch {};
-            buf.append(allocator, x.tail) catch {};
+            try buf.append(allocator, x.head);
+            try buf.append(allocator, x.tail);
         },
         .map_init => |x| for (x.entries) |e| {
-            buf.append(allocator, e.key) catch {};
-            buf.append(allocator, e.value) catch {};
+            try buf.append(allocator, e.key);
+            try buf.append(allocator, e.value);
         },
-        .struct_init => |x| for (x.fields) |f| buf.append(allocator, f.value) catch {},
-        .union_init => |x| buf.append(allocator, x.value) catch {},
-        .box_as_protocol => |x| buf.append(allocator, x.value) catch {},
+        .struct_init => |x| for (x.fields) |f| try buf.append(allocator, f.value),
+        .union_init => |x| try buf.append(allocator, x.value),
+        .box_as_protocol => |x| try buf.append(allocator, x.value),
         .protocol_dispatch => |x| {
-            buf.append(allocator, x.receiver) catch {};
-            for (x.args) |arg_local| buf.append(allocator, arg_local) catch {};
+            try buf.append(allocator, x.receiver);
+            for (x.args) |arg_local| try buf.append(allocator, arg_local);
         },
-        .protocol_box_unbox => |x| buf.append(allocator, x.box) catch {},
-        .protocol_box_vtable_eq => |x| buf.append(allocator, x.box) catch {},
+        .protocol_box_unbox => |x| try buf.append(allocator, x.box),
+        .protocol_box_vtable_eq => |x| try buf.append(allocator, x.box),
         .enum_literal => {},
-        .field_get => |x| buf.append(allocator, x.object) catch {},
+        .field_get => |x| try buf.append(allocator, x.object),
         .field_set => |x| {
-            buf.append(allocator, x.object) catch {};
-            buf.append(allocator, x.value) catch {};
+            try buf.append(allocator, x.object);
+            try buf.append(allocator, x.value);
         },
-        .index_get => |x| buf.append(allocator, x.object) catch {},
-        .list_len_check => |x| buf.append(allocator, x.scrutinee) catch {},
-        .list_get => |x| buf.append(allocator, x.list) catch {},
-        .list_is_not_empty => |x| buf.append(allocator, x.list) catch {},
-        .list_head, .list_tail => |x| buf.append(allocator, x.list) catch {},
+        .index_get => |x| try buf.append(allocator, x.object),
+        .list_len_check => |x| try buf.append(allocator, x.scrutinee),
+        .list_get => |x| try buf.append(allocator, x.list),
+        .list_is_not_empty => |x| try buf.append(allocator, x.list),
+        .list_head, .list_tail => |x| try buf.append(allocator, x.list),
         .map_has_key => |x| {
-            buf.append(allocator, x.map) catch {};
-            buf.append(allocator, x.key) catch {};
+            try buf.append(allocator, x.map);
+            try buf.append(allocator, x.key);
         },
         .map_get => |x| {
-            buf.append(allocator, x.map) catch {};
-            buf.append(allocator, x.key) catch {};
-            buf.append(allocator, x.default) catch {};
+            try buf.append(allocator, x.map);
+            try buf.append(allocator, x.key);
+            try buf.append(allocator, x.default);
         },
         .binary_op => |x| {
-            buf.append(allocator, x.lhs) catch {};
-            buf.append(allocator, x.rhs) catch {};
+            try buf.append(allocator, x.lhs);
+            try buf.append(allocator, x.rhs);
         },
-        .unary_op => |x| buf.append(allocator, x.operand) catch {},
-        .call_direct => |x| for (x.args) |a| buf.append(allocator, a) catch {},
-        .call_named => |x| for (x.args) |a| buf.append(allocator, a) catch {},
+        .unary_op => |x| try buf.append(allocator, x.operand),
+        .call_direct => |x| for (x.args) |a| try buf.append(allocator, a),
+        .call_named => |x| for (x.args) |a| try buf.append(allocator, a),
         .call_closure => |x| {
-            buf.append(allocator, x.callee) catch {};
-            for (x.args) |a| buf.append(allocator, a) catch {};
+            try buf.append(allocator, x.callee);
+            for (x.args) |a| try buf.append(allocator, a);
         },
-        .call_dispatch => |x| for (x.args) |a| buf.append(allocator, a) catch {},
-        .call_builtin => |x| for (x.args) |a| buf.append(allocator, a) catch {},
-        .tail_call => |x| for (x.args) |a| buf.append(allocator, a) catch {},
+        .call_dispatch => |x| for (x.args) |a| try buf.append(allocator, a),
+        .call_builtin => |x| for (x.args) |a| try buf.append(allocator, a),
+        .tail_call => |x| for (x.args) |a| try buf.append(allocator, a),
         .try_call_named => |x| {
-            for (x.args) |a| buf.append(allocator, a) catch {};
-            buf.append(allocator, x.input_local) catch {};
+            for (x.args) |a| try buf.append(allocator, a);
+            try buf.append(allocator, x.input_local);
             // handler_result and success_result are produced inside
             // sub-streams; not direct uses of the parent instruction.
         },
         .error_catch => |x| {
-            buf.append(allocator, x.source) catch {};
-            buf.append(allocator, x.catch_value) catch {};
+            try buf.append(allocator, x.source);
+            try buf.append(allocator, x.catch_value);
         },
         // Phase 3.b: error-union unwrap reads its source (the call's error
         // union); the payload it produces is the dest.
-        .unwrap_error_union => |x| buf.append(allocator, x.source) catch {},
+        .unwrap_error_union => |x| try buf.append(allocator, x.source),
         .set_safety => {},
         // Arm results (then_result / else_result) are appended by the
         // shared `forEachArmResult` walk above; here we only add the
         // condition, which is a use but not an arm result.
-        .if_expr => |x| buf.append(allocator, x.condition) catch {},
-        .guard_block => |x| buf.append(allocator, x.condition) catch {},
+        .if_expr => |x| try buf.append(allocator, x.condition),
+        .guard_block => |x| try buf.append(allocator, x.condition),
         // Arm/default results appended by `forEachArmResult` above.
         .case_block => {},
         .branch => {},
-        .cond_branch => |x| buf.append(allocator, x.condition) catch {},
-        .switch_tag => |x| buf.append(allocator, x.scrutinee) catch {},
+        .cond_branch => |x| try buf.append(allocator, x.condition),
+        .switch_tag => |x| try buf.append(allocator, x.scrutinee),
         // Scrutinee is a use; case/default results via `forEachArmResult`.
-        .switch_literal => |x| buf.append(allocator, x.scrutinee) catch {},
+        .switch_literal => |x| try buf.append(allocator, x.scrutinee),
         // Case/default results appended by `forEachArmResult` above; the
         // scrutinee of a `switch_return` is a param index, not a local.
         .switch_return => {},
@@ -4284,85 +4881,85 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
         .union_switch_return => {},
         // Scrutinee is a use; case + catch-all (`else_result`) results
         // via `forEachArmResult` above (GAP-P1R2-01).
-        .union_switch => |x| buf.append(allocator, x.scrutinee) catch {},
-        .match_atom => |x| buf.append(allocator, x.scrutinee) catch {},
-        .match_variant_tag => |x| buf.append(allocator, x.scrutinee) catch {},
-        .variant_payload_get => |x| buf.append(allocator, x.scrutinee) catch {},
-        .match_int => |x| buf.append(allocator, x.scrutinee) catch {},
-        .match_float => |x| buf.append(allocator, x.scrutinee) catch {},
-        .match_string => |x| buf.append(allocator, x.scrutinee) catch {},
-        .match_type => |x| buf.append(allocator, x.scrutinee) catch {},
+        .union_switch => |x| try buf.append(allocator, x.scrutinee),
+        .match_atom => |x| try buf.append(allocator, x.scrutinee),
+        .match_variant_tag => |x| try buf.append(allocator, x.scrutinee),
+        .variant_payload_get => |x| try buf.append(allocator, x.scrutinee),
+        .match_int => |x| try buf.append(allocator, x.scrutinee),
+        .match_float => |x| try buf.append(allocator, x.scrutinee),
+        .match_string => |x| try buf.append(allocator, x.scrutinee),
+        .match_type => |x| try buf.append(allocator, x.scrutinee),
         .match_fail => |x| {
-            if (x.message_local) |l| buf.append(allocator, l) catch {};
+            if (x.message_local) |l| try buf.append(allocator, l);
         },
-        .match_error_return => |x| buf.append(allocator, x.scrutinee) catch {},
+        .match_error_return => |x| try buf.append(allocator, x.scrutinee),
         // Phase 3.b: a propagating raise is a pure error-return terminator;
         // the boxed error's use is accounted for by the preceding
         // recoverable_raise call instruction, not here.
         .ret_raise => {},
         .ret => |x| {
-            if (x.value) |l| buf.append(allocator, l) catch {};
+            if (x.value) |l| try buf.append(allocator, l);
         },
         .cond_return => |x| {
-            buf.append(allocator, x.condition) catch {};
-            if (x.value) |l| buf.append(allocator, l) catch {};
+            try buf.append(allocator, x.condition);
+            if (x.value) |l| try buf.append(allocator, l);
         },
         .case_break => |x| {
-            if (x.value) |l| buf.append(allocator, l) catch {};
+            if (x.value) |l| try buf.append(allocator, l);
         },
         .jump => |x| {
-            if (x.value) |l| buf.append(allocator, l) catch {};
+            if (x.value) |l| try buf.append(allocator, l);
         },
-        .make_closure => |x| for (x.captures) |a| buf.append(allocator, a) catch {},
+        .make_closure => |x| for (x.captures) |a| try buf.append(allocator, a),
         .capture_get => {},
-        .optional_unwrap => |x| buf.append(allocator, x.source) catch {},
-        .bin_len_check => |x| buf.append(allocator, x.scrutinee) catch {},
+        .optional_unwrap => |x| try buf.append(allocator, x.source),
+        .bin_len_check => |x| try buf.append(allocator, x.scrutinee),
         .bin_read_int => |x| {
-            buf.append(allocator, x.source) catch {};
+            try buf.append(allocator, x.source);
             switch (x.offset) {
-                .dynamic => |d| buf.append(allocator, d) catch {},
+                .dynamic => |d| try buf.append(allocator, d),
                 .static => {},
             }
         },
         .bin_read_float => |x| {
-            buf.append(allocator, x.source) catch {};
+            try buf.append(allocator, x.source);
             switch (x.offset) {
-                .dynamic => |d| buf.append(allocator, d) catch {},
+                .dynamic => |d| try buf.append(allocator, d),
                 .static => {},
             }
         },
         .bin_slice => |x| {
-            buf.append(allocator, x.source) catch {};
+            try buf.append(allocator, x.source);
             switch (x.offset) {
-                .dynamic => |d| buf.append(allocator, d) catch {},
+                .dynamic => |d| try buf.append(allocator, d),
                 .static => {},
             }
             if (x.length) |len_off| {
                 switch (len_off) {
-                    .dynamic => |d| buf.append(allocator, d) catch {},
+                    .dynamic => |d| try buf.append(allocator, d),
                     .static => {},
                 }
             }
         },
         .bin_read_utf8 => |x| {
-            buf.append(allocator, x.source) catch {};
+            try buf.append(allocator, x.source);
             switch (x.offset) {
-                .dynamic => |d| buf.append(allocator, d) catch {},
+                .dynamic => |d| try buf.append(allocator, d),
                 .static => {},
             }
         },
-        .bin_match_prefix => |x| buf.append(allocator, x.source) catch {},
-        .retain => |x| buf.append(allocator, x.value) catch {},
-        .release => |x| buf.append(allocator, x.value) catch {},
-        .reset => |x| buf.append(allocator, x.source) catch {},
+        .bin_match_prefix => |x| try buf.append(allocator, x.source),
+        .retain => |x| try buf.append(allocator, x.value),
+        .release => |x| try buf.append(allocator, x.value),
+        .reset => |x| try buf.append(allocator, x.source),
         .reuse_alloc => |x| {
-            if (x.token) |t| buf.append(allocator, t) catch {};
+            if (x.token) |t| try buf.append(allocator, t);
         },
-        .int_widen, .float_widen => |x| buf.append(allocator, x.source) catch {},
+        .int_widen, .float_widen => |x| try buf.append(allocator, x.source),
         // Typed-undefined placeholder reads no locals — its operand is the
         // interned `undef` value, not a Zap local.
         .typed_undef => {},
-        .phi => |x| for (x.sources) |src| buf.append(allocator, src.value) catch {},
+        .phi => |x| for (x.sources) |src| try buf.append(allocator, src.value),
         // scrutinee_param is a param index (not a local); payload_local
         // is a def; nested nil_instrs / struct_instrs are visited
         // separately by the dataflow. The arm results (nil_result /
@@ -4375,8 +4972,46 @@ pub fn collectUses(instr: ir.Instruction, buf: *UseList) void {
         // could destroy a value the debugger expects to observe.
         // `.dbg_stmt` has no operands.
         .dbg_stmt => {},
-        .dbg_var => |x| buf.append(allocator, x.value) catch {},
+        .dbg_var => |x| try buf.append(allocator, x.value),
     }
+}
+
+test "arc_liveness: arm-result walker visits every case result beyond fixed-buffer sizes" {
+    var arms: [20]ir.IrCaseArm = undefined;
+    for (&arms, 0..) |*arm, index| {
+        arm.* = .{
+            .cond_instrs = &.{},
+            .condition = 1,
+            .body_instrs = &.{},
+            .result = @intCast(index + 100),
+        };
+    }
+
+    const default_result: ir.LocalId = 999;
+    const instr = ir.Instruction{ .case_block = .{
+        .dest = 50,
+        .pre_instrs = &.{},
+        .arms = &arms,
+        .default_instrs = &.{},
+        .default_result = default_result,
+    } };
+
+    const Counter = struct {
+        count: usize = 0,
+        sum: usize = 0,
+        fn visit(ctx: *@This(), result_local: ir.LocalId) void {
+            ctx.count += 1;
+            ctx.sum += @intCast(result_local);
+        }
+    };
+
+    var counter: Counter = .{};
+    forEachArmResult(instr, &counter, Counter.visit);
+
+    var expected_sum: usize = @intCast(default_result);
+    for (0..arms.len) |index| expected_sum += index + 100;
+    try std.testing.expectEqual(@as(usize, arms.len + 1), counter.count);
+    try std.testing.expectEqual(expected_sum, counter.sum);
 }
 
 pub const DefList = struct {
@@ -4498,34 +5133,6 @@ fn aggregateDest(instr: ir.Instruction) ?ir.LocalId {
     };
 }
 
-/// Collects up to 16 arm-result locals from an aggregating
-/// instruction. Returns the count.
-///
-/// Delegates the per-arm enumeration to the shared `forEachArmResult`
-/// walker so this list and `collectUses`'s arm-result list are derived
-/// from one source and cannot drift apart (audit class S1; the catch-all
-/// `union_switch.else_result` previously diverged — GAP-P1R2-01). The
-/// only callers (`identifyArcLocals` / `propagateReturnSourcesThrough
-/// Aggregates`) gate on `aggregateDest`, so in practice this is invoked
-/// only for if_expr / case_block / switch_literal / union_switch; the
-/// extra variants the shared walker also handles are simply never
-/// reached here.
-fn collectArmResults(instr: ir.Instruction, out: *[16]ir.LocalId) usize {
-    var n: usize = 0;
-    const ArmResultCollector = struct {
-        out: *[16]ir.LocalId,
-        n: *usize,
-        fn visit(ctx: @This(), result_local: ir.LocalId) void {
-            if (ctx.n.* < ctx.out.len) {
-                ctx.out.*[ctx.n.*] = result_local;
-                ctx.n.* += 1;
-            }
-        }
-    };
-    forEachArmResult(instr, ArmResultCollector{ .out = out, .n = &n }, ArmResultCollector.visit);
-    return n;
-}
-
 test "arc_liveness: collectUses collects union_switch.else_result of a passthrough catch-all (GAP-P1R2-01)" {
     // S1 catch-all-skip regression: a `union_switch` whose `_` prong
     // yields a value computed BEFORE the switch (the passthrough
@@ -4562,7 +5169,7 @@ test "arc_liveness: collectUses collects union_switch.else_result of a passthrou
 
     var uses: UseList = .{};
     defer uses.deinit(std.testing.allocator);
-    collectUses(instr, &uses);
+    try collectUses(std.testing.allocator, instr, &uses);
 
     const found = uses.slice();
     var saw_else_result = false;
@@ -4578,6 +5185,128 @@ test "arc_liveness: collectUses collects union_switch.else_result of a passthrou
     try std.testing.expect(saw_case_result);
     // The load-bearing assertion: the catch-all result is a use.
     try std.testing.expect(saw_else_result);
+}
+
+test "arc_liveness: collectUses propagates OOM when use-list overflow allocation fails" {
+    var elements: [17]ir.LocalId = undefined;
+    for (&elements, 0..) |*element, index| {
+        element.* = @intCast(index + 1);
+    }
+
+    const instr = ir.Instruction{ .tuple_init = .{
+        .dest = 99,
+        .elements = &elements,
+    } };
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = failing_allocator.allocator();
+
+    var uses: UseList = .{};
+    defer uses.deinit(allocator);
+
+    try std.testing.expectError(error.OutOfMemory, collectUses(allocator, instr, &uses));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "arc_liveness: Analyzer.applyUses propagates use-list overflow OOM" {
+    const function = ir.Function{
+        .id = 0,
+        .name = "apply_uses_oom_test",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 100,
+        .param_conventions = &.{},
+        .local_ownership = &.{},
+        .result_convention = .owned,
+    };
+
+    var analyzer = Analyzer{
+        .allocator = std.testing.allocator,
+        .function = &function,
+        .type_store = suite_dummy_type_store_for_h6,
+        .arc_managed = arc_managed_for_h6,
+        .records = .empty,
+        .pointer_to_id = .empty,
+        .arc_locals = .empty,
+        .local_to_arc_index = .empty,
+        .live_after = .empty,
+    };
+    defer analyzer.deinit();
+
+    var elements: [17]ir.LocalId = undefined;
+    for (&elements, 0..) |*element, index| {
+        const local: ir.LocalId = @intCast(index + 1);
+        element.* = local;
+        try analyzer.local_to_arc_index.put(std.testing.allocator, local, @intCast(index));
+    }
+
+    const instr = ir.Instruction{ .tuple_init = .{
+        .dest = 99,
+        .elements = &elements,
+    } };
+
+    var live_set = try LiveSet.init(std.testing.allocator, @intCast(elements.len));
+    defer live_set.deinit(std.testing.allocator);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    analyzer.allocator = failing_allocator.allocator();
+    const apply_result = analyzer.applyUses(instr, &live_set);
+    analyzer.allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.OutOfMemory, apply_result);
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "arc_liveness: Analyzer.deinit frees shared alias slices without allocating" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var analyzer_allocator = failing_allocator.allocator();
+
+    const function = ir.Function{
+        .id = 0,
+        .name = "alias_slice_deinit_test",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 0,
+        .param_conventions = &.{},
+        .local_ownership = &.{},
+        .result_convention = .owned,
+    };
+
+    var analyzer = Analyzer{
+        .allocator = analyzer_allocator,
+        .function = &function,
+        .type_store = suite_dummy_type_store_for_h6,
+        .arc_managed = arc_managed_for_h6,
+        .records = .empty,
+        .pointer_to_id = .empty,
+        .arc_locals = .empty,
+        .local_to_arc_index = .empty,
+        .live_after = .empty,
+    };
+    errdefer analyzer.deinit();
+
+    const alias_slice = try analyzer_allocator.dupe(ir.LocalId, &[_]ir.LocalId{ 1, 2 });
+    var alias_slice_registered = false;
+    errdefer if (!alias_slice_registered) analyzer_allocator.free(alias_slice);
+    try analyzer.param_alias_group_slices.append(analyzer_allocator, alias_slice);
+    alias_slice_registered = true;
+    try analyzer.param_alias_group.put(analyzer_allocator, 1, alias_slice);
+    try analyzer.param_alias_group.put(analyzer_allocator, 2, alias_slice);
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    analyzer.deinit();
+
+    try std.testing.expect(!failing_allocator.has_induced_failure);
 }
 
 /// Whether a `ZigType` represents a heap-allocated, ARC-managed shape.
@@ -4798,15 +5527,15 @@ const TestSuite = struct {
         const alloc = arena_ptr.allocator();
 
         const parser_ptr = try alloc.create(Parser);
-        parser_ptr.* = Parser.init(alloc, source);
+        parser_ptr.* = try Parser.init(alloc, source);
         const program = try parser_ptr.parseProgram();
 
         const collector_ptr = try alloc.create(Collector);
-        collector_ptr.* = Collector.init(alloc, parser_ptr.interner, null);
+        collector_ptr.* = try Collector.init(alloc, parser_ptr.interner, null);
         try collector_ptr.collectProgram(&program);
 
         const checker_ptr = try alloc.create(types_mod.TypeChecker);
-        checker_ptr.* = types_mod.TypeChecker.init(alloc, parser_ptr.interner, &collector_ptr.graph);
+        checker_ptr.* = try types_mod.TypeChecker.init(alloc, parser_ptr.interner, &collector_ptr.graph);
         try checker_ptr.checkProgram(&program);
 
         const hir_ptr = try alloc.create(HirBuilder);
@@ -5176,6 +5905,138 @@ test "arc_liveness: arc_managed_locals records every ARC local in the function" 
 // Phase 4 unit tests: write-back of consume modes onto share_value.
 // ============================================================
 
+const NestedGuardStream = struct {
+    root: []const ir.Instruction,
+    leaf: *ir.Instruction,
+};
+
+fn buildNestedGuardStream(
+    arena: std.mem.Allocator,
+    depth: usize,
+    leaf: ir.Instruction,
+) !NestedGuardStream {
+    const leaf_stream = try arena.alloc(ir.Instruction, 1);
+    leaf_stream[0] = leaf;
+    var stream: []const ir.Instruction = leaf_stream;
+    for (0..depth) |_| {
+        const wrapper = try arena.alloc(ir.Instruction, 1);
+        wrapper[0] = .{ .guard_block = .{
+            .condition = 0,
+            .body = stream,
+        } };
+        stream = wrapper;
+    }
+    return .{ .root = stream, .leaf = &leaf_stream[0] };
+}
+
+fn buildNestedGuardTestFunction(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    stream: []const ir.Instruction,
+    local_count: u32,
+) !ir.Function {
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{
+        .label = 0,
+        .instructions = stream,
+    };
+    const local_ownership = try arena.alloc(ir.OwnershipClass, local_count);
+    for (local_ownership) |*ownership| ownership.* = .owned;
+    return .{
+        .id = 0,
+        .name = name,
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = local_count,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+}
+
+fn buildNestedGuardTrivialTestFunction(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    stream: []const ir.Instruction,
+    local_count: u32,
+) !ir.Function {
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{
+        .label = 0,
+        .instructions = stream,
+    };
+    const local_ownership = try arena.alloc(ir.OwnershipClass, local_count);
+    for (local_ownership) |*ownership| ownership.* = .trivial;
+    return .{
+        .id = 0,
+        .name = name,
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = local_count,
+        .param_conventions = &.{},
+        .local_ownership = local_ownership,
+        .result_convention = .trivial,
+    };
+}
+
+test "arc_liveness: analyzer flatten visits deep child streams iteratively" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const depth = 16 * 1024;
+    const nested = try buildNestedGuardStream(arena, depth, .{ .const_bool = .{
+        .dest = 0,
+        .value = true,
+    } });
+    const function = try buildNestedGuardTrivialTestFunction(arena, "flatten_deep", nested.root, 1);
+
+    var ownership = try computeArcOwnership(
+        std.testing.allocator,
+        &function,
+        suite_dummy_type_store_for_h6,
+        arc_managed_for_h6,
+    );
+    defer ownership.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, depth + 1), ownership.record_count.?);
+    try std.testing.expectEqual(@as(usize, 0), ownership.arc_managed_locals.count());
+}
+
+test "arc_liveness: analyzer flatten propagates explicit-stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const nested = try buildNestedGuardStream(arena, 1, .{ .const_bool = .{
+        .dest = 0,
+        .value = true,
+    } });
+    const function = try buildNestedGuardTrivialTestFunction(arena, "flatten_oom", nested.root, 1);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        computeArcOwnership(
+            failing_allocator.allocator(),
+            &function,
+            suite_dummy_type_store_for_h6,
+            arc_managed_for_h6,
+        ),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
 test "arc_liveness: writeBackConsumeModes is a no-op under borrow ABI" {
     // Under the borrow-by-default ABI, `consume_share_sites` is empty
     // for every function — the analyzer refuses to promote any
@@ -5214,11 +6075,11 @@ test "arc_liveness: writeBackConsumeModes is a no-op under borrow ABI" {
         .consumes_marked = 0,
         .ownership = &ownership,
     };
-    walker.walkFunction(run_func);
+    try walker.walkFunction(std.testing.allocator, run_func);
     try std.testing.expectEqual(@as(u64, 0), walker.consumes_marked);
 
     // Idempotent: a second invocation reports zero upgrades.
-    const second = writeBackConsumeModes(run_func, &ownership);
+    const second = try writeBackConsumeModes(std.testing.allocator, run_func, &ownership);
     try std.testing.expectEqual(@as(u64, 0), second);
 
     // Every share_value remains at the default `.retain` mode.
@@ -5229,6 +6090,76 @@ test "arc_liveness: writeBackConsumeModes is a no-op under borrow ABI" {
             }
         }
     }
+}
+
+test "arc_liveness: writeBackConsumeModes visits deep child streams iteratively" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const depth = 96;
+    const nested = try buildNestedGuardStream(arena, depth, .{ .share_value = .{
+        .dest = 1,
+        .source = 0,
+        .mode = .retain,
+    } });
+    const function = try buildNestedGuardTestFunction(arena, "write_back_deep", nested.root, 2);
+
+    var ownership: ArcOwnership = .{};
+    defer ownership.deinit(std.testing.allocator);
+    try ownership.consume_share_sites.put(
+        std.testing.allocator,
+        @as(InstructionId, @intCast(depth)),
+        {},
+    );
+
+    const consumes_marked = try writeBackConsumeModes(std.testing.allocator, &function, &ownership);
+    try std.testing.expectEqual(@as(u64, 1), consumes_marked);
+    try std.testing.expectEqual(ir.ShareMode.consume, nested.leaf.share_value.mode);
+}
+
+test "arc_liveness: writeBackConsumeModes propagates explicit-stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const nested = try buildNestedGuardStream(arena, 96, .{ .const_bool = .{
+        .dest = 0,
+        .value = true,
+    } });
+    const function = try buildNestedGuardTestFunction(arena, "write_back_oom", nested.root, 1);
+
+    var ownership: ArcOwnership = .{};
+    defer ownership.deinit(std.testing.allocator);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        writeBackConsumeModes(failing_allocator.allocator(), &function, &ownership),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "arc_liveness: assertConsumeReturnDisjoint propagates explicit-stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const nested = try buildNestedGuardStream(arena, 96, .{ .const_bool = .{
+        .dest = 0,
+        .value = true,
+    } });
+    const function = try buildNestedGuardTestFunction(arena, "disjoint_oom", nested.root, 1);
+
+    var ownership: ArcOwnership = .{};
+    defer ownership.deinit(std.testing.allocator);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        assertConsumeReturnDisjoint(failing_allocator.allocator(), &function, &ownership),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
 }
 
 test "arc_liveness: runProgramArcOwnership populates per-function table" {
@@ -5363,7 +6294,7 @@ fn collectReleaseSources(
         }
     };
     var walker = Walker{ .result = &result, .allocator = allocator };
-    ir.forEachInstruction(function, &walker, Walker.visit);
+    try ir.forEachInstruction(allocator, function, &walker, Walker.visit);
     return result;
 }
 
@@ -5971,7 +6902,10 @@ test "arc_liveness: live_before_ret keys all map to ret-equivalent terminator in
 /// (e.g. because the heuristic's preconditions fail), the test
 /// silently exits — the load-bearing assertion only runs when the
 /// shape under test is actually present in the IR.
-fn functionContainsOptionalDispatch(function: *const ir.Function) bool {
+fn functionContainsOptionalDispatch(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+) std.mem.Allocator.Error!bool {
     const Detector = struct {
         seen: bool = false,
         fn visit(self: *@This(), instr: *const ir.Instruction) void {
@@ -5979,13 +6913,13 @@ fn functionContainsOptionalDispatch(function: *const ir.Function) bool {
         }
     };
     var detector = Detector{};
-    ir.forEachInstruction(function, &detector, Detector.visit);
+    try ir.forEachInstruction(allocator, function, &detector, Detector.visit);
     return detector.seen;
 }
 
 test "arc_liveness: analyzer recurses into optional_dispatch arms without crashing (Phase D)" {
     // Phase D (Phase 6 redux plan §3.D): the analyzer's
-    // `flattenChildren` must recurse into both arm bodies of an
+    // the analyzer flatten traversal must enter both arm bodies of an
     // `optional_dispatch` so every nested instruction — including
     // ret-equivalent terminators like `tail_call` — receives an
     // `InstructionId` and a `live_before_ret` snapshot.
@@ -6023,7 +6957,7 @@ test "arc_liveness: analyzer recurses into optional_dispatch arms without crashi
     defer suite.deinit();
 
     const process_func = suite.findFunctionByName("process") orelse return error.MissingFunction;
-    if (!functionContainsOptionalDispatch(process_func)) {
+    if (!try functionContainsOptionalDispatch(std.testing.allocator, process_func)) {
         // The IR builder declined to emit `optional_dispatch`. Phase
         // D's recursion structure is correctness-preserving on every
         // shape, but the load-bearing assertion needs the shape to
@@ -6048,7 +6982,7 @@ test "arc_liveness: analyzer recurses into optional_dispatch arms without crashi
     // lives inside optional_dispatch arms (proving the recursion
     // structurally fired) AND every `live_before_ret` key maps to
     // a ret-equivalent terminator (proving the analyzer's
-    // `flattenChildren` numbering remained consistent under the
+    // analyzer flatten traversal numbering remained consistent under the
     // new recursion).
     var id_to_is_term: std.AutoHashMapUnmanaged(InstructionId, bool) = .empty;
     defer id_to_is_term.deinit(std.testing.allocator);

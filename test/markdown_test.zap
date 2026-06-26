@@ -19,6 +19,18 @@ pub struct MarkdownTest {
     test("consecutive lines join into one paragraph") {
       assert(Markdown.to_html("line one\nline two") == "<p>line one\nline two</p>\n")
     }
+
+    test("many consecutive lines stay in one paragraph") {
+      input = String.repeat("line\n", 512) <> "tail"
+      expected = "<p>" <> input <> "</p>\n"
+      assert(Markdown.to_html(input) == expected)
+    }
+
+    test("a long paragraph line stays intact") {
+      input = String.repeat("alpha", 1024)
+      expected = "<p>" <> input <> "</p>\n"
+      assert(Markdown.to_html(input) == expected)
+    }
   }
 
   describe("headings") {
@@ -78,6 +90,12 @@ pub struct MarkdownTest {
 
     test("HTML inside backticks is still escaped") {
       assert(Markdown.to_html("`a < b`") == "<p><code>a &lt; b</code></p>\n")
+    }
+  }
+
+  describe("inline links") {
+    test("markdown links render as anchors") {
+      assert(Markdown.to_html("see [Zap](https://example.com?a=1&b=2)") == "<p>see <a href=\"https://example.com?a=1&amp;b=2\">Zap</a></p>\n")
     }
   }
 

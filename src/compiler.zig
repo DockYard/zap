@@ -82,14 +82,615 @@ fn profilingEnabled() bool {
 fn reportHirBuilderError(
     diag_engine: *zap.diagnostics.DiagnosticEngine,
     hir_error: zap.hir.HirBuilder.Error,
-) void {
-    diag_engine.reportDiagnostic(.{
+) std.mem.Allocator.Error!void {
+    try diag_engine.reportDiagnostic(.{
         .severity = .@"error",
         .message = hir_error.message,
         .span = hir_error.span,
         .label = hir_error.label,
         .help = hir_error.help,
-    }) catch {};
+    });
+}
+
+fn reportHirBuilderErrors(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    hir_errors: []const zap.hir.HirBuilder.Error,
+) std.mem.Allocator.Error!void {
+    for (hir_errors) |hir_error| {
+        try reportHirBuilderError(diag_engine, hir_error);
+    }
+}
+
+fn reportIrBuilderErrors(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    ir_errors: []const zap.ir.IrBuilder.Error,
+) std.mem.Allocator.Error!void {
+    for (ir_errors) |ir_error| {
+        try diag_engine.reportDiagnostic(.{
+            .severity = .@"error",
+            .message = ir_error.message,
+            .span = ir_error.span,
+            .label = ir_error.label,
+            .help = ir_error.help,
+        });
+    }
+}
+
+fn reportMonomorphizeErrors(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    monomorph_errors: []const zap.monomorphize.MonomorphError,
+) std.mem.Allocator.Error!void {
+    for (monomorph_errors) |monomorph_error| {
+        try diag_engine.err(monomorph_error.message, monomorph_error.span);
+    }
+}
+
+fn reportParserErrors(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    parse_errors: []const zap.Parser.Error,
+) std.mem.Allocator.Error!void {
+    for (parse_errors) |parse_err| {
+        try diag_engine.reportDiagnostic(.{
+            .severity = .@"error",
+            .domain = .parse,
+            .message = parse_err.message,
+            .span = parse_err.span,
+            .label = parse_err.label,
+            .help = parse_err.help,
+        });
+    }
+}
+
+fn routeAnalysisPipelineFailureDiagnostic(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    err: anyerror,
+) std.mem.Allocator.Error!bool {
+    const diagnostic = switch (err) {
+        error.AnalysisNestingLimitExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "IR/escape analysis nesting is too deep",
+            .span = .{ .start = 0, .end = 0 },
+            .label = "analysis nesting limit exceeded",
+            .help = "split deeply nested expressions or control-flow into smaller named functions so escape analysis can process each part independently",
+        },
+        error.GeneralizedEscapeFixpointBudgetExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "generalized escape analysis fixpoint budget exceeded",
+            .span = .{ .start = 0, .end = 0 },
+            .label = "escape analysis still had pending propagation work",
+            .help = "split very large alias or aggregate propagation chains into smaller functions so escape analysis can reach a complete fixpoint",
+        },
+        error.LambdaSetFixpointBudgetExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "lambda-set analysis fixpoint budget exceeded",
+            .span = .{ .start = 0, .end = 0 },
+            .label = "lambda-set analysis still had pending propagation work",
+            .help = "split very large closure-flow chains into smaller functions so lambda-set analysis can reach a complete fixpoint",
+        },
+        error.LambdaSetTypeWalkBudgetExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "lambda-set analysis ZigType traversal budget exceeded",
+            .span = .{ .start = 0, .end = 0 },
+            .label = "closure-carry type scan exceeded its structural budget",
+            .help = "reduce extremely deep static type nesting in closure-carrying values",
+        },
+        error.InterproceduralInstructionNestingLimitExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "interprocedural analysis nesting is too deep",
+            .span = .{ .start = 0, .end = 0 },
+            .label = "interprocedural nesting limit exceeded",
+            .help = "split deeply nested calls or control-flow into smaller named functions so interprocedural analysis can summarize each function independently",
+        },
+        else => return false,
+    };
+    try diag_engine.reportDiagnostic(diagnostic);
+    return true;
+}
+
+fn reportParseTaskGroupFailureDiagnostic(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    err: anyerror,
+) std.mem.Allocator.Error!void {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "parallel parse task group failed with internal compiler error: {s}",
+        .{@errorName(err)},
+    );
+    try diag_engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .domain = .parse,
+        .message = message,
+        .span = .{ .start = 0, .end = 0 },
+        .label = "parallel parse infrastructure failure",
+        .help = "please report this compiler error with the source that triggered it",
+    });
+}
+
+fn handleParseTaskGroupAwaitError(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    err: anyerror,
+) CompileError {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    reportParseTaskGroupFailureDiagnostic(allocator, diag_engine, err) catch return error.OutOfMemory;
+    return error.ParseFailed;
+}
+
+fn reportLintFailureDiagnostic(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    lint_name: []const u8,
+    source_index: usize,
+    err: anyerror,
+) std.mem.Allocator.Error!void {
+    const source_id: u32 = @intCast(source_index);
+    const diagnostic = switch (err) {
+        error.LintAstWalkDepthExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .domain = .parse,
+            .message = "lint AST traversal budget exceeded",
+            .span = .{ .start = 0, .end = 0, .source_id = source_id },
+            .label = "lint traversal exceeded its structural budget",
+            .help = "reduce generated syntax nesting or split deeply nested expressions, patterns, or function bodies into smaller declarations",
+        },
+        else => blk: {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "{s} failed with internal compiler error: {s}",
+                .{ lint_name, @errorName(err) },
+            );
+            break :blk zap.diagnostics.Diagnostic{
+                .severity = .@"error",
+                .domain = .parse,
+                .message = message,
+                .span = .{ .start = 0, .end = 0, .source_id = source_id },
+                .label = "lint infrastructure failure",
+                .help = "please report this compiler error with the source that triggered it",
+            };
+        },
+    };
+    try diag_engine.reportDiagnostic(diagnostic);
+}
+
+fn handleLintFailure(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    lint_name: []const u8,
+    source_index: usize,
+    err: anyerror,
+) CompileError {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    reportLintFailureDiagnostic(allocator, diag_engine, lint_name, source_index, err) catch return error.OutOfMemory;
+    return error.ParseFailed;
+}
+
+fn runErrorCodeCollisionCheck(
+    allocator: std.mem.Allocator,
+    parsed_programs: []const ast.Program,
+    interner: *const ast.StringInterner,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+) CompileError!void {
+    _ = zap.error_codes.checkCodeCollisions(
+        allocator,
+        parsed_programs,
+        interner,
+        diag_engine,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+fn reportIrCloneStructuralBudgetExceeded(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+) std.mem.Allocator.Error!void {
+    try diag_engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .message = "IR program clone is too structurally complex: ZigType clone budget exceeded",
+        .span = .{ .start = 0, .end = 0 },
+        .label = "ZigType clone structural budget exceeded",
+        .help = "simplify deeply nested type annotations or split the program into smaller type shapes",
+    });
+}
+
+fn cloneProgramWithDiagnostics(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    program: ir.Program,
+) CompileError!ir.Program {
+    return ir.cloneProgram(allocator, program) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.IrStructuralBudgetExceeded => {
+            try reportIrCloneStructuralBudgetExceeded(diag_engine);
+            return error.IrFailed;
+        },
+    };
+}
+
+fn routeCapabilityInferenceFailureDiagnostic(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    err: zap.capability_inference.Error,
+    failure: zap.capability_inference.Failure,
+) !bool {
+    const diagnostic = switch (err) {
+        error.CapabilityAstWalkDepthExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "capability inference AST nesting is too deep",
+            .span = failure.span orelse .{ .start = 0, .end = 0 },
+            .label = "capability inference nesting limit exceeded",
+            .help = "split deeply nested expressions or functions so capability inference can analyze each part independently",
+        },
+        error.CapabilityPropagationBudgetExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "capability inference propagation budget exceeded",
+            .span = failure.span orelse .{ .start = 0, .end = 0 },
+            .label = "capability call graph propagation exceeded its analysis budget",
+            .help = "split very large macro or function call graphs into smaller modules so capability inference can reach a fixed point",
+        },
+        else => return false,
+    };
+    try diag_engine.reportDiagnostic(diagnostic);
+    return true;
+}
+
+fn runCapabilityInference(
+    allocator: std.mem.Allocator,
+    graph: *zap.scope.ScopeGraph,
+    interner: *const ast.StringInterner,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+) CompileError!void {
+    var failure: zap.capability_inference.Failure = .{};
+    zap.capability_inference.inferAndApply(allocator, graph, interner, &failure) catch |err| {
+        if (routeCapabilityInferenceFailureDiagnostic(diag_engine, err, failure) catch return error.OutOfMemory) {
+            return error.CollectFailed;
+        }
+
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.CapabilityAstWalkDepthExceeded => error.CollectFailed,
+            error.CapabilityPropagationBudgetExceeded => error.CollectFailed,
+        };
+    };
+}
+
+fn reportCollectorErrorsSince(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    collector: *const zap.Collector,
+    start_index: usize,
+) std.mem.Allocator.Error!void {
+    for (collector.errors.items[start_index..]) |collect_err| {
+        try diag_engine.err(collect_err.message, collect_err.span);
+    }
+}
+
+fn reportCollectorInfrastructureFailureDiagnostic(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    phase_name: []const u8,
+    err: anyerror,
+) std.mem.Allocator.Error!void {
+    const diagnostic = switch (err) {
+        error.CollectorAstWalkBudgetExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "collector AST traversal budget exceeded",
+            .span = .{ .start = 0, .end = 0 },
+            .label = "collector traversal exceeded its structural budget",
+            .help = "reduce deeply nested macro-expanded declarations or split them into smaller functions",
+        },
+        else => blk: {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "{s} failed with internal compiler error: {s}",
+                .{ phase_name, @errorName(err) },
+            );
+            break :blk zap.diagnostics.Diagnostic{
+                .severity = .@"error",
+                .message = message,
+                .span = .{ .start = 0, .end = 0 },
+                .label = "internal compiler failure",
+                .help = "please report this compiler error with the source that triggered it",
+            };
+        },
+    };
+    try diag_engine.reportDiagnostic(diagnostic);
+}
+
+fn handleCollectorPhaseError(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    collector: *const zap.Collector,
+    error_start_index: usize,
+    phase_name: []const u8,
+    err: anyerror,
+) CompileError {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    if (collector.errors.items.len > error_start_index) {
+        reportCollectorErrorsSince(diag_engine, collector, error_start_index) catch return error.OutOfMemory;
+        return error.CollectFailed;
+    }
+    reportCollectorInfrastructureFailureDiagnostic(allocator, diag_engine, phase_name, err) catch return error.OutOfMemory;
+    return error.CollectFailed;
+}
+
+const TypeCheckFailureKind = enum {
+    semantic,
+    infrastructure,
+};
+
+const TypeCheckPassError = error{
+    SemanticTypeCheckFailed,
+    InfrastructureTypeCheckFailed,
+    OutOfMemory,
+};
+
+fn isTypeCheckerInfrastructureFailure(err: anyerror) bool {
+    return switch (err) {
+        error.TypeCheckerCollectionTypeDepthExceeded,
+        error.TypeCheckerCollectionTypeNodeLimitExceeded,
+        => true,
+        else => false,
+    };
+}
+
+fn reportTypeCheckerErrors(
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    type_errors: []const zap.types.TypeChecker.Error,
+) std.mem.Allocator.Error!void {
+    for (type_errors) |type_err| {
+        try diag_engine.reportDiagnostic(.{
+            .severity = type_err.severity orelse .@"error",
+            .message = type_err.message,
+            .span = type_err.span,
+            .label = type_err.label,
+            .help = type_err.help,
+            .secondary_spans = type_err.secondary_spans,
+            .related_spans = type_err.related_spans,
+            .machine_data = type_err.machine_data,
+            .fixits = type_err.fixits,
+            .expansion = type_err.expansion,
+            .domain = type_err.domain,
+        });
+    }
+}
+
+fn reportTypeCheckerInfrastructureFailureDiagnostic(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    phase_name: []const u8,
+    err: anyerror,
+) std.mem.Allocator.Error!void {
+    const diagnostic = switch (err) {
+        error.TypeCheckerCollectionTypeDepthExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "type-checker collection type traversal depth exceeded while unifying nested collection literals",
+            .span = .{ .start = 0, .end = 0 },
+            .label = "collection type nesting exceeds the type-checker budget",
+            .help = "reduce deeply nested collection literals or split generated collection expressions into smaller values",
+            .domain = .typecheck,
+        },
+        error.TypeCheckerCollectionTypeNodeLimitExceeded => zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "type-checker collection type traversal node budget exceeded while unifying nested collection literals",
+            .span = .{ .start = 0, .end = 0 },
+            .label = "collection type graph exceeds the type-checker budget",
+            .help = "reduce the number of nested collection type nodes produced here",
+            .domain = .typecheck,
+        },
+        else => blk: {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "{s} failed with internal compiler error: {s}",
+                .{ phase_name, @errorName(err) },
+            );
+            break :blk zap.diagnostics.Diagnostic{
+                .severity = .@"error",
+                .message = message,
+                .span = .{ .start = 0, .end = 0 },
+                .label = "internal compiler failure",
+                .help = "please report this compiler error with the source that triggered it",
+                .domain = .typecheck,
+            };
+        },
+    };
+    try diag_engine.reportDiagnostic(diagnostic);
+}
+
+fn handleTypeCheckerPassError(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    type_checker: *const zap.types.TypeChecker,
+    error_baseline: usize,
+    phase_name: []const u8,
+    err: anyerror,
+) TypeCheckPassError {
+    reportTypeCheckerErrors(diag_engine, type_checker.errors.items) catch return error.OutOfMemory;
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+
+    if (isTypeCheckerInfrastructureFailure(err)) {
+        if (diag_engine.errorCount() == error_baseline) {
+            reportTypeCheckerInfrastructureFailureDiagnostic(allocator, diag_engine, phase_name, err) catch return error.OutOfMemory;
+        }
+        return error.InfrastructureTypeCheckFailed;
+    }
+
+    if (diag_engine.errorCount() > error_baseline) return error.SemanticTypeCheckFailed;
+
+    reportTypeCheckerInfrastructureFailureDiagnostic(allocator, diag_engine, phase_name, err) catch return error.OutOfMemory;
+    return error.InfrastructureTypeCheckFailed;
+}
+
+fn runTypeCheckerProgramPass(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    type_checker: *zap.types.TypeChecker,
+    error_baseline: usize,
+    phase_name: []const u8,
+    program: *const ast.Program,
+    check_unused: bool,
+) TypeCheckPassError!void {
+    type_checker.checkProgram(program) catch |err| {
+        return handleTypeCheckerPassError(
+            allocator,
+            diag_engine,
+            type_checker,
+            error_baseline,
+            phase_name,
+            err,
+        );
+    };
+    if (check_unused) {
+        type_checker.checkUnusedBindings() catch |err| {
+            return handleTypeCheckerPassError(
+                allocator,
+                diag_engine,
+                type_checker,
+                error_baseline,
+                phase_name,
+                err,
+            );
+        };
+    }
+    reportTypeCheckerErrors(diag_engine, type_checker.errors.items) catch return error.OutOfMemory;
+    if (diag_engine.errorCount() > error_baseline) return error.SemanticTypeCheckFailed;
+}
+
+fn collectProgramSurfaceForProject(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    collector: *zap.Collector,
+    program: *const ast.Program,
+    phase_name: []const u8,
+) CompileError!void {
+    const error_start_index = collector.errors.items.len;
+    collector.collectProgramSurface(program) catch |err| {
+        return handleCollectorPhaseError(
+            allocator,
+            diag_engine,
+            collector,
+            error_start_index,
+            phase_name,
+            err,
+        );
+    };
+}
+
+fn validateAndRegisterImplConformanceForProject(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    collector: *zap.Collector,
+    phase_name: []const u8,
+) CompileError!void {
+    const error_start_index = collector.errors.items.len;
+    collector.validateImplConformance() catch |err| {
+        return handleCollectorPhaseError(
+            allocator,
+            diag_engine,
+            collector,
+            error_start_index,
+            phase_name,
+            err,
+        );
+    };
+    collector.registerImplFunctionsInTargetScopes() catch |err| {
+        return handleCollectorPhaseError(
+            allocator,
+            diag_engine,
+            collector,
+            error_start_index,
+            phase_name,
+            err,
+        );
+    };
+}
+
+fn finalizeCollectedProgramsForProject(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    collector: *zap.Collector,
+    programs: []const ast.Program,
+    phase_name: []const u8,
+) CompileError!void {
+    const error_start_index = collector.errors.items.len;
+    collector.finalizeCollectedPrograms(programs) catch |err| {
+        return handleCollectorPhaseError(
+            allocator,
+            diag_engine,
+            collector,
+            error_start_index,
+            phase_name,
+            err,
+        );
+    };
+}
+
+fn failCollectionWithDiagnostics(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    collector: *const zap.Collector,
+    all_source_units: []const SourceUnit,
+    options: CompileOptions,
+) CompileError {
+    reportCollectorErrorsSince(diag_engine, collector, 0) catch return error.OutOfMemory;
+    progressClear(options);
+    emitDiagnosticsFromUnits(allocator, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color) catch return error.OutOfMemory;
+    return error.CollectFailed;
+}
+
+fn failCollectionPhase(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    all_source_units: []const SourceUnit,
+    options: CompileOptions,
+    err: CompileError,
+) CompileError {
+    progressClear(options);
+    if (err != error.OutOfMemory) {
+        emitDiagnosticsFromUnits(allocator, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color) catch return error.OutOfMemory;
+    }
+    return err;
+}
+
+fn isHirStructuralFailure(err: anyerror) bool {
+    return switch (err) {
+        error.PatternMatrixDecisionBudgetExceeded,
+        error.HirPatternLoweringBudgetExceeded,
+        error.HirMatchPatternBindingBudgetExceeded,
+        error.HirTypeExprResolutionBudgetExceeded,
+        error.HirCollectionTypeBudgetExceeded,
+        error.HirPipeChainBudgetExceeded,
+        => true,
+        else => false,
+    };
+}
+
+fn reportHirInfrastructureFailureDiagnostic(
+    allocator: std.mem.Allocator,
+    diag_engine: *zap.diagnostics.DiagnosticEngine,
+    err: anyerror,
+) std.mem.Allocator.Error!void {
+    const diagnostic = if (isHirStructuralFailure(err))
+        zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = "HIR lowering exceeded a structural budget",
+            .span = .{ .start = 0, .end = 0 },
+            .label = "HIR structural budget exceeded",
+            .help = "reduce deeply nested macro-expanded expressions, patterns, or type annotations",
+        }
+    else blk: {
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "HIR lowering failed with internal compiler error: {s}",
+            .{@errorName(err)},
+        );
+        break :blk zap.diagnostics.Diagnostic{
+            .severity = .@"error",
+            .message = message,
+            .span = .{ .start = 0, .end = 0 },
+            .label = "internal HIR lowering failure",
+            .help = "please report this compiler error with the source that triggered it",
+        };
+    };
+    try diag_engine.reportDiagnostic(diagnostic);
 }
 
 /// True when verbose incremental-cache tracing is enabled. This is separate
@@ -457,6 +1058,56 @@ pub const StructProgram = struct {
     program: ast.Program,
 };
 
+/// Append the frontend per-struct compilation order.
+///
+/// When discovery supplied a source-order graph, the final list is that
+/// graph plus collected structs introduced by desugaring. Without a
+/// discovery order, the final list follows the collected struct programs.
+pub fn appendStructCompileOrderNames(
+    alloc: std.mem.Allocator,
+    names: *std.ArrayListUnmanaged([]const u8),
+    struct_order: ?[]const []const u8,
+    struct_programs: []const StructProgram,
+) std.mem.Allocator.Error!void {
+    if (struct_order) |graph_order| {
+        for (graph_order) |struct_name| {
+            try names.append(alloc, struct_name);
+        }
+        // The precomputed `struct_order` is the discovery-time topological
+        // ordering of the SOURCE structs. Structs that only exist after
+        // desugaring — notably the `pub struct Foo` produced by every
+        // `pub error Foo` rewrite (e.g. `RuntimeError`, `IndexError`) — are
+        // absent from it because discovery ran before `applyErrorDeclDesugar`.
+        // They ARE present in `ctx.struct_programs` (built from the fully
+        // desugared programs and registered in the re-collected scope graph).
+        // Compiling only `struct_order` would silently drop these structs from
+        // the merged IR: their `pub impl Error` method functions
+        // (`RuntimeError.message__1`, ...) would never be lowered, so the
+        // protocol vtable instance `ErrorVTable_for_RuntimeError` — which IS
+        // emitted — would reference methods that do not exist, tripping the ZIR
+        // backend's "struct 'RuntimeError' has no member named 'message__1'"
+        // (#186). Append every collected struct program missing from the
+        // precomputed order so the compilation set is the union of the
+        // discovery order and the actually collected structs. The per-struct
+        // loops downstream dedup by name, so appending an already-present name
+        // is harmless.
+        for (struct_programs) |mp| {
+            var already_ordered = false;
+            for (names.items) |existing| {
+                if (std.mem.eql(u8, existing, mp.name)) {
+                    already_ordered = true;
+                    break;
+                }
+            }
+            if (!already_ordered) try names.append(alloc, mp.name);
+        }
+    } else {
+        for (struct_programs) |mp| {
+            try names.append(alloc, mp.name);
+        }
+    }
+}
+
 /// Per-file compilation state.
 pub const CompilationUnit = struct {
     file_path: []const u8,
@@ -634,7 +1285,7 @@ pub const FrontendIncrementalState = struct {
 
         var diag_engine = zap.DiagnosticEngine.init(alloc);
         diag_engine.use_color = zap.diagnostics.detectColor();
-        setDiagnosticSources(&diag_engine, source_units);
+        try setDiagnosticSources(&diag_engine, source_units);
         diag_engine.setLineOffset(0);
 
         progressHeader(options);
@@ -672,7 +1323,14 @@ pub const FrontendIncrementalState = struct {
             // own legacy idioms are not the lint's concern) and skip cached
             // units (already linted on their first parse).
             if (!isStdlibUnitPath(unit.file_path)) {
-                zap.lints.runPhase14Lints(&parsed.program, &self.interner, &diag_engine) catch {};
+                zap.lints.runPhase14Lints(&parsed.program, &self.interner, &diag_engine) catch |err| {
+                    progressClear(options);
+                    const routed = handleLintFailure(alloc, &diag_engine, "phase 1.4 advisory lint", source_index, err);
+                    if (routed != error.OutOfMemory) {
+                        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, source_units, diag_engine.use_color);
+                    }
+                    return routed;
+                };
             }
 
             try new_parsed_files.append(alloc, parsed);
@@ -693,7 +1351,7 @@ pub const FrontendIncrementalState = struct {
 
         if (diag_engine.hasErrors()) {
             progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, source_units, diag_engine.use_color);
+            try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, source_units, diag_engine.use_color);
             return error.ParseFailed;
         }
 
@@ -704,7 +1362,7 @@ pub const FrontendIncrementalState = struct {
         // be silently dropped (the parse loop only emits on the error path).
         if (diag_engine.warningCount() > 0) {
             progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, source_units, diag_engine.use_color);
+            try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, source_units, diag_engine.use_color);
         }
 
         var new_dependency_graph = try buildFrontendIncrementalGraph(self.allocator, source_units, graph);
@@ -804,45 +1462,9 @@ pub const FrontendIncrementalState = struct {
         );
 
         var names: std.ArrayListUnmanaged([]const u8) = .empty;
-        if (options.struct_order) |graph_order| {
-            for (graph_order) |struct_name| {
-                names.append(alloc, struct_name) catch {};
-            }
-            // The precomputed `struct_order` is the discovery-time
-            // topological ordering of the SOURCE structs. Structs that
-            // only exist after desugaring — notably the `pub struct Foo`
-            // produced by every `pub error Foo` rewrite (e.g.
-            // `RuntimeError`, `IndexError`) — are absent from it
-            // because discovery ran before `applyErrorDeclDesugar`. They
-            // ARE present in `ctx.struct_programs` (built from the fully
-            // desugared programs and registered in the re-collected
-            // scope graph). Compiling only `struct_order` would silently
-            // drop these structs from the merged IR: their `pub impl
-            // Error` method functions (`RuntimeError.message__1`, …)
-            // would never be lowered, so the protocol vtable instance
-            // `ErrorVTable_for_RuntimeError` — which IS emitted — would
-            // reference methods that do not exist, tripping the ZIR
-            // backend's "struct 'RuntimeError' has no member named
-            // 'message__1'" (#186). Append every collected struct program
-            // missing from the precomputed order so the compilation set
-            // is the union of the discovery order and the actually
-            // collected structs. The per-struct loops downstream dedup by
-            // name, so appending an already-present name is harmless.
-            for (ctx.struct_programs) |mp| {
-                var already_ordered = false;
-                for (names.items) |existing| {
-                    if (std.mem.eql(u8, existing, mp.name)) {
-                        already_ordered = true;
-                        break;
-                    }
-                }
-                if (!already_ordered) names.append(alloc, mp.name) catch {};
-            }
-        } else {
-            for (ctx.struct_programs) |mp| {
-                names.append(alloc, mp.name) catch {};
-            }
-        }
+        defer names.deinit(alloc);
+        appendStructCompileOrderNames(alloc, &names, options.struct_order, ctx.struct_programs) catch
+            return error.OutOfMemory;
 
         const result = try compileStructByStructIncrementalFinal(
             alloc,
@@ -859,7 +1481,7 @@ pub const FrontendIncrementalState = struct {
 
         var final_arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer final_arena.deinit();
-        const final_program = ir.cloneProgram(final_arena.allocator(), result.ir_program) catch return error.OutOfMemory;
+        const final_program = try cloneProgramWithDiagnostics(final_arena.allocator(), &diag_engine, result.ir_program);
 
         return .{
             .state = self,
@@ -934,19 +1556,24 @@ pub const FrontendIncrementalState = struct {
         );
         defer parser.deinit();
 
-        artifact.program = parser.parseProgram() catch {
-            emitParseErrorsFromUnits(alloc, parser.errors.items, source_units, diag_engine.use_color);
-            return error.ParseFailed;
+        artifact.program = parser.parseProgram() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                reportParserErrors(diag_engine, parser.errors.items) catch return error.OutOfMemory;
+                try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, source_units, diag_engine.use_color);
+                return error.ParseFailed;
+            },
         };
 
-        for (parser.errors.items) |parse_err| {
-            diag_engine.reportDiagnostic(.{
-                .severity = .@"error",
-                .message = parse_err.message,
-                .span = parse_err.span,
-                .label = parse_err.label,
-                .help = parse_err.help,
-            }) catch {};
+        reportParserErrors(diag_engine, parser.errors.items) catch return error.OutOfMemory;
+        if (parser.errors.items.len > 0) {
+            // Recoverable parser errors leave a partial AST whose only valid
+            // purpose is diagnostic rendering. Do not build incremental
+            // fingerprints from it: fingerprinting assumes downstream-only
+            // declarations, such as raw `pub error`, have already been
+            // desugared and can otherwise panic before `prepare` emits the
+            // parse diagnostics collected above.
+            return artifact;
         }
 
         artifact.declaration_fingerprints = computeFrontendDeclarationFingerprints(
@@ -2119,10 +2746,11 @@ fn appendReflectedFileInventory(
                 pending_doc = null;
             },
             .error_decl, .priv_error_decl => {
-                // `pub error` desugars to `pub struct + pub impl Error` in
-                // `src/desugar.zig` before any reflective traversal of the
-                // top-level item list. Seeing one here is a wiring bug.
-                @panic("incremental fingerprint saw an ErrorDecl that should have been desugared");
+                // Per-file incremental fingerprints are computed before the
+                // whole-program error-declaration desugar. Raw `pub error`
+                // declarations are not reflected as source-graph structs
+                // here; they only terminate any pending top-level doc.
+                pending_doc = null;
             },
         }
     }
@@ -2146,7 +2774,9 @@ fn appendReflectedProtocol(
     hasher.appendInt(u64, protocol_decl.functions.len);
     for (protocol_decl.functions) |function_sig| {
         hasher.appendBytes(interner.get(function_sig.name));
-        hasher.appendBytes(zap.signature.buildProtocolFunctionSignature(alloc, function_sig, interner));
+        const signature_text = try zap.signature.buildProtocolFunctionSignature(alloc, function_sig, interner);
+        hasher.appendBytes(signature_text);
+        alloc.free(signature_text);
     }
 }
 
@@ -2166,7 +2796,9 @@ fn appendReflectedUnion(
     hasher.appendInt(u64, union_decl.variants.len);
     for (union_decl.variants) |variant| {
         hasher.appendBytes(interner.get(variant.name));
-        hasher.appendBytes(zap.signature.buildUnionVariantSignature(alloc, variant, interner));
+        const signature_text = try zap.signature.buildUnionVariantSignature(alloc, variant, interner);
+        hasher.appendBytes(signature_text);
+        alloc.free(signature_text);
     }
 }
 
@@ -2187,7 +2819,8 @@ fn appendReflectedImpl(
     hasher.appendInt(u64, impl_decl.protocol_type_args.len);
     for (impl_decl.protocol_type_args) |type_arg| {
         var buffer = zap.signature.Buffer.init(alloc);
-        zap.signature.appendTypeExpr(&buffer, type_arg, interner);
+        defer buffer.deinit();
+        try zap.signature.appendTypeExpr(&buffer, type_arg, interner);
         hasher.appendBytes(buffer.toSlice());
     }
 }
@@ -2282,8 +2915,10 @@ fn topLevelStructDocAttribute(
             .opaque_decl,
             => pending_doc = null,
             .error_decl, .priv_error_decl => {
-                // Desugar runs before this scan; an ErrorDecl here is a wiring bug.
-                @panic("topLevelStructDocAttribute saw an ErrorDecl that should have been desugared");
+                // Per-file incremental fingerprints run before the
+                // whole-program `pub error` desugar. A raw error declaration
+                // is a declaration boundary for any pending struct doc.
+                pending_doc = null;
             },
         }
     }
@@ -3268,80 +3903,54 @@ fn addAnalysisSummaryEdgesFromInstructions(
     policy: FrontendPassPolicy,
     callers_by_callee: *std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
 ) CompileError!void {
-    for (instructions) |instruction| {
-        switch (instruction) {
-            .call_direct => |call| try addReverseCallEdgeTarget(alloc, program, caller_id, call.function, callers_by_callee),
-            .call_named => |call| {
-                if (functionIdByName(program, call.name)) |target_id| {
-                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
-                }
-            },
-            .tail_call => |call| {
-                if (functionIdByName(program, call.name)) |target_id| {
-                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
-                }
-            },
-            .try_call_named => |call| {
-                if (functionIdByName(program, call.name)) |target_id| {
-                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
-                }
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, call.handler_instrs, policy, callers_by_callee);
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, call.success_instrs, policy, callers_by_callee);
-            },
-            .make_closure => |closure| {
-                if (policy.run_contification) {
-                    try addReverseCallEdgeTarget(alloc, program, caller_id, closure.function, callers_by_callee);
-                }
-            },
-            .if_expr => |value| {
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.then_instrs, policy, callers_by_callee);
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.else_instrs, policy, callers_by_callee);
-            },
-            .guard_block => |value| try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.body, policy, callers_by_callee),
-            .case_block => |value| {
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.pre_instrs, policy, callers_by_callee);
-                for (value.arms) |arm| {
-                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, arm.cond_instrs, policy, callers_by_callee);
-                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, arm.body_instrs, policy, callers_by_callee);
-                }
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, policy, callers_by_callee);
-            },
-            .switch_literal => |value| {
-                for (value.cases) |case| {
-                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, policy, callers_by_callee);
-                }
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, policy, callers_by_callee);
-            },
-            .switch_return => |value| {
-                for (value.cases) |case| {
-                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, policy, callers_by_callee);
-                }
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, policy, callers_by_callee);
-            },
-            .union_switch => |value| {
-                for (value.cases) |case| {
-                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, policy, callers_by_callee);
-                }
-                // The catch-all `_` prong can call functions whose summaries
-                // the caller's final IR depends on; without this edge a
-                // callee invoked only from the else arm is not marked dirty
-                // when its summary changes → stale incremental rebuild.
-                if (value.has_else) {
-                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.else_instrs, policy, callers_by_callee);
-                }
-            },
-            .union_switch_return => |value| {
-                for (value.cases) |case| {
-                    try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, policy, callers_by_callee);
-                }
-            },
-            .optional_dispatch => |value| {
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.nil_instrs, policy, callers_by_callee);
-                try addAnalysisSummaryEdgesFromInstructions(alloc, program, caller_id, value.struct_instrs, policy, callers_by_callee);
-            },
-            else => {},
+    const Context = struct {
+        alloc: std.mem.Allocator,
+        program: ir.Program,
+        caller_id: ir.FunctionId,
+        policy: FrontendPassPolicy,
+        callers_by_callee: *std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+        err: ?CompileError = null,
+
+        fn addTarget(self: *@This(), target_id: ir.FunctionId) void {
+            if (self.err != null) return;
+            addReverseCallEdgeTarget(self.alloc, self.program, self.caller_id, target_id, self.callers_by_callee) catch |err| {
+                self.err = err;
+            };
         }
-    }
+
+        fn addNamedTarget(self: *@This(), name: []const u8) void {
+            if (self.err != null) return;
+            if (functionIdByName(self.program, name)) |target_id| {
+                self.addTarget(target_id);
+            }
+        }
+
+        fn visit(self: *@This(), instruction: *const ir.Instruction) void {
+            if (self.err != null) return;
+            switch (instruction.*) {
+                .call_direct => |call| self.addTarget(call.function),
+                .call_named => |call| self.addNamedTarget(call.name),
+                .tail_call => |call| self.addNamedTarget(call.name),
+                .try_call_named => |call| self.addNamedTarget(call.name),
+                .make_closure => |closure| {
+                    if (self.policy.run_contification) {
+                        self.addTarget(closure.function);
+                    }
+                },
+                else => {},
+            }
+        }
+    };
+
+    var context = Context{
+        .alloc = alloc,
+        .program = program,
+        .caller_id = caller_id,
+        .policy = policy,
+        .callers_by_callee = callers_by_callee,
+    };
+    try ir.forEachInstructionInStream(alloc, instructions, &context, Context.visit);
+    if (context.err) |err| return err;
 }
 
 fn calleeBodyMayAffectCallerFinalIr(function: ir.Function, policy: FrontendPassPolicy) bool {
@@ -3502,25 +4111,26 @@ fn applyTargetCapabilityGate(
     interner: *const ast.StringInterner,
     options: CompileOptions,
     diag_engine: *zap.DiagnosticEngine,
-) void {
+) std.mem.Allocator.Error!void {
     const atoms = zap.target_triple.resolve(options.ctfe_target);
     const caps = if (atoms) |a| zap.target_caps.capabilitiesForTarget(a) else null;
-    const label = targetCapabilityLabel(alloc, options.ctfe_target, atoms);
+    const label = try targetCapabilityLabel(alloc, options.ctfe_target, atoms);
     var diagnostics: std.ArrayListUnmanaged(zap.ctfe.GateDiagnostic) = .empty;
-    zap.ctfe.gateAvailableOn(alloc, graph, interner, .{ .caps = caps, .label = label }, &diagnostics) catch return;
+    defer diagnostics.deinit(alloc);
+    try zap.ctfe.gateAvailableOn(alloc, graph, interner, .{ .caps = caps, .label = label }, &diagnostics);
     for (diagnostics.items) |d| {
-        diag_engine.err(d.message, d.span) catch {};
+        try diag_engine.err(d.message, d.span);
     }
 }
 
 /// A human target label for the gate diagnostic — the requested triple
 /// verbatim, or a synthesized `arch-os-abi` from the resolved host atoms for a
 /// native sentinel (so the label is a concrete triple, never `"default"`).
-fn targetCapabilityLabel(alloc: std.mem.Allocator, ctfe_target: ?[]const u8, atoms: ?zap.target_triple.TargetAtoms) []const u8 {
+fn targetCapabilityLabel(alloc: std.mem.Allocator, ctfe_target: ?[]const u8, atoms: ?zap.target_triple.TargetAtoms) std.mem.Allocator.Error![]const u8 {
     const requested = ctfe_target orelse "";
     if (!zap.target_triple.isNativeSentinel(requested)) return requested;
     if (atoms) |a| {
-        return std.fmt.allocPrint(alloc, "{s}-{s}-{s}", .{ a.arch, a.os, a.abi }) catch requested;
+        return try std.fmt.allocPrint(alloc, "{s}-{s}-{s}", .{ a.arch, a.os, a.abi });
     }
     return requested;
 }
@@ -3561,7 +4171,7 @@ pub fn collectAllFromUnits(
 
     const all_source_units = source_units;
 
-    setDiagnosticSources(&diag_engine, all_source_units);
+    try setDiagnosticSources(&diag_engine, all_source_units);
     diag_engine.setLineOffset(0);
 
     var global_interner = ast.StringInterner.init(alloc);
@@ -3581,31 +4191,38 @@ pub fn collectAllFromUnits(
             parse_results[i] = .{};
             group.async(io_val, parseFileTask, .{ alloc, unit.source, &local_interners[i], @as(u32, @intCast(i)), unit.script_mode, &parsed_programs[i], &parse_results[i] });
         }
-        group.await(io_val) catch {};
+        defer {
+            for (parse_results) |result| {
+                if (result.errors.len > 0) alloc.free(result.errors);
+            }
+        }
+        group.await(io_val) catch |err| {
+            progressClear(options);
+            return handleParseTaskGroupAwaitError(alloc, &diag_engine, err);
+        };
 
         // Check for parse failures and collect errors
         var any_failed = false;
         for (parse_results, 0..) |result, i| {
+            if (result.infrastructure_error) |err| {
+                progressClear(options);
+                return err;
+            }
             if (result.failed) {
                 if (result.errors.len > 0) {
-                    emitParseErrorsFromUnits(alloc, result.errors, all_source_units, diag_engine.use_color);
+                    reportParserErrors(&diag_engine, result.errors) catch return error.OutOfMemory;
                 }
                 any_failed = true;
             } else {
-                for (result.errors) |parse_err| {
-                    diag_engine.reportDiagnostic(.{
-                        .severity = .@"error",
-                        .message = parse_err.message,
-                        .span = parse_err.span,
-                        .label = parse_err.label,
-                        .help = parse_err.help,
-                    }) catch {};
-                }
+                reportParserErrors(&diag_engine, result.errors) catch return error.OutOfMemory;
             }
             _ = i;
         }
         if (any_failed) {
             progressClear(options);
+            if (diag_engine.errorCount() > 0) {
+                try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            }
             return error.ParseFailed;
         }
     } else {
@@ -3615,21 +4232,19 @@ pub fn collectAllFromUnits(
             var parser = zap.Parser.initWithSharedInternerScriptMode(alloc, unit.source, &local_interners[i], @intCast(i), unit.script_mode);
             defer parser.deinit();
 
-            parsed_programs[i] = parser.parseProgram() catch {
-                emitParseErrorsFromUnits(alloc, parser.errors.items, all_source_units, diag_engine.use_color);
+            parsed_programs[i] = parser.parseProgram() catch |err| {
                 progressClear(options);
-                return error.ParseFailed;
+                switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        reportParserErrors(&diag_engine, parser.errors.items) catch return error.OutOfMemory;
+                        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+                        return error.ParseFailed;
+                    },
+                }
             };
 
-            for (parser.errors.items) |parse_err| {
-                diag_engine.reportDiagnostic(.{
-                    .severity = .@"error",
-                    .message = parse_err.message,
-                    .span = parse_err.span,
-                    .label = parse_err.label,
-                    .help = parse_err.help,
-                }) catch {};
-            }
+            reportParserErrors(&diag_engine, parser.errors.items) catch return error.OutOfMemory;
         }
     }
 
@@ -3637,8 +4252,15 @@ pub fn collectAllFromUnits(
     for (0..all_source_units.len) |i| {
         const remap = buildInternerRemap(alloc, &local_interners[i], &global_interner) catch
             return error.OutOfMemory;
-        remapProgram(alloc, &parsed_programs[i], remap) catch
-            return error.OutOfMemory;
+        remapProgram(alloc, &parsed_programs[i], remap) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AstRemapDepthExceeded => {
+                reportAstRemapDepthExceeded(&diag_engine, i) catch return error.OutOfMemory;
+                progressClear(options);
+                try emitDiagnostics(&diag_engine, alloc);
+                return error.CollectFailed;
+            },
+        };
     }
     const interner = try alloc.create(ast.StringInterner);
     interner.* = global_interner;
@@ -3651,19 +4273,34 @@ pub fn collectAllFromUnits(
     // legacy idioms are exempt.
     for (parsed_programs, 0..) |*parsed_program, i| {
         if (isStdlibUnitPath(all_source_units[i].file_path)) continue;
-        zap.lints.runPhase14Lints(parsed_program, interner, &diag_engine) catch {};
+        zap.lints.runPhase14Lints(parsed_program, interner, &diag_engine) catch |err| {
+            progressClear(options);
+            const routed = handleLintFailure(alloc, &diag_engine, "phase 1.4 advisory lint", i, err);
+            if (routed != error.OutOfMemory) {
+                try emitDiagnostics(&diag_engine, alloc);
+            }
+            return routed;
+        };
     }
 
     // Phase 3.b — mandatory-`raises` lint mode (opt-in via ZAP_LINT_RAISES),
-    // scoped to the stdlib (`lib/*`). Warn-only: it flags `pub fn`s whose
-    // body can `raise`/propagate but omit a `raises` row, so the stdlib's
-    // participation in the nominal abortive effect is auditable. Off by
+    // scoped to the stdlib (`lib/*`). Findings are warn-only: it flags
+    // `pub fn`s whose body can `raise`/propagate but omit a `raises` row, so
+    // the stdlib's participation in the nominal abortive effect is auditable.
+    // Traversal/OOM failures still route as hard compiler failures. Off by
     // default to keep ordinary builds quiet; `ZAP_LINT_RAISES=1 zap build`
     // confirms `lib/*` is consistent under mandatory annotation.
     if (std.c.getenv("ZAP_LINT_RAISES") != null) {
         for (parsed_programs, 0..) |*parsed_program, i| {
             if (!isStdlibUnitPath(all_source_units[i].file_path)) continue;
-            zap.lints.runMandatoryRaisesLint(parsed_program, interner, &diag_engine) catch {};
+            zap.lints.runMandatoryRaisesLint(parsed_program, interner, &diag_engine) catch |err| {
+                progressClear(options);
+                const routed = handleLintFailure(alloc, &diag_engine, "mandatory raises lint", i, err);
+                if (routed != error.OutOfMemory) {
+                    try emitDiagnostics(&diag_engine, alloc);
+                }
+                return routed;
+            };
         }
     }
 
@@ -3674,17 +4311,17 @@ pub fn collectAllFromUnits(
     // caught) and emits a hard `.error` diagnostic per collision. Unlike
     // the warn-only lints above this aborts the build via the
     // `hasErrors` gate below.
-    _ = zap.error_codes.checkCodeCollisions(alloc, parsed_programs, interner, &diag_engine) catch {};
+    try runErrorCodeCollisionCheck(alloc, parsed_programs, interner, &diag_engine);
 
     if (diag_engine.hasErrors()) {
         progressClear(options);
-        emitDiagnostics(&diag_engine, alloc);
+        try emitDiagnostics(&diag_engine, alloc);
         return error.ParseFailed;
     }
 
     if (diag_engine.warningCount() > 0) {
         progressClear(options);
-        emitDiagnostics(&diag_engine, alloc);
+        try emitDiagnostics(&diag_engine, alloc);
     }
 
     var program = try mergePrograms(alloc, parsed_programs);
@@ -3709,7 +4346,7 @@ pub fn collectAllFromUnits(
     // auto-import injection. The literal name lives in
     // `discovery.kernel_struct_name`.
     const kernel_name_id = try interner.intern(zap.discovery.kernel_struct_name);
-    var collector = zap.Collector.init(alloc, interner, kernel_name_id);
+    var collector = try zap.Collector.init(alloc, interner, kernel_name_id);
     try registerSourceUnits(&collector.graph, all_source_units);
     {
         const pre_struct_programs = try buildStructPrograms(alloc, &program, interner);
@@ -3718,63 +4355,63 @@ pub fn collectAllFromUnits(
         // auto-import resolves. This mirrors Elixir's bootstrap ordering.
         for (pre_struct_programs) |entry| {
             if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) {
-                collector.collectProgramSurface(&entry.program) catch {};
+                collectProgramSurfaceForProject(
+                    alloc,
+                    &diag_engine,
+                    &collector,
+                    &entry.program,
+                    "initial Kernel collection",
+                ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
                 break;
             }
         }
         for (pre_struct_programs) |entry| {
             if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) continue;
-            collector.collectProgramSurface(&entry.program) catch {
-                for (collector.errors.items) |collect_err| {
-                    diag_engine.err(collect_err.message, collect_err.span) catch {};
-                }
-                progressClear(options);
-                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-                return error.CollectFailed;
-            };
+            collectProgramSurfaceForProject(
+                alloc,
+                &diag_engine,
+                &collector,
+                &entry.program,
+                "initial struct collection",
+            ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
         }
 
         if (program.top_items.len > 0) {
             const top_only = ast.Program{ .structs = &.{}, .top_items = program.top_items };
-            collector.collectProgramSurface(&top_only) catch {
-                for (collector.errors.items) |collect_err| {
-                    diag_engine.err(collect_err.message, collect_err.span) catch {};
-                }
-                progressClear(options);
-                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-                return error.CollectFailed;
-            };
+            collectProgramSurfaceForProject(
+                alloc,
+                &diag_engine,
+                &collector,
+                &top_only,
+                "initial top-level collection",
+            ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
         }
         // Validate protocol conformance and register impl functions in target structs
-        collector.validateImplConformance() catch {};
-        collector.registerImplFunctionsInTargetScopes() catch {};
+        validateAndRegisterImplConformanceForProject(
+            alloc,
+            &diag_engine,
+            &collector,
+            "initial impl conformance registration",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
         if (collector.errors.items.len > 0) {
-            for (collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-            return error.CollectFailed;
+            return failCollectionWithDiagnostics(alloc, &diag_engine, &collector, all_source_units, options);
         }
 
         const pre_slices = try alloc.alloc(ast.Program, pre_struct_programs.len);
         for (pre_struct_programs, 0..) |entry, i| pre_slices[i] = entry.program;
-        collector.finalizeCollectedPrograms(pre_slices) catch {
-            for (collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-            return error.CollectFailed;
-        };
+        finalizeCollectedProgramsForProject(
+            alloc,
+            &diag_engine,
+            &collector,
+            pre_slices,
+            "initial collection finalization",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
     }
 
-    for (collector.errors.items) |collect_err| {
-        diag_engine.err(collect_err.message, collect_err.span) catch {};
-    }
+    reportCollectorErrorsSince(&diag_engine, &collector, 0) catch return error.OutOfMemory;
     if (diag_engine.hasErrors()) {
         progressClear(options);
-        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
         return error.CollectFailed;
     }
 
@@ -3783,7 +4420,11 @@ pub fn collectAllFromUnits(
     // each `MacroFamily.required_caps` reflects what the body actually does.
     // Replaces the historical `@requires` annotation; macro authors no
     // longer write capability sets by hand.
-    zap.capability_inference.inferAndApply(alloc, &collector.graph, interner) catch {};
+    runCapabilityInference(alloc, &collector.graph, interner, &diag_engine) catch |err| {
+        progressClear(options);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return err;
+    };
 
     // Run macro expansion and desugaring. When the discovery graph supplies a
     // struct order, expand one struct at a time and compile each completed
@@ -3804,7 +4445,7 @@ pub fn collectAllFromUnits(
             options,
         ) catch |err| {
             progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return err;
         }
     else
@@ -3816,7 +4457,7 @@ pub fn collectAllFromUnits(
             &diag_engine,
         ) catch |err| {
             progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return err;
         };
 
@@ -3835,63 +4476,85 @@ pub fn collectAllFromUnits(
     step += 1;
     progressStage(options, "[{d}/{d}] Re-collect", .{ step, total_steps });
 
-    var final_collector = zap.Collector.init(alloc, interner, kernel_name_id);
+    var final_collector = try zap.Collector.init(alloc, interner, kernel_name_id);
     try registerSourceUnits(&final_collector.graph, all_source_units);
     // Collect Kernel first in the second pass too
     for (struct_programs) |entry| {
         if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) {
-            final_collector.collectProgramSurface(&entry.program) catch {};
+            collectProgramSurfaceForProject(
+                alloc,
+                &diag_engine,
+                &final_collector,
+                &entry.program,
+                "final Kernel collection",
+            ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
             break;
         }
     }
     for (struct_programs) |entry| {
         if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) continue;
-        final_collector.collectProgramSurface(&entry.program) catch {
-            for (final_collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-            return error.CollectFailed;
-        };
+        collectProgramSurfaceForProject(
+            alloc,
+            &diag_engine,
+            &final_collector,
+            &entry.program,
+            "final struct collection",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
     }
     if (desugared_program.top_items.len > 0) {
         const top_only = ast.Program{ .structs = &.{}, .top_items = desugared_program.top_items };
-        final_collector.collectProgramSurface(&top_only) catch {
-            for (final_collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            return error.CollectFailed;
-        };
+        collectProgramSurfaceForProject(
+            alloc,
+            &diag_engine,
+            &final_collector,
+            &top_only,
+            "final top-level collection",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
     }
     // Re-register impl functions in their target struct scopes. The first
     // collector did this on its own graph, but the final_collector built a
     // fresh graph and per-struct HIR/type-check reads from THIS graph. Without
     // re-registration, impl functions like `Integer.+` are invisible.
-    final_collector.validateImplConformance() catch {};
-    final_collector.registerImplFunctionsInTargetScopes() catch {};
+    validateAndRegisterImplConformanceForProject(
+        alloc,
+        &diag_engine,
+        &final_collector,
+        "final impl conformance registration",
+    ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
     {
         const slices = try alloc.alloc(ast.Program, struct_programs.len);
         for (struct_programs, 0..) |entry, i| slices[i] = entry.program;
-        final_collector.finalizeCollectedPrograms(slices) catch {
-            for (final_collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            return error.CollectFailed;
-        };
+        finalizeCollectedProgramsForProject(
+            alloc,
+            &diag_engine,
+            &final_collector,
+            slices,
+            "final collection finalization",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
+    }
+    if (final_collector.errors.items.len > 0) {
+        return failCollectionWithDiagnostics(alloc, &diag_engine, &final_collector, all_source_units, options);
     }
 
     // Re-run capability inference on the post-expansion graph so any
     // downstream consumer (HIR, runtime CTFE) reads the same inferred
     // capability sets the macro engine used.
-    zap.capability_inference.inferAndApply(alloc, &final_collector.graph, interner) catch {};
+    runCapabilityInference(alloc, &final_collector.graph, interner, &diag_engine) catch |err| {
+        progressClear(options);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return err;
+    };
 
     // Target-capability gate (Phase 2): mark `@available_on`-gated decls the
     // build's target cannot satisfy, BEFORE type-checking resolves references.
-    applyTargetCapabilityGate(alloc, &final_collector.graph, interner, options, &diag_engine);
+    applyTargetCapabilityGate(alloc, &final_collector.graph, interner, options, &diag_engine) catch |err| {
+        progressClear(options);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return err;
+    };
     if (diag_engine.hasErrors()) {
         progressClear(options);
-        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
         return error.CollectFailed;
     }
 
@@ -3924,7 +4587,7 @@ fn collectAllFromParsedPrograms(
 
     if (diag_engine.hasErrors()) {
         progressClear(options);
-        emitDiagnostics(&diag_engine, alloc);
+        try emitDiagnostics(&diag_engine, alloc);
         return error.ParseFailed;
     }
 
@@ -3953,73 +4616,77 @@ fn collectAllFromParsedPrograms(
     progressStage(options, "[{d}/{d}] Collect", .{ step, total_steps });
 
     const kernel_name_id = try interner.intern(zap.discovery.kernel_struct_name);
-    var collector = zap.Collector.init(alloc, interner, kernel_name_id);
+    var collector = try zap.Collector.init(alloc, interner, kernel_name_id);
     try registerSourceUnits(&collector.graph, all_source_units);
     {
         const pre_struct_programs = try buildStructPrograms(alloc, &program, interner);
 
         for (pre_struct_programs) |entry| {
             if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) {
-                collector.collectProgramSurface(&entry.program) catch {};
+                collectProgramSurfaceForProject(
+                    alloc,
+                    &diag_engine,
+                    &collector,
+                    &entry.program,
+                    "initial Kernel collection",
+                ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
                 break;
             }
         }
         for (pre_struct_programs) |entry| {
             if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) continue;
-            collector.collectProgramSurface(&entry.program) catch {
-                for (collector.errors.items) |collect_err| {
-                    diag_engine.err(collect_err.message, collect_err.span) catch {};
-                }
-                progressClear(options);
-                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-                return error.CollectFailed;
-            };
+            collectProgramSurfaceForProject(
+                alloc,
+                &diag_engine,
+                &collector,
+                &entry.program,
+                "initial struct collection",
+            ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
         }
 
         if (program.top_items.len > 0) {
             const top_only = ast.Program{ .structs = &.{}, .top_items = program.top_items };
-            collector.collectProgramSurface(&top_only) catch {
-                for (collector.errors.items) |collect_err| {
-                    diag_engine.err(collect_err.message, collect_err.span) catch {};
-                }
-                progressClear(options);
-                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-                return error.CollectFailed;
-            };
+            collectProgramSurfaceForProject(
+                alloc,
+                &diag_engine,
+                &collector,
+                &top_only,
+                "initial top-level collection",
+            ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
         }
-        collector.validateImplConformance() catch {};
-        collector.registerImplFunctionsInTargetScopes() catch {};
+        validateAndRegisterImplConformanceForProject(
+            alloc,
+            &diag_engine,
+            &collector,
+            "initial impl conformance registration",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
         if (collector.errors.items.len > 0) {
-            for (collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-            return error.CollectFailed;
+            return failCollectionWithDiagnostics(alloc, &diag_engine, &collector, all_source_units, options);
         }
 
         const pre_slices = try alloc.alloc(ast.Program, pre_struct_programs.len);
         for (pre_struct_programs, 0..) |entry, i| pre_slices[i] = entry.program;
-        collector.finalizeCollectedPrograms(pre_slices) catch {
-            for (collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-            return error.CollectFailed;
-        };
+        finalizeCollectedProgramsForProject(
+            alloc,
+            &diag_engine,
+            &collector,
+            pre_slices,
+            "initial collection finalization",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
     }
 
-    for (collector.errors.items) |collect_err| {
-        diag_engine.err(collect_err.message, collect_err.span) catch {};
-    }
+    reportCollectorErrorsSince(&diag_engine, &collector, 0) catch return error.OutOfMemory;
     if (diag_engine.hasErrors()) {
         progressClear(options);
-        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
         return error.CollectFailed;
     }
 
-    zap.capability_inference.inferAndApply(alloc, &collector.graph, interner) catch {};
+    runCapabilityInference(alloc, &collector.graph, interner, &diag_engine) catch |err| {
+        progressClear(options);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return err;
+    };
 
     step += 1;
     progressStage(options, "[{d}/{d}] Macro expand", .{ step, total_steps });
@@ -4037,7 +4704,7 @@ fn collectAllFromParsedPrograms(
                 cache,
             ) catch |err| {
                 progressClear(options);
-                emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+                try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
                 return err;
             };
         }
@@ -4051,7 +4718,7 @@ fn collectAllFromParsedPrograms(
             options,
         ) catch |err| {
             progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+            try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
             return err;
         };
     } else legacyMacroExpandAndDesugar(
@@ -4062,7 +4729,7 @@ fn collectAllFromParsedPrograms(
         &diag_engine,
     ) catch |err| {
         progressClear(options);
-        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
         return err;
     };
 
@@ -4074,55 +4741,77 @@ fn collectAllFromParsedPrograms(
     step += 1;
     progressStage(options, "[{d}/{d}] Re-collect", .{ step, total_steps });
 
-    var final_collector = zap.Collector.init(alloc, interner, kernel_name_id);
+    var final_collector = try zap.Collector.init(alloc, interner, kernel_name_id);
     try registerSourceUnits(&final_collector.graph, all_source_units);
     for (struct_programs) |entry| {
         if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) {
-            final_collector.collectProgramSurface(&entry.program) catch {};
+            collectProgramSurfaceForProject(
+                alloc,
+                &diag_engine,
+                &final_collector,
+                &entry.program,
+                "final Kernel collection",
+            ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
             break;
         }
     }
     for (struct_programs) |entry| {
         if (std.mem.eql(u8, entry.name, zap.discovery.kernel_struct_name)) continue;
-        final_collector.collectProgramSurface(&entry.program) catch {
-            for (final_collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            progressClear(options);
-            emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
-            return error.CollectFailed;
-        };
+        collectProgramSurfaceForProject(
+            alloc,
+            &diag_engine,
+            &final_collector,
+            &entry.program,
+            "final struct collection",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
     }
     if (desugared_program.top_items.len > 0) {
         const top_only = ast.Program{ .structs = &.{}, .top_items = desugared_program.top_items };
-        final_collector.collectProgramSurface(&top_only) catch {
-            for (final_collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            return error.CollectFailed;
-        };
+        collectProgramSurfaceForProject(
+            alloc,
+            &diag_engine,
+            &final_collector,
+            &top_only,
+            "final top-level collection",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
     }
-    final_collector.validateImplConformance() catch {};
-    final_collector.registerImplFunctionsInTargetScopes() catch {};
+    validateAndRegisterImplConformanceForProject(
+        alloc,
+        &diag_engine,
+        &final_collector,
+        "final impl conformance registration",
+    ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
     {
         const slices = try alloc.alloc(ast.Program, struct_programs.len);
         for (struct_programs, 0..) |entry, i| slices[i] = entry.program;
-        final_collector.finalizeCollectedPrograms(slices) catch {
-            for (final_collector.errors.items) |collect_err| {
-                diag_engine.err(collect_err.message, collect_err.span) catch {};
-            }
-            return error.CollectFailed;
-        };
+        finalizeCollectedProgramsForProject(
+            alloc,
+            &diag_engine,
+            &final_collector,
+            slices,
+            "final collection finalization",
+        ) catch |err| return failCollectionPhase(alloc, &diag_engine, all_source_units, options, err);
+    }
+    if (final_collector.errors.items.len > 0) {
+        return failCollectionWithDiagnostics(alloc, &diag_engine, &final_collector, all_source_units, options);
     }
 
-    zap.capability_inference.inferAndApply(alloc, &final_collector.graph, interner) catch {};
+    runCapabilityInference(alloc, &final_collector.graph, interner, &diag_engine) catch |err| {
+        progressClear(options);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return err;
+    };
 
     // Target-capability gate (Phase 2): mark `@available_on`-gated decls the
     // build's target cannot satisfy, BEFORE type-checking resolves references.
-    applyTargetCapabilityGate(alloc, &final_collector.graph, interner, options, &diag_engine);
+    applyTargetCapabilityGate(alloc, &final_collector.graph, interner, options, &diag_engine) catch |err| {
+        progressClear(options);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        return err;
+    };
     if (diag_engine.hasErrors()) {
         progressClear(options);
-        emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
+        try emitDiagnosticsFromUnits(alloc, diag_engine.diagnostics.items, all_source_units, diag_engine.use_color);
         return error.CollectFailed;
     }
 
@@ -4160,9 +4849,9 @@ pub fn compileForCtfe(
     // desugar can rewrite their bodies — register them now, then
     // again after desugar in case desugaring synthesised more
     // helpers (`__for_N`, etc.).
-    pipeline.runReCollectFunctions(&expanded);
+    try pipeline.runReCollectFunctions(&expanded);
     const desugared = try pipeline.runDesugar(&expanded);
-    pipeline.runReCollectFunctions(&desugared);
+    try pipeline.runReCollectFunctions(&desugared);
 
     var type_checker = try pipeline.runTypeCheck(&desugared, null, true);
     defer type_checker.deinit();
@@ -4173,7 +4862,7 @@ pub fn compileForCtfe(
     const ir_lowering_result = try pipeline.runIrLowering(&mono_program, type_checker.store);
     var ir_program = ir_lowering_result.program;
 
-    pipeline.runCtfeAttributes(&ir_program, options.struct_order);
+    try pipeline.runCtfeAttributes(&ir_program, options.struct_order);
 
     var analysis_result = try pipeline.runAnalysisAndOptimization(&ir_program);
 
@@ -4190,18 +4879,32 @@ pub fn compileForCtfe(
     type_checker.setAnalysisContext(&analysis_result.context, &ir_program);
     type_checker.errors.clearRetainingCapacity();
     type_checker.allow_external_static_references = options.allow_external_static_references;
-    type_checker.checkProgram(&desugared) catch {};
-    type_checker.checkUnusedBindings() catch {};
+    const second_pass_error_baseline = ctx.diag_engine.errorCount();
+    var second_pass_failed = false;
+    runTypeCheckerProgramPass(
+        alloc,
+        &ctx.diag_engine,
+        &type_checker,
+        second_pass_error_baseline,
+        "CTFE second-pass type check",
+        &desugared,
+        true,
+    ) catch |err| switch (err) {
+        error.SemanticTypeCheckFailed,
+        error.InfrastructureTypeCheckFailed,
+        => second_pass_failed = true,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
 
     for (analysis_result.diagnostics.items) |analysis_diag| {
-        ctx.diag_engine.reportDiagnostic(analysis_diag) catch {};
+        ctx.diag_engine.reportDiagnostic(analysis_diag) catch return error.OutOfMemory;
     }
-    pipeline.routeTypeCheckerErrors(&type_checker);
+    if (second_pass_failed) return pipeline.failWithExisting(error.TypeCheckFailed);
     if (ctx.diag_engine.hasErrors()) return pipeline.failWithExisting(error.TypeCheckFailed);
 
     if (ctx.diag_engine.warningCount() > 0) {
         pipeline.clearProgress();
-        emitContextDiagnostics(ctx, alloc);
+        try emitContextDiagnostics(ctx, alloc);
     }
 
     pipeline.clearProgress();
@@ -4246,6 +4949,11 @@ const Pipeline = struct {
     /// per-struct pipelines don't trip on residual errors from earlier
     /// structs sharing the same DiagnosticEngine.
     error_baseline: usize,
+    /// Classification for the most recent type-check failure produced
+    /// by `runTypeCheck`. Per-struct compilation uses this to continue
+    /// after ordinary user type errors while still aborting infrastructure
+    /// failures that would leave partial type state behind.
+    last_type_check_failure_kind: ?TypeCheckFailureKind,
     /// When true, `failWith`/`failWithExisting` accumulate errors into the
     /// engine but do not flush them to stderr. Used by the per-struct
     /// loop in `compileStructByStruct`, which renders all collected
@@ -4267,6 +4975,7 @@ const Pipeline = struct {
             .total_steps = total_steps,
             .progress_enabled = options.show_progress and total_steps > 0,
             .error_baseline = ctx.diag_engine.errorCount(),
+            .last_type_check_failure_kind = null,
             .defer_render = false,
         };
     }
@@ -4296,9 +5005,9 @@ const Pipeline = struct {
     /// without populating any structured diagnostics, so log a "Error
     /// during X" line and bubble the supplied compile error.
     fn failWith(self: *Pipeline, message: []const u8, err: CompileError) CompileError {
-        self.ctx.diag_engine.err(message, .{ .start = 0, .end = 0 }) catch {};
+        self.ctx.diag_engine.err(message, .{ .start = 0, .end = 0 }) catch return error.OutOfMemory;
         self.clearProgress();
-        if (!self.defer_render) emitContextDiagnostics(self.ctx, self.alloc);
+        if (!self.defer_render) emitContextDiagnostics(self.ctx, self.alloc) catch return error.OutOfMemory;
         return err;
     }
 
@@ -4306,7 +5015,7 @@ const Pipeline = struct {
     /// errors into the diagnostic engine; flush them and bubble.
     fn failWithExisting(self: *Pipeline, err: CompileError) CompileError {
         self.clearProgress();
-        if (!self.defer_render) emitContextDiagnostics(self.ctx, self.alloc);
+        if (!self.defer_render) emitContextDiagnostics(self.ctx, self.alloc) catch return error.OutOfMemory;
         return err;
     }
 
@@ -4319,9 +5028,11 @@ const Pipeline = struct {
             &self.ctx.collector.graph,
             self.ctx.interner,
             &subst_errors,
-        ) catch return self.failWith("Error during attribute substitution", error.DesugarFailed);
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
         for (subst_errors.items) |subst_err| {
-            self.ctx.diag_engine.err(subst_err.message, subst_err.span) catch {};
+            self.ctx.diag_engine.err(subst_err.message, subst_err.span) catch return error.OutOfMemory;
         }
         if (self.hasNewErrors()) return self.failWithExisting(error.DesugarFailed);
         return substituted;
@@ -4331,14 +5042,15 @@ const Pipeline = struct {
         self.progress("Expand macros");
         var macro_engine = zap.MacroEngine.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph);
         defer macro_engine.deinit();
-        const expanded = macro_engine.expandProgram(program) catch {
+        const expanded = macro_engine.expandProgram(program) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             for (macro_engine.errors.items) |macro_err| {
-                self.ctx.diag_engine.err(macro_err.message, macro_err.span) catch {};
+                self.ctx.diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
             }
             return self.failWithExisting(error.MacroExpansionFailed);
         };
         for (macro_engine.errors.items) |macro_err| {
-            self.ctx.diag_engine.err(macro_err.message, macro_err.span) catch {};
+            self.ctx.diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
         }
         if (self.hasNewErrors()) return self.failWithExisting(error.MacroExpansionFailed);
         return expanded;
@@ -4347,8 +5059,10 @@ const Pipeline = struct {
     fn runDesugar(self: *Pipeline, program: *const ast.Program) CompileError!ast.Program {
         self.progress("Desugar");
         var desugarer = zap.Desugarer.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph);
-        return desugarer.desugarProgram(program) catch
-            self.failWith("Error during desugaring", error.DesugarFailed);
+        return desugarer.desugarProgram(program) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.failWith("Error during desugaring", error.DesugarFailed),
+        };
     }
 
     /// Walk `program` and register every function declaration that
@@ -4359,7 +5073,7 @@ const Pipeline = struct {
     /// HIR builder compares AST node pointers to determine which
     /// functions belong to the current struct, so the scope graph
     /// entries must reference these new AST nodes.
-    fn runReCollectFunctions(self: *Pipeline, program: *const ast.Program) void {
+    fn runReCollectFunctions(self: *Pipeline, program: *const ast.Program) CompileError!void {
         for (program.structs) |*mod| {
             const mod_scope = self.ctx.collector.graph.findStructScope(mod.name) orelse continue;
             for (mod.items) |item| {
@@ -4369,7 +5083,17 @@ const Pipeline = struct {
                         const key = zap.scope.FamilyKey{ .name = func.name, .arity = arity };
                         const scope_data = self.ctx.collector.graph.getScope(mod_scope);
                         if (scope_data.function_families.get(key) == null) {
-                            self.ctx.collector.collectFunction(func, mod_scope) catch {};
+                            const error_start_index = self.ctx.collector.errors.items.len;
+                            self.ctx.collector.collectFunction(func, mod_scope) catch |err| {
+                                return handleCollectorPhaseError(
+                                    self.alloc,
+                                    &self.ctx.diag_engine,
+                                    &self.ctx.collector,
+                                    error_start_index,
+                                    "function recollection",
+                                    err,
+                                );
+                            };
                         }
                     },
                     else => {},
@@ -4399,7 +5123,7 @@ const Pipeline = struct {
             // struct so they don't leak between structs.
             store.inferred_signatures.clearRetainingCapacity();
             break :blk zap.types.TypeChecker.initWithSharedStore(self.alloc, store, self.ctx.interner, &self.ctx.collector.graph);
-        } else zap.types.TypeChecker.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph);
+        } else try zap.types.TypeChecker.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph);
         errdefer type_checker.deinit();
         type_checker.allow_external_static_references = self.options.allow_external_static_references;
         // Thread the resolved compilation target so resolution honors comptime
@@ -4407,35 +5131,31 @@ const Pipeline = struct {
         // reference inside a comptime-dead `@target` branch is not type-checked.
         type_checker.target = zap.target_triple.resolve(self.options.ctfe_target);
 
-        type_checker.checkProgram(desugared) catch {};
-        if (check_unused) type_checker.checkUnusedBindings() catch {};
-        self.routeTypeCheckerErrors(&type_checker);
-        if (self.hasNewErrors()) return self.failWithExisting(error.TypeCheckFailed);
+        self.last_type_check_failure_kind = null;
+        runTypeCheckerProgramPass(
+            self.alloc,
+            &self.ctx.diag_engine,
+            &type_checker,
+            self.error_baseline,
+            "type check",
+            desugared,
+            check_unused,
+        ) catch |err| switch (err) {
+            error.SemanticTypeCheckFailed => {
+                self.last_type_check_failure_kind = .semantic;
+                return self.failWithExisting(error.TypeCheckFailed);
+            },
+            error.InfrastructureTypeCheckFailed => {
+                self.last_type_check_failure_kind = .infrastructure;
+                return self.failWithExisting(error.TypeCheckFailed);
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
         return type_checker;
     }
 
-    /// Forward errors collected by `type_checker` into the context's
-    /// diagnostic engine. Type-checker errors are always hard errors —
-    /// strict types is a hard language requirement, not an opt-in.
-    /// Pulled out as a helper because compileForCtfe also needs to
-    /// drain the checker after a second-pass `checkProgram` once
-    /// escape analysis has populated borrow diagnostics.
-    fn routeTypeCheckerErrors(self: *Pipeline, type_checker: *const zap.types.TypeChecker) void {
-        for (type_checker.errors.items) |type_err| {
-            self.ctx.diag_engine.reportDiagnostic(.{
-                .severity = type_err.severity orelse .@"error",
-                .message = type_err.message,
-                .span = type_err.span,
-                .label = type_err.label,
-                .help = type_err.help,
-                .secondary_spans = type_err.secondary_spans,
-                .related_spans = type_err.related_spans,
-                .machine_data = type_err.machine_data,
-                .fixits = type_err.fixits,
-                .expansion = type_err.expansion,
-                .domain = type_err.domain,
-            }) catch {};
-        }
+    fn routeIrBuilderErrors(self: *Pipeline, ir_builder: *const zap.ir.IrBuilder) std.mem.Allocator.Error!void {
+        try reportIrBuilderErrors(&self.ctx.diag_engine, ir_builder.errors.items);
     }
 
     /// Build HIR from a desugared program. `group_id_offset` lets the
@@ -4455,12 +5175,52 @@ const Pipeline = struct {
         // the host triple). An unrecognized triple here leaves `target` null;
         // a `@target` access then reports its own diagnostic.
         hir_builder.target = zap.target_triple.resolve(self.options.ctfe_target);
-        const hir_program = hir_builder.buildProgram(desugared) catch {
-            for (hir_builder.errors.items) |hir_err| reportHirBuilderError(&self.ctx.diag_engine, hir_err);
+        const hir_program = hir_builder.buildProgram(desugared) catch |err| {
+            reportHirBuilderErrors(&self.ctx.diag_engine, hir_builder.errors.items) catch return error.OutOfMemory;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (!self.hasNewErrors()) {
+                reportHirInfrastructureFailureDiagnostic(self.alloc, &self.ctx.diag_engine, err) catch return error.OutOfMemory;
+            }
+            if (isHirStructuralFailure(err) or self.hasNewErrors()) return self.failWithExisting(error.HirFailed);
+            return self.failWith("Error during HIR lowering", error.HirFailed);
+        };
+        reportHirBuilderErrors(&self.ctx.diag_engine, hir_builder.errors.items) catch return error.OutOfMemory;
+        if (self.hasNewErrors()) return self.failWithExisting(error.HirFailed);
+        return .{ .program = hir_program, .next_group_id = hir_builder.next_group_id };
+    }
+
+    fn runHirBuildForStruct(
+        self: *Pipeline,
+        desugared: *const ast.Program,
+        type_store: *zap.types.TypeStore,
+        group_id_offset: u32,
+    ) CompileError!?HirBuildResult {
+        self.progress("HIR");
+        var hir_builder = zap.hir.HirBuilder.init(self.alloc, self.ctx.interner, &self.ctx.collector.graph, type_store);
+        hir_builder.next_group_id = group_id_offset;
+        hir_builder.allow_external_static_references = self.options.allow_external_static_references;
+        hir_builder.target = zap.target_triple.resolve(self.options.ctfe_target);
+        const hir_program = hir_builder.buildProgram(desugared) catch |err| {
+            reportHirBuilderErrors(&self.ctx.diag_engine, hir_builder.errors.items) catch return error.OutOfMemory;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (isHirStructuralFailure(err)) {
+                if (!self.hasNewErrors()) {
+                    reportHirInfrastructureFailureDiagnostic(self.alloc, &self.ctx.diag_engine, err) catch return error.OutOfMemory;
+                }
+                return self.failWithExisting(error.HirFailed);
+            }
+            if (self.hasNewErrors()) {
+                self.clearProgress();
+                return null;
+            }
+            reportHirInfrastructureFailureDiagnostic(self.alloc, &self.ctx.diag_engine, err) catch return error.OutOfMemory;
             return self.failWithExisting(error.HirFailed);
         };
-        for (hir_builder.errors.items) |hir_err| reportHirBuilderError(&self.ctx.diag_engine, hir_err);
-        if (self.hasNewErrors()) return self.failWithExisting(error.HirFailed);
+        reportHirBuilderErrors(&self.ctx.diag_engine, hir_builder.errors.items) catch return error.OutOfMemory;
+        if (self.hasNewErrors()) {
+            self.clearProgress();
+            return null;
+        }
         return .{ .program = hir_program, .next_group_id = hir_builder.next_group_id };
     }
 
@@ -4470,8 +5230,13 @@ const Pipeline = struct {
         type_store: *zap.types.TypeStore,
         next_group_id: *u32,
     ) CompileError!zap.hir.Program {
-        const result = zap.monomorphize.monomorphize(self.alloc, hir_program, type_store, next_group_id, self.ctx.interner) catch
-            return self.failWith("Error during monomorphization", error.HirFailed);
+        const result = zap.monomorphize.monomorphize(self.alloc, hir_program, type_store, next_group_id, self.ctx.interner) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        if (result.errors.len > 0) {
+            reportMonomorphizeErrors(&self.ctx.diag_engine, result.errors) catch return error.OutOfMemory;
+            return self.failWithExisting(error.HirFailed);
+        }
         return result.program;
     }
 
@@ -4493,15 +5258,23 @@ const Pipeline = struct {
         ir_builder.type_store = type_store;
         ir_builder.scope_graph = &self.ctx.collector.graph;
         defer ir_builder.deinit();
-        var program = ir_builder.buildProgram(hir_program) catch
+        var program = ir_builder.buildProgram(hir_program) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            self.routeIrBuilderErrors(&ir_builder) catch return error.OutOfMemory;
+            if (self.hasNewErrors()) return self.failWithExisting(error.IrFailed);
             return self.failWith("Error during IR lowering", error.IrFailed);
+        };
+        self.routeIrBuilderErrors(&ir_builder) catch return error.OutOfMemory;
+        if (self.hasNewErrors()) return self.failWithExisting(error.IrFailed);
         // Phase 4 of the ARC ownership initiative: compute the
         // last-use ownership pass and write back consume modes onto
         // every share_value instruction whose ID is a consume site.
         // The returned table is threaded downstream so the ZIR
         // backend can consult `return_source_locals` per function.
-        var ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
-            return self.failWith("Error during ARC ownership analysis", error.IrFailed);
+        var ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        errdefer ownership.deinit();
         // Phase E.9 of the Phase 6 redux plan: per-callee parameter
         // convention inference. Promotes `.borrowed` to `.owned` for
         // function parameters whose every call site (recursive AND
@@ -4509,15 +5282,19 @@ const Pipeline = struct {
         // a prerequisite for emitting `move_value` at non-tail call
         // sites in `arc_ownership` (Step 2) and is enforced by V7 in
         // `arc_verifier` (Step 4).
-        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store, self.options.declared_caps, true) catch
-            return self.failWith("Error during ARC parameter convention inference", error.IrFailed);
+        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store, self.options.declared_caps, true) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.failWith("Error during ARC parameter convention inference", error.IrFailed),
+        };
         // Phase A of the Phase 6 redux plan: run the new ownership
         // classification + verifier passes between `arc_liveness` and
         // `arc_drop_insertion`. Both passes are stubs at this phase
         // (no IR mutation, no rejected programs); they exist so the
         // wiring is in place when subsequent phases populate them.
-        runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store, self.options) catch
-            return self.failWith("Error during ARC ownership classification or verification", error.IrFailed);
+        runArcOwnershipAndVerify(self.alloc, &program, &ownership, type_store, self.options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.failWith("Error during ARC ownership classification or verification", error.IrFailed),
+        };
         // Phase E.9: `runArcOwnershipAndVerify` rewrote share/release
         // pairs into move/(no-release) for owned-convention call
         // sites, which mutates the per-stream liveness shape that
@@ -4528,8 +5305,10 @@ const Pipeline = struct {
         // pass would emit destroys for sources that are now moved
         // through a call (double-free).
         ownership.deinit();
-        ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
-            return self.failWith("Error during ARC ownership analysis (recompute)", error.IrFailed);
+        ownership = zap.arc_liveness.ProgramArcOwnership.init(self.alloc);
+        ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
         // Phase 6 of the ARC ownership initiative: insert scope-exit
         // `release` IR instructions before every ret-equivalent
         // terminator, using the per-terminator live-before-ret sets
@@ -4546,8 +5325,10 @@ const Pipeline = struct {
         // drop-insertion to `compileStructByStruct`'s Phase 5b so the
         // post-merge uniqueness inference sees a clean `last_use_map` (see
         // the note in `runIrLoweringWithTryIdSeed`).
-        runArcDropInsertion(self.alloc, &program, &ownership, type_store, self.options) catch
-            return self.failWith("Error during ARC drop insertion", error.IrFailed);
+        runArcDropInsertion(self.alloc, &program, &ownership, type_store, self.options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.failWith("Error during ARC drop insertion", error.IrFailed),
+        };
         return .{ .program = program, .arc_ownership = ownership };
     }
 
@@ -4572,11 +5353,19 @@ const Pipeline = struct {
         ir_builder.next_try_id = next_try_id.*;
         ir_builder.known_name_program = known_name_program;
         defer ir_builder.deinit();
-        var program = ir_builder.buildProgram(hir_program) catch
+        var program = ir_builder.buildProgram(hir_program) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            self.routeIrBuilderErrors(&ir_builder) catch return error.OutOfMemory;
+            if (self.hasNewErrors()) return self.failWithExisting(error.IrFailed);
             return self.failWith("Error during IR lowering", error.IrFailed);
+        };
+        self.routeIrBuilderErrors(&ir_builder) catch return error.OutOfMemory;
+        if (self.hasNewErrors()) return self.failWithExisting(error.IrFailed);
         next_try_id.* = ir_builder.next_try_id;
-        var ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch
-            return self.failWith("Error during ARC ownership analysis", error.IrFailed);
+        var ownership = zap.arc_liveness.runProgramArcOwnership(self.alloc, &program, type_store) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        errdefer ownership.deinit();
         // Phase E.9: same per-callee inference as `runIrLowering`.
         // Both pipelines must run the inference before
         // `arc_ownership` so the classifier sees the refined
@@ -4597,8 +5386,10 @@ const Pipeline = struct {
         // closes that gap by running the same inference against the
         // merged program where every cross-struct call site is
         // visible.
-        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store, self.options.declared_caps, false) catch
-            return self.failWith("Error during ARC parameter convention inference", error.IrFailed);
+        zap.arc_param_convention.inferConventions(self.alloc, &program, &ownership, type_store, self.options.declared_caps, false) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.failWith("Error during ARC parameter convention inference", error.IrFailed),
+        };
         // NOTE: `runArcOwnershipAndVerify` (which runs
         // `rewriteOwnedConsumeBuiltinSites`, `classifyAndNormalize`, and
         // `rewriteOwnedConsumeSites`) is intentionally SKIPPED here.
@@ -4637,25 +5428,110 @@ const Pipeline = struct {
         return .{ .program = program, .arc_ownership = ownership };
     }
 
+    fn ctfeErrorPrimarySpan(ctfe_error: zap.ctfe.CtfeError) ast.SourceSpan {
+        var frame_index = ctfe_error.call_stack.len;
+        while (frame_index > 0) {
+            frame_index -= 1;
+            if (ctfe_error.call_stack[frame_index].source_span) |span| return span;
+        }
+        return .{ .start = 0, .end = 0 };
+    }
+
+    fn ctfeErrorLabel(
+        self: *Pipeline,
+        ctfe_error: zap.ctfe.CtfeError,
+    ) std.mem.Allocator.Error!?[]const u8 {
+        if (ctfe_error.attribute_context) |attribute_context| {
+            return try std.fmt.allocPrint(
+                self.ctx.diag_engine.allocator,
+                "while evaluating attribute `@{s}` in `{s}`",
+                .{ attribute_context.attr_name, attribute_context.struct_name },
+            );
+        }
+        return "compile-time attribute evaluation failed";
+    }
+
+    fn ctfeErrorNotes(
+        self: *Pipeline,
+        ctfe_error: zap.ctfe.CtfeError,
+    ) std.mem.Allocator.Error![]const zap.diagnostics.Diagnostic.Note {
+        if (ctfe_error.call_stack.len == 0) return &.{};
+
+        const notes = try self.ctx.diag_engine.allocator.alloc(
+            zap.diagnostics.Diagnostic.Note,
+            ctfe_error.call_stack.len,
+        );
+        var note_index: usize = 0;
+        var frame_index = ctfe_error.call_stack.len;
+        while (frame_index > 0) {
+            frame_index -= 1;
+            const frame = ctfe_error.call_stack[frame_index];
+            const note_message = if (note_index == 0)
+                try std.fmt.allocPrint(
+                    self.ctx.diag_engine.allocator,
+                    "while evaluating `{s}`",
+                    .{frame.function_name},
+                )
+            else
+                try std.fmt.allocPrint(
+                    self.ctx.diag_engine.allocator,
+                    "called from `{s}`",
+                    .{frame.function_name},
+                );
+            notes[note_index] = .{
+                .message = note_message,
+                .span = frame.source_span,
+            };
+            note_index += 1;
+        }
+        return notes;
+    }
+
+    fn routeCtfeAttributeErrors(
+        self: *Pipeline,
+        errors: []const zap.ctfe.CtfeError,
+    ) CompileError!void {
+        for (errors) |ctfe_error| {
+            self.ctx.diag_engine.reportDiagnostic(.{
+                .severity = .@"error",
+                .domain = .typecheck,
+                .message = ctfe_error.message,
+                .span = ctfeErrorPrimarySpan(ctfe_error),
+                .label = try self.ctfeErrorLabel(ctfe_error),
+                .notes = try self.ctfeErrorNotes(ctfe_error),
+            }) catch return error.OutOfMemory;
+        }
+    }
+
+    fn routeCtfeAttributeResult(
+        self: *Pipeline,
+        result: zap.ctfe.EvalAttrResult,
+    ) CompileError!void {
+        if (result.errors.len > 0) {
+            try self.routeCtfeAttributeErrors(result.errors);
+            return self.failWithExisting(error.IrFailed);
+        }
+    }
+
     /// CTFE attribute evaluation across the whole IR program. When a
-    /// `struct_order` is supplied each struct's attributes are
-    /// evaluated in dependency order so each struct can read its
-    /// dependencies' resolved values; otherwise the legacy
-    /// whole-program evaluator runs. CTFE errors are emitted through
-    /// the CTFE struct's own path, so the return is best-effort.
+    /// `struct_order` is supplied each struct's attributes are evaluated in
+    /// dependency order so each struct can read its dependencies' resolved
+    /// values; otherwise the legacy whole-program evaluator runs. Returned
+    /// CTFE errors are routed through the compiler diagnostic engine and fail
+    /// the IR phase.
     fn runCtfeAttributes(
         self: *Pipeline,
         ir_program: *ir.Program,
         struct_order: ?[]const []const u8,
-    ) void {
+    ) CompileError!void {
         const cache_dir = self.options.cache_dir;
         const opts_hash = ctfeCompileOptionsHash(self.options);
         // NOTE: the `@available_on` target gate is applied EARLIER, directly
         // from the AST in `applyTargetCapabilityGate` (after collection, before
         // type-checking) — it must precede name resolution. This pass only
         // computes attribute VALUES (`@doc`, etc.); it does not gate.
-        if (struct_order) |order| {
-            _ = zap.ctfe.evaluateStructAttributesInOrder(
+        const result = if (struct_order) |order|
+            zap.ctfe.evaluateStructAttributesInOrder(
                 self.alloc,
                 ir_program,
                 &self.ctx.collector.graph,
@@ -4663,27 +5539,31 @@ const Pipeline = struct {
                 order,
                 cache_dir,
                 opts_hash,
-            ) catch {};
-        } else {
-            _ = zap.ctfe.evaluateComputedAttributes(
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+            }
+        else
+            zap.ctfe.evaluateComputedAttributes(
                 self.alloc,
                 ir_program,
                 &self.ctx.collector.graph,
                 self.ctx.interner,
                 cache_dir,
                 opts_hash,
-            ) catch {};
-        }
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        try self.routeCtfeAttributeResult(result);
     }
 
     /// Per-struct CTFE used when each struct's IR is built in
-    /// isolation. Surfaces any errors directly through the CTFE
-    /// emit path.
+    /// isolation. Routes returned CTFE errors through the compiler diagnostic
+    /// engine and fails the IR phase.
     fn runCtfeAttributesForStruct(
         self: *Pipeline,
         mod_name: []const u8,
         mod_ir: *ir.Program,
-    ) void {
+    ) CompileError!void {
         const ctfe_result = zap.ctfe.evaluateComputedAttributesForStruct(
             self.alloc,
             mod_ir,
@@ -4692,10 +5572,10 @@ const Pipeline = struct {
             mod_name,
             self.options.cache_dir,
             ctfeCompileOptionsHash(self.options),
-        ) catch null;
-        if (ctfe_result) |cr| {
-            if (cr.errors.len > 0) zap.ctfe.emitCtfeErrors(self.alloc, cr.errors);
-        }
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        try self.routeCtfeAttributeResult(ctfe_result);
     }
 
     fn runAnalysisPipelineOnly(
@@ -4704,8 +5584,14 @@ const Pipeline = struct {
     ) CompileError!zap.analysis_pipeline.PipelineResult {
         self.progress("Escape analysis");
         const policy = self.options.frontend_optimize_mode.passPolicy();
-        return zap.analysis_pipeline.runAnalysisPipelineWithPolicy(self.alloc, ir_program, policy) catch
+        return zap.analysis_pipeline.runAnalysisPipelineWithPolicy(self.alloc, ir_program, policy) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            if (routeAnalysisPipelineFailureDiagnostic(&self.ctx.diag_engine, err) catch return error.OutOfMemory) {
+                return self.failWithExisting(error.IrFailed);
+            }
+            if (self.hasNewErrors()) return self.failWithExisting(error.IrFailed);
             return self.failWith("Error during escape analysis", error.IrFailed);
+        };
     }
 
     fn runContificationRewrite(
@@ -4718,6 +5604,7 @@ const Pipeline = struct {
         // it enabled.
         zap.contification_rewrite.rewriteContifiedContinuations(self.alloc, ir_program, &pipeline_result.context) catch |err| switch (err) {
             error.UnsupportedContifiedRewrite => {},
+            error.OutOfMemory => return error.OutOfMemory,
             else => return error.IrFailed,
         };
     }
@@ -4747,7 +5634,7 @@ fn compileSingleStructHir(
     shared_store: *zap.types.TypeStore,
     group_id_offset: u32,
     options: CompileOptions,
-) CompileError!StructHirResult {
+) CompileError!?StructHirResult {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
     pipeline.defer_render = true;
     const desugared = try pipeline.runSubstitute(mod_program);
@@ -4756,10 +5643,16 @@ fn compileSingleStructHir(
     // shares the scope graph across structs but only visits the
     // current struct's bindings, so checking all bindings here would
     // emit false "unused" warnings for bindings declared elsewhere.
-    var type_checker = try pipeline.runTypeCheck(&desugared, shared_store, false);
+    var type_checker = pipeline.runTypeCheck(&desugared, shared_store, false) catch |err| switch (err) {
+        error.TypeCheckFailed => {
+            if (pipeline.last_type_check_failure_kind == .semantic and pipeline.hasNewErrors()) return null;
+            return err;
+        },
+        else => return err,
+    };
     defer type_checker.deinit();
 
-    const hir_result = try pipeline.runHirBuild(&desugared, shared_store, group_id_offset);
+    const hir_result = (try pipeline.runHirBuildForStruct(&desugared, shared_store, group_id_offset)) orelse return null;
     return .{
         .mod_name = mod_name,
         .hir_program = hir_result.program,
@@ -4788,7 +5681,7 @@ fn compileHirToIr(
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
     pipeline.defer_render = true;
     var mod_ir_result = try pipeline.runIrLoweringWithTryIdSeed(hir_program, type_store, next_try_id, known_name_program);
-    pipeline.runCtfeAttributesForStruct(mod_name, &mod_ir_result.program);
+    try pipeline.runCtfeAttributesForStruct(mod_name, &mod_ir_result.program);
     return mod_ir_result;
 }
 
@@ -4801,20 +5694,22 @@ fn legacyMacroExpandAndDesugar(
 ) CompileError!ast.Program {
     var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
     defer macro_engine.deinit();
-    const expanded_program = macro_engine.expandProgram(program) catch {
+    const expanded_program = macro_engine.expandProgram(program) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         for (macro_engine.errors.items) |macro_err| {
-            diag_engine.err(macro_err.message, macro_err.span) catch {};
+            diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
         }
         return error.MacroExpansionFailed;
     };
     for (macro_engine.errors.items) |macro_err| {
-        diag_engine.err(macro_err.message, macro_err.span) catch {};
+        diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
     }
     if (diag_engine.hasErrors()) return error.MacroExpansionFailed;
 
     var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
-    return desugarer.desugarProgram(&expanded_program) catch {
-        diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
+    return desugarer.desugarProgram(&expanded_program) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch return error.OutOfMemory;
         return error.DesugarFailed;
     };
 }
@@ -4841,7 +5736,7 @@ fn stagedMacroExpandAndDesugar(
     defer compiled_executor.deinit();
 
     const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
-    shared_store.* = zap.types.TypeStore.init(alloc, interner);
+    shared_store.* = try zap.types.TypeStore.init(alloc, interner);
 
     var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
@@ -4891,6 +5786,7 @@ fn stagedMacroExpandAndDesugar(
             hir_results.items,
             interner,
             collector,
+            diag_engine,
             shared_store,
             group_id_offset,
         );
@@ -5002,7 +5898,7 @@ fn stagedMacroExpandAndDesugarCached(
     defer compiled_executor.deinit();
 
     const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
-    shared_store.* = zap.types.TypeStore.init(alloc, interner);
+    shared_store.* = try zap.types.TypeStore.init(alloc, interner);
 
     var hir_results: std.ArrayListUnmanaged(StructHirResult) = .empty;
     var group_id_offset: u32 = 0;
@@ -5026,6 +5922,7 @@ fn stagedMacroExpandAndDesugarCached(
                 hir_results.items,
                 interner,
                 collector,
+                diag_engine,
                 shared_store,
                 group_id_offset,
             );
@@ -5081,6 +5978,7 @@ fn stagedMacroExpandAndDesugarCached(
             hir_results.items,
             interner,
             collector,
+            diag_engine,
             shared_store,
             group_id_offset,
         );
@@ -5290,7 +6188,7 @@ fn cachedOrExpandTopLevelProgram(
         artifact_alloc,
         cache.macro_expansion_dependencies.items[dependency_start..],
     );
-    artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
+    artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner, diag_engine);
     try updateImplDeclsInProgram(collector, &artifact.program);
     cache.new_expanded_top_level.* = artifact;
     return artifact.program;
@@ -5351,7 +6249,7 @@ fn cachedOrExpandStagedStruct(
         artifact_alloc,
         cache.macro_expansion_dependencies.items[dependency_start..],
     );
-    artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner);
+    artifact.program = try cloneAstProgramOwned(artifact_alloc, expanded_program, interner, diag_engine);
     try reCollectFunctionsInProgram(collector, &artifact.program);
     try updateImplDeclsInProgram(collector, &artifact.program);
     try cache.new_expanded_structs.append(alloc, artifact);
@@ -5399,14 +6297,15 @@ fn expandAndDesugarTopLevelProgram(
     var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
     defer macro_engine.deinit();
     macro_engine.setCompiledExecutor(compiled_executor);
-    const expanded = macro_engine.expandProgram(&top_program) catch {
+    const expanded = macro_engine.expandProgram(&top_program) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         for (macro_engine.errors.items) |macro_err| {
-            diag_engine.err(macro_err.message, macro_err.span) catch {};
+            diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
         }
         return error.MacroExpansionFailed;
     };
     for (macro_engine.errors.items) |macro_err| {
-        diag_engine.err(macro_err.message, macro_err.span) catch {};
+        diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
     }
     if (diag_engine.errorCount() > error_baseline) return error.MacroExpansionFailed;
     if (cache) |expansion_cache| {
@@ -5421,8 +6320,9 @@ fn expandAndDesugarTopLevelProgram(
     }
 
     var desugarer = zap.Desugarer.initWithSharedClosureCounter(alloc, interner, &collector.graph, shared_closure_counter);
-    const desugared = desugarer.desugarProgram(&expanded) catch {
-        diag_engine.err("Error during top-level desugaring", .{ .start = 0, .end = 0 }) catch {};
+    const desugared = desugarer.desugarProgram(&expanded) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        diag_engine.err("Error during top-level desugaring", .{ .start = 0, .end = 0 }) catch return error.OutOfMemory;
         return error.DesugarFailed;
     };
     // A closure literal at the top level (a script `main/1` body) also
@@ -5456,26 +6356,26 @@ fn expandAndDesugarStagedStruct(
         &collector.graph,
         interner,
         &subst_errors,
-    ) catch {
-        diag_engine.err("Error during attribute substitution", .{ .start = 0, .end = 0 }) catch {};
-        return error.DesugarFailed;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
     };
     for (subst_errors.items) |subst_err| {
-        diag_engine.err(subst_err.message, subst_err.span) catch {};
+        diag_engine.err(subst_err.message, subst_err.span) catch return error.OutOfMemory;
     }
     if (diag_engine.errorCount() > error_baseline) return error.DesugarFailed;
 
     var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
     defer macro_engine.deinit();
     macro_engine.setCompiledExecutor(compiled_executor);
-    const expanded = macro_engine.expandProgram(&substituted) catch {
+    const expanded = macro_engine.expandProgram(&substituted) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         for (macro_engine.errors.items) |macro_err| {
-            diag_engine.err(macro_err.message, macro_err.span) catch {};
+            diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
         }
         return error.MacroExpansionFailed;
     };
     for (macro_engine.errors.items) |macro_err| {
-        diag_engine.err(macro_err.message, macro_err.span) catch {};
+        diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
     }
     if (diag_engine.errorCount() > error_baseline) return error.MacroExpansionFailed;
     if (cache) |expansion_cache| {
@@ -5493,8 +6393,9 @@ fn expandAndDesugarStagedStruct(
     try updateImplDeclsInProgram(collector, &expanded);
 
     var desugarer = zap.Desugarer.initWithSharedClosureCounter(alloc, interner, &collector.graph, shared_closure_counter);
-    const desugared = desugarer.desugarProgram(&expanded) catch {
-        diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch {};
+    const desugared = desugarer.desugarProgram(&expanded) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        diag_engine.err("Error during desugaring", .{ .start = 0, .end = 0 }) catch return error.OutOfMemory;
         return error.DesugarFailed;
     };
     // Register the closure structs the desugar synthesized (`__closure_N` +
@@ -5549,14 +6450,15 @@ fn expandGraphImplsForProgram(
         var macro_engine = zap.MacroEngine.init(alloc, interner, &collector.graph);
         defer macro_engine.deinit();
         macro_engine.setCompiledExecutor(compiled_executor);
-        const expanded = macro_engine.expandProgram(&impl_program) catch {
+        const expanded = macro_engine.expandProgram(&impl_program) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
             for (macro_engine.errors.items) |macro_err| {
-                diag_engine.err(macro_err.message, macro_err.span) catch {};
+                diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
             }
             return error.MacroExpansionFailed;
         };
         for (macro_engine.errors.items) |macro_err| {
-            diag_engine.err(macro_err.message, macro_err.span) catch {};
+            diag_engine.err(macro_err.message, macro_err.span) catch return error.OutOfMemory;
         }
         if (cache) |expansion_cache| {
             try appendMacroExpansionDependenciesFromEngine(
@@ -5570,8 +6472,9 @@ fn expandGraphImplsForProgram(
         }
 
         var desugarer = zap.Desugarer.init(alloc, interner, &collector.graph);
-        const desugared_impl_program = desugarer.desugarProgram(&expanded) catch {
-            diag_engine.err("Error during impl desugaring", .{ .start = 0, .end = 0 }) catch {};
+        const desugared_impl_program = desugarer.desugarProgram(&expanded) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            diag_engine.err("Error during impl desugaring", .{ .start = 0, .end = 0 }) catch return error.OutOfMemory;
             return error.DesugarFailed;
         };
         if (desugared_impl_program.top_items.len > 0) {
@@ -5601,14 +6504,12 @@ fn compileStagedStructHir(
 ) CompileError!StructHirResult {
     const error_baseline = diag_engine.errorCount();
     if (findUndesugaredMacroForm(desugared) orelse findUndesugaredMacroFormInGraphImpls(&collector.graph, desugared)) |form| {
-        diag_engine.err(
-            std.fmt.allocPrint(
-                alloc,
-                "staged macro expansion left raw `{s}` before HIR in `{s}`",
-                .{ form.name, struct_name },
-            ) catch "staged macro expansion left raw macro form before HIR",
-            form.span,
-        ) catch {};
+        const message = std.fmt.allocPrint(
+            alloc,
+            "staged macro expansion left raw `{s}` before HIR in `{s}`",
+            .{ form.name, struct_name },
+        ) catch return error.OutOfMemory;
+        try diag_engine.err(message, form.span);
         return error.MacroExpansionFailed;
     }
     shared_store.inferred_signatures.clearRetainingCapacity();
@@ -5617,35 +6518,36 @@ fn compileStagedStructHir(
     var type_checker = zap.types.TypeChecker.initWithSharedStore(alloc, shared_store, interner, &collector.graph);
     defer type_checker.deinit();
     type_checker.allow_external_static_references = allow_external_static_references;
-    type_checker.checkProgram(desugared) catch {};
+    runTypeCheckerProgramPass(
+        alloc,
+        diag_engine,
+        &type_checker,
+        error_baseline,
+        "staged struct type check",
+        desugared,
+        false,
+    ) catch |err| switch (err) {
+        error.SemanticTypeCheckFailed,
+        error.InfrastructureTypeCheckFailed,
+        => return error.TypeCheckFailed,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     const tc_ms = sub_timer.lapMs();
-    for (type_checker.errors.items) |type_err| {
-        diag_engine.reportDiagnostic(.{
-            .severity = type_err.severity orelse .@"error",
-            .message = type_err.message,
-            .span = type_err.span,
-            .label = type_err.label,
-            .help = type_err.help,
-            .secondary_spans = type_err.secondary_spans,
-            .related_spans = type_err.related_spans,
-            .machine_data = type_err.machine_data,
-            .fixits = type_err.fixits,
-            .expansion = type_err.expansion,
-            .domain = type_err.domain,
-        }) catch {};
-    }
-    if (diag_engine.errorCount() > error_baseline) return error.TypeCheckFailed;
 
     var hir_builder = zap.hir.HirBuilder.init(alloc, interner, &collector.graph, shared_store);
     hir_builder.next_group_id = group_id_offset;
     hir_builder.allow_external_static_references = allow_external_static_references;
     hir_builder.target = zap.target_triple.resolve(ctfe_target);
     sub_timer.reset();
-    const hir_program = hir_builder.buildProgram(desugared) catch {
-        for (hir_builder.errors.items) |hir_err| reportHirBuilderError(diag_engine, hir_err);
+    const hir_program = hir_builder.buildProgram(desugared) catch |err| {
+        reportHirBuilderErrors(diag_engine, hir_builder.errors.items) catch return error.OutOfMemory;
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (diag_engine.errorCount() == error_baseline) {
+            reportHirInfrastructureFailureDiagnostic(alloc, diag_engine, err) catch return error.OutOfMemory;
+        }
         return error.HirFailed;
     };
-    for (hir_builder.errors.items) |hir_err| reportHirBuilderError(diag_engine, hir_err);
+    reportHirBuilderErrors(diag_engine, hir_builder.errors.items) catch return error.OutOfMemory;
     const hb_ms = sub_timer.lapMs();
     if (profilingEnabled() and (tc_ms + hb_ms) >= 100) {
         std.debug.print("\n[hir-stage struct={s} type_check_ms={d} hir_build_ms={d}]\n", .{ struct_name, tc_ms, hb_ms });
@@ -5852,6 +6754,7 @@ fn rebuildStagedIr(
     hir_results: []const StructHirResult,
     interner: *ast.StringInterner,
     collector: *zap.Collector,
+    diag_engine: *zap.DiagnosticEngine,
     shared_store: *zap.types.TypeStore,
     group_id_offset: u32,
 ) CompileError!ir.Program {
@@ -5882,16 +6785,29 @@ fn rebuildStagedIr(
     };
 
     var mono_next = group_id_offset;
-    const mono_result = zap.monomorphize.monomorphize(alloc, &combined_hir, shared_store, &mono_next, interner) catch
+    const mono_result = zap.monomorphize.monomorphize(alloc, &combined_hir, shared_store, &mono_next, interner) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    if (mono_result.errors.len > 0) {
+        reportMonomorphizeErrors(diag_engine, mono_result.errors) catch return error.OutOfMemory;
         return error.HirFailed;
+    }
     combined_hir = mono_result.program;
 
     var ir_builder = zap.ir.IrBuilder.init(alloc, interner);
     ir_builder.type_store = shared_store;
     ir_builder.scope_graph = &collector.graph;
     defer ir_builder.deinit();
-    const program = ir_builder.buildProgram(&combined_hir) catch return error.IrFailed;
-    zap.arc_liveness.runProgramArcLiveness(alloc, &program, shared_store) catch return error.IrFailed;
+    const program = ir_builder.buildProgram(&combined_hir) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        reportIrBuilderErrors(diag_engine, ir_builder.errors.items) catch return error.OutOfMemory;
+        return error.IrFailed;
+    };
+    reportIrBuilderErrors(diag_engine, ir_builder.errors.items) catch return error.OutOfMemory;
+    if (ir_builder.errors.items.len > 0) return error.IrFailed;
+    zap.arc_liveness.runProgramArcLiveness(alloc, &program, shared_store) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     return program;
 }
 
@@ -6047,7 +6963,7 @@ fn compileStructsToPreFinalIr(
     var group_id_offset: u32 = 0;
 
     const shared_store = alloc.create(zap.types.TypeStore) catch return error.OutOfMemory;
-    shared_store.* = zap.types.TypeStore.init(alloc, ctx.interner);
+    shared_store.* = try zap.types.TypeStore.init(alloc, ctx.interner);
 
     var lowered_structs = std.StringHashMap(void).init(alloc);
     defer lowered_structs.deinit();
@@ -6056,7 +6972,8 @@ fn compileStructsToPreFinalIr(
         progressStage(options, "[hir {d}/{d}] {s}", .{ mod_idx + 1, struct_order.len, mod_name });
         const mod_program = lookupStructProgram(ctx, mod_name) orelse continue;
         per_struct_timer.reset();
-        const hir_result = compileSingleStructHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options) catch continue;
+        const maybe_hir_result = try compileSingleStructHir(alloc, ctx, mod_name, mod_program, shared_store, group_id_offset, options);
+        const hir_result = maybe_hir_result orelse continue;
         const hir_elapsed_ms = per_struct_timer.readMs();
         if (profilingEnabled() and hir_elapsed_ms >= 100) {
             std.debug.print("\n[stage HIR struct={s}] ms={d}\n", .{ mod_name, hir_elapsed_ms });
@@ -6129,8 +7046,10 @@ fn compileStructsToPreFinalIr(
             .top_functions = &.{},
         };
         per_struct_timer.reset();
-        const mod_lower = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id, &combined_hir) catch {
-            continue;
+        const mod_lower = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id, &combined_hir) catch |err| switch (err) {
+            error.IrFailed => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return err,
         };
         const mod_ir = mod_lower.program;
         try mergeArcOwnership(alloc, &combined_arc_ownership, mod_lower.arc_ownership);
@@ -6154,7 +7073,11 @@ fn compileStructsToPreFinalIr(
             .top_functions = combined_hir.top_functions,
             .impls = combined_hir.impls,
         };
-        const mod_lower = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id, &combined_hir) catch return error.IrFailed;
+        const mod_lower = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id, &combined_hir) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.IrFailed => return error.IrFailed,
+            else => return err,
+        };
         const mod_ir = mod_lower.program;
         try mergeArcOwnership(alloc, &combined_arc_ownership, mod_lower.arc_ownership);
         for (mod_ir.functions) |function| {
@@ -6208,28 +7131,43 @@ fn finishMergedIr(
     {
         progressStage(options, "ARC: ownership and drops", .{});
         progressStage(options, "ARC: computing merged ownership", .{});
-        var merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch
-            return error.IrFailed;
-        progressStage(options, "ARC: inferring parameter conventions", .{});
-        zap.arc_param_convention.inferConventions(alloc, &merged_ir, &merged_ownership, shared_store, options.declared_caps, true) catch {
-            merged_ownership.deinit();
-            return error.IrFailed;
+        var merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
         };
-        runArcOwnershipAndVerify(alloc, &merged_ir, &merged_ownership, shared_store, options) catch {
+        progressStage(options, "ARC: inferring parameter conventions", .{});
+        zap.arc_param_convention.inferConventions(alloc, &merged_ir, &merged_ownership, shared_store, options.declared_caps, true) catch |err| {
             merged_ownership.deinit();
-            return error.IrFailed;
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.IrFailed,
+            };
+        };
+        runArcOwnershipAndVerify(alloc, &merged_ir, &merged_ownership, shared_store, options) catch |err| {
+            merged_ownership.deinit();
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.IrFailed,
+            };
         };
         progressStage(options, "ARC: recomputing post-rewrite ownership", .{});
         merged_ownership.deinit();
-        merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch
-            return error.IrFailed;
-        runArcDropInsertion(alloc, &merged_ir, &merged_ownership, shared_store, options) catch {
-            merged_ownership.deinit();
-            return error.IrFailed;
+        merged_ownership = zap.arc_liveness.ProgramArcOwnership.init(alloc);
+        merged_ownership = zap.arc_liveness.runProgramArcOwnership(alloc, &merged_ir, shared_store) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
         };
-        materializeAnalysisArcOps(alloc, &merged_ir, &analysis_result.context, shared_store, options.declared_caps, options) catch {
+        runArcDropInsertion(alloc, &merged_ir, &merged_ownership, shared_store, options) catch |err| {
             merged_ownership.deinit();
-            return error.IrFailed;
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.IrFailed,
+            };
+        };
+        materializeAnalysisArcOps(alloc, &merged_ir, &analysis_result.context, shared_store, options.declared_caps, options) catch |err| {
+            merged_ownership.deinit();
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.IrFailed,
+            };
         };
         combined_arc_ownership.deinit();
         combined_arc_ownership = merged_ownership;
@@ -6242,9 +7180,10 @@ fn finishMergedIr(
 
     if (ctx.diag_engine.hasErrors()) {
         pipeline.clearProgress();
-        emitContextDiagnostics(ctx, alloc);
-        // The merged-IR path reports per-struct frontend errors and CONTINUES
-        // (the `compileSingleStructHir(...) catch continue` loop), so the whole
+        try emitContextDiagnostics(ctx, alloc);
+        // The merged-IR path reports per-struct semantic frontend errors and
+        // CONTINUES (the `compileSingleStructHir(...) orelse continue` loop),
+        // so the whole
         // program's errors surface together; callers gate on `errorCount()`,
         // and a genuine type/name error still fails end-to-end because it trips
         // a backend "undeclared identifier" (the
@@ -6847,77 +7786,56 @@ fn addCallEdgesFromInstructions(
     instructions: []const ir.Instruction,
     callers_by_callee: *std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
 ) CompileError!void {
-    for (instructions) |instruction| {
-        switch (instruction) {
-            .call_direct => |call| try addReverseCallEdgeTarget(alloc, program, caller_id, call.function, callers_by_callee),
-            .call_dispatch => |call| try addReverseDispatchCallEdges(alloc, program, caller_id, call.group_id, callers_by_callee),
-            .make_closure => |closure| try addReverseCallEdgeTarget(alloc, program, caller_id, closure.function, callers_by_callee),
-            .call_named => |call| {
-                if (functionIdByName(program, call.name)) |target_id| {
-                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
-                }
-            },
-            .tail_call => |call| {
-                if (functionIdByName(program, call.name)) |target_id| {
-                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
-                }
-            },
-            .try_call_named => |call| {
-                if (functionIdByName(program, call.name)) |target_id| {
-                    try addReverseCallEdgeTarget(alloc, program, caller_id, target_id, callers_by_callee);
-                }
-                try addCallEdgesFromInstructions(alloc, program, caller_id, call.handler_instrs, callers_by_callee);
-                try addCallEdgesFromInstructions(alloc, program, caller_id, call.success_instrs, callers_by_callee);
-            },
-            .if_expr => |value| {
-                try addCallEdgesFromInstructions(alloc, program, caller_id, value.then_instrs, callers_by_callee);
-                try addCallEdgesFromInstructions(alloc, program, caller_id, value.else_instrs, callers_by_callee);
-            },
-            .guard_block => |value| try addCallEdgesFromInstructions(alloc, program, caller_id, value.body, callers_by_callee),
-            .case_block => |value| {
-                try addCallEdgesFromInstructions(alloc, program, caller_id, value.pre_instrs, callers_by_callee);
-                for (value.arms) |arm| {
-                    try addCallEdgesFromInstructions(alloc, program, caller_id, arm.cond_instrs, callers_by_callee);
-                    try addCallEdgesFromInstructions(alloc, program, caller_id, arm.body_instrs, callers_by_callee);
-                }
-                try addCallEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, callers_by_callee);
-            },
-            .switch_literal => |value| {
-                for (value.cases) |case| {
-                    try addCallEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, callers_by_callee);
-                }
-                try addCallEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, callers_by_callee);
-            },
-            .switch_return => |value| {
-                for (value.cases) |case| {
-                    try addCallEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, callers_by_callee);
-                }
-                try addCallEdgesFromInstructions(alloc, program, caller_id, value.default_instrs, callers_by_callee);
-            },
-            .union_switch => |value| {
-                for (value.cases) |case| {
-                    try addCallEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, callers_by_callee);
-                }
-                // A callee invoked only from the catch-all `_` prong must
-                // still register a reverse call edge, or it will not be
-                // marked dirty when its signature/summary changes →
-                // stale incremental rebuild.
-                if (value.has_else) {
-                    try addCallEdgesFromInstructions(alloc, program, caller_id, value.else_instrs, callers_by_callee);
-                }
-            },
-            .union_switch_return => |value| {
-                for (value.cases) |case| {
-                    try addCallEdgesFromInstructions(alloc, program, caller_id, case.body_instrs, callers_by_callee);
-                }
-            },
-            .optional_dispatch => |value| {
-                try addCallEdgesFromInstructions(alloc, program, caller_id, value.nil_instrs, callers_by_callee);
-                try addCallEdgesFromInstructions(alloc, program, caller_id, value.struct_instrs, callers_by_callee);
-            },
-            else => {},
+    const Context = struct {
+        alloc: std.mem.Allocator,
+        program: ir.Program,
+        caller_id: ir.FunctionId,
+        callers_by_callee: *std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+        err: ?CompileError = null,
+
+        fn addTarget(self: *@This(), target_id: ir.FunctionId) void {
+            if (self.err != null) return;
+            addReverseCallEdgeTarget(self.alloc, self.program, self.caller_id, target_id, self.callers_by_callee) catch |err| {
+                self.err = err;
+            };
         }
-    }
+
+        fn addNamedTarget(self: *@This(), name: []const u8) void {
+            if (self.err != null) return;
+            if (functionIdByName(self.program, name)) |target_id| {
+                self.addTarget(target_id);
+            }
+        }
+
+        fn addDispatchTargets(self: *@This(), group_id: ir.FunctionId) void {
+            if (self.err != null) return;
+            addReverseDispatchCallEdges(self.alloc, self.program, self.caller_id, group_id, self.callers_by_callee) catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn visit(self: *@This(), instruction: *const ir.Instruction) void {
+            if (self.err != null) return;
+            switch (instruction.*) {
+                .call_direct => |call| self.addTarget(call.function),
+                .call_dispatch => |call| self.addDispatchTargets(call.group_id),
+                .make_closure => |closure| self.addTarget(closure.function),
+                .call_named => |call| self.addNamedTarget(call.name),
+                .tail_call => |call| self.addNamedTarget(call.name),
+                .try_call_named => |call| self.addNamedTarget(call.name),
+                else => {},
+            }
+        }
+    };
+
+    var context = Context{
+        .alloc = alloc,
+        .program = program,
+        .caller_id = caller_id,
+        .callers_by_callee = callers_by_callee,
+    };
+    try ir.forEachInstructionInStream(alloc, instructions, &context, Context.visit);
+    if (context.err) |err| return err;
 }
 
 fn expandAffectedFunctionsToCallers(
@@ -9261,6 +10179,90 @@ test "incremental frontend uncommitted and failed prepares do not replace state 
     try std.testing.expect((try state.dependencyGraphStructSurfaceNode("Beta")) == null);
 }
 
+test "incremental frontend reports recoverable parse errors before fingerprinting" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    const bad_structs = [_][]const u8{"Bad"};
+    try file_to_structs.put("lib/bad.zap", &bad_structs);
+
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+
+    const bad_source =
+        "pub error ExistingError {}\n" ++
+        "pub struct Bad {\n" ++
+        "  pub fn broken() -> i64 {\n" ++
+        "    state :: Enumerable(i64) = []\n" ++
+        "    0\n" ++
+        "  }\n" ++
+        "}\n";
+    var units = [_]SourceUnit{
+        .{ .file_path = "lib/bad.zap", .source = bad_source, .primary_struct_name = "Bad" },
+    };
+
+    try std.testing.expectError(error.ParseFailed, state.prepare(alloc, &units, graph, .{
+        .show_progress = false,
+        .struct_order = &bad_structs,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), state.dependencyGraphNodeCount());
+}
+
+test "incremental reflection fingerprints tolerate raw error declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    const source =
+        "@doc = \"\"\"\n" ++
+        "  Existing error.\n" ++
+        "  \"\"\"\n" ++
+        "\n" ++
+        "pub error ExistingError {}\n" ++
+        "\n" ++
+        "@doc = \"\"\"\n" ++
+        "  Bad struct.\n" ++
+        "  \"\"\"\n" ++
+        "\n" ++
+        "pub struct Bad {\n" ++
+        "  @doc = \"\"\"\n" ++
+        "    Returns a value.\n" ++
+        "    \"\"\"\n" ++
+        "\n" ++
+        "  pub fn value() -> i64 { 1 }\n" ++
+        "}\n";
+
+    var parser = zap.Parser.initWithSharedInternerScriptMode(alloc, source, &interner, 0, false);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    try std.testing.expectEqual(@as(usize, 0), parser.errors.items.len);
+
+    const fingerprints = try computeFrontendReflectionFingerprints(
+        alloc,
+        program,
+        source,
+        0,
+        "lib/bad.zap",
+        &interner,
+    );
+    try std.testing.expect(fingerprints.records.len > 0);
+}
+
 fn nodeIdSliceContains(haystack: []const zap.incremental_graph.NodeId, needle: zap.incremental_graph.NodeId) bool {
     for (haystack) |candidate| {
         if (candidate == needle) return true;
@@ -9439,7 +10441,7 @@ fn expectCtfeBool(
     function_name: []const u8,
     expected: bool,
 ) !void {
-    var interpreter = zap.ctfe.Interpreter.init(alloc, &program);
+    var interpreter = try zap.ctfe.Interpreter.init(alloc, &program);
     defer interpreter.deinit();
     const value = try interpreter.evalByName(function_name, &.{});
 
@@ -9453,7 +10455,7 @@ fn expectCtfeInt(
     function_name: []const u8,
     expected: i64,
 ) !void {
-    var interpreter = zap.ctfe.Interpreter.init(alloc, &program);
+    var interpreter = try zap.ctfe.Interpreter.init(alloc, &program);
     defer interpreter.deinit();
     const value = try interpreter.evalByName(function_name, &.{});
 
@@ -9862,7 +10864,9 @@ fn materializeAnalysisArcOps(
     progressStage(options, "ARC: materializing analysis operations", .{});
     for (program.functions, 0..) |_, fi| {
         const function: *ir.Function = @constCast(&program.functions[fi]);
-        zap.arc_materialize.materializeAnalysisArcOps(alloc, function, analysis_context, declared_caps) catch return error.IrFailed;
+        zap.arc_materialize.materializeAnalysisArcOps(alloc, function, analysis_context, declared_caps) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
     }
     try runArcVerifier(alloc, program, type_store, options);
 }
@@ -9969,7 +10973,7 @@ fn runArcScopeExitDropInsertion(
         // walks every release (including the ones the scope-exit
         // pass just inserted) and flips the `kind` + `protocol_name`
         // payload where the value local hits the sidecar.
-        zap.arc_drop_insertion.rewriteProtocolBoxReleases(function);
+        zap.arc_drop_insertion.rewriteProtocolBoxReleases(alloc, function) catch return error.OutOfMemory;
         // Phase 3 (INDIVIDUAL_NO_REFCOUNT static free-at-last-use): relocate
         // each scope-exit owned-local drop to immediately after its proven
         // last use, so a boxed value is reclaimed BEFORE a mid-scope
@@ -10414,7 +11418,10 @@ fn applyErrorDeclDesugar(
     program: *ast.Program,
 ) CompileError!void {
     var desugarer = zap.Desugarer.init(alloc, interner_arg, null);
-    desugarer.desugarErrorDecls(program) catch return error.DesugarFailed;
+    desugarer.desugarErrorDecls(program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.DesugarFailed,
+    };
 }
 
 fn mergePrograms(alloc: std.mem.Allocator, programs: []const ast.Program) !ast.Program {
@@ -10441,13 +11448,22 @@ fn cloneAstProgramOwned(
     alloc: std.mem.Allocator,
     program: ast.Program,
     interner: *const ast.StringInterner,
-) !ast.Program {
+    diag_engine: ?*zap.DiagnosticEngine,
+) CompileError!ast.Program {
     var cloned = program;
     const identity_remap = try alloc.alloc(ast.StringId, interner.strings.items.len);
     for (identity_remap, 0..) |*slot, index| {
         slot.* = @intCast(index);
     }
-    try remapProgram(alloc, &cloned, identity_remap);
+    remapProgram(alloc, &cloned, identity_remap) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AstRemapDepthExceeded => {
+            if (diag_engine) |engine| {
+                reportAstRemapDepthExceeded(engine, 0) catch return error.OutOfMemory;
+            }
+            return error.CollectFailed;
+        },
+    };
     return cloned;
 }
 
@@ -10456,21 +11472,22 @@ fn emitParseErrorsFromUnits(
     parse_errors: []const zap.Parser.Error,
     source_units: []const SourceUnit,
     use_color: bool,
-) void {
+) std.mem.Allocator.Error!void {
     var engine = zap.DiagnosticEngine.init(alloc);
+    defer engine.deinit();
     engine.use_color = use_color;
-    setDiagnosticSources(&engine, source_units);
+    try setDiagnosticSources(&engine, source_units);
     for (parse_errors) |parse_err| {
-        engine.reportDiagnostic(.{
+        try engine.reportDiagnostic(.{
             .severity = .@"error",
             .domain = .parse,
             .message = parse_err.message,
             .span = parse_err.span,
             .label = parse_err.label,
             .help = parse_err.help,
-        }) catch {};
+        });
     }
-    emitDiagnostics(&engine, alloc);
+    try emitDiagnostics(&engine, alloc);
 }
 
 /// Route a single-file's parser errors through the UNIFIED diagnostic path
@@ -10485,18 +11502,24 @@ pub fn emitScriptParseErrors(
     parse_errors: []const zap.Parser.Error,
     file_path: []const u8,
     source: []const u8,
-) void {
+) std.mem.Allocator.Error!void {
     const units = [_]SourceUnit{.{ .file_path = file_path, .source = source }};
-    emitParseErrorsFromUnits(alloc, parse_errors, &units, zap.diagnostics.detectColor());
+    try emitParseErrorsFromUnits(alloc, parse_errors, &units, zap.diagnostics.detectColor());
 }
 
-fn setDiagnosticSources(engine: *zap.DiagnosticEngine, source_units: []const SourceUnit) void {
-    const sources = engine.allocator.alloc(zap.DiagnosticEngine.SourceFile, source_units.len) catch return;
-    defer engine.allocator.free(sources);
-    for (source_units, 0..) |unit, i| {
-        sources[i] = .{ .source = unit.source, .file_path = unit.file_path };
+fn setDiagnosticSources(engine: *zap.DiagnosticEngine, source_units: []const SourceUnit) std.mem.Allocator.Error!void {
+    try engine.sources.ensureTotalCapacity(engine.allocator, source_units.len);
+    engine.sources.clearRetainingCapacity();
+    for (source_units) |unit| {
+        engine.sources.appendAssumeCapacity(.{ .source = unit.source, .file_path = unit.file_path });
     }
-    engine.setSources(sources);
+    if (source_units.len > 0) {
+        engine.source = source_units[0].source;
+        engine.file_path = source_units[0].file_path;
+    } else {
+        engine.source = null;
+        engine.file_path = null;
+    }
 }
 
 fn emitDiagnosticsFromUnits(
@@ -10504,12 +11527,13 @@ fn emitDiagnosticsFromUnits(
     diagnostics: []const zap.diagnostics.Diagnostic,
     source_units: []const SourceUnit,
     use_color: bool,
-) void {
+) std.mem.Allocator.Error!void {
     var engine = zap.DiagnosticEngine.init(alloc);
+    defer engine.deinit();
     engine.use_color = use_color;
-    setDiagnosticSources(&engine, source_units);
+    try setDiagnosticSources(&engine, source_units);
     for (diagnostics) |diag| {
-        engine.reportDiagnostic(.{
+        try engine.reportDiagnostic(.{
             .severity = diag.severity,
             .message = diag.message,
             .span = diag.span,
@@ -10519,17 +11543,17 @@ fn emitDiagnosticsFromUnits(
             .help = diag.help,
             .suggestion = diag.suggestion,
             .code = diag.code,
-        }) catch {};
+        });
     }
-    emitDiagnostics(&engine, alloc);
+    try emitDiagnostics(&engine, alloc);
 }
 
-fn emitContextDiagnostics(ctx: *const CompilationContext, alloc: std.mem.Allocator) void {
+fn emitContextDiagnostics(ctx: *const CompilationContext, alloc: std.mem.Allocator) std.mem.Allocator.Error!void {
     const engine = @constCast(&ctx.diag_engine);
     // Phase 4.b: give the renderer the interner so a diagnostic's macro-
     // expansion backtrace can resolve interned `macro_name`s to their text.
     engine.setInterner(ctx.interner);
-    emitDiagnostics(engine, alloc);
+    try emitDiagnostics(engine, alloc);
 }
 
 fn structNameToOwnedString(
@@ -10549,7 +11573,7 @@ fn lookupStructProgram(ctx: *const CompilationContext, mod_name: []const u8) ?*c
 
 /// Compile a Zap source file through the frontend and ZIR backend to produce
 /// a native binary.
-fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator) void {
+fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator) std.mem.Allocator.Error!void {
     // Honor the process-wide diagnostic-output policy (set once at CLI parse):
     // the security tier governs path stripping, and the format selects the
     // human text renderer or the stable LSP-projectable JSON schema.
@@ -10558,7 +11582,8 @@ fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator)
 
     switch (policy.format) {
         .text => {
-            const rendered = diag_engine.format(alloc) catch return;
+            const rendered = try diag_engine.format(alloc);
+            defer alloc.free(rendered);
             // Route through the diagnostics module's embedder-owned stderr sink
             // rather than hardwiring `std.debug.print`: production writes to the
             // real stderr, while a unit-test build discards by default so a
@@ -10571,7 +11596,8 @@ fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator)
             // `--error-format=json`: emit the canonical Error IR as a single
             // JSON document on STDOUT (the machine channel), so a tool can
             // consume it cleanly while human progress stays on stderr.
-            const json_text = zap.error_json.serialize(diag_engine, alloc) catch return;
+            const json_text = try zap.error_json.serialize(diag_engine, alloc);
+            defer alloc.free(json_text);
             writeStdoutAll(json_text);
             writeStdoutAll("\n");
         },
@@ -10587,12 +11613,12 @@ fn emitDiagnostics(diag_engine: *zap.DiagnosticEngine, alloc: std.mem.Allocator)
 /// The caller decides what to do next (typically `std.process.exit(1)`); this
 /// only emits. `code` is a stable `Z9xxx` band identifier (see
 /// `diagnostics.ICE_CODE_PREFIX`).
-pub fn emitIce(alloc: std.mem.Allocator, pass: []const u8, code: []const u8, message: []const u8) void {
+pub fn emitIce(alloc: std.mem.Allocator, pass: []const u8, code: []const u8, message: []const u8) std.mem.Allocator.Error!void {
     var engine = zap.DiagnosticEngine.init(alloc);
     defer engine.deinit();
     engine.use_color = zap.diagnostics.detectColor();
-    engine.reportDiagnostic(zap.diagnostics.iceDiagnostic(pass, code, message)) catch return;
-    emitDiagnostics(&engine, alloc);
+    try engine.reportDiagnostic(zap.diagnostics.iceDiagnostic(pass, code, message));
+    try emitDiagnostics(&engine, alloc);
 }
 
 /// Map an internal error value to a structured ICE and emit it (Phase 4.b).
@@ -10607,9 +11633,10 @@ pub fn emitIceFromError(
     code: []const u8,
     context: []const u8,
     err: anyerror,
-) void {
-    const message = std.fmt.allocPrint(alloc, "{s}: {s}", .{ context, @errorName(err) }) catch context;
-    emitIce(alloc, pass, code, message);
+) std.mem.Allocator.Error!void {
+    const message = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ context, @errorName(err) });
+    defer alloc.free(message);
+    try emitIce(alloc, pass, code, message);
 }
 
 /// Write `bytes` to STDOUT (fd 1) with a partial-write loop. Used by the
@@ -10752,7 +11779,7 @@ pub fn validateOneStructPerFile(
     alloc: std.mem.Allocator,
     source: []const u8,
     file_path: []const u8,
-) ?[]const u8 {
+) !?[]const u8 {
     // Use an arena for scratch allocations (parser, name buffers).
     // Only the returned error message (if any) is allocated with the caller's allocator.
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -10760,11 +11787,13 @@ pub fn validateOneStructPerFile(
     const arena = arena_state.allocator();
 
     // Parse without stdlib — we only need to count struct declarations
-    var parser = zap.Parser.init(arena, source);
+    var parser = try zap.Parser.init(arena, source);
+    defer parser.deinit();
 
-    const program = parser.parseProgram() catch {
+    const program = parser.parseProgram() catch |err| switch (err) {
         // Parse errors will be caught later in the full compilation.
-        return null;
+        error.ParseError => return null,
+        else => return err,
     };
 
     // The file's "primary" struct names the file. A struct with items
@@ -10834,17 +11863,17 @@ pub fn validateOneStructPerFile(
     }
 
     if (primary_count > 1) {
-        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found {d}", .{ file_path, primary_count }) catch "file has multiple structs";
+        return try std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found {d}", .{ file_path, primary_count });
     }
 
     // No primary: exactly one data struct stands in as the primary.
     // More than one data struct (with no primary to anchor the file)
     // is ambiguous and rejected.
     if (primary_count == 0 and data_struct_count == 0) {
-        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found none", .{file_path}) catch "file has no struct";
+        return try std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found none", .{file_path});
     }
     if (primary_count == 0 and data_struct_count > 1) {
-        return std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found {d}", .{ file_path, data_struct_count }) catch "file has multiple structs";
+        return try std.fmt.allocPrint(alloc, "File `{s}` must contain exactly one struct declaration, found {d}", .{ file_path, data_struct_count });
     }
 
     const struct_name_parts: ?[]const ast.StringId = primary_name_parts orelse data_name_parts;
@@ -10853,8 +11882,8 @@ pub fn validateOneStructPerFile(
     const parts = struct_name_parts orelse return null;
     var actual_name: std.ArrayListUnmanaged(u8) = .empty;
     for (parts, 0..) |part, i| {
-        if (i > 0) actual_name.append(arena, '.') catch return null;
-        actual_name.appendSlice(arena, parser.interner.get(part)) catch return null;
+        if (i > 0) try actual_name.append(arena, '.');
+        try actual_name.appendSlice(arena, parser.interner.get(part));
     }
 
     // Build the expected struct name from the file path
@@ -10872,7 +11901,7 @@ pub fn validateOneStructPerFile(
     var first_seg = true;
     while (seg_iter.next()) |segment| {
         if (segment.len == 0) continue;
-        if (!first_seg) expected_name.append(arena, '.') catch return null;
+        if (!first_seg) try expected_name.append(arena, '.');
         first_seg = false;
 
         // Capitalize: convert snake_case to PascalCase
@@ -10883,10 +11912,10 @@ pub fn validateOneStructPerFile(
                 capitalize_next = true;
             } else {
                 if (capitalize_next) {
-                    expected_name.append(arena, std.ascii.toUpper(c)) catch return null;
+                    try expected_name.append(arena, std.ascii.toUpper(c));
                     capitalize_next = false;
                 } else {
-                    expected_name.append(arena, c) catch return null;
+                    try expected_name.append(arena, c);
                 }
             }
         }
@@ -10894,11 +11923,11 @@ pub fn validateOneStructPerFile(
 
     if (!std.mem.eql(u8, actual_name.items, expected_name.items)) {
         // Allocate the error message with the caller's allocator so it outlives the arena
-        return std.fmt.allocPrint(
+        return try std.fmt.allocPrint(
             alloc,
             "Struct name `{s}` does not match file path `{s}` — expected `{s}`",
             .{ actual_name.items, file_path, expected_name.items },
-        ) catch "struct name does not match file path";
+        );
     }
 
     return null;
@@ -11301,7 +12330,20 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
 const ParseTaskResult = struct {
     failed: bool = false,
     errors: []const zap.Parser.Error = &.{},
+    infrastructure_error: ?CompileError = null,
 };
+
+fn storeParseTaskErrors(
+    alloc: std.mem.Allocator,
+    parse_errors: []const zap.Parser.Error,
+    out_result: *ParseTaskResult,
+) void {
+    if (parse_errors.len == 0) return;
+    out_result.errors = alloc.dupe(zap.Parser.Error, parse_errors) catch {
+        out_result.infrastructure_error = error.OutOfMemory;
+        return;
+    };
+}
 
 /// Task function for parallel file parsing via Io.Group.
 /// Each task creates its own parser with a private local interner,
@@ -11318,20 +12360,54 @@ fn parseFileTask(
     var parser = zap.Parser.initWithSharedInternerScriptMode(alloc, source, interner, source_id, script_mode);
     defer parser.deinit();
 
-    out_program.* = parser.parseProgram() catch {
+    out_program.* = parser.parseProgram() catch |err| {
         out_result.failed = true;
-        out_result.errors = parser.errors.toOwnedSlice(alloc) catch &.{};
+        if (err == error.OutOfMemory) {
+            out_result.infrastructure_error = error.OutOfMemory;
+            return;
+        }
+        storeParseTaskErrors(alloc, parser.errors.items, out_result);
         return;
     };
 
     if (parser.errors.items.len > 0) {
-        out_result.errors = parser.errors.toOwnedSlice(alloc) catch &.{};
+        storeParseTaskErrors(alloc, parser.errors.items, out_result);
     }
 }
 
 // ============================================================
 // Interner merging and AST remapping
 // ============================================================
+
+const RemapError = error{ OutOfMemory, AstRemapDepthExceeded };
+
+const MAX_AST_REMAP_DEPTH: u32 = 512;
+threadlocal var ast_remap_depth: u32 = 0;
+
+fn enterAstRemapNode() RemapError!void {
+    if (ast_remap_depth >= MAX_AST_REMAP_DEPTH) return error.AstRemapDepthExceeded;
+    ast_remap_depth += 1;
+}
+
+fn leaveAstRemapNode() void {
+    std.debug.assert(ast_remap_depth > 0);
+    ast_remap_depth -= 1;
+}
+
+fn reportAstRemapDepthExceeded(
+    diag_engine: *zap.DiagnosticEngine,
+    source_index: usize,
+) error{OutOfMemory}!void {
+    const source_id: u32 = @intCast(source_index);
+    try diag_engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .domain = .parse,
+        .message = "project AST is too deeply nested to remap safely",
+        .span = .{ .start = 0, .end = 0, .source_id = source_id },
+        .label = "AST remap depth budget exhausted in this source unit",
+        .help = "reduce generated syntax nesting or split deeply nested expressions, patterns, or type annotations into smaller declarations",
+    });
+}
 
 /// Build a remap table from a local interner to the global interner.
 /// For each string in `local_interner`, interns it into `global_interner`
@@ -11354,7 +12430,7 @@ fn remapProgram(
     alloc: std.mem.Allocator,
     program: *ast.Program,
     remap: []const ast.StringId,
-) !void {
+) RemapError!void {
     // Remap structs (mutable copy needed since program.structs is []const)
     if (program.structs.len > 0) {
         const mutable_structs = try alloc.alloc(ast.StructDecl, program.structs.len);
@@ -11376,7 +12452,7 @@ fn remapProgram(
     }
 }
 
-fn remapStructName(alloc: std.mem.Allocator, name: *ast.StructName, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapStructName(alloc: std.mem.Allocator, name: *ast.StructName, remap: []const ast.StringId) RemapError!void {
     if (name.parts.len > 0) {
         const mutable_parts = try alloc.alloc(ast.StringId, name.parts.len);
         for (name.parts, 0..) |part, i| {
@@ -11386,7 +12462,7 @@ fn remapStructName(alloc: std.mem.Allocator, name: *ast.StructName, remap: []con
     }
 }
 
-fn remapStructDecl(alloc: std.mem.Allocator, mod: *ast.StructDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapStructDecl(alloc: std.mem.Allocator, mod: *ast.StructDecl, remap: []const ast.StringId) RemapError!void {
     try remapStructName(alloc, &mod.name, remap);
     if (mod.parent) |p| mod.parent = remap[p];
     // Parametric type parameters on `pub struct Foo(T)` carry the
@@ -11432,7 +12508,7 @@ fn remapStructDecl(alloc: std.mem.Allocator, mod: *ast.StructDecl, remap: []cons
     }
 }
 
-fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast.StringId) RemapError!void {
     switch (item.*) {
         .struct_decl, .priv_struct_decl => |mod_ptr| {
             const mutable = try alloc.create(ast.StructDecl);
@@ -11516,7 +12592,7 @@ fn remapTopItem(alloc: std.mem.Allocator, item: *ast.TopItem, remap: []const ast
     }
 }
 
-fn remapErrorDecl(alloc: std.mem.Allocator, ed: *ast.ErrorDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapErrorDecl(alloc: std.mem.Allocator, ed: *ast.ErrorDecl, remap: []const ast.StringId) RemapError!void {
     try remapStructName(alloc, &ed.name, remap);
     if (ed.type_params.len > 0) {
         const mutable_params = try alloc.alloc(ast.StringId, ed.type_params.len);
@@ -11559,7 +12635,7 @@ fn remapErrorDecl(alloc: std.mem.Allocator, ed: *ast.ErrorDecl, remap: []const a
     }
 }
 
-fn remapProtocolDecl(alloc: std.mem.Allocator, proto: *ast.ProtocolDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapProtocolDecl(alloc: std.mem.Allocator, proto: *ast.ProtocolDecl, remap: []const ast.StringId) RemapError!void {
     // Remap protocol name parts
     const new_parts = try alloc.alloc(ast.StringId, proto.name.parts.len);
     for (proto.name.parts, 0..) |part, i| {
@@ -11604,7 +12680,7 @@ fn remapProtocolDecl(alloc: std.mem.Allocator, proto: *ast.ProtocolDecl, remap: 
     proto.functions = new_fns;
 }
 
-fn remapImplDecl(alloc: std.mem.Allocator, impl_d: *ast.ImplDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapImplDecl(alloc: std.mem.Allocator, impl_d: *ast.ImplDecl, remap: []const ast.StringId) RemapError!void {
     // Remap protocol name parts
     const new_proto_parts = try alloc.alloc(ast.StringId, impl_d.protocol_name.parts.len);
     for (impl_d.protocol_name.parts, 0..) |part, i| {
@@ -11653,7 +12729,7 @@ fn remapImplDecl(alloc: std.mem.Allocator, impl_d: *ast.ImplDecl, remap: []const
     impl_d.functions = new_fns;
 }
 
-fn remapStructItem(alloc: std.mem.Allocator, item: *ast.StructItem, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapStructItem(alloc: std.mem.Allocator, item: *ast.StructItem, remap: []const ast.StringId) RemapError!void {
     switch (item.*) {
         .type_decl => |td| {
             const mutable = try alloc.create(ast.TypeDecl);
@@ -11731,7 +12807,7 @@ fn remapStructItem(alloc: std.mem.Allocator, item: *ast.StructItem, remap: []con
     }
 }
 
-fn remapAttributeDecl(alloc: std.mem.Allocator, attr: *ast.AttributeDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapAttributeDecl(alloc: std.mem.Allocator, attr: *ast.AttributeDecl, remap: []const ast.StringId) RemapError!void {
     attr.name = remap[attr.name];
     if (attr.type_expr) |type_expr| {
         const mutable_type_expr = try alloc.create(ast.TypeExpr);
@@ -11747,7 +12823,7 @@ fn remapAttributeDecl(alloc: std.mem.Allocator, attr: *ast.AttributeDecl, remap:
     }
 }
 
-fn remapTypeDecl(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapTypeDecl(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) RemapError!void {
     td.name = remap[td.name];
     try remapTypeParams(alloc, td, remap);
     const mutable_body = try alloc.create(ast.TypeExpr);
@@ -11756,7 +12832,7 @@ fn remapTypeDecl(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast
     td.body = mutable_body;
 }
 
-fn remapOpaqueDecl(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapOpaqueDecl(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) RemapError!void {
     od.name = remap[od.name];
     try remapOpaqueParams(alloc, od, remap);
     const mutable_body = try alloc.create(ast.TypeExpr);
@@ -11765,7 +12841,7 @@ fn remapOpaqueDecl(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const
     od.body = mutable_body;
 }
 
-fn remapTypeParams(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapTypeParams(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const ast.StringId) RemapError!void {
     if (td.params.len > 0) {
         const mutable_params = try alloc.alloc(ast.TypeParam, td.params.len);
         for (td.params, 0..) |p, i| {
@@ -11776,7 +12852,7 @@ fn remapTypeParams(alloc: std.mem.Allocator, td: *ast.TypeDecl, remap: []const a
     }
 }
 
-fn remapOpaqueParams(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapOpaqueParams(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []const ast.StringId) RemapError!void {
     if (od.params.len > 0) {
         const mutable_params = try alloc.alloc(ast.TypeParam, od.params.len);
         for (od.params, 0..) |p, i| {
@@ -11787,7 +12863,7 @@ fn remapOpaqueParams(alloc: std.mem.Allocator, od: *ast.OpaqueDecl, remap: []con
     }
 }
 
-fn remapUnionDecl(alloc: std.mem.Allocator, ud: *ast.UnionDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapUnionDecl(alloc: std.mem.Allocator, ud: *ast.UnionDecl, remap: []const ast.StringId) RemapError!void {
     ud.name = remap[ud.name];
     // Parametric type parameters on `pub union Foo(T)` — same remap
     // contract as `remapStructDecl`'s `mod.type_params`. The
@@ -11818,7 +12894,7 @@ fn remapUnionDecl(alloc: std.mem.Allocator, ud: *ast.UnionDecl, remap: []const a
     }
 }
 
-fn remapFunctionDecl(alloc: std.mem.Allocator, fd: *ast.FunctionDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapFunctionDecl(alloc: std.mem.Allocator, fd: *ast.FunctionDecl, remap: []const ast.StringId) RemapError!void {
     fd.name = remap[fd.name];
     if (fd.name_expr) |ne| {
         const mutable_ne = try alloc.create(ast.Expr);
@@ -11836,7 +12912,7 @@ fn remapFunctionDecl(alloc: std.mem.Allocator, fd: *ast.FunctionDecl, remap: []c
     }
 }
 
-fn remapFunctionClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapFunctionClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, remap: []const ast.StringId) RemapError!void {
     if (clause.params.len > 0) {
         const mutable_params = try alloc.alloc(ast.Param, clause.params.len);
         for (clause.params, 0..) |p, i| {
@@ -11893,7 +12969,7 @@ fn remapFunctionClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, re
     }
 }
 
-fn remapStmtsForClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, remap: []const ast.StringId, body: []const ast.Stmt) !void {
+fn remapStmtsForClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, remap: []const ast.StringId, body: []const ast.Stmt) RemapError!void {
     const mutable_body = try alloc.alloc(ast.Stmt, body.len);
     @memcpy(mutable_body, body);
     for (mutable_body) |*stmt| {
@@ -11902,7 +12978,7 @@ fn remapStmtsForClause(alloc: std.mem.Allocator, clause: *ast.FunctionClause, re
     clause.body = mutable_body;
 }
 
-fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.StringId) RemapError!void {
     switch (stmt.*) {
         .expr => |e| {
             const mutable = try alloc.create(ast.Expr);
@@ -11950,7 +13026,7 @@ fn remapStmt(alloc: std.mem.Allocator, stmt: *ast.Stmt, remap: []const ast.Strin
     }
 }
 
-fn remapImportDecl(alloc: std.mem.Allocator, id: *ast.ImportDecl, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapImportDecl(alloc: std.mem.Allocator, id: *ast.ImportDecl, remap: []const ast.StringId) RemapError!void {
     try remapStructName(alloc, &id.struct_path, remap);
     if (id.filter) |*filter| {
         switch (filter.*) {
@@ -11978,7 +13054,10 @@ fn remapImportDecl(alloc: std.mem.Allocator, id: *ast.ImportDecl, remap: []const
     }
 }
 
-fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.StringId) RemapError!void {
+    try enterAstRemapNode();
+    defer leaveAstRemapNode();
+
     switch (expr.*) {
         .string_literal => |*sl| sl.value = remap[sl.value],
         .atom_literal => |*al| al.value = remap[al.value],
@@ -12423,7 +13502,7 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
     }
 }
 
-fn remapStmtSlice(alloc: std.mem.Allocator, stmts: *[]const ast.Stmt, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapStmtSlice(alloc: std.mem.Allocator, stmts: *[]const ast.Stmt, remap: []const ast.StringId) RemapError!void {
     if (stmts.len > 0) {
         const mutable = try alloc.alloc(ast.Stmt, stmts.len);
         @memcpy(mutable, stmts.*);
@@ -12434,7 +13513,7 @@ fn remapStmtSlice(alloc: std.mem.Allocator, stmts: *[]const ast.Stmt, remap: []c
     }
 }
 
-fn remapCaseClause(alloc: std.mem.Allocator, clause: *ast.CaseClause, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapCaseClause(alloc: std.mem.Allocator, clause: *ast.CaseClause, remap: []const ast.StringId) RemapError!void {
     const mutable_pat = try alloc.create(ast.Pattern);
     mutable_pat.* = clause.pattern.*;
     try remapPattern(alloc, mutable_pat, remap);
@@ -12454,7 +13533,7 @@ fn remapCaseClause(alloc: std.mem.Allocator, clause: *ast.CaseClause, remap: []c
     try remapStmtSlice(alloc, &clause.body, remap);
 }
 
-fn remapBinarySegments(alloc: std.mem.Allocator, bl: *ast.BinaryLiteral, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapBinarySegments(alloc: std.mem.Allocator, bl: *ast.BinaryLiteral, remap: []const ast.StringId) RemapError!void {
     if (bl.segments.len > 0) {
         const mutable_segs = try alloc.alloc(ast.BinarySegment, bl.segments.len);
         for (bl.segments, 0..) |seg, i| {
@@ -12465,7 +13544,7 @@ fn remapBinarySegments(alloc: std.mem.Allocator, bl: *ast.BinaryLiteral, remap: 
     }
 }
 
-fn remapBinarySegment(alloc: std.mem.Allocator, seg: *ast.BinarySegment, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapBinarySegment(alloc: std.mem.Allocator, seg: *ast.BinarySegment, remap: []const ast.StringId) RemapError!void {
     switch (seg.value) {
         .expr => |e| {
             const mutable = try alloc.create(ast.Expr);
@@ -12489,7 +13568,10 @@ fn remapBinarySegment(alloc: std.mem.Allocator, seg: *ast.BinarySegment, remap: 
     }
 }
 
-fn remapPattern(alloc: std.mem.Allocator, pattern: *ast.Pattern, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapPattern(alloc: std.mem.Allocator, pattern: *ast.Pattern, remap: []const ast.StringId) RemapError!void {
+    try enterAstRemapNode();
+    defer leaveAstRemapNode();
+
     switch (pattern.*) {
         .bind => |*bp| bp.name = remap[bp.name],
         .pin => |*pp| pp.name = remap[pp.name],
@@ -12616,7 +13698,10 @@ fn remapPattern(alloc: std.mem.Allocator, pattern: *ast.Pattern, remap: []const 
     }
 }
 
-fn remapTypeExpr(alloc: std.mem.Allocator, te: *ast.TypeExpr, remap: []const ast.StringId) error{OutOfMemory}!void {
+fn remapTypeExpr(alloc: std.mem.Allocator, te: *ast.TypeExpr, remap: []const ast.StringId) RemapError!void {
+    try enterAstRemapNode();
+    defer leaveAstRemapNode();
+
     switch (te.*) {
         .name => |*tne| {
             tne.name = remap[tne.name];
@@ -12731,14 +13816,14 @@ fn remapTypeExpr(alloc: std.mem.Allocator, te: *ast.TypeExpr, remap: []const ast
 test "validateOneStructPerFile: valid single struct" {
     const alloc = std.testing.allocator;
     const source = "pub struct Config {\n  pub fn load() -> String {\n    \"ok\"\n  }\n}\n";
-    const result = validateOneStructPerFile(alloc, source, "config.zap");
+    const result = try validateOneStructPerFile(alloc, source, "config.zap");
     try std.testing.expectEqual(null, result);
 }
 
 test "validateOneStructPerFile: valid nested struct name" {
     const alloc = std.testing.allocator;
     const source = "pub struct Config.Parser {\n  pub fn parse() -> String {\n    \"ok\"\n  }\n}\n";
-    const result = validateOneStructPerFile(alloc, source, "config/parser.zap");
+    const result = try validateOneStructPerFile(alloc, source, "config/parser.zap");
     try std.testing.expectEqual(null, result);
 }
 
@@ -12746,25 +13831,25 @@ test "validateOneStructPerFile: valid source-root relative test struct names" {
     const alloc = std.testing.allocator;
 
     const root_source = "pub struct PatternMatchingTest {\n  pub fn run() -> String {\n    \"ok\"\n  }\n}\n";
-    const root_result = validateOneStructPerFile(alloc, root_source, "pattern_matching_test.zap");
+    const root_result = try validateOneStructPerFile(alloc, root_source, "pattern_matching_test.zap");
     try std.testing.expectEqual(null, root_result);
 
     const nested_source = "pub struct Zap.ListTest {\n  pub fn run() -> String {\n    \"ok\"\n  }\n}\n";
-    const nested_result = validateOneStructPerFile(alloc, nested_source, "zap/list_test.zap");
+    const nested_result = try validateOneStructPerFile(alloc, nested_source, "zap/list_test.zap");
     try std.testing.expectEqual(null, nested_result);
 }
 
 test "validateOneStructPerFile: valid private struct" {
     const alloc = std.testing.allocator;
     const source = "struct Config.Helpers {\n  pub fn help() -> String {\n    \"ok\"\n  }\n}\n";
-    const result = validateOneStructPerFile(alloc, source, "config/helpers.zap");
+    const result = try validateOneStructPerFile(alloc, source, "config/helpers.zap");
     try std.testing.expectEqual(null, result);
 }
 
 test "validateOneStructPerFile: field-only struct is a valid struct" {
     const alloc = std.testing.allocator;
     const source = "pub struct Point {\n  x :: i64\n}\n";
-    const result = validateOneStructPerFile(alloc, source, "point.zap");
+    const result = try validateOneStructPerFile(alloc, source, "point.zap");
     // Field-only data structs are valid struct declarations.
     try std.testing.expect(result == null);
 }
@@ -12772,7 +13857,7 @@ test "validateOneStructPerFile: field-only struct is a valid struct" {
 test "validateOneStructPerFile: multiple structs is error" {
     const alloc = std.testing.allocator;
     const source = "pub struct Foo {\n  pub fn foo() -> i64 {\n    1\n  }\n}\npub struct Bar {\n  pub fn bar() -> i64 {\n    2\n  }\n}\n";
-    const result = validateOneStructPerFile(alloc, source, "foo.zap");
+    const result = try validateOneStructPerFile(alloc, source, "foo.zap");
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.find(u8, result.?, "found 2") != null);
     alloc.free(result.?);
@@ -12781,7 +13866,7 @@ test "validateOneStructPerFile: multiple structs is error" {
 test "validateOneStructPerFile: name mismatch is error" {
     const alloc = std.testing.allocator;
     const source = "pub struct WrongName {\n  pub fn foo() -> i64 {\n    1\n  }\n}\n";
-    const result = validateOneStructPerFile(alloc, source, "config.zap");
+    const result = try validateOneStructPerFile(alloc, source, "config.zap");
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.find(u8, result.?, "does not match") != null);
     alloc.free(result.?);
@@ -12793,7 +13878,7 @@ test "validateOneStructPerFile: data structs alongside primary struct" {
         "pub struct Point {\n  x :: i64\n  y :: i64\n}\n" ++
         "pub struct Config {\n  name :: String\n}\n" ++
         "pub struct StructTest {\n  pub fn run() -> String {\n    \"ok\"\n  }\n}\n";
-    const result = validateOneStructPerFile(alloc, source, "struct_test.zap");
+    const result = try validateOneStructPerFile(alloc, source, "struct_test.zap");
     // The single method-bearing struct names the file; field-only
     // data structs ride along as supporting declarations.
     try std.testing.expect(result == null);
@@ -12804,7 +13889,7 @@ test "validateOneStructPerFile: multiple data structs without primary is error" 
     const source =
         "pub struct Point {\n  x :: i64\n}\n" ++
         "pub struct Config {\n  name :: String\n}\n";
-    const result = validateOneStructPerFile(alloc, source, "data.zap");
+    const result = try validateOneStructPerFile(alloc, source, "data.zap");
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.find(u8, result.?, "found 2") != null);
     alloc.free(result.?);
@@ -12813,8 +13898,51 @@ test "validateOneStructPerFile: multiple data structs without primary is error" 
 test "validateOneStructPerFile: snake_case path to PascalCase" {
     const alloc = std.testing.allocator;
     const source = "pub struct JsonParser {\n  pub fn parse() -> String {\n    \"ok\"\n  }\n}\n";
-    const result = validateOneStructPerFile(alloc, source, "json_parser.zap");
+    const result = try validateOneStructPerFile(alloc, source, "json_parser.zap");
     try std.testing.expectEqual(null, result);
+}
+
+fn countValidateOneStructPerFileAllocations(source: []const u8, file_path: []const u8) !usize {
+    var counting_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const counting_alloc = counting_allocator.allocator();
+
+    const result = try validateOneStructPerFile(counting_alloc, source, file_path);
+    if (result) |message| counting_alloc.free(message);
+
+    return counting_allocator.alloc_index;
+}
+
+fn expectValidateOneStructPerFileAllocationFailuresPropagate(source: []const u8, file_path: []const u8) !void {
+    const allocation_count = try countValidateOneStructPerFileAllocations(source, file_path);
+    try std.testing.expect(allocation_count > 0);
+
+    for (0..allocation_count) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        const failing_alloc = failing_allocator.allocator();
+
+        const result = validateOneStructPerFile(failing_alloc, source, file_path) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing_allocator.has_induced_failure);
+                continue;
+            },
+            else => return err,
+        };
+
+        try std.testing.expect(!failing_allocator.has_induced_failure);
+        if (result) |message| failing_alloc.free(message);
+    }
+}
+
+test "validateOneStructPerFile: scratch name allocation OOM propagates" {
+    const source = "pub struct Config.Parser {\n  pub fn parse() -> String {\n    \"ok\"\n  }\n}\n";
+    try expectValidateOneStructPerFileAllocationFailuresPropagate(source, "config/parser.zap");
+}
+
+test "validateOneStructPerFile: validation message allocation OOM propagates" {
+    const source = "pub struct Foo {\n  pub fn foo() -> i64 {\n    1\n  }\n}\npub struct Bar {\n  pub fn bar() -> i64 {\n    2\n  }\n}\n";
+    try expectValidateOneStructPerFileAllocationFailuresPropagate(source, "foo.zap");
 }
 
 test "buildStructPrograms stores per-struct AST programs" {
@@ -12828,7 +13956,7 @@ test "buildStructPrograms stores per-struct AST programs" {
         "}\n" ++
         "";
 
-    var parser = zap.Parser.init(alloc, source);
+    var parser = try zap.Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
@@ -12850,7 +13978,7 @@ test "buildCompilationUnits derives units from struct programs" {
         "pub struct Bar.Baz {\n" ++
         "}\n";
 
-    var parser = zap.Parser.init(alloc, source);
+    var parser = try zap.Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const struct_programs = try buildStructPrograms(alloc, &program, parser.interner);
@@ -12945,14 +14073,14 @@ test "collector can build graph from per-struct programs" {
         "  }\n" ++
         "}\n";
 
-    var parser = zap.Parser.init(alloc, source);
+    var parser = try zap.Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
     const struct_programs = try buildStructPrograms(alloc, &program, parser.interner);
     const program_slices = try alloc.alloc(ast.Program, struct_programs.len);
     for (struct_programs, 0..) |entry, i| program_slices[i] = entry.program;
 
-    var collector = zap.Collector.init(alloc, parser.interner, null);
+    var collector = try zap.Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     for (struct_programs) |entry| {
         try collector.collectProgramSurface(&entry.program);
@@ -12960,6 +14088,1337 @@ test "collector can build graph from per-struct programs" {
     try collector.finalizeCollectedPrograms(program_slices);
 
     try std.testing.expectEqual(@as(usize, 2), collector.graph.structs.items.len);
+}
+
+fn makeP4J2CompilerTestMeta() ast.NodeMeta {
+    return .{ .span = .{ .start = 0, .end = 1 } };
+}
+
+fn makeP4J2StructName(
+    allocator: std.mem.Allocator,
+    name_id: ast.StringId,
+) !ast.StructName {
+    const parts = try allocator.alloc(ast.StringId, 1);
+    parts[0] = name_id;
+    return .{ .parts = parts, .span = makeP4J2CompilerTestMeta().span };
+}
+
+fn makeP4J2DeepUnaryExpr(
+    allocator: std.mem.Allocator,
+    depth: usize,
+) !*const ast.Expr {
+    const meta = makeP4J2CompilerTestMeta();
+    var current = try allocator.create(ast.Expr);
+    current.* = .{ .int_literal = .{ .meta = meta, .value = 1 } };
+    for (0..depth) |_| {
+        const wrapper = try allocator.create(ast.Expr);
+        wrapper.* = .{ .unary_op = .{
+            .meta = meta,
+            .op = .not_op,
+            .operand = current,
+        } };
+        current = wrapper;
+    }
+    return current;
+}
+
+fn makeP4J2DeepUnarySource(
+    allocator: std.mem.Allocator,
+    struct_name: []const u8,
+    depth: usize,
+) ![]const u8 {
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    try source.appendSlice(allocator, "pub struct ");
+    try source.appendSlice(allocator, struct_name);
+    try source.appendSlice(allocator, " {\n  pub fn value() -> i64 {\n    ");
+    for (0..depth) |_| {
+        try source.appendSlice(allocator, "not ");
+    }
+    try source.appendSlice(allocator, "1\n  }\n}\n");
+    return source.toOwnedSlice(allocator);
+}
+
+fn makeP4J2KernelProgram(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    function_body_depth: usize,
+) !ast.Program {
+    const meta = makeP4J2CompilerTestMeta();
+    const kernel_name = try interner.intern(zap.discovery.kernel_struct_name);
+    const function_name = try interner.intern("deep");
+    const body_expr = try makeP4J2DeepUnaryExpr(allocator, function_body_depth);
+    const body = try allocator.alloc(ast.Stmt, 1);
+    body[0] = .{ .expr = body_expr };
+    const clauses = try allocator.alloc(ast.FunctionClause, 1);
+    clauses[0] = .{
+        .meta = meta,
+        .params = &.{},
+        .return_type = null,
+        .refinement = null,
+        .body = body,
+    };
+    const function = try allocator.create(ast.FunctionDecl);
+    function.* = .{
+        .meta = meta,
+        .name = function_name,
+        .clauses = clauses,
+        .visibility = .public,
+    };
+    const items = try allocator.alloc(ast.StructItem, 1);
+    items[0] = .{ .function = function };
+    const structs = try allocator.alloc(ast.StructDecl, 1);
+    structs[0] = .{
+        .meta = meta,
+        .name = try makeP4J2StructName(allocator, kernel_name),
+        .items = items,
+    };
+    return .{ .structs = structs, .top_items = &.{} };
+}
+
+fn makeP4J2FunctionProgram(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    struct_name_text: []const u8,
+    function_name_text: []const u8,
+    body_expr: *const ast.Expr,
+) !ast.Program {
+    const meta = makeP4J2CompilerTestMeta();
+    const struct_name = try interner.intern(struct_name_text);
+    const function_name = try interner.intern(function_name_text);
+    const body = try allocator.alloc(ast.Stmt, 1);
+    body[0] = .{ .expr = body_expr };
+    const clauses = try allocator.alloc(ast.FunctionClause, 1);
+    clauses[0] = .{
+        .meta = meta,
+        .params = &.{},
+        .return_type = null,
+        .refinement = null,
+        .body = body,
+    };
+    const function = try allocator.create(ast.FunctionDecl);
+    function.* = .{
+        .meta = meta,
+        .name = function_name,
+        .clauses = clauses,
+        .visibility = .public,
+    };
+    const items = try allocator.alloc(ast.StructItem, 1);
+    items[0] = .{ .function = function };
+    const structs = try allocator.alloc(ast.StructDecl, 1);
+    structs[0] = .{
+        .meta = meta,
+        .name = try makeP4J2StructName(allocator, struct_name),
+        .items = items,
+    };
+    return .{ .structs = structs, .top_items = &.{} };
+}
+
+fn makeP4J2EmptyStructProgram(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    struct_name_text: []const u8,
+) !ast.Program {
+    const structs = try allocator.alloc(ast.StructDecl, 1);
+    structs[0] = .{
+        .meta = makeP4J2CompilerTestMeta(),
+        .name = try makeP4J2StructName(allocator, try interner.intern(struct_name_text)),
+        .items = &.{},
+    };
+    return .{ .structs = structs, .top_items = &.{} };
+}
+
+fn makeP4J2ErrorDecl(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    error_name_text: []const u8,
+    code_text: []const u8,
+) !*const ast.ErrorDecl {
+    const decl = try allocator.create(ast.ErrorDecl);
+    decl.* = .{
+        .meta = makeP4J2CompilerTestMeta(),
+        .name = try makeP4J2StructName(allocator, try interner.intern(error_name_text)),
+        .code = try interner.intern(code_text),
+    };
+    return decl;
+}
+
+fn makeP4J2ErrorCodeCollisionProgram(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+) !ast.Program {
+    const top_items = try allocator.alloc(ast.TopItem, 2);
+    top_items[0] = .{ .error_decl = try makeP4J2ErrorDecl(allocator, interner, "FirstCollision", "Z4242") };
+    top_items[1] = .{ .error_decl = try makeP4J2ErrorDecl(allocator, interner, "SecondCollision", "Z4242") };
+    return .{ .structs = &.{}, .top_items = top_items };
+}
+
+fn makeP4J2IntLiteralExpr(
+    allocator: std.mem.Allocator,
+    value: i64,
+) !*const ast.Expr {
+    const expr = try allocator.create(ast.Expr);
+    expr.* = .{ .int_literal = .{ .meta = makeP4J2CompilerTestMeta(), .value = value } };
+    return expr;
+}
+
+fn makeP4J2AtomLiteralExpr(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    value: []const u8,
+) !*const ast.Expr {
+    const expr = try allocator.create(ast.Expr);
+    expr.* = .{ .atom_literal = .{
+        .meta = makeP4J2CompilerTestMeta(),
+        .value = try interner.intern(value),
+    } };
+    return expr;
+}
+
+fn makeP4J2ListExpr(
+    allocator: std.mem.Allocator,
+    elements: []const *const ast.Expr,
+) !*const ast.Expr {
+    const expr = try allocator.create(ast.Expr);
+    expr.* = .{ .list = .{
+        .meta = makeP4J2CompilerTestMeta(),
+        .elements = elements,
+    } };
+    return expr;
+}
+
+fn appendP4J2AvailableOnAttribute(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    graph: *zap.scope.ScopeGraph,
+    family_id: zap.scope.FunctionFamilyId,
+    value: *const ast.Expr,
+) !void {
+    const available_on_name = try interner.intern("available_on");
+    try graph.getFamilyMut(family_id).attributes.append(allocator, .{
+        .name = available_on_name,
+        .value = value,
+    });
+}
+
+fn makeP4J2TupleExpr(
+    allocator: std.mem.Allocator,
+) !*const ast.Expr {
+    const elements = try allocator.alloc(*const ast.Expr, 2);
+    elements[0] = try makeP4J2IntLiteralExpr(allocator, 1);
+    elements[1] = try makeP4J2IntLiteralExpr(allocator, 2);
+    const expr = try allocator.create(ast.Expr);
+    expr.* = .{ .tuple = .{ .meta = makeP4J2CompilerTestMeta(), .elements = elements } };
+    return expr;
+}
+
+fn makeP4J2CollectedContext(
+    allocator: std.mem.Allocator,
+    interner: *ast.StringInterner,
+    surface_program: *const ast.Program,
+    typecheck_program: *const ast.Program,
+    primary_struct_name: []const u8,
+) !CompilationContext {
+    var diag_engine = zap.DiagnosticEngine.init(allocator);
+    var collector = try zap.Collector.init(allocator, interner, null);
+    try collectProgramSurfaceForProject(
+        allocator,
+        &diag_engine,
+        &collector,
+        surface_program,
+        "P4J2 test collection",
+    );
+    const program_slices = try allocator.alloc(ast.Program, 1);
+    program_slices[0] = surface_program.*;
+    try finalizeCollectedProgramsForProject(
+        allocator,
+        &diag_engine,
+        &collector,
+        program_slices,
+        "P4J2 test collection finalization",
+    );
+    const struct_programs = try buildStructPrograms(allocator, typecheck_program, interner);
+    const source_units = try allocator.alloc(SourceUnit, 1);
+    source_units[0] = .{
+        .file_path = "p4j2_typecheck.zap",
+        .source = "",
+        .primary_struct_name = primary_struct_name,
+    };
+    const units = try buildCompilationUnits(allocator, struct_programs, source_units);
+    return .{
+        .alloc = allocator,
+        .merged_program = typecheck_program.*,
+        .struct_programs = struct_programs,
+        .units = units,
+        .source_units = source_units,
+        .interner = interner,
+        .collector = collector,
+        .diag_engine = diag_engine,
+    };
+}
+
+const P4J2CtfeAttributeFixture = struct {
+    ctx: CompilationContext,
+    ir_program: ir.Program,
+};
+
+fn makeP4J2CtfeFailingAttributeFixture(
+    allocator: std.mem.Allocator,
+) !P4J2CtfeAttributeFixture {
+    const instructions = try allocator.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .binary_op = .{ .dest = 2, .op = .div, .lhs = 0, .rhs = 1 } },
+        .{ .ret = .{ .value = 2 } },
+    });
+    const blocks = try allocator.dupe(ir.Block, &[_]ir.Block{.{
+        .label = 0,
+        .instructions = instructions,
+    }});
+    const functions = try allocator.dupe(ir.Function, &[_]ir.Function{.{
+        .id = 0,
+        .name = "Foo__compute",
+        .scope_id = 1,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .i64,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+    }});
+    const ir_program = ir.Program{
+        .functions = functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    const interner = try allocator.create(ast.StringInterner);
+    interner.* = ast.StringInterner.init(allocator);
+
+    var collector = try zap.Collector.init(allocator, interner, null);
+    const struct_scope = try collector.graph.createScope(0, .struct_scope);
+
+    const struct_name_id = try interner.intern("Foo");
+    const attribute_name_id = try interner.intern("config");
+    const callee_name_id = try interner.intern("compute");
+
+    const callee_expr = try allocator.create(ast.Expr);
+    callee_expr.* = .{ .var_ref = .{
+        .meta = makeP4J2CompilerTestMeta(),
+        .name = callee_name_id,
+    } };
+    const call_expr = try allocator.create(ast.Expr);
+    call_expr.* = .{ .call = .{
+        .meta = makeP4J2CompilerTestMeta(),
+        .callee = callee_expr,
+        .args = &.{},
+    } };
+
+    const struct_name = try makeP4J2StructName(allocator, struct_name_id);
+    const struct_decl = try allocator.create(ast.StructDecl);
+    struct_decl.* = .{
+        .meta = makeP4J2CompilerTestMeta(),
+        .name = struct_name,
+        .items = &.{},
+    };
+
+    try collector.graph.structs.append(allocator, .{
+        .name = struct_name,
+        .scope_id = struct_scope,
+        .decl = struct_decl,
+    });
+    try collector.graph.structs.items[0].attributes.append(allocator, .{
+        .name = attribute_name_id,
+        .value = call_expr,
+    });
+
+    return .{
+        .ctx = .{
+            .alloc = allocator,
+            .merged_program = .{ .structs = &.{}, .top_items = &.{} },
+            .struct_programs = &.{},
+            .units = &.{},
+            .source_units = &.{},
+            .interner = interner,
+            .collector = collector,
+            .diag_engine = zap.DiagnosticEngine.init(allocator),
+        },
+        .ir_program = ir_program,
+    };
+}
+
+test "P4J2: incremental parser diagnostic reporting OOM propagates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const bad_source =
+        "pub error ExistingError {}\n" ++
+        "pub struct BadParseReportOOM {\n" ++
+        "  pub fn broken() -> i64 {\n" ++
+        "    state :: Enumerable(i64) = []\n" ++
+        "    0\n" ++
+        "  }\n" ++
+        "}\n";
+    var units = [_]SourceUnit{.{
+        .file_path = "lib/bad_parse_report_oom.zap",
+        .source = bad_source,
+        .primary_struct_name = "BadParseReportOOM",
+    }};
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var diag_engine = zap.DiagnosticEngine.init(failing_alloc);
+    defer diag_engine.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        state.parseSourceUnit(
+            units[0],
+            &units,
+            0,
+            0,
+            alloc,
+            &diag_engine,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag_engine.errorCount());
+}
+
+test "P4J2: parse task error slice allocation OOM is carried in task result" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    const parse_errors = [_]zap.Parser.Error{.{
+        .message = "parse task error",
+        .span = .{ .start = 0, .end = 1 },
+    }};
+    var result = ParseTaskResult{};
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    storeParseTaskErrors(failing_alloc, &parse_errors, &result);
+
+    try std.testing.expectEqual(@as(?CompileError, error.OutOfMemory), result.infrastructure_error);
+    try std.testing.expectEqual(@as(usize, 0), result.errors.len);
+}
+
+test "P4J2: diagnostic source allocation OOM propagates" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var diag_engine = zap.DiagnosticEngine.init(failing_alloc);
+    defer diag_engine.deinit();
+
+    const source_units = [_]SourceUnit{.{
+        .file_path = "lib/source_report_oom.zap",
+        .source = "pub struct SourceReportOOM {}\n",
+    }};
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        setDiagnosticSources(&diag_engine, &source_units),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag_engine.sources.items.len);
+}
+
+test "P4J2: parser diagnostic report allocation OOM propagates" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    const parse_errors = [_]zap.Parser.Error{.{
+        .message = "parser diagnostic allocation failed",
+        .span = .{ .start = 0, .end = 1 },
+        .label = "parser diagnostic",
+    }};
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        emitParseErrorsFromUnits(failing_alloc, &parse_errors, &.{}, false),
+    );
+}
+
+test "P4J2: diagnostic report allocation OOM propagates" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    const diagnostics = [_]zap.diagnostics.Diagnostic{.{
+        .severity = .@"error",
+        .message = "diagnostic allocation failed",
+        .span = .{ .start = 0, .end = 1 },
+        .label = "diagnostic",
+    }};
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        emitDiagnosticsFromUnits(failing_alloc, &diagnostics, &.{}, false),
+    );
+}
+
+test "P4J2: diagnostic render allocation OOM propagates" {
+    const previous_policy = zap.diagnostics.outputPolicy();
+    defer zap.diagnostics.setOutputPolicy(previous_policy);
+    zap.diagnostics.setOutputPolicy(.{ .format = .text, .tier = .dev_local });
+
+    var diag_engine = zap.DiagnosticEngine.init(std.testing.allocator);
+    defer diag_engine.deinit();
+    try diag_engine.reportDiagnostic(.{
+        .severity = .@"error",
+        .message = "render allocation failed",
+        .span = .{ .start = 0, .end = 1 },
+    });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        emitDiagnostics(&diag_engine, failing_alloc),
+    );
+}
+
+test "P4J2: diagnostic reporting from source units still emits text" {
+    const previous_policy = zap.diagnostics.outputPolicy();
+    defer zap.diagnostics.setOutputPolicy(previous_policy);
+    zap.diagnostics.setOutputPolicy(.{ .format = .text, .tier = .dev_local });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(alloc);
+    const previous_capture = zap.diagnostics.installStderrCapture(.{
+        .list = &captured,
+        .allocator = alloc,
+    });
+    defer _ = zap.diagnostics.installStderrCapture(previous_capture);
+
+    const source =
+        "pub struct SourceReportOK {\n" ++
+        "  pub fn broken() -> i64 {\n" ++
+        "  }\n" ++
+        "}\n";
+    const source_units = [_]SourceUnit{.{
+        .file_path = "lib/source_report_ok.zap",
+        .source = source,
+    }};
+    const diagnostics = [_]zap.diagnostics.Diagnostic{.{
+        .severity = .@"error",
+        .message = "expected expression",
+        .span = .{ .start = 50, .end = 51, .line = 3, .col = 3, .source_id = 0 },
+        .label = "expression required here",
+    }};
+
+    try emitDiagnosticsFromUnits(alloc, &diagnostics, &source_units, false);
+
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "expected expression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured.items, "lib/source_report_ok.zap") != null);
+}
+
+test "P4J2: struct compile-order name append OOM propagates" {
+    const empty_program = ast.Program{ .structs = &.{}, .top_items = &.{} };
+    const struct_programs = [_]StructProgram{.{
+        .name = "SyntheticErrorStruct",
+        .program = empty_program,
+    }};
+
+    {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const failing_alloc = failing_allocator.allocator();
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer names.deinit(failing_alloc);
+        const graph_order = [_][]const u8{"OrderedStruct"};
+
+        failing_allocator.fail_index = failing_allocator.alloc_index;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            appendStructCompileOrderNames(failing_alloc, &names, &graph_order, &.{}),
+        );
+    }
+
+    {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const failing_alloc = failing_allocator.allocator();
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer names.deinit(failing_alloc);
+        const graph_order = [_][]const u8{};
+
+        failing_allocator.fail_index = failing_allocator.alloc_index;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            appendStructCompileOrderNames(failing_alloc, &names, &graph_order, &struct_programs),
+        );
+    }
+
+    {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        const failing_alloc = failing_allocator.allocator();
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer names.deinit(failing_alloc);
+
+        failing_allocator.fail_index = failing_allocator.alloc_index;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            appendStructCompileOrderNames(failing_alloc, &names, null, &struct_programs),
+        );
+    }
+}
+
+test "P4J2: struct compile-order name append preserves full frontend order" {
+    const empty_program = ast.Program{ .structs = &.{}, .top_items = &.{} };
+    const struct_programs = [_]StructProgram{
+        .{
+            .name = "OrderedStruct",
+            .program = empty_program,
+        },
+        .{
+            .name = "SyntheticErrorStruct",
+            .program = empty_program,
+        },
+    };
+    const graph_order = [_][]const u8{"OrderedStruct"};
+
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer names.deinit(std.testing.allocator);
+
+    try appendStructCompileOrderNames(
+        std.testing.allocator,
+        &names,
+        &graph_order,
+        &struct_programs,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), names.items.len);
+    try std.testing.expectEqualStrings("OrderedStruct", names.items[0]);
+    try std.testing.expectEqualStrings("SyntheticErrorStruct", names.items[1]);
+}
+
+test "P4J2: whole-program CTFE attribute errors fail IR phase" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fixture = try makeP4J2CtfeFailingAttributeFixture(alloc);
+    var pipeline = Pipeline.init(alloc, &fixture.ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+
+    try std.testing.expectError(
+        error.IrFailed,
+        pipeline.runCtfeAttributes(&fixture.ir_program, null),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fixture.ctx.diag_engine.errorCount());
+    const diagnostic = fixture.ctx.diag_engine.diagnostics.items[0];
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "division by zero") != null);
+    try std.testing.expect(diagnostic.label != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.label.?, "@config") != null);
+}
+
+test "P4J2: per-struct CTFE attribute infrastructure failure propagates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fixture = try makeP4J2CtfeFailingAttributeFixture(alloc);
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var pipeline = Pipeline.init(failing_alloc, &fixture.ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        pipeline.runCtfeAttributesForStruct("Foo", &fixture.ir_program),
+    );
+    try std.testing.expectEqual(@as(usize, 0), fixture.ctx.diag_engine.errorCount());
+}
+
+test "P4J2: per-struct CTFE attribute semantic failure remains IR failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fixture = try makeP4J2CtfeFailingAttributeFixture(alloc);
+    var pipeline = Pipeline.init(alloc, &fixture.ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+
+    try std.testing.expectError(
+        error.IrFailed,
+        pipeline.runCtfeAttributesForStruct("Foo", &fixture.ir_program),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fixture.ctx.diag_engine.errorCount());
+}
+
+test "P4J2: macro expansion wrapper propagates OutOfMemory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    const program = try makeP4J2EmptyStructProgram(setup_alloc, &interner, "MacroWrapperOOM");
+    var ctx = try makeP4J2CollectedContext(setup_alloc, &interner, &program, &program, "MacroWrapperOOM");
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var pipeline = Pipeline.init(failing_alloc, &ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        pipeline.runMacroExpand(&ctx.merged_program),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.diag_engine.errorCount());
+}
+
+test "P4J2: desugar wrapper propagates OutOfMemory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    const program = try makeP4J2EmptyStructProgram(setup_alloc, &interner, "DesugarWrapperOOM");
+    var ctx = try makeP4J2CollectedContext(setup_alloc, &interner, &program, &program, "DesugarWrapperOOM");
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var pipeline = Pipeline.init(failing_alloc, &ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        pipeline.runDesugar(&ctx.merged_program),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.diag_engine.errorCount());
+}
+
+test "P4J2: IR lowering wrapper propagates OutOfMemory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{.{
+        .file_path = "ir_wrapper_oom.zap",
+        .source = "pub struct IrWrapperOOM {\n" ++
+            "  pub fn answer() -> i64 { 42 }\n" ++
+            "}\n",
+    }};
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+    const mod_program = lookupStructProgram(&ctx, "IrWrapperOOM") orelse return error.TestUnexpectedResult;
+
+    var shared_store = try zap.types.TypeStore.init(alloc, ctx.interner);
+    defer shared_store.deinit();
+    const maybe_hir_result = try compileSingleStructHir(
+        alloc,
+        &ctx,
+        "IrWrapperOOM",
+        mod_program,
+        &shared_store,
+        0,
+        .{ .show_progress = false },
+    );
+    const hir_result = maybe_hir_result orelse return error.TestUnexpectedResult;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var pipeline = Pipeline.init(failing_alloc, &ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+    var next_try_id = hir_result.next_group_id;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        pipeline.runIrLoweringWithTryIdSeed(&hir_result.hir_program, &shared_store, &next_try_id, null),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.diag_engine.errorCount());
+}
+
+test "P4J2: target capability gate propagates gateAvailableOn allocation failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    var graph = try zap.scope.ScopeGraph.init(setup_alloc);
+    defer graph.deinit();
+
+    const unknown_family = try graph.createFamily(0, try interner.intern("unknown_gate"), 0, .public);
+    const unavailable_family = try graph.createFamily(0, try interner.intern("unavailable"), 0, .public);
+    try appendP4J2AvailableOnAttribute(
+        setup_alloc,
+        &interner,
+        &graph,
+        unknown_family,
+        try makeP4J2AtomLiteralExpr(setup_alloc, &interner, "not_a_capability"),
+    );
+    try appendP4J2AvailableOnAttribute(
+        setup_alloc,
+        &interner,
+        &graph,
+        unavailable_family,
+        try makeP4J2AtomLiteralExpr(setup_alloc, &interner, "processes"),
+    );
+
+    var diag_engine = zap.DiagnosticEngine.init(setup_alloc);
+    defer diag_engine.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        applyTargetCapabilityGate(
+            failing_alloc,
+            &graph,
+            &interner,
+            .{ .show_progress = false, .ctfe_target = "wasm32-wasi" },
+            &diag_engine,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag_engine.errorCount());
+    try std.testing.expectEqual(@as(?zap.scope.GatedOut, null), graph.getFamily(unavailable_family).gated_out);
+}
+
+test "P4J2: target capability gate propagates diagnostic reporting allocation failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    var graph = try zap.scope.ScopeGraph.init(setup_alloc);
+    defer graph.deinit();
+
+    const family_id = try graph.createFamily(0, try interner.intern("malformed_gate"), 0, .public);
+    try appendP4J2AvailableOnAttribute(
+        setup_alloc,
+        &interner,
+        &graph,
+        family_id,
+        try makeP4J2ListExpr(setup_alloc, &.{}),
+    );
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var diag_engine = zap.DiagnosticEngine.init(failing_alloc);
+    defer diag_engine.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        applyTargetCapabilityGate(
+            setup_alloc,
+            &graph,
+            &interner,
+            .{ .show_progress = false, .ctfe_target = "wasm32-wasi" },
+            &diag_engine,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag_engine.errorCount());
+}
+
+test "P4J2: error-code collision diagnostic OOM propagates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    const program = try makeP4J2ErrorCodeCollisionProgram(setup_alloc, &interner);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var diag_engine = zap.DiagnosticEngine.init(failing_alloc);
+    defer diag_engine.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        runErrorCodeCollisionCheck(setup_alloc, &[_]ast.Program{program}, &interner, &diag_engine),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag_engine.errorCount());
+}
+
+test "P4J2: parse task group failure is routed through diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var diag_engine = zap.DiagnosticEngine.init(alloc);
+    defer diag_engine.deinit();
+
+    try std.testing.expectEqual(
+        error.ParseFailed,
+        handleParseTaskGroupAwaitError(alloc, &diag_engine, error.Canceled),
+    );
+    try std.testing.expectEqual(@as(usize, 1), diag_engine.errorCount());
+    try std.testing.expectEqualStrings(
+        "parallel parse task group failed with internal compiler error: Canceled",
+        diag_engine.diagnostics.items[0].message,
+    );
+
+    const baseline = diag_engine.errorCount();
+    try std.testing.expectEqual(
+        error.OutOfMemory,
+        handleParseTaskGroupAwaitError(alloc, &diag_engine, error.OutOfMemory),
+    );
+    try std.testing.expectEqual(baseline, diag_engine.errorCount());
+}
+
+test "P4J2: lint budget failure is routed through compiler diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var diag_engine = zap.DiagnosticEngine.init(alloc);
+    defer diag_engine.deinit();
+
+    try std.testing.expectEqual(
+        error.ParseFailed,
+        handleLintFailure(alloc, &diag_engine, "mandatory raises lint", 5, error.LintAstWalkDepthExceeded),
+    );
+    try std.testing.expectEqual(@as(usize, 1), diag_engine.errorCount());
+
+    const diagnostic = diag_engine.diagnostics.items[0];
+    try std.testing.expectEqual(zap.diagnostics.Severity.@"error", diagnostic.severity);
+    try std.testing.expectEqual(zap.diagnostics.Domain.parse, diagnostic.domain);
+    try std.testing.expectEqual(@as(?u32, 5), diagnostic.span.source_id);
+    try std.testing.expectEqualStrings("lint AST traversal budget exceeded", diagnostic.message);
+}
+
+test "P4J2: lint diagnostic reporting OOM propagates" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var diag_engine = zap.DiagnosticEngine.init(failing_alloc);
+    defer diag_engine.deinit();
+
+    try std.testing.expectEqual(
+        error.OutOfMemory,
+        handleLintFailure(failing_alloc, &diag_engine, "phase 1.4 advisory lint", 0, error.OutOfMemory),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag_engine.errorCount());
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectEqual(
+        error.OutOfMemory,
+        handleLintFailure(failing_alloc, &diag_engine, "phase 1.4 advisory lint", 0, error.LintAstWalkDepthExceeded),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag_engine.errorCount());
+}
+
+test "P4J2: incremental phase 1.4 lint failure aborts prepare" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var state = FrontendIncrementalState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const file_path = "app/deep_lint_prepare.zap";
+    const struct_names = [_][]const u8{"DeepLintPrepare"};
+    var file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    try file_to_structs.put(file_path, &struct_names);
+    var file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    var file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    const graph = FrontendDependencyGraph{
+        .file_to_structs = &file_to_structs,
+        .file_imported_by = &file_imported_by,
+        .file_compile_after_globs = &file_compile_after_globs,
+        .file_compile_after_files = &file_compile_after_files,
+    };
+
+    const source = try makeP4J2DeepUnarySource(alloc, "DeepLintPrepare", 2100);
+    var units = [_]SourceUnit{
+        .{ .file_path = file_path, .source = source, .primary_struct_name = "DeepLintPrepare" },
+    };
+
+    try std.testing.expectError(error.ParseFailed, state.prepare(alloc, &units, graph, .{
+        .show_progress = false,
+        .struct_order = &struct_names,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), state.dependencyGraphNodeCount());
+}
+
+test "P4J2: phase diagnostic reporting OOM propagates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    const program = try makeP4J2EmptyStructProgram(setup_alloc, &interner, "PhaseDiagnosticOOM");
+    var ctx = try makeP4J2CollectedContext(setup_alloc, &interner, &program, &program, "PhaseDiagnosticOOM");
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    ctx.diag_engine = zap.DiagnosticEngine.init(failing_alloc);
+    defer ctx.diag_engine.deinit();
+
+    var pipeline = Pipeline.init(setup_alloc, &ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectEqual(
+        error.OutOfMemory,
+        pipeline.failWith("Error during P4J2 diagnostic reporting", error.IrFailed),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.diag_engine.errorCount());
+}
+
+test "P4J2: function recollection collector OOM propagates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    const surface_program = try makeP4J2EmptyStructProgram(setup_alloc, &interner, "RecollectOOM");
+    const recollect_program = try makeP4J2FunctionProgram(
+        setup_alloc,
+        &interner,
+        "RecollectOOM",
+        "fresh_function",
+        try makeP4J2IntLiteralExpr(setup_alloc, 1),
+    );
+    var ctx = try makeP4J2CollectedContext(setup_alloc, &interner, &surface_program, &recollect_program, "RecollectOOM");
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    ctx.collector.allocator = failing_alloc;
+    ctx.collector.graph.allocator = failing_alloc;
+
+    var pipeline = Pipeline.init(setup_alloc, &ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        pipeline.runReCollectFunctions(&ctx.merged_program),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.diag_engine.errorCount());
+}
+
+test "P4J2: Kernel collection OOM propagates instead of being swallowed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(setup_alloc);
+    const kernel_name = try interner.intern(zap.discovery.kernel_struct_name);
+    const structs = try setup_alloc.alloc(ast.StructDecl, 1);
+    structs[0] = .{
+        .meta = makeP4J2CompilerTestMeta(),
+        .name = try makeP4J2StructName(setup_alloc, kernel_name),
+        .items = &.{},
+    };
+    const program = ast.Program{ .structs = structs, .top_items = &.{} };
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var collector = try zap.Collector.init(failing_alloc, &interner, kernel_name);
+    defer collector.deinit();
+    var diag_engine = zap.DiagnosticEngine.init(setup_alloc);
+    defer diag_engine.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        collectProgramSurfaceForProject(
+            failing_alloc,
+            &diag_engine,
+            &collector,
+            &program,
+            "initial Kernel collection",
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag_engine.errorCount());
+}
+
+test "P4J2: Kernel collection structural budget is routed to diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const kernel_name = try interner.intern(zap.discovery.kernel_struct_name);
+    const program = try makeP4J2KernelProgram(alloc, &interner, 1100);
+
+    var collector = try zap.Collector.init(alloc, &interner, kernel_name);
+    defer collector.deinit();
+    var diag_engine = zap.DiagnosticEngine.init(alloc);
+    defer diag_engine.deinit();
+
+    try std.testing.expectError(
+        error.CollectFailed,
+        collectProgramSurfaceForProject(
+            alloc,
+            &diag_engine,
+            &collector,
+            &program,
+            "initial Kernel collection",
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), diag_engine.errorCount());
+    try std.testing.expectEqualStrings(
+        "collector AST traversal budget exceeded while walking macro-expanded syntax",
+        diag_engine.diagnostics.items[0].message,
+    );
+}
+
+test "P4J2: impl conformance registration OOM propagates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const setup_alloc = arena.allocator();
+    const source =
+        \\pub protocol Printable {
+        \\  fn to_string(value) -> String
+        \\}
+        \\pub struct Thing {
+        \\}
+        \\pub impl Printable for Thing {
+        \\  pub fn to_string(value :: Thing) -> String {
+        \\    "thing"
+        \\  }
+        \\}
+    ;
+
+    var parser = try zap.Parser.init(setup_alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var collector = try zap.Collector.init(failing_alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgramSurface(&program);
+
+    var diag_engine = zap.DiagnosticEngine.init(setup_alloc);
+    defer diag_engine.deinit();
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        validateAndRegisterImplConformanceForProject(
+            failing_alloc,
+            &diag_engine,
+            &collector,
+            "impl conformance registration",
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag_engine.errorCount());
+}
+
+test "P4J2: main program type-check OOM propagates instead of continuing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    const surface_program = try makeP4J2FunctionProgram(
+        alloc,
+        &interner,
+        "TypeCheckOOM",
+        "answer",
+        try makeP4J2IntLiteralExpr(alloc, 42),
+    );
+    const typecheck_program = try makeP4J2FunctionProgram(
+        alloc,
+        &interner,
+        "TypeCheckOOM",
+        "answer",
+        try makeP4J2TupleExpr(alloc),
+    );
+    var ctx = try makeP4J2CollectedContext(alloc, &interner, &surface_program, &typecheck_program, "TypeCheckOOM");
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var shared_store = try zap.types.TypeStore.init(alloc, ctx.interner);
+    defer shared_store.deinit();
+
+    var pipeline = Pipeline.init(failing_alloc, &ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        pipeline.runTypeCheck(&ctx.merged_program, &shared_store, false),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.diag_engine.errorCount());
+}
+
+test "P4J2: main program type-check budget is infrastructure failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{.{
+        .file_path = "type_check_budget_main.zap",
+        .source = "pub struct TypeCheckBudgetMain {\n" ++
+            "  pub fn value() -> i64 { 1 }\n" ++
+            "}\n",
+    }};
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+    var type_checker = try zap.types.TypeChecker.init(alloc, ctx.interner, &ctx.collector.graph);
+    defer type_checker.deinit();
+    try std.testing.expectEqual(
+        error.InfrastructureTypeCheckFailed,
+        handleTypeCheckerPassError(
+            alloc,
+            &ctx.diag_engine,
+            &type_checker,
+            ctx.diag_engine.errorCount(),
+            "type check",
+            error.TypeCheckerCollectionTypeDepthExceeded,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ctx.diag_engine.errorCount());
+    try std.testing.expectEqualStrings(
+        "type-checker collection type traversal depth exceeded while unifying nested collection literals",
+        ctx.diag_engine.diagnostics.items[0].message,
+    );
+}
+
+test "P4J2: CTFE type-check pass routes infrastructure diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{.{
+        .file_path = "type_check_ctfe.zap",
+        .source = "pub struct TypeCheckCtfe {\n" ++
+            "  pub fn value() -> i64 { 1 }\n" ++
+            "}\n",
+    }};
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+
+    var type_checker = try zap.types.TypeChecker.init(alloc, ctx.interner, &ctx.collector.graph);
+    defer type_checker.deinit();
+    try std.testing.expectEqual(
+        error.InfrastructureTypeCheckFailed,
+        handleTypeCheckerPassError(
+            alloc,
+            &ctx.diag_engine,
+            &type_checker,
+            ctx.diag_engine.errorCount(),
+            "CTFE second-pass type check",
+            error.P4J2InjectedTypeCheckFailure,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ctx.diag_engine.errorCount());
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        ctx.diag_engine.diagnostics.items[0].message,
+        "CTFE second-pass type check failed with internal compiler error: P4J2InjectedTypeCheckFailure",
+    ) != null);
+}
+
+test "P4J2: per-struct type-check infrastructure failure is not skipped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{.{
+        .file_path = "type_check_struct_oom.zap",
+        .source = "pub struct TypeCheckStructOOM {\n" ++
+            "  value :: i64\n" ++
+            "  pub fn value() -> i64 { 1 }\n" ++
+            "}\n",
+    }};
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+    const mod_program = lookupStructProgram(&ctx, "TypeCheckStructOOM") orelse return error.TestUnexpectedResult;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var shared_store = try zap.types.TypeStore.init(failing_alloc, ctx.interner);
+    defer shared_store.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        compileSingleStructHir(
+            alloc,
+            &ctx,
+            "TypeCheckStructOOM",
+            mod_program,
+            &shared_store,
+            0,
+            .{ .show_progress = false },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.diag_engine.errorCount());
+}
+
+test "P4J2: staged single-struct type-check OOM propagates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{.{
+        .file_path = "staged_type_check_oom.zap",
+        .source = "pub struct StagedTypeCheckOOM {\n" ++
+            "  value :: i64\n" ++
+            "  pub fn value() -> i64 { 1 }\n" ++
+            "}\n",
+    }};
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+    const mod_program = lookupStructProgram(&ctx, "StagedTypeCheckOOM") orelse return error.TestUnexpectedResult;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var shared_store = try zap.types.TypeStore.init(failing_alloc, ctx.interner);
+    defer shared_store.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        compileStagedStructHir(
+            alloc,
+            mod_program,
+            "StagedTypeCheckOOM",
+            ctx.interner,
+            &ctx.collector,
+            &ctx.diag_engine,
+            &shared_store,
+            0,
+            false,
+            null,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.diag_engine.errorCount());
+}
+
+test "P4J2: per-struct HIR infrastructure OOM is not a semantic skip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const source_units = [_]SourceUnit{.{
+        .file_path = "hir_infra.zap",
+        .source = "pub struct HirInfra {\n" ++
+            "  pub fn answer() -> i64 { 42 }\n" ++
+            "}\n",
+    }};
+    var ctx = try collectAllFromUnits(alloc, &source_units, .{ .show_progress = false });
+    const mod_program = lookupStructProgram(&ctx, "HirInfra") orelse return error.TestUnexpectedResult;
+
+    var shared_store = try zap.types.TypeStore.init(alloc, ctx.interner);
+    var type_checker = zap.types.TypeChecker.initWithSharedStore(alloc, &shared_store, ctx.interner, &ctx.collector.graph);
+    defer type_checker.deinit();
+    type_checker.checkProgram(mod_program) catch {};
+    try std.testing.expectEqual(@as(usize, 0), type_checker.errors.items.len);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var pipeline = Pipeline.init(failing_alloc, &ctx, .{ .show_progress = false }, 0, 0);
+    pipeline.defer_render = true;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        pipeline.runHirBuildForStruct(mod_program, &shared_store, 0),
+    );
 }
 
 test "compileStructByStruct isolates per-struct diagnostics" {
@@ -13097,6 +15556,94 @@ test "compileStructByStruct dedupes a struct that appears twice in struct_order"
             return error.DuplicateIrFunctionName;
         }
     }
+}
+
+test "remapExpr reports depth budget exhaustion before native stack overflow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const meta: ast.NodeMeta = .{ .span = .{ .start = 0, .end = 1 } };
+    const remap = try alloc.alloc(ast.StringId, 2);
+    remap[0] = 1;
+    remap[1] = 0;
+
+    var expr = try alloc.create(ast.Expr);
+    expr.* = .{ .var_ref = .{ .meta = meta, .name = 0 } };
+    const depth: usize = @as(usize, MAX_AST_REMAP_DEPTH) + 8;
+    for (0..depth) |_| {
+        const wrapper = try alloc.create(ast.Expr);
+        wrapper.* = .{ .unary_op = .{
+            .meta = meta,
+            .op = .not_op,
+            .operand = expr,
+        } };
+        expr = wrapper;
+    }
+
+    try std.testing.expectError(error.AstRemapDepthExceeded, remapExpr(alloc, expr, remap));
+    try std.testing.expectEqual(@as(u32, 0), ast_remap_depth);
+}
+
+test "remapPattern reports depth budget exhaustion before native stack overflow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const meta: ast.NodeMeta = .{ .span = .{ .start = 0, .end = 1 } };
+    const remap = try alloc.alloc(ast.StringId, 2);
+    remap[0] = 1;
+    remap[1] = 0;
+
+    var pattern = try alloc.create(ast.Pattern);
+    pattern.* = .{ .bind = .{ .meta = meta, .name = 0 } };
+    const depth: usize = @as(usize, MAX_AST_REMAP_DEPTH) + 8;
+    for (0..depth) |_| {
+        const wrapper = try alloc.create(ast.Pattern);
+        wrapper.* = .{ .paren = .{ .meta = meta, .inner = pattern } };
+        pattern = wrapper;
+    }
+
+    try std.testing.expectError(error.AstRemapDepthExceeded, remapPattern(alloc, pattern, remap));
+    try std.testing.expectEqual(@as(u32, 0), ast_remap_depth);
+}
+
+test "remapTypeExpr reports depth budget exhaustion before native stack overflow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const meta: ast.NodeMeta = .{ .span = .{ .start = 0, .end = 1 } };
+    const remap = try alloc.alloc(ast.StringId, 2);
+    remap[0] = 1;
+    remap[1] = 0;
+
+    var type_expr = try alloc.create(ast.TypeExpr);
+    type_expr.* = .{ .variable = .{ .meta = meta, .name = 0 } };
+    const depth: usize = @as(usize, MAX_AST_REMAP_DEPTH) + 8;
+    for (0..depth) |_| {
+        const wrapper = try alloc.create(ast.TypeExpr);
+        wrapper.* = .{ .paren = .{ .meta = meta, .inner = type_expr } };
+        type_expr = wrapper;
+    }
+
+    try std.testing.expectError(error.AstRemapDepthExceeded, remapTypeExpr(alloc, type_expr, remap));
+    try std.testing.expectEqual(@as(u32, 0), ast_remap_depth);
+}
+
+test "remap depth exhaustion reports a structured project diagnostic" {
+    var engine = zap.DiagnosticEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    try reportAstRemapDepthExceeded(&engine, 7);
+
+    try std.testing.expectEqual(@as(usize, 1), engine.diagnostics.items.len);
+    const diagnostic = engine.diagnostics.items[0];
+    try std.testing.expectEqual(zap.diagnostics.Severity.@"error", diagnostic.severity);
+    try std.testing.expectEqual(zap.diagnostics.Domain.parse, diagnostic.domain);
+    try std.testing.expectEqual(@as(?u32, 7), diagnostic.span.source_id);
+    try std.testing.expect(diagnostic.label != null);
+    try std.testing.expect(diagnostic.help != null);
 }
 
 test "remapFunctionDecl rewrites name_expr through the remap table" {
@@ -13248,7 +15795,7 @@ test "staged macro expansion can call previously compiled Zap functions" {
     });
     var result = try compileStructByStruct(alloc, &ctx, &struct_order, .{ .show_progress = false });
 
-    var interpreter = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    var interpreter = try zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interpreter.deinit();
     const value = try interpreter.evalByName("Caller__main__0", &.{});
 
@@ -13295,7 +15842,7 @@ test "staged macro expansion can call compiled Zap functions that use allowed CT
     });
     var result = try compileStructByStruct(alloc, &ctx, &struct_order, .{ .show_progress = false });
 
-    var interpreter = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    var interpreter = try zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interpreter.deinit();
     const value = try interpreter.evalByName("Caller__main__0", &.{});
 
@@ -13340,7 +15887,7 @@ test "staged use macro expansion can call previously compiled Zap functions" {
     });
     var result = try compileStructByStruct(alloc, &ctx, &struct_order, .{ .show_progress = false });
 
-    var interpreter = zap.ctfe.Interpreter.init(alloc, &result.ir_program);
+    var interpreter = try zap.ctfe.Interpreter.init(alloc, &result.ir_program);
     defer interpreter.deinit();
     const value = try interpreter.evalByName("Caller__main__0", &.{});
 
@@ -13372,6 +15919,173 @@ test "staged macro provider rejects direct underscore-prefixed call before compi
             .struct_order = &struct_order,
         }),
     );
+}
+
+test "compiler routes monomorphization diagnostics with original spans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var diag_engine = zap.DiagnosticEngine.init(alloc);
+    defer diag_engine.deinit();
+
+    const monomorph_errors = [_]zap.monomorphize.MonomorphError{
+        .{
+            .message = "monomorphization exceeded the per-generic specialization limit for `grow/1`",
+            .span = .{ .start = 10, .end = 14, .line = 2, .col = 3 },
+        },
+        .{
+            .message = "monomorphization type arguments for generic `wrap/1` are too structurally large",
+            .span = .{ .start = 30, .end = 39, .line = 5, .col = 7 },
+        },
+    };
+
+    try reportMonomorphizeErrors(&diag_engine, &monomorph_errors);
+
+    try std.testing.expectEqual(@as(usize, 2), diag_engine.errorCount());
+    try std.testing.expectEqualStrings(monomorph_errors[0].message, diag_engine.diagnostics.items[0].message);
+    try std.testing.expectEqual(monomorph_errors[0].span.start, diag_engine.diagnostics.items[0].span.start);
+    try std.testing.expectEqual(monomorph_errors[1].span.line, diag_engine.diagnostics.items[1].span.line);
+}
+
+test "compiler routes bounded analysis failures to precise diagnostics" {
+    var diag_engine = zap.DiagnosticEngine.init(std.testing.allocator);
+    defer diag_engine.deinit();
+
+    try std.testing.expect(try routeAnalysisPipelineFailureDiagnostic(
+        &diag_engine,
+        error.AnalysisNestingLimitExceeded,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), diag_engine.errorCount());
+    try std.testing.expectEqualStrings(
+        "IR/escape analysis nesting is too deep",
+        diag_engine.diagnostics.items[0].message,
+    );
+    try std.testing.expectEqual(@as(u32, 0), diag_engine.diagnostics.items[0].span.start);
+    try std.testing.expectEqualStrings(
+        "split deeply nested expressions or control-flow into smaller named functions so escape analysis can process each part independently",
+        diag_engine.diagnostics.items[0].help.?,
+    );
+
+    try std.testing.expect(try routeAnalysisPipelineFailureDiagnostic(
+        &diag_engine,
+        error.InterproceduralInstructionNestingLimitExceeded,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), diag_engine.errorCount());
+    try std.testing.expectEqualStrings(
+        "interprocedural analysis nesting is too deep",
+        diag_engine.diagnostics.items[1].message,
+    );
+    try std.testing.expectEqualStrings(
+        "split deeply nested calls or control-flow into smaller named functions so interprocedural analysis can summarize each function independently",
+        diag_engine.diagnostics.items[1].help.?,
+    );
+
+    try std.testing.expect(!try routeAnalysisPipelineFailureDiagnostic(
+        &diag_engine,
+        error.OutOfMemory,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), diag_engine.errorCount());
+}
+
+fn testDeepOptionalIrType(allocator: std.mem.Allocator, depth: usize) !ir.ZigType {
+    var current: ir.ZigType = .i64;
+    var remaining = depth;
+    while (remaining != 0) : (remaining -= 1) {
+        const inner = try allocator.create(ir.ZigType);
+        inner.* = current;
+        current = .{ .optional = inner };
+    }
+    return current;
+}
+
+test "compiler routes cloneProgram structural budget failures to diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var diag_engine = zap.DiagnosticEngine.init(alloc);
+    defer diag_engine.deinit();
+
+    const deep_type = try testDeepOptionalIrType(alloc, 4096);
+    const functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "deep",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = deep_type,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+    }};
+    const program: ir.Program = .{
+        .functions = &functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    try std.testing.expectError(
+        error.IrFailed,
+        cloneProgramWithDiagnostics(alloc, &diag_engine, program),
+    );
+    try std.testing.expectEqual(@as(usize, 1), diag_engine.errorCount());
+    try std.testing.expectEqualStrings(
+        "IR program clone is too structurally complex: ZigType clone budget exceeded",
+        diag_engine.diagnostics.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "simplify deeply nested type annotations or split the program into smaller type shapes",
+        diag_engine.diagnostics.items[0].help.?,
+    );
+}
+
+test "compiler routes capability inference depth failures to diagnostics" {
+    var diag_engine = zap.DiagnosticEngine.init(std.testing.allocator);
+    defer diag_engine.deinit();
+
+    try std.testing.expect(try routeCapabilityInferenceFailureDiagnostic(
+        &diag_engine,
+        error.CapabilityAstWalkDepthExceeded,
+        .{ .span = .{ .start = 42, .end = 57, .line = 4, .col = 9 } },
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), diag_engine.errorCount());
+    try std.testing.expectEqualStrings(
+        "capability inference AST nesting is too deep",
+        diag_engine.diagnostics.items[0].message,
+    );
+    try std.testing.expectEqual(@as(u32, 42), diag_engine.diagnostics.items[0].span.start);
+    try std.testing.expectEqual(@as(u32, 4), diag_engine.diagnostics.items[0].span.line);
+    try std.testing.expectEqualStrings(
+        "split deeply nested expressions or functions so capability inference can analyze each part independently",
+        diag_engine.diagnostics.items[0].help.?,
+    );
+
+    try std.testing.expect(try routeCapabilityInferenceFailureDiagnostic(
+        &diag_engine,
+        error.CapabilityPropagationBudgetExceeded,
+        .{ .span = .{ .start = 75, .end = 83, .line = 6, .col = 2 } },
+    ));
+
+    try std.testing.expectEqual(@as(usize, 2), diag_engine.errorCount());
+    try std.testing.expectEqualStrings(
+        "capability inference propagation budget exceeded",
+        diag_engine.diagnostics.items[1].message,
+    );
+    try std.testing.expectEqual(@as(u32, 75), diag_engine.diagnostics.items[1].span.start);
+    try std.testing.expectEqual(@as(u32, 6), diag_engine.diagnostics.items[1].span.line);
+    try std.testing.expectEqualStrings(
+        "split very large macro or function call graphs into smaller modules so capability inference can reach a fixed point",
+        diag_engine.diagnostics.items[1].help.?,
+    );
+
+    try std.testing.expect(!try routeCapabilityInferenceFailureDiagnostic(
+        &diag_engine,
+        error.OutOfMemory,
+        .{},
+    ));
+    try std.testing.expectEqual(@as(usize, 2), diag_engine.errorCount());
 }
 
 test "Phase 2 memory adapters: getRuntimeSource rewrites REFCOUNT_V1 caps" {
@@ -13505,6 +16219,184 @@ test "Phase 2 memory adapters: runtime rewrite cache separates refcount sized ex
     try std.testing.expect(sized_src.ptr != unsized_src.ptr);
     try std.testing.expect(std.mem.indexOf(u8, sized_src, "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = true;") != null);
     try std.testing.expect(std.mem.indexOf(u8, unsized_src, "const RUNTIME_REFCOUNT_SIZED_EXTENSION_DEFAULT: bool = false;") != null);
+}
+
+const p4j2_deep_child_stream_depth: usize = 16 * 1024;
+
+fn fillDeepGuardIfChildStreamChain(instructions: []ir.Instruction, leaf_instruction: ir.Instruction) void {
+    std.debug.assert(instructions.len > 0);
+    instructions[instructions.len - 1] = leaf_instruction;
+
+    var next_index = instructions.len - 1;
+    while (next_index > 0) {
+        const child_index = next_index;
+        next_index -= 1;
+        const child_stream = instructions[child_index .. child_index + 1];
+        if (next_index % 2 == 0) {
+            instructions[next_index] = .{ .guard_block = .{
+                .condition = 0,
+                .body = child_stream,
+            } };
+        } else if (next_index % 4 == 1) {
+            instructions[next_index] = .{ .if_expr = .{
+                .dest = @intCast(next_index),
+                .condition = 0,
+                .then_instrs = child_stream,
+                .then_result = null,
+                .else_instrs = &.{},
+                .else_result = null,
+            } };
+        } else {
+            instructions[next_index] = .{ .if_expr = .{
+                .dest = @intCast(next_index),
+                .condition = 0,
+                .then_instrs = &.{},
+                .then_result = null,
+                .else_instrs = child_stream,
+                .else_result = null,
+            } };
+        }
+    }
+}
+
+fn deinitCallerMap(
+    alloc: std.mem.Allocator,
+    callers_by_callee: *std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+) void {
+    var iterator = callers_by_callee.valueIterator();
+    while (iterator.next()) |list| list.deinit(alloc);
+    callers_by_callee.deinit();
+}
+
+fn reverseEdgeMapContainsCaller(
+    callers_by_callee: *const std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)),
+    callee_id: ir.FunctionId,
+    caller_id: ir.FunctionId,
+) bool {
+    const callers = callers_by_callee.get(callee_id) orelse return false;
+    for (callers.items) |candidate| {
+        if (candidate == caller_id) return true;
+    }
+    return false;
+}
+
+test "P4J2: call edge collection handles deep guard and if child streams" {
+    const alloc = std.testing.allocator;
+    const instructions = try alloc.alloc(ir.Instruction, p4j2_deep_child_stream_depth + 1);
+    defer alloc.free(instructions);
+
+    fillDeepGuardIfChildStreamChain(instructions, .{ .call_named = .{
+        .dest = 1,
+        .name = "callee",
+        .args = &.{},
+        .arg_modes = &.{},
+    } });
+
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = instructions[0..1],
+    }};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "caller",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .void,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "callee",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .void,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var callers_by_callee = std.AutoHashMap(ir.FunctionId, std.ArrayListUnmanaged(ir.FunctionId)).init(alloc);
+    defer deinitCallerMap(alloc, &callers_by_callee);
+
+    try addCallEdgesFromInstructions(alloc, program, 0, instructions[0..1], &callers_by_callee);
+    try std.testing.expect(reverseEdgeMapContainsCaller(&callers_by_callee, 1, 0));
+}
+
+test "P4J2: analysis summary graph handles deep guard and if child streams" {
+    const alloc = std.testing.allocator;
+    const instructions = try alloc.alloc(ir.Instruction, p4j2_deep_child_stream_depth + 1);
+    defer alloc.free(instructions);
+
+    fillDeepGuardIfChildStreamChain(instructions, .{ .call_named = .{
+        .dest = 1,
+        .name = "callee",
+        .args = &.{},
+        .arg_modes = &.{},
+    } });
+
+    const caller_blocks = [_]ir.Block{.{
+        .label = 0,
+        .instructions = instructions[0..1],
+    }};
+    const borrowed_param = [_]ir.Param{.{ .name = "value", .type_expr = .string }};
+    const borrowed_convention = [_]ir.ParamConvention{.borrowed};
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "Caller__check__0",
+            .struct_name = "Caller",
+            .local_name = "check__0",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .void,
+            .body = &caller_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "callee",
+            .struct_name = "Callee",
+            .local_name = "callee__1",
+            .scope_id = 0,
+            .arity = 1,
+            .params = &borrowed_param,
+            .return_type = .void,
+            .body = &.{},
+            .is_closure = false,
+            .captures = &.{},
+            .param_conventions = &borrowed_convention,
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = null };
+
+    var dependency_graph = zap.incremental_graph.Graph.init(alloc);
+    defer dependency_graph.deinit();
+    try augmentFrontendGraphWithFunctions(alloc, &dependency_graph, program);
+    try augmentFrontendGraphWithAnalysisSummaryEdges(
+        alloc,
+        &dependency_graph,
+        program,
+        FrontendOptimizeMode.debug.passPolicy(),
+    );
+
+    const callee_body_id = (try dependency_graph.getNode(try frontendFunctionBodyNodeKey(functions[1]))).?;
+    const caller_body_id = (try dependency_graph.getNode(try frontendFunctionBodyNodeKey(functions[0]))).?;
+    const affected_trace = try dependency_graph.affectedTraceFrom(alloc, &.{callee_body_id});
+    defer alloc.free(affected_trace);
+
+    try std.testing.expectEqual(@as(usize, 1), affected_trace.len);
+    try std.testing.expectEqual(caller_body_id, affected_trace[0].depender);
+    try std.testing.expectEqual(callee_body_id, affected_trace[0].dependee);
+    try std.testing.expectEqual(zap.incremental_graph.DependencyReason.analysis_summary, affected_trace[0].reason);
 }
 
 // GAP-P1-04: a callee invoked only from a `union_switch` catch-all `_`

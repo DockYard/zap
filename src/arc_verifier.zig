@@ -172,7 +172,7 @@ pub fn verifyFull(
     signatures: ?*const uniqueness_signature.ProgramSignatures,
     ownership: ?*const arc_liveness.ArcOwnership,
 ) VerifyError!void {
-    var ctx = VerifyContext{ .function = function, .program = program };
+    var ctx = VerifyContext{ .allocator = allocator, .function = function, .program = program };
     for (function.body) |block| {
         try verifyStream(&ctx, block.instructions);
     }
@@ -185,6 +185,7 @@ pub fn verifyFull(
 /// dataflow for the "destroyed exactly once" invariant) would
 /// extend this struct with `live_owned` / `live_borrowed` bitsets.
 const VerifyContext = struct {
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: *const ir.Program,
 };
@@ -731,11 +732,12 @@ fn ownershipOf(
 /// call; verifier work is already O(local_count) overall, so this
 /// stays linear in function size.
 fn paramConventionOf(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     local_id: ir.LocalId,
-) ?ir.ParamConvention {
+) std.mem.Allocator.Error!?ir.ParamConvention {
     var ctx = ParamGetWalker{ .target = local_id };
-    ir.forEachInstruction(function, &ctx, ParamGetWalker.visit);
+    try ir.forEachInstruction(allocator, function, &ctx, ParamGetWalker.visit);
     const idx = ctx.found_index orelse return null;
     if (idx >= function.param_conventions.len) return null;
     return function.param_conventions[idx];
@@ -910,7 +912,7 @@ fn verifyInstruction(
             // for "who owns this value." A borrowed-convention param
             // is owned by the caller; releasing it on the callee
             // side would double-free.
-            if (paramConventionOf(function, r.value)) |conv| {
+            if (try paramConventionOf(ctx.allocator, function, r.value)) |conv| {
                 if (conv == .borrowed) {
                     emitDiagnostic(
                         function,
@@ -1095,7 +1097,7 @@ fn runUniquenessCheckFull(
     // running the analysis. Most functions have no unchecked sites
     // (Phase 3 codegen hasn't landed yet); skipping the analysis on
     // those keeps verifier overhead minimal.
-    if (!hasUncheckedCallSite(function)) return;
+    if (!try hasUncheckedCallSite(allocator, function)) return;
 
     var uniqueness = uniqueness_analysis.analyzeUniquenessFull(
         allocator,
@@ -1110,24 +1112,25 @@ fn runUniquenessCheckFull(
     defer uniqueness.deinit(allocator);
 
     var walker = UniquenessCheckWalker{
+        .allocator = allocator,
         .function = function,
         .uniqueness = &uniqueness,
         .next_id = 0,
         .err = null,
     };
-    for (function.body) |block| {
-        try walker.walkStream(block.instructions);
-        if (walker.err) |e| return e;
-    }
+    try walker.walkFunction();
 }
 
 /// Quick per-function pre-check: does the function contain ANY
 /// owned-mutating call site to an unchecked variant? Returns
 /// without running the (more expensive) uniqueness analysis when there
 /// are no unchecked sites.
-fn hasUncheckedCallSite(function: *const ir.Function) bool {
+fn hasUncheckedCallSite(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+) std.mem.Allocator.Error!bool {
     var checker = UncheckedCallScanner{ .found = false };
-    ir.forEachInstruction(function, &checker, UncheckedCallScanner.visit);
+    try ir.forEachInstruction(allocator, function, &checker, UncheckedCallScanner.visit);
     return checker.found;
 }
 
@@ -1154,48 +1157,86 @@ const UncheckedCallScanner = struct {
 };
 
 const UniquenessCheckWalker = struct {
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     uniqueness: *const uniqueness_analysis.Uniqueness,
     next_id: arc_liveness.InstructionId,
     err: ?VerifyError,
 
+    const StreamFrame = struct {
+        stream: []const ir.Instruction,
+        next_index: usize = 0,
+    };
+
+    fn walkFunction(self: *UniquenessCheckWalker) VerifyError!void {
+        for (self.function.body) |block| {
+            try self.walkStream(block.instructions);
+            if (self.err) |e| return e;
+        }
+    }
+
     fn walkStream(
         self: *UniquenessCheckWalker,
         stream: []const ir.Instruction,
     ) error{OutOfMemory}!void {
-        for (stream) |*instr| {
+        if (stream.len == 0) return;
+
+        var stack: std.ArrayListUnmanaged(StreamFrame) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, .{ .stream = stream });
+
+        while (stack.items.len != 0) {
+            const frame = &stack.items[stack.items.len - 1];
+            if (frame.next_index >= frame.stream.len) {
+                _ = stack.pop().?;
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            frame.next_index += 1;
+
             const my_id = self.next_id;
             self.next_id += 1;
-            if (self.err != null) return;
             self.checkUncheckedCallSite(instr, my_id);
             if (self.err != null) return;
-            try self.walkChildren(instr);
+            try self.pushChildren(&stack, instr);
         }
     }
 
-    /// Recurse into every child stream via the canonical enumerator so
-    /// the InstructionId numbering matches the uniqueness analyzer
+    /// Push every child stream via the canonical enumerator so the
+    /// InstructionId numbering matches the uniqueness analyzer
     /// (including `union_switch.else_instrs`, previously skipped — which
     /// both desynced the id space feeding `isUnique(my_id)` and left
     /// unchecked-mutation sites inside the catch-all unverified). Audit
     /// finding uniqueness--01 / arc-drop-verify--01.
-    fn walkChildren(
+    fn pushChildren(
         self: *UniquenessCheckWalker,
+        stack: *std.ArrayListUnmanaged(StreamFrame),
         instr: *const ir.Instruction,
     ) error{OutOfMemory}!void {
         const Ctx = struct {
-            walker: *UniquenessCheckWalker,
+            allocator: std.mem.Allocator,
+            child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty,
             err: ?error{OutOfMemory} = null,
             fn onStream(ctx: *@This(), child: ir.ChildStream) void {
-                if (ctx.err != null) return;
-                ctx.walker.walkStream(child.stream) catch |e| {
-                    ctx.err = e;
+                if (ctx.err != null or child.stream.len == 0) return;
+                ctx.child_streams.append(ctx.allocator, child.stream) catch |err| {
+                    ctx.err = err;
                 };
             }
         };
-        var ctx = Ctx{ .walker = self };
+        var ctx = Ctx{
+            .allocator = self.allocator,
+        };
+        defer ctx.child_streams.deinit(self.allocator);
         ir.forEachChildStream(instr, &ctx, Ctx.onStream);
         if (ctx.err) |e| return e;
+
+        var child_index = ctx.child_streams.items.len;
+        while (child_index > 0) {
+            child_index -= 1;
+            try stack.append(self.allocator, .{ .stream = ctx.child_streams.items[child_index] });
+        }
     }
 
     fn checkUncheckedCallSite(
@@ -1312,6 +1353,31 @@ fn freeTestFunction(allocator: std.mem.Allocator, function: *ir.Function) void {
     allocator.free(function.params);
 }
 
+fn buildNestedGuardStream(
+    arena: std.mem.Allocator,
+    depth: usize,
+    leaf: ir.Instruction,
+) ![]const ir.Instruction {
+    return buildNestedGuardStreamFromStream(arena, depth, &[_]ir.Instruction{leaf});
+}
+
+fn buildNestedGuardStreamFromStream(
+    arena: std.mem.Allocator,
+    depth: usize,
+    leaf_stream: []const ir.Instruction,
+) ![]const ir.Instruction {
+    var stream = try arena.dupe(ir.Instruction, leaf_stream);
+    for (0..depth) |_| {
+        const wrapper = try arena.alloc(ir.Instruction, 1);
+        wrapper[0] = .{ .guard_block = .{
+            .condition = 0,
+            .body = stream,
+        } };
+        stream = wrapper;
+    }
+    return stream;
+}
+
 /// Test-only adapter that wraps a single hand-rolled `function` in a
 /// minimal `Program` and invokes the public `verify`. Existing tests
 /// (V1-V6) construct an isolated function and have no need for a
@@ -1328,6 +1394,90 @@ fn verifyFunctionStandalone(
         .entry = null,
     };
     return verify(allocator, function, &program);
+}
+
+test "arc_verifier: uniqueness check walker preserves deep child-stream ids" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 3);
+    args[0] = 0;
+    args[1] = 1;
+    args[2] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 3);
+    arg_modes[0] = .move;
+    arg_modes[1] = .borrow;
+    arg_modes[2] = .borrow;
+
+    const depth = 96;
+    const stream = try buildNestedGuardStream(arena, depth, .{ .call_builtin = .{
+        .dest = 3,
+        .name = "Map.put_owned_unchecked",
+        .args = args,
+        .arg_modes = arg_modes,
+    } });
+    const ownership = [_]ir.OwnershipClass{ .owned, .trivial, .trivial, .owned };
+    var function = try buildTestFunction(
+        arena,
+        "test_uniqueness_deep_ids",
+        stream,
+        &ownership,
+        &.{},
+        .owned,
+    );
+
+    var uniqueness = uniqueness_analysis.Uniqueness{};
+    defer uniqueness.deinit(testing.allocator);
+    try uniqueness.sites.put(
+        testing.allocator,
+        @as(arc_liveness.InstructionId, @intCast(depth)),
+        true,
+    );
+
+    var walker = UniquenessCheckWalker{
+        .allocator = testing.allocator,
+        .function = &function,
+        .uniqueness = &uniqueness,
+        .next_id = 0,
+        .err = null,
+    };
+    try walker.walkFunction();
+    try testing.expectEqual(@as(arc_liveness.InstructionId, @intCast(depth + 1)), walker.next_id);
+    try testing.expectEqual(@as(?VerifyError, null), walker.err);
+}
+
+test "arc_verifier: uniqueness check walker propagates explicit-stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const stream = try buildNestedGuardStream(arena, 96, .{ .const_bool = .{
+        .dest = 0,
+        .value = true,
+    } });
+    const ownership = [_]ir.OwnershipClass{.trivial};
+    var function = try buildTestFunction(
+        arena,
+        "test_uniqueness_stack_oom",
+        stream,
+        &ownership,
+        &.{},
+        .trivial,
+    );
+
+    const uniqueness = uniqueness_analysis.Uniqueness{};
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var walker = UniquenessCheckWalker{
+        .allocator = failing_allocator.allocator(),
+        .function = &function,
+        .uniqueness = &uniqueness,
+        .next_id = 0,
+        .err = null,
+    };
+
+    try testing.expectError(error.OutOfMemory, walker.walkFunction());
+    try testing.expect(failing_allocator.has_induced_failure);
 }
 
 /// RAII guard that suppresses verifier diagnostics for the
@@ -2233,6 +2383,160 @@ test "arc_verifier: V7 accepts share_value into borrowed-convention slot" {
 }
 
 // ============================================================
+// V9 — backward release→retain reachability
+// ============================================================
+
+test "arc_verifier: V9 owned-param detection preserves true and false results" {
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned };
+    const conventions = [_]ir.ParamConvention{ .owned, .borrowed };
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v9_owned_param_detection",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    try testing.expect(try v9IsOwnedParamLocal(allocator, &function, 0));
+    try testing.expect(!try v9IsOwnedParamLocal(allocator, &function, 1));
+    try testing.expect(!try v9IsOwnedParamLocal(allocator, &function, 2));
+}
+
+test "arc_verifier: V9 owned-param detection handles deeply nested child streams" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const depth = 4096;
+    const stream = try buildNestedGuardStream(arena, depth, .{ .param_get = .{
+        .dest = 0,
+        .index = 0,
+    } });
+    const ownership = [_]ir.OwnershipClass{.owned};
+    const conventions = [_]ir.ParamConvention{.owned};
+    var function = try buildTestFunction(
+        arena,
+        "test_v9_deep_owned_param_detection",
+        stream,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+
+    try testing.expect(try v9IsOwnedParamLocal(testing.allocator, &function, 0));
+}
+
+test "arc_verifier: V9 release scan handles deeply nested child streams" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const depth = 4096;
+    const leaf_stream = [_]ir.Instruction{
+        .{ .retain = .{ .value = 0 } },
+        .{ .release = .{ .value = 0 } },
+    };
+    const stream = try buildNestedGuardStreamFromStream(arena, depth, &leaf_stream);
+    const ownership = [_]ir.OwnershipClass{.owned};
+    var function = try buildTestFunction(
+        arena,
+        "test_v9_deep_release_scan",
+        stream,
+        &ownership,
+        &.{},
+        .trivial,
+    );
+
+    try v9CheckAllReleases(testing.allocator, &function);
+}
+
+test "arc_verifier: V9 producer search handles deeply nested earlier child streams" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const depth = 4096;
+    const nested_producer = try buildNestedGuardStream(arena, depth, .{ .retain = .{
+        .value = 0,
+    } });
+    const instrs = [_]ir.Instruction{
+        nested_producer[0],
+        .{ .release = .{ .value = 0 } },
+    };
+    const ownership = [_]ir.OwnershipClass{.owned};
+    var function = try buildTestFunction(
+        arena,
+        "test_v9_deep_backward_producer_search",
+        &instrs,
+        &ownership,
+        &.{},
+        .trivial,
+    );
+
+    try v9CheckAllReleases(testing.allocator, &function);
+}
+
+test "arc_verifier: V9 propagates owned-param seed OOM" {
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{.owned};
+    const conventions = [_]ir.ParamConvention{.owned};
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .release = .{ .value = 0 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v9_owned_param_seed_oom",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const result = v9IsOwnedParamLocal(failing_allocator.allocator(), &function, 0);
+    try testing.expectError(error.OutOfMemory, result);
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "arc_verifier: V9 propagates producer-search explicit-stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const nested_producer = try buildNestedGuardStream(arena, 1, .{ .retain = .{
+        .value = 0,
+    } });
+    const instrs = [_]ir.Instruction{
+        nested_producer[0],
+        .{ .release = .{ .value = 0 } },
+    };
+    const ownership = [_]ir.OwnershipClass{.owned};
+    var function = try buildTestFunction(
+        arena,
+        "test_v9_producer_stack_oom",
+        &instrs,
+        &ownership,
+        &.{},
+        .trivial,
+    );
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const checked_stream = function.body[0].instructions;
+    const result = v9CheckRelease(failing_allocator.allocator(), &function, checked_stream, 1, 0);
+    try testing.expectError(error.OutOfMemory, result);
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+// ============================================================
 // uniqueness — alias safety on owned update
 // ============================================================
 //
@@ -3130,7 +3434,7 @@ pub fn verifyPostDropInsertion(
     // V9 — backward release→retain reachability. Each release
     // independently walks backward to find a matching retain or
     // implicit-retain producer.
-    v9CheckAllReleases(function);
+    try v9CheckAllReleases(allocator, function);
 
     // Warning-only mode (V8/V9): both checks emit diagnostics via
     // ZAP_DEBUG_V8 / ZAP_DEBUG_V9 env vars but do not propagate
@@ -3252,111 +3556,210 @@ const V9ProducerWalker = struct {
     }
 };
 
+const V9ForwardStreamFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+};
+
+const V9BackwardStreamFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize,
+    producer: ?ir.Instruction = null,
+
+    fn initStream(stream: []const ir.Instruction, end_index: usize) V9BackwardStreamFrame {
+        return .{
+            .stream = stream,
+            .next_index = end_index,
+            .producer = null,
+        };
+    }
+
+    fn initProducer(instr: ir.Instruction) V9BackwardStreamFrame {
+        return .{
+            .stream = &[_]ir.Instruction{},
+            .next_index = 0,
+            .producer = instr,
+        };
+    }
+};
+
+fn v9AppendChildStream(
+    allocator: std.mem.Allocator,
+    child_streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+    stream: []const ir.Instruction,
+) error{OutOfMemory}!void {
+    if (stream.len == 0) return;
+    try child_streams.append(allocator, stream);
+}
+
+fn v9CollectForwardChildStreams(
+    allocator: std.mem.Allocator,
+    instr: *const ir.Instruction,
+    child_streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+) error{OutOfMemory}!void {
+    child_streams.clearRetainingCapacity();
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        child_streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+        err: ?error{OutOfMemory} = null,
+
+        fn onStream(self: *@This(), child: ir.ChildStream) void {
+            if (self.err != null) return;
+            v9AppendChildStream(self.allocator, self.child_streams, child.stream) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var ctx = Ctx{
+        .allocator = allocator,
+        .child_streams = child_streams,
+    };
+    ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+    if (ctx.err) |err| return err;
+}
+
+fn v9PushForwardChildren(
+    allocator: std.mem.Allocator,
+    stack: *std.ArrayListUnmanaged(V9ForwardStreamFrame),
+    instr: *const ir.Instruction,
+    child_streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+) error{OutOfMemory}!void {
+    try v9CollectForwardChildStreams(allocator, instr, child_streams);
+    var child_index = child_streams.items.len;
+    while (child_index > 0) {
+        child_index -= 1;
+        try stack.append(allocator, .{ .stream = child_streams.items[child_index] });
+    }
+}
+
+fn v9CollectBackwardChildStreams(
+    allocator: std.mem.Allocator,
+    instr: ir.Instruction,
+    child_streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+) error{OutOfMemory}!void {
+    child_streams.clearRetainingCapacity();
+    switch (instr) {
+        .if_expr => |ie| {
+            try v9AppendChildStream(allocator, child_streams, ie.then_instrs);
+            try v9AppendChildStream(allocator, child_streams, ie.else_instrs);
+        },
+        .case_block => |cb| {
+            for (cb.arms) |arm| {
+                try v9AppendChildStream(allocator, child_streams, arm.body_instrs);
+                try v9AppendChildStream(allocator, child_streams, arm.cond_instrs);
+            }
+            try v9AppendChildStream(allocator, child_streams, cb.pre_instrs);
+            try v9AppendChildStream(allocator, child_streams, cb.default_instrs);
+        },
+        .switch_literal => |sl| {
+            for (sl.cases) |c| try v9AppendChildStream(allocator, child_streams, c.body_instrs);
+            try v9AppendChildStream(allocator, child_streams, sl.default_instrs);
+        },
+        .switch_return => |sr| {
+            for (sr.cases) |c| try v9AppendChildStream(allocator, child_streams, c.body_instrs);
+            try v9AppendChildStream(allocator, child_streams, sr.default_instrs);
+        },
+        .union_switch => |us| {
+            for (us.cases) |c| try v9AppendChildStream(allocator, child_streams, c.body_instrs);
+            if (us.has_else) {
+                try v9AppendChildStream(allocator, child_streams, us.else_instrs);
+            }
+        },
+        .union_switch_return => |usr| {
+            for (usr.cases) |c| try v9AppendChildStream(allocator, child_streams, c.body_instrs);
+        },
+        .try_call_named => |tc| {
+            try v9AppendChildStream(allocator, child_streams, tc.success_instrs);
+            try v9AppendChildStream(allocator, child_streams, tc.handler_instrs);
+        },
+        .guard_block => |gb| {
+            try v9AppendChildStream(allocator, child_streams, gb.body);
+        },
+        .optional_dispatch => |od| {
+            try v9AppendChildStream(allocator, child_streams, od.struct_instrs);
+            try v9AppendChildStream(allocator, child_streams, od.nil_instrs);
+        },
+        else => {},
+    }
+}
+
+fn v9PushBackwardChildrenThenProducer(
+    allocator: std.mem.Allocator,
+    stack: *std.ArrayListUnmanaged(V9BackwardStreamFrame),
+    instr: ir.Instruction,
+    child_streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+) error{OutOfMemory}!void {
+    try v9CollectBackwardChildStreams(allocator, instr, child_streams);
+    try stack.append(allocator, V9BackwardStreamFrame.initProducer(instr));
+    var child_index = child_streams.items.len;
+    while (child_index > 0) {
+        child_index -= 1;
+        const child = child_streams.items[child_index];
+        try stack.append(allocator, V9BackwardStreamFrame.initStream(child, child.len));
+    }
+}
+
 /// Walk a stream backward looking for a producer of `walker.target`.
 /// Updates `walker.found_kind` when a producer is found.
 /// `.move_value { dest: target, source: Y }` retargets the search
 /// through Y for the remainder of the backward walk.
 fn v9WalkStreamBackward(
+    allocator: std.mem.Allocator,
     walker: *V9ProducerWalker,
     stream: []const ir.Instruction,
     end_index: usize,
-) bool {
-    var idx = end_index;
-    while (idx > 0) {
-        idx -= 1;
-        const instr = stream[idx];
+) error{OutOfMemory}!bool {
+    if (end_index == 0) return false;
+
+    var stack: std.ArrayListUnmanaged(V9BackwardStreamFrame) = .empty;
+    defer stack.deinit(allocator);
+    var child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+    defer child_streams.deinit(allocator);
+
+    try stack.append(allocator, V9BackwardStreamFrame.initStream(stream, end_index));
+    while (stack.items.len != 0) {
+        const frame = &stack.items[stack.items.len - 1];
+        if (frame.producer) |producer_instr| {
+            _ = stack.pop().?;
+            if (walker.produces(producer_instr)) |kind| {
+                walker.found_kind = kind;
+                return true;
+            }
+            continue;
+        }
+
+        if (frame.next_index == 0) {
+            _ = stack.pop().?;
+            continue;
+        }
+
+        frame.next_index -= 1;
+        const instr = frame.stream[frame.next_index];
         // Move chain: retarget the search through the move's source.
         if (instr == .move_value and instr.move_value.dest == walker.target) {
             walker.target = instr.move_value.source;
             continue;
         }
-        // Recurse into nested streams (in reverse: later children
-        // first since they execute after earlier in forward order;
-        // for backward walk we want to traverse in reverse-of-
-        // forward-order). Practically, we walk EACH child stream
-        // backward; if any finds a producer, we're done.
-        if (v9WalkInstructionChildren(walker, instr)) return true;
-        // Direct producer check on this instruction.
-        if (walker.produces(instr)) |kind| {
-            walker.found_kind = kind;
-            return true;
-        }
-    }
-    return false;
-}
 
-fn v9WalkInstructionChildren(
-    walker: *V9ProducerWalker,
-    instr: ir.Instruction,
-) bool {
-    switch (instr) {
-        .if_expr => |ie| {
-            if (v9WalkStreamBackward(walker, ie.then_instrs, ie.then_instrs.len)) return true;
-            if (v9WalkStreamBackward(walker, ie.else_instrs, ie.else_instrs.len)) return true;
-        },
-        .case_block => |cb| {
-            for (cb.arms) |arm| {
-                if (v9WalkStreamBackward(walker, arm.body_instrs, arm.body_instrs.len)) return true;
-                if (v9WalkStreamBackward(walker, arm.cond_instrs, arm.cond_instrs.len)) return true;
-            }
-            if (v9WalkStreamBackward(walker, cb.pre_instrs, cb.pre_instrs.len)) return true;
-            if (v9WalkStreamBackward(walker, cb.default_instrs, cb.default_instrs.len)) return true;
-        },
-        .switch_literal => |sl| {
-            for (sl.cases) |c| {
-                if (v9WalkStreamBackward(walker, c.body_instrs, c.body_instrs.len)) return true;
-            }
-            if (v9WalkStreamBackward(walker, sl.default_instrs, sl.default_instrs.len)) return true;
-        },
-        .switch_return => |sr| {
-            for (sr.cases) |c| {
-                if (v9WalkStreamBackward(walker, c.body_instrs, c.body_instrs.len)) return true;
-            }
-            if (v9WalkStreamBackward(walker, sr.default_instrs, sr.default_instrs.len)) return true;
-        },
-        .union_switch => |us| {
-            for (us.cases) |c| {
-                if (v9WalkStreamBackward(walker, c.body_instrs, c.body_instrs.len)) return true;
-            }
-            // The catch-all `_` prong can also produce the searched-for
-            // local; without it the V9 producer search misses it. (This
-            // walker is a backward producer search whose result is
-            // order-independent — "does any producer exist".) Audit
-            // finding arc-drop-verify--01.
-            if (us.has_else) {
-                if (v9WalkStreamBackward(walker, us.else_instrs, us.else_instrs.len)) return true;
-            }
-        },
-        .union_switch_return => |usr| {
-            for (usr.cases) |c| {
-                if (v9WalkStreamBackward(walker, c.body_instrs, c.body_instrs.len)) return true;
-            }
-        },
-        .try_call_named => |tc| {
-            if (v9WalkStreamBackward(walker, tc.success_instrs, tc.success_instrs.len)) return true;
-            if (v9WalkStreamBackward(walker, tc.handler_instrs, tc.handler_instrs.len)) return true;
-        },
-        .guard_block => |gb| {
-            if (v9WalkStreamBackward(walker, gb.body, gb.body.len)) return true;
-        },
-        .optional_dispatch => |od| {
-            if (v9WalkStreamBackward(walker, od.struct_instrs, od.struct_instrs.len)) return true;
-            if (v9WalkStreamBackward(walker, od.nil_instrs, od.nil_instrs.len)) return true;
-        },
-        else => {},
+        // Nested streams are searched before the parent instruction's
+        // own producer check, matching the former recursive walker.
+        try v9PushBackwardChildrenThenProducer(allocator, &stack, instr, &child_streams);
     }
     return false;
 }
 
 /// Check whether `target` is the dest local of any `.owned`-convention
 /// parameter via its `param_get` instruction.
-fn v9IsOwnedParamLocal(function: *const ir.Function, target: ir.LocalId) bool {
+fn v9IsOwnedParamLocal(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    target: ir.LocalId,
+) error{OutOfMemory}!bool {
+    if (function.param_conventions.len == 0) return false;
     var resolved: std.AutoHashMapUnmanaged(u32, ir.LocalId) = .empty;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    defer resolved.deinit(allocator);
     for (function.body) |block| {
-        v9SeedParamGets(a, block.instructions, &resolved) catch return false;
+        try v9SeedParamGets(allocator, block.instructions, &resolved);
     }
     var iter = resolved.iterator();
     while (iter.next()) |entry| {
@@ -3373,43 +3776,74 @@ fn v9SeedParamGets(
     stream: []const ir.Instruction,
     resolved: *std.AutoHashMapUnmanaged(u32, ir.LocalId),
 ) error{OutOfMemory}!void {
-    for (stream) |*instr| {
+    if (stream.len == 0) return;
+
+    var stack: std.ArrayListUnmanaged(V9ForwardStreamFrame) = .empty;
+    defer stack.deinit(allocator);
+    var child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+    defer child_streams.deinit(allocator);
+
+    try stack.append(allocator, .{ .stream = stream });
+    while (stack.items.len != 0) {
+        const frame = &stack.items[stack.items.len - 1];
+        if (frame.next_index >= frame.stream.len) {
+            _ = stack.pop().?;
+            continue;
+        }
+
+        const instr = &frame.stream[frame.next_index];
+        frame.next_index += 1;
+
         if (instr.* == .param_get) {
             const pg = instr.param_get;
             const gop = try resolved.getOrPut(allocator, pg.index);
             if (!gop.found_existing) gop.value_ptr.* = pg.dest;
         }
-        // Recurse into every nested sub-stream via the canonical
-        // enumerator (covers union_switch.else_instrs, previously
-        // skipped). Param collection is order-independent.
-        const Ctx = struct {
-            allocator: std.mem.Allocator,
-            resolved: *std.AutoHashMapUnmanaged(u32, ir.LocalId),
-            err: ?error{OutOfMemory} = null,
-            fn onStream(self_ctx: *@This(), child: ir.ChildStream) void {
-                if (self_ctx.err != null) return;
-                v9SeedParamGets(self_ctx.allocator, child.stream, self_ctx.resolved) catch |e| {
-                    self_ctx.err = e;
-                };
-            }
-        };
-        var ctx = Ctx{ .allocator = allocator, .resolved = resolved };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
+        // Walk every nested sub-stream via the canonical enumerator
+        // (covers union_switch.else_instrs, previously skipped).
+        // Param collection is order-independent, but the traversal
+        // preserves the former recursive DFS for duplicate param_get
+        // first-hit behavior.
+        try v9PushForwardChildren(allocator, &stack, instr, &child_streams);
     }
 }
 
 /// V9 entry point. Walks every `.release { value: X }` in the
 /// function and verifies a matching producer is reachable on every
 /// backward path.
-fn v9CheckAllReleases(function: *const ir.Function) void {
+fn v9CheckAllReleases(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+) error{OutOfMemory}!void {
     for (function.body) |block| {
-        v9CheckStream(function, block.instructions);
+        try v9CheckStream(allocator, function, block.instructions);
     }
 }
 
-fn v9CheckStream(function: *const ir.Function, stream: []const ir.Instruction) void {
-    for (stream, 0..) |*instr, idx| {
+fn v9CheckStream(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    stream: []const ir.Instruction,
+) error{OutOfMemory}!void {
+    if (stream.len == 0) return;
+
+    var stack: std.ArrayListUnmanaged(V9ForwardStreamFrame) = .empty;
+    defer stack.deinit(allocator);
+    var child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty;
+    defer child_streams.deinit(allocator);
+
+    try stack.append(allocator, .{ .stream = stream });
+    while (stack.items.len != 0) {
+        const frame = &stack.items[stack.items.len - 1];
+        if (frame.next_index >= frame.stream.len) {
+            _ = stack.pop().?;
+            continue;
+        }
+
+        const idx = frame.next_index;
+        const instr = &frame.stream[idx];
+        frame.next_index += 1;
+
         if (instr.* == .release) {
             const r = instr.release;
             // V1/V4 already check that .release on .borrowed locals is
@@ -3419,34 +3853,28 @@ fn v9CheckStream(function: *const ir.Function, stream: []const ir.Instruction) v
                 function.local_ownership[r.value] == .owned
             else
                 true;
-            if (owned) v9CheckRelease(function, stream, idx, r.value);
+            if (owned) try v9CheckRelease(allocator, function, frame.stream, idx, r.value);
         }
-        // Recurse into every nested sub-stream via the canonical
-        // enumerator (covers union_switch.else_instrs, previously
-        // skipped, leaving releases inside the catch-all's producer
-        // check unverified). Audit finding arc-drop-verify--01.
-        const Ctx = struct {
-            function: *const ir.Function,
-            fn onStream(self: *@This(), child: ir.ChildStream) void {
-                v9CheckStream(self.function, child.stream);
-            }
-        };
-        var ctx = Ctx{ .function = function };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
+        // Walk every nested sub-stream via the canonical enumerator
+        // (covers union_switch.else_instrs, previously skipped,
+        // leaving releases inside the catch-all's producer check
+        // unverified). Audit finding arc-drop-verify--01.
+        try v9PushForwardChildren(allocator, &stack, instr, &child_streams);
     }
 }
 
 fn v9CheckRelease(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     stream: []const ir.Instruction,
     release_index: usize,
     value: ir.LocalId,
-) void {
+) error{OutOfMemory}!void {
     var walker = V9ProducerWalker{
         .function = function,
         .target = value,
     };
-    if (v9WalkStreamBackward(&walker, stream, release_index)) return;
+    if (try v9WalkStreamBackward(allocator, &walker, stream, release_index)) return;
     // No producer found within this stream. Walk earlier blocks.
     // (Most functions have a single block; this is a safety net.)
     var found = false;
@@ -3454,13 +3882,13 @@ fn v9CheckRelease(
         const block_stream = block.instructions;
         if (block_stream.ptr == stream.ptr) break;
         _ = bi;
-        if (v9WalkStreamBackward(&walker, block_stream, block_stream.len)) {
+        if (try v9WalkStreamBackward(allocator, &walker, block_stream, block_stream.len)) {
             found = true;
             break;
         }
     }
     if (found) return;
-    if (v9IsOwnedParamLocal(function, walker.target)) return;
+    if (try v9IsOwnedParamLocal(allocator, function, walker.target)) return;
     if (suppress_diagnostics) return;
     if (std.c.getenv("ZAP_DEBUG_V9") == null) return;
     std.debug.print(

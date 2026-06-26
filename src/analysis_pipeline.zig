@@ -202,7 +202,12 @@ fn runOptionalRegionSolver(
         // Parallel region solving
         const io_val = pio.?;
         const region_results = try alloc.alloc(RegionTaskResult, program.functions.len);
-        defer alloc.free(region_results);
+        defer {
+            for (region_results) |*result| {
+                result.deinit();
+            }
+            alloc.free(region_results);
+        }
 
         // Initialize all results
         for (region_results) |*r| {
@@ -211,11 +216,17 @@ fn runOptionalRegionSolver(
 
         // Extract per-function data and launch parallel tasks
         const func_escapes = try alloc.alloc(std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.EscapeState), program.functions.len);
+        for (func_escapes) |*func_escape| {
+            func_escape.* = .empty;
+        }
         defer {
             for (func_escapes) |*fe| fe.deinit(alloc);
             alloc.free(func_escapes);
         }
         const func_alloc_sites_arr = try alloc.alloc(std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.AllocSiteId), program.functions.len);
+        for (func_alloc_sites_arr) |*func_alloc_sites| {
+            func_alloc_sites.* = .empty;
+        }
         defer {
             for (func_alloc_sites_arr) |*fas| fas.deinit(alloc);
             alloc.free(func_alloc_sites_arr);
@@ -223,7 +234,6 @@ fn runOptionalRegionSolver(
 
         // Prepare per-function inputs (sequential — reads shared ctx)
         for (program.functions, 0..) |func, fi| {
-            func_escapes[fi] = .empty;
             var es_iter = context.escape_states.iterator();
             while (es_iter.next()) |entry| {
                 if (entry.key_ptr.function == func.id) {
@@ -231,7 +241,6 @@ fn runOptionalRegionSolver(
                 }
             }
 
-            func_alloc_sites_arr[fi] = .empty;
             var next_site: lattice.AllocSiteId = 0;
             for (func.body) |block| {
                 for (block.instructions) |instr| {
@@ -259,11 +268,16 @@ fn runOptionalRegionSolver(
                 alloc, func, &func_escapes[fi], &func_alloc_sites_arr[fi], &region_results[fi],
             });
         }
-        group.await(io_val) catch {};
+        try group.await(io_val);
+
+        try propagateRegionTaskFailures(region_results);
 
         // Merge results sequentially
         for (region_results) |*result| {
-            if (!result.solved) continue;
+            switch (result.state) {
+                .solved => {},
+                .pending, .failed => unreachable,
+            }
 
             var ra_iter = result.region_assignments.iterator();
             while (ra_iter.next()) |entry| {
@@ -279,11 +293,6 @@ fn runOptionalRegionSolver(
             for (result.outlives_constraints.items) |c| {
                 try context.outlives_constraints.append(alloc, c);
             }
-        }
-
-        // Clean up results
-        for (region_results) |*result| {
-            result.deinit();
         }
     } else {
         // Sequential fallback
@@ -322,9 +331,7 @@ fn runOptionalRegionSolver(
                 }
             }
 
-            var region_result = solver.solveFunction(func, &func_escape, &func_alloc_sites) catch {
-                continue;
-            };
+            var region_result = try solver.solveFunction(func, &func_escape, &func_alloc_sites);
             defer region_result.deinit();
 
             var ra_iter = region_result.region_assignments.iterator();
@@ -476,13 +483,13 @@ fn runClosureEnvironmentSemantics(
             // as ordinary positional parameters. This keeps the call-site
             // shape (call_direct with prepended capture args) and the
             // callee's parameter list in agreement.
-            if (!hasMakeClosureForFunction(program, func.id)) {
+            if (!try hasMakeClosureForFunction(context.allocator, program, func.id)) {
                 try context.closure_tiers.put(func.id, .lambda_lifted);
                 continue;
             }
             // Find the escape state for this closure's creation site.
             // Look through all functions for a make_closure that references this function.
-            const escape = findClosureEscape(context, program, func.id);
+            const escape = try findClosureEscape(context, program, func.id);
             const tier = lattice.escapeToClosureTier(escape, func.captures.len > 0);
             try context.closure_tiers.put(func.id, tier);
         }
@@ -491,8 +498,14 @@ fn runClosureEnvironmentSemantics(
 
 /// Result from a parallel region solving task. Mirrors the fields of
 /// region_solver.FunctionRegionResult that get merged into AnalysisContext.
+const RegionTaskState = union(enum) {
+    pending,
+    solved,
+    failed: anyerror,
+};
+
 const RegionTaskResult = struct {
-    solved: bool = false,
+    state: RegionTaskState = .pending,
     func_id: ir.FunctionId = 0,
     region_assignments: std.AutoArrayHashMapUnmanaged(ir.LocalId, lattice.RegionId) = .empty,
     alloc_summaries: std.AutoArrayHashMapUnmanaged(lattice.AllocSiteId, lattice.AllocSiteSummary) = .empty,
@@ -500,12 +513,25 @@ const RegionTaskResult = struct {
     task_alloc: std.mem.Allocator = undefined,
 
     fn deinit(self: *RegionTaskResult) void {
-        if (!self.solved) return;
+        switch (self.state) {
+            .solved => {},
+            .pending, .failed => return,
+        }
         self.region_assignments.deinit(self.task_alloc);
         self.alloc_summaries.deinit(self.task_alloc);
         self.outlives_constraints.deinit(self.task_alloc);
     }
 };
+
+fn propagateRegionTaskFailures(region_results: []const RegionTaskResult) !void {
+    for (region_results) |*result| {
+        switch (result.state) {
+            .solved => {},
+            .failed => |err| return err,
+            .pending => return error.RegionSolveTaskIncomplete,
+        }
+    }
+}
 
 fn regionSolveTask(
     alloc: std.mem.Allocator,
@@ -515,11 +541,13 @@ fn regionSolveTask(
     result: *RegionTaskResult,
 ) void {
     var solver = region_solver.RegionSolver.init(alloc);
-    var region_result = solver.solveFunction(func, func_escape, func_alloc_sites) catch {
+    var region_result = solver.solveFunction(func, func_escape, func_alloc_sites) catch |err| {
+        result.func_id = func.id;
+        result.state = .{ .failed = err };
         return;
     };
     // Transfer ownership of data to the result struct
-    result.solved = true;
+    result.state = .solved;
     result.func_id = func.id;
     result.task_alloc = alloc;
     result.region_assignments = region_result.region_assignments;
@@ -598,44 +626,284 @@ fn collectBorrowDiagnostics(
     }
 }
 
+const InstructionStreamWalkControl = enum {
+    continue_walk,
+    stop_walk,
+};
+
+const InstructionStreamFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+};
+
+const InstructionStreamWalker = struct {
+    allocator: std.mem.Allocator,
+    stack: std.ArrayListUnmanaged(InstructionStreamFrame) = .empty,
+    child_streams: std.ArrayListUnmanaged([]const ir.Instruction) = .empty,
+
+    fn init(allocator: std.mem.Allocator) InstructionStreamWalker {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *InstructionStreamWalker) void {
+        self.stack.deinit(self.allocator);
+        self.child_streams.deinit(self.allocator);
+    }
+
+    fn walk(
+        self: *InstructionStreamWalker,
+        root_stream: []const ir.Instruction,
+        context: anytype,
+        comptime visitFn: fn (
+            ctx: @TypeOf(context),
+            stream: []const ir.Instruction,
+            instr: *const ir.Instruction,
+        ) anyerror!InstructionStreamWalkControl,
+    ) !InstructionStreamWalkControl {
+        self.stack.clearRetainingCapacity();
+        self.child_streams.clearRetainingCapacity();
+        if (root_stream.len == 0) return .continue_walk;
+
+        try self.stack.append(self.allocator, .{ .stream = root_stream });
+        while (self.stack.items.len > 0) {
+            const frame_index = self.stack.items.len - 1;
+            if (self.stack.items[frame_index].next_index >= self.stack.items[frame_index].stream.len) {
+                _ = self.stack.pop();
+                continue;
+            }
+
+            const instr_index = self.stack.items[frame_index].next_index;
+            self.stack.items[frame_index].next_index += 1;
+            const current_stream = self.stack.items[frame_index].stream;
+            const instr = &current_stream[instr_index];
+
+            switch (try visitFn(context, current_stream, instr)) {
+                .continue_walk => {},
+                .stop_walk => return .stop_walk,
+            }
+
+            try self.pushInstructionChildren(instr);
+        }
+
+        return .continue_walk;
+    }
+
+    fn pushInstructionChildren(self: *InstructionStreamWalker, instr: *const ir.Instruction) !void {
+        self.child_streams.clearRetainingCapacity();
+
+        const ChildStreamCollector = struct {
+            allocator: std.mem.Allocator,
+            streams: *std.ArrayListUnmanaged([]const ir.Instruction),
+            err: ?anyerror = null,
+
+            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+                if (ctx.err != null or child.stream.len == 0) return;
+                ctx.streams.append(ctx.allocator, child.stream) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        var child_collector = ChildStreamCollector{
+            .allocator = self.allocator,
+            .streams = &self.child_streams,
+        };
+        ir.forEachChildStream(instr, &child_collector, ChildStreamCollector.onStream);
+        if (child_collector.err) |err| return err;
+
+        var stream_index = self.child_streams.items.len;
+        while (stream_index > 0) {
+            stream_index -= 1;
+            try self.stack.append(self.allocator, .{ .stream = self.child_streams.items[stream_index] });
+        }
+    }
+};
+
+const AliasQuery = struct {
+    local: ir.LocalId,
+    stream: []const ir.Instruction,
+};
+
+const AliasQueryKey = struct {
+    local: ir.LocalId,
+    stream_ptr: usize,
+    stream_len: usize,
+
+    fn init(local: ir.LocalId, stream: []const ir.Instruction) AliasQueryKey {
+        return .{
+            .local = local,
+            .stream_ptr = if (stream.len == 0) 0 else @intFromPtr(stream.ptr),
+            .stream_len = stream.len,
+        };
+    }
+};
+
+const ClosureAliasResolver = struct {
+    allocator: std.mem.Allocator,
+    stream_walker: InstructionStreamWalker,
+    query_stack: std.ArrayListUnmanaged(AliasQuery) = .empty,
+    visited_queries: std.AutoArrayHashMapUnmanaged(AliasQueryKey, void) = .empty,
+
+    fn init(allocator: std.mem.Allocator) ClosureAliasResolver {
+        return .{
+            .allocator = allocator,
+            .stream_walker = InstructionStreamWalker.init(allocator),
+        };
+    }
+
+    fn deinit(self: *ClosureAliasResolver) void {
+        self.visited_queries.deinit(self.allocator);
+        self.query_stack.deinit(self.allocator);
+        self.stream_walker.deinit();
+    }
+
+    fn queueQuery(
+        self: *ClosureAliasResolver,
+        local: ir.LocalId,
+        stream: []const ir.Instruction,
+    ) !void {
+        const visited_entry = try self.visited_queries.getOrPut(self.allocator, AliasQueryKey.init(local, stream));
+        if (!visited_entry.found_existing) {
+            try self.query_stack.append(self.allocator, .{
+                .local = local,
+                .stream = stream,
+            });
+        }
+    }
+
+    fn isAlias(
+        self: *ClosureAliasResolver,
+        local: ir.LocalId,
+        closure_local: ir.LocalId,
+        instrs: []const ir.Instruction,
+    ) !bool {
+        self.query_stack.clearRetainingCapacity();
+        self.visited_queries.clearRetainingCapacity();
+        try self.queueQuery(local, instrs);
+
+        while (self.query_stack.pop()) |query| {
+            if (query.local == closure_local) return true;
+
+            const AliasDefinitionCollector = struct {
+                resolver: *ClosureAliasResolver,
+                target_local: ir.LocalId,
+                closure_local: ir.LocalId,
+                found: bool = false,
+
+                fn queueSource(
+                    ctx: *@This(),
+                    source: ir.LocalId,
+                    stream: []const ir.Instruction,
+                ) !InstructionStreamWalkControl {
+                    if (source == ctx.closure_local) {
+                        ctx.found = true;
+                        return .stop_walk;
+                    }
+                    try ctx.resolver.queueQuery(source, stream);
+                    return .continue_walk;
+                }
+
+                fn visit(
+                    ctx: *@This(),
+                    stream: []const ir.Instruction,
+                    instr: *const ir.Instruction,
+                ) anyerror!InstructionStreamWalkControl {
+                    switch (instr.*) {
+                        .local_get => |lg| if (lg.dest == ctx.target_local) return try ctx.queueSource(lg.source, stream),
+                        .local_set => |ls| if (ls.dest == ctx.target_local) return try ctx.queueSource(ls.value, stream),
+                        .move_value => |mv| if (mv.dest == ctx.target_local) return try ctx.queueSource(mv.source, stream),
+                        .share_value => |sv| if (sv.dest == ctx.target_local) return try ctx.queueSource(sv.source, stream),
+                        else => {},
+                    }
+                    return .continue_walk;
+                }
+            };
+
+            var definition_collector = AliasDefinitionCollector{
+                .resolver = self,
+                .target_local = query.local,
+                .closure_local = closure_local,
+            };
+            _ = try self.stream_walker.walk(query.stream, &definition_collector, AliasDefinitionCollector.visit);
+            if (definition_collector.found) return true;
+        }
+
+        return false;
+    }
+};
+
 /// Does any `make_closure` instruction in the program target the given
 /// function? If not, the function is only ever direct-called and its
 /// captures are forwarded as ordinary arguments — i.e., it should be
 /// classified as lambda-lifted regardless of its `is_closure` flag.
-fn hasMakeClosureForFunction(program: *const ir.Program, target_func_id: ir.FunctionId) bool {
+fn hasMakeClosureForFunction(
+    allocator: std.mem.Allocator,
+    program: *const ir.Program,
+    target_func_id: ir.FunctionId,
+) !bool {
+    var walker = InstructionStreamWalker.init(allocator);
+    defer walker.deinit();
+
     for (program.functions) |func| {
         for (func.body) |block| {
-            if (instrsContainMakeClosureFor(block.instructions, target_func_id)) return true;
+            if (try instrsContainMakeClosureForWithWalker(&walker, block.instructions, target_func_id)) return true;
         }
     }
     return false;
 }
 
-fn instrsContainMakeClosureFor(instrs: []const ir.Instruction, target_func_id: ir.FunctionId) bool {
-    for (instrs) |instr| {
-        switch (instr) {
-            .make_closure => |mc| if (mc.function == target_func_id) return true,
-            .if_expr => |ie| {
-                if (instrsContainMakeClosureFor(ie.then_instrs, target_func_id)) return true;
-                if (instrsContainMakeClosureFor(ie.else_instrs, target_func_id)) return true;
-            },
-            .case_block => |cb| {
-                if (instrsContainMakeClosureFor(cb.pre_instrs, target_func_id)) return true;
-                for (cb.arms) |arm| {
-                    if (instrsContainMakeClosureFor(arm.cond_instrs, target_func_id)) return true;
-                    if (instrsContainMakeClosureFor(arm.body_instrs, target_func_id)) return true;
-                }
-                if (instrsContainMakeClosureFor(cb.default_instrs, target_func_id)) return true;
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    if (instrsContainMakeClosureFor(c.body_instrs, target_func_id)) return true;
-                }
-            },
-            else => {},
+fn instrsContainMakeClosureFor(
+    allocator: std.mem.Allocator,
+    instrs: []const ir.Instruction,
+    target_func_id: ir.FunctionId,
+) !bool {
+    return (try findMakeClosureForFunction(allocator, instrs, target_func_id)) != null;
+}
+
+fn instrsContainMakeClosureForWithWalker(
+    walker: *InstructionStreamWalker,
+    instrs: []const ir.Instruction,
+    target_func_id: ir.FunctionId,
+) !bool {
+    return (try findMakeClosureForFunctionWithWalker(walker, instrs, target_func_id)) != null;
+}
+
+fn findMakeClosureForFunction(
+    allocator: std.mem.Allocator,
+    instrs: []const ir.Instruction,
+    target_func_id: ir.FunctionId,
+) !?ir.MakeClosure {
+    var walker = InstructionStreamWalker.init(allocator);
+    defer walker.deinit();
+    return findMakeClosureForFunctionWithWalker(&walker, instrs, target_func_id);
+}
+
+fn findMakeClosureForFunctionWithWalker(
+    walker: *InstructionStreamWalker,
+    instrs: []const ir.Instruction,
+    target_func_id: ir.FunctionId,
+) !?ir.MakeClosure {
+    const MakeClosureFinder = struct {
+        target_func_id: ir.FunctionId,
+        result: ?ir.MakeClosure = null,
+
+        fn visit(
+            ctx: *@This(),
+            stream: []const ir.Instruction,
+            instr: *const ir.Instruction,
+        ) anyerror!InstructionStreamWalkControl {
+            _ = stream;
+            if (instr.* == .make_closure and instr.make_closure.function == ctx.target_func_id) {
+                ctx.result = instr.make_closure;
+                return .stop_walk;
+            }
+            return .continue_walk;
         }
-    }
-    return false;
+    };
+
+    var finder = MakeClosureFinder{ .target_func_id = target_func_id };
+    _ = try walker.walk(instrs, &finder, MakeClosureFinder.visit);
+    return finder.result;
 }
 
 /// Find the escape state for a closure's creation site by searching
@@ -646,43 +914,26 @@ fn findClosureEscape(
     ctx: *const lattice.AnalysisContext,
     program: *const ir.Program,
     closure_func_id: ir.FunctionId,
-) lattice.EscapeState {
+) !lattice.EscapeState {
+    var make_closure_walker = InstructionStreamWalker.init(ctx.allocator);
+    defer make_closure_walker.deinit();
+
     for (program.functions) |func| {
         for (func.body) |block| {
-            for (block.instructions) |instr| {
-                switch (instr) {
-                    .make_closure => |mc| {
-                        if (mc.function == closure_func_id) {
-                            // Check if this closure is only called locally
-                            // (never stored, passed as arg, or returned).
-                            if (isCallLocalOnly(func, mc.dest, block.instructions)) {
-                                return .no_escape;
-                            }
-                            if (hasHardEscapeInFunction(func, mc.dest)) {
-                                return .global_escape;
-                            }
-                            const vkey = lattice.ValueKey{
-                                .function = func.id,
-                                .local = mc.dest,
-                            };
-                            return ctx.getEscape(vkey);
-                        }
-                    },
-                    // Check nested instructions.
-                    .if_expr => |ie| {
-                        if (findClosureEscapeInInstrs(ctx, func.id, ie.then_instrs, closure_func_id)) |e| return e;
-                        if (findClosureEscapeInInstrs(ctx, func.id, ie.else_instrs, closure_func_id)) |e| return e;
-                    },
-                    .case_block => |cb| {
-                        if (findClosureEscapeInInstrs(ctx, func.id, cb.pre_instrs, closure_func_id)) |e| return e;
-                        for (cb.arms) |arm| {
-                            if (findClosureEscapeInInstrs(ctx, func.id, arm.cond_instrs, closure_func_id)) |e| return e;
-                            if (findClosureEscapeInInstrs(ctx, func.id, arm.body_instrs, closure_func_id)) |e| return e;
-                        }
-                        if (findClosureEscapeInInstrs(ctx, func.id, cb.default_instrs, closure_func_id)) |e| return e;
-                    },
-                    else => {},
+            if (try findMakeClosureForFunctionWithWalker(&make_closure_walker, block.instructions, closure_func_id)) |mc| {
+                // Check if this closure is only called locally
+                // (never stored, passed as arg, or returned).
+                if (try isCallLocalOnly(ctx.allocator, func, mc.dest, block.instructions)) {
+                    return .no_escape;
                 }
+                if (try hasHardEscapeInFunction(ctx.allocator, func, mc.dest)) {
+                    return .global_escape;
+                }
+                const vkey = lattice.ValueKey{
+                    .function = func.id,
+                    .local = mc.dest,
+                };
+                return ctx.getEscape(vkey);
             }
         }
     }
@@ -695,249 +946,376 @@ fn findClosureEscape(
 /// Check if a closure (identified by its make_closure dest local) is only
 /// ever used as the callee of call_closure instructions in the given instruction list.
 /// If it's stored, passed as an argument, returned, or used in any other way, return false.
-fn isCallLocalOnly(func: ir.Function, closure_local: ir.LocalId, start_instrs: []const ir.Instruction) bool {
+fn isCallLocalOnly(
+    allocator: std.mem.Allocator,
+    func: ir.Function,
+    closure_local: ir.LocalId,
+    start_instrs: []const ir.Instruction,
+) !bool {
     // Track aliases: locals that hold the same value as closure_local.
     // Simple: just track the initial local and any direct copies.
+    var scan_walker = InstructionStreamWalker.init(allocator);
+    defer scan_walker.deinit();
+    var alias_resolver = ClosureAliasResolver.init(allocator);
+    defer alias_resolver.deinit();
+
     var found_use = false;
-    return isCallLocalInInstrs(closure_local, start_instrs, start_instrs, &found_use) and
-        isCallLocalInAllBlocks(func, closure_local);
+    return (try isCallLocalInInstrsWithScratch(
+        &scan_walker,
+        &alias_resolver,
+        closure_local,
+        start_instrs,
+        start_instrs,
+        &found_use,
+    )) and
+        (try isCallLocalInAllBlocksWithScratch(&scan_walker, &alias_resolver, func, closure_local));
 }
 
-fn isCallLocalInAllBlocks(func: ir.Function, closure_local: ir.LocalId) bool {
+fn isCallLocalInAllBlocks(
+    allocator: std.mem.Allocator,
+    func: ir.Function,
+    closure_local: ir.LocalId,
+) !bool {
+    var scan_walker = InstructionStreamWalker.init(allocator);
+    defer scan_walker.deinit();
+    var alias_resolver = ClosureAliasResolver.init(allocator);
+    defer alias_resolver.deinit();
+    return isCallLocalInAllBlocksWithScratch(&scan_walker, &alias_resolver, func, closure_local);
+}
+
+fn isCallLocalInAllBlocksWithScratch(
+    scan_walker: *InstructionStreamWalker,
+    alias_resolver: *ClosureAliasResolver,
+    func: ir.Function,
+    closure_local: ir.LocalId,
+) !bool {
     var found_use = false;
     for (func.body) |block| {
-        if (!isCallLocalInInstrs(closure_local, block.instructions, block.instructions, &found_use)) return false;
+        if (!try isCallLocalInInstrsWithScratch(
+            scan_walker,
+            alias_resolver,
+            closure_local,
+            block.instructions,
+            block.instructions,
+            &found_use,
+        )) return false;
     }
     return true;
 }
 
-fn isCallLocalInInstrs(closure_local: ir.LocalId, instrs: []const ir.Instruction, root_instrs: []const ir.Instruction, found_use: *bool) bool {
-    for (instrs) |instr| {
-        switch (instr) {
-            .call_closure => |cc| {
-                if (isAliasOfClosure(cc.callee, closure_local, root_instrs, 0)) {
-                    found_use.* = true;
-                    // This is fine — closure is being called.
-                    // But check if it's also passed as an argument.
-                    for (cc.args) |arg| {
-                        if (isAliasOfClosure(arg, closure_local, root_instrs, 0)) return false; // Passed as arg too!
-                    }
-                }
-            },
-            // If the closure local appears as an argument to any call, it escapes.
-            .call_direct => |cd| {
-                for (cd.args) |arg| {
-                    if (isAliasOfClosure(arg, closure_local, root_instrs, 0)) return false;
-                }
-            },
-            .call_named => |cn| {
-                for (cn.args) |arg| {
-                    if (isAliasOfClosure(arg, closure_local, root_instrs, 0)) return false;
-                }
-            },
-            .call_dispatch => |cd2| {
-                for (cd2.args) |arg| {
-                    if (isAliasOfClosure(arg, closure_local, root_instrs, 0)) return false;
-                }
-            },
-            .call_builtin => |cb| {
-                for (cb.args) |arg| {
-                    if (isAliasOfClosure(arg, closure_local, root_instrs, 0)) return false;
-                }
-            },
-            // If returned, it escapes.
-            .ret => |r| {
-                if (r.value) |v| {
-                    if (isAliasOfClosure(v, closure_local, root_instrs, 0)) return false;
-                }
-            },
-            .cond_return => |cr| {
-                if (cr.value) |v| {
-                    if (isAliasOfClosure(v, closure_local, root_instrs, 0)) return false;
-                }
-            },
-            // If stored in aggregate, it escapes.
-            .tuple_init => |ti| {
-                for (ti.elements) |e| {
-                    if (isAliasOfClosure(e, closure_local, root_instrs, 0)) return false;
-                }
-            },
-            .list_init => |li| {
-                for (li.elements) |e| {
-                    if (isAliasOfClosure(e, closure_local, root_instrs, 0)) return false;
-                }
-            },
-            .struct_init => |si| {
-                for (si.fields) |f| {
-                    if (isAliasOfClosure(f.value, closure_local, root_instrs, 0)) return false;
-                }
-            },
-            .field_set => |fs| {
-                if (isAliasOfClosure(fs.value, closure_local, root_instrs, 0)) return false;
-            },
-            // Recurse into nested instructions.
-            .if_expr => |ie| {
-                if (!isCallLocalInInstrs(closure_local, ie.then_instrs, root_instrs, found_use)) return false;
-                if (!isCallLocalInInstrs(closure_local, ie.else_instrs, root_instrs, found_use)) return false;
-            },
-            .case_block => |cb| {
-                if (!isCallLocalInInstrs(closure_local, cb.pre_instrs, root_instrs, found_use)) return false;
-                for (cb.arms) |arm| {
-                    if (!isCallLocalInInstrs(closure_local, arm.cond_instrs, root_instrs, found_use)) return false;
-                    if (!isCallLocalInInstrs(closure_local, arm.body_instrs, root_instrs, found_use)) return false;
-                }
-                if (!isCallLocalInInstrs(closure_local, cb.default_instrs, root_instrs, found_use)) return false;
-            },
-            .guard_block => |gb| {
-                if (!isCallLocalInInstrs(closure_local, gb.body, root_instrs, found_use)) return false;
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| {
-                    if (!isCallLocalInInstrs(closure_local, c.body_instrs, root_instrs, found_use)) return false;
-                }
-                if (!isCallLocalInInstrs(closure_local, sl.default_instrs, root_instrs, found_use)) return false;
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| {
-                    if (!isCallLocalInInstrs(closure_local, c.body_instrs, root_instrs, found_use)) return false;
-                }
-                if (!isCallLocalInInstrs(closure_local, sr.default_instrs, root_instrs, found_use)) return false;
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    if (!isCallLocalInInstrs(closure_local, c.body_instrs, root_instrs, found_use)) return false;
-                }
-            },
-            else => {},
-        }
-    }
-    return true;
-}
-
-fn isAliasOfClosure(local: ir.LocalId, closure_local: ir.LocalId, instrs: []const ir.Instruction, depth: u8) bool {
-    if (local == closure_local) return true;
-    if (depth > 32) return false;
-    for (instrs) |instr| {
-        switch (instr) {
-            .local_get => |lg| if (lg.dest == local) return isAliasOfClosure(lg.source, closure_local, instrs, depth + 1),
-            .local_set => |ls| if (ls.dest == local) return isAliasOfClosure(ls.value, closure_local, instrs, depth + 1),
-            .move_value => |mv| if (mv.dest == local) return isAliasOfClosure(mv.source, closure_local, instrs, depth + 1),
-            .share_value => |sv| if (sv.dest == local) return isAliasOfClosure(sv.source, closure_local, instrs, depth + 1),
-            .if_expr => |ie| {
-                if (isAliasOfClosure(local, closure_local, ie.then_instrs, depth)) return true;
-                if (isAliasOfClosure(local, closure_local, ie.else_instrs, depth)) return true;
-            },
-            .case_block => |cb| {
-                if (isAliasOfClosure(local, closure_local, cb.pre_instrs, depth)) return true;
-                for (cb.arms) |arm| {
-                    if (isAliasOfClosure(local, closure_local, arm.cond_instrs, depth)) return true;
-                    if (isAliasOfClosure(local, closure_local, arm.body_instrs, depth)) return true;
-                }
-                if (isAliasOfClosure(local, closure_local, cb.default_instrs, depth)) return true;
-            },
-            .guard_block => |gb| if (isAliasOfClosure(local, closure_local, gb.body, depth)) return true,
-            .switch_literal => |sl| {
-                for (sl.cases) |c| if (isAliasOfClosure(local, closure_local, c.body_instrs, depth)) return true;
-                if (isAliasOfClosure(local, closure_local, sl.default_instrs, depth)) return true;
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| if (isAliasOfClosure(local, closure_local, c.body_instrs, depth)) return true;
-                if (isAliasOfClosure(local, closure_local, sr.default_instrs, depth)) return true;
-            },
-            .union_switch_return => |usr| for (usr.cases) |c| if (isAliasOfClosure(local, closure_local, c.body_instrs, depth)) return true,
-            else => {},
-        }
-    }
-    return false;
-}
-
-fn hasHardEscapeInFunction(func: ir.Function, closure_local: ir.LocalId) bool {
-    for (func.body) |block| {
-        if (hasHardEscapeInInstrs(closure_local, block.instructions, block.instructions)) return true;
-    }
-    return false;
-}
-
-fn hasHardEscapeInInstrs(closure_local: ir.LocalId, instrs: []const ir.Instruction, root_instrs: []const ir.Instruction) bool {
-    for (instrs) |instr| {
-        switch (instr) {
-            .ret => |r| if (r.value) |v| {
-                if (isAliasOfClosure(v, closure_local, root_instrs, 0)) return true;
-            },
-            .cond_return => |cr| if (cr.value) |v| {
-                if (isAliasOfClosure(v, closure_local, root_instrs, 0)) return true;
-            },
-            .tuple_init => |ti| {
-                for (ti.elements) |e| if (isAliasOfClosure(e, closure_local, root_instrs, 0)) return true;
-            },
-            .list_init => |li| {
-                for (li.elements) |e| if (isAliasOfClosure(e, closure_local, root_instrs, 0)) return true;
-            },
-            .struct_init => |si| {
-                for (si.fields) |f| if (isAliasOfClosure(f.value, closure_local, root_instrs, 0)) return true;
-            },
-            .field_set => |fs| if (isAliasOfClosure(fs.value, closure_local, root_instrs, 0)) return true,
-            .if_expr => |ie| {
-                if (hasHardEscapeInInstrs(closure_local, ie.then_instrs, root_instrs)) return true;
-                if (hasHardEscapeInInstrs(closure_local, ie.else_instrs, root_instrs)) return true;
-            },
-            .case_block => |cb| {
-                if (hasHardEscapeInInstrs(closure_local, cb.pre_instrs, root_instrs)) return true;
-                for (cb.arms) |arm| {
-                    if (hasHardEscapeInInstrs(closure_local, arm.cond_instrs, root_instrs)) return true;
-                    if (hasHardEscapeInInstrs(closure_local, arm.body_instrs, root_instrs)) return true;
-                }
-                if (hasHardEscapeInInstrs(closure_local, cb.default_instrs, root_instrs)) return true;
-            },
-            .guard_block => |gb| if (hasHardEscapeInInstrs(closure_local, gb.body, root_instrs)) return true,
-            .switch_literal => |sl| {
-                for (sl.cases) |c| if (hasHardEscapeInInstrs(closure_local, c.body_instrs, root_instrs)) return true;
-                if (hasHardEscapeInInstrs(closure_local, sl.default_instrs, root_instrs)) return true;
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| if (hasHardEscapeInInstrs(closure_local, c.body_instrs, root_instrs)) return true;
-                if (hasHardEscapeInInstrs(closure_local, sr.default_instrs, root_instrs)) return true;
-            },
-            .union_switch_return => |usr| for (usr.cases) |c| if (hasHardEscapeInInstrs(closure_local, c.body_instrs, root_instrs)) return true,
-            else => {},
-        }
-    }
-    return false;
-}
-
-fn findClosureEscapeInInstrs(
-    ctx: *const lattice.AnalysisContext,
-    func_id: ir.FunctionId,
+fn isCallLocalInInstrs(
+    allocator: std.mem.Allocator,
+    closure_local: ir.LocalId,
     instrs: []const ir.Instruction,
-    closure_func_id: ir.FunctionId,
-) ?lattice.EscapeState {
-    for (instrs) |instr| {
-        switch (instr) {
-            .make_closure => |mc| {
-                if (mc.function == closure_func_id) {
-                    const vkey = lattice.ValueKey{
-                        .function = func_id,
-                        .local = mc.dest,
-                    };
-                    return ctx.getEscape(vkey);
-                }
-            },
-            .if_expr => |ie| {
-                if (findClosureEscapeInInstrs(ctx, func_id, ie.then_instrs, closure_func_id)) |e| return e;
-                if (findClosureEscapeInInstrs(ctx, func_id, ie.else_instrs, closure_func_id)) |e| return e;
-            },
-            .case_block => |cb| {
-                if (findClosureEscapeInInstrs(ctx, func_id, cb.pre_instrs, closure_func_id)) |e| return e;
-                for (cb.arms) |arm| {
-                    if (findClosureEscapeInInstrs(ctx, func_id, arm.cond_instrs, closure_func_id)) |e| return e;
-                    if (findClosureEscapeInInstrs(ctx, func_id, arm.body_instrs, closure_func_id)) |e| return e;
-                }
-                if (findClosureEscapeInInstrs(ctx, func_id, cb.default_instrs, closure_func_id)) |e| return e;
-            },
-            else => {},
+    root_instrs: []const ir.Instruction,
+    found_use: *bool,
+) !bool {
+    var scan_walker = InstructionStreamWalker.init(allocator);
+    defer scan_walker.deinit();
+    var alias_resolver = ClosureAliasResolver.init(allocator);
+    defer alias_resolver.deinit();
+    return isCallLocalInInstrsWithScratch(
+        &scan_walker,
+        &alias_resolver,
+        closure_local,
+        instrs,
+        root_instrs,
+        found_use,
+    );
+}
+
+fn isCallLocalInInstrsWithScratch(
+    scan_walker: *InstructionStreamWalker,
+    alias_resolver: *ClosureAliasResolver,
+    closure_local: ir.LocalId,
+    instrs: []const ir.Instruction,
+    root_instrs: []const ir.Instruction,
+    found_use: *bool,
+) !bool {
+    const CallLocalScan = struct {
+        alias_resolver: *ClosureAliasResolver,
+        closure_local: ir.LocalId,
+        root_instrs: []const ir.Instruction,
+        found_use: *bool,
+        ok: bool = true,
+
+        fn isAlias(ctx: *@This(), local: ir.LocalId) !bool {
+            return ctx.alias_resolver.isAlias(local, ctx.closure_local, ctx.root_instrs);
         }
+
+        fn rejectIfAlias(ctx: *@This(), local: ir.LocalId) !InstructionStreamWalkControl {
+            if (try ctx.isAlias(local)) {
+                ctx.ok = false;
+                return .stop_walk;
+            }
+            return .continue_walk;
+        }
+
+        fn visit(
+            ctx: *@This(),
+            stream: []const ir.Instruction,
+            instr: *const ir.Instruction,
+        ) anyerror!InstructionStreamWalkControl {
+            _ = stream;
+            switch (instr.*) {
+                .call_closure => |cc| {
+                    if (try ctx.isAlias(cc.callee)) {
+                        ctx.found_use.* = true;
+                        // This is fine — closure is being called.
+                        // But check if it's also passed as an argument.
+                        for (cc.args) |arg| {
+                            if (try ctx.isAlias(arg)) {
+                                ctx.ok = false;
+                                return .stop_walk;
+                            }
+                        }
+                    }
+                },
+                // If the closure local appears as an argument to any call, it escapes.
+                .call_direct => |cd| {
+                    for (cd.args) |arg| {
+                        switch (try ctx.rejectIfAlias(arg)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .call_named => |cn| {
+                    for (cn.args) |arg| {
+                        switch (try ctx.rejectIfAlias(arg)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .call_dispatch => |cd2| {
+                    for (cd2.args) |arg| {
+                        switch (try ctx.rejectIfAlias(arg)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .call_builtin => |cb| {
+                    for (cb.args) |arg| {
+                        switch (try ctx.rejectIfAlias(arg)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .tail_call => |tc| {
+                    for (tc.args) |arg| {
+                        switch (try ctx.rejectIfAlias(arg)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .try_call_named => |tc| {
+                    for (tc.args) |arg| {
+                        switch (try ctx.rejectIfAlias(arg)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                    switch (try ctx.rejectIfAlias(tc.input_local)) {
+                        .continue_walk => {},
+                        .stop_walk => return .stop_walk,
+                    }
+                },
+                // If returned, it escapes.
+                .ret => |r| {
+                    if (r.value) |v| {
+                        switch (try ctx.rejectIfAlias(v)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .cond_return => |cr| {
+                    if (cr.value) |v| {
+                        switch (try ctx.rejectIfAlias(v)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                // If stored in aggregate, it escapes.
+                .tuple_init => |ti| {
+                    for (ti.elements) |e| {
+                        switch (try ctx.rejectIfAlias(e)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .list_init => |li| {
+                    for (li.elements) |e| {
+                        switch (try ctx.rejectIfAlias(e)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .struct_init => |si| {
+                    for (si.fields) |f| {
+                        switch (try ctx.rejectIfAlias(f.value)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .field_set => |fs| {
+                    switch (try ctx.rejectIfAlias(fs.value)) {
+                        .continue_walk => {},
+                        .stop_walk => return .stop_walk,
+                    }
+                },
+                else => {},
+            }
+            return .continue_walk;
+        }
+    };
+
+    var scan = CallLocalScan{
+        .alias_resolver = alias_resolver,
+        .closure_local = closure_local,
+        .root_instrs = root_instrs,
+        .found_use = found_use,
+    };
+    _ = try scan_walker.walk(instrs, &scan, CallLocalScan.visit);
+    return scan.ok;
+}
+
+fn isAliasOfClosure(
+    allocator: std.mem.Allocator,
+    local: ir.LocalId,
+    closure_local: ir.LocalId,
+    instrs: []const ir.Instruction,
+) !bool {
+    var alias_resolver = ClosureAliasResolver.init(allocator);
+    defer alias_resolver.deinit();
+    return alias_resolver.isAlias(local, closure_local, instrs);
+}
+
+fn hasHardEscapeInFunction(
+    allocator: std.mem.Allocator,
+    func: ir.Function,
+    closure_local: ir.LocalId,
+) !bool {
+    var scan_walker = InstructionStreamWalker.init(allocator);
+    defer scan_walker.deinit();
+    var alias_resolver = ClosureAliasResolver.init(allocator);
+    defer alias_resolver.deinit();
+
+    for (func.body) |block| {
+        if (try hasHardEscapeInInstrsWithScratch(
+            &scan_walker,
+            &alias_resolver,
+            closure_local,
+            block.instructions,
+            block.instructions,
+        )) return true;
     }
-    return null;
+    return false;
+}
+
+fn hasHardEscapeInInstrs(
+    allocator: std.mem.Allocator,
+    closure_local: ir.LocalId,
+    instrs: []const ir.Instruction,
+    root_instrs: []const ir.Instruction,
+) !bool {
+    var scan_walker = InstructionStreamWalker.init(allocator);
+    defer scan_walker.deinit();
+    var alias_resolver = ClosureAliasResolver.init(allocator);
+    defer alias_resolver.deinit();
+    return hasHardEscapeInInstrsWithScratch(
+        &scan_walker,
+        &alias_resolver,
+        closure_local,
+        instrs,
+        root_instrs,
+    );
+}
+
+fn hasHardEscapeInInstrsWithScratch(
+    scan_walker: *InstructionStreamWalker,
+    alias_resolver: *ClosureAliasResolver,
+    closure_local: ir.LocalId,
+    instrs: []const ir.Instruction,
+    root_instrs: []const ir.Instruction,
+) !bool {
+    const HardEscapeScan = struct {
+        alias_resolver: *ClosureAliasResolver,
+        closure_local: ir.LocalId,
+        root_instrs: []const ir.Instruction,
+        found: bool = false,
+
+        fn isAlias(ctx: *@This(), local: ir.LocalId) !bool {
+            return ctx.alias_resolver.isAlias(local, ctx.closure_local, ctx.root_instrs);
+        }
+
+        fn stopIfAlias(ctx: *@This(), local: ir.LocalId) !InstructionStreamWalkControl {
+            if (try ctx.isAlias(local)) {
+                ctx.found = true;
+                return .stop_walk;
+            }
+            return .continue_walk;
+        }
+
+        fn visit(
+            ctx: *@This(),
+            stream: []const ir.Instruction,
+            instr: *const ir.Instruction,
+        ) anyerror!InstructionStreamWalkControl {
+            _ = stream;
+            switch (instr.*) {
+                .ret => |r| if (r.value) |v| {
+                    return try ctx.stopIfAlias(v);
+                },
+                .cond_return => |cr| if (cr.value) |v| {
+                    return try ctx.stopIfAlias(v);
+                },
+                .tuple_init => |ti| {
+                    for (ti.elements) |e| {
+                        switch (try ctx.stopIfAlias(e)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .list_init => |li| {
+                    for (li.elements) |e| {
+                        switch (try ctx.stopIfAlias(e)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .struct_init => |si| {
+                    for (si.fields) |f| {
+                        switch (try ctx.stopIfAlias(f.value)) {
+                            .continue_walk => {},
+                            .stop_walk => return .stop_walk,
+                        }
+                    }
+                },
+                .field_set => |fs| return try ctx.stopIfAlias(fs.value),
+                else => {},
+            }
+            return .continue_walk;
+        }
+    };
+
+    var scan = HardEscapeScan{
+        .alias_resolver = alias_resolver,
+        .closure_local = closure_local,
+        .root_instrs = root_instrs,
+    };
+    _ = try scan_walker.walk(instrs, &scan, HardEscapeScan.visit);
+    return scan.found;
 }
 
 /// Verify ownership legality in a function's instructions.
@@ -945,155 +1323,143 @@ fn findClosureEscapeInInstrs(
 /// conversions using isOwnershipConversionLegal(), and captures.
 fn verifyOwnershipInInstrs(
     out: *std.ArrayList(diagnostics.Diagnostic),
-    ctx: *const lattice.AnalysisContext,
+    ctx: *lattice.AnalysisContext,
     program: *const ir.Program,
     func: ir.Function,
     instrs: []const ir.Instruction,
 ) !void {
-    for (instrs) |instr| {
-        switch (instr) {
-            // Phi nodes: verify all incoming sources have compatible ownership.
-            // Uses the per-value ownership states populated by the escape analyzer.
-            .phi => |p| {
-                if (p.sources.len >= 2) {
-                    const first_key = lattice.ValueKey{ .function = func.id, .local = p.sources[0].value };
-                    var merged_ownership = ctx.getOwnership(first_key);
+    const OwnershipVerifier = struct {
+        out: *std.ArrayList(diagnostics.Diagnostic),
+        ctx: *lattice.AnalysisContext,
+        program: *const ir.Program,
+        func: ir.Function,
 
-                    for (p.sources[1..]) |src| {
-                        const src_key = lattice.ValueKey{ .function = func.id, .local = src.value };
-                        const src_ownership = ctx.getOwnership(src_key);
-                        const merge_result = lattice.mergeOwnership(merged_ownership, src_ownership);
-                        switch (merge_result) {
-                            .ok => |o| merged_ownership = o,
-                            .illegal => |err| {
-                                const message = switch (err) {
-                                    .borrowed_promoted_to_owned => "ownership merge is illegal: borrowed values cannot be merged into an owning value",
-                                    .different_unique_bindings => "ownership merge is illegal: distinct unique values cannot be merged at a phi node",
-                                };
-                                try addAnalysisDiagnostic(
-                                    ctx.allocator,
-                                    out,
-                                    .@"error",
-                                    message,
-                                    "E-OWN-PHI",
-                                    "illegal ownership merge detected at phi node",
-                                    "insert an explicit share before the merge, or restructure control flow so ownership kinds agree",
-                                );
-                            },
-                        }
-                    }
+        fn visit(
+            verifier: *@This(),
+            stream: []const ir.Instruction,
+            instr: *const ir.Instruction,
+        ) anyerror!InstructionStreamWalkControl {
+            _ = stream;
+            switch (instr.*) {
+                // Phi nodes: verify all incoming sources have compatible ownership.
+                // Uses the per-value ownership states populated by the escape analyzer.
+                .phi => |p| {
+                    if (p.sources.len >= 2) {
+                        const first_key = lattice.ValueKey{ .function = verifier.func.id, .local = p.sources[0].value };
+                        var merged_ownership = verifier.ctx.getOwnership(first_key);
 
-                    // Record the merged ownership for the phi dest.
-                    const dest_key = lattice.ValueKey{ .function = func.id, .local = p.dest };
-                    // setOwnership can fail on allocation; ignore in verifier pass.
-                    @constCast(ctx).setOwnership(dest_key, merged_ownership) catch {};
-                }
-            },
-
-            // share_value: unique→shared conversion. Legal per §3.4.
-            // Verify using isOwnershipConversionLegal.
-            .share_value => |sv| {
-                const src_key = lattice.ValueKey{ .function = func.id, .local = sv.source };
-                const src_ownership = ctx.getOwnership(src_key);
-                if (!lattice.isOwnershipConversionLegal(src_ownership, .shared)) {
-                    try addAnalysisDiagnostic(
-                        ctx.allocator,
-                        out,
-                        .@"error",
-                        "ownership conversion is illegal: borrowed values cannot be promoted to shared ownership",
-                        "E-OWN-SHARE",
-                        "illegal share detected in IR ownership verification",
-                        "keep the value borrowed, or create an owned/shared value before sharing it",
-                    );
-                }
-                // Record dest as shared.
-                const dest_key = lattice.ValueKey{ .function = func.id, .local = sv.dest };
-                @constCast(ctx).setOwnership(dest_key, .shared) catch {};
-            },
-
-            // move_value: ownership transfer.
-            .move_value => |mv| {
-                const src_key = lattice.ValueKey{ .function = func.id, .local = mv.source };
-                const src_ownership = ctx.getOwnership(src_key);
-                // Move is always legal for owned values (unique/shared).
-                // Illegal for borrowed (type checker enforces).
-                if (src_ownership == .borrowed) {
-                    try addAnalysisDiagnostic(
-                        ctx.allocator,
-                        out,
-                        .@"error",
-                        "ownership transfer is illegal: borrowed values cannot be moved",
-                        "E-OWN-MOVE",
-                        "illegal move of borrowed value detected",
-                        "pass or store an owned value instead of moving a borrow",
-                    );
-                }
-                // Dest inherits source ownership.
-                const dest_key = lattice.ValueKey{ .function = func.id, .local = mv.dest };
-                @constCast(ctx).setOwnership(dest_key, src_ownership) catch {};
-            },
-
-            // make_closure: verify borrowed captures aren't in escaping closures.
-            .make_closure => |mc| {
-                for (program.functions) |closure_func| {
-                    if (closure_func.id != mc.function) continue;
-                    for (closure_func.captures) |cap| {
-                        if (cap.ownership == .borrowed) {
-                            const closure_key = lattice.ValueKey{ .function = func.id, .local = mc.dest };
-                            const escape = ctx.getEscape(closure_key);
-                            if (escape.requiresHeap()) {
-                                try addAnalysisDiagnostic(
-                                    ctx.allocator,
-                                    out,
-                                    .@"error",
-                                    "borrowed capture is illegal in an escaping closure",
-                                    "E-OWN-CAPTURE",
-                                    "escaping closure captures a borrowed value",
-                                    "capture an owned/shared value, or keep the closure non-escaping",
-                                );
+                        for (p.sources[1..]) |src| {
+                            const src_key = lattice.ValueKey{ .function = verifier.func.id, .local = src.value };
+                            const src_ownership = verifier.ctx.getOwnership(src_key);
+                            const merge_result = lattice.mergeOwnership(merged_ownership, src_ownership);
+                            switch (merge_result) {
+                                .ok => |o| merged_ownership = o,
+                                .illegal => |err| {
+                                    const message = switch (err) {
+                                        .borrowed_promoted_to_owned => "ownership merge is illegal: borrowed values cannot be merged into an owning value",
+                                        .different_unique_bindings => "ownership merge is illegal: distinct unique values cannot be merged at a phi node",
+                                    };
+                                    try addAnalysisDiagnostic(
+                                        verifier.ctx.allocator,
+                                        verifier.out,
+                                        .@"error",
+                                        message,
+                                        "E-OWN-PHI",
+                                        "illegal ownership merge detected at phi node",
+                                        "insert an explicit share before the merge, or restructure control flow so ownership kinds agree",
+                                    );
+                                },
                             }
                         }
-                    }
-                    break;
-                }
-            },
 
-            // Recurse into nested instruction lists.
-            .if_expr => |ie| {
-                try verifyOwnershipInInstrs(out, ctx, program, func, ie.then_instrs);
-                try verifyOwnershipInInstrs(out, ctx, program, func, ie.else_instrs);
-            },
-            .case_block => |cb| {
-                try verifyOwnershipInInstrs(out, ctx, program, func, cb.pre_instrs);
-                for (cb.arms) |arm| {
-                    try verifyOwnershipInInstrs(out, ctx, program, func, arm.cond_instrs);
-                    try verifyOwnershipInInstrs(out, ctx, program, func, arm.body_instrs);
-                }
-                try verifyOwnershipInInstrs(out, ctx, program, func, cb.default_instrs);
-            },
-            .guard_block => |gb| {
-                try verifyOwnershipInInstrs(out, ctx, program, func, gb.body);
-            },
-            .switch_literal => |sl| {
-                for (sl.cases) |c| {
-                    try verifyOwnershipInInstrs(out, ctx, program, func, c.body_instrs);
-                }
-                try verifyOwnershipInInstrs(out, ctx, program, func, sl.default_instrs);
-            },
-            .switch_return => |sr| {
-                for (sr.cases) |c| {
-                    try verifyOwnershipInInstrs(out, ctx, program, func, c.body_instrs);
-                }
-                try verifyOwnershipInInstrs(out, ctx, program, func, sr.default_instrs);
-            },
-            .union_switch_return => |usr| {
-                for (usr.cases) |c| {
-                    try verifyOwnershipInInstrs(out, ctx, program, func, c.body_instrs);
-                }
-            },
-            else => {},
+                        // Record the merged ownership for the phi dest.
+                        const dest_key = lattice.ValueKey{ .function = verifier.func.id, .local = p.dest };
+                        try verifier.ctx.setOwnership(dest_key, merged_ownership);
+                    }
+                },
+
+                // share_value: unique→shared conversion. Legal per §3.4.
+                // Verify using isOwnershipConversionLegal.
+                .share_value => |sv| {
+                    const src_key = lattice.ValueKey{ .function = verifier.func.id, .local = sv.source };
+                    const src_ownership = verifier.ctx.getOwnership(src_key);
+                    if (!lattice.isOwnershipConversionLegal(src_ownership, .shared)) {
+                        try addAnalysisDiagnostic(
+                            verifier.ctx.allocator,
+                            verifier.out,
+                            .@"error",
+                            "ownership conversion is illegal: borrowed values cannot be promoted to shared ownership",
+                            "E-OWN-SHARE",
+                            "illegal share detected in IR ownership verification",
+                            "keep the value borrowed, or create an owned/shared value before sharing it",
+                        );
+                    }
+                    // Record dest as shared.
+                    const dest_key = lattice.ValueKey{ .function = verifier.func.id, .local = sv.dest };
+                    try verifier.ctx.setOwnership(dest_key, .shared);
+                },
+
+                // move_value: ownership transfer.
+                .move_value => |mv| {
+                    const src_key = lattice.ValueKey{ .function = verifier.func.id, .local = mv.source };
+                    const src_ownership = verifier.ctx.getOwnership(src_key);
+                    // Move is always legal for owned values (unique/shared).
+                    // Illegal for borrowed (type checker enforces).
+                    if (src_ownership == .borrowed) {
+                        try addAnalysisDiagnostic(
+                            verifier.ctx.allocator,
+                            verifier.out,
+                            .@"error",
+                            "ownership transfer is illegal: borrowed values cannot be moved",
+                            "E-OWN-MOVE",
+                            "illegal move of borrowed value detected",
+                            "pass or store an owned value instead of moving a borrow",
+                        );
+                    }
+                    // Dest inherits source ownership.
+                    const dest_key = lattice.ValueKey{ .function = verifier.func.id, .local = mv.dest };
+                    try verifier.ctx.setOwnership(dest_key, src_ownership);
+                },
+
+                // make_closure: verify borrowed captures aren't in escaping closures.
+                .make_closure => |mc| {
+                    for (verifier.program.functions) |closure_func| {
+                        if (closure_func.id != mc.function) continue;
+                        for (closure_func.captures) |cap| {
+                            if (cap.ownership == .borrowed) {
+                                const closure_key = lattice.ValueKey{ .function = verifier.func.id, .local = mc.dest };
+                                const escape = verifier.ctx.getEscape(closure_key);
+                                if (escape.requiresHeap()) {
+                                    try addAnalysisDiagnostic(
+                                        verifier.ctx.allocator,
+                                        verifier.out,
+                                        .@"error",
+                                        "borrowed capture is illegal in an escaping closure",
+                                        "E-OWN-CAPTURE",
+                                        "escaping closure captures a borrowed value",
+                                        "capture an owned/shared value, or keep the closure non-escaping",
+                                    );
+                                }
+                            }
+                        }
+                        break;
+                    }
+                },
+                else => {},
+            }
+            return .continue_walk;
         }
-    }
+    };
+
+    var walker = InstructionStreamWalker.init(ctx.allocator);
+    defer walker.deinit();
+    var verifier = OwnershipVerifier{
+        .out = out,
+        .ctx = ctx,
+        .program = program,
+        .func = func,
+    };
+    _ = try walker.walk(instrs, &verifier, OwnershipVerifier.visit);
 }
 
 // ============================================================
@@ -1101,6 +1467,373 @@ fn verifyOwnershipInInstrs(
 // ============================================================
 
 const testing = std.testing;
+
+fn buildNestedGuardChain(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    terminal: ir.Instruction,
+) ![]ir.Instruction {
+    const instructions = try allocator.alloc(ir.Instruction, depth + 1);
+    errdefer allocator.free(instructions);
+
+    instructions[depth] = terminal;
+    var guard_index = depth;
+    while (guard_index > 0) {
+        guard_index -= 1;
+        instructions[guard_index] = .{
+            .guard_block = .{
+                .condition = 0,
+                .body = instructions[guard_index + 1 .. guard_index + 2],
+            },
+        };
+    }
+
+    return instructions;
+}
+
+test "make_closure query traverses deeply nested child streams without native recursion" {
+    const allocator = testing.allocator;
+    const deep_nesting_depth: usize = 16_384;
+
+    const nested_chain = try buildNestedGuardChain(
+        allocator,
+        deep_nesting_depth,
+        .{ .make_closure = .{ .dest = 7, .function = 42, .captures = &.{} } },
+    );
+    defer allocator.free(nested_chain);
+
+    try testing.expect(try instrsContainMakeClosureFor(allocator, nested_chain[0..1], 42));
+    try testing.expect(!try instrsContainMakeClosureFor(allocator, nested_chain[0..1], 43));
+
+    const make_closure = (try findMakeClosureForFunction(allocator, nested_chain[0..1], 42)).?;
+    try testing.expectEqual(@as(ir.LocalId, 7), make_closure.dest);
+}
+
+test "closure alias resolver resolves deep alias chains without a fixed depth cap" {
+    const allocator = testing.allocator;
+    const closure_local: ir.LocalId = 1;
+    const alias_count: usize = 64;
+
+    const instructions = try allocator.alloc(ir.Instruction, alias_count);
+    defer allocator.free(instructions);
+
+    for (instructions, 0..) |*instruction, alias_index| {
+        const dest: ir.LocalId = @intCast(alias_index + 2);
+        const source: ir.LocalId = if (alias_index == 0) closure_local else @intCast(alias_index + 1);
+        instruction.* = .{ .local_set = .{ .dest = dest, .value = source } };
+    }
+
+    const deepest_alias: ir.LocalId = @intCast(alias_count + 1);
+    try testing.expect(try isAliasOfClosure(allocator, deepest_alias, closure_local, instructions));
+}
+
+test "closure alias resolver terminates on cyclic aliases without false positives" {
+    const allocator = testing.allocator;
+    const closure_local: ir.LocalId = 1;
+    const instructions = [_]ir.Instruction{
+        .{ .local_set = .{ .dest = 2, .value = 3 } },
+        .{ .move_value = .{ .dest = 3, .source = 2 } },
+    };
+
+    try testing.expect(!try isAliasOfClosure(allocator, 2, closure_local, &instructions));
+    try testing.expect(!try isAliasOfClosure(allocator, 3, closure_local, &instructions));
+}
+
+test "ownership verifier traverses deeply nested child streams without native recursion" {
+    const allocator = testing.allocator;
+    const deep_nesting_depth: usize = 16_384;
+
+    const nested_chain = try buildNestedGuardChain(
+        allocator,
+        deep_nesting_depth,
+        .{ .move_value = .{ .dest = 2, .source = 1 } },
+    );
+    defer allocator.free(nested_chain);
+
+    const blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = nested_chain[0..1] },
+    };
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "deep_ownership_verify",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .void,
+            .body = &blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var context = lattice.AnalysisContext.init(allocator);
+    defer context.deinit();
+    try context.setOwnership(.{ .function = 0, .local = 1 }, .borrowed);
+
+    var verifier_diagnostics: std.ArrayList(diagnostics.Diagnostic) = .empty;
+    defer verifier_diagnostics.deinit(allocator);
+
+    try verifyOwnershipInInstrs(&verifier_diagnostics, &context, &program, functions[0], nested_chain[0..1]);
+
+    var found_move_diagnostic = false;
+    for (verifier_diagnostics.items) |diag| {
+        if (diag.code != null and std.mem.eql(u8, diag.code.?, "E-OWN-MOVE")) {
+            found_move_diagnostic = true;
+        }
+    }
+    try testing.expect(found_move_diagnostic);
+}
+
+fn expectOwnershipVerifierUpdateOom(instructions: []const ir.Instruction) !void {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing_allocator.allocator();
+
+    const blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = instructions },
+    };
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "ownership_update_oom",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .void,
+            .body = &blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var context = lattice.AnalysisContext.init(allocator);
+    defer context.deinit();
+
+    var verifier_diagnostics: std.ArrayList(diagnostics.Diagnostic) = .empty;
+    defer verifier_diagnostics.deinit(allocator);
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 1;
+    try testing.expectError(
+        error.OutOfMemory,
+        verifyOwnershipInInstrs(&verifier_diagnostics, &context, &program, functions[0], instructions),
+    );
+}
+
+test "ownership verifier propagates allocation failure while recording phi ownership" {
+    const instructions = [_]ir.Instruction{
+        .{ .phi = .{
+            .dest = 3,
+            .sources = &[_]ir.PhiSource{
+                .{ .from_block = 0, .value = 1 },
+                .{ .from_block = 1, .value = 2 },
+            },
+        } },
+    };
+
+    try expectOwnershipVerifierUpdateOom(&instructions);
+}
+
+test "ownership verifier propagates allocation failure while recording share ownership" {
+    const instructions = [_]ir.Instruction{
+        .{ .share_value = .{ .dest = 2, .source = 1 } },
+    };
+
+    try expectOwnershipVerifierUpdateOom(&instructions);
+}
+
+test "ownership verifier propagates allocation failure while recording move ownership" {
+    const instructions = [_]ir.Instruction{
+        .{ .move_value = .{ .dest = 2, .source = 1 } },
+    };
+
+    try expectOwnershipVerifierUpdateOom(&instructions);
+}
+
+const ParallelRegionSolverTestContext = struct {
+    backing_allocator: std.mem.Allocator,
+    fail_allocations_inside_tasks: bool = false,
+    inside_group_task: bool = false,
+    group_await_error: ?std.Io.Cancelable = null,
+    group_token: u8 = 0,
+    async_calls: usize = 0,
+    await_calls: usize = 0,
+
+    fn allocator(self: *ParallelRegionSolverTestContext) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn shouldFailAllocation(self: *const ParallelRegionSolverTestContext) bool {
+        return self.fail_allocations_inside_tasks and self.inside_group_task;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *ParallelRegionSolverTestContext = @ptrCast(@alignCast(ctx));
+        if (self.shouldFailAllocation()) return null;
+        return self.backing_allocator.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *ParallelRegionSolverTestContext = @ptrCast(@alignCast(ctx));
+        if (self.shouldFailAllocation()) return false;
+        return self.backing_allocator.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *ParallelRegionSolverTestContext = @ptrCast(@alignCast(ctx));
+        if (self.shouldFailAllocation()) return null;
+        return self.backing_allocator.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *ParallelRegionSolverTestContext = @ptrCast(@alignCast(ctx));
+        self.backing_allocator.rawFree(memory, alignment, return_address);
+    }
+
+    fn groupAsync(
+        userdata: ?*anyopaque,
+        group: *std.Io.Group,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (context: *const anyopaque) void,
+    ) void {
+        _ = context_alignment;
+        const self: *ParallelRegionSolverTestContext = @ptrCast(@alignCast(userdata.?));
+        self.async_calls += 1;
+        group.token.store(@ptrCast(&self.group_token), .release);
+
+        const previous_inside_group_task = self.inside_group_task;
+        self.inside_group_task = true;
+        defer self.inside_group_task = previous_inside_group_task;
+        start(context.ptr);
+    }
+
+    fn groupAwait(
+        userdata: ?*anyopaque,
+        group: *std.Io.Group,
+        token: *anyopaque,
+    ) std.Io.Cancelable!void {
+        _ = token;
+        const self: *ParallelRegionSolverTestContext = @ptrCast(@alignCast(userdata.?));
+        self.await_calls += 1;
+        group.token.store(null, .release);
+        if (self.group_await_error) |err| return err;
+    }
+};
+
+fn parallelRegionSolverTestIo(
+    context: *ParallelRegionSolverTestContext,
+    vtable: *std.Io.VTable,
+) std.Io {
+    vtable.* = std.Io.failing.vtable.*;
+    vtable.groupAsync = ParallelRegionSolverTestContext.groupAsync;
+    vtable.groupAwait = ParallelRegionSolverTestContext.groupAwait;
+    return .{
+        .userdata = context,
+        .vtable = vtable,
+    };
+}
+
+fn expectParallelRegionSolverError(
+    expected_error: anyerror,
+    test_context: *ParallelRegionSolverTestContext,
+) !void {
+    const allocator = test_context.allocator();
+    var fake_vtable = std.Io.failing.vtable.*;
+    const fake_io = parallelRegionSolverTestIo(test_context, &fake_vtable);
+
+    const first_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const first_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &first_instrs },
+    };
+    const second_instrs = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 2 } },
+        .{ .ret = .{ .value = 0 } },
+    };
+    const second_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &second_instrs },
+    };
+    const functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "parallel_region_first",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .i64,
+            .body = &first_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+        .{
+            .id = 1,
+            .name = "parallel_region_second",
+            .scope_id = 0,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .i64,
+            .body = &second_blocks,
+            .is_closure = false,
+            .captures = &.{},
+        },
+    };
+    const program = ir.Program{
+        .functions = &functions,
+        .type_defs = &.{},
+        .entry = 0,
+    };
+
+    var context = lattice.AnalysisContext.init(allocator);
+    defer context.deinit();
+
+    try testing.expectError(
+        expected_error,
+        runOptionalRegionSolver(allocator, &program, fake_io, &context),
+    );
+    try testing.expectEqual(@as(usize, 2), test_context.async_calls);
+    try testing.expectEqual(@as(usize, 1), test_context.await_calls);
+}
+
+test "parallel region solver propagates worker task allocation failure" {
+    var test_context = ParallelRegionSolverTestContext{
+        .backing_allocator = testing.allocator,
+        .fail_allocations_inside_tasks = true,
+    };
+
+    try expectParallelRegionSolverError(error.OutOfMemory, &test_context);
+}
+
+test "parallel region solver propagates recorded worker analysis failure" {
+    const region_results = [_]RegionTaskResult{
+        .{ .state = .{ .failed = error.AnalysisNestingLimitExceeded }, .func_id = 0 },
+    };
+
+    try testing.expectError(
+        error.AnalysisNestingLimitExceeded,
+        propagateRegionTaskFailures(&region_results),
+    );
+}
+
+test "parallel region solver propagates group await failure" {
+    var test_context = ParallelRegionSolverTestContext{
+        .backing_allocator = testing.allocator,
+        .group_await_error = error.Canceled,
+    };
+
+    try expectParallelRegionSolverError(error.Canceled, &test_context);
+}
 
 test "pipeline produces context for simple program" {
     const alloc = testing.allocator;
@@ -1356,6 +2089,61 @@ test "pipeline classifies function-local closure tier for known-safe callee" {
         .{ .const_int = .{ .dest = 2, .value = 10 } },
         .{ .call_direct = .{ .dest = 3, .function = 1, .args = &[_]ir.LocalId{ 1, 2 }, .arg_modes = &[_]ir.ValueMode{ .share, .share } } },
         .{ .ret = .{ .value = 3 } },
+    };
+    const main_blocks = [_]ir.Block{.{ .label = 0, .instructions = &main_instrs }};
+    const main_params = [_]ir.Param{.{ .name = "x", .type_expr = .i64 }};
+
+    const functions = [_]ir.Function{
+        .{ .id = 0, .name = "main", .scope_id = 0, .arity = 1, .params = &main_params, .return_type = .i64, .body = &main_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 1, .name = "apply", .scope_id = 0, .arity = 2, .params = &apply_params, .return_type = .i64, .body = &apply_blocks, .is_closure = false, .captures = &.{} },
+        .{ .id = 2, .name = "add_x", .scope_id = 0, .arity = 1, .params = &closure_params, .return_type = .i64, .body = &closure_blocks, .is_closure = true, .captures = &closure_captures },
+    };
+    const program = ir.Program{ .functions = &functions, .type_defs = &.{}, .entry = 0 };
+
+    var result = try runAnalysisPipeline(alloc, &program);
+    defer result.deinit();
+
+    try testing.expectEqual(lattice.ClosureEnvTier.function_local, result.context.closure_tiers.get(2).?);
+}
+
+test "pipeline finds make_closure in switch_return default for closure tier" {
+    const alloc = testing.allocator;
+
+    const apply_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .call_closure = .{ .dest = 2, .callee = 0, .args = &[_]ir.LocalId{1}, .arg_modes = &[_]ir.ValueMode{.share}, .return_type = .i64 } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    const apply_blocks = [_]ir.Block{.{ .label = 0, .instructions = &apply_instrs }};
+    const apply_params = [_]ir.Param{
+        .{ .name = "f", .type_expr = .{ .function = .{ .params = &[_]ir.ZigType{.i64}, .return_type = &.i64 } } },
+        .{ .name = "value", .type_expr = .i64 },
+    };
+
+    const closure_instrs = [_]ir.Instruction{
+        .{ .capture_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 0 } },
+        .{ .binary_op = .{ .dest = 2, .op = .add, .lhs = 0, .rhs = 1 } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    const closure_blocks = [_]ir.Block{.{ .label = 0, .instructions = &closure_instrs }};
+    const closure_params = [_]ir.Param{.{ .name = "y", .type_expr = .i64 }};
+    const closure_captures = [_]ir.Capture{.{ .name = "x", .type_expr = .i64, .ownership = .shared }};
+
+    const default_instrs = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 1, .function = 2, .captures = &[_]ir.LocalId{0} } },
+        .{ .const_int = .{ .dest = 2, .value = 10 } },
+        .{ .call_direct = .{ .dest = 3, .function = 1, .args = &[_]ir.LocalId{ 1, 2 }, .arg_modes = &[_]ir.ValueMode{ .share, .share } } },
+    };
+    const main_instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .switch_return = .{
+            .scrutinee_param = 0,
+            .cases = &.{},
+            .default_instrs = &default_instrs,
+            .default_result = 3,
+        } },
     };
     const main_blocks = [_]ir.Block{.{ .label = 0, .instructions = &main_instrs }};
     const main_params = [_]ir.Param{.{ .name = "x", .type_expr = .i64 }};

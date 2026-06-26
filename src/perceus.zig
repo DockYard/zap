@@ -119,6 +119,62 @@ pub const DestructiveOptionalDispatch = struct {
     scrutinee_param: u32,
 };
 
+fn deinitReusePairSlice(
+    allocator: std.mem.Allocator,
+    reuse_pairs: []const lattice.ReusePair,
+) void {
+    for (reuse_pairs) |pair| {
+        allocator.free(pair.reuse.insertion_point.path);
+    }
+    allocator.free(reuse_pairs);
+}
+
+fn deinitArcOperationSlice(
+    allocator: std.mem.Allocator,
+    arc_ops: []const lattice.ArcOperation,
+) void {
+    for (arc_ops) |op| {
+        allocator.free(op.insertion_point.path);
+    }
+    allocator.free(arc_ops);
+}
+
+fn deinitDropSpecializationSlice(
+    allocator: std.mem.Allocator,
+    drop_specializations: []const DropSpecialization,
+) void {
+    for (drop_specializations) |drop_specialization| {
+        allocator.free(drop_specialization.field_drops);
+        allocator.free(drop_specialization.insertion_point.path);
+    }
+    allocator.free(drop_specializations);
+}
+
+fn deinitConstructionSiteItems(
+    allocator: std.mem.Allocator,
+    construction_sites: []const ConstructionSite,
+) void {
+    for (construction_sites) |construction_site| {
+        allocator.free(construction_site.path);
+    }
+}
+
+fn deinitConstructionSiteSlice(
+    allocator: std.mem.Allocator,
+    construction_sites: []const ConstructionSite,
+) void {
+    deinitConstructionSiteItems(allocator, construction_sites);
+    allocator.free(construction_sites);
+}
+
+fn deinitConstructionSiteList(
+    allocator: std.mem.Allocator,
+    construction_sites: *std.ArrayList(ConstructionSite),
+) void {
+    deinitConstructionSiteItems(allocator, construction_sites.items);
+    construction_sites.deinit(allocator);
+}
+
 /// Complete results from the Perceus analysis pass.
 pub const AnalysisResult = struct {
     reuse_pairs: []const lattice.ReusePair,
@@ -128,19 +184,9 @@ pub const AnalysisResult = struct {
     destructive_optional_dispatch: []const DestructiveOptionalDispatch,
 
     pub fn deinit(self: *const AnalysisResult, allocator: std.mem.Allocator) void {
-        for (self.reuse_pairs) |pair| {
-            allocator.free(pair.reuse.insertion_point.path);
-        }
-        allocator.free(self.reuse_pairs);
-        for (self.arc_ops) |op| {
-            allocator.free(op.insertion_point.path);
-        }
-        allocator.free(self.arc_ops);
-        for (self.drop_specializations) |ds| {
-            allocator.free(ds.field_drops);
-            allocator.free(ds.insertion_point.path);
-        }
-        allocator.free(self.drop_specializations);
+        deinitReusePairSlice(allocator, self.reuse_pairs);
+        deinitArcOperationSlice(allocator, self.arc_ops);
+        deinitDropSpecializationSlice(allocator, self.drop_specializations);
         allocator.free(self.function_stats);
         allocator.free(self.destructive_optional_dispatch);
     }
@@ -224,6 +270,7 @@ pub const PerceusAnalyzer = struct {
         }
 
         var destructive_list: std.ArrayList(DestructiveOptionalDispatch) = .empty;
+        errdefer destructive_list.deinit(self.allocator);
         var destructive_iter = self.destructive_funcs.iterator();
         while (destructive_iter.next()) |entry| {
             try destructive_list.append(self.allocator, .{
@@ -232,12 +279,27 @@ pub const PerceusAnalyzer = struct {
             });
         }
 
+        const reuse_pairs = try self.reuse_pairs.toOwnedSlice(self.allocator);
+        errdefer deinitReusePairSlice(self.allocator, reuse_pairs);
+
+        const arc_ops = try self.arc_ops.toOwnedSlice(self.allocator);
+        errdefer deinitArcOperationSlice(self.allocator, arc_ops);
+
+        const drop_specializations = try self.drop_specializations.toOwnedSlice(self.allocator);
+        errdefer deinitDropSpecializationSlice(self.allocator, drop_specializations);
+
+        const function_stats = try self.function_stats.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(function_stats);
+
+        const destructive_optional_dispatch = try destructive_list.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(destructive_optional_dispatch);
+
         return .{
-            .reuse_pairs = try self.reuse_pairs.toOwnedSlice(self.allocator),
-            .arc_ops = try self.arc_ops.toOwnedSlice(self.allocator),
-            .drop_specializations = try self.drop_specializations.toOwnedSlice(self.allocator),
-            .function_stats = try self.function_stats.toOwnedSlice(self.allocator),
-            .destructive_optional_dispatch = try destructive_list.toOwnedSlice(self.allocator),
+            .reuse_pairs = reuse_pairs,
+            .arc_ops = arc_ops,
+            .drop_specializations = drop_specializations,
+            .function_stats = function_stats,
+            .destructive_optional_dispatch = destructive_optional_dispatch,
         };
     }
 
@@ -292,6 +354,7 @@ pub const PerceusAnalyzer = struct {
                     func,
                     &decon,
                 );
+                defer deinitConstructionSiteSlice(self.allocator, constructions);
 
                 stats.construction_sites += @intCast(constructions.len);
 
@@ -318,14 +381,6 @@ pub const PerceusAnalyzer = struct {
                         .dynamic_reuse => stats.dynamic_reuses += 1,
                     }
                 }
-                // Free each ConstructionSite's path slice (allocator.dupe'd
-                // in scanInstructionForConstructions) before freeing the
-                // array itself. generateReusePair has already copied paths
-                // it needed into the analysis-context-owned InsertionPoint
-                // records, so these transient site-level paths can be
-                // released here.
-                for (constructions) |con| self.allocator.free(con.path);
-                self.allocator.free(constructions);
             }
 
             // Phase 4: Generate drop specializations
@@ -366,6 +421,32 @@ pub const PerceusAnalyzer = struct {
         _ = block_idx;
     }
 
+    fn appendDeconstructionSite(
+        self: *PerceusAnalyzer,
+        function_id: ir.FunctionId,
+        block_label: ir.LabelId,
+        path_snapshot: []const lattice.StreamStep,
+        instr_index: u32,
+        scrutinee: ir.LocalId,
+        scrutinee_type: TypeInfo,
+        match_site_id: lattice.MatchSiteId,
+        match_kind: DeconstructionSite.MatchKind,
+    ) !void {
+        const path = try self.allocator.dupe(lattice.StreamStep, path_snapshot);
+        errdefer self.allocator.free(path);
+
+        try self.current_decon_sites.append(self.allocator, .{
+            .function = function_id,
+            .block = block_label,
+            .path = path,
+            .instr_index = instr_index,
+            .scrutinee = scrutinee,
+            .scrutinee_type = scrutinee_type,
+            .match_site_id = match_site_id,
+            .match_kind = match_kind,
+        });
+    }
+
     fn checkInstructionForDeconstruction(
         self: *PerceusAnalyzer,
         instr: *const ir.Instruction,
@@ -380,31 +461,31 @@ pub const PerceusAnalyzer = struct {
                 if (scrutinee) |scrut| {
                     const type_info = self.inferScrutineeType(&cb);
                     const match_id = self.nextMatchSiteId();
-                    try self.current_decon_sites.append(self.allocator, .{
-                        .function = function_id,
-                        .block = block_label,
-                        .path = try self.allocator.dupe(lattice.StreamStep, path_snapshot),
-                        .instr_index = instr_index,
-                        .scrutinee = scrut,
-                        .scrutinee_type = type_info,
-                        .match_site_id = match_id,
-                        .match_kind = .case_block,
-                    });
+                    try self.appendDeconstructionSite(
+                        function_id,
+                        block_label,
+                        path_snapshot,
+                        instr_index,
+                        scrut,
+                        type_info,
+                        match_id,
+                        .case_block,
+                    );
                 }
             },
             .switch_tag => |st| {
                 const type_info = self.inferSwitchTagType(&st);
                 const match_id = self.nextMatchSiteId();
-                try self.current_decon_sites.append(self.allocator, .{
-                    .function = function_id,
-                    .block = block_label,
-                    .path = try self.allocator.dupe(lattice.StreamStep, path_snapshot),
-                    .instr_index = instr_index,
-                    .scrutinee = st.scrutinee,
-                    .scrutinee_type = type_info,
-                    .match_site_id = match_id,
-                    .match_kind = .switch_tag,
-                });
+                try self.appendDeconstructionSite(
+                    function_id,
+                    block_label,
+                    path_snapshot,
+                    instr_index,
+                    st.scrutinee,
+                    type_info,
+                    match_id,
+                    .switch_tag,
+                );
             },
             .if_expr => |ie| {
                 // if_expr is only a deconstruction site if it pattern-matches on a value
@@ -418,16 +499,16 @@ pub const PerceusAnalyzer = struct {
                         .num_fields = 0,
                     };
                     const match_id = self.nextMatchSiteId();
-                    try self.current_decon_sites.append(self.allocator, .{
-                        .function = function_id,
-                        .block = block_label,
-                        .path = try self.allocator.dupe(lattice.StreamStep, path_snapshot),
-                        .instr_index = instr_index,
-                        .scrutinee = ie.condition,
-                        .scrutinee_type = type_info,
-                        .match_site_id = match_id,
-                        .match_kind = .if_expr,
-                    });
+                    try self.appendDeconstructionSite(
+                        function_id,
+                        block_label,
+                        path_snapshot,
+                        instr_index,
+                        ie.condition,
+                        type_info,
+                        match_id,
+                        .if_expr,
+                    );
                 }
             },
             .optional_dispatch => |od| {
@@ -452,16 +533,16 @@ pub const PerceusAnalyzer = struct {
                     .num_fields = 0,
                 };
                 const match_id = self.nextMatchSiteId();
-                try self.current_decon_sites.append(self.allocator, .{
-                    .function = function_id,
-                    .block = block_label,
-                    .path = try self.allocator.dupe(lattice.StreamStep, path_snapshot),
-                    .instr_index = instr_index,
-                    .scrutinee = od.payload_local,
-                    .scrutinee_type = type_info,
-                    .match_site_id = match_id,
-                    .match_kind = .optional_dispatch,
-                });
+                try self.appendDeconstructionSite(
+                    function_id,
+                    block_label,
+                    path_snapshot,
+                    instr_index,
+                    od.payload_local,
+                    type_info,
+                    match_id,
+                    .optional_dispatch,
+                );
             },
             else => {},
         }
@@ -568,6 +649,7 @@ pub const PerceusAnalyzer = struct {
         decon: *const DeconstructionSite,
     ) ![]ConstructionSite {
         var results: std.ArrayList(ConstructionSite) = .empty;
+        errdefer deinitConstructionSiteList(self.allocator, &results);
 
         // Find the instruction at the deconstruction site
         const block = self.findBlock(func, decon.block) orelse return try results.toOwnedSlice(self.allocator);
@@ -678,7 +760,6 @@ pub const PerceusAnalyzer = struct {
         return try results.toOwnedSlice(self.allocator);
     }
 
-
     fn scanInstructionsForConstructions(
         self: *PerceusAnalyzer,
         instrs: []const ir.Instruction,
@@ -699,6 +780,31 @@ pub const PerceusAnalyzer = struct {
                 results,
             );
         }
+    }
+
+    fn appendConstructionSite(
+        self: *PerceusAnalyzer,
+        results: *std.ArrayList(ConstructionSite),
+        function_id: ir.FunctionId,
+        block_label: ir.LabelId,
+        path_snapshot: []const lattice.StreamStep,
+        instr_index: u32,
+        dest: ir.LocalId,
+        dest_type: TypeInfo,
+        alloc_site_id: lattice.AllocSiteId,
+    ) !void {
+        const path = try self.allocator.dupe(lattice.StreamStep, path_snapshot);
+        errdefer self.allocator.free(path);
+
+        try results.append(self.allocator, .{
+            .function = function_id,
+            .block = block_label,
+            .path = path,
+            .instr_index = instr_index,
+            .dest = dest,
+            .dest_type = dest_type,
+            .alloc_site_id = alloc_site_id,
+        });
     }
 
     /// Walk a single instruction, recording a ConstructionSite for the
@@ -746,15 +852,16 @@ pub const PerceusAnalyzer = struct {
             if (supports_reuse and areTypesReuseCompatible(&decon.scrutinee_type, &ct)) {
                 const alloc_id = self.nextAllocSiteId();
                 const dest = extractConstructionDest(&instr).?;
-                try results.append(self.allocator, .{
-                    .function = function_id,
-                    .block = block_label,
-                    .path = try self.allocator.dupe(lattice.StreamStep, path_builder.items),
-                    .instr_index = instr_index,
-                    .dest = dest,
-                    .dest_type = ct,
-                    .alloc_site_id = alloc_id,
-                });
+                try self.appendConstructionSite(
+                    results,
+                    function_id,
+                    block_label,
+                    path_builder.items,
+                    instr_index,
+                    dest,
+                    ct,
+                    alloc_id,
+                );
             }
         }
 
@@ -867,13 +974,16 @@ pub const PerceusAnalyzer = struct {
             .source_type = 0, // TypeId resolved by later passes
         };
 
+        var reuse_pair_path: ?[]const lattice.StreamStep = try self.allocator.dupe(lattice.StreamStep, con.path);
+        defer if (reuse_pair_path) |path| self.allocator.free(path);
+
         const reuse_op = lattice.ReuseAllocOp{
             .dest = con.dest,
             .token = token_local,
             .insertion_point = .{
                 .function = function_id,
                 .block = con.block,
-                .path = try self.allocator.dupe(lattice.StreamStep, con.path),
+                .path = reuse_pair_path.?,
                 .instr_index = con.instr_index,
                 .position = .before,
                 .expected_identity = con_identity,
@@ -891,6 +1001,7 @@ pub const PerceusAnalyzer = struct {
         };
 
         try self.reuse_pairs.append(self.allocator, pair);
+        reuse_pair_path = null;
 
         // Generate ARC operations: reset at deconstruction, reuse at construction.
         // Each InsertionPoint copies the relevant site's `path` so the
@@ -904,20 +1015,27 @@ pub const PerceusAnalyzer = struct {
         // one reset and its one token; emitting it per construction would run
         // `resetAny` once per arm on the same scrutinee (audit arc-param--04).
         if (emit_reset_arc_op) {
+            var reset_path: ?[]const lattice.StreamStep = try self.allocator.dupe(lattice.StreamStep, decon.path);
+            defer if (reset_path) |path| self.allocator.free(path);
+
             try self.arc_ops.append(self.allocator, .{
                 .kind = .reset,
                 .value = decon.scrutinee,
                 .insertion_point = .{
                     .function = function_id,
                     .block = decon.block,
-                    .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
+                    .path = reset_path.?,
                     .instr_index = decon.instr_index,
                     .position = .before,
                     .expected_identity = decon_identity,
                 },
                 .reason = .perceus_reuse,
             });
+            reset_path = null;
         }
+
+        var reuse_arc_path: ?[]const lattice.StreamStep = try self.allocator.dupe(lattice.StreamStep, con.path);
+        defer if (reuse_arc_path) |path| self.allocator.free(path);
 
         try self.arc_ops.append(self.allocator, .{
             .kind = .reuse_alloc,
@@ -925,13 +1043,14 @@ pub const PerceusAnalyzer = struct {
             .insertion_point = .{
                 .function = function_id,
                 .block = con.block,
-                .path = try self.allocator.dupe(lattice.StreamStep, con.path),
+                .path = reuse_arc_path.?,
                 .instr_index = con.instr_index,
                 .position = .before,
                 .expected_identity = con_identity,
             },
             .reason = .perceus_reuse,
         });
+        reuse_arc_path = null;
     }
 
     /// Fingerprint the instruction a coordinate `(block, path,
@@ -987,7 +1106,9 @@ pub const PerceusAnalyzer = struct {
                 // *arm's body stream* at its end, not the parent
                 // stream after the case_block.
                 for (cb.arms, 0..) |arm, arm_idx| {
-                    const field_drops = try self.extractFieldDropsFromArm(func, &arm);
+                    var field_drops: ?[]const FieldDrop = try self.extractFieldDropsFromArm(func, &arm);
+                    defer if (field_drops) |drops| self.allocator.free(drops);
+
                     var arm_path: std.ArrayListUnmanaged(lattice.StreamStep) = .empty;
                     defer arm_path.deinit(self.allocator);
                     try arm_path.appendSlice(self.allocator, decon.path);
@@ -996,38 +1117,51 @@ pub const PerceusAnalyzer = struct {
                         .child = .{ .case_block_arm_body = @intCast(arm_idx) },
                     });
                     const arm_body_len: u32 = @intCast(arm.body_instrs.len);
+
+                    var insertion_path: ?[]const lattice.StreamStep = try self.allocator.dupe(lattice.StreamStep, arm_path.items);
+                    defer if (insertion_path) |path| self.allocator.free(path);
+
                     try self.drop_specializations.append(self.allocator, .{
                         .match_site = decon.match_site_id,
                         .constructor_tag = @intCast(arm_idx),
-                        .field_drops = field_drops,
+                        .field_drops = field_drops.?,
                         .function = func.id,
                         .insertion_point = .{
                             .function = func.id,
                             .block = decon.block,
-                            .path = try self.allocator.dupe(lattice.StreamStep, arm_path.items),
+                            .path = insertion_path.?,
                             .instr_index = arm_body_len,
                             .position = .before,
                         },
                     });
+                    field_drops = null;
+                    insertion_path = null;
                 }
             },
             .if_expr => {
                 // For if_expr, we generate a single specialization
-                const then_drops = try self.allocator.alloc(FieldDrop, 0);
+                var then_drops: ?[]const FieldDrop = try self.allocator.alloc(FieldDrop, 0);
+                defer if (then_drops) |drops| self.allocator.free(drops);
+
+                var insertion_path: ?[]const lattice.StreamStep = try self.allocator.dupe(lattice.StreamStep, decon.path);
+                defer if (insertion_path) |path| self.allocator.free(path);
+
                 try self.drop_specializations.append(self.allocator, .{
                     .match_site = decon.match_site_id,
                     .constructor_tag = 0,
-                    .field_drops = then_drops,
+                    .field_drops = then_drops.?,
                     .function = func.id,
                     .insertion_point = .{
                         .function = func.id,
                         .block = decon.block,
-                        .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
+                        .path = insertion_path.?,
                         .instr_index = decon.instr_index,
                         .position = .after,
                         .expected_identity = ir.fingerprintInstruction(instr),
                     },
                 });
+                then_drops = null;
+                insertion_path = null;
             },
             .optional_dispatch => |od| {
                 // Optional-dispatch struct branch: emit a single drop
@@ -1055,11 +1189,12 @@ pub const PerceusAnalyzer = struct {
                 if (od.struct_result) |sr| {
                     if (sr == od.payload_local) return;
                 }
-                const destructive = self.isDestructiveOptionalDispatch(&od, func);
+                const destructive = try self.isDestructiveOptionalDispatch(&od, func);
                 if (destructive) {
-                    self.destructive_funcs.put(self.allocator, func.id, od.scrutinee_param) catch return;
+                    try self.destructive_funcs.put(self.allocator, func.id, od.scrutinee_param);
                 }
                 const drops = try self.allocator.alloc(FieldDrop, 1);
+                errdefer self.allocator.free(drops);
                 drops[0] = .{
                     .field_name = "__optional_payload",
                     .field_index = 0,
@@ -1067,6 +1202,8 @@ pub const PerceusAnalyzer = struct {
                     .local = od.payload_local,
                     .kind = if (destructive) .shallow else .deep,
                 };
+                const insertion_path = try self.allocator.dupe(lattice.StreamStep, decon.path);
+                errdefer self.allocator.free(insertion_path);
                 try self.drop_specializations.append(self.allocator, .{
                     .match_site = decon.match_site_id,
                     .constructor_tag = 0,
@@ -1075,7 +1212,7 @@ pub const PerceusAnalyzer = struct {
                     .insertion_point = .{
                         .function = func.id,
                         .block = decon.block,
-                        .path = try self.allocator.dupe(lattice.StreamStep, decon.path),
+                        .path = insertion_path,
                         .instr_index = decon.instr_index,
                         .position = .after,
                         .expected_identity = ir.fingerprintInstruction(instr),
@@ -1109,7 +1246,7 @@ pub const PerceusAnalyzer = struct {
         self: *const PerceusAnalyzer,
         od: *const ir.OptionalDispatch,
         func: *const ir.Function,
-    ) bool {
+    ) !bool {
         if (od.scrutinee_param >= func.params.len) return false;
         const param_type = func.params[od.scrutinee_param].type_expr;
         const inner = switch (param_type) {
@@ -1157,7 +1294,7 @@ pub const PerceusAnalyzer = struct {
             switch (instr) {
                 .param_get => |pg| {
                     if (pg.index == od.scrutinee_param) {
-                        scrutinee_locals.put(self.allocator, pg.dest, {}) catch return false;
+                        try scrutinee_locals.put(self.allocator, pg.dest, {});
                     }
                 },
                 .field_get => |fg| {
@@ -1165,8 +1302,8 @@ pub const PerceusAnalyzer = struct {
                     for (struct_fields) |def_field| {
                         if (!std.mem.eql(u8, def_field.name, fg.field)) continue;
                         if (def_field.storage == .indirect) {
-                            extracted_locals.put(self.allocator, fg.dest, {}) catch return false;
-                            fields_extracted.put(self.allocator, def_field.name, {}) catch return false;
+                            try extracted_locals.put(self.allocator, fg.dest, {});
+                            try fields_extracted.put(self.allocator, def_field.name, {});
                         }
                         break;
                     }
@@ -1329,6 +1466,7 @@ pub const PerceusAnalyzer = struct {
         arm: *const ir.IrCaseArm,
     ) ![]const FieldDrop {
         var drops: std.ArrayList(FieldDrop) = .empty;
+        errdefer drops.deinit(self.allocator);
 
         // Look for field_get instructions in the arm's condition and body
         // instructions — these tell us which fields are extracted and thus
@@ -1860,6 +1998,286 @@ fn makeFunction(id: ir.FunctionId, name: []const u8, body: []const ir.Block) ir.
         .is_closure = false,
         .captures = &.{},
     };
+}
+
+const DestructiveOptionalDispatchFixture = struct {
+    tree_type: ir.ZigType,
+    optional_tree_type: ir.ZigType,
+    params: [1]ir.Param,
+    tree_fields: [1]ir.StructFieldDef,
+    type_defs: [1]ir.TypeDef,
+    struct_instrs: [3]ir.Instruction,
+    optional_dispatch: ir.OptionalDispatch,
+    block_instrs: [1]ir.Instruction,
+    blocks: [1]ir.Block,
+    functions: [1]ir.Function,
+    program: ir.Program,
+    decon: DeconstructionSite,
+
+    fn init(self: *@This()) void {
+        self.tree_type = .{ .struct_ref = "Tree" };
+        self.optional_tree_type = .{ .optional = &self.tree_type };
+        self.params = .{
+            .{ .name = "tree", .type_expr = self.optional_tree_type },
+        };
+        self.tree_fields = .{
+            .{
+                .name = "left",
+                .type_expr = self.optional_tree_type,
+                .storage = .indirect,
+            },
+        };
+        self.type_defs = .{
+            .{
+                .name = "Tree",
+                .kind = .{ .struct_def = .{ .fields = &self.tree_fields } },
+            },
+        };
+        self.struct_instrs = .{
+            .{ .param_get = .{ .dest = 1, .index = 0 } },
+            .{ .field_get = .{ .dest = 2, .object = 1, .field = "left" } },
+            .{ .call_named = .{ .dest = 3, .name = "consume_tree", .args = &.{2}, .arg_modes = &.{} } },
+        };
+        self.optional_dispatch = .{
+            .scrutinee_param = 0,
+            .payload_local = 1,
+            .nil_instrs = &.{},
+            .nil_result = null,
+            .struct_instrs = &self.struct_instrs,
+            .struct_result = 3,
+        };
+        self.block_instrs = .{
+            .{ .optional_dispatch = self.optional_dispatch },
+        };
+        self.blocks = .{
+            makeBlock(0, &self.block_instrs),
+        };
+        var function = makeFunction(0, "destructive_optional", &self.blocks);
+        function.arity = 1;
+        function.params = &self.params;
+        self.functions = .{function};
+        self.program = .{
+            .functions = &self.functions,
+            .type_defs = &self.type_defs,
+            .entry = null,
+        };
+        self.decon = .{
+            .function = function.id,
+            .block = 0,
+            .path = &.{},
+            .instr_index = 0,
+            .scrutinee = self.optional_dispatch.payload_local,
+            .scrutinee_type = .{ .name = "Tree", .kind = .struct_type, .num_fields = 1 },
+            .match_site_id = 0,
+            .match_kind = .optional_dispatch,
+        };
+    }
+};
+
+fn expectDestructiveOptionalDispatchAnalysis(allocator: std.mem.Allocator) !void {
+    var fixture: DestructiveOptionalDispatchFixture = undefined;
+    fixture.init();
+
+    var analyzer = PerceusAnalyzer.init(allocator, &fixture.program);
+    defer analyzer.deinit();
+
+    const result = try analyzer.analyze();
+    defer result.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), result.destructive_optional_dispatch.len);
+    try testing.expectEqual(@as(ir.FunctionId, 0), result.destructive_optional_dispatch[0].function);
+    try testing.expectEqual(@as(u32, 0), result.destructive_optional_dispatch[0].scrutinee_param);
+    try testing.expectEqual(@as(usize, 1), result.drop_specializations.len);
+    try testing.expectEqual(@as(usize, 1), result.drop_specializations[0].field_drops.len);
+    try testing.expectEqual(FieldDrop.Kind.shallow, result.drop_specializations[0].field_drops[0].kind);
+    try testing.expectEqual(@as(?ir.LocalId, 1), result.drop_specializations[0].field_drops[0].local);
+}
+
+fn expectDestructiveOptionalDispatchDetectorAccepts(allocator: std.mem.Allocator) !void {
+    var fixture: DestructiveOptionalDispatchFixture = undefined;
+    fixture.init();
+
+    var analyzer = PerceusAnalyzer.init(allocator, &fixture.program);
+    defer analyzer.deinit();
+
+    try testing.expect(try analyzer.isDestructiveOptionalDispatch(
+        &fixture.optional_dispatch,
+        &fixture.functions[0],
+    ));
+}
+
+fn expectDestructiveOptionalDispatchDropSpecialization(allocator: std.mem.Allocator) !void {
+    var fixture: DestructiveOptionalDispatchFixture = undefined;
+    fixture.init();
+
+    var analyzer = PerceusAnalyzer.init(allocator, &fixture.program);
+    defer analyzer.deinit();
+
+    try analyzer.generateDropSpecialization(&fixture.decon, &fixture.functions[0]);
+
+    try testing.expectEqual(@as(usize, 1), analyzer.drop_specializations.items.len);
+    try testing.expectEqual(@as(usize, 1), analyzer.drop_specializations.items[0].field_drops.len);
+    try testing.expectEqual(FieldDrop.Kind.shallow, analyzer.drop_specializations.items[0].field_drops[0].kind);
+    try testing.expectEqual(@as(?u32, 0), analyzer.destructive_funcs.get(fixture.functions[0].id));
+}
+
+fn expectConstructionDiscoveryAllocationFailureCleanup(allocator: std.mem.Allocator) !void {
+    const cond0 = [_]ir.Instruction{
+        .{ .match_type = .{ .dest = 10, .scrutinee = 1, .expected_type = .{ .struct_ref = "Pair" }, .expected_arity = 2 } },
+    };
+    const body0 = [_]ir.Instruction{
+        .{ .struct_init = .{ .dest = 20, .type_name = "Pair", .fields = &.{
+            .{ .name = "left", .value = 11 },
+            .{ .name = "right", .value = 12 },
+        } } },
+    };
+    const cond1 = [_]ir.Instruction{
+        .{ .match_type = .{ .dest = 15, .scrutinee = 1, .expected_type = .{ .struct_ref = "Pair" }, .expected_arity = 2 } },
+    };
+    const body1 = [_]ir.Instruction{
+        .{ .struct_init = .{ .dest = 25, .type_name = "Pair", .fields = &.{
+            .{ .name = "left", .value = 12 },
+            .{ .name = "right", .value = 11 },
+        } } },
+    };
+    const arms = [_]ir.IrCaseArm{
+        .{ .cond_instrs = &cond0, .condition = 10, .body_instrs = &body0, .result = 20 },
+        .{ .cond_instrs = &cond1, .condition = 15, .body_instrs = &body1, .result = 25 },
+    };
+    const block_instrs = [_]ir.Instruction{
+        .{ .case_block = .{ .dest = 30, .pre_instrs = &.{}, .arms = &arms, .default_instrs = &.{}, .default_result = null } },
+    };
+    const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
+    const functions = [_]ir.Function{makeFunction(0, "construction_discovery_cleanup", &blocks)};
+    var program = try makeTestProgram(&functions);
+    _ = &program;
+
+    var analyzer = PerceusAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    const decon = DeconstructionSite{
+        .function = 0,
+        .block = 0,
+        .path = &.{},
+        .instr_index = 0,
+        .scrutinee = 1,
+        .scrutinee_type = .{ .name = "Pair", .kind = .struct_type, .num_fields = 2 },
+        .match_site_id = 0,
+        .match_kind = .case_block,
+    };
+
+    const constructions = try analyzer.findCompatibleConstructionsForMatch(&functions[0], &decon);
+    defer deinitConstructionSiteSlice(allocator, constructions);
+
+    try testing.expectEqual(@as(usize, 2), constructions.len);
+}
+
+fn expectDeconstructionDiscoveryAllocationFailureCleanup(allocator: std.mem.Allocator) !void {
+    const cond_instrs = [_]ir.Instruction{
+        .{ .match_type = .{ .dest = 10, .scrutinee = 1, .expected_type = .{ .struct_ref = "Pair" }, .expected_arity = 2 } },
+    };
+    const arms = [_]ir.IrCaseArm{
+        .{ .cond_instrs = &cond_instrs, .condition = 10, .body_instrs = &.{}, .result = 1 },
+    };
+    const instruction = ir.Instruction{ .case_block = .{
+        .dest = 20,
+        .pre_instrs = &.{},
+        .arms = &arms,
+        .default_instrs = &.{},
+        .default_result = null,
+    } };
+    const path_snapshot = [_]lattice.StreamStep{
+        .{ .parent_instr_index = 0, .child = .case_block_pre },
+    };
+    const program = ir.Program{
+        .functions = &.{},
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    var analyzer = PerceusAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    try analyzer.checkInstructionForDeconstruction(
+        &instruction,
+        0,
+        0,
+        &path_snapshot,
+        0,
+    );
+
+    try testing.expectEqual(@as(usize, 1), analyzer.current_decon_sites.items.len);
+    try testing.expectEqual(@as(usize, 1), analyzer.current_decon_sites.items[0].path.len);
+}
+
+fn expectReuseAnalysisAllocationFailureCleanup(allocator: std.mem.Allocator) !void {
+    const cond_instrs = [_]ir.Instruction{
+        .{ .match_type = .{ .dest = 10, .scrutinee = 1, .expected_type = .{ .struct_ref = "Cell" }, .expected_arity = 1 } },
+    };
+    const body_instrs = [_]ir.Instruction{
+        .{ .struct_init = .{ .dest = 20, .type_name = "Cell", .fields = &.{
+            .{ .name = "value", .value = 11 },
+        } } },
+    };
+    const arms = [_]ir.IrCaseArm{
+        .{ .cond_instrs = &cond_instrs, .condition = 10, .body_instrs = &body_instrs, .result = 20 },
+    };
+    const block_instrs = [_]ir.Instruction{
+        .{ .case_block = .{ .dest = 30, .pre_instrs = &.{}, .arms = &arms, .default_instrs = &.{}, .default_result = null } },
+    };
+    const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
+    const functions = [_]ir.Function{makeFunction(0, "reuse_generation_cleanup", &blocks)};
+    var program = try makeTestProgram(&functions);
+    _ = &program;
+
+    var analyzer = PerceusAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    const result = try analyzer.analyze();
+    defer result.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), result.reuse_pairs.len);
+    try testing.expect(result.arc_ops.len >= 2);
+}
+
+fn expectCaseDropSpecializationAllocationFailureCleanup(allocator: std.mem.Allocator) !void {
+    const cond_instrs = [_]ir.Instruction{
+        .{ .match_type = .{ .dest = 10, .scrutinee = 1, .expected_type = .{ .struct_ref = "Pair" }, .expected_arity = 2 } },
+        .{ .field_get = .{ .dest = 11, .object = 1, .field = "left" } },
+        .{ .field_get = .{ .dest = 12, .object = 1, .field = "right" } },
+    };
+    const body_instrs = [_]ir.Instruction{
+        .{ .ret = .{ .value = 11 } },
+    };
+    const arms = [_]ir.IrCaseArm{
+        .{ .cond_instrs = &cond_instrs, .condition = 10, .body_instrs = &body_instrs, .result = 11 },
+    };
+    const block_instrs = [_]ir.Instruction{
+        .{ .case_block = .{ .dest = 30, .pre_instrs = &.{}, .arms = &arms, .default_instrs = &.{}, .default_result = null } },
+    };
+    const blocks = [_]ir.Block{makeBlock(0, &block_instrs)};
+    const functions = [_]ir.Function{makeFunction(0, "case_drop_cleanup", &blocks)};
+    var program = try makeTestProgram(&functions);
+    _ = &program;
+
+    var analyzer = PerceusAnalyzer.init(allocator, &program);
+    defer analyzer.deinit();
+
+    const decon = DeconstructionSite{
+        .function = 0,
+        .block = 0,
+        .path = &.{},
+        .instr_index = 0,
+        .scrutinee = 1,
+        .scrutinee_type = .{ .name = "Pair", .kind = .struct_type, .num_fields = 2 },
+        .match_site_id = 0,
+        .match_kind = .case_block,
+    };
+
+    try analyzer.generateDropSpecialization(&decon, &functions[0]);
+
+    try testing.expectEqual(@as(usize, 1), analyzer.drop_specializations.items.len);
+    try testing.expectEqual(@as(usize, 2), analyzer.drop_specializations.items[0].field_drops.len);
 }
 
 // ============================================================
@@ -2609,6 +3027,66 @@ test "drop specialization skips non-ARC field extracts" {
     try testing.expectEqual(@as(usize, 1), drop_spec.field_drops.len);
     try testing.expectEqualStrings("arc_child", drop_spec.field_drops[0].field_name);
     try testing.expectEqual(@as(?ir.LocalId, 11), drop_spec.field_drops[0].local);
+}
+
+test "destructive optional dispatch records shallow drop specialization" {
+    try expectDestructiveOptionalDispatchAnalysis(testing.allocator);
+}
+
+test "destructive optional dispatch analysis cleans up destructive list on allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        expectDestructiveOptionalDispatchAnalysis,
+        .{},
+    );
+}
+
+test "destructive optional dispatch detector propagates allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        expectDestructiveOptionalDispatchDetectorAccepts,
+        .{},
+    );
+}
+
+test "destructive optional dispatch drop specialization propagates allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        expectDestructiveOptionalDispatchDropSpecialization,
+        .{},
+    );
+}
+
+test "construction discovery cleans up owned paths on allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        expectConstructionDiscoveryAllocationFailureCleanup,
+        .{},
+    );
+}
+
+test "deconstruction discovery cleans up owned paths on allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        expectDeconstructionDiscoveryAllocationFailureCleanup,
+        .{},
+    );
+}
+
+test "reuse analysis cleans up construction sites on allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        expectReuseAnalysisAllocationFailureCleanup,
+        .{},
+    );
+}
+
+test "case drop specialization cleans up field drops on allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        expectCaseDropSpecializationAllocationFailureCleanup,
+        .{},
+    );
 }
 
 // ============================================================

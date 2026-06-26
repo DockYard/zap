@@ -2723,9 +2723,11 @@ pub const Desugarer = struct {
         // For each field, either use the override value or generate
         // a field_access on the source.
         var all_fields: std.ArrayList(ast.StructField) = .empty;
-        const all_def_fields = self.collectAllStructFields(struct_decl);
+        errdefer all_fields.deinit(self.allocator);
+        const all_def_fields = try self.collectAllStructFields(struct_decl);
+        defer all_def_fields.deinit(self.allocator);
 
-        for (all_def_fields) |def_field| {
+        for (all_def_fields.fields) |def_field| {
             // Check if this field is overridden
             var override_value: ?*const ast.Expr = null;
             for (override_fields) |of| {
@@ -2756,15 +2758,35 @@ pub const Desugarer = struct {
             }
         }
 
+        const fields = try all_fields.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(fields);
+
         return try self.create(ast.Expr, .{
             .struct_expr = .{
                 .meta = original.meta,
                 .struct_name = original.struct_name,
                 .update_source = null,
-                .fields = try all_fields.toOwnedSlice(self.allocator),
+                .fields = fields,
             },
         });
     }
+
+    const CollectedStructFields = struct {
+        fields: []const ast.StructFieldDecl,
+        is_owned: bool,
+
+        fn borrowed(fields: []const ast.StructFieldDecl) CollectedStructFields {
+            return .{ .fields = fields, .is_owned = false };
+        }
+
+        fn owned(fields: []const ast.StructFieldDecl) CollectedStructFields {
+            return .{ .fields = fields, .is_owned = true };
+        }
+
+        fn deinit(self: CollectedStructFields, allocator: std.mem.Allocator) void {
+            if (self.is_owned) allocator.free(self.fields);
+        }
+    };
 
     /// Find a struct declaration by struct name from the scope graph.
     fn findStructDecl(self: *const Desugarer, struct_name: ast.StructName) ?*const ast.StructDecl {
@@ -2792,8 +2814,8 @@ pub const Desugarer = struct {
     /// Collect ALL fields for a struct, including inherited fields from
     /// the extends chain. Returns fields in order: parent fields first,
     /// then own fields (matching the TypeStore's field ordering).
-    fn collectAllStructFields(self: *const Desugarer, decl: *const ast.StructDecl) []const ast.StructFieldDecl {
-        const graph = self.graph orelse return decl.fields;
+    fn collectAllStructFields(self: *const Desugarer, decl: *const ast.StructDecl) !CollectedStructFields {
+        const graph = self.graph orelse return CollectedStructFields.borrowed(decl.fields);
 
         if (decl.parent) |parent_name_id| {
             // Find parent struct
@@ -2802,18 +2824,21 @@ pub const Desugarer = struct {
                     const parent_entry = graph.types.items[parent_type_id];
                     if (parent_entry.kind == .struct_type) {
                         const parent_decl = parent_entry.kind.struct_type;
-                        const parent_fields = self.collectAllStructFields(parent_decl);
+                        const parent_fields = try self.collectAllStructFields(parent_decl);
+                        defer parent_fields.deinit(self.allocator);
+
                         // Merge: parent fields + own fields
-                        var all_fields: std.ArrayListUnmanaged(ast.StructFieldDecl) = .empty;
-                        all_fields.appendSlice(self.allocator, parent_fields) catch return decl.fields;
-                        all_fields.appendSlice(self.allocator, decl.fields) catch return decl.fields;
-                        return all_fields.toOwnedSlice(self.allocator) catch decl.fields;
+                        const total_field_count = parent_fields.fields.len + decl.fields.len;
+                        const all_fields = try self.allocator.alloc(ast.StructFieldDecl, total_field_count);
+                        @memcpy(all_fields[0..parent_fields.fields.len], parent_fields.fields);
+                        @memcpy(all_fields[parent_fields.fields.len..], decl.fields);
+                        return CollectedStructFields.owned(all_fields);
                     }
                 }
             }
         }
 
-        return decl.fields;
+        return CollectedStructFields.borrowed(decl.fields);
     }
 
     // ============================================================
@@ -3705,7 +3730,7 @@ test "pipe is desugared during macro expansion, not desugar" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
@@ -3732,7 +3757,7 @@ test "desugar no-op on simple expressions" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
@@ -3768,7 +3793,7 @@ test "for inside macro body is not lifted into __for_N helper" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
@@ -3808,7 +3833,7 @@ test "for outside macro body is still lifted into __for_N helper" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
@@ -3851,7 +3876,7 @@ test "desugar rewrites pub error into pub struct + pub impl Error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     var program = try parser.parseProgram();
 
@@ -3940,7 +3965,7 @@ test "desugar preserves user-declared message field default" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     var program = try parser.parseProgram();
 
@@ -3985,7 +4010,7 @@ test "desugar routes inline pub fn message/1 into the Error impl" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     var program = try parser.parseProgram();
 
@@ -4020,7 +4045,7 @@ test "desugar bare `error` produces non-pub struct and impl" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     var program = try parser.parseProgram();
 
@@ -4050,7 +4075,7 @@ test "desugar threads `@code Zxxxx` into the auto-generated code/1 body" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     var program = try parser.parseProgram();
 
@@ -4103,7 +4128,7 @@ test "desugar auto-injects cause :: Option(Error) = Option.None on pub error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     var program = try parser.parseProgram();
 
@@ -4177,7 +4202,7 @@ test "desugar preserves user-declared cause field" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     var program = try parser.parseProgram();
 
@@ -4207,7 +4232,7 @@ test "desugar source/1 default body reads self.cause" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     var program = try parser.parseProgram();
 
@@ -4254,7 +4279,7 @@ test "struct-level expressions synthesize public run function during desugar" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
@@ -4295,7 +4320,7 @@ test "struct-level expressions do not duplicate existing run function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
@@ -4310,4 +4335,139 @@ test "struct-level expressions do not duplicate existing run function" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), run_count);
+}
+
+test "collectAllStructFields includes inherited fields in parent-first order" {
+    const allocator = std.testing.allocator;
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const root_name = try interner.intern("Root");
+    const parent_name = try interner.intern("Parent");
+    const child_name = try interner.intern("Child");
+    const root_field_name = try interner.intern("root");
+    const parent_field_name = try interner.intern("parent");
+    const child_field_name = try interner.intern("child");
+    const i64_name = try interner.intern("i64");
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const i64_type = ast.TypeExpr{ .name = .{ .meta = meta, .name = i64_name, .args = &.{} } };
+
+    const root_fields = [_]ast.StructFieldDecl{.{
+        .meta = meta,
+        .name = root_field_name,
+        .type_expr = &i64_type,
+        .default = null,
+    }};
+    const parent_fields = [_]ast.StructFieldDecl{.{
+        .meta = meta,
+        .name = parent_field_name,
+        .type_expr = &i64_type,
+        .default = null,
+    }};
+    const child_fields = [_]ast.StructFieldDecl{.{
+        .meta = meta,
+        .name = child_field_name,
+        .type_expr = &i64_type,
+        .default = null,
+    }};
+
+    const root_parts = [_]ast.StringId{root_name};
+    const parent_parts = [_]ast.StringId{parent_name};
+    const child_parts = [_]ast.StringId{child_name};
+    const root_decl = ast.StructDecl{
+        .meta = meta,
+        .name = .{ .parts = root_parts[0..], .span = meta.span },
+        .fields = root_fields[0..],
+    };
+    const parent_decl = ast.StructDecl{
+        .meta = meta,
+        .name = .{ .parts = parent_parts[0..], .span = meta.span },
+        .parent = root_name,
+        .fields = parent_fields[0..],
+    };
+    const child_decl = ast.StructDecl{
+        .meta = meta,
+        .name = .{ .parts = child_parts[0..], .span = meta.span },
+        .parent = parent_name,
+        .fields = child_fields[0..],
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(allocator);
+    defer graph.deinit();
+    _ = try graph.registerType(root_name, graph.prelude_scope, .{ .struct_type = &root_decl }, &.{});
+    _ = try graph.registerType(parent_name, graph.prelude_scope, .{ .struct_type = &parent_decl }, &.{});
+    _ = try graph.registerType(child_name, graph.prelude_scope, .{ .struct_type = &child_decl }, &.{});
+
+    var desugarer = Desugarer.init(allocator, &interner, &graph);
+    const collected = try desugarer.collectAllStructFields(&child_decl);
+    defer collected.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), collected.fields.len);
+    try std.testing.expectEqualStrings("root", interner.get(collected.fields[0].name));
+    try std.testing.expectEqualStrings("parent", interner.get(collected.fields[1].name));
+    try std.testing.expectEqualStrings("child", interner.get(collected.fields[2].name));
+}
+
+test "struct update propagates OOM while collecting inherited fields" {
+    const setup_allocator = std.testing.allocator;
+    var interner = ast.StringInterner.init(setup_allocator);
+    defer interner.deinit();
+
+    const parent_name = try interner.intern("Parent");
+    const child_name = try interner.intern("Child");
+    const parent_field_name = try interner.intern("parent");
+    const child_field_name = try interner.intern("child");
+    const i64_name = try interner.intern("i64");
+    const source_name = try interner.intern("source");
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const i64_type = ast.TypeExpr{ .name = .{ .meta = meta, .name = i64_name, .args = &.{} } };
+
+    const parent_fields = [_]ast.StructFieldDecl{.{
+        .meta = meta,
+        .name = parent_field_name,
+        .type_expr = &i64_type,
+        .default = null,
+    }};
+    const child_fields = [_]ast.StructFieldDecl{.{
+        .meta = meta,
+        .name = child_field_name,
+        .type_expr = &i64_type,
+        .default = null,
+    }};
+
+    const parent_parts = [_]ast.StringId{parent_name};
+    const child_parts = [_]ast.StringId{child_name};
+    const parent_decl = ast.StructDecl{
+        .meta = meta,
+        .name = .{ .parts = parent_parts[0..], .span = meta.span },
+        .fields = parent_fields[0..],
+    };
+    const child_decl = ast.StructDecl{
+        .meta = meta,
+        .name = .{ .parts = child_parts[0..], .span = meta.span },
+        .parent = parent_name,
+        .fields = child_fields[0..],
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(setup_allocator);
+    defer graph.deinit();
+    _ = try graph.registerType(parent_name, graph.prelude_scope, .{ .struct_type = &parent_decl }, &.{});
+    _ = try graph.registerType(child_name, graph.prelude_scope, .{ .struct_type = &child_decl }, &.{});
+
+    const source_expr = ast.Expr{ .var_ref = .{ .meta = meta, .name = source_name } };
+    const original = ast.StructExpr{
+        .meta = meta,
+        .struct_name = .{ .parts = child_parts[0..], .span = meta.span },
+        .update_source = &source_expr,
+        .fields = &.{},
+    };
+
+    var failing_allocator = std.testing.FailingAllocator.init(setup_allocator, .{ .fail_index = 0 });
+    var desugarer = Desugarer.init(failing_allocator.allocator(), &interner, &graph);
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        desugarer.desugarStructUpdate(original, &source_expr, &.{}),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
 }

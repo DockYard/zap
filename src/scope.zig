@@ -227,6 +227,9 @@ pub const Scope = struct {
         self.bindings.deinit();
         self.function_families.deinit();
         self.macros.deinit();
+        for (self.imports.items) |*imported_scope| {
+            imported_scope.deinit(allocator);
+        }
         self.imports.deinit(allocator);
         self.aliases.deinit();
     }
@@ -238,6 +241,7 @@ pub const Scope = struct {
 
 pub const ImportedScope = struct {
     source_struct: ast.StructName,
+    owns_source_struct_parts: bool = false,
     filter: ImportFilter,
     imported_families: std.AutoHashMap(FamilyKey, FunctionFamilyId),
     imported_types: std.AutoHashMap(ast.StringId, TypeId),
@@ -251,12 +255,35 @@ pub const ImportedScope = struct {
     /// — appended first, at scope-collection time, before any `use` in the
     /// struct body — would always out-rank explicit imports.
     is_implicit: bool = false,
+
+    /// Free import-owned storage. `source_struct.parts` normally borrows AST
+    /// storage and is only freed for synthesized imports that explicitly mark
+    /// ownership.
+    pub fn deinit(self: *ImportedScope, allocator: std.mem.Allocator) void {
+        if (self.owns_source_struct_parts) {
+            allocator.free(self.source_struct.parts);
+        }
+        self.filter.deinit(allocator);
+        self.imported_families.deinit();
+        self.imported_types.deinit();
+    }
 };
 
 pub const ImportFilter = union(enum) {
     all,
     only: []const ImportEntry,
     except: []const ImportEntry,
+
+    /// Free filter-owned entry slices. Entry names are interned ids and remain
+    /// owned by the AST/string interner.
+    pub fn deinit(self: ImportFilter, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .all => {},
+            .only, .except => |entries| {
+                if (entries.len > 0) allocator.free(entries);
+            },
+        }
+    }
 };
 
 pub const ImportEntry = struct {
@@ -298,6 +325,7 @@ pub const FunctionFamily = struct {
 
     pub fn deinit(self: *FunctionFamily, allocator: std.mem.Allocator) void {
         self.clauses.deinit(allocator);
+        deinitAttributes(allocator, &self.attributes);
     }
 };
 
@@ -355,6 +383,7 @@ pub const MacroFamily = struct {
 
     pub fn deinit(self: *MacroFamily, allocator: std.mem.Allocator) void {
         self.clauses.deinit(allocator);
+        deinitAttributes(allocator, &self.attributes);
     }
 };
 
@@ -382,6 +411,10 @@ pub const Binding = struct {
     /// `ScopeGraph.resolveBindingByScopes`; the legacy scope-chain
     /// `resolveBinding` ignores it.
     scopes: ScopeSet = .empty,
+
+    pub fn deinit(self: *Binding, allocator: std.mem.Allocator) void {
+        self.scopes.deinit(allocator);
+    }
 };
 
 pub const BindingKind = enum {
@@ -402,6 +435,10 @@ pub const TypeEntry = struct {
     params: []const ast.TypeParam,
     /// Type-level attributes (@doc, @deprecated, etc.)
     attributes: std.ArrayListUnmanaged(Attribute) = .empty,
+
+    pub fn deinit(self: *TypeEntry, allocator: std.mem.Allocator) void {
+        deinitAttributes(allocator, &self.attributes);
+    }
 };
 
 pub const TypeKind = union(enum) {
@@ -443,7 +480,8 @@ pub const GatedOut = struct {
     target_label: []const u8,
 };
 
-/// A compile-time attribute stored on a struct or function.
+/// A compile-time attribute stored on a struct, type, protocol,
+/// function, or macro.
 ///
 /// Attributes are append-only at compile time. A single declared
 /// `@name = value` produces one row; macros that call
@@ -451,6 +489,11 @@ pub const GatedOut = struct {
 /// When `accumulate` is true (set via `Struct.register_attribute`),
 /// reads return the full accumulated list; otherwise reads return
 /// the latest row's value.
+///
+/// `computed_value`, when non-null, is an owned deep `ctfe.ConstValue`
+/// allocated with the scope graph's allocator. Attribute containers must
+/// call `deinit` before discarding a row, and replacements must go
+/// through `setComputedValueOwned` so the previous owned value is freed.
 pub const Attribute = struct {
     name: ast.StringId,
     type_expr: ?*const ast.TypeExpr = null,
@@ -459,7 +502,58 @@ pub const Attribute = struct {
     /// When true, multiple `put_attribute` calls accumulate; reads
     /// see the list of values in append order.
     accumulate: bool = false,
+
+    pub fn deinit(self: *Attribute, allocator: std.mem.Allocator) void {
+        self.clearComputedValue(allocator);
+    }
+
+    pub fn clearComputedValue(self: *Attribute, allocator: std.mem.Allocator) void {
+        if (self.computed_value) |value| {
+            ctfe.deinitConstValue(allocator, value);
+            self.computed_value = null;
+        }
+    }
+
+    /// Replace this row's owned computed value, freeing any prior owned
+    /// value. Ownership of `value` transfers to the attribute immediately.
+    pub fn setComputedValueOwned(
+        self: *Attribute,
+        allocator: std.mem.Allocator,
+        value: ctfe.ConstValue,
+    ) void {
+        self.clearComputedValue(allocator);
+        self.computed_value = value;
+    }
 };
+
+/// Borrowed view returned from `ScopeGraph.getStructAttribute`.
+///
+/// `value` borrows stored `Attribute.computed_value` payloads. For
+/// accumulating attributes, the top-level `.list` slice is an owned
+/// shallow wrapper allocated by `getStructAttribute`; its elements still
+/// borrow the stored values. Call `deinit` after importing or inspecting
+/// the view. Do not call `ctfe.deinitConstValue` on this view.
+pub const AttributeValueView = struct {
+    value: ctfe.ConstValue,
+    owned_list_wrapper: ?[]const ctfe.ConstValue = null,
+
+    pub fn deinit(self: *AttributeValueView, allocator: std.mem.Allocator) void {
+        if (self.owned_list_wrapper) |items| {
+            if (items.len > 0) allocator.free(items);
+        }
+        self.* = .{ .value = .void };
+    }
+};
+
+fn deinitAttributes(
+    allocator: std.mem.Allocator,
+    attributes: *std.ArrayListUnmanaged(Attribute),
+) void {
+    for (attributes.items) |*attr| {
+        attr.deinit(allocator);
+    }
+    attributes.deinit(allocator);
+}
 
 pub const StructEntry = struct {
     name: ast.StructName,
@@ -473,6 +567,10 @@ pub const StructEntry = struct {
     /// reference resolves to the `target_capability` diagnostic. Null on
     /// native and whenever the target satisfies the requirement.
     gated_out: ?GatedOut = null,
+
+    pub fn deinit(self: *StructEntry, allocator: std.mem.Allocator) void {
+        deinitAttributes(allocator, &self.attributes);
+    }
 };
 
 pub const SourceFileEntry = struct {
@@ -494,6 +592,10 @@ pub const ProtocolEntry = struct {
     scope_id: ScopeId,
     decl: *const ast.ProtocolDecl,
     attributes: std.ArrayListUnmanaged(Attribute) = .empty,
+
+    pub fn deinit(self: *ProtocolEntry, allocator: std.mem.Allocator) void {
+        deinitAttributes(allocator, &self.attributes);
+    }
 };
 
 pub const ImplEntry = struct {
@@ -572,7 +674,7 @@ pub const ScopeGraph = struct {
         return (sid << 32) | @as(u64, span.start);
     }
 
-    pub fn init(allocator: std.mem.Allocator) ScopeGraph {
+    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!ScopeGraph {
         var graph = ScopeGraph{
             .allocator = allocator,
             .scopes = .empty,
@@ -589,9 +691,11 @@ pub const ScopeGraph = struct {
             .type_name_to_id = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
             .native_type_names = std.EnumArray(NativeTypeKind, ?ast.StringId).initFill(null),
         };
+        errdefer graph.deinit();
+
         // Create prelude scope as scope 0
         const prelude = Scope.init(allocator, 0, null, .prelude);
-        graph.scopes.append(allocator, prelude) catch {};
+        try graph.scopes.append(allocator, prelude);
         return graph;
     }
 
@@ -639,6 +743,9 @@ pub const ScopeGraph = struct {
             s.deinit(self.allocator);
         }
         self.scopes.deinit(self.allocator);
+        for (self.bindings.items) |*binding| {
+            binding.deinit(self.allocator);
+        }
         self.bindings.deinit(self.allocator);
         for (self.families.items) |*f| {
             f.deinit(self.allocator);
@@ -648,9 +755,18 @@ pub const ScopeGraph = struct {
             m.deinit(self.allocator);
         }
         self.macro_families.deinit(self.allocator);
+        for (self.types.items) |*t| {
+            t.deinit(self.allocator);
+        }
         self.types.deinit(self.allocator);
+        for (self.structs.items) |*s| {
+            s.deinit(self.allocator);
+        }
         self.structs.deinit(self.allocator);
         self.source_files.deinit(self.allocator);
+        for (self.protocols.items) |*p| {
+            p.deinit(self.allocator);
+        }
         self.protocols.deinit(self.allocator);
         self.impls.deinit(self.allocator);
         self.node_scope_map.deinit();
@@ -690,7 +806,10 @@ pub const ScopeGraph = struct {
         scopes: ScopeSet,
     ) !BindingId {
         const id: BindingId = @intCast(self.bindings.items.len);
-        const cloned = try scopes.clone(self.allocator);
+        var cloned = try scopes.clone(self.allocator);
+        var cloned_transferred = false;
+        errdefer if (!cloned_transferred) cloned.deinit(self.allocator);
+
         try self.bindings.append(self.allocator, .{
             .id = id,
             .name = name,
@@ -699,6 +818,7 @@ pub const ScopeGraph = struct {
             .span = span,
             .scopes = cloned,
         });
+        cloned_transferred = true;
         try self.getScopeMut(scope_id).bindings.put(name, id);
         return id;
     }
@@ -1175,7 +1295,7 @@ pub const ScopeGraph = struct {
         // name, or append a new one.
         for (mod_entry.attributes.items) |*attr| {
             if (attr.name == name) {
-                attr.computed_value = value;
+                attr.setComputedValueOwned(self.allocator, value);
                 attr.value = null;
                 attr.type_expr = null;
                 return;
@@ -1197,7 +1317,7 @@ pub const ScopeGraph = struct {
         self: *ScopeGraph,
         mod_entry: *const StructEntry,
         name: ast.StringId,
-    ) !?ctfe.ConstValue {
+    ) !?AttributeValueView {
         // Decide on shape by inspecting the rows.
         var is_accumulating = false;
         var match_count: usize = 0;
@@ -1210,16 +1330,22 @@ pub const ScopeGraph = struct {
         }
         if (match_count == 0) return null;
 
-        if (!is_accumulating) return latest_value;
+        if (!is_accumulating) {
+            const value = latest_value orelse return null;
+            return .{ .value = value };
+        }
 
         // Accumulating: collect all computed values into a list.
         var elems: std.ArrayListUnmanaged(ctfe.ConstValue) = .empty;
+        errdefer elems.deinit(self.allocator);
         for (mod_entry.attributes.items) |attr| {
             if (attr.name != name) continue;
             if (attr.computed_value) |cv| try elems.append(self.allocator, cv);
         }
-        return ctfe.ConstValue{
-            .list = try elems.toOwnedSlice(self.allocator),
+        const items = try elems.toOwnedSlice(self.allocator);
+        return AttributeValueView{
+            .value = .{ .list = items },
+            .owned_list_wrapper = items,
         };
     }
 
@@ -1319,8 +1445,55 @@ pub const ScopeGraph = struct {
 // Tests
 // ============================================================
 
+fn putOwnedStructAttributeForTest(
+    graph: *ScopeGraph,
+    struct_entry: *StructEntry,
+    name: ast.StringId,
+    value: ctfe.ConstValue,
+) !void {
+    var transferred = false;
+    errdefer if (!transferred) ctfe.deinitConstValue(graph.allocator, value);
+
+    try graph.putStructAttribute(struct_entry, name, value);
+    transferred = true;
+}
+
+fn appendOwnedComputedStringAttributeForTest(
+    allocator: std.mem.Allocator,
+    attributes: *std.ArrayListUnmanaged(Attribute),
+    name: ast.StringId,
+    bytes: []const u8,
+) !void {
+    const value = try ctfe.exportValue(allocator, .{ .string = bytes });
+    var transferred = false;
+    errdefer if (!transferred) ctfe.deinitConstValue(allocator, value);
+
+    try attributes.append(allocator, .{
+        .name = name,
+        .computed_value = value,
+    });
+    transferred = true;
+}
+
+test "ScopeGraph.init creates prelude scope" {
+    var graph = try ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    try std.testing.expectEqual(@as(ScopeId, 0), graph.prelude_scope);
+    try std.testing.expectEqual(@as(usize, 1), graph.scopes.items.len);
+    try std.testing.expectEqual(ScopeKind.prelude, graph.getScope(graph.prelude_scope).kind);
+    try std.testing.expectEqual(@as(?ScopeId, null), graph.getScope(graph.prelude_scope).parent);
+}
+
+test "ScopeGraph.init propagates prelude allocation OutOfMemory" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(error.OutOfMemory, ScopeGraph.init(failing_allocator.allocator()));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
 test "scope graph basic operations" {
-    var graph = ScopeGraph.init(std.testing.allocator);
+    var graph = try ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
     // Prelude scope exists
@@ -1338,7 +1511,7 @@ test "scope graph basic operations" {
 }
 
 test "scope graph binding resolution" {
-    var graph = ScopeGraph.init(std.testing.allocator);
+    var graph = try ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
     const mod_scope = try graph.createScope(0, .struct_scope);
@@ -1358,8 +1531,38 @@ test "scope graph binding resolution" {
     try std.testing.expect(not_found == null);
 }
 
+fn exerciseCreateBindingWithScopesAllocationFailures(allocator: std.mem.Allocator) !void {
+    var graph = try ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const function_scope = try graph.createScope(graph.prelude_scope, .function);
+    var binding_scopes: ScopeSet = .{};
+    defer binding_scopes.deinit(allocator);
+    try binding_scopes.add(allocator, graph.prelude_scope);
+    try binding_scopes.add(allocator, function_scope);
+
+    const binding_id = try graph.createBindingWithScopes(
+        42,
+        function_scope,
+        .pattern_bind,
+        .{ .start = 0, .end = 1 },
+        binding_scopes,
+    );
+
+    try std.testing.expectEqual(@as(BindingId, 0), binding_id);
+    try std.testing.expect(graph.bindings.items[binding_id].scopes.eq(binding_scopes));
+}
+
+test "P4J2: createBindingWithScopes frees cloned scope set on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseCreateBindingWithScopesAllocationFailures,
+        .{},
+    );
+}
+
 test "scope graph family creation" {
-    var graph = ScopeGraph.init(std.testing.allocator);
+    var graph = try ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
     const mod_scope = try graph.createScope(0, .struct_scope);
@@ -1374,6 +1577,107 @@ test "scope graph family creation" {
     // Different arity should not match
     const wrong_arity = graph.resolveFamily(mod_scope, name_id, 3);
     try std.testing.expect(wrong_arity == null);
+}
+
+test "P4J2: putStructAttribute frees overwritten owned computed value" {
+    const allocator = std.testing.allocator;
+    var graph = try ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const struct_name_id: ast.StringId = 1;
+    const attr_name_id: ast.StringId = 2;
+    const struct_name = ast.StructName{ .parts = &[_]ast.StringId{struct_name_id}, .span = span };
+    var struct_decl = ast.StructDecl{
+        .meta = .{ .span = span },
+        .name = struct_name,
+    };
+    const struct_scope = try graph.createScope(graph.prelude_scope, .struct_scope);
+    try graph.structs.append(allocator, .{
+        .name = struct_name,
+        .scope_id = struct_scope,
+        .decl = &struct_decl,
+    });
+
+    try putOwnedStructAttributeForTest(
+        &graph,
+        &graph.structs.items[0],
+        attr_name_id,
+        try ctfe.exportValue(allocator, .{ .string = "first" }),
+    );
+    try putOwnedStructAttributeForTest(
+        &graph,
+        &graph.structs.items[0],
+        attr_name_id,
+        try ctfe.exportValue(allocator, .{ .string = "second" }),
+    );
+
+    const stored = graph.structs.items[0].attributes.items[0].computed_value.?;
+    try std.testing.expectEqualStrings("second", stored.string);
+}
+
+test "P4J2: ScopeGraph.deinit frees owned computed values in every attribute container" {
+    const allocator = std.testing.allocator;
+    var graph = try ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const struct_name_id: ast.StringId = 10;
+    const struct_attr_id: ast.StringId = 11;
+    const type_attr_id: ast.StringId = 12;
+    const protocol_attr_id: ast.StringId = 13;
+    const function_attr_id: ast.StringId = 14;
+    const macro_attr_id: ast.StringId = 15;
+    const function_name_id: ast.StringId = 16;
+    const macro_name_id: ast.StringId = 17;
+    const type_name_id: ast.StringId = 18;
+    const protocol_name_id: ast.StringId = 19;
+
+    const struct_name = ast.StructName{ .parts = &[_]ast.StringId{struct_name_id}, .span = span };
+    var struct_decl = ast.StructDecl{
+        .meta = .{ .span = span },
+        .name = struct_name,
+    };
+    const struct_scope = try graph.createScope(graph.prelude_scope, .struct_scope);
+    try graph.structs.append(allocator, .{
+        .name = struct_name,
+        .scope_id = struct_scope,
+        .decl = &struct_decl,
+    });
+    try appendOwnedComputedStringAttributeForTest(allocator, &graph.structs.items[0].attributes, struct_attr_id, "struct");
+
+    var type_expr = ast.TypeExpr{ .name = .{
+        .meta = .{ .span = span },
+        .name = type_name_id,
+        .args = &.{},
+    } };
+    try graph.types.append(allocator, .{
+        .id = 0,
+        .name = type_name_id,
+        .scope_id = struct_scope,
+        .kind = .{ .type_alias = &type_expr },
+        .params = &.{},
+    });
+    try appendOwnedComputedStringAttributeForTest(allocator, &graph.types.items[0].attributes, type_attr_id, "type");
+
+    const protocol_name = ast.StructName{ .parts = &[_]ast.StringId{protocol_name_id}, .span = span };
+    var protocol_decl = ast.ProtocolDecl{
+        .meta = .{ .span = span },
+        .name = protocol_name,
+        .functions = &.{},
+    };
+    try graph.protocols.append(allocator, .{
+        .name = protocol_name,
+        .scope_id = struct_scope,
+        .decl = &protocol_decl,
+    });
+    try appendOwnedComputedStringAttributeForTest(allocator, &graph.protocols.items[0].attributes, protocol_attr_id, "protocol");
+
+    const family_id = try graph.createFamily(struct_scope, function_name_id, 0, .public);
+    try appendOwnedComputedStringAttributeForTest(allocator, &graph.getFamilyMut(family_id).attributes, function_attr_id, "function");
+
+    const macro_id = try graph.createMacroFamily(struct_scope, macro_name_id, 0);
+    try appendOwnedComputedStringAttributeForTest(allocator, &graph.macro_families.items[macro_id].attributes, macro_attr_id, "macro");
 }
 
 test "native type kind name parsing" {
@@ -1512,8 +1816,82 @@ test "ScopeSet primary returns innermost (largest id)" {
     try std.testing.expectEqual(@as(?ScopeId, 100), set.primary());
 }
 
+test "ImportFilter.deinit frees owned filter entry slices" {
+    const allocator = std.testing.allocator;
+
+    const only_entries = try allocator.dupe(ImportEntry, &[_]ImportEntry{
+        .{ .name = 10, .arity = 1 },
+    });
+    const only_filter = ImportFilter{ .only = only_entries };
+    only_filter.deinit(allocator);
+
+    const except_entries = try allocator.dupe(ImportEntry, &[_]ImportEntry{
+        .{ .name = 20, .arity = null },
+    });
+    const except_filter = ImportFilter{ .except = except_entries };
+    except_filter.deinit(allocator);
+
+    const all_filter: ImportFilter = .all;
+    all_filter.deinit(allocator);
+}
+
+test "Scope.deinit deinitializes imported filters and maps" {
+    const allocator = std.testing.allocator;
+
+    var owner_scope = Scope.init(allocator, 1, null, .block);
+    defer owner_scope.deinit(allocator);
+
+    const source_parts = [_]ast.StringId{100};
+    const filter_entries = try allocator.dupe(ImportEntry, &[_]ImportEntry{
+        .{ .name = 101, .arity = 2 },
+        .{ .name = 102, .arity = null },
+    });
+
+    var imported_scope = ImportedScope{
+        .source_struct = .{
+            .parts = &source_parts,
+            .span = .{ .start = 0, .end = 6 },
+        },
+        .filter = .{ .only = filter_entries },
+        .imported_families = std.AutoHashMap(FamilyKey, FunctionFamilyId).init(allocator),
+        .imported_types = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
+    };
+    var imported_scope_transferred = false;
+    errdefer if (!imported_scope_transferred) imported_scope.deinit(allocator);
+
+    try imported_scope.imported_families.put(.{ .name = 103, .arity = 1 }, 1);
+    try imported_scope.imported_types.put(104, 2);
+
+    try owner_scope.imports.append(allocator, imported_scope);
+    imported_scope_transferred = true;
+}
+
+test "Scope.deinit frees synthesized import source parts when owned" {
+    const allocator = std.testing.allocator;
+
+    var owner_scope = Scope.init(allocator, 1, null, .block);
+    defer owner_scope.deinit(allocator);
+
+    const source_parts = try allocator.dupe(ast.StringId, &[_]ast.StringId{100});
+    var imported_scope = ImportedScope{
+        .source_struct = .{
+            .parts = source_parts,
+            .span = .{ .start = 0, .end = 6 },
+        },
+        .owns_source_struct_parts = true,
+        .filter = .all,
+        .imported_families = std.AutoHashMap(FamilyKey, FunctionFamilyId).init(allocator),
+        .imported_types = std.AutoHashMap(ast.StringId, TypeId).init(allocator),
+    };
+    var imported_scope_transferred = false;
+    errdefer if (!imported_scope_transferred) imported_scope.deinit(allocator);
+
+    try owner_scope.imports.append(allocator, imported_scope);
+    imported_scope_transferred = true;
+}
+
 test "scope graph native type registry" {
-    var graph = ScopeGraph.init(std.testing.allocator);
+    var graph = try ScopeGraph.init(std.testing.allocator);
     defer graph.deinit();
 
     const list_name: ast.StringId = 11;
@@ -1571,20 +1949,25 @@ fn testAppendBindingWithScopes(
     scopes: ScopeSet,
 ) !BindingId {
     const id: BindingId = @intCast(graph.bindings.items.len);
+    var cloned_scopes = try scopes.clone(graph.allocator);
+    var cloned_scopes_transferred = false;
+    errdefer if (!cloned_scopes_transferred) cloned_scopes.deinit(graph.allocator);
+
     try graph.bindings.append(graph.allocator, .{
         .id = id,
         .name = name,
         .scope_id = 0,
         .kind = .variable,
         .span = .{ .start = 0, .end = 0 },
-        .scopes = scopes,
+        .scopes = cloned_scopes,
     });
+    cloned_scopes_transferred = true;
     return id;
 }
 
 test "resolveBindingByScopes returns null when no binding matches name" {
     const alloc = std.testing.allocator;
-    var graph = ScopeGraph.init(alloc);
+    var graph = try ScopeGraph.init(alloc);
     defer graph.deinit();
 
     var binding_scopes: ScopeSet = .{};
@@ -1603,7 +1986,7 @@ test "resolveBindingByScopes returns null when no binding matches name" {
 
 test "resolveBindingByScopes picks the binding whose scopes is the largest subset" {
     const alloc = std.testing.allocator;
-    var graph = ScopeGraph.init(alloc);
+    var graph = try ScopeGraph.init(alloc);
     defer graph.deinit();
 
     const name: ast.StringId = 42;
@@ -1641,7 +2024,7 @@ test "resolveBindingByScopes picks the binding whose scopes is the largest subse
 
 test "resolveBindingByScopes returns null on ambiguity (tied maximal subsets)" {
     const alloc = std.testing.allocator;
-    var graph = ScopeGraph.init(alloc);
+    var graph = try ScopeGraph.init(alloc);
     defer graph.deinit();
 
     const name: ast.StringId = 7;
@@ -1672,7 +2055,7 @@ test "resolveBindingByScopes returns null on ambiguity (tied maximal subsets)" {
 
 test "resolveBindingByScopes ignores bindings whose scopes are NOT a subset of the reference" {
     const alloc = std.testing.allocator;
-    var graph = ScopeGraph.init(alloc);
+    var graph = try ScopeGraph.init(alloc);
     defer graph.deinit();
 
     const name: ast.StringId = 13;
@@ -1701,7 +2084,7 @@ test "resolveBindingByScopes ignores bindings whose scopes are NOT a subset of t
 
     // With NO visible binding, the result must be null even though the
     // hidden binding shares the name.
-    var graph2 = ScopeGraph.init(alloc);
+    var graph2 = try ScopeGraph.init(alloc);
     defer graph2.deinit();
 
     var hidden2: ScopeSet = .{};

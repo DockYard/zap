@@ -281,7 +281,9 @@ pub const Program = struct {
     entry: ?FunctionId,
 };
 
-const CloneError = std.mem.Allocator.Error;
+const CloneError = std.mem.Allocator.Error || error{
+    IrStructuralBudgetExceeded,
+};
 
 pub fn cloneProgram(allocator: std.mem.Allocator, program: Program) CloneError!Program {
     const functions = try allocator.alloc(Function, program.functions.len);
@@ -343,18 +345,75 @@ fn cloneStringSlice(allocator: std.mem.Allocator, values: []const []const u8) Cl
 }
 
 fn cloneZigTypePtr(allocator: std.mem.Allocator, value: *const ZigType) CloneError!*const ZigType {
+    var budget = TypeWalkBudget{};
+    try validateZigTypeStructuralBudget(value.*, &budget);
+    return cloneZigTypePtrUnchecked(allocator, value);
+}
+
+fn cloneZigTypePtrUnchecked(allocator: std.mem.Allocator, value: *const ZigType) CloneError!*const ZigType {
     const cloned = try allocator.create(ZigType);
-    cloned.* = try cloneZigType(allocator, value.*);
+    errdefer allocator.destroy(cloned);
+    cloned.* = try cloneZigTypeUnchecked(allocator, value.*);
     return cloned;
 }
 
 fn cloneZigTypeSlice(allocator: std.mem.Allocator, values: []const ZigType) CloneError![]const ZigType {
     if (values.len == 0) return &.{};
+    var budget = TypeWalkBudget{};
+    for (values) |value| {
+        try validateZigTypeStructuralBudget(value, &budget);
+    }
+    return cloneZigTypeSliceUnchecked(allocator, values);
+}
+
+fn cloneZigTypeSliceUnchecked(allocator: std.mem.Allocator, values: []const ZigType) CloneError![]const ZigType {
+    if (values.len == 0) return &.{};
     const cloned = try allocator.alloc(ZigType, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |cloned_value| {
+            deinitClonedZigType(allocator, cloned_value);
+        }
+        allocator.free(cloned);
+    }
     for (values, 0..) |value, index| {
-        cloned[index] = try cloneZigType(allocator, value);
+        cloned[index] = try cloneZigTypeUnchecked(allocator, value);
+        initialized += 1;
     }
     return cloned;
+}
+
+fn deinitClonedZigTypePtr(allocator: std.mem.Allocator, value: *const ZigType) void {
+    deinitClonedZigType(allocator, value.*);
+    allocator.destroy(@constCast(value));
+}
+
+fn deinitClonedZigTypeSlice(allocator: std.mem.Allocator, values: []const ZigType) void {
+    for (values) |value| {
+        deinitClonedZigType(allocator, value);
+    }
+    allocator.free(values);
+}
+
+fn deinitClonedZigType(allocator: std.mem.Allocator, value: ZigType) void {
+    switch (value) {
+        .tuple => |items| deinitClonedZigTypeSlice(allocator, items),
+        .list => |item| deinitClonedZigTypePtr(allocator, item),
+        .map => |map_type| {
+            deinitClonedZigTypePtr(allocator, map_type.key);
+            deinitClonedZigTypePtr(allocator, map_type.value);
+        },
+        .struct_ref => |name| allocator.free(name),
+        .function => |fn_type| {
+            deinitClonedZigTypeSlice(allocator, fn_type.params);
+            deinitClonedZigTypePtr(allocator, fn_type.return_type);
+        },
+        .tagged_union => |name| allocator.free(name),
+        .optional => |item| deinitClonedZigTypePtr(allocator, item),
+        .ptr => |item| deinitClonedZigTypePtr(allocator, item),
+        .protocol_box => |name| allocator.free(name),
+        else => {},
+    }
 }
 
 /// True when `zig_type` is one of the fixed-width integer ZigType
@@ -373,6 +432,13 @@ fn isConcreteIntegerZigType(zig_type: ZigType) bool {
 fn isFloatZigType(zig_type: ZigType) bool {
     return switch (zig_type) {
         .f16, .f32, .f64, .f80, .f128 => true,
+        else => false,
+    };
+}
+
+fn isVoidLikeZigType(zig_type: ZigType) bool {
+    return switch (zig_type) {
+        .void, .nil, .never => true,
         else => false,
     };
 }
@@ -427,7 +493,19 @@ fn primitiveNameToZigType(name: []const u8) ?ZigType {
 /// `.applied` forms whose mangling needs recursive type-store
 /// inspection). The caller falls back to the bare base name in
 /// that case.
-fn mangledNameForArgZigType(allocator: std.mem.Allocator, zig_type: ZigType) ?[]const u8 {
+fn mangledNameForArgZigType(allocator: std.mem.Allocator, zig_type: ZigType) TypeWalkError!?[]const u8 {
+    var budget = TypeWalkBudget{};
+    return mangledNameForArgZigTypeBudgeted(allocator, zig_type, &budget);
+}
+
+fn mangledNameForArgZigTypeBudgeted(
+    allocator: std.mem.Allocator,
+    zig_type: ZigType,
+    budget: *TypeWalkBudget,
+) TypeWalkError!?[]const u8 {
+    try budget.enter();
+    defer budget.leave();
+
     return switch (zig_type) {
         .bool_type => "Bool",
         .string => "String",
@@ -469,35 +547,76 @@ fn mangledNameForArgZigType(allocator: std.mem.Allocator, zig_type: ZigType) ?[]
         // mangler (construction/dispatch sites) and the vtable emitter.
         .tuple => |elements| blk: {
             var buf: std.ArrayListUnmanaged(u8) = .empty;
-            buf.appendSlice(allocator, "Tuple") catch return null;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "Tuple");
             for (elements) |elem| {
-                buf.append(allocator, '_') catch return null;
-                const elem_name = mangledNameForArgZigType(allocator, elem) orelse return null;
-                buf.appendSlice(allocator, elem_name) catch return null;
+                try buf.append(allocator, '_');
+                const elem_name = (try mangledNameForArgZigTypeBudgeted(allocator, elem, budget)) orelse return null;
+                try buf.appendSlice(allocator, elem_name);
             }
-            break :blk buf.toOwnedSlice(allocator) catch null;
+            break :blk try buf.toOwnedSlice(allocator);
         },
         else => null,
     };
 }
 
+fn validateZigTypeStructuralBudget(value: ZigType, budget: *TypeWalkBudget) CloneError!void {
+    try budget.enter();
+    defer budget.leave();
+
+    switch (value) {
+        .tuple => |items| {
+            for (items) |item| {
+                try validateZigTypeStructuralBudget(item, budget);
+            }
+        },
+        .list => |item| try validateZigTypeStructuralBudget(item.*, budget),
+        .map => |map_type| {
+            try validateZigTypeStructuralBudget(map_type.key.*, budget);
+            try validateZigTypeStructuralBudget(map_type.value.*, budget);
+        },
+        .function => |fn_type| {
+            for (fn_type.params) |param| {
+                try validateZigTypeStructuralBudget(param, budget);
+            }
+            try validateZigTypeStructuralBudget(fn_type.return_type.*, budget);
+        },
+        .optional => |item| try validateZigTypeStructuralBudget(item.*, budget),
+        .ptr => |item| try validateZigTypeStructuralBudget(item.*, budget),
+        else => {},
+    }
+}
+
 fn cloneZigType(allocator: std.mem.Allocator, value: ZigType) CloneError!ZigType {
+    var budget = TypeWalkBudget{};
+    try validateZigTypeStructuralBudget(value, &budget);
+    return cloneZigTypeUnchecked(allocator, value);
+}
+
+fn cloneZigTypeUnchecked(allocator: std.mem.Allocator, value: ZigType) CloneError!ZigType {
     return switch (value) {
-        .tuple => |items| .{ .tuple = try cloneZigTypeSlice(allocator, items) },
-        .list => |item| .{ .list = try cloneZigTypePtr(allocator, item) },
-        .map => |map_type| .{ .map = .{
-            .key = try cloneZigTypePtr(allocator, map_type.key),
-            .value = try cloneZigTypePtr(allocator, map_type.value),
-        } },
+        .tuple => |items| .{ .tuple = try cloneZigTypeSliceUnchecked(allocator, items) },
+        .list => |item| .{ .list = try cloneZigTypePtrUnchecked(allocator, item) },
+        .map => |map_type| blk: {
+            const key = try cloneZigTypePtrUnchecked(allocator, map_type.key);
+            errdefer deinitClonedZigTypePtr(allocator, key);
+            const value_type = try cloneZigTypePtrUnchecked(allocator, map_type.value);
+            break :blk .{ .map = .{ .key = key, .value = value_type } };
+        },
         .struct_ref => |name| .{ .struct_ref = try cloneBytes(allocator, name) },
-        .function => |fn_type| .{ .function = .{
-            .params = try cloneZigTypeSlice(allocator, fn_type.params),
-            .return_type = try cloneZigTypePtr(allocator, fn_type.return_type),
-            .raises = fn_type.raises,
-        } },
+        .function => |fn_type| blk: {
+            const params = try cloneZigTypeSliceUnchecked(allocator, fn_type.params);
+            errdefer deinitClonedZigTypeSlice(allocator, params);
+            const return_type = try cloneZigTypePtrUnchecked(allocator, fn_type.return_type);
+            break :blk .{ .function = .{
+                .params = params,
+                .return_type = return_type,
+                .raises = fn_type.raises,
+            } };
+        },
         .tagged_union => |name| .{ .tagged_union = try cloneBytes(allocator, name) },
-        .optional => |item| .{ .optional = try cloneZigTypePtr(allocator, item) },
-        .ptr => |item| .{ .ptr = try cloneZigTypePtr(allocator, item) },
+        .optional => |item| .{ .optional = try cloneZigTypePtrUnchecked(allocator, item) },
+        .ptr => |item| .{ .ptr = try cloneZigTypePtrUnchecked(allocator, item) },
         .protocol_box => |name| .{ .protocol_box = try cloneBytes(allocator, name) },
         else => value,
     };
@@ -861,6 +980,10 @@ pub const Param = struct {
     type_expr: ZigType,
     /// Original TypeStore TypeId, preserved for list type detection.
     type_id: ?types_mod.TypeId = null,
+    /// Resolved source-level ownership qualifier for this parameter.
+    ownership: types_mod.Ownership = .shared,
+    /// True when the source explicitly wrote an ownership qualifier.
+    ownership_explicit: bool = false,
 };
 
 fn cloneParams(allocator: std.mem.Allocator, params: []const Param) CloneError![]const Param {
@@ -871,6 +994,8 @@ fn cloneParams(allocator: std.mem.Allocator, params: []const Param) CloneError![
             .name = try cloneBytes(allocator, param.name),
             .type_expr = try cloneZigType(allocator, param.type_expr),
             .type_id = param.type_id,
+            .ownership = param.ownership,
+            .ownership_explicit = param.ownership_explicit,
         };
     }
     return cloned;
@@ -1505,6 +1630,122 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
             .sources = try clonePlainSlice(PhiSource, allocator, value.sources),
         } },
     };
+}
+
+fn deinitConstructedZigType(allocator: std.mem.Allocator, value: ZigType) void {
+    switch (value) {
+        .tuple => |items| {
+            for (items) |item| deinitConstructedZigType(allocator, item);
+            allocator.free(items);
+        },
+        .list => |item| {
+            deinitConstructedZigType(allocator, item.*);
+            allocator.destroy(@constCast(item));
+        },
+        .map => |map_type| {
+            deinitConstructedZigType(allocator, map_type.key.*);
+            allocator.destroy(@constCast(map_type.key));
+            deinitConstructedZigType(allocator, map_type.value.*);
+            allocator.destroy(@constCast(map_type.value));
+        },
+        .function => |fn_type| {
+            for (fn_type.params) |param_type| deinitConstructedZigType(allocator, param_type);
+            allocator.free(fn_type.params);
+            deinitConstructedZigType(allocator, fn_type.return_type.*);
+            allocator.destroy(@constCast(fn_type.return_type));
+        },
+        .optional => |item| {
+            deinitConstructedZigType(allocator, item.*);
+            allocator.destroy(@constCast(item));
+        },
+        .ptr => |item| {
+            deinitConstructedZigType(allocator, item.*);
+            allocator.destroy(@constCast(item));
+        },
+        else => {},
+    }
+}
+
+fn deinitConstructedZigTypeSlicePrefix(allocator: std.mem.Allocator, values: []const ZigType, initialized: usize) void {
+    for (values[0..initialized]) |value| {
+        deinitConstructedZigType(allocator, value);
+    }
+    allocator.free(values);
+}
+
+fn deinitConstructedParam(allocator: std.mem.Allocator, param: Param) void {
+    allocator.free(param.name);
+    deinitConstructedZigType(allocator, param.type_expr);
+}
+
+fn deinitConstructedParamSlice(allocator: std.mem.Allocator, params: []const Param) void {
+    for (params) |param| deinitConstructedParam(allocator, param);
+    allocator.free(params);
+}
+
+fn deinitConstructedParamList(allocator: std.mem.Allocator, params: *std.ArrayList(Param)) void {
+    for (params.items) |param| deinitConstructedParam(allocator, param);
+    params.deinit(allocator);
+    params.* = .empty;
+}
+
+fn deinitConstructedCapture(allocator: std.mem.Allocator, capture: Capture) void {
+    allocator.free(capture.name);
+    deinitConstructedZigType(allocator, capture.type_expr);
+}
+
+fn deinitConstructedCaptureSlice(allocator: std.mem.Allocator, captures: []const Capture) void {
+    for (captures) |capture| deinitConstructedCapture(allocator, capture);
+    allocator.free(captures);
+}
+
+fn deinitConstructedCaptureList(allocator: std.mem.Allocator, captures: *std.ArrayList(Capture)) void {
+    for (captures.items) |capture| deinitConstructedCapture(allocator, capture);
+    captures.deinit(allocator);
+    captures.* = .empty;
+}
+
+fn deinitConstructedBlocks(allocator: std.mem.Allocator, blocks: []const Block) void {
+    for (blocks) |block| allocator.free(block.instructions);
+    allocator.free(blocks);
+}
+
+fn deinitConstructedProtocolBoxLocals(
+    allocator: std.mem.Allocator,
+    protocol_box_locals: *std.AutoHashMapUnmanaged(LocalId, []const u8),
+) void {
+    var iter = protocol_box_locals.iterator();
+    while (iter.next()) |entry| {
+        allocator.free(entry.value_ptr.*);
+    }
+    protocol_box_locals.deinit(allocator);
+    protocol_box_locals.* = .empty;
+}
+
+fn deinitConstructedLocalIdSet(
+    allocator: std.mem.Allocator,
+    local_id_set: *std.AutoHashMapUnmanaged(LocalId, void),
+) void {
+    local_id_set.deinit(allocator);
+    local_id_set.* = .empty;
+}
+
+fn deinitConstructedFunction(allocator: std.mem.Allocator, function: *Function) void {
+    const local_name_aliases_name =
+        function.local_name.len == function.name.len and function.local_name.ptr == function.name.ptr;
+    allocator.free(function.name);
+    if (!local_name_aliases_name and function.local_name.len > 0) {
+        allocator.free(function.local_name);
+    }
+    deinitConstructedParamSlice(allocator, function.params);
+    deinitConstructedZigType(allocator, function.return_type);
+    deinitConstructedBlocks(allocator, function.body);
+    deinitConstructedCaptureSlice(allocator, function.captures);
+    allocator.free(function.defaults);
+    allocator.free(function.param_conventions);
+    allocator.free(function.local_ownership);
+    deinitConstructedProtocolBoxLocals(allocator, &function.protocol_box_locals);
+    deinitConstructedLocalIdSet(allocator, &function.deep_release_owned_locals);
 }
 
 pub const ConstInt = struct {
@@ -2735,6 +2976,160 @@ pub const BinOffset = union(enum) {
 /// compiler (audit ir-1--07).
 const max_binary_pattern_bytes: u64 = std.math.maxInt(u32);
 
+/// Decision-tree lowering still uses recursive descent because each node
+/// carries lowering semantics around nested instruction buffers. Bound the
+/// structural depth and total nodes so hostile/pathological trees produce an
+/// IR diagnostic instead of overflowing the native stack.
+const max_ir_decision_lowering_depth: usize = 1024;
+const max_ir_decision_lowering_nodes: usize = 1_000_000;
+
+/// Error-pipe try lowering recursively builds nested success instruction
+/// streams. A chain this deep is not a practical source program; report it
+/// explicitly rather than risking native stack exhaustion.
+const max_ir_error_pipe_try_depth: usize = 512;
+const max_ir_error_pipe_try_nodes: usize = 1_000_000;
+
+/// HIR pre-scans use explicit heap-backed frames. This node budget keeps
+/// genuinely hostile structures finite while preserving ordinary deep code.
+const max_ir_hir_scan_nodes: usize = 1_000_000;
+
+/// Type lowering walks user-controlled TypeStore/ZigType structure. Keep the
+/// recursive implementation bounded so pathological type graphs report an
+/// explicit compiler error before native stack depth is at risk.
+const max_ir_type_walk_depth: usize = 1024;
+const max_ir_type_walk_nodes: usize = 1_000_000;
+
+const TypeWalkError = types_mod.TypeMangleError || types_mod.TypeGraphError || error{
+    IrStructuralBudgetExceeded,
+    InvalidTypeId,
+};
+
+const TypeWalkBudget = struct {
+    max_depth: usize = max_ir_type_walk_depth,
+    remaining_nodes: usize = max_ir_type_walk_nodes,
+    depth: usize = 0,
+
+    fn enter(self: *TypeWalkBudget) !void {
+        if (self.depth >= self.max_depth or self.remaining_nodes == 0) {
+            return error.IrStructuralBudgetExceeded;
+        }
+        self.depth += 1;
+        self.remaining_nodes -= 1;
+    }
+
+    fn leave(self: *TypeWalkBudget) void {
+        std.debug.assert(self.depth != 0);
+        self.depth -= 1;
+    }
+};
+
+const IrStructuralBudgetContext = enum {
+    decision_tree_lowering,
+    try_variant_scan,
+    error_pipe_try_lowering,
+    local_reservation_scan,
+    raising_closure_scan,
+    zig_type_mangling,
+};
+
+const RecursiveStructuralBudget = struct {
+    context: IrStructuralBudgetContext,
+    span: ast.SourceSpan,
+    max_depth: usize,
+    remaining_nodes: usize,
+    depth: usize = 0,
+    reported: bool = false,
+
+    fn init(
+        context: IrStructuralBudgetContext,
+        span: ast.SourceSpan,
+        max_depth: usize,
+        max_nodes: usize,
+    ) RecursiveStructuralBudget {
+        return .{
+            .context = context,
+            .span = span,
+            .max_depth = max_depth,
+            .remaining_nodes = max_nodes,
+        };
+    }
+};
+
+const InstructionBufferFrame = struct {
+    builder: *IrBuilder,
+    saved: std.ArrayList(Instruction),
+    active: bool = true,
+
+    fn init(builder: *IrBuilder) InstructionBufferFrame {
+        const saved = builder.current_instrs;
+        builder.current_instrs = .empty;
+        return .{ .builder = builder, .saved = saved };
+    }
+
+    fn discardAndRestore(self: *InstructionBufferFrame) void {
+        if (!self.active) return;
+        self.builder.current_instrs.deinit(self.builder.allocator);
+        self.builder.current_instrs = self.saved;
+        self.active = false;
+    }
+
+    fn takeOwnedSliceAndRestore(self: *InstructionBufferFrame) ![]const Instruction {
+        std.debug.assert(self.active);
+        const owned = try self.builder.current_instrs.toOwnedSlice(self.builder.allocator);
+        self.builder.current_instrs = self.saved;
+        self.active = false;
+        return owned;
+    }
+};
+
+const OwnedIrString = struct {
+    value: []const u8,
+    owned: bool,
+
+    fn deinit(self: *OwnedIrString, allocator: std.mem.Allocator) void {
+        if (self.owned) {
+            allocator.free(self.value);
+        }
+        self.owned = false;
+    }
+
+    fn transfer(self: *OwnedIrString) []const u8 {
+        self.owned = false;
+        return self.value;
+    }
+};
+
+const TryVariantScanFrame = union(enum) {
+    block: *const hir_mod.Block,
+    expr: *const hir_mod.Expr,
+    decision: *const hir_mod.Decision,
+};
+
+fn tryVariantScanFrameSpan(frame: TryVariantScanFrame) ast.SourceSpan {
+    return switch (frame) {
+        .expr => |expr| expr.span,
+        .block, .decision => .{ .start = 0, .end = 0 },
+    };
+}
+
+const MaxLocalScanFrame = union(enum) {
+    block: *const hir_mod.Block,
+    expr: *const hir_mod.Expr,
+    decision: *const hir_mod.Decision,
+};
+
+const RaisingClosureScanFrame = union(enum) {
+    block: *const hir_mod.Block,
+    expr: *const hir_mod.Expr,
+};
+
+fn raisingClosureScanFrameSpan(frame: RaisingClosureScanFrame, fallback: ast.SourceSpan) ast.SourceSpan {
+    return switch (frame) {
+        .expr => |expr| expr.span,
+        .block => fallback,
+    };
+}
+
 /// Tracks the running read position while lowering a binary pattern's
 /// segments. The position ALWAYS advances after every segment — fixed
 /// AND variable/dynamic alike — so each subsequent segment reads from the
@@ -2952,6 +3347,12 @@ pub const ReleaseKind = enum {
     /// children) and free the allocation. Lowers to
     /// `ArcRuntime.releaseAny`.
     release,
+    /// Release of an ARC-managed component still owned by a non-ARC aggregate
+    /// after that component was extracted and persistently retained into an
+    /// independent binding owner. Under clone-on-share managers, the persistent
+    /// retain rebinds the extracted local to a clone, so this release must target
+    /// the original aggregate component value captured before that rebind.
+    aggregate_component,
     /// Shallow free: refcount must be statically known to be 1 at
     /// this point; destroys the parent allocation without walking
     /// children. Used by destructive-optional-dispatch where
@@ -3836,33 +4237,32 @@ fn collectEscapingInStream(
     stream: []const Instruction,
     result: *ValueEscapingFunctions,
 ) error{OutOfMemory}!void {
-    for (stream) |*instr| {
-        switch (instr.*) {
-            .make_closure => |mc| {
-                try markGroupEscaping(allocator, program, mc.function, result);
-            },
-            .call_dispatch => |cd| {
-                try markGroupEscaping(allocator, program, cd.group_id, result);
-            },
-            else => {},
-        }
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        program: *const Program,
+        result: *ValueEscapingFunctions,
+        err: ?error{OutOfMemory} = null,
 
-        const Ctx = struct {
-            allocator: std.mem.Allocator,
-            program: *const Program,
-            result: *ValueEscapingFunctions,
-            err: ?error{OutOfMemory} = null,
-            fn onStream(self_ctx: *@This(), child: ChildStream) void {
-                if (self_ctx.err != null) return;
-                collectEscapingInStream(self_ctx.allocator, self_ctx.program, child.stream, self_ctx.result) catch |e| {
-                    self_ctx.err = e;
-                };
+        fn visit(self_ctx: *@This(), instr: *const Instruction) void {
+            if (self_ctx.err != null) return;
+            switch (instr.*) {
+                .make_closure => |mc| {
+                    markGroupEscaping(self_ctx.allocator, self_ctx.program, mc.function, self_ctx.result) catch |err| {
+                        self_ctx.err = err;
+                    };
+                },
+                .call_dispatch => |cd| {
+                    markGroupEscaping(self_ctx.allocator, self_ctx.program, cd.group_id, self_ctx.result) catch |err| {
+                        self_ctx.err = err;
+                    };
+                },
+                else => {},
             }
-        };
-        var ctx = Ctx{ .allocator = allocator, .program = program, .result = result };
-        forEachChildStream(instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
-    }
+        }
+    };
+    var ctx = Ctx{ .allocator = allocator, .program = program, .result = result };
+    try forEachInstructionInStream(allocator, stream, &ctx, Ctx.visit);
+    if (ctx.err) |err| return err;
 }
 
 /// Mark the `Function`(s) named by `group_id` as value-escaping. A
@@ -4173,43 +4573,191 @@ pub fn mapChildStreams(
 /// passes that need to enumerate every instruction without
 /// re-implementing the structural recursion.
 pub fn forEachInstruction(
+    allocator: std.mem.Allocator,
     function: *const Function,
     context: anytype,
     comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) void,
-) void {
+) std.mem.Allocator.Error!void {
+    var walker = InstructionStreamWalker.init(allocator);
+    defer walker.deinit();
+
     for (function.body) |block| {
-        forEachInstructionInStream(block.instructions, context, visitFn);
+        try walker.walk(block.instructions, context, visitFn);
     }
 }
 
+/// Walks every instruction in `stream` and its nested child streams in
+/// the same parent-before-children order as `forEachInstruction`.
 pub fn forEachInstructionInStream(
+    allocator: std.mem.Allocator,
     stream: []const Instruction,
     context: anytype,
     comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) void,
-) void {
-    for (stream) |*instr| {
-        visitFn(context, instr);
-        forEachInstructionChildren(instr, context, visitFn);
-    }
+) std.mem.Allocator.Error!void {
+    var walker = InstructionStreamWalker.init(allocator);
+    defer walker.deinit();
+    try walker.walk(stream, context, visitFn);
 }
 
-/// Recurse into every child instruction stream of `instr`, in canonical
-/// flatten order, via `forEachChildStream` — the single source of truth
-/// for the structural recursion. (Previously a hand-rolled `switch` that
-/// skipped `union_switch.else_instrs`.)
-fn forEachInstructionChildren(
-    instr: *const Instruction,
-    context: anytype,
-    comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) void,
-) void {
-    const Adapter = struct {
-        ctx: @TypeOf(context),
-        fn onStream(self: @This(), child: ChildStream) void {
-            forEachInstructionInStream(child.stream, self.ctx, visitFn);
+const instruction_stream_inline_frame_capacity = 64;
+const instruction_stream_inline_child_capacity = 16;
+
+const InstructionWalkControl = enum {
+    keep_walking,
+    stop,
+};
+
+const InstructionStreamFrame = struct {
+    stream: []const Instruction,
+    next_index: usize = 0,
+};
+
+fn SmallInlineStack(comptime T: type, comptime inline_capacity: usize) type {
+    return struct {
+        inline_items: [inline_capacity]T = undefined,
+        inline_len: usize = 0,
+        spill: std.ArrayListUnmanaged(T) = .empty,
+
+        const Self = @This();
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.spill.deinit(allocator);
+        }
+
+        fn clearRetainingCapacity(self: *Self) void {
+            self.inline_len = 0;
+            self.spill.clearRetainingCapacity();
+        }
+
+        fn len(self: *const Self) usize {
+            return self.inline_len + self.spill.items.len;
+        }
+
+        fn append(self: *Self, allocator: std.mem.Allocator, item: T) std.mem.Allocator.Error!void {
+            if (self.spill.items.len == 0 and self.inline_len < inline_capacity) {
+                self.inline_items[self.inline_len] = item;
+                self.inline_len += 1;
+                return;
+            }
+            try self.spill.append(allocator, item);
+        }
+
+        fn get(self: *const Self, index: usize) T {
+            std.debug.assert(index < self.len());
+            if (index < self.inline_len) return self.inline_items[index];
+            return self.spill.items[index - self.inline_len];
+        }
+
+        fn topPtr(self: *Self) *T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) {
+                return &self.spill.items[self.spill.items.len - 1];
+            }
+            return &self.inline_items[self.inline_len - 1];
+        }
+
+        fn pop(self: *Self) T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) return self.spill.pop().?;
+            self.inline_len -= 1;
+            return self.inline_items[self.inline_len];
         }
     };
-    forEachChildStream(instr, Adapter{ .ctx = context }, Adapter.onStream);
 }
+
+const InstructionStreamWalker = struct {
+    allocator: std.mem.Allocator,
+    stack: SmallInlineStack(InstructionStreamFrame, instruction_stream_inline_frame_capacity) = .{},
+    child_streams: SmallInlineStack([]const Instruction, instruction_stream_inline_child_capacity) = .{},
+
+    fn init(allocator: std.mem.Allocator) InstructionStreamWalker {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *InstructionStreamWalker) void {
+        self.stack.deinit(self.allocator);
+        self.child_streams.deinit(self.allocator);
+    }
+
+    fn walk(
+        self: *InstructionStreamWalker,
+        root_stream: []const Instruction,
+        context: anytype,
+        comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) void,
+    ) std.mem.Allocator.Error!void {
+        const Adapter = struct {
+            original_context: @TypeOf(context),
+
+            fn visit(adapter: *@This(), instr: *const Instruction) InstructionWalkControl {
+                visitFn(adapter.original_context, instr);
+                return .keep_walking;
+            }
+        };
+
+        var adapter = Adapter{ .original_context = context };
+        _ = try self.walkUntil(root_stream, &adapter, Adapter.visit);
+    }
+
+    fn walkUntil(
+        self: *InstructionStreamWalker,
+        root_stream: []const Instruction,
+        context: anytype,
+        comptime visitFn: fn (ctx: @TypeOf(context), instr: *const Instruction) InstructionWalkControl,
+    ) std.mem.Allocator.Error!InstructionWalkControl {
+        self.stack.clearRetainingCapacity();
+        self.child_streams.clearRetainingCapacity();
+        if (root_stream.len == 0) return .keep_walking;
+
+        try self.stack.append(self.allocator, .{ .stream = root_stream });
+        while (self.stack.len() != 0) {
+            const frame = self.stack.topPtr();
+            if (frame.next_index >= frame.stream.len) {
+                _ = self.stack.pop();
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            frame.next_index += 1;
+
+            switch (visitFn(context, instr)) {
+                .keep_walking => {},
+                .stop => return .stop,
+            }
+            try self.pushInstructionChildren(instr);
+        }
+
+        return .keep_walking;
+    }
+
+    fn pushInstructionChildren(
+        self: *InstructionStreamWalker,
+        instr: *const Instruction,
+    ) std.mem.Allocator.Error!void {
+        self.child_streams.clearRetainingCapacity();
+
+        const ChildStreamCollector = struct {
+            walker: *InstructionStreamWalker,
+            err: ?std.mem.Allocator.Error = null,
+
+            fn onStream(ctx: *@This(), child: ChildStream) void {
+                if (ctx.err != null or child.stream.len == 0) return;
+                ctx.walker.child_streams.append(ctx.walker.allocator, child.stream) catch |err| {
+                    ctx.err = err;
+                };
+            }
+        };
+
+        var child_collector = ChildStreamCollector{ .walker = self };
+        forEachChildStream(instr, &child_collector, ChildStreamCollector.onStream);
+        if (child_collector.err) |err| return err;
+
+        var child_index = self.child_streams.len();
+        while (child_index > 0) {
+            child_index -= 1;
+            try self.stack.append(self.allocator, .{ .stream = self.child_streams.get(child_index) });
+        }
+    }
+};
 
 // ============================================================
 // Qualified instruction coordinates (P1J3, audit findings
@@ -4519,7 +5067,15 @@ pub fn fingerprintInstruction(instr: *const Instruction) InstructionIdentity {
 // ============================================================
 
 pub const IrBuilder = struct {
+    pub const Error = struct {
+        message: []const u8,
+        span: ast.SourceSpan,
+        label: ?[]const u8 = null,
+        help: ?[]const u8 = null,
+    };
+
     allocator: std.mem.Allocator,
+    errors: std.ArrayList(Error),
     functions: std.ArrayList(Function),
     /// Separate ID counter for __try variants. Initialized in `buildProgram`
     /// to `max(group.id) + 1` over the input HIR groups so the variant IDs
@@ -4528,6 +5084,8 @@ pub const IrBuilder = struct {
     next_local: LocalId,
     current_blocks: std.ArrayList(Block),
     current_instrs: std.ArrayList(Instruction),
+    decision_tree_lowering_budget: ?RecursiveStructuralBudget = null,
+    error_pipe_try_lowering_budget: ?RecursiveStructuralBudget = null,
     /// Phase 3.b — true while lowering the statements of a `try { … }` body
     /// (set around `lowerTryRescueBodyStmt`). A call to a raising callee
     /// lowered with this flag set unwraps its error union via `catch`
@@ -4602,19 +5160,26 @@ pub const IrBuilder = struct {
     /// `materialized_closure_locals`). Read by `isArcManagedLocal`. Cleared
     /// per function group.
     boxed_existential_locals: std.AutoHashMapUnmanaged(LocalId, void),
-    /// FCC unified model: locals extracted from a TEMPORARY scrutinee tuple
-    /// (`{:cont, value, next_state}` over a `[fn(..) -> ..]`) that own a fresh
-    /// clone bearing eagerly-freed boxed `Callable` children — the boxed head
-    /// (`ProtocolBox`) and the `List(Callable)` tail. Each already receives its
-    /// own scope-exit DEEP release (a `.protocol_box_drop` for the head, a deep
-    /// `List` release for the tail), so the aggregate-component-release pass
-    /// (`ComponentReleaseCollector`) must EXCLUDE them — releasing both the
-    /// component-release AND the owned drop double-frees under `Memory.Tracking`.
-    /// Distinct from the classic destructure pattern (a plain `.owned`
-    /// String/scalar extracted from a tuple), which has NO separate deep release
-    /// and correctly relies on the component release. Snapshotted onto
+    /// Locals extracted from a temporary tuple that have their own release path
+    /// outside the tuple component-release pass. This includes boxed-Callable
+    /// extraction clones with deep scope-exit releases, and explicit ownership-
+    /// transfer cursors moved through `unique` call arguments. The component
+    /// release pass must exclude these locals: releasing the extracted
+    /// component at the tuple's last use and then also following its dedicated
+    /// move/deep-release path double-releases the same runtime cell. Distinct
+    /// from classic destructuring of an ARC component with no separate release
+    /// path, which still relies on tuple component release. Snapshotted onto
     /// `ir.Function.deep_release_owned_locals`. Cleared per function group.
     deep_release_owned_locals: std.AutoHashMapUnmanaged(LocalId, void),
+    /// Locals known to carry an ownership unit because IR construction placed
+    /// them on a `.move_value` edge. This is a value-flow ownership signal, not
+    /// a type-level signal: devirtualized protocol values can have a
+    /// parametric `protocol_constraint` HIR type that is intentionally not
+    /// globally ARC-managed, while an explicit `unique` call parameter still
+    /// requires a real ownership transfer for the concrete cursor value.
+    /// `computeLocalOwnership` treats these locals as `.owned` so verifier V6
+    /// and V11 see the same transfer semantics the IR encodes.
+    owned_transfer_locals: std.AutoHashMapUnmanaged(LocalId, void),
     /// Locals whose value originated from a `param_get` instruction.
     /// Used by the call-builtin encoder to detect bridge calls inside
     /// generic Zap functions — those have `param: anytype` in the
@@ -4682,6 +5247,18 @@ pub const IrBuilder = struct {
     /// param-bound dest local is `.trivial` and the verifier never
     /// classifies the param read as ARC-managed.
     current_param_hir_types: std.ArrayListUnmanaged(hir_mod.TypeId) = .empty,
+    /// Whether each declared parameter's explicit `unique` qualifier carries a
+    /// runtime ownership unit even when its type is not globally ARC-managed
+    /// (notably devirtualized protocol constraints such as `Enumerable(t)`).
+    current_param_unique_owners: std.ArrayListUnmanaged(bool) = .empty,
+    /// Canonical `param_get` local for each parameter in the function currently
+    /// being lowered. A function parameter has one runtime ownership slot; after
+    /// the first read, ordinary value references flow through `emitLocalGet`
+    /// while borrow-only call arguments can pass the canonical local directly.
+    /// Both paths keep ARC borrowing, copying, and moving anchored to one owner
+    /// instead of manufacturing multiple raw `param_get` owners for the same
+    /// slot.
+    current_param_locals: std.AutoHashMap(u32, LocalId),
     /// Contextual type supplied by a call argument slot while lowering the
     /// argument expression. Used for empty container literals whose own HIR
     /// type is intentionally underconstrained.
@@ -4772,9 +5349,15 @@ pub const IrBuilder = struct {
         clause_index: u32,
     };
 
+    const PatternMatrixDiagnosticContext = enum {
+        function_clauses,
+        case_expression,
+    };
+
     pub fn init(allocator: std.mem.Allocator, interner: *const ast.StringInterner) IrBuilder {
         return .{
             .allocator = allocator,
+            .errors = .empty,
             .functions = .empty,
             .next_local = 0,
             .current_blocks = .empty,
@@ -4786,9 +5369,11 @@ pub const IrBuilder = struct {
             .materialized_closure_locals = .empty,
             .boxed_existential_locals = .empty,
             .deep_release_owned_locals = .empty,
+            .owned_transfer_locals = .empty,
             .param_backed_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .rescue_unboxed_borrow_locals = std.AutoHashMap(LocalId, void).init(allocator),
             .term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(allocator),
+            .current_param_locals = std.AutoHashMap(u32, LocalId).init(allocator),
             .current_struct_prefix = null,
             .known_function_names = std.StringHashMap(void).init(allocator),
             .synthesized_type_defs = .empty,
@@ -4802,6 +5387,7 @@ pub const IrBuilder = struct {
     }
 
     pub fn deinit(self: *IrBuilder) void {
+        self.errors.deinit(self.allocator);
         self.functions.deinit(self.allocator);
         self.current_blocks.deinit(self.allocator);
         self.current_instrs.deinit(self.allocator);
@@ -4810,12 +5396,15 @@ pub const IrBuilder = struct {
         self.materialized_closure_locals.deinit(self.allocator);
         self.boxed_existential_locals.deinit(self.allocator);
         self.deep_release_owned_locals.deinit(self.allocator);
+        self.owned_transfer_locals.deinit(self.allocator);
         self.param_backed_locals.deinit();
         self.rescue_unboxed_borrow_locals.deinit();
         self.term_tuple_locals.deinit();
+        self.current_param_locals.deinit();
         self.synthesized_type_defs.deinit(self.allocator);
         self.union_dispatch_map.deinit();
         self.known_function_names.deinit();
+        self.try_variant_names.deinit();
         self.applied_specializations.deinit(self.allocator);
         self.applied_id_to_spec.deinit();
         self.applied_name_to_spec.deinit(self.allocator);
@@ -4827,6 +5416,201 @@ pub const IrBuilder = struct {
             }
             self.callable_instantiation_raises.deinit();
         }
+    }
+
+    fn sourceSpanHasLocation(span: ast.SourceSpan) bool {
+        return span.start != 0 or span.end != 0 or span.line != 0 or span.col != 0 or span.source_id != null;
+    }
+
+    fn patternMatrixSpanForFunctionGroup(group: *const hir_mod.FunctionGroup) ast.SourceSpan {
+        if (sourceSpanHasLocation(group.debug_span)) return group.debug_span;
+        for (group.clauses) |clause| {
+            if (sourceSpanHasLocation(clause.debug_span)) return clause.debug_span;
+        }
+        return .{ .start = 0, .end = 0 };
+    }
+
+    fn reportPatternMatrixBudgetExceeded(
+        self: *IrBuilder,
+        context: PatternMatrixDiagnosticContext,
+        span: ast.SourceSpan,
+    ) !void {
+        const message = switch (context) {
+            .function_clauses => "function clause pattern matching is too complex: decision tree budget exceeded",
+            .case_expression => "case expression pattern matching is too complex: decision tree budget exceeded",
+        };
+        try self.errors.append(self.allocator, .{
+            .message = message,
+            .span = span,
+            .help = "simplify the pattern match by splitting it into smaller functions or case expressions",
+        });
+    }
+
+    fn reportIrStructuralBudgetExceeded(
+        self: *IrBuilder,
+        context: IrStructuralBudgetContext,
+        span: ast.SourceSpan,
+    ) !void {
+        const message = switch (context) {
+            .decision_tree_lowering => "IR lowering is too structurally complex: decision tree lowering budget exceeded",
+            .try_variant_scan => "IR lowering is too structurally complex: try-variant scan budget exceeded",
+            .error_pipe_try_lowering => "IR lowering is too structurally complex: error-pipe try lowering budget exceeded",
+            .local_reservation_scan => "IR lowering is too structurally complex: local-reservation scan budget exceeded",
+            .raising_closure_scan => "IR lowering is too structurally complex: raising-closure scan budget exceeded",
+            .zig_type_mangling => "IR lowering is too structurally complex: ZigType mangling budget exceeded",
+        };
+        try self.errors.append(self.allocator, .{
+            .message = message,
+            .span = span,
+            .help = "simplify the expression or split the pattern match into smaller functions or case expressions",
+        });
+    }
+
+    fn enterRecursiveStructuralBudget(self: *IrBuilder, budget: *RecursiveStructuralBudget) !void {
+        if (budget.depth >= budget.max_depth or budget.remaining_nodes == 0) {
+            if (!budget.reported) {
+                budget.reported = true;
+                try self.reportIrStructuralBudgetExceeded(budget.context, budget.span);
+            }
+            return error.IrStructuralBudgetExceeded;
+        }
+        budget.depth += 1;
+        budget.remaining_nodes -= 1;
+    }
+
+    fn leaveRecursiveStructuralBudget(_: *IrBuilder, budget: *RecursiveStructuralBudget) void {
+        std.debug.assert(budget.depth != 0);
+        budget.depth -= 1;
+    }
+
+    fn beginDecisionTreeLoweringBudget(self: *IrBuilder, span: ast.SourceSpan) bool {
+        if (self.decision_tree_lowering_budget != null) return false;
+        self.decision_tree_lowering_budget = RecursiveStructuralBudget.init(
+            .decision_tree_lowering,
+            span,
+            max_ir_decision_lowering_depth,
+            max_ir_decision_lowering_nodes,
+        );
+        return true;
+    }
+
+    fn endDecisionTreeLoweringBudget(self: *IrBuilder, root: bool) void {
+        if (root) self.decision_tree_lowering_budget = null;
+    }
+
+    fn enterDecisionTreeLowering(self: *IrBuilder) !void {
+        if (self.decision_tree_lowering_budget) |*budget| {
+            try self.enterRecursiveStructuralBudget(budget);
+            return;
+        }
+        unreachable;
+    }
+
+    fn leaveDecisionTreeLowering(self: *IrBuilder) void {
+        if (self.decision_tree_lowering_budget) |*budget| {
+            self.leaveRecursiveStructuralBudget(budget);
+            return;
+        }
+        unreachable;
+    }
+
+    fn beginErrorPipeTryLoweringBudget(self: *IrBuilder, span: ast.SourceSpan) bool {
+        if (self.error_pipe_try_lowering_budget != null) return false;
+        self.error_pipe_try_lowering_budget = RecursiveStructuralBudget.init(
+            .error_pipe_try_lowering,
+            span,
+            max_ir_error_pipe_try_depth,
+            max_ir_error_pipe_try_nodes,
+        );
+        return true;
+    }
+
+    fn endErrorPipeTryLoweringBudget(self: *IrBuilder, root: bool) void {
+        if (root) self.error_pipe_try_lowering_budget = null;
+    }
+
+    fn enterErrorPipeTryLowering(self: *IrBuilder) !void {
+        if (self.error_pipe_try_lowering_budget) |*budget| {
+            try self.enterRecursiveStructuralBudget(budget);
+            return;
+        }
+        unreachable;
+    }
+
+    fn leaveErrorPipeTryLowering(self: *IrBuilder) void {
+        if (self.error_pipe_try_lowering_budget) |*budget| {
+            self.leaveRecursiveStructuralBudget(budget);
+            return;
+        }
+        unreachable;
+    }
+
+    fn pushInstructionBuffer(self: *IrBuilder) InstructionBufferFrame {
+        return InstructionBufferFrame.init(self);
+    }
+
+    fn appendOwnedFunctionRecord(
+        self: *IrBuilder,
+        function: Function,
+        register_known_name: bool,
+    ) !void {
+        var owned_function = function;
+        errdefer deinitConstructedFunction(self.allocator, &owned_function);
+
+        try self.functions.ensureUnusedCapacity(self.allocator, 1);
+        if (register_known_name) {
+            try self.known_function_names.ensureUnusedCapacity(1);
+        }
+
+        self.functions.appendAssumeCapacity(owned_function);
+        if (register_known_name) {
+            self.known_function_names.putAssumeCapacity(owned_function.name, {});
+        }
+    }
+
+    fn appendOwnedMakeClosureInstruction(self: *IrBuilder, make_closure: MakeClosure) !void {
+        errdefer self.allocator.free(make_closure.captures);
+
+        try self.current_instrs.ensureUnusedCapacity(self.allocator, 1);
+        self.current_instrs.appendAssumeCapacity(.{ .make_closure = make_closure });
+    }
+
+    fn computeMaxBindingLocalForClauses(
+        self: *IrBuilder,
+        clauses: []const hir_mod.Clause,
+        span: ast.SourceSpan,
+    ) !LocalId {
+        return maxBindingLocalForClauses(self.allocator, clauses) catch |err| switch (err) {
+            error.IrStructuralBudgetExceeded => {
+                try self.reportIrStructuralBudgetExceeded(.local_reservation_scan, span);
+                return error.IrStructuralBudgetExceeded;
+            },
+            else => return err,
+        };
+    }
+
+    fn compilePatternMatrixForIr(
+        self: *IrBuilder,
+        context: PatternMatrixDiagnosticContext,
+        span: ast.SourceSpan,
+        matrix: hir_mod.PatternMatrix,
+        scrutinee_ids: []const u32,
+        next_id: *u32,
+        options: hir_mod.PatternMatrixCompileOptions,
+    ) !*const hir_mod.Decision {
+        return hir_mod.compilePatternMatrixWithOptions(
+            self.allocator,
+            matrix,
+            scrutinee_ids,
+            next_id,
+            options,
+        ) catch |err| switch (err) {
+            error.PatternMatrixDecisionBudgetExceeded => {
+                try self.reportPatternMatrixBudgetExceeded(context, span);
+                return error.PatternMatrixDecisionBudgetExceeded;
+            },
+            else => return err,
+        };
     }
 
     fn localBackedByParam(self: *const IrBuilder, local: LocalId) bool {
@@ -4934,7 +5718,7 @@ pub const IrBuilder = struct {
         target: hir_mod.CallTarget,
         arg_count: usize,
         args: []const hir_mod.CallArg,
-    ) ?*const hir_mod.Clause {
+    ) TypeWalkError!?*const hir_mod.Clause {
         const group = switch (target) {
             .direct => |direct| blk: {
                 const group = self.hirFunctionGroupById(direct.function_group_id) orelse return null;
@@ -4948,7 +5732,7 @@ pub const IrBuilder = struct {
             .named => |named| blk: {
                 const group = self.resolveNamedHirGroup(named, @intCast(arg_count)) orelse return null;
                 if (named.struct_name) |struct_name| {
-                    if (self.selectTypeOnlyNamedClause(struct_name, named.name, arg_count, args, named.clause_index)) |selected| {
+                    if (try self.selectTypeOnlyNamedClause(struct_name, named.name, arg_count, args, named.clause_index)) |selected| {
                         const index: usize = @intCast(selected.clause_index);
                         if (index < group.clauses.len) return &group.clauses[index];
                     }
@@ -4973,7 +5757,7 @@ pub const IrBuilder = struct {
     /// scopes from the group's scope, and queries the type store's
     /// `inferred_raises` via the shared stable qualified key. Builtins and
     /// closures never carry an inferred row, so they return false.
-    fn calleeRaises(self: *const IrBuilder, target: hir_mod.CallTarget, arg_count: usize) bool {
+    fn calleeRaises(self: *IrBuilder, target: hir_mod.CallTarget, arg_count: usize) error{ OutOfMemory, IrStructuralBudgetExceeded }!bool {
         const store = self.type_store orelse return false;
         const graph = self.scope_graph orelse return false;
         const group: *const hir_mod.FunctionGroup = switch (target) {
@@ -4990,32 +5774,32 @@ pub const IrBuilder = struct {
         outer: while (scope_cursor) |sid| {
             for (graph.structs.items) |entry| {
                 if (entry.scope_id != sid) continue;
-                const joined = entry.name.joinedWith(self.allocator, self.interner, ".") catch break :outer;
+                const joined = try entry.name.joinedWith(self.allocator, self.interner, ".");
                 struct_prefix_buf = joined;
                 struct_prefix = joined;
                 break :outer;
             }
             scope_cursor = graph.getScope(sid).parent;
         }
-        if (store.functionRaises(struct_prefix, method_name, group.arity)) return true;
+        if (try store.functionRaises(struct_prefix, method_name, group.arity)) return true;
         // #201 — a (monomorphized) higher-order callee that invokes a
         // raising closure parameter returns `error{ZapRaise}!T` even
         // though its own inferred row is empty. Its call site must
         // unwrap/propagate the error union just like a directly-raising
         // callee. The pure instance has a non-raising closure-param
         // type, so this is false there (no spurious unwrap).
-        return self.groupInvokesRaisingClosureParam(group);
+        return try self.groupInvokesRaisingClosureParam(group);
     }
 
     fn resolvedCallReturnType(
         self: *IrBuilder,
         target: hir_mod.CallTarget,
         args: []const hir_mod.CallArg,
-    ) ?types_mod.TypeId {
+    ) TypeWalkError!?types_mod.TypeId {
         const store_const = self.type_store orelse return self.callTargetReturnType(target, args.len);
-        const clause = self.callTargetClause(target, args.len, args) orelse return null;
+        const clause = (try self.callTargetClause(target, args.len, args)) orelse return null;
         const return_type = clause.return_type;
-        if (!containsUnresolvedTypeVarForSpecialization(store_const, return_type)) return return_type;
+        if (!try containsUnresolvedTypeVarForSpecialization(store_const, return_type)) return return_type;
 
         var substitutions = types_mod.SubstitutionMap.init(self.allocator);
         defer substitutions.deinit();
@@ -5024,7 +5808,7 @@ pub const IrBuilder = struct {
         for (clause.params[0..param_count], args[0..param_count]) |param, arg| {
             const actual_type = self.typeOnlyArgType(arg);
             if (actual_type == types_mod.TypeStore.UNKNOWN or actual_type == types_mod.TypeStore.ERROR) continue;
-            const matched = store_const.unify(param.type_id, actual_type, &substitutions) catch false;
+            const matched = try store_const.unify(param.type_id, actual_type, &substitutions);
             if (!matched) return return_type;
         }
 
@@ -5033,14 +5817,14 @@ pub const IrBuilder = struct {
         // type-checking and monomorphization, so extending it here
         // keeps later ownership/ZIR decisions on concrete TypeIds
         // instead of stale bare type variables.
-        return substitutions.applyToReturnType(@constCast(store_const), return_type);
+        return try substitutions.applyToReturnType(@constCast(store_const), return_type);
     }
 
     fn trackCallResultType(self: *IrBuilder, dest: LocalId, return_type: ?types_mod.TypeId) !void {
         const type_id = return_type orelse return;
-        _ = self.usableContextType(type_id) orelse return;
+        _ = (try self.usableContextType(type_id)) orelse return;
         try self.local_hir_types.put(dest, type_id);
-        const zig_type = typeIdToZigTypeWithStore(type_id, self.type_store);
+        const zig_type = try typeIdToZigTypeWithStore(type_id, self.type_store);
         if (zig_type != .any and zig_type != .void) {
             try self.known_local_types.put(dest, zig_type);
         }
@@ -5069,8 +5853,8 @@ pub const IrBuilder = struct {
         result_type_id: types_mod.TypeId,
         lhs: LocalId,
         rhs: LocalId,
-    ) ZigType {
-        const result_type = typeIdToZigTypeWithStore(result_type_id, self.type_store);
+    ) TypeWalkError!ZigType {
+        const result_type = try typeIdToZigTypeWithStore(result_type_id, self.type_store);
         if (result_type != .any) return result_type;
         if (self.known_local_types.get(lhs)) |lhs_type| {
             if (lhs_type != .any) return lhs_type;
@@ -5086,23 +5870,23 @@ pub const IrBuilder = struct {
         result_type_id: types_mod.TypeId,
         lhs: LocalId,
         rhs: LocalId,
-    ) types_mod.TypeId {
-        if (self.usableContextType(result_type_id)) |type_id| return type_id;
+    ) TypeWalkError!types_mod.TypeId {
+        if (try self.usableContextType(result_type_id)) |type_id| return type_id;
         if (self.local_hir_types.get(lhs)) |lhs_type| {
-            if (self.usableContextType(lhs_type)) |type_id| return type_id;
+            if (try self.usableContextType(lhs_type)) |type_id| return type_id;
         }
         if (self.local_hir_types.get(rhs)) |rhs_type| {
-            if (self.usableContextType(rhs_type)) |type_id| return type_id;
+            if (try self.usableContextType(rhs_type)) |type_id| return type_id;
         }
         return result_type_id;
     }
 
-    fn listElementTypeFromHirMaybe(self: *const IrBuilder, type_id: types_mod.TypeId) ?ZigType {
+    fn listElementTypeFromHirMaybe(self: *const IrBuilder, type_id: types_mod.TypeId) TypeWalkError!?ZigType {
         const ts = self.type_store orelse return null;
         if (type_id >= ts.types.items.len) return null;
         const typ = ts.types.items[type_id];
         return switch (typ) {
-            .list => |lt| typeIdToZigTypeWithStore(lt.element, self.type_store),
+            .list => |lt| try typeIdToZigTypeWithStore(lt.element, self.type_store),
             else => null,
         };
     }
@@ -5114,29 +5898,29 @@ pub const IrBuilder = struct {
     }
 
     fn listTypeFromHirOrElement(self: *const IrBuilder, type_id: types_mod.TypeId, element_type: ZigType) !ZigType {
-        if (self.listElementTypeFromHirMaybe(type_id)) |hir_element_type| {
+        if (try self.listElementTypeFromHirMaybe(type_id)) |hir_element_type| {
             if (hir_element_type != .any or element_type == .any) {
-                return typeIdToZigTypeWithStore(type_id, self.type_store);
+                return try typeIdToZigTypeWithStore(type_id, self.type_store);
             }
         }
         if (self.current_expected_type) |expected_type| {
-            if (self.listElementTypeFromHirMaybe(expected_type)) |expected_element_type| {
+            if (try self.listElementTypeFromHirMaybe(expected_type)) |expected_element_type| {
                 if (expected_element_type != .any or element_type == .any) {
-                    return typeIdToZigTypeWithStore(expected_type, self.type_store);
+                    return try typeIdToZigTypeWithStore(expected_type, self.type_store);
                 }
             }
         }
         return try self.listTypeFromElement(element_type);
     }
 
-    fn chooseListElementType(self: *const IrBuilder, hir_type_id: types_mod.TypeId, fallback_type: ZigType) ZigType {
-        if (self.listElementTypeFromHirMaybe(hir_type_id)) |hir_element_type| {
+    fn chooseListElementType(self: *const IrBuilder, hir_type_id: types_mod.TypeId, fallback_type: ZigType) TypeWalkError!ZigType {
+        if (try self.listElementTypeFromHirMaybe(hir_type_id)) |hir_element_type| {
             if (hir_element_type != .any or fallback_type == .any) {
                 return hir_element_type;
             }
         }
         if (self.current_expected_type) |expected_type| {
-            if (self.listElementTypeFromHirMaybe(expected_type)) |expected_element_type| {
+            if (try self.listElementTypeFromHirMaybe(expected_type)) |expected_element_type| {
                 if (expected_element_type != .any or fallback_type == .any) {
                     return expected_element_type;
                 }
@@ -5152,12 +5936,12 @@ pub const IrBuilder = struct {
         return null;
     }
 
-    fn usableContextType(self: *const IrBuilder, type_id: types_mod.TypeId) ?types_mod.TypeId {
+    fn usableContextType(self: *const IrBuilder, type_id: types_mod.TypeId) TypeWalkError!?types_mod.TypeId {
         if (type_id == types_mod.TypeStore.UNKNOWN or type_id == types_mod.TypeStore.ERROR) return null;
         if (self.type_store) |store| {
-            if (containsUnresolvedTypeVarForSpecialization(store, type_id)) return null;
+            if (try containsUnresolvedTypeVarForSpecialization(store, type_id)) return null;
         }
-        const resolved = typeIdToZigTypeWithStore(type_id, self.type_store);
+        const resolved = try typeIdToZigTypeWithStore(type_id, self.type_store);
         if (resolved == .any) return null;
         return type_id;
     }
@@ -5169,10 +5953,10 @@ pub const IrBuilder = struct {
     /// function's return type for a tail/return-position literal). Returns
     /// `null` for absent, non-integer, or unresolved contexts so the
     /// caller falls back to the literal's own type.
-    fn expectedConcreteIntegerType(self: *const IrBuilder) ?ZigType {
+    fn expectedConcreteIntegerType(self: *const IrBuilder) TypeWalkError!?ZigType {
         const context = self.current_expected_type orelse return null;
-        if (self.usableContextType(context) == null) return null;
-        const context_zig_type = typeIdToZigTypeWithStore(context, self.type_store);
+        if (try self.usableContextType(context) == null) return null;
+        const context_zig_type = try typeIdToZigTypeWithStore(context, self.type_store);
         return switch (context_zig_type) {
             .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .usize, .isize => context_zig_type,
             else => null,
@@ -5187,37 +5971,37 @@ pub const IrBuilder = struct {
     /// tail/return-position literal, including through `if`/`case` arms) —
     /// without it an arm float literal stays a bare `comptime_float` and Zig
     /// rejects a comptime-only value depending on runtime control flow.
-    fn expectedConcreteFloatType(self: *const IrBuilder) ?ZigType {
+    fn expectedConcreteFloatType(self: *const IrBuilder) TypeWalkError!?ZigType {
         const context = self.current_expected_type orelse return null;
-        if (self.usableContextType(context) == null) return null;
-        const context_zig_type = typeIdToZigTypeWithStore(context, self.type_store);
+        if (try self.usableContextType(context) == null) return null;
+        const context_zig_type = try typeIdToZigTypeWithStore(context, self.type_store);
         return switch (context_zig_type) {
             .f16, .f32, .f64, .f80, .f128 => context_zig_type,
             else => null,
         };
     }
 
-    fn shouldPreferContextType(self: *const IrBuilder, fallback: types_mod.TypeId, context: types_mod.TypeId) bool {
-        _ = self.usableContextType(context) orelse return false;
+    fn shouldPreferContextType(self: *const IrBuilder, fallback: types_mod.TypeId, context: types_mod.TypeId) TypeWalkError!bool {
+        _ = (try self.usableContextType(context)) orelse return false;
         if (fallback == types_mod.TypeStore.UNKNOWN or fallback == types_mod.TypeStore.ERROR) return true;
-        const fallback_resolved = typeIdToZigTypeWithStore(fallback, self.type_store);
+        const fallback_resolved = try typeIdToZigTypeWithStore(fallback, self.type_store);
         if (fallback_resolved == .any) return true;
         if (self.type_store) |store| {
-            if (containsUnresolvedTypeVarForSpecialization(store, fallback)) return true;
+            if (try containsUnresolvedTypeVarForSpecialization(store, fallback)) return true;
         }
         return false;
     }
 
-    fn effectiveTrackedHirType(self: *IrBuilder, expr: *const hir_mod.Expr) types_mod.TypeId {
+    fn effectiveTrackedHirType(self: *IrBuilder, expr: *const hir_mod.Expr) TypeWalkError!types_mod.TypeId {
         var fallback = expr.type_id;
         if (expr.kind == .call) {
             const call = expr.kind.call;
-            if (self.resolvedCallReturnType(call.target, call.args)) |return_type| {
-                if (self.usableContextType(return_type) != null) fallback = return_type;
+            if (try self.resolvedCallReturnType(call.target, call.args)) |return_type| {
+                if (try self.usableContextType(return_type) != null) fallback = return_type;
             }
         }
         if (self.current_expected_type) |context| {
-            if (self.shouldPreferContextType(fallback, context)) return context;
+            if (try self.shouldPreferContextType(fallback, context)) return context;
         }
         return fallback;
     }
@@ -5231,8 +6015,8 @@ pub const IrBuilder = struct {
         return null;
     }
 
-    fn closureReturnType(self: *const IrBuilder, expr_type: types_mod.TypeId, callee: LocalId) ZigType {
-        const expr_zig_type = typeIdToZigTypeWithStore(expr_type, self.type_store);
+    fn closureReturnType(self: *const IrBuilder, expr_type: types_mod.TypeId, callee: LocalId) TypeWalkError!ZigType {
+        const expr_zig_type = try typeIdToZigTypeWithStore(expr_type, self.type_store);
         if (expr_zig_type != .any) return expr_zig_type;
         if (self.known_local_types.get(callee)) |callee_type| {
             if (callee_type == .function) {
@@ -5315,7 +6099,7 @@ pub const IrBuilder = struct {
     /// populated when lowering a `field_get`/`call`/element-extraction that
     /// produces a closure value, and propagated source→dest through
     /// `emitLocalGet` and the alias-forming instructions.
-    fn noteMaterializedClosureLocal(self: *IrBuilder, dest: LocalId, expr: *const hir_mod.Expr) void {
+    fn noteMaterializedClosureLocal(self: *IrBuilder, dest: LocalId, expr: *const hir_mod.Expr) !void {
         const store = self.type_store orelse return;
         if (store.getType(expr.type_id) != .function) return;
         switch (expr.kind) {
@@ -5326,7 +6110,7 @@ pub const IrBuilder = struct {
             .list_head_get,
             .list_tail_get,
             .map_value_get,
-            => self.materialized_closure_locals.put(self.allocator, dest, {}) catch {},
+            => try self.materialized_closure_locals.put(self.allocator, dest, {}),
             else => {},
         }
     }
@@ -5337,10 +6121,10 @@ pub const IrBuilder = struct {
     /// must itself return `error{ZapRaise}!T`. After monomorphization
     /// the closure-argument effect is fixed per instance, so the pure
     /// instance's closure-param type has `raises = false` and this
-    /// returns false (no widening). Walks the first clause's body for a
+    /// returns false (no widening). Walks each candidate clause body for a
     /// `call_closure` whose callee resolves to a raising-function-typed
     /// parameter of this group.
-    fn groupInvokesRaisingClosureParam(self: *const IrBuilder, group: *const hir_mod.FunctionGroup) bool {
+    fn groupInvokesRaisingClosureParam(self: *IrBuilder, group: *const hir_mod.FunctionGroup) error{ OutOfMemory, IrStructuralBudgetExceeded }!bool {
         const store = self.type_store orelse return false;
         if (group.clauses.len == 0) return false;
         // Collect the parameter local types that are raising closures.
@@ -5357,49 +6141,90 @@ pub const IrBuilder = struct {
                 }
             }
             if (!any_raising_param) continue;
-            if (self.blockInvokesRaisingClosure(clause.body)) return true;
+            if (try self.blockInvokesRaisingClosure(clause.body, clause.debug_span)) return true;
         }
         return false;
     }
 
-    /// Recursively scan a HIR block for a `call_closure` whose callee
+    /// Iteratively scan a HIR block for a `call_closure` whose callee
     /// expression's static type is a raising function. Used by
     /// `groupInvokesRaisingClosureParam` (#201).
-    fn blockInvokesRaisingClosure(self: *const IrBuilder, block: *const hir_mod.Block) bool {
-        for (block.stmts) |stmt| {
-            if (self.stmtInvokesRaisingClosure(stmt)) return true;
+    fn blockInvokesRaisingClosure(
+        self: *IrBuilder,
+        block: *const hir_mod.Block,
+        span: ast.SourceSpan,
+    ) error{ OutOfMemory, IrStructuralBudgetExceeded }!bool {
+        return try self.blockInvokesRaisingClosureBudgeted(block, span, max_ir_hir_scan_nodes);
+    }
+
+    fn blockInvokesRaisingClosureBudgeted(
+        self: *IrBuilder,
+        block: *const hir_mod.Block,
+        span: ast.SourceSpan,
+        max_nodes: usize,
+    ) error{ OutOfMemory, IrStructuralBudgetExceeded }!bool {
+        var stack: std.ArrayList(RaisingClosureScanFrame) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, .{ .block = block });
+
+        var visited_nodes: usize = 0;
+        while (stack.items.len != 0) {
+            const frame = stack.items[stack.items.len - 1];
+            stack.items.len -= 1;
+
+            if (visited_nodes >= max_nodes) {
+                try self.reportIrStructuralBudgetExceeded(
+                    .raising_closure_scan,
+                    raisingClosureScanFrameSpan(frame, span),
+                );
+                return error.IrStructuralBudgetExceeded;
+            }
+            visited_nodes += 1;
+
+            switch (frame) {
+                .block => |current_block| {
+                    var stmt_index = current_block.stmts.len;
+                    while (stmt_index != 0) {
+                        stmt_index -= 1;
+                        switch (current_block.stmts[stmt_index]) {
+                            .expr => |expr| try stack.append(self.allocator, .{ .expr = expr }),
+                            .local_set => |local_set| try stack.append(self.allocator, .{ .expr = local_set.value }),
+                            .function_group => {},
+                        }
+                    }
+                },
+                .expr => |expr| switch (expr.kind) {
+                    .call => |call| {
+                        switch (call.target) {
+                            .closure => |callee| {
+                                if (self.closureCalleeRaises(callee)) return true;
+                                var arg_index = call.args.len;
+                                while (arg_index != 0) {
+                                    arg_index -= 1;
+                                    try stack.append(self.allocator, .{ .expr = call.args[arg_index].expr });
+                                }
+                                try stack.append(self.allocator, .{ .expr = callee });
+                            },
+                            else => {
+                                var arg_index = call.args.len;
+                                while (arg_index != 0) {
+                                    arg_index -= 1;
+                                    try stack.append(self.allocator, .{ .expr = call.args[arg_index].expr });
+                                }
+                            },
+                        }
+                    },
+                    .binary => |binary| {
+                        try stack.append(self.allocator, .{ .expr = binary.rhs });
+                        try stack.append(self.allocator, .{ .expr = binary.lhs });
+                    },
+                    .unary => |unary| try stack.append(self.allocator, .{ .expr = unary.operand }),
+                    .block => |*current_block| try stack.append(self.allocator, .{ .block = current_block }),
+                    else => {},
+                },
+            }
         }
         return false;
-    }
-
-    fn stmtInvokesRaisingClosure(self: *const IrBuilder, stmt: hir_mod.Stmt) bool {
-        return switch (stmt) {
-            .expr => |e| self.exprInvokesRaisingClosure(e),
-            .local_set => |ls| self.exprInvokesRaisingClosure(ls.value),
-            else => false,
-        };
-    }
-
-    fn exprInvokesRaisingClosure(self: *const IrBuilder, expr: *const hir_mod.Expr) bool {
-        switch (expr.kind) {
-            .call => |call| {
-                switch (call.target) {
-                    .closure => |callee| {
-                        if (self.closureCalleeRaises(callee)) return true;
-                        if (self.exprInvokesRaisingClosure(callee)) return true;
-                    },
-                    else => {},
-                }
-                for (call.args) |arg| {
-                    if (self.exprInvokesRaisingClosure(arg.expr)) return true;
-                }
-                return false;
-            },
-            .binary => |b| return self.exprInvokesRaisingClosure(b.lhs) or self.exprInvokesRaisingClosure(b.rhs),
-            .unary => |u| return self.exprInvokesRaisingClosure(u.operand),
-            .block => |b| return self.blockInvokesRaisingClosure(&b),
-            else => return false,
-        }
     }
 
     /// Extract the list element ZigType from a local's known type.
@@ -5430,7 +6255,7 @@ pub const IrBuilder = struct {
     /// generic shapes, missing TypeStore). The ZIR emitter uses the
     /// returned `ZigType` to drive the source-level type the indirect
     /// auto-deref must produce.
-    fn fieldZigTypeAndStorage(self: *const IrBuilder, struct_name: []const u8, field_name: []const u8) ?struct {
+    fn fieldZigTypeAndStorage(self: *const IrBuilder, struct_name: []const u8, field_name: []const u8) !?struct {
         type_expr: ZigType,
         storage: FieldStorage,
     } {
@@ -5454,8 +6279,7 @@ pub const IrBuilder = struct {
                 // post-substitution struct_ref, so a self-referential
                 // parametric struct still correctly lowers to
                 // indirect storage at the per-instantiation TypeDef.
-                const reaches_cycle = zigTypeReachesStructInCycle(self.allocator, field_zig_type, struct_name, ts, self.interner) catch
-                    zigTypeReachesStruct(field_zig_type, struct_name);
+                const reaches_cycle = try zigTypeReachesStructInCycle(self.allocator, field_zig_type, struct_name, ts, self.interner);
                 const storage: FieldStorage = if (reaches_cycle) .indirect else .direct;
                 return .{ .type_expr = field_zig_type, .storage = storage };
             }
@@ -5469,12 +6293,11 @@ pub const IrBuilder = struct {
             for (st.fields) |f| {
                 const fname = self.interner.get(f.name);
                 if (!std.mem.eql(u8, fname, field_name)) continue;
-                const field_zig_type = typeIdToZigTypeWithStore(f.type_id, self.type_store);
+                const field_zig_type = try typeIdToZigTypeWithStore(f.type_id, self.type_store);
                 // Use the SCC-aware walker so mutual recursion (`A
                 // → B → A`) gets the same `.indirect` storage that
                 // self-recursion already does.
-                const reaches_cycle = zigTypeReachesStructInCycle(self.allocator, field_zig_type, owner, ts, self.interner) catch
-                    zigTypeReachesStruct(field_zig_type, owner);
+                const reaches_cycle = try zigTypeReachesStructInCycle(self.allocator, field_zig_type, owner, ts, self.interner);
                 const storage: FieldStorage = if (reaches_cycle) .indirect else .direct;
                 return .{ .type_expr = field_zig_type, .storage = storage };
             }
@@ -5512,8 +6335,7 @@ pub const IrBuilder = struct {
     ) !void {
         var fields: std.ArrayList(StructFieldDef) = .empty;
         for (field_names, field_zig_types, field_defaults) |name_id, zig_type, default_val| {
-            const reaches_cycle = zigTypeReachesStructInCycle(self.allocator, zig_type, owner_name, type_store, self.interner) catch
-                zigTypeReachesStruct(zig_type, owner_name);
+            const reaches_cycle = try zigTypeReachesStructInCycle(self.allocator, zig_type, owner_name, type_store, self.interner);
             const storage: FieldStorage = if (reaches_cycle) .indirect else .direct;
             try fields.append(self.allocator, .{
                 .name = self.interner.get(name_id),
@@ -5548,7 +6370,7 @@ pub const IrBuilder = struct {
         defer self.allocator.free(defaults);
         for (fields, 0..) |field, i| {
             names[i] = field.name;
-            zig_types[i] = typeIdToZigTypeWithStore(field.type_id, type_store);
+            zig_types[i] = try typeIdToZigTypeWithStore(field.type_id, type_store);
             defaults[i] = if (field.default_expr) |expr| self.extractDefaultValue(expr) else null;
         }
         try self.appendStructTypeDefShape(type_defs, type_store, owner_name, names, zig_types, defaults);
@@ -5611,7 +6433,7 @@ pub const IrBuilder = struct {
                     for (tu.variants, 0..) |variant, i| {
                         const type_str = if (spec.variant_payload_type_ids[i]) |tid| blk: {
                             if (tid == types_mod.TypeStore.ATOM) break :blk @as([]const u8, "u32");
-                            break :blk typeIdToZigTypeStrWithStore(tid, type_store);
+                            break :blk try typeIdToZigTypeStrWithStore(tid, type_store);
                         } else "void";
                         try variants.append(self.allocator, .{
                             .name = self.interner.get(variant.name),
@@ -5662,7 +6484,7 @@ pub const IrBuilder = struct {
             for (variants_in) |v| {
                 const type_str = if (v.type_id) |tid| blk: {
                     if (tid == types_mod.TypeStore.ATOM) break :blk @as([]const u8, "u32");
-                    break :blk typeIdToZigTypeStrWithStore(tid, self.type_store);
+                    break :blk try typeIdToZigTypeStrWithStore(tid, self.type_store);
                 } else "void";
                 try union_variants.append(self.allocator, .{
                     .name = self.interner.get(v.name),
@@ -5704,7 +6526,7 @@ pub const IrBuilder = struct {
         // per-instantiation union module the vtable references (the
         // `no module named 'Option_Atom'` failure in the whole-stdlib
         // `zap test` build). See `internProtocolSignatureInstantiations`.
-        self.internProtocolSignatureInstantiations();
+        try self.internProtocolSignatureInstantiations();
 
         // Precompute the per-instantiation specialization table for
         // every concrete `.applied { base, args }` TypeId in the
@@ -5734,7 +6556,7 @@ pub const IrBuilder = struct {
         var max_group_id: FunctionId = 0;
         const name_program = self.known_name_program orelse hir_program;
         for (name_program.structs) |mod| {
-            const struct_prefix = self.structNameToPrefix(mod.name);
+            const struct_prefix = try self.structNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
                 if (func_group.id > max_group_id) max_group_id = func_group.id;
                 const func_name = self.interner.get(func_group.name);
@@ -5787,7 +6609,7 @@ pub const IrBuilder = struct {
         // that need __try variants. This must happen before building function bodies
         // so that __try variants are generated during buildFunctionGroup.
         for (hir_program.structs) |mod| {
-            const struct_prefix = self.structNameToPrefix(mod.name);
+            const struct_prefix = try self.structNameToPrefix(mod.name);
             for (mod.functions) |func_group| {
                 for (func_group.clauses) |clause| {
                     try self.scanForTryVariantNames(clause.body, struct_prefix);
@@ -5802,7 +6624,7 @@ pub const IrBuilder = struct {
 
         // Fourth pass: build function bodies
         for (hir_program.structs) |mod| {
-            const struct_prefix = self.structNameToPrefix(mod.name);
+            const struct_prefix = try self.structNameToPrefix(mod.name);
             self.current_struct_prefix = struct_prefix;
             for (mod.functions) |func_group| {
                 try self.buildFunctionGroup(&func_group);
@@ -5933,14 +6755,14 @@ pub const IrBuilder = struct {
         return arg.expr.type_id;
     }
 
-    fn typeOnlyClauseMatchCost(self: *const IrBuilder, clause: *const hir_mod.Clause, call_arity: usize, args: []const hir_mod.CallArg) ?u32 {
+    fn typeOnlyClauseMatchCost(self: *const IrBuilder, clause: *const hir_mod.Clause, call_arity: usize, args: []const hir_mod.CallArg) TypeWalkError!?u32 {
         const ts = self.type_store orelse return null;
         if (args.len < call_arity) return null;
         if (clause.params.len < call_arity) return null;
 
         var total: u32 = 0;
         for (args[0..call_arity], clause.params[0..call_arity]) |arg, param| {
-            const cost = ts.callMatchCost(self.typeOnlyArgType(arg), param.type_id) orelse return null;
+            const cost = (try ts.callMatchCost(self.typeOnlyArgType(arg), param.type_id)) orelse return null;
             total +|= cost;
         }
         return total;
@@ -5983,7 +6805,7 @@ pub const IrBuilder = struct {
         call_arity: usize,
         args: []const hir_mod.CallArg,
         requested_clause_index: ?u32,
-    ) ?TypedClauseResolution {
+    ) TypeWalkError!?TypedClauseResolution {
         _ = self.type_store orelse return null;
         const program = self.known_name_program orelse return null;
 
@@ -5992,7 +6814,7 @@ pub const IrBuilder = struct {
         var best_rank: u32 = std.math.maxInt(u32);
 
         for (program.structs) |candidate_struct| {
-            const candidate_prefix = self.structNameToPrefix(candidate_struct.name);
+            const candidate_prefix = try self.structNameToPrefix(candidate_struct.name);
             if (!std.mem.eql(u8, candidate_prefix, struct_prefix)) continue;
 
             for (candidate_struct.functions) |function_group| {
@@ -6005,7 +6827,7 @@ pub const IrBuilder = struct {
                 _ = requested_clause_index;
 
                 for (function_group.clauses, 0..) |*clause, clause_index| {
-                    const cost = self.typeOnlyClauseMatchCost(clause, call_arity, args) orelse continue;
+                    const cost = (try self.typeOnlyClauseMatchCost(clause, call_arity, args)) orelse continue;
                     if (best == null or cost < best_cost) {
                         best = .{
                             .declared_arity = function_group.arity,
@@ -6041,11 +6863,14 @@ pub const IrBuilder = struct {
         self.materialized_closure_locals.clearRetainingCapacity();
         self.boxed_existential_locals.clearRetainingCapacity();
         self.deep_release_owned_locals.clearRetainingCapacity();
+        self.owned_transfer_locals.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
         self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
+        self.current_param_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
         self.current_param_hir_types = .empty;
+        self.current_param_unique_owners = .empty;
 
         // Phase 3.b / audit ir-1--04: a typed-clause entrypoint is reached via
         // the type-only-overload branch of `buildFunctionGroup`, which returns
@@ -6060,58 +6885,106 @@ pub const IrBuilder = struct {
         // clauses) OR an invoked raising closure parameter.
         self.in_try_body = false;
         const declared_function_raises = if (self.type_store) |ts|
-            ts.functionRaises(self.current_struct_prefix, self.interner.get(group.name), group.arity)
+            try ts.functionRaises(self.current_struct_prefix, self.interner.get(group.name), group.arity)
         else
             false;
-        const function_raises = declared_function_raises or self.groupInvokesRaisingClosureParam(group);
+        const function_raises = declared_function_raises or try self.groupInvokesRaisingClosureParam(group);
         self.current_function_raises = function_raises;
 
         var captures: std.ArrayList(Capture) = .empty;
+        errdefer deinitConstructedCaptureList(self.allocator, &captures);
+        try captures.ensureUnusedCapacity(self.allocator, group.captures.len);
         for (group.captures, 0..) |capture, idx| {
             const cap_name = try std.fmt.allocPrint(self.allocator, "__cap_{d}", .{idx});
-            try captures.append(self.allocator, .{
+            errdefer self.allocator.free(cap_name);
+            const type_expr = try typeIdToZigTypeWithStore(capture.type_id, self.type_store);
+            captures.appendAssumeCapacity(.{
                 .name = cap_name,
-                .type_expr = typeIdToZigTypeWithStore(capture.type_id, self.type_store),
+                .type_expr = type_expr,
                 .ownership = capture.ownership,
             });
         }
 
         var params: std.ArrayList(Param) = .empty;
+        errdefer deinitConstructedParamList(self.allocator, &params);
+        try params.ensureUnusedCapacity(self.allocator, clause.params.len);
+        try self.current_param_types.ensureUnusedCapacity(self.allocator, clause.params.len);
+        try self.current_param_hir_types.ensureUnusedCapacity(self.allocator, clause.params.len);
+        try self.current_param_unique_owners.ensureUnusedCapacity(self.allocator, clause.params.len);
         for (clause.params, 0..) |param, i| {
             const name = try std.fmt.allocPrint(self.allocator, "__arg_{d}", .{i});
-            const resolved_type = typeIdToZigTypeWithStore(param.type_id, self.type_store);
-            try params.append(self.allocator, .{
+            errdefer self.allocator.free(name);
+            const resolved_type = try typeIdToZigTypeWithStore(param.type_id, self.type_store);
+            var resolved_type_owned = true;
+            errdefer if (resolved_type_owned) deinitConstructedZigType(self.allocator, resolved_type);
+            const ir_param = Param{
                 .name = name,
                 .type_expr = resolved_type,
                 .type_id = param.type_id,
-            });
-            try self.current_param_types.append(self.allocator, resolved_type);
-            try self.current_param_hir_types.append(self.allocator, param.type_id);
+                .ownership = param.ownership,
+                .ownership_explicit = param.ownership_explicit,
+            };
+            params.appendAssumeCapacity(ir_param);
+            self.current_param_types.appendAssumeCapacity(resolved_type);
+            self.current_param_hir_types.appendAssumeCapacity(param.type_id);
+            self.current_param_unique_owners.appendAssumeCapacity(self.paramHasExplicitUniqueOwnershipUnit(ir_param));
+            resolved_type_owned = false;
         }
 
         const single_clause = [_]hir_mod.Clause{clause.*};
-        self.next_local = computeMaxBindingLocalForClauses(single_clause[0..]);
+        self.next_local = try self.computeMaxBindingLocalForClauses(single_clause[0..], clause.debug_span);
+        try self.emitCanonicalParamLocals(params.items, null);
         try self.emitClauseBindingsAndBody(clause);
-        const entry_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+        try self.propagateOwnedTransfersThroughLocalGets(self.current_instrs.items);
+        var entry_instrs_owner: ?[]const Instruction = try self.current_instrs.toOwnedSlice(self.allocator);
+        errdefer if (entry_instrs_owner) |entry_instrs| self.allocator.free(entry_instrs);
 
         const raw_name = if (group.name < self.interner.strings.items.len)
             self.interner.get(group.name)
         else
             "anonymous";
         const mangled_raw_name = try mangleSymbolForZig(self.allocator, raw_name);
+        defer if (mangled_raw_name.ptr != raw_name.ptr) self.allocator.free(mangled_raw_name);
         const local_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}__clause_{d}", .{ mangled_raw_name, group.arity, clause_index });
+        var local_name_owner: ?[]const u8 = local_name;
+        errdefer if (local_name_owner) |owned_local_name| self.allocator.free(owned_local_name);
         const name_str = if (self.current_struct_prefix) |prefix|
             try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, local_name })
         else
             local_name;
+        var name_str_owner: ?[]const u8 = if (name_str.ptr == local_name.ptr) null else name_str;
+        errdefer if (name_str_owner) |owned_name| self.allocator.free(owned_name);
 
-        try self.known_function_names.put(name_str, {});
-        const final_params_typed = try params.toOwnedSlice(self.allocator);
+        var final_params_owner: ?[]const Param = try params.toOwnedSlice(self.allocator);
+        params = .empty;
+        errdefer if (final_params_owner) |final_params| deinitConstructedParamSlice(self.allocator, final_params);
+        const final_params_typed = final_params_owner.?;
         const param_conventions = try self.computeParamConventions(final_params_typed);
+        var param_conventions_owner: ?[]const ParamConvention = param_conventions;
+        errdefer if (param_conventions_owner) |owned_param_conventions| self.allocator.free(owned_param_conventions);
         const local_ownership = try self.computeLocalOwnership(self.next_local);
-        const result_convention = self.computeResultConvention(clause.return_type);
+        var local_ownership_owner: ?[]OwnershipClass = local_ownership;
+        errdefer if (local_ownership_owner) |owned_local_ownership| self.allocator.free(owned_local_ownership);
+        const result_convention = try self.computeResultConvention(clause.return_type);
         const debug_span = clause.debug_span;
-        try self.functions.append(self.allocator, .{
+        const return_type = try typeIdToZigTypeWithStore(clause.return_type, self.type_store);
+        var return_type_owner: ?ZigType = return_type;
+        errdefer if (return_type_owner) |owned_return_type| deinitConstructedZigType(self.allocator, owned_return_type);
+        var body_owner: ?[]const Block = try self.allocSlice(Block, &.{.{
+            .label = 0,
+            .instructions = entry_instrs_owner.?,
+        }});
+        entry_instrs_owner = null;
+        errdefer if (body_owner) |owned_body| deinitConstructedBlocks(self.allocator, owned_body);
+        var captures_owner: ?[]const Capture = try captures.toOwnedSlice(self.allocator);
+        captures = .empty;
+        errdefer if (captures_owner) |owned_captures| deinitConstructedCaptureSlice(self.allocator, owned_captures);
+        var protocol_box_locals_owner: ?std.AutoHashMapUnmanaged(LocalId, []const u8) = try self.snapshotProtocolBoxLocals();
+        errdefer if (protocol_box_locals_owner) |*owned_protocol_box_locals| deinitConstructedProtocolBoxLocals(self.allocator, owned_protocol_box_locals);
+        var deep_release_owned_locals_owner: ?std.AutoHashMapUnmanaged(LocalId, void) = try self.cloneLocalIdSet(self.deep_release_owned_locals);
+        errdefer if (deep_release_owned_locals_owner) |*owned_deep_release_locals| deinitConstructedLocalIdSet(self.allocator, owned_deep_release_locals);
+
+        const function = Function{
             .id = func_id,
             .name = name_str,
             .source_group_id = group.id,
@@ -6124,25 +6997,33 @@ pub const IrBuilder = struct {
             .scope_id = group.scope_id,
             .arity = group.arity,
             .params = final_params_typed,
-            .return_type = typeIdToZigTypeWithStore(clause.return_type, self.type_store),
+            .return_type = return_type,
             .return_type_id = clause.return_type,
             // audit ir-1--04: emit the raise effect so the ZIR backend lowers
             // this clause to an `error{ZapRaise}!T` return when the overload
             // family raises — matching the regular `buildFunctionGroup` path.
             .raises = function_raises,
-            .body = try self.allocSlice(Block, &.{.{
-                .label = 0,
-                .instructions = entry_instrs,
-            }}),
+            .body = body_owner.?,
             .is_closure = group.captures.len > 0,
-            .captures = try captures.toOwnedSlice(self.allocator),
+            .captures = captures_owner.?,
             .local_count = self.next_local,
-            .param_conventions = param_conventions,
-            .local_ownership = local_ownership,
+            .param_conventions = param_conventions_owner.?,
+            .local_ownership = local_ownership_owner.?,
             .result_convention = result_convention,
-            .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
-            .deep_release_owned_locals = try self.cloneLocalIdSet(self.deep_release_owned_locals),
-        });
+            .protocol_box_locals = protocol_box_locals_owner.?,
+            .deep_release_owned_locals = deep_release_owned_locals_owner.?,
+        };
+        local_name_owner = null;
+        name_str_owner = null;
+        final_params_owner = null;
+        return_type_owner = null;
+        body_owner = null;
+        captures_owner = null;
+        param_conventions_owner = null;
+        local_ownership_owner = null;
+        protocol_box_locals_owner = null;
+        deep_release_owned_locals_owner = null;
+        try self.appendOwnedFunctionRecord(function, true);
     }
 
     /// Build a function group (an anonymous/nested closure) encountered
@@ -6154,7 +7035,7 @@ pub const IrBuilder = struct {
     /// path) resets every per-function map at its start
     /// (`clearRetainingCapacity` on `known_local_types`, `local_hir_types`,
     /// `materialized_closure_locals`, `boxed_existential_locals`,
-    /// `deep_release_owned_locals`, `param_backed_locals`,
+    /// `deep_release_owned_locals`, `owned_transfer_locals`, `param_backed_locals`,
     /// `rescue_unboxed_borrow_locals`, `term_tuple_locals`, and resets the
     /// `current_param_*` lists). Those maps drive `computeLocalOwnership` /
     /// `snapshotProtocolBoxLocals` — which run at the ENCLOSING function's
@@ -6189,22 +7070,28 @@ pub const IrBuilder = struct {
         const saved_materialized_closure_locals = self.materialized_closure_locals;
         const saved_boxed_existential_locals = self.boxed_existential_locals;
         const saved_deep_release_owned_locals = self.deep_release_owned_locals;
+        const saved_owned_transfer_locals = self.owned_transfer_locals;
         const saved_param_backed_locals = self.param_backed_locals;
         const saved_rescue_unboxed_borrow_locals = self.rescue_unboxed_borrow_locals;
         const saved_term_tuple_locals = self.term_tuple_locals;
         const saved_current_param_types = self.current_param_types;
         const saved_current_param_hir_types = self.current_param_hir_types;
+        const saved_current_param_unique_owners = self.current_param_unique_owners;
+        const saved_current_param_locals = self.current_param_locals;
         self.current_instrs = .empty;
         self.known_local_types = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
         self.local_hir_types = std.AutoHashMap(LocalId, hir_mod.TypeId).init(self.allocator);
         self.materialized_closure_locals = .empty;
         self.boxed_existential_locals = .empty;
         self.deep_release_owned_locals = .empty;
+        self.owned_transfer_locals = .empty;
         self.param_backed_locals = std.AutoHashMap(LocalId, void).init(self.allocator);
         self.rescue_unboxed_borrow_locals = std.AutoHashMap(LocalId, void).init(self.allocator);
         self.term_tuple_locals = std.AutoHashMap(LocalId, ZigType).init(self.allocator);
         self.current_param_types = .empty;
         self.current_param_hir_types = .empty;
+        self.current_param_unique_owners = .empty;
+        self.current_param_locals = std.AutoHashMap(u32, LocalId).init(self.allocator);
         defer {
             self.known_local_types.deinit();
             self.known_local_types = saved_known_local_types;
@@ -6216,6 +7103,8 @@ pub const IrBuilder = struct {
             self.boxed_existential_locals = saved_boxed_existential_locals;
             self.deep_release_owned_locals.deinit(self.allocator);
             self.deep_release_owned_locals = saved_deep_release_owned_locals;
+            self.owned_transfer_locals.deinit(self.allocator);
+            self.owned_transfer_locals = saved_owned_transfer_locals;
             self.param_backed_locals.deinit();
             self.param_backed_locals = saved_param_backed_locals;
             self.rescue_unboxed_borrow_locals.deinit();
@@ -6226,6 +7115,10 @@ pub const IrBuilder = struct {
             self.current_param_types = saved_current_param_types;
             self.current_param_hir_types.deinit(self.allocator);
             self.current_param_hir_types = saved_current_param_hir_types;
+            self.current_param_unique_owners.deinit(self.allocator);
+            self.current_param_unique_owners = saved_current_param_unique_owners;
+            self.current_param_locals.deinit();
+            self.current_param_locals = saved_current_param_locals;
             // Restore the enclosing function's raise-effect context (see the
             // save above). In the defer so an error inside the nested build
             // cannot leave the outer context corrupted.
@@ -6244,7 +7137,7 @@ pub const IrBuilder = struct {
         // that can't be lowered to concrete IR types. Only the monomorphized copies
         // (produced by the monomorphization pass) should be compiled.
         if (self.type_store) |ts| {
-            if (isGenericHirGroup(ts, group)) return;
+            if (try isGenericHirGroup(ts, group)) return;
         }
 
         if (self.type_store != null and self.isTypeOnlyOverloadGroup(group)) {
@@ -6262,11 +7155,14 @@ pub const IrBuilder = struct {
         self.materialized_closure_locals.clearRetainingCapacity();
         self.boxed_existential_locals.clearRetainingCapacity();
         self.deep_release_owned_locals.clearRetainingCapacity();
+        self.owned_transfer_locals.clearRetainingCapacity();
         self.param_backed_locals.clearRetainingCapacity();
         self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
         self.term_tuple_locals.clearRetainingCapacity();
+        self.current_param_locals.clearRetainingCapacity();
         self.current_param_types = .empty;
         self.current_param_hir_types = .empty;
+        self.current_param_unique_owners = .empty;
 
         // Phase 3.b: does THIS function carry the `raises` effect (returns an
         // error union)? Computed up front so it is set before the body is
@@ -6274,7 +7170,7 @@ pub const IrBuilder = struct {
         // decide `try` (propagate) vs the top-level abort. Also reused for the
         // emitted `ir.Function.raises` flag below.
         const declared_function_raises = if (self.type_store) |ts|
-            ts.functionRaises(self.current_struct_prefix, self.interner.get(group.name), group.arity)
+            try ts.functionRaises(self.current_struct_prefix, self.interner.get(group.name), group.arity)
         else
             false;
         // #201 — a higher-order instance that INVOKES a closure
@@ -6285,7 +7181,7 @@ pub const IrBuilder = struct {
         // type and so does NOT widen — that is the per-instance
         // specialization. A function's own inferred row OR an invoked
         // raising closure parameter both make it raising.
-        const function_raises = declared_function_raises or self.groupInvokesRaisingClosureParam(group);
+        const function_raises = declared_function_raises or try self.groupInvokesRaisingClosureParam(group);
         self.current_function_raises = function_raises;
 
         // Use first clause for arity and return type
@@ -6296,27 +7192,40 @@ pub const IrBuilder = struct {
         // If clauses have different struct types, synthesize a union.
         // Otherwise fall back to anytype.
         var params: std.ArrayList(Param) = .empty;
+        errdefer deinitConstructedParamList(self.allocator, &params);
+        try params.ensureUnusedCapacity(self.allocator, first_clause.params.len);
+        try self.current_param_types.ensureUnusedCapacity(self.allocator, first_clause.params.len);
+        try self.current_param_hir_types.ensureUnusedCapacity(self.allocator, first_clause.params.len);
+        try self.current_param_unique_owners.ensureUnusedCapacity(self.allocator, first_clause.params.len);
         var union_param_idx: ?u32 = null;
         var optional_param_idx: ?u32 = null;
         var optional_payload_type: ?ZigType = null;
         var optional_payload_type_id: ?types_mod.TypeId = null;
         var captures: std.ArrayList(Capture) = .empty;
+        errdefer deinitConstructedCaptureList(self.allocator, &captures);
+        try captures.ensureUnusedCapacity(self.allocator, group.captures.len);
         for (group.captures, 0..) |capture, idx| {
             const cap_name = try std.fmt.allocPrint(self.allocator, "__cap_{d}", .{idx});
-            try captures.append(self.allocator, .{
+            errdefer self.allocator.free(cap_name);
+            const type_expr = try typeIdToZigTypeWithStore(capture.type_id, self.type_store);
+            captures.appendAssumeCapacity(.{
                 .name = cap_name,
-                .type_expr = typeIdToZigTypeWithStore(capture.type_id, self.type_store),
+                .type_expr = type_expr,
                 .ownership = capture.ownership,
             });
         }
         for (first_clause.params, 0..) |param, i| {
             const name = try std.fmt.allocPrint(self.allocator, "__arg_{d}", .{i});
-            var resolved_type = typeIdToZigTypeWithStore(param.type_id, self.type_store);
+            errdefer self.allocator.free(name);
+            var resolved_type = try typeIdToZigTypeWithStore(param.type_id, self.type_store);
+            var resolved_type_owned = true;
+            errdefer if (resolved_type_owned) deinitConstructedZigType(self.allocator, resolved_type);
             var resolved_type_id: ?types_mod.TypeId = param.type_id;
             if (group.clauses.len > 1) {
                 for (group.clauses[1..]) |clause| {
                     if (i < clause.params.len) {
-                        const other_type = typeIdToZigTypeWithStore(clause.params[i].type_id, self.type_store);
+                        const other_type = try typeIdToZigTypeWithStore(clause.params[i].type_id, self.type_store);
+                        defer deinitConstructedZigType(self.allocator, other_type);
                         const tags_differ = std.meta.activeTag(other_type) != std.meta.activeTag(resolved_type);
                         // Also check if both are struct_ref but with different names
                         const struct_names_differ = if (resolved_type == .struct_ref and other_type == .struct_ref)
@@ -6326,21 +7235,25 @@ pub const IrBuilder = struct {
                         if (tags_differ or struct_names_differ) {
                             // Check if this is a union synthesis candidate
                             if (try self.canUnionDispatch(group, @intCast(i))) |union_type_name| {
+                                deinitConstructedZigType(self.allocator, resolved_type);
                                 resolved_type = .{ .struct_ref = union_type_name };
                                 resolved_type_id = null;
                                 union_param_idx = @intCast(i);
-                            } else if (self.canOptionalDispatch(group, @intCast(i))) |optional_candidate| {
+                            } else if (try self.canOptionalDispatch(group, @intCast(i))) |optional_candidate| {
                                 // f(nil) / f(t :: T) shape — unify the
                                 // param to `?T` and route via
                                 // optional_dispatch IR.
                                 const inner_ptr = try self.allocator.create(ZigType);
+                                errdefer self.allocator.destroy(inner_ptr);
                                 inner_ptr.* = try cloneZigType(self.allocator, optional_candidate.payload_type);
+                                deinitConstructedZigType(self.allocator, resolved_type);
                                 resolved_type = .{ .optional = inner_ptr };
                                 resolved_type_id = optional_candidate.optional_type_id;
                                 optional_param_idx = @intCast(i);
                                 optional_payload_type = optional_candidate.payload_type;
                                 optional_payload_type_id = optional_candidate.payload_type_id;
                             } else {
+                                deinitConstructedZigType(self.allocator, resolved_type);
                                 resolved_type = .any;
                                 resolved_type_id = null;
                             }
@@ -6349,19 +7262,31 @@ pub const IrBuilder = struct {
                     }
                 }
             }
-            try params.append(self.allocator, .{
+            const ir_param = Param{
                 .name = name,
                 .type_expr = resolved_type,
                 .type_id = resolved_type_id,
-            });
-            try self.current_param_types.append(self.allocator, resolved_type);
-            try self.current_param_hir_types.append(self.allocator, resolved_type_id orelse param.type_id);
+                .ownership = param.ownership,
+                .ownership_explicit = param.ownership_explicit,
+            };
+            params.appendAssumeCapacity(ir_param);
+            self.current_param_types.appendAssumeCapacity(resolved_type);
+            self.current_param_hir_types.appendAssumeCapacity(resolved_type_id orelse param.type_id);
+            self.current_param_unique_owners.appendAssumeCapacity(self.paramHasExplicitUniqueOwnershipUnit(.{
+                .name = name,
+                .type_expr = resolved_type,
+                .type_id = resolved_type_id orelse param.type_id,
+                .ownership = param.ownership,
+                .ownership_explicit = param.ownership_explicit,
+            }));
+            resolved_type_owned = false;
         }
 
         // Reserve local indices used by destructure bindings across all clauses.
         // These locals are defined inside guard_blocks (separate Zig scopes),
         // so top-level code must start allocating ABOVE this range.
-        self.next_local = computeMaxBindingLocalForClauses(group.clauses);
+        self.next_local = try self.computeMaxBindingLocalForClauses(group.clauses, patternMatrixSpanForFunctionGroup(group));
+        try self.emitCanonicalParamLocals(params.items, optional_param_idx);
 
         var uses_decision_tree = false;
 
@@ -6370,7 +7295,7 @@ pub const IrBuilder = struct {
             // bindings and the body; a binary pattern's length/prefix checks
             // gate the body via a guard + match_fail (audit ir-1--02).
             try self.emitClauseBindingsAndBody(first_clause);
-        } else if (self.canSwitchDispatch(group)) |switch_param| {
+        } else if (try self.canSwitchDispatch(group)) |switch_param| {
             // Emit switch_return for integer literal dispatch
             var return_cases: std.ArrayList(ReturnCase) = .empty;
             var default_instrs_result: []const Instruction = &.{};
@@ -6606,14 +7531,16 @@ pub const IrBuilder = struct {
             }
 
             var next_scrutinee_id: u32 = group.arity;
-            const decision = try hir_mod.compilePatternMatrix(
-                self.allocator,
+            const decision = try self.compilePatternMatrixForIr(
+                .function_clauses,
+                patternMatrixSpanForFunctionGroup(group),
                 .{
                     .rows = try pattern_rows.toOwnedSlice(self.allocator),
                     .column_count = group.arity,
                 },
                 try scrutinee_ids.toOwnedSlice(self.allocator),
                 &next_scrutinee_id,
+                .{},
             );
 
             // Set up scrutinee_map: map scrutinee IDs to param_get locals
@@ -6626,7 +7553,7 @@ pub const IrBuilder = struct {
                     .param_get = .{ .dest = param_local, .index = @intCast(i) },
                 });
                 // Track known types for Phase 3
-                const param_type = typeIdToZigTypeWithStore(first_clause.params[i].type_id, self.type_store);
+                const param_type = try typeIdToZigTypeWithStore(first_clause.params[i].type_id, self.type_store);
                 if (param_type != .any) {
                     try self.known_local_types.put(param_local, param_type);
                 }
@@ -6638,40 +7565,53 @@ pub const IrBuilder = struct {
                 try scrutinee_map.put(@intCast(i), param_local);
             }
 
-            try self.lowerDecisionTreeForDispatch(decision, group.clauses, &scrutinee_map);
+            try self.lowerDecisionTreeForDispatchWithSpan(decision, group.clauses, &scrutinee_map, patternMatrixSpanForFunctionGroup(group));
         }
 
-        var entry_instrs: []const Instruction = try self.current_instrs.toOwnedSlice(self.allocator);
+        try self.propagateOwnedTransfersThroughLocalGets(self.current_instrs.items);
+        var entry_instrs_owner: ?[]const Instruction = try self.current_instrs.toOwnedSlice(self.allocator);
+        errdefer if (entry_instrs_owner) |entry_instrs| self.allocator.free(entry_instrs);
 
         const raw_name = if (group.name < self.interner.strings.items.len)
             self.interner.get(group.name)
         else
             "anonymous";
         const mangled_raw_name = try mangleSymbolForZig(self.allocator, raw_name);
+        defer if (mangled_raw_name.ptr != raw_name.ptr) self.allocator.free(mangled_raw_name);
         const local_name = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ mangled_raw_name, group.arity });
+        var local_name_owner: ?[]const u8 = local_name;
+        errdefer if (local_name_owner) |owned_local_name| self.allocator.free(owned_local_name);
         const name_str = if (self.current_struct_prefix) |prefix|
             try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ prefix, local_name })
         else
             local_name;
+        var name_str_owner: ?[]const u8 = if (name_str.ptr == local_name.ptr) null else name_str;
+        errdefer if (name_str_owner) |owned_name| self.allocator.free(owned_name);
 
-        const return_type = typeIdToZigTypeWithStore(first_clause.return_type, self.type_store);
+        const return_type = try typeIdToZigTypeWithStore(first_clause.return_type, self.type_store);
+        var return_type_owner: ?ZigType = return_type;
+        errdefer if (return_type_owner) |owned_return_type| deinitConstructedZigType(self.allocator, owned_return_type);
 
         // Register union dispatch info for call-site wrapping
+        var pending_union_dispatch_info: ?UnionDispatchInfo = null;
+        errdefer if (pending_union_dispatch_info) |*info| info.variants.deinit();
         if (union_param_idx) |u_idx| {
             for (params.items) |p| {
                 if (p.type_expr == .struct_ref) {
                     var variants = std.StringHashMap(void).init(self.allocator);
+                    errdefer variants.deinit();
                     for (group.clauses) |clause| {
-                        const clause_type = typeIdToZigTypeWithStore(clause.params[u_idx].type_id, self.type_store);
+                        const clause_type = try typeIdToZigTypeWithStore(clause.params[u_idx].type_id, self.type_store);
+                        defer deinitConstructedZigType(self.allocator, clause_type);
                         if (clause_type == .struct_ref) {
                             try variants.put(clause_type.struct_ref, {});
                         }
                     }
-                    try self.union_dispatch_map.put(name_str, .{
+                    pending_union_dispatch_info = .{
                         .param_idx = u_idx,
                         .union_type_name = p.type_expr.struct_ref,
                         .variants = variants,
-                    });
+                    };
                     break;
                 }
             }
@@ -6681,21 +7621,27 @@ pub const IrBuilder = struct {
         // ZIR backend's tail_call lowering picks musttail (TCO-safe
         // signatures) vs loopification (byref) — see `rewriteTailCalls`
         // doc for the dispatch rationale.
-        entry_instrs = try self.rewriteTailCalls(entry_instrs, name_str, func_id, params.items, return_type);
+        const rewritten_entry_instrs = try self.rewriteTailCalls(entry_instrs_owner.?, name_str, func_id, params.items, return_type);
+        self.allocator.free(entry_instrs_owner.?);
+        entry_instrs_owner = rewritten_entry_instrs;
 
-        const has_tail_call = containsTailCall(entry_instrs);
+        const has_tail_call = try containsTailCall(self.allocator, entry_instrs_owner.?);
         const tco_safe = isTcoEligible(params.items, return_type);
         const loopify = has_tail_call and !tco_safe;
 
         const entry_block = Block{
             .label = 0,
-            .instructions = entry_instrs,
+            .instructions = entry_instrs_owner.?,
         };
 
-        const final_params = try params.toOwnedSlice(self.allocator);
+        var final_params_owner: ?[]const Param = try params.toOwnedSlice(self.allocator);
+        params = .empty;
+        errdefer if (final_params_owner) |final_params_slice| deinitConstructedParamSlice(self.allocator, final_params_slice);
+        const final_params = final_params_owner.?;
 
         // Collect default parameter values for call-site inlining
         var defaults_list: std.ArrayList(DefaultValue) = .empty;
+        errdefer defaults_list.deinit(self.allocator);
         if (group.clauses.len == 1) {
             const clause = &group.clauses[0];
             var di: usize = clause.params.len;
@@ -6716,13 +7662,34 @@ pub const IrBuilder = struct {
         }
 
         const param_conventions = try self.computeParamConventions(final_params);
+        var param_conventions_owner: ?[]const ParamConvention = param_conventions;
+        errdefer if (param_conventions_owner) |owned_param_conventions| self.allocator.free(owned_param_conventions);
         const local_ownership = try self.computeLocalOwnership(self.next_local);
-        const result_convention = self.computeResultConvention(first_clause.return_type);
+        var local_ownership_owner: ?[]OwnershipClass = local_ownership;
+        errdefer if (local_ownership_owner) |owned_local_ownership| self.allocator.free(owned_local_ownership);
+        const result_convention = try self.computeResultConvention(first_clause.return_type);
         const debug_span = group.debug_span;
         // `function_raises` (computed at the top of this function, before the
         // body was lowered) is the `raises`-effect verdict; a non-empty row
         // means the function lowers to a Zig error-union return.
-        try self.functions.append(self.allocator, .{
+        var body_owner: ?[]const Block = try self.allocSlice(Block, &.{entry_block});
+        entry_instrs_owner = null;
+        errdefer if (body_owner) |owned_body| deinitConstructedBlocks(self.allocator, owned_body);
+        var captures_owner: ?[]const Capture = try captures.toOwnedSlice(self.allocator);
+        captures = .empty;
+        errdefer if (captures_owner) |owned_captures| deinitConstructedCaptureSlice(self.allocator, owned_captures);
+        var defaults_owner: ?[]const DefaultValue = try defaults_list.toOwnedSlice(self.allocator);
+        defaults_list = .empty;
+        errdefer if (defaults_owner) |owned_defaults| self.allocator.free(owned_defaults);
+        var protocol_box_locals_owner: ?std.AutoHashMapUnmanaged(LocalId, []const u8) = try self.snapshotProtocolBoxLocals();
+        errdefer if (protocol_box_locals_owner) |*owned_protocol_box_locals| deinitConstructedProtocolBoxLocals(self.allocator, owned_protocol_box_locals);
+        var deep_release_owned_locals_owner: ?std.AutoHashMapUnmanaged(LocalId, void) = try self.cloneLocalIdSet(self.deep_release_owned_locals);
+        errdefer if (deep_release_owned_locals_owner) |*owned_deep_release_locals| deinitConstructedLocalIdSet(self.allocator, owned_deep_release_locals);
+        if (pending_union_dispatch_info != null) {
+            try self.union_dispatch_map.ensureUnusedCapacity(1);
+        }
+
+        const function = Function{
             .id = func_id,
             .name = name_str,
             .debug_source_path = self.debugPathForSpan(debug_span),
@@ -6736,18 +7703,34 @@ pub const IrBuilder = struct {
             .return_type = return_type,
             .return_type_id = first_clause.return_type,
             .raises = function_raises,
-            .body = try self.allocSlice(Block, &.{entry_block}),
+            .body = body_owner.?,
             .is_closure = group.captures.len > 0,
-            .captures = try captures.toOwnedSlice(self.allocator),
+            .captures = captures_owner.?,
             .local_count = self.next_local,
-            .defaults = try defaults_list.toOwnedSlice(self.allocator),
+            .defaults = defaults_owner.?,
             .loopify = loopify,
-            .param_conventions = param_conventions,
-            .local_ownership = local_ownership,
+            .param_conventions = param_conventions_owner.?,
+            .local_ownership = local_ownership_owner.?,
             .result_convention = result_convention,
-            .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
-            .deep_release_owned_locals = try self.cloneLocalIdSet(self.deep_release_owned_locals),
-        });
+            .protocol_box_locals = protocol_box_locals_owner.?,
+            .deep_release_owned_locals = deep_release_owned_locals_owner.?,
+        };
+        local_name_owner = null;
+        name_str_owner = null;
+        final_params_owner = null;
+        return_type_owner = null;
+        body_owner = null;
+        captures_owner = null;
+        defaults_owner = null;
+        param_conventions_owner = null;
+        local_ownership_owner = null;
+        protocol_box_locals_owner = null;
+        deep_release_owned_locals_owner = null;
+        try self.appendOwnedFunctionRecord(function, false);
+        if (pending_union_dispatch_info) |info| {
+            self.union_dispatch_map.putAssumeCapacity(name_str, info);
+            pending_union_dispatch_info = null;
+        }
 
         // Generate a `__try` variant whenever the catch-basin pipeline asked
         // for one (i.e. the original function name is in `try_variant_names`).
@@ -6785,12 +7768,17 @@ pub const IrBuilder = struct {
             self.materialized_closure_locals.clearRetainingCapacity();
             self.boxed_existential_locals.clearRetainingCapacity();
             self.deep_release_owned_locals.clearRetainingCapacity();
+            self.owned_transfer_locals.clearRetainingCapacity();
             self.param_backed_locals.clearRetainingCapacity();
             self.rescue_unboxed_borrow_locals.clearRetainingCapacity();
             self.term_tuple_locals.clearRetainingCapacity();
+            self.current_param_locals.clearRetainingCapacity();
+            self.current_param_types = .empty;
+            self.current_param_hir_types = .empty;
+            self.current_param_unique_owners = .empty;
 
             // Reserve binding locals (same as normal function)
-            self.next_local = computeMaxBindingLocalForClauses(group.clauses);
+            self.next_local = try self.computeMaxBindingLocalForClauses(group.clauses, patternMatrixSpanForFunctionGroup(group));
 
             // Re-build the decision tree with try_mode enabled
             self.try_mode = true;
@@ -6816,14 +7804,16 @@ pub const IrBuilder = struct {
             }
 
             var try_next_scrutinee_id: u32 = group.arity;
-            const try_decision = try hir_mod.compilePatternMatrix(
-                self.allocator,
+            const try_decision = try self.compilePatternMatrixForIr(
+                .function_clauses,
+                patternMatrixSpanForFunctionGroup(group),
                 .{
                     .rows = try try_pattern_rows.toOwnedSlice(self.allocator),
                     .column_count = group.arity,
                 },
                 try try_scrutinee_ids.toOwnedSlice(self.allocator),
                 &try_next_scrutinee_id,
+                .{},
             );
 
             var try_scrutinee_map = std.AutoHashMap(u32, LocalId).init(self.allocator);
@@ -6834,7 +7824,7 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .param_get = .{ .dest = param_local, .index = @intCast(i) },
                 });
-                const param_type = typeIdToZigTypeWithStore(first_clause.params[i].type_id, self.type_store);
+                const param_type = try typeIdToZigTypeWithStore(first_clause.params[i].type_id, self.type_store);
                 if (param_type != .any) {
                     try self.known_local_types.put(param_local, param_type);
                 }
@@ -6844,36 +7834,80 @@ pub const IrBuilder = struct {
                 try try_scrutinee_map.put(@intCast(i), param_local);
             }
 
-            try self.lowerDecisionTreeForDispatch(try_decision, group.clauses, &try_scrutinee_map);
+            try self.lowerDecisionTreeForDispatchWithSpan(try_decision, group.clauses, &try_scrutinee_map, patternMatrixSpanForFunctionGroup(group));
 
-            const try_entry_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
+            try self.propagateOwnedTransfersThroughLocalGets(self.current_instrs.items);
+            var try_entry_instrs_owner: ?[]const Instruction = try self.current_instrs.toOwnedSlice(self.allocator);
+            errdefer if (try_entry_instrs_owner) |try_entry_instrs| self.allocator.free(try_entry_instrs);
             const try_entry_block = Block{
                 .label = 0,
-                .instructions = try_entry_instrs,
+                .instructions = try_entry_instrs_owner.?,
             };
 
             // Re-build captures for the __try variant
             var try_captures: std.ArrayList(Capture) = .empty;
+            errdefer deinitConstructedCaptureList(self.allocator, &try_captures);
+            try try_captures.ensureUnusedCapacity(self.allocator, group.captures.len);
             for (group.captures, 0..) |capture, idx| {
                 const cap_name = try std.fmt.allocPrint(self.allocator, "__cap_{d}", .{idx});
-                try try_captures.append(self.allocator, .{
+                errdefer self.allocator.free(cap_name);
+                const type_expr = try typeIdToZigTypeWithStore(capture.type_id, self.type_store);
+                try_captures.appendAssumeCapacity(.{
                     .name = cap_name,
-                    .type_expr = typeIdToZigTypeWithStore(capture.type_id, self.type_store),
+                    .type_expr = type_expr,
                     .ownership = capture.ownership,
                 });
             }
 
             // __try variant has the same params as the original (no handler param)
             var try_params: std.ArrayList(Param) = .empty;
-            for (final_params) |p| try try_params.append(self.allocator, p);
+            errdefer deinitConstructedParamList(self.allocator, &try_params);
+            try try_params.ensureUnusedCapacity(self.allocator, final_params.len);
+            for (final_params) |p| {
+                const param_name = try cloneBytes(self.allocator, p.name);
+                errdefer self.allocator.free(param_name);
+                const param_type = try cloneZigType(self.allocator, p.type_expr);
+                try_params.appendAssumeCapacity(.{
+                    .name = param_name,
+                    .type_expr = param_type,
+                    .type_id = p.type_id,
+                    .ownership = p.ownership,
+                    .ownership_explicit = p.ownership_explicit,
+                });
+            }
 
             const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{name_str});
+            var try_name_owner: ?[]const u8 = try_name;
+            errdefer if (try_name_owner) |owned_try_name| self.allocator.free(owned_try_name);
             const try_local_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{local_name});
-            const try_final_params = try try_params.toOwnedSlice(self.allocator);
+            var try_local_name_owner: ?[]const u8 = try_local_name;
+            errdefer if (try_local_name_owner) |owned_try_local_name| self.allocator.free(owned_try_local_name);
+            var try_final_params_owner: ?[]const Param = try try_params.toOwnedSlice(self.allocator);
+            try_params = .empty;
+            errdefer if (try_final_params_owner) |owned_try_params| deinitConstructedParamSlice(self.allocator, owned_try_params);
+            const try_final_params = try_final_params_owner.?;
             const try_param_conventions = try self.computeParamConventions(try_final_params);
+            var try_param_conventions_owner: ?[]const ParamConvention = try_param_conventions;
+            errdefer if (try_param_conventions_owner) |owned_try_param_conventions| self.allocator.free(owned_try_param_conventions);
             const try_local_ownership = try self.computeLocalOwnership(self.next_local);
-            const try_result_convention = self.computeResultConvention(first_clause.return_type);
-            try self.functions.append(self.allocator, .{
+            var try_local_ownership_owner: ?[]OwnershipClass = try_local_ownership;
+            errdefer if (try_local_ownership_owner) |owned_try_local_ownership| self.allocator.free(owned_try_local_ownership);
+            const try_result_convention = try self.computeResultConvention(first_clause.return_type);
+            const try_return_type = try cloneZigType(self.allocator, return_type);
+            var try_return_type_owner: ?ZigType = try_return_type;
+            errdefer if (try_return_type_owner) |owned_try_return_type| deinitConstructedZigType(self.allocator, owned_try_return_type);
+            var try_body_owner: ?[]const Block = try self.allocSlice(Block, &.{try_entry_block});
+            try_entry_instrs_owner = null;
+            errdefer if (try_body_owner) |owned_try_body| deinitConstructedBlocks(self.allocator, owned_try_body);
+            var try_captures_owner: ?[]const Capture = try try_captures.toOwnedSlice(self.allocator);
+            try_captures = .empty;
+            errdefer if (try_captures_owner) |owned_try_captures| deinitConstructedCaptureSlice(self.allocator, owned_try_captures);
+            var try_protocol_box_locals_owner: ?std.AutoHashMapUnmanaged(LocalId, []const u8) = try self.snapshotProtocolBoxLocals();
+            errdefer if (try_protocol_box_locals_owner) |*owned_try_protocol_box_locals| deinitConstructedProtocolBoxLocals(self.allocator, owned_try_protocol_box_locals);
+            var try_deep_release_owned_locals_owner: ?std.AutoHashMapUnmanaged(LocalId, void) = try self.cloneLocalIdSet(self.deep_release_owned_locals);
+            errdefer if (try_deep_release_owned_locals_owner) |*owned_try_deep_release_locals| deinitConstructedLocalIdSet(self.allocator, owned_try_deep_release_locals);
+
+            const try_function = Function{
                 .id = try_func_id,
                 .name = try_name,
                 .debug_source_path = self.debugPathForSpan(debug_span),
@@ -6884,17 +7918,28 @@ pub const IrBuilder = struct {
                 .scope_id = group.scope_id,
                 .arity = group.arity,
                 .params = try_final_params,
-                .return_type = return_type,
-                .body = try self.allocSlice(Block, &.{try_entry_block}),
+                .return_type = try_return_type,
+                .body = try_body_owner.?,
                 .is_closure = group.captures.len > 0,
-                .captures = try try_captures.toOwnedSlice(self.allocator),
+                .captures = try_captures_owner.?,
                 .local_count = self.next_local,
-                .param_conventions = try_param_conventions,
-                .local_ownership = try_local_ownership,
+                .param_conventions = try_param_conventions_owner.?,
+                .local_ownership = try_local_ownership_owner.?,
                 .result_convention = try_result_convention,
-                .protocol_box_locals = try self.snapshotProtocolBoxLocals(),
-                .deep_release_owned_locals = try self.cloneLocalIdSet(self.deep_release_owned_locals),
-            });
+                .protocol_box_locals = try_protocol_box_locals_owner.?,
+                .deep_release_owned_locals = try_deep_release_owned_locals_owner.?,
+            };
+            try_name_owner = null;
+            try_local_name_owner = null;
+            try_final_params_owner = null;
+            try_return_type_owner = null;
+            try_body_owner = null;
+            try_captures_owner = null;
+            try_param_conventions_owner = null;
+            try_local_ownership_owner = null;
+            try_protocol_box_locals_owner = null;
+            try_deep_release_owned_locals_owner = null;
+            try self.appendOwnedFunctionRecord(try_function, false);
         }
     }
 
@@ -6983,24 +8028,19 @@ pub const IrBuilder = struct {
     /// `tail_call` instruction reaches the surface anywhere. Used to
     /// decide if a function's signature needs the loopification
     /// lowering path: `loopify = !isTcoEligible AND containsTailCall`.
-    fn containsTailCall(instrs: []const Instruction) bool {
-        for (instrs) |*instr| {
-            if (instr.* == .tail_call) return true;
-            // Recurse into every child stream via the canonical
-            // enumerator so no sub-stream (notably
-            // `union_switch.else_instrs`) can be missed.
-            const Finder = struct {
-                found: bool = false,
-                fn onStream(self: *@This(), child: ChildStream) void {
-                    if (self.found) return;
-                    if (containsTailCall(child.stream)) self.found = true;
-                }
-            };
-            var finder = Finder{};
-            forEachChildStream(instr, &finder, Finder.onStream);
-            if (finder.found) return true;
-        }
-        return false;
+    fn containsTailCall(
+        allocator: std.mem.Allocator,
+        instrs: []const Instruction,
+    ) std.mem.Allocator.Error!bool {
+        const Finder = struct {
+            fn visit(_: void, instr: *const Instruction) InstructionWalkControl {
+                return if (instr.* == .tail_call) .stop else .keep_walking;
+            }
+        };
+
+        var walker = InstructionStreamWalker.init(allocator);
+        defer walker.deinit();
+        return (try walker.walkUntil(instrs, {}, Finder.visit)) == .stop;
     }
 
     /// Phase E.6: classify a trailing instruction sitting between a
@@ -7308,6 +8348,9 @@ pub const IrBuilder = struct {
                                         .share_value => |sv| {
                                             if (dropped_share_dests.contains(sv.dest)) continue;
                                         },
+                                        .retain => |retain| {
+                                            if (dropped_share_dests.contains(retain.value)) continue;
+                                        },
                                         else => {},
                                     }
                                     try rebuilt_prelude.append(self.allocator, prelude_instr);
@@ -7513,6 +8556,9 @@ pub const IrBuilder = struct {
                 .share_value => |sv| {
                     if (dropped_share_dests.contains(sv.dest)) continue;
                 },
+                .retain => |retain| {
+                    if (dropped_share_dests.contains(retain.value)) continue;
+                },
                 else => {},
             }
             try new_body.append(self.allocator, bi);
@@ -7706,7 +8752,7 @@ pub const IrBuilder = struct {
 
     /// Check if multi-clause function can emit switch_return for integer literals.
     /// Returns the param index to switch on if eligible.
-    fn canSwitchDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup) ?u32 {
+    fn canSwitchDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup) TypeWalkError!?u32 {
         if (group.clauses.len < 2) return null;
 
         var switch_param_idx: ?u32 = null;
@@ -7771,7 +8817,7 @@ pub const IrBuilder = struct {
                 if (idx != found_literal_param.?) return null; // different param positions
             } else {
                 // Check that the param type is a known integer type
-                const param_type = typeIdToZigType(clause.params[found_literal_param.?].type_id);
+                const param_type = try typeIdToZigType(clause.params[found_literal_param.?].type_id);
                 switch (param_type) {
                     .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64, .u128, .isize, .usize => {},
                     else => return null,
@@ -7800,7 +8846,7 @@ pub const IrBuilder = struct {
     ///  - no `TypeStore` (unit-test path with raw IR)
     ///  - more than one distinct non-nil payload type
     ///  - all clauses are nil (degenerate) or all payload (no optional)
-    fn canOptionalDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup, param_idx: u32) ?OptionalDispatchCandidate {
+    fn canOptionalDispatch(self: *IrBuilder, group: *const hir_mod.FunctionGroup, param_idx: u32) TypeWalkError!?OptionalDispatchCandidate {
         if (group.clauses.len < 2) return null;
         const ts = self.type_store orelse return null;
 
@@ -7851,7 +8897,7 @@ pub const IrBuilder = struct {
             if (payload_type_id) |existing| {
                 if (!ts.typeEquals(existing, tid)) return null;
             } else {
-                payload_type = typeIdToZigTypeWithStore(tid, ts);
+                payload_type = try typeIdToZigTypeWithStore(tid, ts);
                 payload_type_id = tid;
             }
             saw_payload = true;
@@ -8554,7 +9600,7 @@ pub const IrBuilder = struct {
             // types are authoritative after monomorphization (mirrors the
             // `param_get` lowering at `lowerExpr`).
             const param_type: ZigType = if (binding.param_index < clause.params.len)
-                typeIdToZigTypeWithStore(clause.params[binding.param_index].type_id, self.type_store)
+                try typeIdToZigTypeWithStore(clause.params[binding.param_index].type_id, self.type_store)
             else
                 ZigType.any;
             if (param_type != .any) {
@@ -8615,7 +9661,7 @@ pub const IrBuilder = struct {
             const struct_name = self.interner.get(binding.struct_type);
             try self.known_local_types.put(struct_local, .{ .struct_ref = struct_name });
             const field_name = self.interner.get(binding.field_name);
-            const info = self.fieldZigTypeAndStorage(struct_name, field_name);
+            const info = try self.fieldZigTypeAndStorage(struct_name, field_name);
             // Plumb the field's HIR type onto the destructured local so
             // `emitArcRetainOnAggregateExtract` can detect an ARC-managed
             // extraction. Mirrors the equivalent plumbing for tuple
@@ -8657,7 +9703,7 @@ pub const IrBuilder = struct {
             // the right `Map(K, V)` cell for the runtime call. Without
             // this the emitter would default to `.atom`/`.i64`.
             const param_type = if (binding.param_index < clause.params.len)
-                typeIdToZigTypeWithStore(clause.params[binding.param_index].type_id, self.type_store)
+                try typeIdToZigTypeWithStore(clause.params[binding.param_index].type_id, self.type_store)
             else
                 ZigType.any;
             const key_type: ZigType = if (param_type == .map) param_type.map.key.* else .atom;
@@ -9006,20 +10052,22 @@ pub const IrBuilder = struct {
             try scrutinee_map.put(0, scrutinee_local);
 
             var next_scrutinee_id: u32 = 1;
-            const decision = try hir_mod.compilePatternMatrix(
-                self.allocator,
+            const decision = try self.compilePatternMatrixForIr(
+                .case_expression,
+                case_data.scrutinee.span,
                 .{
                     .rows = try pattern_rows.toOwnedSlice(self.allocator),
                     .column_count = 1,
                 },
                 try self.allocSlice(u32, &.{0}),
                 &next_scrutinee_id,
+                .{},
             );
 
             // Emit case_block wrapping the decision tree lowering
             const saved_outer = self.current_instrs;
             self.current_instrs = .empty;
-            try self.lowerDecisionTreeForCase(decision, case_data.arms, &scrutinee_map, dest);
+            try self.lowerDecisionTreeForCaseWithSpan(decision, case_data.arms, &scrutinee_map, dest, case_data.scrutinee.span);
             const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
             self.current_instrs = saved_outer;
 
@@ -9102,9 +10150,7 @@ pub const IrBuilder = struct {
             if (self.next_local <= error_local_fast) self.next_local = error_local_fast + 1;
             const taken_fast = try self.lowerExpr(tr.take_raise_call);
             try self.current_instrs.append(self.allocator, .{ .local_set = .{ .dest = error_local_fast, .value = taken_fast } });
-            if (self.local_hir_types.get(taken_fast)) |taken_type| {
-                try self.local_hir_types.put(error_local_fast, taken_type);
-            }
+            try self.recordLocalSetAliasMetadata(error_local_fast, taken_fast);
             const handler_dest_fast = self.next_local;
             self.next_local += 1;
             const handler_joined_fast = tr.result_type_id;
@@ -9113,7 +10159,7 @@ pub const IrBuilder = struct {
                 handler_joined_fast != types_mod.TypeStore.NEVER)
             {
                 try self.local_hir_types.put(handler_dest_fast, handler_joined_fast);
-                const handler_joined_zig = typeIdToZigTypeWithStore(handler_joined_fast, self.type_store);
+                const handler_joined_zig = try typeIdToZigTypeWithStore(handler_joined_fast, self.type_store);
                 if (handler_joined_zig != .any and handler_joined_zig != .void) {
                     try self.known_local_types.put(handler_dest_fast, handler_joined_zig);
                 }
@@ -9132,6 +10178,7 @@ pub const IrBuilder = struct {
             // got no in-arm splice (only divergent arms do).
             if (!fast_outcome.diverges) {
                 try self.current_instrs.append(self.allocator, .{ .local_set = .{ .dest = dest, .value = handler_dest_fast } });
+                try self.recordLocalSetAliasMetadata(dest, handler_dest_fast);
                 if (tr.after_block) |cleanup| {
                     for (cleanup.stmts) |stmt| {
                         _ = try self.lowerTryRescueBodyStmt(stmt);
@@ -9152,12 +10199,10 @@ pub const IrBuilder = struct {
         if (self.next_local <= error_local) self.next_local = error_local + 1;
         const taken = try self.lowerExpr(tr.take_raise_call);
         try self.current_instrs.append(self.allocator, .{ .local_set = .{ .dest = error_local, .value = taken } });
-        // Propagate the side-channel's HIR type onto error_local so the
-        // rescue patterns (struct downcast / type-binding) see the Error
-        // existential type for ARC + dispatch decisions.
-        if (self.local_hir_types.get(taken)) |taken_type| {
-            try self.local_hir_types.put(error_local, taken_type);
-        }
+        // Preserve the side-channel's protocol-box identity on `error_local`.
+        // Rescue arms emit a per-arm release of this local, and the later
+        // protocol-box release rewrite keys off this alias metadata.
+        try self.recordLocalSetAliasMetadata(error_local, taken);
         const handler_dest = self.next_local;
         self.next_local += 1;
         // Stamp the dispatch result local with the joined result type BEFORE
@@ -9176,7 +10221,7 @@ pub const IrBuilder = struct {
             handler_joined != types_mod.TypeStore.NEVER)
         {
             try self.local_hir_types.put(handler_dest, handler_joined);
-            const handler_joined_zig = typeIdToZigTypeWithStore(handler_joined, self.type_store);
+            const handler_joined_zig = try typeIdToZigTypeWithStore(handler_joined, self.type_store);
             if (handler_joined_zig != .any and handler_joined_zig != .void) {
                 try self.known_local_types.put(handler_dest, handler_joined_zig);
             }
@@ -9316,7 +10361,7 @@ pub const IrBuilder = struct {
             // that type — a never-read value giving the merge a clean peer type.
             const placeholder = self.next_local;
             self.next_local += 1;
-            const placeholder_zig = typeIdToZigTypeWithStore(joined, self.type_store);
+            const placeholder_zig = try typeIdToZigTypeWithStore(joined, self.type_store);
             try else_branch_instrs.append(self.allocator, .{
                 .typed_undef = .{ .dest = placeholder, .ty = placeholder_zig },
             });
@@ -9442,7 +10487,7 @@ pub const IrBuilder = struct {
                 // recoverable raise stashes — when the box's ZigType has not
                 // been stamped (defensive; the stamp is always present in
                 // practice).
-                const protocol_name = self.protocolNameForBox(error_local) orelse "Error";
+                const protocol_name = (try self.protocolNameForBox(error_local)) orelse "Error";
 
                 // Guard: does the box hold a `concrete.target_type_name`?
                 const guard_local = self.next_local;
@@ -9868,7 +10913,7 @@ pub const IrBuilder = struct {
         {
             return tail;
         }
-        const joined_zig = typeIdToZigTypeWithStore(joined_type, self.type_store);
+        const joined_zig = try typeIdToZigTypeWithStore(joined_type, self.type_store);
 
         // Always emit the `@as(<joined>, tail)` when the join is a concrete
         // numeric type — do NOT short-circuit on the tail's TRACKED
@@ -9975,7 +11020,7 @@ pub const IrBuilder = struct {
 
         const placeholder = self.next_local;
         self.next_local += 1;
-        const placeholder_zig = typeIdToZigTypeWithStore(joined_type, self.type_store);
+        const placeholder_zig = try typeIdToZigTypeWithStore(joined_type, self.type_store);
         try self.current_instrs.append(self.allocator, .{
             .typed_undef = .{ .dest = placeholder, .ty = placeholder_zig },
         });
@@ -10070,10 +11115,10 @@ pub const IrBuilder = struct {
     /// Resolve the bare protocol name a `protocol_box` local carries from its
     /// recorded ZigType (`.protocol_box(<Protocol>)`). Returns null when the
     /// local's ZigType is absent or not a protocol box.
-    fn protocolNameForBox(self: *const IrBuilder, box_local: LocalId) ?[]const u8 {
+    fn protocolNameForBox(self: *const IrBuilder, box_local: LocalId) TypeWalkError!?[]const u8 {
         const zig_type = self.known_local_types.get(box_local) orelse blk: {
             const hir_type = self.local_hir_types.get(box_local) orelse return null;
-            break :blk typeIdToZigTypeWithStore(hir_type, self.type_store);
+            break :blk try typeIdToZigTypeWithStore(hir_type, self.type_store);
         };
         if (zig_type == .protocol_box) return zig_type.protocol_box;
         return null;
@@ -10102,7 +11147,7 @@ pub const IrBuilder = struct {
             .local_set => |ls| {
                 const val = try self.lowerExpr(ls.value);
                 try self.current_instrs.append(self.allocator, .{ .local_set = .{ .dest = ls.index, .value = val } });
-                if (self.local_hir_types.get(val)) |t| try self.local_hir_types.put(ls.index, t);
+                try self.recordLocalSetAliasMetadata(ls.index, val);
                 return null;
             },
             .function_group => return null,
@@ -10157,14 +11202,13 @@ pub const IrBuilder = struct {
                 });
             }
 
-            const saved = self.current_instrs;
-            self.current_instrs = .empty;
+            var frame = self.pushInstructionBuffer();
+            errdefer frame.discardAndRestore();
             switch (context) {
                 .case => try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, dest),
                 .dispatch => try self.lowerDecisionTreeForDispatch(case.next, clauses, scrutinee_map),
             }
-            const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-            self.current_instrs = saved;
+            const body_instrs = try frame.takeOwnedSliceAndRestore();
 
             try union_cases.append(self.allocator, .{
                 .variant_name = variant_name,
@@ -10182,14 +11226,13 @@ pub const IrBuilder = struct {
         var else_result: ?LocalId = null;
         var has_else = false;
         if (sw.default.* != .failure) {
-            const saved = self.current_instrs;
-            self.current_instrs = .empty;
+            var frame = self.pushInstructionBuffer();
+            errdefer frame.discardAndRestore();
             switch (context) {
                 .case => try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, dest),
                 .dispatch => try self.lowerDecisionTreeForDispatch(sw.default, clauses, scrutinee_map),
             }
-            else_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-            self.current_instrs = saved;
+            else_instrs = try frame.takeOwnedSliceAndRestore();
             else_result = null;
             has_else = true;
         }
@@ -10212,6 +11255,22 @@ pub const IrBuilder = struct {
         scrutinee_map: *std.AutoHashMap(u32, LocalId),
         dest: LocalId,
     ) anyerror!void {
+        try self.lowerDecisionTreeForCaseWithSpan(decision, case_arms, scrutinee_map, dest, .{ .start = 0, .end = 0 });
+    }
+
+    fn lowerDecisionTreeForCaseWithSpan(
+        self: *IrBuilder,
+        decision: *const hir_mod.Decision,
+        case_arms: []const hir_mod.CaseArm,
+        scrutinee_map: *std.AutoHashMap(u32, LocalId),
+        dest: LocalId,
+        span: ast.SourceSpan,
+    ) anyerror!void {
+        const budget_root = self.beginDecisionTreeLoweringBudget(span);
+        defer self.endDecisionTreeLoweringBudget(budget_root);
+        try self.enterDecisionTreeLowering();
+        defer self.leaveDecisionTreeLowering();
+
         switch (decision.*) {
             .success => |leaf| {
                 const arm = case_arms[leaf.body_index];
@@ -10239,11 +11298,10 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{ .set_safety = false });
                 const guard_local = try self.lowerGuardExpr(guard_node.condition, scrutinee_map);
                 try self.current_instrs.append(self.allocator, .{ .set_safety = true });
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
                 try self.lowerDecisionTreeForCase(guard_node.success, case_arms, scrutinee_map, dest);
-                const guard_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const guard_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = guard_local, .body = guard_body },
                 });
@@ -10253,11 +11311,10 @@ pub const IrBuilder = struct {
                 const scrutinee_local = try self.resolveScrutinee(sw.scrutinee, scrutinee_map);
                 for (sw.cases) |case| {
                     const check_local = try self.emitSubPatternCheck(scrutinee_local, case.value);
-                    const saved = self.current_instrs;
-                    self.current_instrs = .empty;
+                    var frame = self.pushInstructionBuffer();
+                    errdefer frame.discardAndRestore();
                     try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, dest);
-                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                    self.current_instrs = saved;
+                    const case_body = try frame.takeOwnedSliceAndRestore();
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = check_local, .body = case_body },
                     });
@@ -10273,11 +11330,10 @@ pub const IrBuilder = struct {
                     try self.current_instrs.append(self.allocator, .{
                         .match_atom = .{ .dest = match_local, .scrutinee = scrutinee_local, .atom_name = tag_name },
                     });
-                    const saved = self.current_instrs;
-                    self.current_instrs = .empty;
+                    var frame = self.pushInstructionBuffer();
+                    errdefer frame.discardAndRestore();
                     try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, dest);
-                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                    self.current_instrs = saved;
+                    const case_body = try frame.takeOwnedSliceAndRestore();
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = match_local, .body = case_body },
                     });
@@ -10351,50 +11407,13 @@ pub const IrBuilder = struct {
                     if (coerce_to != .any) {
                         try self.known_local_types.put(elem_local, coerce_to);
                     }
-                    if (scrutinee_tuple_hir) |tuple_hir| {
-                        const tuple_typ = self.type_store.?.getType(tuple_hir);
-                        if (i < tuple_typ.tuple.elements.len) {
-                            const elem_hir = tuple_typ.tuple.elements[i];
-                            const elem_zig = typeIdToZigTypeWithStore(elem_hir, self.type_store);
-                            if (protocolConstraintIsBoxedCallable(self.type_store.?, elem_hir)) {
-                                // The boxed-`Callable` head: `List.next`/`ownElement`
-                                // hands back a FRESH owned `ProtocolBox` clone, so
-                                // the extracted element owns its inner and gets one
-                                // scope-exit `.protocol_box_drop` at its real last
-                                // use in the arm. Recorded as a boxed-existential
-                                // owner (so it is `.owned` + routed through the box
-                                // vtable drop) AND in `deep_release_owned_locals` so
-                                // the aggregate-component-release pass excludes it
-                                // (`isOwnedBoxExtraction`) — released exactly once.
-                                // Keyed on the `Callable` protocol name; the
-                                // devirtualized `Enumerable` state is never boxed.
-                                try self.local_hir_types.put(elem_local, elem_hir);
-                                if (elem_zig == .protocol_box) {
-                                    try self.known_local_types.put(elem_local, elem_zig);
-                                }
-                                try self.boxed_existential_locals.put(self.allocator, elem_local, {});
-                                try self.deep_release_owned_locals.put(self.allocator, elem_local, {});
-                            } else if (typeContainsBoxedCallable(self.type_store.?, elem_hir, 0)) {
-                                // The `next_state` tail is a container of boxed
-                                // `Callable`s (`List(Callable)`) that `List.next`/
-                                // `cloneRangeRetainingChildren` clones — owning fresh
-                                // box clones of the remaining elements. Record its
-                                // HIR/ZigType so the standard ARC machinery owns it
-                                // (`.list` is type-level ARC-managed) and its
-                                // scope-exit deep-release frees the cloned boxes.
-                                // Recorded in `deep_release_owned_locals` so the
-                                // aggregate-component-release pass excludes it (it
-                                // already has its own deep release) — freed exactly
-                                // once. Plain-data tails (`List(i64)`/`List(String)`)
-                                // have no boxed children, so this never fires for
-                                // them (`typeContainsBoxedCallable` is false).
-                                try self.local_hir_types.put(elem_local, elem_hir);
-                                if (elem_zig != .any and elem_zig != .void) {
-                                    try self.known_local_types.put(elem_local, elem_zig);
-                                }
-                                try self.deep_release_owned_locals.put(self.allocator, elem_local, {});
-                            }
-                        }
+                    const extraction_owns_fresh_component = try self.recordTupleElementExtractionMetadata(
+                        elem_local,
+                        scrutinee_tuple_hir,
+                        i,
+                    );
+                    if (!extraction_owns_fresh_component) {
+                        try self.emitArcRetainOnAggregateExtract(elem_local);
                     }
                     // audit ir-3--06: the pattern compiler always populates
                     // `element_scrutinee_ids`; require it rather than fall back
@@ -10423,8 +11442,8 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length, .element_type = elem_type, .via_helper = dispatch_via_helper },
                 });
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
                 var i: u32 = 0;
                 while (i < cl.expected_length) : (i += 1) {
                     const elem_local = self.next_local;
@@ -10450,8 +11469,7 @@ pub const IrBuilder = struct {
                     try scrutinee_map.put(cl.element_scrutinee_ids[i], elem_local);
                 }
                 try self.lowerDecisionTreeForCase(cl.success, case_arms, scrutinee_map, dest);
-                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
@@ -10478,8 +11496,8 @@ pub const IrBuilder = struct {
                         .via_helper = dispatch_via_helper,
                     },
                 });
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
                 var i: u32 = 0;
                 while (i < clc.head_count) : (i += 1) {
                     const head_local = self.next_local;
@@ -10507,8 +11525,7 @@ pub const IrBuilder = struct {
                 try self.recordListChildHirType(scrutinee_local, tail_local, .list);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
                 try self.lowerDecisionTreeForCase(clc.success, case_arms, scrutinee_map, dest);
-                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
@@ -10532,8 +11549,8 @@ pub const IrBuilder = struct {
                     condition_local = try self.emitAnd(condition_local, prefix_cond);
                 }
 
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
 
                 // Emit binary segment extraction instructions for case arm bindings.
                 // Each segment with a bind pattern needs a bin_read_int/bin_read_float/bin_slice
@@ -10541,8 +11558,7 @@ pub const IrBuilder = struct {
                 try self.emitBinarySegmentExtractions(cb.segments, scrutinee_local, case_arms);
 
                 try self.lowerDecisionTreeForCase(cb.success, case_arms, scrutinee_map, dest);
-                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = condition_local, .body = success_body },
                 });
@@ -10570,7 +11586,7 @@ pub const IrBuilder = struct {
                     self.next_local += 1;
                     const field_name = self.interner.get(fe.field_name);
                     const field_info = if (struct_type) |sname|
-                        self.fieldZigTypeAndStorage(sname, field_name)
+                        try self.fieldZigTypeAndStorage(sname, field_name)
                     else
                         null;
                     // Plumb the field's HIR type onto the destructured
@@ -10666,8 +11682,8 @@ pub const IrBuilder = struct {
                         has_key_local;
                 }
 
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
                 for (em.keys) |ke| {
                     const key_local = try self.lowerExpr(ke.key);
                     const default_local = try self.emitDefaultValueForType(value_type);
@@ -10691,8 +11707,7 @@ pub const IrBuilder = struct {
                     try scrutinee_map.put(ke.scrutinee_id, value_local);
                 }
                 try self.lowerDecisionTreeForCase(em.success, case_arms, scrutinee_map, dest);
-                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const success_body = try frame.takeOwnedSliceAndRestore();
 
                 if (presence_condition) |condition| {
                     try self.current_instrs.append(self.allocator, .{
@@ -10716,6 +11731,21 @@ pub const IrBuilder = struct {
         clauses: []const hir_mod.Clause,
         scrutinee_map: *std.AutoHashMap(u32, LocalId),
     ) anyerror!void {
+        try self.lowerDecisionTreeForDispatchWithSpan(decision, clauses, scrutinee_map, .{ .start = 0, .end = 0 });
+    }
+
+    fn lowerDecisionTreeForDispatchWithSpan(
+        self: *IrBuilder,
+        decision: *const hir_mod.Decision,
+        clauses: []const hir_mod.Clause,
+        scrutinee_map: *std.AutoHashMap(u32, LocalId),
+        span: ast.SourceSpan,
+    ) anyerror!void {
+        const budget_root = self.beginDecisionTreeLoweringBudget(span);
+        defer self.endDecisionTreeLoweringBudget(budget_root);
+        try self.enterDecisionTreeLowering();
+        defer self.leaveDecisionTreeLowering();
+
         switch (decision.*) {
             .success => |leaf| {
                 const clause = &clauses[leaf.body_index];
@@ -10747,7 +11777,7 @@ pub const IrBuilder = struct {
                         });
                         // Track fallback param's type so listElementTypeForLocal works
                         if (binding.param_index < clause.params.len) {
-                            const param_type = typeIdToZigTypeWithStore(clause.params[binding.param_index].type_id, self.type_store);
+                            const param_type = try typeIdToZigTypeWithStore(clause.params[binding.param_index].type_id, self.type_store);
                             if (param_type != .any) {
                                 try self.known_local_types.put(pl, param_type);
                             }
@@ -10823,14 +11853,13 @@ pub const IrBuilder = struct {
                 var bin_data: std.ArrayList(BinaryParamData) = .empty;
                 const bin_condition = try self.emitBinaryMatchConditions(clause, &bin_data);
                 if (bin_condition) |condition| {
-                    const inner_saved = self.current_instrs;
-                    self.current_instrs = .empty;
+                    var frame = self.pushInstructionBuffer();
+                    errdefer frame.discardAndRestore();
                     try self.emitBinaryExtractions(clause, bin_data.items);
                     try self.emitStructBindings(clause);
                     const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
                     try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
-                    const guarded_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                    self.current_instrs = inner_saved;
+                    const guarded_body = try frame.takeOwnedSliceAndRestore();
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = condition, .body = guarded_body },
                     });
@@ -10863,11 +11892,10 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{ .set_safety = false });
                 const guard_local = try self.lowerGuardExpr(guard_node.condition, scrutinee_map);
                 try self.current_instrs.append(self.allocator, .{ .set_safety = true });
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
                 try self.lowerDecisionTreeForDispatch(guard_node.success, clauses, scrutinee_map);
-                const guard_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const guard_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = guard_local, .body = guard_body },
                 });
@@ -10878,11 +11906,10 @@ pub const IrBuilder = struct {
                 for (sw.cases) |case| {
                     const skip = self.shouldSkipTypeCheck(scrutinee_local, case.value);
                     const check_local = try self.emitSubPatternCheckWithSkip(scrutinee_local, case.value, skip);
-                    const saved = self.current_instrs;
-                    self.current_instrs = .empty;
+                    var frame = self.pushInstructionBuffer();
+                    errdefer frame.discardAndRestore();
                     try self.lowerDecisionTreeForDispatch(case.next, clauses, scrutinee_map);
-                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                    self.current_instrs = saved;
+                    const case_body = try frame.takeOwnedSliceAndRestore();
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = check_local, .body = case_body },
                     });
@@ -10898,11 +11925,10 @@ pub const IrBuilder = struct {
                     try self.current_instrs.append(self.allocator, .{
                         .match_atom = .{ .dest = match_local, .scrutinee = scrutinee_local, .atom_name = tag_name },
                     });
-                    const saved = self.current_instrs;
-                    self.current_instrs = .empty;
+                    var frame = self.pushInstructionBuffer();
+                    errdefer frame.discardAndRestore();
                     try self.lowerDecisionTreeForDispatch(case.next, clauses, scrutinee_map);
-                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                    self.current_instrs = saved;
+                    const case_body = try frame.takeOwnedSliceAndRestore();
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = match_local, .body = case_body },
                     });
@@ -10928,8 +11954,8 @@ pub const IrBuilder = struct {
                             .variant_name = variant_name,
                         },
                     });
-                    const saved = self.current_instrs;
-                    self.current_instrs = .empty;
+                    var frame = self.pushInstructionBuffer();
+                    errdefer frame.discardAndRestore();
                     if (case.has_payload) {
                         const payload_local = self.next_local;
                         self.next_local += 1;
@@ -10943,8 +11969,7 @@ pub const IrBuilder = struct {
                         try scrutinee_map.put(case.payload_scrutinee_id, payload_local);
                     }
                     try self.lowerDecisionTreeForDispatch(case.next, clauses, scrutinee_map);
-                    const case_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                    self.current_instrs = saved;
+                    const case_body = try frame.takeOwnedSliceAndRestore();
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = tag_check_local, .body = case_body },
                     });
@@ -10953,13 +11978,19 @@ pub const IrBuilder = struct {
             },
             .check_tuple => |ct| {
                 const scrutinee_local = try self.resolveScrutinee(ct.scrutinee, scrutinee_map);
+                const scrutinee_tuple_hir: ?hir_mod.TypeId = blk: {
+                    const ts = self.type_store orelse break :blk null;
+                    const scrutinee_hir = self.local_hir_types.get(scrutinee_local) orelse break :blk null;
+                    if (ts.getType(scrutinee_hir) != .tuple) break :blk null;
+                    break :blk scrutinee_hir;
+                };
                 const type_check_local = self.next_local;
                 self.next_local += 1;
                 try self.current_instrs.append(self.allocator, .{
                     .match_type = .{ .dest = type_check_local, .scrutinee = scrutinee_local, .expected_type = .{ .tuple = &.{} }, .expected_arity = ct.expected_arity },
                 });
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
                 var i: u32 = 0;
                 while (i < ct.expected_arity) : (i += 1) {
                     const elem_local = self.next_local;
@@ -10967,6 +11998,14 @@ pub const IrBuilder = struct {
                     try self.current_instrs.append(self.allocator, .{
                         .index_get = .{ .dest = elem_local, .object = scrutinee_local, .index = i },
                     });
+                    const extraction_owns_fresh_component = try self.recordTupleElementExtractionMetadata(
+                        elem_local,
+                        scrutinee_tuple_hir,
+                        i,
+                    );
+                    if (!extraction_owns_fresh_component) {
+                        try self.emitArcRetainOnAggregateExtract(elem_local);
+                    }
                     // audit ir-3--06: the pattern compiler always populates
                     // `element_scrutinee_ids`; require it rather than fall back
                     // to the removed `findParamGetIdInDecision` heuristic.
@@ -10974,8 +12013,7 @@ pub const IrBuilder = struct {
                     try scrutinee_map.put(ct.element_scrutinee_ids[i], elem_local);
                 }
                 try self.lowerDecisionTreeForDispatch(ct.success, clauses, scrutinee_map);
-                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = type_check_local, .body = success_body },
                 });
@@ -10991,8 +12029,8 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .list_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .expected_len = cl.expected_length, .element_type = elem_type },
                 });
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
                 // Extract list elements into locals
                 var i: u32 = 0;
                 while (i < cl.expected_length) : (i += 1) {
@@ -11015,8 +12053,7 @@ pub const IrBuilder = struct {
                     try scrutinee_map.put(cl.element_scrutinee_ids[i], elem_local);
                 }
                 try self.lowerDecisionTreeForDispatch(cl.success, clauses, scrutinee_map);
-                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
@@ -11038,8 +12075,8 @@ pub const IrBuilder = struct {
                         .element_type = elem_type,
                     },
                 });
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
                 var i: u32 = 0;
                 while (i < clc.head_count) : (i += 1) {
                     const head_local = self.next_local;
@@ -11061,8 +12098,7 @@ pub const IrBuilder = struct {
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
 
                 try self.lowerDecisionTreeForDispatch(clc.success, clauses, scrutinee_map);
-                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
@@ -11076,8 +12112,8 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{
                     .bin_len_check = .{ .dest = len_check_local, .scrutinee = scrutinee_local, .min_len = cb.min_byte_size },
                 });
-                const saved = self.current_instrs;
-                self.current_instrs = .empty;
+                var frame = self.pushInstructionBuffer();
+                errdefer frame.discardAndRestore();
 
                 if (clauses.len > 1) {
                     // Multi-clause binary dispatch: emit per-clause guarded bodies.
@@ -11109,13 +12145,12 @@ pub const IrBuilder = struct {
                         var bin_data: std.ArrayList(BinaryParamData) = .empty;
                         const clause_condition = try self.emitBinaryMatchConditions(&clause, &bin_data);
 
-                        const inner_saved = self.current_instrs;
-                        self.current_instrs = .empty;
+                        var inner_frame = self.pushInstructionBuffer();
+                        errdefer inner_frame.discardAndRestore();
                         try self.emitBinaryExtractions(&clause, bin_data.items);
                         const result_local = try self.lowerBlockExpecting(clause.body, clause.return_type);
                         try self.current_instrs.append(self.allocator, .{ .ret = .{ .value = result_local } });
-                        const clause_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                        self.current_instrs = inner_saved;
+                        const clause_body = try inner_frame.takeOwnedSliceAndRestore();
 
                         if (clause_condition) |cond| {
                             try self.current_instrs.append(self.allocator, .{
@@ -11134,8 +12169,7 @@ pub const IrBuilder = struct {
                     try self.lowerDecisionTreeForDispatch(cb.success, clauses, scrutinee_map);
                 }
 
-                const success_body = try self.current_instrs.toOwnedSlice(self.allocator);
-                self.current_instrs = saved;
+                const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
@@ -11167,7 +12201,7 @@ pub const IrBuilder = struct {
                     self.next_local += 1;
                     const field_name = self.interner.get(fe.field_name);
                     const field_info = if (struct_type) |sname|
-                        self.fieldZigTypeAndStorage(sname, field_name)
+                        try self.fieldZigTypeAndStorage(sname, field_name)
                     else
                         null;
                     // See parallel comment in lowerDecisionTreeForCase's
@@ -11335,7 +12369,7 @@ pub const IrBuilder = struct {
                         .op = ir_op,
                         .lhs = lhs,
                         .rhs = rhs,
-                        .result_type = self.binaryResultZigType(expr.type_id, lhs, rhs),
+                        .result_type = try self.binaryResultZigType(expr.type_id, lhs, rhs),
                     },
                 });
                 if (bin.op == .not_in_op) {
@@ -11483,7 +12517,7 @@ pub const IrBuilder = struct {
                 .expr => |expr| {
                     const saved_expected_type = self.current_expected_type;
                     if (stmt_index + 1 == block.stmts.len) {
-                        if (self.usableContextType(block.result_type)) |block_result_type| {
+                        if (try self.usableContextType(block.result_type)) |block_result_type| {
                             // The tail expression's expected type is normally
                             // the block's own inferred `result_type`. But when
                             // the block was entered via `lowerBlockExpecting`
@@ -11507,8 +12541,8 @@ pub const IrBuilder = struct {
                             // resolve to it (`u8`) and carry a concrete hint.
                             const keep_outer_integer = blk: {
                                 const outer = self.current_expected_type orelse break :blk false;
-                                const outer_zig = typeIdToZigTypeWithStore(outer, self.type_store);
-                                const block_zig = typeIdToZigTypeWithStore(block_result_type, self.type_store);
+                                const outer_zig = try typeIdToZigTypeWithStore(outer, self.type_store);
+                                const block_zig = try typeIdToZigTypeWithStore(block_result_type, self.type_store);
                                 break :blk isConcreteIntegerZigType(outer_zig) and
                                     isConcreteIntegerZigType(block_zig) and
                                     outer != block_result_type;
@@ -11517,6 +12551,8 @@ pub const IrBuilder = struct {
                                 self.current_expected_type = block_result_type;
                             }
                         }
+                    } else {
+                        self.current_expected_type = null;
                     }
                     defer self.current_expected_type = saved_expected_type;
                     last_local = try self.lowerExpr(expr);
@@ -11539,7 +12575,7 @@ pub const IrBuilder = struct {
                     // rather than the leaked return type.
                     const val = blk: {
                         const saved_expected_type = self.current_expected_type;
-                        self.current_expected_type = if (self.usableContextType(ls.value.type_id)) |usable_type_id|
+                        self.current_expected_type = if (try self.usableContextType(ls.value.type_id)) |usable_type_id|
                             usable_type_id
                         else
                             null;
@@ -11552,32 +12588,7 @@ pub const IrBuilder = struct {
                             .local_set = .{ .dest = ls.index, .value = val },
                         });
                     }
-                    // Propagate type from value to assignment target
-                    if (self.known_local_types.get(val)) |src_type| {
-                        try self.known_local_types.put(ls.index, src_type);
-                    }
-                    // Propagate HIR type as well so subsequent `.local_get`
-                    // sites reading `ls.index` know whether the value is
-                    // ARC-managed and need a retain on alias.
-                    if (self.local_hir_types.get(val)) |src_hir_type| {
-                        try self.local_hir_types.put(ls.index, src_hir_type);
-                    }
-                    // Gap E — propagate the materialized-closure-value marker
-                    // from the RHS into the binding local, so a later
-                    // `call_closure` whose callee is `local_get(name)`
-                    // recognises `name = make(); name()` as a bare-fn-ptr
-                    // call (direct `call_ref`).
-                    if (self.materialized_closure_locals.contains(val)) {
-                        try self.materialized_closure_locals.put(self.allocator, ls.index, {});
-                    }
-                    // FCC Phase 2 — propagate the boxed-existential owner
-                    // marker from the RHS into the binding local, so
-                    // `add5 = make_adder(5)` (RHS is the box-returning call's
-                    // result) marks `add5` as a box owner needing a
-                    // scope-exit `.protocol_box_drop`.
-                    if (self.boxed_existential_locals.contains(val)) {
-                        try self.boxed_existential_locals.put(self.allocator, ls.index, {});
-                    }
+                    try self.recordLocalSetAliasMetadata(ls.index, val);
                     // Phase 0 — DWARF foundation: record the Zap source
                     // identifier for this local so the ZIR backend can
                     // emit a `dbg_var_val`, preserving the name into
@@ -11612,7 +12623,7 @@ pub const IrBuilder = struct {
     ) anyerror!?LocalId {
         const saved_expected_type = self.current_expected_type;
         if (expected_type) |type_id| {
-            if (self.usableContextType(type_id)) |usable_type_id| {
+            if (try self.usableContextType(type_id)) |usable_type_id| {
                 self.current_expected_type = usable_type_id;
             }
         }
@@ -11645,7 +12656,7 @@ pub const IrBuilder = struct {
         //     result already a box) and abort-tailed bodies.
         if (result) |result_local| {
             if (expected_type) |type_id| {
-                const expected_zig = typeIdToZigTypeWithStore(type_id, self.type_store);
+                const expected_zig = try typeIdToZigTypeWithStore(type_id, self.type_store);
                 if (expected_zig == .protocol_box) {
                     const tail_hir = self.local_hir_types.get(result_local) orelse types_mod.TypeStore.UNKNOWN;
                     if (tail_hir == types_mod.TypeStore.NEVER) {
@@ -11709,6 +12720,58 @@ pub const IrBuilder = struct {
         }
     }
 
+    /// Propagate a tuple slot's HIR/Zig metadata onto an `index_get` result
+    /// emitted by decision-tree case lowering.
+    ///
+    /// Unlike `tuple_index_get` expressions and parameter tuple bindings, the
+    /// decision-tree `check_tuple` path allocates element locals manually, so
+    /// it must explicitly stamp each extracted local before ARC ownership is
+    /// computed. The returned flag is true for the existing boxed-Callable
+    /// fresh-owner carve-out: those components are already independently owned
+    /// and must be excluded from aggregate component releases rather than
+    /// receiving the ordinary `index_get` retain.
+    fn recordTupleElementExtractionMetadata(
+        self: *IrBuilder,
+        elem_local: LocalId,
+        maybe_tuple_hir: ?hir_mod.TypeId,
+        element_index: u32,
+    ) !bool {
+        const tuple_hir = maybe_tuple_hir orelse return false;
+        const ts = self.type_store orelse return false;
+        const tuple_type = ts.getType(tuple_hir);
+        if (tuple_type != .tuple) return false;
+        if (element_index >= tuple_type.tuple.elements.len) return false;
+
+        const elem_hir = tuple_type.tuple.elements[element_index];
+        const elem_zig = try typeIdToZigTypeWithStore(elem_hir, self.type_store);
+        try self.local_hir_types.put(elem_local, elem_hir);
+        if (elem_zig != .any and elem_zig != .void) {
+            try self.known_local_types.put(elem_local, elem_zig);
+        }
+
+        if (protocolConstraintIsBoxedCallable(ts, elem_hir)) {
+            // The boxed-`Callable` head: `List.next`/`ownElement` hands back a
+            // fresh owned `ProtocolBox` clone. It owns its inner and gets one
+            // scope-exit `.protocol_box_drop`; the parent tuple must not also
+            // release the same component.
+            if (elem_zig == .protocol_box) {
+                try self.boxed_existential_locals.put(self.allocator, elem_local, {});
+            }
+            try self.deep_release_owned_locals.put(self.allocator, elem_local, {});
+            return true;
+        }
+
+        if (typeContainsBoxedCallable(ts, elem_hir, 0)) {
+            // Containers of boxed `Callable`s returned by iterator `next`
+            // contain fresh owned clones of eagerly-freed boxed children. Their
+            // normal scope-exit deep release is the only component release.
+            try self.deep_release_owned_locals.put(self.allocator, elem_local, {});
+            return true;
+        }
+
+        return false;
+    }
+
     fn isArcManagedType(self: *const IrBuilder, type_id: hir_mod.TypeId) bool {
         const store = self.type_store orelse return false;
         // Phase F flip: `.map` joined `.opaque_type` as ARC-managed.
@@ -11746,8 +12809,25 @@ pub const IrBuilder = struct {
         if (self.boxed_existential_locals.contains(local) and self.localZigTypeIsBox(local)) {
             return true;
         }
+        if (self.localIsParamBackedBoxedCallable(local)) {
+            return true;
+        }
         const hir_type = self.local_hir_types.get(local) orelse return false;
         return self.isArcManagedType(hir_type);
+    }
+
+    fn localIsParamBackedBoxedCallable(self: *const IrBuilder, local: LocalId) bool {
+        if (!self.param_backed_locals.contains(local)) return false;
+        const zig_type = self.known_local_types.get(local) orelse return false;
+        return self.zigTypeIsBoxedCallable(zig_type);
+    }
+
+    fn localHasVoidLikeType(self: *const IrBuilder, local: LocalId) TypeWalkError!bool {
+        if (self.known_local_types.get(local)) |zig_type| {
+            if (isVoidLikeZigType(zig_type)) return true;
+        }
+        const hir_type = self.local_hir_types.get(local) orelse return false;
+        return isVoidLikeZigType((try typeIdToZigTypeWithStore(hir_type, self.type_store)));
     }
 
     /// FCC Phase 2 — true iff `local`'s tracked ZigType is `.protocol_box`
@@ -11840,8 +12920,45 @@ pub const IrBuilder = struct {
 
     fn defaultParamConventionForParam(self: *const IrBuilder, param: Param) ParamConvention {
         const hir_convention = defaultParamConvention(self.type_store, param.type_id);
+        if (param.ownership_explicit) {
+            const has_managed_runtime = hir_convention != .trivial or
+                self.isArcManagedZigType(param.type_expr) or
+                self.zigTypeIsBoxedCallable(param.type_expr);
+            switch (param.ownership) {
+                .unique => return if (has_managed_runtime or self.paramTypeIsProtocolConstraint(param) or self.paramIsErasedAny(param)) .owned else .trivial,
+                .borrowed => return if (has_managed_runtime) .borrowed else .trivial,
+                .shared => {},
+            }
+        }
         if (hir_convention != .trivial) return hir_convention;
+        if (self.zigTypeIsBoxedCallable(param.type_expr)) return .borrowed;
         return if (self.isArcManagedZigType(param.type_expr)) .borrowed else .trivial;
+    }
+
+    fn paramHasExplicitUniqueOwnershipUnit(self: *const IrBuilder, param: Param) bool {
+        if (!param.ownership_explicit or param.ownership != .unique) return false;
+        const hir_convention = defaultParamConvention(self.type_store, param.type_id);
+        return hir_convention != .trivial or
+            self.isArcManagedZigType(param.type_expr) or
+            self.zigTypeIsBoxedCallable(param.type_expr) or
+            self.typeIdIsProtocolConstraint(param.type_id) or
+            self.paramIsErasedAny(param);
+    }
+
+    fn paramTypeIsProtocolConstraint(self: *const IrBuilder, param: Param) bool {
+        return self.typeIdIsProtocolConstraint(param.type_id);
+    }
+
+    fn paramIsErasedAny(self: *const IrBuilder, param: Param) bool {
+        _ = self;
+        return param.type_id == null and param.type_expr == .any;
+    }
+
+    fn typeIdIsProtocolConstraint(self: *const IrBuilder, maybe_type_id: ?types_mod.TypeId) bool {
+        const type_id = maybe_type_id orelse return false;
+        const ts = self.type_store orelse return false;
+        if (type_id >= ts.types.items.len) return false;
+        return ts.getType(type_id) == .protocol_constraint;
     }
 
     /// Phase 1.2.5.d helper: true iff the scope graph carries a
@@ -11861,8 +12978,7 @@ pub const IrBuilder = struct {
         const graph = self.scope_graph orelse return false;
         for (graph.protocols.items) |proto_entry| {
             if (proto_entry.decl.type_params.len != 0) continue;
-            const text = self.protocolNameToString(proto_entry.name);
-            if (std.mem.eql(u8, text, protocol_name_text)) return true;
+            if (self.protocolNameEqualsText(proto_entry.name, protocol_name_text)) return true;
         }
         return false;
     }
@@ -11960,7 +13076,7 @@ pub const IrBuilder = struct {
     /// Returns `null` for type variables and names the store cannot
     /// resolve (those are not concrete instantiations that need a
     /// per-instantiation TypeDef).
-    fn resolveConcreteAppliedTypeId(self: *IrBuilder, type_expr: *const ast.TypeExpr) ?types_mod.TypeId {
+    fn resolveConcreteAppliedTypeId(self: *IrBuilder, type_expr: *const ast.TypeExpr) TypeWalkError!?types_mod.TypeId {
         const store_const = self.type_store orelse return null;
         switch (type_expr.*) {
             .name => |name_expr| {
@@ -11984,12 +13100,18 @@ pub const IrBuilder = struct {
                 var arg_ids = std.ArrayListUnmanaged(types_mod.TypeId).empty;
                 defer arg_ids.deinit(self.allocator);
                 for (name_expr.args) |arg| {
-                    const arg_id = self.resolveConcreteAppliedTypeId(arg) orelse return null;
-                    arg_ids.append(self.allocator, arg_id) catch return null;
+                    const arg_id = (try self.resolveConcreteAppliedTypeId(arg)) orelse return null;
+                    try arg_ids.append(self.allocator, arg_id);
                 }
-                const owned_args = arg_ids.toOwnedSlice(self.allocator) catch return null;
+                const owned_args = try arg_ids.toOwnedSlice(self.allocator);
+                errdefer self.allocator.free(owned_args);
                 const store = @constCast(store_const);
-                return store.addType(.{ .applied = .{ .base = base_id, .args = owned_args } }) catch null;
+                const previous_type_count = store.types.items.len;
+                const applied_type_id = try store.addType(.{ .applied = .{ .base = base_id, .args = owned_args } });
+                if (applied_type_id < previous_type_count) {
+                    self.allocator.free(owned_args);
+                }
+                return applied_type_id;
             },
             else => return null,
         }
@@ -12013,18 +13135,18 @@ pub const IrBuilder = struct {
     /// makes both paths emit the same per-instantiation modules for every
     /// type a protocol vtable signature names, independent of how the
     /// TypeStore was otherwise populated.
-    fn internProtocolSignatureInstantiations(self: *IrBuilder) void {
+    fn internProtocolSignatureInstantiations(self: *IrBuilder) TypeWalkError!void {
         const graph = self.scope_graph orelse return;
         for (graph.protocols.items) |proto_entry| {
             if (proto_entry.decl.type_params.len != 0) continue;
             for (proto_entry.decl.functions) |fn_sig| {
                 for (fn_sig.params) |param| {
                     if (param.type_annotation) |annotation| {
-                        _ = self.resolveConcreteAppliedTypeId(annotation);
+                        _ = try self.resolveConcreteAppliedTypeId(annotation);
                     }
                 }
                 if (fn_sig.return_type) |return_type| {
-                    _ = self.resolveConcreteAppliedTypeId(return_type);
+                    _ = try self.resolveConcreteAppliedTypeId(return_type);
                 }
             }
         }
@@ -12041,7 +13163,7 @@ pub const IrBuilder = struct {
             // for them would either alias a concrete instantiation
             // (silent name collision) or carry type_var-shaped fields
             // (illegal at the ZIR layer).
-            if (containsUnresolvedTypeVarForSpecialization(store, @intCast(candidate_index))) continue;
+            if (try containsUnresolvedTypeVarForSpecialization(store, @intCast(candidate_index))) continue;
 
             // The applied base must resolve to a nominal struct /
             // tagged_union. Anything else is a malformed applied
@@ -12126,14 +13248,14 @@ pub const IrBuilder = struct {
             // never reach the closure boxing path.
             if (impl_entry.decl.type_params.len != 0) continue;
 
-            const mangled_proto = self.mangledParametricProtocolName(
+            const mangled_proto = (try self.mangledParametricProtocolName(
                 proto_entry,
                 impl_entry.decl.protocol_type_args,
-            ) orelse continue;
+            )) orelse continue;
             defer self.allocator.free(mangled_proto);
-            // `protocolNameToString` returns interner-backed memory for a
-            // single-part name (the `__closure_N` common case), never freed.
-            const target_name = self.protocolNameToString(impl_entry.target_type);
+            const target_name_prefix = try self.protocolNamePrefix(impl_entry.target_type);
+            defer target_name_prefix.deinit(self.allocator);
+            const target_name = target_name_prefix.bytes();
 
             const gop = try self.callable_instantiation_raises.getOrPut(mangled_proto);
             if (!gop.found_existing) {
@@ -12146,7 +13268,7 @@ pub const IrBuilder = struct {
             for (proto_entry.decl.functions, 0..) |fn_sig, method_index| {
                 const method_name = self.interner.get(fn_sig.name);
                 const arity: u32 = @intCast(fn_sig.params.len);
-                if (self.implMethodRaises(target_name, method_name, arity)) {
+                if (try self.implMethodRaises(target_name, method_name, arity)) {
                     gop.value_ptr.*[method_index] = true;
                 }
             }
@@ -12205,7 +13327,9 @@ pub const IrBuilder = struct {
         for (graph.protocols.items) |proto_entry| {
             if (proto_entry.decl.type_params.len != 0) continue;
 
-            const protocol_name = self.protocolNameToString(proto_entry.name);
+            const protocol_name_prefix = try self.protocolNamePrefix(proto_entry.name);
+            defer protocol_name_prefix.deinit(self.allocator);
+            const protocol_name = protocol_name_prefix.bytes();
             const vtable_type_name = try std.fmt.allocPrint(
                 self.allocator,
                 "{s}VTable",
@@ -12224,10 +13348,10 @@ pub const IrBuilder = struct {
                 const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
                 if (extra_count > 0) {
                     for (fn_sig.params[1..], 0..) |param, param_index| {
-                        extra_param_types[param_index] = self.protocolParamTypeToZigType(param.type_annotation);
+                        extra_param_types[param_index] = try self.protocolParamTypeToZigType(param.type_annotation);
                     }
                 }
-                const return_zig_type = self.protocolReturnTypeToZigType(fn_sig.return_type);
+                const return_zig_type = try self.protocolReturnTypeToZigType(fn_sig.return_type);
                 methods[method_index] = .{
                     .name = try cloneBytes(self.allocator, method_name),
                     .arity = arity,
@@ -12279,8 +13403,12 @@ pub const IrBuilder = struct {
             // type arguments). Skip them in this bare-protocol pass.
             if (proto_entry.decl.type_params.len != 0) continue;
 
-            const protocol_name = self.protocolNameToString(proto_entry.name);
-            const declared_target_name = self.protocolNameToString(impl_entry.target_type);
+            const protocol_name_prefix = try self.protocolNamePrefix(proto_entry.name);
+            defer protocol_name_prefix.deinit(self.allocator);
+            const protocol_name = protocol_name_prefix.bytes();
+            const declared_target_name_prefix = try self.protocolNamePrefix(impl_entry.target_type);
+            defer declared_target_name_prefix.deinit(self.allocator);
+            const declared_target_name = declared_target_name_prefix.bytes();
 
             if (impl_entry.decl.type_params.len == 0) {
                 // Concrete-target impl — Phase 1.2.5.a's path.
@@ -12337,7 +13465,13 @@ pub const IrBuilder = struct {
         // lockstep with the dispatch-site unwrap decision (single source of
         // truth — no recomputation, no drift).
         var emitted_parametric_vtables = std.StringHashMap(void).init(self.allocator);
-        defer emitted_parametric_vtables.deinit();
+        defer {
+            var emitted_key_iter = emitted_parametric_vtables.keyIterator();
+            while (emitted_key_iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+            emitted_parametric_vtables.deinit();
+        }
         for (graph.impls.items) |impl_entry| {
             const proto_entry = graph.findProtocol(impl_entry.protocol_name) orelse continue;
             if (proto_entry.decl.type_params.len == 0) continue; // bare protocol: handled above
@@ -12347,17 +13481,24 @@ pub const IrBuilder = struct {
             // `__closure_N` and hand-written concrete impls).
             if (impl_entry.decl.type_params.len != 0) continue;
 
-            const mangled_proto = self.mangledParametricProtocolName(
+            const mangled_proto = (try self.mangledParametricProtocolName(
                 proto_entry,
                 impl_entry.decl.protocol_type_args,
-            ) orelse continue;
-            const target_name = self.protocolNameToString(impl_entry.target_type);
+            )) orelse continue;
+            defer self.allocator.free(mangled_proto);
+            const target_name_prefix = try self.protocolNamePrefix(impl_entry.target_type);
+            defer target_name_prefix.deinit(self.allocator);
+            const target_name = target_name_prefix.bytes();
 
             const raises_row: ?[]const bool = self.callable_instantiation_raises.get(mangled_proto);
 
             // Emit the per-instantiation vtable struct once.
             if (!emitted_parametric_vtables.contains(mangled_proto)) {
-                try emitted_parametric_vtables.put(mangled_proto, {});
+                {
+                    const emitted_key = try cloneBytes(self.allocator, mangled_proto);
+                    errdefer self.allocator.free(emitted_key);
+                    try emitted_parametric_vtables.put(emitted_key, {});
+                }
                 try self.emitParametricProtocolVTableDef(
                     type_defs,
                     proto_entry,
@@ -12391,9 +13532,23 @@ pub const IrBuilder = struct {
         target_name: []const u8,
         method_name: []const u8,
         arity: u32,
-    ) bool {
+    ) !bool {
         const store = self.type_store orelse return false;
-        return store.functionRaises(target_name, method_name, arity);
+        return try store.functionRaises(target_name, method_name, arity);
+    }
+
+    fn mangledNameForProtocolArg(
+        self: *IrBuilder,
+        arg: *const ast.TypeExpr,
+    ) TypeWalkError!?[]const u8 {
+        const arg_zig = try self.astTypeExprToZigTypeForProtocol(arg);
+        return mangledNameForArgZigType(self.allocator, arg_zig) catch |err| switch (err) {
+            error.IrStructuralBudgetExceeded => {
+                try self.reportIrStructuralBudgetExceeded(.zig_type_mangling, arg.getMeta().span);
+                return error.IrStructuralBudgetExceeded;
+            },
+            else => return err,
+        };
     }
 
     /// Compose the per-instantiation mangled name for a parametric
@@ -12406,18 +13561,19 @@ pub const IrBuilder = struct {
         self: *IrBuilder,
         proto_entry: *const scope_mod.ProtocolEntry,
         protocol_type_args: []const *const ast.TypeExpr,
-    ) ?[]const u8 {
-        const proto_name = self.protocolNameToString(proto_entry.name);
+    ) TypeWalkError!?[]const u8 {
+        const proto_name_prefix = try self.protocolNamePrefix(proto_entry.name);
+        defer proto_name_prefix.deinit(self.allocator);
+        const proto_name = proto_name_prefix.bytes();
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
-        buf.appendSlice(self.allocator, proto_name) catch return null;
+        try buf.appendSlice(self.allocator, proto_name);
         for (protocol_type_args) |arg| {
-            buf.append(self.allocator, '_') catch return null;
-            const arg_zig = self.astTypeExprToZigTypeForProtocol(arg);
-            const arg_name = mangledNameForArgZigType(self.allocator, arg_zig) orelse return null;
-            buf.appendSlice(self.allocator, arg_name) catch return null;
+            try buf.append(self.allocator, '_');
+            const arg_name = (try self.mangledNameForProtocolArg(arg)) orelse return null;
+            try buf.appendSlice(self.allocator, arg_name);
         }
-        return buf.toOwnedSlice(self.allocator) catch null;
+        return try buf.toOwnedSlice(self.allocator);
     }
 
     /// Emit a `protocol_vtable_def` for a parametric protocol
@@ -12442,7 +13598,7 @@ pub const IrBuilder = struct {
             const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
             if (extra_count > 0) {
                 for (fn_sig.params[1..], 0..) |param, param_index| {
-                    extra_param_types[param_index] = self.protocolMethodTypeWithFormals(
+                    extra_param_types[param_index] = try self.protocolMethodTypeWithFormals(
                         param.type_annotation,
                         proto_entry.decl.type_params,
                         protocol_type_args,
@@ -12450,7 +13606,7 @@ pub const IrBuilder = struct {
                     );
                 }
             }
-            const return_zig_type = self.protocolMethodTypeWithFormals(
+            const return_zig_type = try self.protocolMethodTypeWithFormals(
                 fn_sig.return_type,
                 proto_entry.decl.type_params,
                 protocol_type_args,
@@ -12505,7 +13661,7 @@ pub const IrBuilder = struct {
             const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
             if (extra_count > 0) {
                 for (fn_sig.params[1..], 0..) |param, param_index| {
-                    extra_param_types[param_index] = self.protocolMethodTypeWithFormals(
+                    extra_param_types[param_index] = try self.protocolMethodTypeWithFormals(
                         param.type_annotation,
                         proto_entry.decl.type_params,
                         protocol_type_args,
@@ -12513,7 +13669,7 @@ pub const IrBuilder = struct {
                     );
                 }
             }
-            const return_zig_type = self.protocolMethodTypeWithFormals(
+            const return_zig_type = try self.protocolMethodTypeWithFormals(
                 fn_sig.return_type,
                 proto_entry.decl.type_params,
                 protocol_type_args,
@@ -12556,7 +13712,7 @@ pub const IrBuilder = struct {
         formal_names: []const ast.StringId,
         protocol_type_args: []const *const ast.TypeExpr,
         fallback: ZigType,
-    ) ZigType {
+    ) TypeWalkError!ZigType {
         const ann = type_annotation orelse return fallback;
         // A bare reference to a formal type-param name resolves to the
         // matching concrete type argument. A lowercase formal (`args`,
@@ -12564,10 +13720,10 @@ pub const IrBuilder = struct {
         // as a nullary `.name`. `formalTypeParamIndex` handles both.
         if (formalTypeParamIndex(ann, formal_names)) |idx| {
             if (idx < protocol_type_args.len) {
-                return self.astTypeExprToZigTypeForProtocol(protocol_type_args[idx]);
+                return try self.astTypeExprToZigTypeForProtocol(protocol_type_args[idx]);
             }
         }
-        return self.astTypeExprToZigTypeForProtocol(ann);
+        return try self.astTypeExprToZigTypeForProtocol(ann);
     }
 
     /// If `type_expr` is a bare reference to one of `formal_names` (a
@@ -12642,10 +13798,10 @@ pub const IrBuilder = struct {
             const extra_param_types = try self.allocator.alloc(ZigType, extra_count);
             if (extra_count > 0) {
                 for (proto_fn_sig.params[1..], 0..) |param, param_index| {
-                    extra_param_types[param_index] = self.protocolParamTypeToZigType(param.type_annotation);
+                    extra_param_types[param_index] = try self.protocolParamTypeToZigType(param.type_annotation);
                 }
             }
-            const return_zig_type = self.protocolReturnTypeToZigType(proto_fn_sig.return_type);
+            const return_zig_type = try self.protocolReturnTypeToZigType(proto_fn_sig.return_type);
             methods[method_index] = .{
                 .method_name = try cloneBytes(self.allocator, method_name),
                 .impl_function_name = impl_function_name,
@@ -12665,16 +13821,71 @@ pub const IrBuilder = struct {
         });
     }
 
-    /// Convert a `StructName` from the scope graph into a flat
-    /// string suitable for use as a vtable name prefix or target
-    /// suffix. Single-segment names (the common case for protocols
-    /// and impl targets) return the leaf; multi-segment names join
-    /// with `_` to keep the result a valid Zig identifier without
-    /// re-running the per-segment mangler.
-    fn protocolNameToString(self: *const IrBuilder, name: ast.StructName) []const u8 {
-        if (name.parts.len == 1) return self.interner.get(name.parts[0]);
-        return name.joinedWith(self.allocator, self.interner, "_") catch
-            self.interner.get(name.parts[name.parts.len - 1]);
+    const ProtocolNamePrefix = union(enum) {
+        borrowed: []const u8,
+        owned: []const u8,
+
+        fn bytes(self: ProtocolNamePrefix) []const u8 {
+            return switch (self) {
+                .borrowed => |value| value,
+                .owned => |value| value,
+            };
+        }
+
+        fn deinit(self: ProtocolNamePrefix, allocator: std.mem.Allocator) void {
+            switch (self) {
+                .borrowed => {},
+                .owned => |value| allocator.free(value),
+            }
+        }
+    };
+
+    /// Convert a `StructName` from the scope graph into a flat string suitable
+    /// for use as a vtable name prefix or target suffix. Single-segment names
+    /// borrow the interned leaf; multi-segment names allocate an `_`-joined
+    /// prefix owned by the returned wrapper.
+    fn protocolNamePrefix(
+        self: *const IrBuilder,
+        name: ast.StructName,
+    ) std.mem.Allocator.Error!ProtocolNamePrefix {
+        if (name.parts.len == 0) return .{ .borrowed = "" };
+        if (name.parts.len == 1) return .{ .borrowed = self.interner.get(name.parts[0]) };
+        return .{ .owned = try name.joinedWith(self.allocator, self.interner, "_") };
+    }
+
+    fn protocolNameEqualsText(self: *const IrBuilder, name: ast.StructName, text: []const u8) bool {
+        const matched_len = self.protocolNamePrefixLengthInText(name, text) orelse return false;
+        return matched_len == text.len;
+    }
+
+    fn protocolNameFamilyPrefixLength(
+        self: *const IrBuilder,
+        name: ast.StructName,
+        family_name: []const u8,
+    ) ?usize {
+        const matched_len = self.protocolNamePrefixLengthInText(name, family_name) orelse return null;
+        if (matched_len == family_name.len) return matched_len;
+        if (family_name[matched_len] == '_') return matched_len;
+        return null;
+    }
+
+    fn protocolNamePrefixLengthInText(
+        self: *const IrBuilder,
+        name: ast.StructName,
+        text: []const u8,
+    ) ?usize {
+        var offset: usize = 0;
+        if (name.parts.len == 0) return if (text.len == 0) 0 else null;
+        for (name.parts, 0..) |part, part_index| {
+            if (part_index > 0) {
+                if (offset >= text.len or text[offset] != '_') return null;
+                offset += 1;
+            }
+            const part_text = self.interner.get(part);
+            if (!std.mem.startsWith(u8, text[offset..], part_text)) return null;
+            offset += part_text.len;
+        }
+        return offset;
     }
 
     /// Phase 1.2.5.d consumption-site dispatch helper. Look up the
@@ -12694,8 +13905,8 @@ pub const IrBuilder = struct {
         self: *IrBuilder,
         protocol_name_text: []const u8,
         method_name_text: []const u8,
-    ) ?ProtocolMethodSlot {
-        return self.findProtocolMethodSlotForReceiver(
+    ) TypeWalkError!?ProtocolMethodSlot {
+        return try self.findProtocolMethodSlotForReceiver(
             protocol_name_text,
             method_name_text,
             types_mod.TypeStore.UNKNOWN,
@@ -12729,7 +13940,7 @@ pub const IrBuilder = struct {
         // the HIR type. Only a `.protocol_box` whose family is `Callable`
         // routes through the box vtable.
         const callee_zig = self.known_local_types.get(callee_local) orelse
-            typeIdToZigTypeWithStore(callee.type_id, self.type_store);
+            try typeIdToZigTypeWithStore(callee.type_id, self.type_store);
         if (callee_zig != .protocol_box) return false;
         const box_name = callee_zig.protocol_box;
         const base_protocol = self.baseProtocolName(box_name);
@@ -12777,14 +13988,14 @@ pub const IrBuilder = struct {
         if (type_params.len < 2) return false;
         const args_tuple_type_id = type_params[0];
 
-        const slot = self.findProtocolMethodSlotForReceiver("Callable", "call", callable_type_id) orelse return false;
+        const slot = (try self.findProtocolMethodSlotForReceiver("Callable", "call", callable_type_id)) orelse return false;
 
         // Pack the call arguments into the `args` tuple. A zero-arg closure
         // packs the canonical empty tuple `{}` (a zero-element `tuple_init`).
         const tuple_local = self.next_local;
         self.next_local += 1;
         const tuple_elements = try self.allocator.dupe(LocalId, arg_locals);
-        const tuple_zig = typeIdToZigTypeWithStore(args_tuple_type_id, self.type_store);
+        const tuple_zig = try typeIdToZigTypeWithStore(args_tuple_type_id, self.type_store);
         const component_types: ?[]const ZigType = if (tuple_zig == .tuple and tuple_zig.tuple.len == arg_locals.len)
             try self.allocator.dupe(ZigType, tuple_zig.tuple)
         else
@@ -12836,7 +14047,7 @@ pub const IrBuilder = struct {
         const payload_zig = if (slot.return_type != .any and slot.return_type != .void)
             slot.return_type
         else
-            typeIdToZigTypeWithStore(type_params[1], self.type_store);
+            try typeIdToZigTypeWithStore(type_params[1], self.type_store);
         try self.emitBoxedCallableRaisesUnwrap(dest, box_name, slot.method_index, payload_zig);
         return true;
     }
@@ -12902,10 +14113,12 @@ pub const IrBuilder = struct {
         protocol_name_text: []const u8,
         method_name_text: []const u8,
         receiver_type_id: hir_mod.TypeId,
-    ) ?ProtocolMethodSlot {
+    ) TypeWalkError!?ProtocolMethodSlot {
         const graph = self.scope_graph orelse return null;
         for (graph.protocols.items) |proto_entry| {
-            const proto_text = self.protocolNameToString(proto_entry.name);
+            const proto_text_prefix = try self.protocolNamePrefix(proto_entry.name);
+            defer proto_text_prefix.deinit(self.allocator);
+            const proto_text = proto_text_prefix.bytes();
             if (!std.mem.eql(u8, proto_text, protocol_name_text)) continue;
 
             // Concrete type arguments carried by the receiver existential
@@ -12924,9 +14137,17 @@ pub const IrBuilder = struct {
                 const fn_name = self.interner.get(fn_sig.name);
                 if (!std.mem.eql(u8, fn_name, method_name_text)) continue;
                 const return_zig_type = if (proto_entry.decl.type_params.len == 0)
-                    self.protocolReturnTypeToZigType(fn_sig.return_type)
+                    try self.protocolReturnTypeToZigType(fn_sig.return_type)
                 else
-                    self.protocolReturnTypeWithFormalTypeIds(
+                    try self.protocolReturnTypeWithFormalTypeIds(
+                        fn_sig.return_type,
+                        proto_entry.decl.type_params,
+                        receiver_type_args,
+                    );
+                const return_type_id = if (proto_entry.decl.type_params.len == 0)
+                    try self.protocolReturnTypeId(fn_sig.return_type)
+                else
+                    try self.protocolReturnTypeIdWithFormalTypeIds(
                         fn_sig.return_type,
                         proto_entry.decl.type_params,
                         receiver_type_args,
@@ -12935,6 +14156,7 @@ pub const IrBuilder = struct {
                     .method_index = @intCast(idx),
                     .arity = @intCast(fn_sig.params.len),
                     .return_type = return_zig_type,
+                    .return_type_id = return_type_id,
                 };
             }
             return null;
@@ -12950,14 +14172,45 @@ pub const IrBuilder = struct {
         return_type: ?*const ast.TypeExpr,
         formal_names: []const ast.StringId,
         receiver_type_args: []const hir_mod.TypeId,
-    ) ZigType {
+    ) TypeWalkError!ZigType {
         const ret = return_type orelse return .void;
         if (formalTypeParamIndex(ret, formal_names)) |idx| {
             if (idx < receiver_type_args.len) {
-                return typeIdToZigTypeWithStore(receiver_type_args[idx], self.type_store);
+                return normalizeProtocolReturnZigType(try typeIdToZigTypeWithStore(receiver_type_args[idx], self.type_store));
             }
         }
-        return self.protocolReturnTypeToZigType(ret);
+        return try self.protocolReturnTypeToZigType(ret);
+    }
+
+    /// Resolve a protocol method's return type to the HIR TypeId used by
+    /// ownership classification. The vtable ABI still uses `ZigType`, but
+    /// result locals must also carry the HIR type so ARC drop insertion knows
+    /// whether the dispatch result owns a runtime cell. Returns null when the
+    /// annotation is not a concrete type expression this IR-side resolver can
+    /// name; callers then keep their existing expression-derived fallback.
+    fn protocolReturnTypeId(
+        self: *IrBuilder,
+        return_type: ?*const ast.TypeExpr,
+    ) TypeWalkError!?types_mod.TypeId {
+        const ret = return_type orelse return types_mod.TypeStore.VOID;
+        return try self.resolveConcreteAppliedTypeId(ret);
+    }
+
+    /// HIR-TypeId counterpart of `protocolReturnTypeWithFormalTypeIds`.
+    /// Handles the common parametric-protocol return shape where the method
+    /// returns one of the protocol's formal type parameters, e.g.
+    /// `Callable(args, result).call -> result`.
+    fn protocolReturnTypeIdWithFormalTypeIds(
+        self: *IrBuilder,
+        return_type: ?*const ast.TypeExpr,
+        formal_names: []const ast.StringId,
+        receiver_type_args: []const hir_mod.TypeId,
+    ) TypeWalkError!?types_mod.TypeId {
+        const ret = return_type orelse return types_mod.TypeStore.VOID;
+        if (formalTypeParamIndex(ret, formal_names)) |idx| {
+            if (idx < receiver_type_args.len) return receiver_type_args[idx];
+        }
+        return try self.protocolReturnTypeId(ret);
     }
 
     /// Convert a protocol method's parameter or return type
@@ -12977,17 +14230,21 @@ pub const IrBuilder = struct {
     fn protocolParamTypeToZigType(
         self: *IrBuilder,
         type_annotation: ?*const ast.TypeExpr,
-    ) ZigType {
+    ) TypeWalkError!ZigType {
         const ann = type_annotation orelse return .any;
-        return self.astTypeExprToZigTypeForProtocol(ann);
+        return try self.astTypeExprToZigTypeForProtocol(ann);
     }
 
     fn protocolReturnTypeToZigType(
         self: *IrBuilder,
         return_type: ?*const ast.TypeExpr,
-    ) ZigType {
+    ) TypeWalkError!ZigType {
         const ret = return_type orelse return .void;
-        return self.astTypeExprToZigTypeForProtocol(ret);
+        return normalizeProtocolReturnZigType(try self.astTypeExprToZigTypeForProtocol(ret));
+    }
+
+    fn normalizeProtocolReturnZigType(zig_type: ZigType) ZigType {
+        return if (zig_type == .nil) .void else zig_type;
     }
 
     /// Minimal AST `TypeExpr` → IR `ZigType` resolver for protocol
@@ -13001,7 +14258,7 @@ pub const IrBuilder = struct {
     fn astTypeExprToZigTypeForProtocol(
         self: *IrBuilder,
         type_expr: *const ast.TypeExpr,
-    ) ZigType {
+    ) TypeWalkError!ZigType {
         return switch (type_expr.*) {
             .name => |name_expr| blk: {
                 const text = self.interner.get(name_expr.name);
@@ -13023,7 +14280,7 @@ pub const IrBuilder = struct {
                         if (proto_entry.name.parts.len > 0 and
                             std.mem.eql(u8, self.interner.get(proto_entry.name.parts[proto_entry.name.parts.len - 1]), text))
                         {
-                            break :blk .{ .protocol_box = self.allocator.dupe(u8, text) catch text };
+                            break :blk .{ .protocol_box = try self.allocator.dupe(u8, text) };
                         }
                     }
                 }
@@ -13048,7 +14305,7 @@ pub const IrBuilder = struct {
                 // a namespace value Sema rejects with "expected
                 // pointer, found 'type'".
                 if (name_expr.args.len > 0) {
-                    if (self.composeMangledAppliedName(name_expr)) |mangled| {
+                    if (try self.composeMangledAppliedName(name_expr)) |mangled| {
                         // Determine whether the base is a tagged
                         // union or struct. Parametric protocol-
                         // signature args reachable today (Option,
@@ -13060,10 +14317,10 @@ pub const IrBuilder = struct {
                     // Fall back to the bare base name — keeps the
                     // diagnostic surfaced ("unknown declaration X")
                     // honest instead of silently dropping the args.
-                    break :blk .{ .struct_ref = self.allocator.dupe(u8, text) catch text };
+                    break :blk .{ .struct_ref = try self.allocator.dupe(u8, text) };
                 }
                 // Bare nominal — treat as struct ref.
-                break :blk .{ .struct_ref = self.allocator.dupe(u8, text) catch text };
+                break :blk .{ .struct_ref = try self.allocator.dupe(u8, text) };
             },
             // A tuple type expression (`{i64}`, `{i64, String}`, `{}`) is
             // the arity-as-tuple `args` parameter of a `Callable` method.
@@ -13071,9 +14328,9 @@ pub const IrBuilder = struct {
             // `appendZigTypeForVTable` renders it as a Zig anonymous tuple
             // `struct { ... }` in the vtable slot signature.
             .tuple => |tuple_expr| blk: {
-                const elems = self.allocator.alloc(ZigType, tuple_expr.elements.len) catch break :blk .any;
+                const elems = try self.allocator.alloc(ZigType, tuple_expr.elements.len);
                 for (tuple_expr.elements, 0..) |elem, idx| {
-                    elems[idx] = self.astTypeExprToZigTypeForProtocol(elem);
+                    elems[idx] = try self.astTypeExprToZigTypeForProtocol(elem);
                 }
                 break :blk .{ .tuple = elems };
             },
@@ -13098,18 +14355,17 @@ pub const IrBuilder = struct {
     fn composeMangledAppliedName(
         self: *IrBuilder,
         name_expr: ast.TypeNameExpr,
-    ) ?[]const u8 {
+    ) TypeWalkError!?[]const u8 {
         const base_text = self.interner.get(name_expr.name);
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(self.allocator);
-        buf.appendSlice(self.allocator, base_text) catch return null;
+        try buf.appendSlice(self.allocator, base_text);
         for (name_expr.args) |arg| {
-            buf.append(self.allocator, '_') catch return null;
-            const arg_zig_type = self.astTypeExprToZigTypeForProtocol(arg);
-            const arg_name = mangledNameForArgZigType(self.allocator, arg_zig_type) orelse return null;
-            buf.appendSlice(self.allocator, arg_name) catch return null;
+            try buf.append(self.allocator, '_');
+            const arg_name = (try self.mangledNameForProtocolArg(arg)) orelse return null;
+            try buf.appendSlice(self.allocator, arg_name);
         }
-        return buf.toOwnedSlice(self.allocator) catch null;
+        return try buf.toOwnedSlice(self.allocator);
     }
 
     /// Build the per-instantiation specialization data for one
@@ -13137,7 +14393,7 @@ pub const IrBuilder = struct {
                 for (st.type_params[0..pair_count], applied.args[0..pair_count]) |tp_id, arg_id| {
                     const tp_type = store.getType(tp_id);
                     if (tp_type != .type_var) continue;
-                    subs.bind(tp_type.type_var, arg_id);
+                    try subs.bind(tp_type.type_var, arg_id);
                 }
 
                 const zig_types = try self.allocator.alloc(ZigType, st.fields.len);
@@ -13145,9 +14401,9 @@ pub const IrBuilder = struct {
                 const hir_types = try self.allocator.alloc(types_mod.TypeId, st.fields.len);
                 errdefer self.allocator.free(hir_types);
                 for (st.fields, 0..) |field, i| {
-                    const substituted = subs.applyToType(store, field.type_id);
+                    const substituted = try subs.applyToType(store, field.type_id);
                     hir_types[i] = substituted;
-                    zig_types[i] = typeIdToZigTypeWithStore(substituted, store);
+                    zig_types[i] = try typeIdToZigTypeWithStore(substituted, store);
                 }
 
                 return .{
@@ -13164,7 +14420,7 @@ pub const IrBuilder = struct {
                 for (tu.type_params[0..pair_count], applied.args[0..pair_count]) |tp_id, arg_id| {
                     const tp_type = store.getType(tp_id);
                     if (tp_type != .type_var) continue;
-                    subs.bind(tp_type.type_var, arg_id);
+                    try subs.bind(tp_type.type_var, arg_id);
                 }
 
                 const zig_types = try self.allocator.alloc(ZigType, tu.variants.len);
@@ -13175,10 +14431,10 @@ pub const IrBuilder = struct {
                 errdefer self.allocator.free(payloads);
                 for (tu.variants, 0..) |variant, i| {
                     if (variant.type_id) |payload| {
-                        const substituted = subs.applyToType(store, payload);
+                        const substituted = try subs.applyToType(store, payload);
                         payloads[i] = substituted;
                         hir_types[i] = substituted;
-                        zig_types[i] = typeIdToZigTypeWithStore(substituted, store);
+                        zig_types[i] = try typeIdToZigTypeWithStore(substituted, store);
                     } else {
                         payloads[i] = null;
                         hir_types[i] = types_mod.TypeStore.UNKNOWN;
@@ -13262,6 +14518,10 @@ pub const IrBuilder = struct {
         const out = try self.allocator.alloc(OwnershipClass, local_count);
         var index: u32 = 0;
         while (index < local_count) : (index += 1) {
+            if (try self.localHasVoidLikeType(index)) {
+                out[index] = .trivial;
+                continue;
+            }
             // A rescue-arm binding aliasing an unboxed `Error` box inner
             // (Phase 3.a Gap A) is a BORROW: the box owns the heap cell and
             // deep-releases it at scope exit, so the alias gets no scope-exit
@@ -13273,9 +14533,54 @@ pub const IrBuilder = struct {
                 out[index] = .borrowed;
                 continue;
             }
+            if (self.owned_transfer_locals.contains(index)) {
+                out[index] = .owned;
+                continue;
+            }
             out[index] = if (self.isArcManagedLocal(index)) .owned else .trivial;
         }
         return out;
+    }
+
+    fn propagateOwnedTransfersThroughLocalGets(self: *IrBuilder, stream: []const Instruction) !void {
+        var changed = true;
+        while (changed) {
+            changed = try self.propagateOwnedTransfersThroughLocalGetsOnce(stream);
+        }
+        var iter = self.owned_transfer_locals.keyIterator();
+        while (iter.next()) |local_ptr| {
+            try self.deep_release_owned_locals.put(self.allocator, local_ptr.*, {});
+        }
+    }
+
+    fn propagateOwnedTransfersThroughLocalGetsOnce(self: *IrBuilder, stream: []const Instruction) !bool {
+        const Ctx = struct {
+            builder: *IrBuilder,
+            changed: bool = false,
+            err: ?std.mem.Allocator.Error = null,
+
+            fn visit(ctx: *@This(), instr: *const Instruction) void {
+                if (ctx.err != null) return;
+                switch (instr.*) {
+                    .local_get => |local_get| {
+                        if (ctx.builder.owned_transfer_locals.contains(local_get.dest) and
+                            !ctx.builder.owned_transfer_locals.contains(local_get.source))
+                        {
+                            ctx.builder.owned_transfer_locals.put(ctx.builder.allocator, local_get.source, {}) catch |err| {
+                                ctx.err = err;
+                            };
+                            ctx.changed = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        };
+
+        var ctx = Ctx{ .builder = self };
+        try forEachInstructionInStream(self.allocator, stream, &ctx, Ctx.visit);
+        if (ctx.err) |err| return err;
+        return ctx.changed;
     }
 
     /// Phase 1.2.5.d sidecar. Snapshot `known_local_types` for every
@@ -13293,6 +14598,7 @@ pub const IrBuilder = struct {
         self: *IrBuilder,
     ) !std.AutoHashMapUnmanaged(LocalId, []const u8) {
         var out: std.AutoHashMapUnmanaged(LocalId, []const u8) = .empty;
+        errdefer deinitConstructedProtocolBoxLocals(self.allocator, &out);
         var iter = self.known_local_types.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.* != .protocol_box) continue;
@@ -13316,8 +14622,11 @@ pub const IrBuilder = struct {
             const has_vtable = self.protocolHasVTable(protocol_name) or
                 self.boxed_existential_locals.contains(local);
             if (!has_vtable) continue;
-            const protocol_name_copy = try cloneBytes(self.allocator, protocol_name);
-            try out.put(self.allocator, local, protocol_name_copy);
+            {
+                const protocol_name_copy = try cloneBytes(self.allocator, protocol_name);
+                errdefer self.allocator.free(protocol_name_copy);
+                try out.put(self.allocator, local, protocol_name_copy);
+            }
         }
         return out;
     }
@@ -13329,6 +14638,7 @@ pub const IrBuilder = struct {
         source: std.AutoHashMapUnmanaged(LocalId, void),
     ) !std.AutoHashMapUnmanaged(LocalId, void) {
         var out: std.AutoHashMapUnmanaged(LocalId, void) = .empty;
+        errdefer out.deinit(self.allocator);
         var iter = source.iterator();
         while (iter.next()) |entry| {
             try out.put(self.allocator, entry.key_ptr.*, {});
@@ -13340,7 +14650,7 @@ pub const IrBuilder = struct {
     /// HIR-level return type is `return_type_id`. Mirrors
     /// `defaultResultConvention`; placed on the builder so call sites
     /// can use the same `self.type_store` context.
-    fn computeResultConvention(self: *const IrBuilder, return_type_id: ?hir_mod.TypeId) ResultConvention {
+    fn computeResultConvention(self: *const IrBuilder, return_type_id: ?hir_mod.TypeId) TypeWalkError!ResultConvention {
         const base = defaultResultConvention(self.type_store, return_type_id);
         if (base != .trivial) return base;
         // FCC Phase 2 — a function whose return ZigType is `.protocol_box`
@@ -13354,7 +14664,7 @@ pub const IrBuilder = struct {
         // `fn`-return (`.function` ZigType) stays `.trivial` (no box to
         // transfer); `Enum.*` never RETURNS a devirtualized `Enumerable`.
         if (return_type_id) |tid| {
-            const zig_type = typeIdToZigTypeWithStore(tid, self.type_store);
+            const zig_type = try typeIdToZigTypeWithStore(tid, self.type_store);
             if (zig_type == .protocol_box) return .owned;
         }
         return base;
@@ -13414,6 +14724,9 @@ pub const IrBuilder = struct {
         if (self.param_backed_locals.contains(source)) {
             try self.param_backed_locals.put(dest, {});
         }
+        if (self.owned_transfer_locals.contains(source)) {
+            try self.owned_transfer_locals.put(self.allocator, dest, {});
+        }
         // Gap E — propagate the materialized-closure-value marker across
         // the alias so `f = make(); f()` (callee `local_get(f)`) is
         // recognised as a bare-fn-ptr call.
@@ -13429,6 +14742,104 @@ pub const IrBuilder = struct {
         // propagation.
         if (self.boxed_existential_locals.contains(source)) {
             try self.boxed_existential_locals.put(self.allocator, dest, {});
+        }
+    }
+
+    /// Propagate metadata across a `.local_set{dest, value=source}` alias.
+    ///
+    /// `local_set` does not manufacture a new runtime value; it binds another
+    /// local name to the source local's current value. Type and ownership
+    /// sidecars must therefore move with the alias. In particular, a boxed
+    /// protocol existential must keep both its `.protocol_box` ZigType and its
+    /// boxed-owner marker so later ARC/drop passes can rewrite releases to
+    /// `<Protocol>VTable.drop(box)` instead of treating the box as an ordinary
+    /// ARC pointer.
+    fn recordLocalSetAliasMetadata(self: *IrBuilder, dest: LocalId, source: LocalId) !void {
+        if (self.known_local_types.get(source)) |src_type| {
+            try self.known_local_types.put(dest, src_type);
+        }
+        if (self.local_hir_types.get(source)) |src_hir_type| {
+            try self.local_hir_types.put(dest, src_hir_type);
+        }
+        if (self.owned_transfer_locals.contains(source)) {
+            try self.owned_transfer_locals.put(self.allocator, dest, {});
+        }
+        if (self.materialized_closure_locals.contains(source)) {
+            try self.materialized_closure_locals.put(self.allocator, dest, {});
+        }
+        if (self.boxed_existential_locals.contains(source)) {
+            try self.boxed_existential_locals.put(self.allocator, dest, {});
+        }
+    }
+
+    /// Propagate value sidecars across an ownership transfer.
+    ///
+    /// A `.move_value` creates a fresh local that holds the same runtime value
+    /// the source held, while later ARC liveness clears the source's owns bit at
+    /// the move site. Static metadata must therefore follow the destination:
+    /// without the HIR type or precise boxed-existential marker,
+    /// `computeLocalOwnership` can classify the move destination as
+    /// `.trivial`, violating the verifier's V11 contract even though the IR
+    /// correctly transfers an owned value.
+    fn recordMoveValueMetadata(self: *IrBuilder, dest: LocalId, source: LocalId) !void {
+        try self.owned_transfer_locals.put(self.allocator, source, {});
+        try self.owned_transfer_locals.put(self.allocator, dest, {});
+        if (self.known_local_types.get(source)) |src_type| {
+            try self.known_local_types.put(dest, src_type);
+        }
+        if (self.local_hir_types.get(source)) |src_hir_type| {
+            try self.local_hir_types.put(dest, src_hir_type);
+        }
+        if (self.param_backed_locals.contains(source)) {
+            try self.param_backed_locals.put(dest, {});
+        }
+        if (self.materialized_closure_locals.contains(source)) {
+            try self.materialized_closure_locals.put(self.allocator, dest, {});
+        }
+        if (self.boxed_existential_locals.contains(source)) {
+            try self.boxed_existential_locals.put(self.allocator, dest, {});
+        }
+        if (self.deep_release_owned_locals.contains(source)) {
+            try self.deep_release_owned_locals.put(self.allocator, dest, {});
+        }
+        if (self.term_tuple_locals.get(source)) |tuple_type| {
+            try self.term_tuple_locals.put(dest, tuple_type);
+        }
+    }
+
+    /// Emit one entry-local for each function parameter.
+    ///
+    /// Expression-level parameter references must alias these locals rather
+    /// than emitting fresh raw `param_get`s. The parameter itself owns at most
+    /// one runtime value slot; downstream ARC passes decide whether each read
+    /// from the canonical local is a borrow, copy, or move.
+    fn emitCanonicalParamLocals(self: *IrBuilder, params: []const Param, skip_param_index: ?u32) !void {
+        self.current_param_locals.clearRetainingCapacity();
+
+        for (params, 0..) |param, param_index| {
+            if (skip_param_index == @as(u32, @intCast(param_index))) continue;
+
+            const dest = self.next_local;
+            self.next_local += 1;
+
+            try self.current_instrs.append(self.allocator, .{
+                .param_get = .{ .dest = dest, .index = @intCast(param_index) },
+            });
+
+            if (param.type_expr != .any) {
+                try self.known_local_types.put(dest, param.type_expr);
+            }
+            if (param_index < self.current_param_hir_types.items.len) {
+                try self.local_hir_types.put(dest, self.current_param_hir_types.items[param_index]);
+            } else if (param.type_id) |type_id| {
+                try self.local_hir_types.put(dest, type_id);
+            }
+            if (param_index < self.current_param_unique_owners.items.len and self.current_param_unique_owners.items[param_index]) {
+                try self.owned_transfer_locals.put(self.allocator, dest, {});
+            }
+
+            try self.param_backed_locals.put(dest, {});
+            try self.current_param_locals.put(@intCast(param_index), dest);
         }
     }
 
@@ -13454,144 +14865,315 @@ pub const IrBuilder = struct {
     /// `List.getHead`, …) and never reach this helper because their
     /// extractions lower to dedicated IR opcodes (`map_get`,
     /// `list_head`, …) instead of `index_get` / `field_get`.
+    ///
+    /// The extracted binding is a scope-lived second owner, so this is always
+    /// a `.persistent` retain. Under `Memory.Tracking`,
+    /// `shareAnyPersistent` clones extracted owners whose storage has no
+    /// refcount, including inline-header List/Map cells. Without that rebind,
+    /// the tuple component release frees the tuple-owned cell while the arm's
+    /// extracted local still points at it.
     fn emitArcRetainOnAggregateExtract(self: *IrBuilder, dest: LocalId) !void {
         if (!self.isArcManagedLocal(dest)) return;
         try self.current_instrs.append(self.allocator, .{
-            .retain = .{ .value = dest, .kind = self.extractRetainKind(dest) },
+            .retain = .{ .value = dest, .kind = .persistent },
         });
-    }
-
-    /// Choose the retain flavor for an aggregate-extraction co-ownership
-    /// retain. The extracted binding is a SCOPE-LIVED second owner (its
-    /// matching scope-exit `.release` comes from `arc_drop_insertion`), so
-    /// it is a `.persistent` retain by nature — EXCEPT for inline-header
-    /// collection cells (`List`/`Map`), which must stay `.normal`.
-    ///
-    /// Why the List/Map carve-out: `.persistent` lowers (in zir_builder) to
-    /// `shareAnyPersistent`, which under REFCOUNTED routes an inline-header
-    /// cell through the type's own `retain` method (firing Map's share-event
-    /// workload tracking) whereas `.normal`/`retainAny` does a plain
-    /// `headerRetain`. Routing List/Map extractions through `.persistent`
-    /// would therefore change ARC share-event accounting. For every OTHER
-    /// ARC type — an indirect-storage (side-table) recursive struct, a
-    /// by-value aggregate, an opaque cell — `.persistent` and `.normal` are
-    /// byte-for-byte identical under REFCOUNTED (both dispatch the side-
-    /// table `retain_sized`, or both `retainChildrenAny` for a by-value
-    /// aggregate), so the carve-out is the ONLY place the two kinds diverge
-    /// under ARC. The change is thus ARC-invariant.
-    ///
-    /// Under an `individual_no_refcount` + `clone_on_share` manager
-    /// (`Memory.Tracking`) the distinction is load-bearing:
-    /// `shareAnyPersistent` deep-CLONES an extracted indirect-storage cell so
-    /// the extracted owner and the still-live parent each reach a single
-    /// `core.deallocate` — without it both releases free the SAME cell (the
-    /// parent via its field deep-walk, the extraction via its scope-exit
-    /// release) = double-free segfault. This is the field-EXTRACTION analog
-    /// of the field-STORE `.protocol_box_share` / persistent-share
-    /// clone-on-share, and of the container `ownElement` path. A List/Map
-    /// extraction never needs the clone (an inline-header cell is not eagerly
-    /// freed under no-REFCOUNT_V1), so `.normal` is both ARC-correct and
-    /// Tracking-safe for it.
-    fn extractRetainKind(self: *const IrBuilder, dest: LocalId) RetainKind {
-        const hir_type = self.local_hir_types.get(dest) orelse return .normal;
-        const store = self.type_store orelse return .normal;
-        if (hir_type >= store.types.items.len) return .normal;
-        return switch (store.getType(hir_type)) {
-            // Inline-header collection cells: keep the plain transient
-            // retain so ARC share-event accounting is unchanged; they are
-            // never eagerly freed under no-REFCOUNT_V1, so no clone needed.
-            .list, .map => .normal,
-            // Every other ARC-managed extraction is a scope-lived co-owner
-            // that must clone-on-share under no-REFCOUNT_V1.
-            else => .persistent,
-        };
     }
 
     /// Pre-scan HIR block to find error_pipe expressions with
     /// is_dispatched steps, registering their function names in try_variant_names.
     /// This runs before function bodies are built so __try variants are generated.
-    fn scanForTryVariantNames(self: *IrBuilder, block: *const hir_mod.Block, struct_prefix: ?[]const u8) error{OutOfMemory}!void {
-        for (block.stmts) |stmt| {
-            switch (stmt) {
-                .expr => |expr| try self.scanExprForTryVariants(expr, struct_prefix),
-                .local_set => |ls| try self.scanExprForTryVariants(ls.value, struct_prefix),
-                .function_group => |fg| {
-                    for (fg.clauses) |clause| {
-                        try self.scanForTryVariantNames(clause.body, struct_prefix);
-                    }
-                },
-            }
-        }
+    fn scanForTryVariantNames(self: *IrBuilder, block: *const hir_mod.Block, struct_prefix: ?[]const u8) error{ OutOfMemory, IrStructuralBudgetExceeded }!void {
+        try self.scanTryVariantFrames(.{ .block = block }, struct_prefix);
     }
 
-    fn scanExprForTryVariants(self: *IrBuilder, expr: *const hir_mod.Expr, struct_prefix: ?[]const u8) error{OutOfMemory}!void {
-        switch (expr.kind) {
-            .error_pipe => |ep| {
-                for (ep.steps) |step| {
-                    if (step.is_dispatched and step.expr.kind == .call) {
-                        const call = step.expr.kind.call;
-                        // +1 for the piped value which becomes the first argument
-                        const call_arity = call.args.len + 1;
-                        const call_name_str = switch (call.target) {
-                            .named => |n| blk: {
-                                if (n.struct_name) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, call_arity });
-                                if (struct_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, call_arity });
-                                break :blk try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, call_arity });
+    fn scanExprForTryVariants(self: *IrBuilder, expr: *const hir_mod.Expr, struct_prefix: ?[]const u8) error{ OutOfMemory, IrStructuralBudgetExceeded }!void {
+        try self.scanTryVariantFrames(.{ .expr = expr }, struct_prefix);
+    }
+
+    fn scanBlockForTryVariants(self: *IrBuilder, block: *const hir_mod.Block, struct_prefix: ?[]const u8) error{ OutOfMemory, IrStructuralBudgetExceeded }!void {
+        try self.scanTryVariantFrames(.{ .block = block }, struct_prefix);
+    }
+
+    fn scanTryVariantFrames(
+        self: *IrBuilder,
+        root: TryVariantScanFrame,
+        struct_prefix: ?[]const u8,
+    ) error{ OutOfMemory, IrStructuralBudgetExceeded }!void {
+        var stack: std.ArrayList(TryVariantScanFrame) = .empty;
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, root);
+
+        var visited_nodes: usize = 0;
+        while (stack.items.len != 0) {
+            const frame = stack.items[stack.items.len - 1];
+            stack.items.len -= 1;
+
+            if (visited_nodes >= max_ir_hir_scan_nodes) {
+                try self.reportIrStructuralBudgetExceeded(.try_variant_scan, tryVariantScanFrameSpan(frame));
+                return error.IrStructuralBudgetExceeded;
+            }
+            visited_nodes += 1;
+
+            switch (frame) {
+                .block => |block| {
+                    var stmt_index = block.stmts.len;
+                    while (stmt_index != 0) {
+                        stmt_index -= 1;
+                        switch (block.stmts[stmt_index]) {
+                            .expr => |expr| try stack.append(self.allocator, .{ .expr = expr }),
+                            .local_set => |ls| try stack.append(self.allocator, .{ .expr = ls.value }),
+                            .function_group => |fg| {
+                                var clause_index = fg.clauses.len;
+                                while (clause_index != 0) {
+                                    clause_index -= 1;
+                                    try stack.append(self.allocator, .{ .block = fg.clauses[clause_index].body });
+                                }
                             },
-                            else => continue,
-                        };
-                        try self.try_variant_names.put(call_name_str, {});
+                        }
                     }
-                    // Recurse into step expressions
-                    try self.scanExprForTryVariants(step.expr, struct_prefix);
-                }
-                // Recurse into handler
-                try self.scanExprForTryVariants(ep.handler, struct_prefix);
-            },
-            .call => |c| {
-                for (c.args) |arg| {
-                    try self.scanExprForTryVariants(arg.expr, struct_prefix);
-                }
-            },
-            .branch => |br| {
-                try self.scanExprForTryVariants(br.condition, struct_prefix);
-                try self.scanBlockForTryVariants(br.then_block, struct_prefix);
-                if (br.else_block) |eb| try self.scanBlockForTryVariants(eb, struct_prefix);
-            },
-            .case => |ce| {
-                try self.scanExprForTryVariants(ce.scrutinee, struct_prefix);
-                for (ce.arms) |arm| {
-                    try self.scanBlockForTryVariants(arm.body, struct_prefix);
-                }
-            },
-            .binary => |b| {
-                try self.scanExprForTryVariants(b.lhs, struct_prefix);
-                try self.scanExprForTryVariants(b.rhs, struct_prefix);
-            },
-            .unary => |u| {
-                try self.scanExprForTryVariants(u.operand, struct_prefix);
-            },
-            .union_init => |ui| {
-                try self.scanExprForTryVariants(ui.value, struct_prefix);
-            },
-            .block => |blk| {
-                try self.scanBlockForTryVariants(&blk, struct_prefix);
-            },
-            else => {},
+                },
+                .expr => |expr| switch (expr.kind) {
+                    .error_pipe => |ep| {
+                        try stack.append(self.allocator, .{ .expr = ep.handler });
+                        var step_index = ep.steps.len;
+                        while (step_index != 0) {
+                            step_index -= 1;
+                            const step = ep.steps[step_index];
+                            if (step.is_dispatched and step.expr.kind == .call) {
+                                try self.registerTryVariantForErrorPipeStep(step, struct_prefix);
+                            }
+                            try stack.append(self.allocator, .{ .expr = step.expr });
+                        }
+                    },
+                    .call => |c| {
+                        switch (c.target) {
+                            .closure => |callee| try stack.append(self.allocator, .{ .expr = callee }),
+                            else => {},
+                        }
+                        var arg_index = c.args.len;
+                        while (arg_index != 0) {
+                            arg_index -= 1;
+                            try stack.append(self.allocator, .{ .expr = c.args[arg_index].expr });
+                        }
+                    },
+                    .branch => |br| {
+                        if (br.else_block) |else_block| try stack.append(self.allocator, .{ .block = else_block });
+                        try stack.append(self.allocator, .{ .block = br.then_block });
+                        try stack.append(self.allocator, .{ .expr = br.condition });
+                    },
+                    .case => |ce| {
+                        var arm_index = ce.arms.len;
+                        while (arm_index != 0) {
+                            arm_index -= 1;
+                            if (ce.arms[arm_index].guard) |guard| {
+                                try stack.append(self.allocator, .{ .expr = guard });
+                            }
+                            try stack.append(self.allocator, .{ .block = ce.arms[arm_index].body });
+                        }
+                        try stack.append(self.allocator, .{ .expr = ce.scrutinee });
+                    },
+                    .binary => |b| {
+                        try stack.append(self.allocator, .{ .expr = b.rhs });
+                        try stack.append(self.allocator, .{ .expr = b.lhs });
+                    },
+                    .unary => |u| try stack.append(self.allocator, .{ .expr = u.operand }),
+                    .union_init => |ui| try stack.append(self.allocator, .{ .expr = ui.value }),
+                    .block => |*block| try stack.append(self.allocator, .{ .block = block }),
+                    .match => |m| {
+                        try stack.append(self.allocator, .{ .decision = m.decision });
+                        try stack.append(self.allocator, .{ .expr = m.scrutinee });
+                    },
+                    .tuple_init => |elements| {
+                        var element_index = elements.len;
+                        while (element_index != 0) {
+                            element_index -= 1;
+                            try stack.append(self.allocator, .{ .expr = elements[element_index] });
+                        }
+                    },
+                    .list_init => |elements| {
+                        var element_index = elements.len;
+                        while (element_index != 0) {
+                            element_index -= 1;
+                            try stack.append(self.allocator, .{ .expr = elements[element_index] });
+                        }
+                    },
+                    .list_cons => |lc| {
+                        try stack.append(self.allocator, .{ .expr = lc.tail });
+                        try stack.append(self.allocator, .{ .expr = lc.head });
+                    },
+                    .map_init => |entries| {
+                        var entry_index = entries.len;
+                        while (entry_index != 0) {
+                            entry_index -= 1;
+                            try stack.append(self.allocator, .{ .expr = entries[entry_index].value });
+                            try stack.append(self.allocator, .{ .expr = entries[entry_index].key });
+                        }
+                    },
+                    .struct_init => |si| {
+                        var field_index = si.fields.len;
+                        while (field_index != 0) {
+                            field_index -= 1;
+                            try stack.append(self.allocator, .{ .expr = si.fields[field_index].value });
+                        }
+                    },
+                    .field_get => |fg| try stack.append(self.allocator, .{ .expr = fg.object }),
+                    .tuple_index_get => |tig| try stack.append(self.allocator, .{ .expr = tig.object }),
+                    .list_index_get => |lig| try stack.append(self.allocator, .{ .expr = lig.list }),
+                    .list_head_get => |lhg| try stack.append(self.allocator, .{ .expr = lhg.list }),
+                    .list_tail_get => |ltg| try stack.append(self.allocator, .{ .expr = ltg.list }),
+                    .map_value_get => |mvg| {
+                        try stack.append(self.allocator, .{ .expr = mvg.key });
+                        try stack.append(self.allocator, .{ .expr = mvg.map });
+                    },
+                    .panic => |operand| try stack.append(self.allocator, .{ .expr = operand }),
+                    .unwrap => |operand| try stack.append(self.allocator, .{ .expr = operand }),
+                    .ret_raise => |rr| try stack.append(self.allocator, .{ .expr = rr.stash_call }),
+                    .try_rescue => |tr| {
+                        if (tr.after_block) |after_block| try stack.append(self.allocator, .{ .block = after_block });
+                        var arm_index = tr.arms.len;
+                        while (arm_index != 0) {
+                            arm_index -= 1;
+                            if (tr.arms[arm_index].guard) |guard| {
+                                try stack.append(self.allocator, .{ .expr = guard });
+                            }
+                            try stack.append(self.allocator, .{ .block = tr.arms[arm_index].body });
+                        }
+                        try stack.append(self.allocator, .{ .expr = tr.take_raise_call });
+                        try stack.append(self.allocator, .{ .expr = tr.raise_occurred_call });
+                        try stack.append(self.allocator, .{ .block = tr.body });
+                    },
+                    .closure_create => |cc| {
+                        var capture_index = cc.captures.len;
+                        while (capture_index != 0) {
+                            capture_index -= 1;
+                            try stack.append(self.allocator, .{ .expr = cc.captures[capture_index].expr });
+                        }
+                    },
+                    .int_lit,
+                    .float_lit,
+                    .string_lit,
+                    .atom_lit,
+                    .bool_lit,
+                    .nil_lit,
+                    .local_get,
+                    .param_get,
+                    .capture_get,
+                    .never,
+                    => {},
+                },
+                .decision => |decision| switch (decision.*) {
+                    .success,
+                    .failure,
+                    => {},
+                    .guard => |guard| {
+                        try stack.append(self.allocator, .{ .decision = guard.failure });
+                        try stack.append(self.allocator, .{ .decision = guard.success });
+                        try stack.append(self.allocator, .{ .expr = guard.condition });
+                    },
+                    .switch_tag => |switch_node| {
+                        try stack.append(self.allocator, .{ .decision = switch_node.default });
+                        var case_index = switch_node.cases.len;
+                        while (case_index != 0) {
+                            case_index -= 1;
+                            try stack.append(self.allocator, .{ .decision = switch_node.cases[case_index].next });
+                        }
+                        try stack.append(self.allocator, .{ .expr = switch_node.scrutinee });
+                    },
+                    .switch_literal => |switch_node| {
+                        try stack.append(self.allocator, .{ .decision = switch_node.default });
+                        var case_index = switch_node.cases.len;
+                        while (case_index != 0) {
+                            case_index -= 1;
+                            try stack.append(self.allocator, .{ .decision = switch_node.cases[case_index].next });
+                        }
+                        try stack.append(self.allocator, .{ .expr = switch_node.scrutinee });
+                    },
+                    .switch_variant => |switch_node| {
+                        try stack.append(self.allocator, .{ .decision = switch_node.default });
+                        var case_index = switch_node.cases.len;
+                        while (case_index != 0) {
+                            case_index -= 1;
+                            try stack.append(self.allocator, .{ .decision = switch_node.cases[case_index].next });
+                        }
+                        try stack.append(self.allocator, .{ .expr = switch_node.scrutinee });
+                    },
+                    .check_tuple => |check| {
+                        try stack.append(self.allocator, .{ .decision = check.failure });
+                        try stack.append(self.allocator, .{ .decision = check.success });
+                        try stack.append(self.allocator, .{ .expr = check.scrutinee });
+                    },
+                    .check_list => |check| {
+                        try stack.append(self.allocator, .{ .decision = check.failure });
+                        try stack.append(self.allocator, .{ .decision = check.success });
+                        try stack.append(self.allocator, .{ .expr = check.scrutinee });
+                    },
+                    .check_list_cons => |check| {
+                        try stack.append(self.allocator, .{ .decision = check.failure });
+                        try stack.append(self.allocator, .{ .decision = check.success });
+                        try stack.append(self.allocator, .{ .expr = check.scrutinee });
+                    },
+                    .check_binary => |check| {
+                        try stack.append(self.allocator, .{ .decision = check.failure });
+                        try stack.append(self.allocator, .{ .decision = check.success });
+                        try stack.append(self.allocator, .{ .expr = check.scrutinee });
+                    },
+                    .bind => |bind| {
+                        try stack.append(self.allocator, .{ .decision = bind.next });
+                        try stack.append(self.allocator, .{ .expr = bind.source });
+                    },
+                    .extract_struct => |extract| {
+                        try stack.append(self.allocator, .{ .decision = extract.failure });
+                        try stack.append(self.allocator, .{ .decision = extract.success });
+                        try stack.append(self.allocator, .{ .expr = extract.scrutinee });
+                    },
+                    .extract_map => |extract| {
+                        try stack.append(self.allocator, .{ .decision = extract.failure });
+                        try stack.append(self.allocator, .{ .decision = extract.success });
+                        var key_index = extract.keys.len;
+                        while (key_index != 0) {
+                            key_index -= 1;
+                            try stack.append(self.allocator, .{ .expr = extract.keys[key_index].key });
+                        }
+                        try stack.append(self.allocator, .{ .expr = extract.scrutinee });
+                    },
+                },
+            }
         }
     }
 
-    fn scanBlockForTryVariants(self: *IrBuilder, block: *const hir_mod.Block, struct_prefix: ?[]const u8) error{OutOfMemory}!void {
-        for (block.stmts) |stmt| {
-            switch (stmt) {
-                .expr => |expr| try self.scanExprForTryVariants(expr, struct_prefix),
-                .local_set => |ls| try self.scanExprForTryVariants(ls.value, struct_prefix),
-                .function_group => |fg| {
-                    for (fg.clauses) |clause| {
-                        try self.scanForTryVariantNames(clause.body, struct_prefix);
-                    }
-                },
-            }
+    fn registerTryVariantForErrorPipeStep(
+        self: *IrBuilder,
+        step: hir_mod.ErrorPipeStep,
+        struct_prefix: ?[]const u8,
+    ) error{OutOfMemory}!void {
+        const call = step.expr.kind.call;
+        // +1 for the piped value which becomes the first argument.
+        const call_arity = call.args.len + 1;
+        var call_name = switch (call.target) {
+            .named => |n| blk: {
+                if (n.struct_name) |mod| break :blk OwnedIrString{
+                    .value = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, call_arity }),
+                    .owned = true,
+                };
+                if (struct_prefix) |prefix| break :blk OwnedIrString{
+                    .value = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, call_arity }),
+                    .owned = true,
+                };
+                break :blk OwnedIrString{
+                    .value = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, call_arity }),
+                    .owned = true,
+                };
+            },
+            else => return,
+        };
+        errdefer call_name.deinit(self.allocator);
+        try self.try_variant_names.ensureUnusedCapacity(1);
+        const entry = self.try_variant_names.getOrPutAssumeCapacity(call_name.value);
+        if (entry.found_existing) {
+            call_name.deinit(self.allocator);
+        } else {
+            entry.key_ptr.* = call_name.transfer();
+            entry.value_ptr.* = {};
         }
     }
 
@@ -13599,14 +15181,23 @@ pub const IrBuilder = struct {
     /// `Mod__name__N` when there is a struct prefix, `name__N` otherwise.
     /// Mirrors what the rest of the IR uses so that the `__try` variant
     /// resolved at the call site matches the concrete function we emit.
-    fn formatErrorPipeCallName(self: *IrBuilder, call: hir_mod.CallExpr, arity: usize) anyerror![]const u8 {
+    fn formatErrorPipeCallName(self: *IrBuilder, call: hir_mod.CallExpr, arity: usize) anyerror!OwnedIrString {
         return switch (call.target) {
             .named => |n| blk: {
-                if (n.struct_name) |mod| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, arity });
-                if (self.current_struct_prefix) |prefix| break :blk try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, arity });
-                break :blk try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, arity });
+                if (n.struct_name) |mod| break :blk .{
+                    .value = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ mod, n.name, arity }),
+                    .owned = true,
+                };
+                if (self.current_struct_prefix) |prefix| break :blk .{
+                    .value = try std.fmt.allocPrint(self.allocator, "{s}__{s}__{d}", .{ prefix, n.name, arity }),
+                    .owned = true,
+                };
+                break :blk .{
+                    .value = try std.fmt.allocPrint(self.allocator, "{s}__{d}", .{ n.name, arity }),
+                    .owned = true,
+                };
             },
-            else => "unknown",
+            else => .{ .value = "unknown", .owned = false },
         };
     }
 
@@ -13617,20 +15208,37 @@ pub const IrBuilder = struct {
     fn lowerSingleErrorPipeCall(self: *IrBuilder, step: hir_mod.ErrorPipeStep, pipe_val: LocalId) anyerror!LocalId {
         const call = step.expr.kind.call;
         var arg_locals: std.ArrayList(LocalId) = .empty;
+        defer arg_locals.deinit(self.allocator);
         try arg_locals.append(self.allocator, pipe_val);
         for (call.args) |arg| {
             try arg_locals.append(self.allocator, try self.lowerExpr(arg.expr));
         }
         const call_dest = self.next_local;
         self.next_local += 1;
-        const final_args = try arg_locals.toOwnedSlice(self.allocator);
-        const modes = try self.allocator.alloc(ValueMode, final_args.len);
-        @memset(modes, .share);
-        const ep_call_arity = final_args.len;
-        const call_name_str = try self.formatErrorPipeCallName(call, ep_call_arity);
-        try self.current_instrs.append(self.allocator, .{
-            .call_named = .{ .dest = call_dest, .name = call_name_str, .args = final_args, .arg_modes = modes },
+        const ep_call_arity = arg_locals.items.len;
+        try self.current_instrs.ensureUnusedCapacity(self.allocator, 1);
+
+        var call_name = try self.formatErrorPipeCallName(call, ep_call_arity);
+        errdefer call_name.deinit(self.allocator);
+
+        var final_args_owner: ?[]LocalId = try arg_locals.toOwnedSlice(self.allocator);
+        arg_locals = .empty;
+        errdefer if (final_args_owner) |final_args| self.allocator.free(final_args);
+
+        var modes_owner: ?[]ValueMode = try self.allocator.alloc(ValueMode, final_args_owner.?.len);
+        errdefer if (modes_owner) |modes| self.allocator.free(modes);
+        @memset(modes_owner.?, .share);
+
+        self.current_instrs.appendAssumeCapacity(.{
+            .call_named = .{
+                .dest = call_dest,
+                .name = call_name.transfer(),
+                .args = final_args_owner.?,
+                .arg_modes = modes_owner.?,
+            },
         });
+        final_args_owner = null;
+        modes_owner = null;
         return call_dest;
     }
 
@@ -13647,28 +15255,32 @@ pub const IrBuilder = struct {
         err_local: ?u32,
         handler_hir: *const hir_mod.Expr,
     ) anyerror!LocalId {
+        const budget_root = self.beginErrorPipeTryLoweringBudget(step.expr.span);
+        defer self.endErrorPipeTryLoweringBudget(budget_root);
+        try self.enterErrorPipeTryLowering();
+        defer self.leaveErrorPipeTryLowering();
+
         const call = step.expr.kind.call;
         var arg_locals: std.ArrayList(LocalId) = .empty;
+        defer arg_locals.deinit(self.allocator);
         try arg_locals.append(self.allocator, pipe_val);
         for (call.args) |arg| {
             try arg_locals.append(self.allocator, try self.lowerExpr(arg.expr));
         }
         const call_dest = self.next_local;
         self.next_local += 1;
-        const final_args = try arg_locals.toOwnedSlice(self.allocator);
-        const modes = try self.allocator.alloc(ValueMode, final_args.len);
-        @memset(modes, .share);
-        const ep_call_arity = final_args.len;
-        const call_name_str = try self.formatErrorPipeCallName(call, ep_call_arity);
+        const ep_call_arity = arg_locals.items.len;
+        var call_name = try self.formatErrorPipeCallName(call, ep_call_arity);
+        errdefer call_name.deinit(self.allocator);
 
-        const try_name = try std.fmt.allocPrint(self.allocator, "{s}__try", .{call_name_str});
-        try self.try_variant_names.put(call_name_str, {});
+        var try_name_owner: ?[]const u8 = try std.fmt.allocPrint(self.allocator, "{s}__try", .{call_name.value});
+        errdefer if (try_name_owner) |try_name| self.allocator.free(try_name);
 
         // Lower the handler in a fresh instruction buffer. The handler
         // reads the failed pipe value via `__err` (block-style handlers)
         // or as a function argument (`err_local == 0`).
-        const saved = self.current_instrs;
-        self.current_instrs = .empty;
+        var handler_frame = self.pushInstructionBuffer();
+        errdefer handler_frame.discardAndRestore();
         if (err_local) |el| {
             if (self.next_local <= el) self.next_local = el + 1;
             try self.current_instrs.append(self.allocator, .{
@@ -13676,8 +15288,8 @@ pub const IrBuilder = struct {
             });
         }
         const handler_result = try self.lowerExpr(handler_hir);
-        const handler_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-        self.current_instrs = saved;
+        var handler_instrs_owner: ?[]const Instruction = try handler_frame.takeOwnedSliceAndRestore();
+        errdefer if (handler_instrs_owner) |handler_instrs| self.allocator.free(handler_instrs);
 
         // Allocate a local to hold the unwrapped payload, so the success
         // branch can refer to it as the input of subsequent steps.
@@ -13687,8 +15299,8 @@ pub const IrBuilder = struct {
         // Build the success branch: emit any remaining steps with
         // `payload_local` as the new pipe value, recursing into another
         // try_call_named for the next dispatched step.
-        const success_saved = self.current_instrs;
-        self.current_instrs = .empty;
+        var success_frame = self.pushInstructionBuffer();
+        errdefer success_frame.discardAndRestore();
         var success_pipe_val: LocalId = payload_local;
         var rem_idx: usize = 0;
         while (rem_idx < remaining.len) : (rem_idx += 1) {
@@ -13711,23 +15323,46 @@ pub const IrBuilder = struct {
             // already been folded into its success branch.
             break;
         }
-        const success_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
-        self.current_instrs = success_saved;
+        var success_instrs_owner: ?[]const Instruction = try success_frame.takeOwnedSliceAndRestore();
+        errdefer if (success_instrs_owner) |success_instrs| self.allocator.free(success_instrs);
 
-        try self.current_instrs.append(self.allocator, .{
+        try self.current_instrs.ensureUnusedCapacity(self.allocator, 1);
+        try self.try_variant_names.ensureUnusedCapacity(1);
+
+        var final_args_owner: ?[]LocalId = try arg_locals.toOwnedSlice(self.allocator);
+        arg_locals = .empty;
+        errdefer if (final_args_owner) |final_args| self.allocator.free(final_args);
+
+        var modes_owner: ?[]ValueMode = try self.allocator.alloc(ValueMode, final_args_owner.?.len);
+        errdefer if (modes_owner) |modes| self.allocator.free(modes);
+        @memset(modes_owner.?, .share);
+
+        const try_variant_entry = self.try_variant_names.getOrPutAssumeCapacity(call_name.value);
+        if (try_variant_entry.found_existing) {
+            call_name.deinit(self.allocator);
+        } else {
+            try_variant_entry.key_ptr.* = call_name.transfer();
+            try_variant_entry.value_ptr.* = {};
+        }
+        self.current_instrs.appendAssumeCapacity(.{
             .try_call_named = .{
                 .dest = call_dest,
-                .name = try_name,
-                .args = final_args,
-                .arg_modes = modes,
+                .name = try_name_owner.?,
+                .args = final_args_owner.?,
+                .arg_modes = modes_owner.?,
                 .input_local = pipe_val,
-                .handler_instrs = handler_instrs,
+                .handler_instrs = handler_instrs_owner.?,
                 .handler_result = handler_result,
-                .success_instrs = success_instrs,
+                .success_instrs = success_instrs_owner.?,
                 .success_result = success_pipe_val,
                 .payload_local = payload_local,
             },
         });
+        try_name_owner = null;
+        final_args_owner = null;
+        modes_owner = null;
+        handler_instrs_owner = null;
+        success_instrs_owner = null;
         return call_dest;
     }
 
@@ -13746,7 +15381,7 @@ pub const IrBuilder = struct {
         self: *const IrBuilder,
         union_type_name: []const u8,
         variant_name: []const u8,
-    ) ?ZigType {
+    ) TypeWalkError!?ZigType {
         const ts = self.type_store orelse return null;
         // Per-instantiation form (`Option_Error`): substituted
         // payloads live in the applied-spec cache.
@@ -13771,7 +15406,7 @@ pub const IrBuilder = struct {
                 const vname = self.interner.get(variant.name);
                 if (!std.mem.eql(u8, vname, variant_name)) continue;
                 const tid = variant.type_id orelse return ZigType.nil;
-                return typeIdToZigTypeWithStore(tid, self.type_store);
+                return try typeIdToZigTypeWithStore(tid, self.type_store);
             }
         }
         return null;
@@ -13858,7 +15493,7 @@ pub const IrBuilder = struct {
         // consistent box type for the local.
         const value_zig_type = self.known_local_types.get(value_local) orelse blk: {
             const hir_type = self.local_hir_types.get(value_local) orelse return value_local;
-            const recovered = typeIdToZigTypeWithStore(hir_type, self.type_store);
+            const recovered = try typeIdToZigTypeWithStore(hir_type, self.type_store);
             if (recovered == .any) return value_local;
             try self.known_local_types.put(value_local, recovered);
             break :blk recovered;
@@ -14098,17 +15733,18 @@ pub const IrBuilder = struct {
     /// which still fails the downstream `lookupExisting` gracefully).
     fn baseProtocolName(self: *const IrBuilder, family_name: []const u8) []const u8 {
         const graph = self.scope_graph orelse return family_name;
-        var best: ?[]const u8 = null;
+        var best_len: ?usize = null;
         for (graph.protocols.items) |proto_entry| {
-            const proto_text = self.protocolNameToString(proto_entry.name);
-            if (std.mem.eql(u8, proto_text, family_name)) return proto_text;
-            if (std.mem.startsWith(u8, family_name, proto_text) and
-                family_name.len > proto_text.len and family_name[proto_text.len] == '_')
-            {
-                if (best == null or proto_text.len > best.?.len) best = proto_text;
-            }
+            const prefix_len = self.protocolNameFamilyPrefixLength(proto_entry.name, family_name) orelse continue;
+            if (prefix_len == family_name.len) return family_name;
+            if (best_len == null or prefix_len > best_len.?) best_len = prefix_len;
         }
-        return best orelse family_name;
+        return if (best_len) |len| family_name[0..len] else family_name;
+    }
+
+    fn zigTypeIsBoxedCallable(self: *const IrBuilder, zig_type: ZigType) bool {
+        if (zig_type != .protocol_box) return false;
+        return std.mem.eql(u8, self.baseProtocolName(zig_type.protocol_box), "Callable");
     }
 
     /// Find the `protocol_constraint` TypeId in the store whose protocol
@@ -14135,14 +15771,14 @@ pub const IrBuilder = struct {
     }
 
     fn lowerExpr(self: *IrBuilder, expr: *const hir_mod.Expr) anyerror!LocalId {
-        const tracked_hir_type = self.effectiveTrackedHirType(expr);
+        const tracked_hir_type = try self.effectiveTrackedHirType(expr);
 
         // Case expressions need binding locals reserved before dest allocation
         // to avoid shadowing conflicts in the generated Zig.
         if (expr.kind == .case) {
             const case_dest = try self.lowerCaseExpr(expr.kind.case);
             try self.local_hir_types.put(case_dest, tracked_hir_type);
-            const case_result_type = typeIdToZigTypeWithStore(tracked_hir_type, self.type_store);
+            const case_result_type = try typeIdToZigTypeWithStore(tracked_hir_type, self.type_store);
             if (case_result_type != .any and case_result_type != .void) {
                 try self.known_local_types.put(case_dest, case_result_type);
             }
@@ -14184,9 +15820,9 @@ pub const IrBuilder = struct {
                 //      type in the ZIR layer.
                 //   3. Else a bare `i64`-tracked literal (no concrete context),
                 //      emitted untyped so straight-line uses stay flexible.
-                const declared_int_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const declared_int_type = try typeIdToZigTypeWithStore(expr.type_id, self.type_store);
                 const context_int_type: ?ZigType = if (declared_int_type == .any or declared_int_type == .i64)
-                    self.expectedConcreteIntegerType()
+                    try self.expectedConcreteIntegerType()
                 else
                     null;
                 const resolved = if (context_int_type) |ctx|
@@ -14214,9 +15850,9 @@ pub const IrBuilder = struct {
                 //      arm float literal adopt e.g. `f32` instead of escaping a
                 //      runtime branch as a bare `comptime_float`.
                 //   3. Else a bare `f64`-stamped literal, emitted untyped.
-                const declared_float_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const declared_float_type = try typeIdToZigTypeWithStore(expr.type_id, self.type_store);
                 const context_float_type: ?ZigType = if (declared_float_type == .any or declared_float_type == .f64)
-                    self.expectedConcreteFloatType()
+                    try self.expectedConcreteFloatType()
                 else
                     null;
                 const resolved = if (context_float_type) |ctx|
@@ -14265,47 +15901,54 @@ pub const IrBuilder = struct {
                 try self.emitLocalGet(dest, idx);
             },
             .param_get => |idx| {
-                try self.current_instrs.append(self.allocator, .{
-                    .param_get = .{ .dest = dest, .index = idx },
-                });
-                // Phase 3: track known type from HIR expr type_id
-                var param_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
-                // Always prefer the declared param type from the function signature.
-                // The expression's type_id may be stale (from before monomorphization)
-                // or incorrectly concretized. The function's declared param types are
-                // the authoritative source of truth after monomorphization.
-                if (idx < self.current_param_types.items.len) {
-                    param_zig_type = self.current_param_types.items[idx];
+                if (self.current_param_locals.get(idx)) |source| {
+                    try self.emitLocalGet(dest, source);
+                } else {
+                    try self.current_instrs.append(self.allocator, .{
+                        .param_get = .{ .dest = dest, .index = idx },
+                    });
+                    // Phase 3: track known type from HIR expr type_id
+                    var param_zig_type = try typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                    // Always prefer the declared param type from the function signature.
+                    // The expression's type_id may be stale (from before monomorphization)
+                    // or incorrectly concretized. The function's declared param types are
+                    // the authoritative source of truth after monomorphization.
+                    if (idx < self.current_param_types.items.len) {
+                        param_zig_type = self.current_param_types.items[idx];
+                    }
+                    if (param_zig_type != .any) {
+                        try self.known_local_types.put(dest, param_zig_type);
+                    }
+                    // Phase E.5 Gap 2: override the universal
+                    // `local_hir_types[dest] = expr.type_id` (set above at
+                    // expression entry) with the function signature's
+                    // declared parameter HIR type when available. The HIR
+                    // expression's `type_id` may be `UNKNOWN` (or stale
+                    // from before monomorphization) for some param_get
+                    // sites; the function's declared param HIR type is the
+                    // authoritative source. Without this override
+                    // `isArcManagedLocal(dest)` returns false on the param-
+                    // bound local in single-clause functions, so
+                    // `local_ownership[dest] = .trivial` and downstream
+                    // arc_liveness/verifier never treat the param read as
+                    // ARC-managed.
+                    if (idx < self.current_param_hir_types.items.len) {
+                        const declared_hir_type = self.current_param_hir_types.items[idx];
+                        try self.local_hir_types.put(dest, declared_hir_type);
+                    }
+                    if (idx < self.current_param_unique_owners.items.len and self.current_param_unique_owners.items[idx]) {
+                        try self.owned_transfer_locals.put(self.allocator, dest, {});
+                    }
+                    // Mark this local as param-backed so call-name encoding
+                    // can detect bridge calls that thread function parameters
+                    // straight into a `:zig.<Container>.<method>` site.
+                    try self.param_backed_locals.put(dest, {});
                 }
-                if (param_zig_type != .any) {
-                    try self.known_local_types.put(dest, param_zig_type);
-                }
-                // Phase E.5 Gap 2: override the universal
-                // `local_hir_types[dest] = expr.type_id` (set above at
-                // expression entry) with the function signature's
-                // declared parameter HIR type when available. The HIR
-                // expression's `type_id` may be `UNKNOWN` (or stale
-                // from before monomorphization) for some param_get
-                // sites; the function's declared param HIR type is the
-                // authoritative source. Without this override
-                // `isArcManagedLocal(dest)` returns false on the param-
-                // bound local in single-clause functions, so
-                // `local_ownership[dest] = .trivial` and downstream
-                // arc_liveness/verifier never treat the param read as
-                // ARC-managed.
-                if (idx < self.current_param_hir_types.items.len) {
-                    const declared_hir_type = self.current_param_hir_types.items[idx];
-                    try self.local_hir_types.put(dest, declared_hir_type);
-                }
-                // Mark this local as param-backed so call-name encoding
-                // can detect bridge calls that thread function parameters
-                // straight into a `:zig.<Container>.<method>` site.
-                try self.param_backed_locals.put(dest, {});
             },
             .binary => |bin| {
                 const lhs = try self.lowerExpr(bin.lhs);
                 const rhs = try self.lowerExpr(bin.rhs);
-                try self.local_hir_types.put(dest, self.binaryResultHirType(expr.type_id, lhs, rhs));
+                try self.local_hir_types.put(dest, try self.binaryResultHirType(expr.type_id, lhs, rhs));
                 // Detect string comparison — Zig needs std.mem.eql, not ==
                 const lhs_is_string = if (self.known_local_types.get(lhs)) |t| t == .string else (bin.lhs.type_id == types_mod.TypeStore.STRING);
                 const rhs_is_string = if (self.known_local_types.get(rhs)) |t| t == .string else (bin.rhs.type_id == types_mod.TypeStore.STRING);
@@ -14353,7 +15996,7 @@ pub const IrBuilder = struct {
                         .op = ir_op,
                         .lhs = lhs,
                         .rhs = rhs,
-                        .result_type = self.binaryResultZigType(expr.type_id, lhs, rhs),
+                        .result_type = try self.binaryResultZigType(expr.type_id, lhs, rhs),
                     },
                 });
                 if (bin.op == .not_in_op) {
@@ -14368,7 +16011,7 @@ pub const IrBuilder = struct {
                     .negate => .negate,
                     .not_op => .bool_not,
                 };
-                const result_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const result_zig_type = try typeIdToZigTypeWithStore(expr.type_id, self.type_store);
                 const needs_numeric_coercion = isConcreteIntegerZigType(result_zig_type) or isFloatZigType(result_zig_type);
                 const unary_dest = if (needs_numeric_coercion) blk: {
                     const raw_dest = self.next_local;
@@ -14405,7 +16048,10 @@ pub const IrBuilder = struct {
                         else
                             null;
                         defer self.current_expected_type = saved_expected_type;
-                        break :blk try self.lowerExpr(arg.expr);
+                        break :blk if (arg.mode == .borrow)
+                            try self.lowerBorrowArgumentExpr(arg.expr)
+                        else
+                            try self.lowerExpr(arg.expr);
                     };
                     // A `.move` arg whose value will be auto-boxed into a
                     // `ProtocolBox` (the target slot is `.protocol_box`) must
@@ -14420,17 +16066,41 @@ pub const IrBuilder = struct {
                     const arg_autoboxes = blk_box: {
                         const tgt = self.callTargetExpectedType(call.target, call.args.len, arg_index) orelse arg.expected_type;
                         if (tgt == types_mod.TypeStore.UNKNOWN or tgt == types_mod.TypeStore.ERROR) break :blk_box false;
-                        break :blk_box typeIdToZigTypeWithStore(tgt, self.type_store) == .protocol_box;
+                        break :blk_box (try typeIdToZigTypeWithStore(tgt, self.type_store)) == .protocol_box;
                     };
                     const lowered_arg = switch (arg.mode) {
                         .move => blk: {
                             if (arg_autoboxes) break :blk arg_local;
+                            const should_move_arc = blk_move: {
+                                if (self.owned_transfer_locals.contains(arg_local)) {
+                                    break :blk_move true;
+                                }
+                                const target_ownership_type = self.callTargetExpectedType(call.target, call.args.len, arg_index) orelse arg.expected_type;
+                                if (target_ownership_type != types_mod.TypeStore.UNKNOWN and
+                                    target_ownership_type != types_mod.TypeStore.ERROR and
+                                    (self.isArcManagedType(target_ownership_type) or self.typeIdIsProtocolConstraint(target_ownership_type)))
+                                {
+                                    break :blk_move true;
+                                }
+                                if (arg_ownership_type != types_mod.TypeStore.UNKNOWN and
+                                    arg_ownership_type != types_mod.TypeStore.ERROR and
+                                    self.isArcManagedType(arg_ownership_type))
+                                {
+                                    break :blk_move true;
+                                }
+                                if (arg.expr.type_id != types_mod.TypeStore.UNKNOWN and
+                                    arg.expr.type_id != types_mod.TypeStore.ERROR and
+                                    self.isArcManagedType(arg.expr.type_id))
+                                {
+                                    break :blk_move true;
+                                }
+                                break :blk_move self.isArcManagedLocal(arg_local);
+                            };
+                            if (!should_move_arc) break :blk arg_local;
                             const moved_local = self.next_local;
                             self.next_local += 1;
                             try self.current_instrs.append(self.allocator, .{ .move_value = .{ .dest = moved_local, .source = arg_local } });
-                            if (self.known_local_types.get(arg_local)) |src_type| {
-                                try self.known_local_types.put(moved_local, src_type);
-                            }
+                            try self.recordMoveValueMetadata(moved_local, arg_local);
                             break :blk moved_local;
                         },
                         .share => blk: {
@@ -14575,7 +16245,7 @@ pub const IrBuilder = struct {
                             arg.expected_type;
                         if (target_expected_type == types_mod.TypeStore.UNKNOWN) continue;
                         if (target_expected_type == types_mod.TypeStore.ERROR) continue;
-                        const expected_zig_type = typeIdToZigTypeWithStore(target_expected_type, ts);
+                        const expected_zig_type = try typeIdToZigTypeWithStore(target_expected_type, ts);
                         if (expected_zig_type != .protocol_box) continue;
                         const boxed = try self.maybeBoxAsProtocol(args.items[i], expected_zig_type);
                         args.items[i] = boxed;
@@ -14604,16 +16274,13 @@ pub const IrBuilder = struct {
                         // box carrying that HIR type so the move only fires for
                         // genuinely owned boxes.
                         if (i < arg_modes.items.len and arg_modes.items[i] == .move) {
-                            if (self.local_hir_types.get(boxed)) |box_hir| {
+                            if (self.local_hir_types.get(boxed)) |_| {
                                 const moved_box = self.next_local;
                                 self.next_local += 1;
                                 try self.current_instrs.append(self.allocator, .{
                                     .move_value = .{ .dest = moved_box, .source = boxed },
                                 });
-                                try self.local_hir_types.put(moved_box, box_hir);
-                                if (self.known_local_types.get(boxed)) |box_type| {
-                                    try self.known_local_types.put(moved_box, box_type);
-                                }
+                                try self.recordMoveValueMetadata(moved_box, boxed);
                                 args.items[i] = moved_box;
                             }
                         }
@@ -14632,7 +16299,7 @@ pub const IrBuilder = struct {
                         if (ts.canWidenTo(actual, expected)) {
                             const widened_local = self.next_local;
                             self.next_local += 1;
-                            const dest_zig_type = typeIdToZigTypeWithStore(expected, self.type_store);
+                            const dest_zig_type = try typeIdToZigTypeWithStore(expected, self.type_store);
                             const actual_type = ts.getType(actual);
                             if (actual_type == .int) {
                                 try self.current_instrs.append(self.allocator, .{
@@ -14689,7 +16356,7 @@ pub const IrBuilder = struct {
                             const receiver_local = args.items[0];
                             const receiver_zig_type =
                                 self.known_local_types.get(receiver_local) orelse
-                                typeIdToZigTypeWithStore(
+                                try typeIdToZigTypeWithStore(
                                     call.args[0].expr.type_id,
                                     self.type_store,
                                 );
@@ -14710,11 +16377,11 @@ pub const IrBuilder = struct {
                                 box_name.len > mod.len and box_name[mod.len] == '_';
                             if (!exact and !parametric) break :dispatch_blk;
 
-                            const slot = self.findProtocolMethodSlotForReceiver(
+                            const slot = (try self.findProtocolMethodSlotForReceiver(
                                 mod,
                                 nc.name,
                                 call.args[0].expr.type_id,
-                            ) orelse break :dispatch_blk;
+                            )) orelse break :dispatch_blk;
 
                             // The receiver flows in as the implicit
                             // first slot of the synthesized
@@ -14755,7 +16422,7 @@ pub const IrBuilder = struct {
                                     .return_type = slot.return_type,
                                 },
                             });
-                            try self.trackCallResultType(dest, tracked_hir_type);
+                            try self.trackCallResultType(dest, slot.return_type_id orelse tracked_hir_type);
                             // Track the dest's Zig type from the slot
                             // so downstream lowering sees a concrete
                             // return shape (mirrors call_named's
@@ -14776,7 +16443,7 @@ pub const IrBuilder = struct {
                             const payload_zig = if (slot.return_type != .any and slot.return_type != .void)
                                 slot.return_type
                             else
-                                typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                                try typeIdToZigTypeWithStore(expr.type_id, self.type_store);
                             try self.emitBoxedCallableRaisesUnwrap(dest, box_name, slot.method_index, payload_zig);
                             return dest;
                         }
@@ -14787,7 +16454,7 @@ pub const IrBuilder = struct {
                         // declarations registered in known_function_names.
                         const resolved_name = if (nc.struct_name) |mod| blk: {
                             const mangled_call_name = try mangleSymbolForZig(self.allocator, nc.name);
-                            if (self.selectTypeOnlyNamedClause(mod, nc.name, call_arity, call.args, nc.clause_index)) |selected_clause| {
+                            if (try self.selectTypeOnlyNamedClause(mod, nc.name, call_arity, call.args, nc.clause_index)) |selected_clause| {
                                 const candidate = try std.fmt.allocPrint(
                                     self.allocator,
                                     "{s}__{s}__{d}__clause_{d}",
@@ -14825,7 +16492,7 @@ pub const IrBuilder = struct {
                                     }
                                     // Also check via HIR expr type_id
                                     if (info.param_idx < call.args.len) {
-                                        const arg_type = typeIdToZigTypeWithStore(call.args[info.param_idx].expr.type_id, self.type_store);
+                                        const arg_type = try typeIdToZigTypeWithStore(call.args[info.param_idx].expr.type_id, self.type_store);
                                         if (arg_type == .struct_ref) {
                                             if (info.variants.contains(arg_type.struct_ref)) {
                                                 break :blk arg_type.struct_ref;
@@ -14885,7 +16552,7 @@ pub const IrBuilder = struct {
 
                         const lowered_args = try args.toOwnedSlice(self.allocator);
                         const lowered_modes = try arg_modes.toOwnedSlice(self.allocator);
-                        const return_type = self.closureReturnType(expr.type_id, callee_local);
+                        const return_type = try self.closureReturnType(expr.type_id, callee_local);
                         const closure_raises = self.closureCalleeRaises(callee);
                         const callee_bare_fn = self.closureCalleeIsMaterializedValue(callee, callee_local);
                         try self.current_instrs.append(self.allocator, .{
@@ -14915,7 +16582,7 @@ pub const IrBuilder = struct {
                             const payload_zig = if (return_type != .any and return_type != .void)
                                 return_type
                             else
-                                typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                                try typeIdToZigTypeWithStore(expr.type_id, self.type_store);
                             try self.current_instrs.append(self.allocator, .{
                                 .unwrap_error_union = .{
                                     .dest = dest,
@@ -15107,7 +16774,7 @@ pub const IrBuilder = struct {
                         // constructor-style generic runtime calls such as
                         // `List.new_empty(capacity)`, where there is no receiver
                         // argument to recover `List(T)` from.
-                        const call_result_type = typeIdToZigTypeWithStore(tracked_hir_type, self.type_store);
+                        const call_result_type = try typeIdToZigTypeWithStore(tracked_hir_type, self.type_store);
                         try self.current_instrs.append(self.allocator, .{
                             .call_builtin = .{
                                 .dest = dest,
@@ -15132,14 +16799,14 @@ pub const IrBuilder = struct {
                 //   - in an error-union fn → `try` (propagate; ERT chain),
                 //   - otherwise (e.g. `main`) → abort via the unhandled-raise
                 //     crash report (re-raise the stashed box).
-                if (self.calleeRaises(call.target, call.args.len)) {
+                if (try self.calleeRaises(call.target, call.args.len)) {
                     const mode: ErrorUnionUnwrapMode = if (self.in_try_body)
                         .route_to_handler
                     else if (self.current_function_raises)
                         .propagate
                     else
                         .abort_unhandled;
-                    const payload_zig = typeIdToZigTypeWithStore(tracked_hir_type, self.type_store);
+                    const payload_zig = try typeIdToZigTypeWithStore(tracked_hir_type, self.type_store);
                     try self.current_instrs.append(self.allocator, .{
                         .unwrap_error_union = .{
                             .dest = dest,
@@ -15159,13 +16826,17 @@ pub const IrBuilder = struct {
             },
             .tuple_init => |elems| {
                 var locals: std.ArrayList(LocalId) = .empty;
+                defer locals.deinit(self.allocator);
                 var elem_zig_types: std.ArrayList(ZigType) = .empty;
+                defer elem_zig_types.deinit(self.allocator);
                 for (elems) |elem| {
                     const local = try self.lowerExpr(elem);
                     try locals.append(self.allocator, local);
                     try elem_zig_types.append(self.allocator, self.known_local_types.get(local) orelse .any);
                 }
-                const elements = try locals.toOwnedSlice(self.allocator);
+                var elements_owner: ?[]LocalId = try locals.toOwnedSlice(self.allocator);
+                locals = .empty;
+                errdefer if (elements_owner) |elements| self.allocator.free(elements);
 
                 // Resolve the static tuple type for this expression (when
                 // the type system inferred one). When the parent context
@@ -15173,13 +16844,14 @@ pub const IrBuilder = struct {
                 // the HIR-side type id reflects that — preferring it over
                 // the per-element known_local_types means we can tell the
                 // backend to wrap concrete values via `Term.from`.
-                const inferred_tuple_type: ZigType = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
-                const component_types: ?[]const ZigType = blk: {
+                const inferred_tuple_type: ZigType = try typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                var component_types_owner: ?[]const ZigType = blk: {
                     if (inferred_tuple_type == .tuple and inferred_tuple_type.tuple.len == elems.len) {
                         // Copy the inferred component types so this slice is
                         // owned by the IR (the type-store-derived slice is
                         // owned elsewhere and may be aliased).
                         var copy: std.ArrayList(ZigType) = .empty;
+                        errdefer copy.deinit(self.allocator);
                         for (inferred_tuple_type.tuple) |comp| {
                             try copy.append(self.allocator, comp);
                         }
@@ -15187,27 +16859,43 @@ pub const IrBuilder = struct {
                     }
                     break :blk null;
                 };
+                errdefer if (component_types_owner) |component_types| self.allocator.free(component_types);
 
-                try self.current_instrs.append(self.allocator, .{
-                    .tuple_init = .{ .dest = dest, .elements = elements, .component_types = component_types },
+                try self.current_instrs.ensureUnusedCapacity(self.allocator, 1);
+                try self.known_local_types.ensureUnusedCapacity(1);
+                var tuple_type_owner: ?[]const ZigType = try elem_zig_types.toOwnedSlice(self.allocator);
+                elem_zig_types = .empty;
+                errdefer if (tuple_type_owner) |tuple_types| self.allocator.free(tuple_types);
+
+                self.current_instrs.appendAssumeCapacity(.{
+                    .tuple_init = .{
+                        .dest = dest,
+                        .elements = elements_owner.?,
+                        .component_types = component_types_owner,
+                    },
                 });
-                try self.known_local_types.put(dest, .{
-                    .tuple = try elem_zig_types.toOwnedSlice(self.allocator),
-                });
+                self.known_local_types.putAssumeCapacity(dest, .{ .tuple = tuple_type_owner.? });
+                elements_owner = null;
+                component_types_owner = null;
+                tuple_type_owner = null;
             },
             .list_init => |elems| {
                 var locals: std.ArrayList(LocalId) = .empty;
+                defer locals.deinit(self.allocator);
                 for (elems) |elem| {
                     try locals.append(self.allocator, try self.lowerExpr(elem));
                 }
-                const elements = try locals.toOwnedSlice(self.allocator);
+                var elements_owner: ?[]LocalId = try locals.toOwnedSlice(self.allocator);
+                locals = .empty;
+                errdefer if (elements_owner) |elements| self.allocator.free(elements);
+
                 const fallback_elem_type: ?ZigType = blk: {
-                    if (elements.len > 0) {
-                        break :blk self.listElementTypeFromLocal(elements[0]);
+                    if (elements_owner.?.len > 0) {
+                        break :blk self.listElementTypeFromLocal(elements_owner.?[0]);
                     }
                     break :blk ZigType.i64;
                 };
-                const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type orelse .any);
+                const elem_type = try self.chooseListElementType(expr.type_id, fallback_elem_type orelse .any);
                 if (elem_type == .any and fallback_elem_type == null) return error.ListElementTypeUnavailable;
                 // When the list's element type is a protocol-box
                 // existential (`[fn(i64) -> i64]` -> `[Callable(...)]`),
@@ -15221,22 +16909,27 @@ pub const IrBuilder = struct {
                 // boxed element moves in. `maybeBoxAsProtocol` is a no-op for
                 // an element already boxed.
                 if (elem_type == .protocol_box) {
-                    for (elements, elems) |*elem_local, elem_expr| {
+                    for (elements_owner.?, elems) |*elem_local, elem_expr| {
                         elem_local.* = try self.boxedCallableAggregateOwnerLocal(elem_local.*, elem_expr, elem_type);
                     }
                 }
-                try self.current_instrs.append(self.allocator, .{
-                    .list_init = .{ .dest = dest, .elements = elements, .element_type = elem_type },
-                });
+
+                try self.current_instrs.ensureUnusedCapacity(self.allocator, 1);
+                try self.known_local_types.ensureUnusedCapacity(1);
                 const list_zig_type = try self.listTypeFromHirOrElement(expr.type_id, elem_type);
-                try self.known_local_types.put(dest, list_zig_type);
+
+                self.current_instrs.appendAssumeCapacity(.{
+                    .list_init = .{ .dest = dest, .elements = elements_owner.?, .element_type = elem_type },
+                });
+                self.known_local_types.putAssumeCapacity(dest, list_zig_type);
+                elements_owner = null;
             },
             .list_cons => |lc| {
                 var head = try self.lowerExpr(lc.head);
                 const tail = try self.lowerExpr(lc.tail);
                 const fallback_elem_type = self.listElementTypeFromTailLocal(tail) orelse
                     self.listElementTypeFromLocal(head);
-                const elem_type = self.chooseListElementType(expr.type_id, fallback_elem_type orelse .any);
+                const elem_type = try self.chooseListElementType(expr.type_id, fallback_elem_type orelse .any);
                 if (elem_type == .any and fallback_elem_type == null) return error.ListElementTypeUnavailable;
                 // FCC unified model: a cons cell is an OWNING aggregate slot
                 // for its head, so a boxed `Callable` head REFERENCED from an
@@ -15304,53 +16997,7 @@ pub const IrBuilder = struct {
                             try self.current_instrs.append(self.allocator, .{
                                 .local_set = .{ .dest = ls.index, .value = val },
                             });
-                            // Propagate the source local's type so a
-                            // downstream `field_get` on this binding can
-                            // still resolve its struct nominal type and
-                            // run indirect-storage auto-deref.
-                            if (self.known_local_types.get(val)) |t| {
-                                try self.known_local_types.put(ls.index, t);
-                            }
-                            // Propagate the HIR type as well so ARC ownership
-                            // classification (`computeLocalOwnership` via
-                            // `isArcManagedLocal`/`local_hir_types`) sees this
-                            // binding's ARC-managed type. Without this, a
-                            // `let` inside a nested block expression (e.g. a
-                            // Zest `describe`/`test` body) whose RHS yields an
-                            // ARC value — such as `first = List.head(items)`
-                            // where `items : List(List(String))` — leaves the
-                            // binding classified `.trivial`. A later ARC pass
-                            // that inserts a `.copy_value` reading that binding
-                            // then trips the V11 verifier invariant (source of
-                            // `.copy_value` must be non-`.trivial`). The
-                            // top-level statement arm already mirrors this; the
-                            // nested-block arm must too, or the two paths
-                            // disagree on which bindings are ARC-managed.
-                            if (self.local_hir_types.get(val)) |src_hir_type| {
-                                try self.local_hir_types.put(ls.index, src_hir_type);
-                            }
-                            // FCC unified model: propagate the boxed-existential
-                            // OWNER marker (and the Gap-E materialized-closure
-                            // marker) from the RHS into this binding local — the
-                            // SAME propagation the top-level statement
-                            // `local_set` arm performs. Without it, a binding
-                            // inside a nested block (a `zap run` script `main`
-                            // body lowers as a block, and the inline-indexed
-                            // `List.get(ops, i)(v)` hoists its cloned boxed
-                            // element into such a `local_set`) inherits the
-                            // box's ZigType but NOT its owner marker, so
-                            // `computeLocalOwnership` classifies it `.trivial`
-                            // and `arc_drop_insertion` schedules no scope-exit
-                            // `.protocol_box_drop` — the cloned element leaks
-                            // under `Memory.Tracking` (a NAMED binding through
-                            // the statement path already gets the drop; the two
-                            // paths must agree).
-                            if (self.boxed_existential_locals.contains(val)) {
-                                try self.boxed_existential_locals.put(self.allocator, ls.index, {});
-                            }
-                            if (self.materialized_closure_locals.contains(val)) {
-                                try self.materialized_closure_locals.put(self.allocator, ls.index, {});
-                            }
+                            try self.recordLocalSetAliasMetadata(ls.index, val);
                         },
                         .function_group => |group| {
                             // Anonymous functions and nested functions defined
@@ -15383,10 +17030,11 @@ pub const IrBuilder = struct {
                 // and the value is a concrete struct implementing `P`.
                 const struct_type_name = self.resolveTypeName(si.type_id);
                 var ir_fields: std.ArrayList(StructFieldInit) = .empty;
+                defer ir_fields.deinit(self.allocator);
                 for (si.fields) |field| {
                     var val = try self.lowerExpr(field.value);
                     const field_name_str = self.interner.get(field.name);
-                    if (self.fieldZigTypeAndStorage(struct_type_name, field_name_str)) |field_info| {
+                    if (try self.fieldZigTypeAndStorage(struct_type_name, field_name_str)) |field_info| {
                         // FCC unified model: a struct field (incl. a
                         // closure-env capture field) is an OWNING aggregate
                         // slot, so a boxed `Callable` REFERENCED from an
@@ -15403,17 +17051,24 @@ pub const IrBuilder = struct {
                 // the per-field coercion lookup; reuse here so the
                 // struct_init instruction carries the same name).
                 const type_name = struct_type_name;
-                try self.current_instrs.append(self.allocator, .{
+                try self.current_instrs.ensureUnusedCapacity(self.allocator, 1);
+                try self.known_local_types.ensureUnusedCapacity(1);
+                var fields_owner: ?[]const StructFieldInit = try ir_fields.toOwnedSlice(self.allocator);
+                ir_fields = .empty;
+                errdefer if (fields_owner) |fields| self.allocator.free(fields);
+
+                self.current_instrs.appendAssumeCapacity(.{
                     .struct_init = .{
                         .dest = dest,
                         .type_name = type_name,
-                        .fields = try ir_fields.toOwnedSlice(self.allocator),
+                        .fields = fields_owner.?,
                     },
                 });
                 // Track the constructed value's nominal type so a later
                 // `field_get` on this local can resolve struct identity
                 // for indirect-storage auto-deref.
-                try self.known_local_types.put(dest, .{ .struct_ref = type_name });
+                self.known_local_types.putAssumeCapacity(dest, .{ .struct_ref = type_name });
+                fields_owner = null;
             },
             .error_pipe => |ep| {
                 // Lower the error pipe so that a failure in any dispatched
@@ -15481,7 +17136,7 @@ pub const IrBuilder = struct {
                 // and the supplied value is a concrete struct
                 // implementing P, wrap the value in a
                 // `runtime.ProtocolBox` via `box_as_protocol`.
-                if (self.variantPayloadZigTypeByName(type_name, variant_name_str)) |variant_payload_type| {
+                if (try self.variantPayloadZigTypeByName(type_name, variant_name_str)) |variant_payload_type| {
                     // FCC unified model: a tagged-union payload is an OWNING
                     // aggregate slot, so a boxed `Callable` payload REFERENCED
                     // from an existing binding/param is clone-on-shared into an
@@ -15595,7 +17250,7 @@ pub const IrBuilder = struct {
                 // emission. (Phase 1 Class A.)
                 try self.emitArcRetainOnAggregateExtract(dest);
                 if (struct_type) |sname| {
-                    if (self.fieldZigTypeAndStorage(sname, field_name)) |info| {
+                    if (try self.fieldZigTypeAndStorage(sname, field_name)) |info| {
                         try self.known_local_types.put(dest, info.type_expr);
                     }
                 }
@@ -15621,7 +17276,7 @@ pub const IrBuilder = struct {
                 if (self.type_store) |ts| {
                     const obj_type = ts.getType(tig.object.type_id);
                     if (obj_type == .tuple and tig.index < obj_type.tuple.elements.len) {
-                        try self.known_local_types.put(dest, typeIdToZigTypeWithStore(obj_type.tuple.elements[tig.index], self.type_store));
+                        try self.known_local_types.put(dest, try typeIdToZigTypeWithStore(obj_type.tuple.elements[tig.index], self.type_store));
                     }
                 }
             },
@@ -15681,6 +17336,7 @@ pub const IrBuilder = struct {
             },
             .map_init => |entries| {
                 var ir_entries: std.ArrayList(MapEntry) = .empty;
+                defer ir_entries.deinit(self.allocator);
                 // Read key/value types from the unified map type computed in
                 // HIR (which already collapses disagreeing scalars to TERM and
                 // unifies tuple shapes component-wise). Fall back to the first
@@ -15692,15 +17348,15 @@ pub const IrBuilder = struct {
                         if (expr.type_id < ts.types.items.len) {
                             const map_t = ts.types.items[expr.type_id];
                             if (map_t == .map) {
-                                key_type = typeIdToZigTypeWithStore(map_t.map.key, self.type_store);
-                                value_type = typeIdToZigTypeWithStore(map_t.map.value, self.type_store);
+                                key_type = try typeIdToZigTypeWithStore(map_t.map.key, self.type_store);
+                                value_type = try typeIdToZigTypeWithStore(map_t.map.value, self.type_store);
                                 break :blk;
                             }
                         }
                     }
                     if (entries.len > 0) {
-                        key_type = typeIdToZigTypeWithStore(entries[0].key.type_id, self.type_store);
-                        value_type = typeIdToZigTypeWithStore(entries[0].value.type_id, self.type_store);
+                        key_type = try typeIdToZigTypeWithStore(entries[0].key.type_id, self.type_store);
+                        value_type = try typeIdToZigTypeWithStore(entries[0].value.type_id, self.type_store);
                     }
                 }
                 for (entries) |entry| {
@@ -15718,42 +17374,61 @@ pub const IrBuilder = struct {
                     }
                     try ir_entries.append(self.allocator, .{ .key = key, .value = value });
                 }
-                try self.current_instrs.append(self.allocator, .{
+                try self.current_instrs.ensureUnusedCapacity(self.allocator, 1);
+                try self.known_local_types.ensureUnusedCapacity(1);
+
+                var entries_owner: ?[]const MapEntry = try ir_entries.toOwnedSlice(self.allocator);
+                ir_entries = .empty;
+                errdefer if (entries_owner) |owned_entries| self.allocator.free(owned_entries);
+
+                const kt = try self.allocator.create(ZigType);
+                var kt_owner: ?*ZigType = kt;
+                errdefer if (kt_owner) |owned_key_type| self.allocator.destroy(owned_key_type);
+                kt.* = key_type;
+
+                const vt = try self.allocator.create(ZigType);
+                var vt_owner: ?*ZigType = vt;
+                errdefer if (vt_owner) |owned_value_type| self.allocator.destroy(owned_value_type);
+                vt.* = value_type;
+
+                self.current_instrs.appendAssumeCapacity(.{
                     .map_init = .{
                         .dest = dest,
-                        .entries = try ir_entries.toOwnedSlice(self.allocator),
+                        .entries = entries_owner.?,
                         .key_type = key_type,
                         .value_type = value_type,
                     },
                 });
                 // Track the map's concrete type so Map.method calls can dispatch
-                const kt = try self.allocator.create(ZigType);
-                kt.* = key_type;
-                const vt = try self.allocator.create(ZigType);
-                vt.* = value_type;
-                try self.known_local_types.put(dest, .{ .map = .{ .key = kt, .value = vt } });
+                self.known_local_types.putAssumeCapacity(dest, .{ .map = .{ .key = kt, .value = vt } });
+                entries_owner = null;
+                kt_owner = null;
+                vt_owner = null;
             },
             .capture_get => |index| {
                 try self.current_instrs.append(self.allocator, .{
                     .capture_get = .{ .dest = dest, .index = index },
                 });
-                const capture_zig_type = typeIdToZigTypeWithStore(expr.type_id, self.type_store);
+                const capture_zig_type = try typeIdToZigTypeWithStore(expr.type_id, self.type_store);
                 if (capture_zig_type != .any) {
                     try self.known_local_types.put(dest, capture_zig_type);
                 }
             },
             .closure_create => |cc| {
                 var capture_locals: std.ArrayList(LocalId) = .empty;
+                defer capture_locals.deinit(self.allocator);
+                try capture_locals.ensureUnusedCapacity(self.allocator, cc.captures.len);
                 for (cc.captures) |capture| {
-                    try capture_locals.append(self.allocator, try self.lowerExpr(capture.expr));
+                    capture_locals.appendAssumeCapacity(try self.lowerExpr(capture.expr));
                 }
-                try self.current_instrs.append(self.allocator, .{
-                    .make_closure = .{
-                        .dest = dest,
-                        .function = cc.function_group_id,
-                        .captures = try capture_locals.toOwnedSlice(self.allocator),
-                    },
+                var owned_capture_locals: ?[]const LocalId = try capture_locals.toOwnedSlice(self.allocator);
+                errdefer if (owned_capture_locals) |captures| self.allocator.free(captures);
+                try self.appendOwnedMakeClosureInstruction(.{
+                    .dest = dest,
+                    .function = cc.function_group_id,
+                    .captures = owned_capture_locals.?,
                 });
+                owned_capture_locals = null;
             },
             else => {
                 // Emit a nil placeholder for unhandled expressions
@@ -15764,9 +17439,24 @@ pub const IrBuilder = struct {
         // Gap E — mark `dest` if this expression materialized a closure
         // VALUE out of storage (field / return / collection element), so a
         // later `call_closure` aliasing it invokes via a direct `call_ref`.
-        self.noteMaterializedClosureLocal(dest, expr);
+        try self.noteMaterializedClosureLocal(dest, expr);
 
         return dest;
+    }
+
+    /// Lower a call argument that the callee borrows.
+    ///
+    /// A simple local or parameter reference already names storage whose
+    /// lifetime covers the call. Passing that existing local preserves borrow
+    /// mode without manufacturing a retained `local_get` alias. More complex
+    /// expressions still lower normally: their producer owns whatever
+    /// temporary value the borrowed call observes.
+    fn lowerBorrowArgumentExpr(self: *IrBuilder, expr: *const hir_mod.Expr) anyerror!LocalId {
+        return switch (expr.kind) {
+            .local_get => |local| local,
+            .param_get => |index| self.current_param_locals.get(index) orelse try self.lowerExpr(expr),
+            else => try self.lowerExpr(expr),
+        };
     }
 
     /// Resolve a type_id to a string name for struct/enum types.
@@ -15832,9 +17522,9 @@ pub const IrBuilder = struct {
 
     /// Convert an ast.StructName to a prefix string for function naming.
     /// Single-part: "IO". Multi-part: "IO_File".
-    fn structNameToPrefix(self: *IrBuilder, name: ast.StructName) []const u8 {
+    fn structNameToPrefix(self: *IrBuilder, name: ast.StructName) std.mem.Allocator.Error![]const u8 {
         if (name.parts.len == 1) return self.interner.get(name.parts[0]);
-        return name.joinedWith(self.allocator, self.interner, "_") catch self.interner.get(name.parts[0]);
+        return try name.joinedWith(self.allocator, self.interner, "_");
     }
 
     fn allocSlice(self: *IrBuilder, comptime T: type, items: []const T) ![]const T {
@@ -15902,6 +17592,7 @@ pub const ProtocolMethodSlot = struct {
     method_index: u32,
     arity: u32,
     return_type: ZigType,
+    return_type_id: ?types_mod.TypeId = null,
 };
 
 pub fn findProtocolMethodSlot(
@@ -15962,6 +17653,8 @@ pub fn mangleSymbolForZig(allocator: std.mem.Allocator, name: []const u8) ![]con
     if (!needs_mangle) return name;
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
     for (name) |c| {
         switch (c) {
             'a'...'z', 'A'...'Z', '0'...'9', '_', '?', '!' => try buf.append(allocator, c),
@@ -16068,301 +17761,339 @@ fn isTotalMatchPattern(pattern: *const hir_mod.MatchPattern) bool {
 /// silently collides, causing `local_set` propagation to overwrite the
 /// IR builder's `local_hir_types[ls.index]` with a stale entry.
 /// Walking the body for `local_set` indices closes that collision.
-fn computeMaxBindingLocalForClauses(clauses: []const hir_mod.Clause) LocalId {
+fn maxBindingLocalForClauses(
+    allocator: std.mem.Allocator,
+    clauses: []const hir_mod.Clause,
+) error{ OutOfMemory, IrStructuralBudgetExceeded }!LocalId {
     var max_local: LocalId = 0;
     for (clauses) |clause| {
         for (clause.tuple_bindings) |binding| {
-            max_local = @max(max_local, binding.local_index + 1);
+            updateMaxLocalFromIndex(&max_local, binding.local_index);
         }
         for (clause.struct_bindings) |binding| {
-            max_local = @max(max_local, binding.local_index + 1);
+            updateMaxLocalFromIndex(&max_local, binding.local_index);
         }
         for (clause.list_bindings) |binding| {
-            max_local = @max(max_local, binding.local_index + 1);
+            updateMaxLocalFromIndex(&max_local, binding.local_index);
         }
         for (clause.cons_tail_bindings) |binding| {
-            max_local = @max(max_local, binding.local_index + 1);
+            updateMaxLocalFromIndex(&max_local, binding.local_index);
         }
         for (clause.binary_bindings) |binding| {
-            max_local = @max(max_local, binding.local_index + 1);
+            updateMaxLocalFromIndex(&max_local, binding.local_index);
         }
         for (clause.map_bindings) |binding| {
-            max_local = @max(max_local, binding.local_index + 1);
+            updateMaxLocalFromIndex(&max_local, binding.local_index);
         }
         // Walk the clause body for `local_set` indices (assignment
         // bindings allocated via HIR's per-clause `next_local`).
-        const body_max = maxLocalSetIndexInBlock(clause.body);
+        const body_max = try maxLocalSetIndexInBlock(allocator, clause.body);
         max_local = @max(max_local, body_max);
     }
     return max_local;
 }
 
-/// Recursively walks a HIR block, returning one past the largest
+/// Walks a HIR block, returning one past the largest
 /// `local_set.index` reached anywhere inside the block (including
-/// nested blocks, function-group bodies, branches, case arms, error
-/// pipes, etc.). Returns `0` when the block contains no `local_set`.
-fn maxLocalSetIndexInBlock(block: *const hir_mod.Block) LocalId {
-    var max_local: LocalId = 0;
-    for (block.stmts) |stmt| {
-        switch (stmt) {
-            .local_set => |ls| {
-                max_local = @max(max_local, ls.index + 1);
-                const value_max = maxLocalSetIndexInExpr(ls.value);
-                max_local = @max(max_local, value_max);
-            },
-            .expr => |expr| {
-                const expr_max = maxLocalSetIndexInExpr(expr);
-                max_local = @max(max_local, expr_max);
-            },
-            .function_group => |group| {
-                // Closures capture by reference; their bodies use a
-                // fresh `next_local` counter, so they cannot collide
-                // with the enclosing function's local space. Skip.
-                _ = group;
-            },
-        }
-    }
-    return max_local;
+/// nested blocks, branches, case arms, error pipes, etc.). Nested
+/// function-group bodies are deliberately skipped because they own a fresh
+/// local space. Returns `0` when the block contains no `local_set`.
+fn maxLocalSetIndexInBlock(
+    allocator: std.mem.Allocator,
+    block: *const hir_mod.Block,
+) error{ OutOfMemory, IrStructuralBudgetExceeded }!LocalId {
+    return maxLocalSetIndexFromFrame(allocator, .{ .block = block });
 }
 
-/// Recursively walks a HIR expression for `local_set` indices that
+/// Walks a HIR expression for `local_set` indices that
 /// appear inside its sub-blocks (case arms, branches, error pipes,
 /// blocks-as-expressions, ...). Mirrors `maxLocalSetIndexInBlock`.
-fn maxLocalSetIndexInExpr(expr: *const hir_mod.Expr) LocalId {
+fn maxLocalSetIndexInExpr(
+    allocator: std.mem.Allocator,
+    expr: *const hir_mod.Expr,
+) error{ OutOfMemory, IrStructuralBudgetExceeded }!LocalId {
+    return maxLocalSetIndexFromFrame(allocator, .{ .expr = expr });
+}
+
+fn updateMaxLocalFromIndex(max_local: *LocalId, index: LocalId) void {
+    const one_past = if (index == std.math.maxInt(LocalId)) index else index + 1;
+    max_local.* = @max(max_local.*, one_past);
+}
+
+fn maxLocalSetIndexFromFrame(
+    allocator: std.mem.Allocator,
+    root: MaxLocalScanFrame,
+) error{ OutOfMemory, IrStructuralBudgetExceeded }!LocalId {
     var max_local: LocalId = 0;
-    switch (expr.kind) {
-        .branch => |*br| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(br.condition));
-            max_local = @max(max_local, maxLocalSetIndexInBlock(br.then_block));
-            if (br.else_block) |eb| max_local = @max(max_local, maxLocalSetIndexInBlock(eb));
-        },
-        .case => |*ce| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(ce.scrutinee));
-            for (ce.arms) |arm| {
-                max_local = @max(max_local, maxLocalSetIndexInBlock(arm.body));
-                // Phase H.5: case-arm bindings allocate `local_index`
-                // from the HIR builder's per-clause `next_local`
-                // counter (see `collectCasePatternBindings`). The
-                // IR-builder reservation in
-                // `computeMaxBindingLocalForClauses` walks every
-                // `tuple_bindings`/`list_bindings`/etc. on the clause
-                // to keep its own `next_local` above any reserved
-                // index, but it never visited the case arm's
-                // `bindings` list — so a case-arm binding's
-                // `local_index` could collide with a top-level
-                // `local_set` (e.g. `opts = [...]` whose list_init
-                // dest gets `next_local++`). The collision rebinds
-                // an already-ARC-managed local mid-function, which
-                // makes `local_ownership[binding] = .owned` and
-                // causes the classifier to emit `copy_value` (with
-                // a runtime retain) on top of a non-ARC value
-                // (e.g. a String binding inside a keyword pattern).
-                // Walk the arm's bindings here so the reservation is
-                // sound across every case-arm pattern shape.
-                for (arm.bindings) |binding| {
-                    max_local = @max(max_local, binding.local_index + 1);
+    var stack: std.ArrayList(MaxLocalScanFrame) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, root);
+
+    var visited_nodes: usize = 0;
+    while (stack.items.len != 0) {
+        const frame = stack.items[stack.items.len - 1];
+        stack.items.len -= 1;
+
+        if (visited_nodes >= max_ir_hir_scan_nodes) return error.IrStructuralBudgetExceeded;
+        visited_nodes += 1;
+
+        switch (frame) {
+            .block => |block| {
+                var stmt_index = block.stmts.len;
+                while (stmt_index != 0) {
+                    stmt_index -= 1;
+                    switch (block.stmts[stmt_index]) {
+                        .local_set => |ls| {
+                            updateMaxLocalFromIndex(&max_local, ls.index);
+                            try stack.append(allocator, .{ .expr = ls.value });
+                        },
+                        .expr => |expr| try stack.append(allocator, .{ .expr = expr }),
+                        .function_group => |group| {
+                            // Closures capture by reference; their bodies use a
+                            // fresh `next_local` counter, so they cannot collide
+                            // with the enclosing function's local space. Skip.
+                            _ = group;
+                        },
+                    }
                 }
-            }
-        },
-        .block => |*blk| {
-            max_local = @max(max_local, maxLocalSetIndexInBlock(blk));
-        },
-        .binary => |b| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(b.lhs));
-            max_local = @max(max_local, maxLocalSetIndexInExpr(b.rhs));
-        },
-        .unary => |u| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(u.operand));
-        },
-        .call => |c| {
-            for (c.args) |arg| {
-                max_local = @max(max_local, maxLocalSetIndexInExpr(arg.expr));
-            }
-        },
-        .union_init => |ui| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(ui.value));
-        },
-        .match => |*m| {
-            // The match scrutinee plus the entire decision tree, whose
-            // `bind`/`success` nodes reserve `local_index` values from the
-            // same per-clause space. Skipping it (the prior `else` arm) let
-            // a decision-tree binding's `local_index` collide with a later
-            // `local_set`, rebinding a live ARC-managed local mid-function.
-            max_local = @max(max_local, maxLocalSetIndexInExpr(m.scrutinee));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(m.decision));
-        },
-        .tuple_init => |elements| {
-            for (elements) |element| {
-                max_local = @max(max_local, maxLocalSetIndexInExpr(element));
-            }
-        },
-        .list_init => |elements| {
-            for (elements) |element| {
-                max_local = @max(max_local, maxLocalSetIndexInExpr(element));
-            }
-        },
-        .list_cons => |*lc| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(lc.head));
-            max_local = @max(max_local, maxLocalSetIndexInExpr(lc.tail));
-        },
-        .map_init => |entries| {
-            for (entries) |entry| {
-                max_local = @max(max_local, maxLocalSetIndexInExpr(entry.key));
-                max_local = @max(max_local, maxLocalSetIndexInExpr(entry.value));
-            }
-        },
-        .struct_init => |*si| {
-            for (si.fields) |field| {
-                max_local = @max(max_local, maxLocalSetIndexInExpr(field.value));
-            }
-        },
-        .field_get => |*fg| max_local = @max(max_local, maxLocalSetIndexInExpr(fg.object)),
-        .tuple_index_get => |*tig| max_local = @max(max_local, maxLocalSetIndexInExpr(tig.object)),
-        .list_index_get => |*lig| max_local = @max(max_local, maxLocalSetIndexInExpr(lig.list)),
-        .list_head_get => |*lhg| max_local = @max(max_local, maxLocalSetIndexInExpr(lhg.list)),
-        .list_tail_get => |*ltg| max_local = @max(max_local, maxLocalSetIndexInExpr(ltg.list)),
-        .map_value_get => |*mvg| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(mvg.map));
-            max_local = @max(max_local, maxLocalSetIndexInExpr(mvg.key));
-        },
-        .panic => |operand| max_local = @max(max_local, maxLocalSetIndexInExpr(operand)),
-        .unwrap => |operand| max_local = @max(max_local, maxLocalSetIndexInExpr(operand)),
-        .ret_raise => |*rr| max_local = @max(max_local, maxLocalSetIndexInExpr(rr.stash_call)),
-        .closure_create => |*cc| {
-            for (cc.captures) |capture| {
-                max_local = @max(max_local, maxLocalSetIndexInExpr(capture.expr));
-            }
-        },
-        .error_pipe => |ep| {
-            for (ep.steps) |step| {
-                max_local = @max(max_local, maxLocalSetIndexInExpr(step.expr));
-            }
-            max_local = @max(max_local, maxLocalSetIndexInExpr(ep.handler));
-        },
-        .try_rescue => |*tr| {
-            // A `try`/`rescue`/`after` reserves several HIR-numbered locals
-            // the IR builder's `next_local` floor MUST clear, or freshly
-            // allocated lowering locals (`share_value`/`param_get`/
-            // `borrow_value`/`copy_value` dests) collide with them and rebind
-            // a live, ARC-managed local mid-function — corrupting its refcount
-            // header (observed as a bus_error in an unrelated `List(T).release`
-            // when a `for`-comprehension list in the body aliases a low local
-            // that a rescue arm's binding then reuses). Walk every reserved
-            // index: the recovered-error binding (`error_local`), the try
-            // body's `local_set`s, and each rescue arm's body `local_set`s AND
-            // pattern bindings (`e :: E`, `%E{field: x}` field binds, the
-            // synthesized re-raise binding). The `after` block runs straight-
-            // line and allocates locals from the same space, so include it too.
-            max_local = @max(max_local, tr.error_local + 1);
-            max_local = @max(max_local, maxLocalSetIndexInBlock(tr.body));
-            for (tr.arms) |arm| {
-                max_local = @max(max_local, maxLocalSetIndexInBlock(arm.body));
-                for (arm.bindings) |binding| {
-                    max_local = @max(max_local, binding.local_index + 1);
-                }
-            }
-            if (tr.after_block) |after_block| {
-                max_local = @max(max_local, maxLocalSetIndexInBlock(after_block));
-            }
-        },
-        // Leaves: no nested expression and no reserved local index. Listed
-        // explicitly (no `else`) so a future binding- or sub-expression-
-        // bearing `ExprKind` cannot silently re-open the local-collision
-        // class — adding such a variant forces a decision here.
-        .int_lit,
-        .float_lit,
-        .string_lit,
-        .atom_lit,
-        .bool_lit,
-        .nil_lit,
-        .local_get,
-        .param_get,
-        .capture_get,
-        .never,
-        => {},
+            },
+            .expr => |expr| switch (expr.kind) {
+                .branch => |*br| {
+                    if (br.else_block) |else_block| try stack.append(allocator, .{ .block = else_block });
+                    try stack.append(allocator, .{ .block = br.then_block });
+                    try stack.append(allocator, .{ .expr = br.condition });
+                },
+                .case => |*ce| {
+                    var arm_index = ce.arms.len;
+                    while (arm_index != 0) {
+                        arm_index -= 1;
+                        for (ce.arms[arm_index].bindings) |binding| {
+                            updateMaxLocalFromIndex(&max_local, binding.local_index);
+                        }
+                        if (ce.arms[arm_index].guard) |guard| try stack.append(allocator, .{ .expr = guard });
+                        try stack.append(allocator, .{ .block = ce.arms[arm_index].body });
+                    }
+                    try stack.append(allocator, .{ .expr = ce.scrutinee });
+                },
+                .block => |*block| try stack.append(allocator, .{ .block = block }),
+                .binary => |b| {
+                    try stack.append(allocator, .{ .expr = b.rhs });
+                    try stack.append(allocator, .{ .expr = b.lhs });
+                },
+                .unary => |u| try stack.append(allocator, .{ .expr = u.operand }),
+                .call => |c| {
+                    switch (c.target) {
+                        .closure => |callee| try stack.append(allocator, .{ .expr = callee }),
+                        else => {},
+                    }
+                    var arg_index = c.args.len;
+                    while (arg_index != 0) {
+                        arg_index -= 1;
+                        try stack.append(allocator, .{ .expr = c.args[arg_index].expr });
+                    }
+                },
+                .union_init => |ui| try stack.append(allocator, .{ .expr = ui.value }),
+                .match => |*m| {
+                    // The match scrutinee plus the entire decision tree, whose
+                    // `bind`/`success` nodes reserve `local_index` values from the
+                    // same per-clause space. Skipping it let a decision-tree
+                    // binding collide with a later `local_set`.
+                    try stack.append(allocator, .{ .decision = m.decision });
+                    try stack.append(allocator, .{ .expr = m.scrutinee });
+                },
+                .tuple_init => |elements| {
+                    var element_index = elements.len;
+                    while (element_index != 0) {
+                        element_index -= 1;
+                        try stack.append(allocator, .{ .expr = elements[element_index] });
+                    }
+                },
+                .list_init => |elements| {
+                    var element_index = elements.len;
+                    while (element_index != 0) {
+                        element_index -= 1;
+                        try stack.append(allocator, .{ .expr = elements[element_index] });
+                    }
+                },
+                .list_cons => |*lc| {
+                    try stack.append(allocator, .{ .expr = lc.tail });
+                    try stack.append(allocator, .{ .expr = lc.head });
+                },
+                .map_init => |entries| {
+                    var entry_index = entries.len;
+                    while (entry_index != 0) {
+                        entry_index -= 1;
+                        try stack.append(allocator, .{ .expr = entries[entry_index].value });
+                        try stack.append(allocator, .{ .expr = entries[entry_index].key });
+                    }
+                },
+                .struct_init => |*si| {
+                    var field_index = si.fields.len;
+                    while (field_index != 0) {
+                        field_index -= 1;
+                        try stack.append(allocator, .{ .expr = si.fields[field_index].value });
+                    }
+                },
+                .field_get => |*fg| try stack.append(allocator, .{ .expr = fg.object }),
+                .tuple_index_get => |*tig| try stack.append(allocator, .{ .expr = tig.object }),
+                .list_index_get => |*lig| try stack.append(allocator, .{ .expr = lig.list }),
+                .list_head_get => |*lhg| try stack.append(allocator, .{ .expr = lhg.list }),
+                .list_tail_get => |*ltg| try stack.append(allocator, .{ .expr = ltg.list }),
+                .map_value_get => |*mvg| {
+                    try stack.append(allocator, .{ .expr = mvg.key });
+                    try stack.append(allocator, .{ .expr = mvg.map });
+                },
+                .panic => |operand| try stack.append(allocator, .{ .expr = operand }),
+                .unwrap => |operand| try stack.append(allocator, .{ .expr = operand }),
+                .ret_raise => |*rr| try stack.append(allocator, .{ .expr = rr.stash_call }),
+                .closure_create => |*cc| {
+                    var capture_index = cc.captures.len;
+                    while (capture_index != 0) {
+                        capture_index -= 1;
+                        try stack.append(allocator, .{ .expr = cc.captures[capture_index].expr });
+                    }
+                },
+                .error_pipe => |ep| {
+                    try stack.append(allocator, .{ .expr = ep.handler });
+                    var step_index = ep.steps.len;
+                    while (step_index != 0) {
+                        step_index -= 1;
+                        try stack.append(allocator, .{ .expr = ep.steps[step_index].expr });
+                    }
+                },
+                .try_rescue => |*tr| {
+                    // A `try`/`rescue`/`after` reserves several HIR-numbered locals
+                    // the IR builder's `next_local` floor MUST clear. Walk every
+                    // reserved index: `error_local`, body local_sets, rescue arm
+                    // bodies, rescue pattern bindings, and the after block.
+                    updateMaxLocalFromIndex(&max_local, tr.error_local);
+                    if (tr.after_block) |after_block| try stack.append(allocator, .{ .block = after_block });
+                    var arm_index = tr.arms.len;
+                    while (arm_index != 0) {
+                        arm_index -= 1;
+                        for (tr.arms[arm_index].bindings) |binding| {
+                            updateMaxLocalFromIndex(&max_local, binding.local_index);
+                        }
+                        if (tr.arms[arm_index].guard) |guard| try stack.append(allocator, .{ .expr = guard });
+                        try stack.append(allocator, .{ .block = tr.arms[arm_index].body });
+                    }
+                    try stack.append(allocator, .{ .expr = tr.take_raise_call });
+                    try stack.append(allocator, .{ .expr = tr.raise_occurred_call });
+                    try stack.append(allocator, .{ .block = tr.body });
+                },
+                // Leaves: no nested expression and no reserved local index.
+                .int_lit,
+                .float_lit,
+                .string_lit,
+                .atom_lit,
+                .bool_lit,
+                .nil_lit,
+                .local_get,
+                .param_get,
+                .capture_get,
+                .never,
+                => {},
+            },
+            .decision => |decision| switch (decision.*) {
+                .success => |*leaf| {
+                    for (leaf.bindings) |binding| {
+                        updateMaxLocalFromIndex(&max_local, binding.local_index);
+                    }
+                },
+                .failure => {},
+                .guard => |*guard| {
+                    try stack.append(allocator, .{ .decision = guard.failure });
+                    try stack.append(allocator, .{ .decision = guard.success });
+                    try stack.append(allocator, .{ .expr = guard.condition });
+                },
+                .switch_tag => |*switch_node| {
+                    try stack.append(allocator, .{ .decision = switch_node.default });
+                    var case_index = switch_node.cases.len;
+                    while (case_index != 0) {
+                        case_index -= 1;
+                        try stack.append(allocator, .{ .decision = switch_node.cases[case_index].next });
+                    }
+                    try stack.append(allocator, .{ .expr = switch_node.scrutinee });
+                },
+                .switch_literal => |*switch_node| {
+                    try stack.append(allocator, .{ .decision = switch_node.default });
+                    var case_index = switch_node.cases.len;
+                    while (case_index != 0) {
+                        case_index -= 1;
+                        try stack.append(allocator, .{ .decision = switch_node.cases[case_index].next });
+                    }
+                    try stack.append(allocator, .{ .expr = switch_node.scrutinee });
+                },
+                .switch_variant => |*switch_node| {
+                    try stack.append(allocator, .{ .decision = switch_node.default });
+                    var case_index = switch_node.cases.len;
+                    while (case_index != 0) {
+                        case_index -= 1;
+                        try stack.append(allocator, .{ .decision = switch_node.cases[case_index].next });
+                    }
+                    try stack.append(allocator, .{ .expr = switch_node.scrutinee });
+                },
+                .check_tuple => |*check| {
+                    try stack.append(allocator, .{ .decision = check.failure });
+                    try stack.append(allocator, .{ .decision = check.success });
+                    try stack.append(allocator, .{ .expr = check.scrutinee });
+                },
+                .check_list => |*check| {
+                    try stack.append(allocator, .{ .decision = check.failure });
+                    try stack.append(allocator, .{ .decision = check.success });
+                    try stack.append(allocator, .{ .expr = check.scrutinee });
+                },
+                .check_list_cons => |*check| {
+                    try stack.append(allocator, .{ .decision = check.failure });
+                    try stack.append(allocator, .{ .decision = check.success });
+                    try stack.append(allocator, .{ .expr = check.scrutinee });
+                },
+                .check_binary => |*check| {
+                    try stack.append(allocator, .{ .decision = check.failure });
+                    try stack.append(allocator, .{ .decision = check.success });
+                    try stack.append(allocator, .{ .expr = check.scrutinee });
+                },
+                .bind => |*bind| {
+                    updateMaxLocalFromIndex(&max_local, bind.local_index);
+                    try stack.append(allocator, .{ .decision = bind.next });
+                    try stack.append(allocator, .{ .expr = bind.source });
+                },
+                .extract_struct => |*extract| {
+                    try stack.append(allocator, .{ .decision = extract.failure });
+                    try stack.append(allocator, .{ .decision = extract.success });
+                    try stack.append(allocator, .{ .expr = extract.scrutinee });
+                },
+                .extract_map => |*extract| {
+                    try stack.append(allocator, .{ .decision = extract.failure });
+                    try stack.append(allocator, .{ .decision = extract.success });
+                    var key_index = extract.keys.len;
+                    while (key_index != 0) {
+                        key_index -= 1;
+                        try stack.append(allocator, .{ .expr = extract.keys[key_index].key });
+                    }
+                    try stack.append(allocator, .{ .expr = extract.scrutinee });
+                },
+            },
+        }
     }
     return max_local;
 }
 
 /// Returns one past the largest `local_index` reserved anywhere in a
 /// match decision tree (the `bind` nodes and `success`-leaf bindings),
-/// recursing every sub-decision and the expressions they carry. The
+/// walking every sub-decision and the expressions they carry. The
 /// `scrutinee_id` fields on the check/extract/switch nodes index a
 /// SEPARATE match-scrutinee table — they are NOT local indices and are
 /// deliberately excluded. Mirrors `maxLocalSetIndexInExpr`.
-fn maxLocalSetIndexInDecision(decision: *const hir_mod.Decision) LocalId {
-    var max_local: LocalId = 0;
-    switch (decision.*) {
-        .success => |*leaf| {
-            for (leaf.bindings) |binding| {
-                max_local = @max(max_local, binding.local_index + 1);
-            }
-        },
-        .failure => {},
-        .guard => |*g| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(g.condition));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(g.success));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(g.failure));
-        },
-        .switch_tag => |*sn| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(sn.scrutinee));
-            for (sn.cases) |case| max_local = @max(max_local, maxLocalSetIndexInDecision(case.next));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(sn.default));
-        },
-        .switch_literal => |*sn| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(sn.scrutinee));
-            for (sn.cases) |case| max_local = @max(max_local, maxLocalSetIndexInDecision(case.next));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(sn.default));
-        },
-        .check_tuple => |*cn| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(cn.scrutinee));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.success));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.failure));
-        },
-        .check_list => |*cn| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(cn.scrutinee));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.success));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.failure));
-        },
-        .check_list_cons => |*cn| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(cn.scrutinee));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.success));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.failure));
-        },
-        .check_binary => |*cn| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(cn.scrutinee));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.success));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(cn.failure));
-        },
-        .bind => |*bn| {
-            max_local = @max(max_local, bn.local_index + 1);
-            max_local = @max(max_local, maxLocalSetIndexInExpr(bn.source));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(bn.next));
-        },
-        .extract_struct => |*en| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(en.scrutinee));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(en.success));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(en.failure));
-        },
-        .extract_map => |*en| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(en.scrutinee));
-            for (en.keys) |key_extraction| {
-                max_local = @max(max_local, maxLocalSetIndexInExpr(key_extraction.key));
-            }
-            max_local = @max(max_local, maxLocalSetIndexInDecision(en.success));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(en.failure));
-        },
-        .switch_variant => |*sn| {
-            max_local = @max(max_local, maxLocalSetIndexInExpr(sn.scrutinee));
-            for (sn.cases) |case| max_local = @max(max_local, maxLocalSetIndexInDecision(case.next));
-            max_local = @max(max_local, maxLocalSetIndexInDecision(sn.default));
-        },
-    }
-    return max_local;
+fn maxLocalSetIndexInDecision(
+    allocator: std.mem.Allocator,
+    decision: *const hir_mod.Decision,
+) error{ OutOfMemory, IrStructuralBudgetExceeded }!LocalId {
+    return maxLocalSetIndexFromFrame(allocator, .{ .decision = decision });
 }
 
 /// Check if a HIR function group is generic (has unresolved type variables in params/return).
-fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.FunctionGroup) bool {
+fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.FunctionGroup) TypeWalkError!bool {
     if (group.clauses.len == 0) return false;
 
     // Synthesized protocol dispatch functions (scope_id = 0) are NOT generic.
@@ -16373,7 +18104,7 @@ fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.Fu
     for (first_clause.params) |param| {
         // UNKNOWN (any) parameters are NOT generic — they compile to anytype in Zig
         if (param.type_id == types_mod.TypeStore.UNKNOWN) continue;
-        if (containsUnresolvedTypeVarForSpecialization(store, param.type_id)) {
+        if (try containsUnresolvedTypeVarForSpecialization(store, param.type_id)) {
             // Check if the actual type is a type_var that was unified from UNKNOWN
             if (param.type_id < store.types.items.len) {
                 const actual = store.types.items[param.type_id];
@@ -16383,7 +18114,7 @@ fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.Fu
         }
     }
     const ret = first_clause.return_type;
-    if (ret != types_mod.TypeStore.UNKNOWN and containsUnresolvedTypeVarForSpecialization(store, ret)) return true;
+    if (ret != types_mod.TypeStore.UNKNOWN and try containsUnresolvedTypeVarForSpecialization(store, ret)) return true;
     return false;
 }
 
@@ -16413,38 +18144,50 @@ fn isGenericHirGroup(store: *const types_mod.TypeStore, group: *const hir_mod.Fu
 /// return `false` for `protocol_constraint` even when its inner
 /// `type_params` still contain abstractions — the existential
 /// boxing erases the inner shape from the runtime ABI.
-fn containsUnresolvedTypeVarForSpecialization(store: *const types_mod.TypeStore, type_id: types_mod.TypeId) bool {
-    if (type_id >= store.types.items.len) return false;
+fn containsUnresolvedTypeVarForSpecialization(store: *const types_mod.TypeStore, type_id: types_mod.TypeId) TypeWalkError!bool {
+    var budget = TypeWalkBudget{};
+    return containsUnresolvedTypeVarForSpecializationBudgeted(store, type_id, &budget);
+}
+
+fn containsUnresolvedTypeVarForSpecializationBudgeted(
+    store: *const types_mod.TypeStore,
+    type_id: types_mod.TypeId,
+    budget: *TypeWalkBudget,
+) TypeWalkError!bool {
+    try budget.enter();
+    defer budget.leave();
+
+    if (type_id >= store.types.items.len) return error.InvalidTypeId;
     const typ = store.types.items[type_id];
     return switch (typ) {
         .type_var => true,
-        .list => |lt| containsUnresolvedTypeVarForSpecialization(store, lt.element),
+        .list => |lt| try containsUnresolvedTypeVarForSpecializationBudgeted(store, lt.element, budget),
         .tuple => |tt| {
             for (tt.elements) |elem| {
-                if (containsUnresolvedTypeVarForSpecialization(store, elem)) return true;
+                if (try containsUnresolvedTypeVarForSpecializationBudgeted(store, elem, budget)) return true;
             }
             return false;
         },
         .function => |ft| {
             for (ft.params) |param| {
-                if (containsUnresolvedTypeVarForSpecialization(store, param)) return true;
+                if (try containsUnresolvedTypeVarForSpecializationBudgeted(store, param, budget)) return true;
             }
-            if (containsUnresolvedTypeVarForSpecialization(store, ft.return_type)) return true;
+            if (try containsUnresolvedTypeVarForSpecializationBudgeted(store, ft.return_type, budget)) return true;
             // #201 — a polymorphic closure-effect marker is an
             // unresolved type variable; an effect-polymorphic
             // higher-order function is generic and must be
             // monomorphized per closure-argument effect rather than
             // compiled in its unspecialized form.
             if (ft.effect_var) |ev| {
-                if (containsUnresolvedTypeVarForSpecialization(store, ev)) return true;
+                if (try containsUnresolvedTypeVarForSpecializationBudgeted(store, ev, budget)) return true;
             }
             return false;
         },
-        .map => |mt| containsUnresolvedTypeVarForSpecialization(store, mt.key) or
-            containsUnresolvedTypeVarForSpecialization(store, mt.value),
+        .map => |mt| (try containsUnresolvedTypeVarForSpecializationBudgeted(store, mt.key, budget)) or
+            (try containsUnresolvedTypeVarForSpecializationBudgeted(store, mt.value, budget)),
         .applied => |at| {
             for (at.args) |arg| {
-                if (containsUnresolvedTypeVarForSpecialization(store, arg)) return true;
+                if (try containsUnresolvedTypeVarForSpecializationBudgeted(store, arg, budget)) return true;
             }
             return false;
         },
@@ -16453,11 +18196,33 @@ fn containsUnresolvedTypeVarForSpecialization(store: *const types_mod.TypeStore,
     };
 }
 
-fn typeIdToZigType(type_id: types_mod.TypeId) ZigType {
+fn typeIdToZigType(type_id: types_mod.TypeId) TypeWalkError!ZigType {
     return typeIdToZigTypeWithStore(type_id, null);
 }
 
-fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types_mod.TypeStore) ZigType {
+fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types_mod.TypeStore) TypeWalkError!ZigType {
+    var budget = TypeWalkBudget{};
+    return typeIdToZigTypeWithStoreBudgeted(type_id, type_store, &budget);
+}
+
+/// Lowers a TypeStore TypeId to a constructed ZigType.
+///
+/// Ownership: scalar variants and name payloads are borrowed from the source
+/// TypeStore/interner lifetime. Compound containers (`tuple`, `list`, `map`,
+/// `function`, `optional`, `ptr`) allocate their slices/pointers with the
+/// TypeStore allocator and transfer those containers to the caller on success.
+/// Callers that do not transfer the returned value into a longer-lived IR owner
+/// must release the compound containers with `deinitConstructedZigType` and the
+/// same allocator. This helper cleans every partially constructed compound
+/// container before returning an error.
+fn typeIdToZigTypeWithStoreBudgeted(
+    type_id: types_mod.TypeId,
+    type_store: ?*const types_mod.TypeStore,
+    budget: *TypeWalkBudget,
+) TypeWalkError!ZigType {
+    try budget.enter();
+    defer budget.leave();
+
     return switch (type_id) {
         types_mod.TypeStore.BOOL => .bool_type,
         types_mod.TypeStore.STRING => .string,
@@ -16514,36 +18279,49 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                             // string is short-lived and bounded by
                             // the program's parametric instantiation
                             // count.
-                            const mangled = types_mod.typeIdMangledName(ts.allocator, ts, type_id) catch
-                                return .any;
+                            const mangled = try types_mod.typeIdMangledName(ts.allocator, ts, type_id);
                             return .{ .struct_ref = mangled };
                         },
                         .tuple => |tt| {
-                            var zig_elems = ts.allocator.alloc(ZigType, tt.elements.len) catch return .any;
+                            const zig_elems = try ts.allocator.alloc(ZigType, tt.elements.len);
+                            var initialized: usize = 0;
+                            errdefer deinitConstructedZigTypeSlicePrefix(ts.allocator, zig_elems, initialized);
                             for (tt.elements, 0..) |elem, i| {
-                                zig_elems[i] = typeIdToZigTypeWithStore(elem, type_store);
+                                zig_elems[i] = try typeIdToZigTypeWithStoreBudgeted(elem, type_store, budget);
+                                initialized += 1;
                             }
                             return .{ .tuple = zig_elems };
                         },
                         .list => |lt| {
-                            const elem_zig = ts.allocator.create(ZigType) catch return .any;
-                            elem_zig.* = typeIdToZigTypeWithStore(lt.element, type_store);
+                            const elem_zig = try ts.allocator.create(ZigType);
+                            errdefer ts.allocator.destroy(elem_zig);
+                            elem_zig.* = try typeIdToZigTypeWithStoreBudgeted(lt.element, type_store, budget);
+                            errdefer deinitConstructedZigType(ts.allocator, elem_zig.*);
                             return .{ .list = elem_zig };
                         },
                         .map => |mt| {
-                            const key_zig = ts.allocator.create(ZigType) catch return .any;
-                            key_zig.* = typeIdToZigTypeWithStore(mt.key, type_store);
-                            const val_zig = ts.allocator.create(ZigType) catch return .any;
-                            val_zig.* = typeIdToZigTypeWithStore(mt.value, type_store);
+                            const key_zig = try ts.allocator.create(ZigType);
+                            errdefer ts.allocator.destroy(key_zig);
+                            key_zig.* = try typeIdToZigTypeWithStoreBudgeted(mt.key, type_store, budget);
+                            errdefer deinitConstructedZigType(ts.allocator, key_zig.*);
+                            const val_zig = try ts.allocator.create(ZigType);
+                            errdefer ts.allocator.destroy(val_zig);
+                            val_zig.* = try typeIdToZigTypeWithStoreBudgeted(mt.value, type_store, budget);
+                            errdefer deinitConstructedZigType(ts.allocator, val_zig.*);
                             return .{ .map = .{ .key = key_zig, .value = val_zig } };
                         },
                         .function => |ft| {
-                            var zig_params = ts.allocator.alloc(ZigType, ft.params.len) catch return .any;
+                            const zig_params = try ts.allocator.alloc(ZigType, ft.params.len);
+                            var initialized: usize = 0;
+                            errdefer deinitConstructedZigTypeSlicePrefix(ts.allocator, zig_params, initialized);
                             for (ft.params, 0..) |param, i| {
-                                zig_params[i] = typeIdToZigTypeWithStore(param, type_store);
+                                zig_params[i] = try typeIdToZigTypeWithStoreBudgeted(param, type_store, budget);
+                                initialized += 1;
                             }
-                            const ret_ptr = ts.allocator.create(ZigType) catch return .any;
-                            ret_ptr.* = typeIdToZigTypeWithStore(ft.return_type, type_store);
+                            const ret_ptr = try ts.allocator.create(ZigType);
+                            errdefer ts.allocator.destroy(ret_ptr);
+                            ret_ptr.* = try typeIdToZigTypeWithStoreBudgeted(ft.return_type, type_store, budget);
+                            errdefer deinitConstructedZigType(ts.allocator, ret_ptr.*);
                             // Phase 4 — carry the closure's inferred effect onto
                             // the devirtualized bare-fn-ptr type so a raising
                             // returned/stored non-capturing closure renders
@@ -16585,9 +18363,14 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                             }
                             if (nil_count == 1 and non_nil_count == 1) {
                                 const inner = non_nil_member.?;
-                                const inner_zig = typeIdToZigTypeWithStore(inner, type_store);
-                                const inner_ptr = ts.allocator.create(ZigType) catch return .any;
-                                inner_ptr.* = inner_zig;
+                                var inner_zig_owner: ?ZigType = try typeIdToZigTypeWithStoreBudgeted(inner, type_store, budget);
+                                errdefer if (inner_zig_owner) |inner_zig| {
+                                    deinitConstructedZigType(ts.allocator, inner_zig);
+                                };
+                                const inner_ptr = try ts.allocator.create(ZigType);
+                                errdefer ts.allocator.destroy(inner_ptr);
+                                inner_ptr.* = inner_zig_owner.?;
+                                inner_zig_owner = null;
                                 return .{ .optional = inner_ptr };
                             }
                             // General union types → anytype
@@ -16613,13 +18396,12 @@ fn typeIdToZigTypeWithStore(type_id: types_mod.TypeId, type_store: ?*const types
                             if (pc.type_params.len == 0) {
                                 return .{ .protocol_box = ts.interner.get(pc.protocol_name) };
                             }
-                            const mangled = types_mod.typeIdMangledName(ts.allocator, ts, type_id) catch
-                                return .{ .protocol_box = ts.interner.get(pc.protocol_name) };
+                            const mangled = try types_mod.typeIdMangledName(ts.allocator, ts, type_id);
                             return .{ .protocol_box = mangled };
                         },
                         else => {},
                     }
-                }
+                } else return error.InvalidTypeId;
             }
             return .any;
         },
@@ -16648,25 +18430,37 @@ fn zigTypeStructName(t: ZigType) ?[]const u8 {
     };
 }
 
-fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) bool {
+fn zigTypeReachesStruct(t: ZigType, owner_name: []const u8) TypeWalkError!bool {
+    var budget = TypeWalkBudget{};
+    return zigTypeReachesStructBudgeted(t, owner_name, &budget);
+}
+
+fn zigTypeReachesStructBudgeted(
+    t: ZigType,
+    owner_name: []const u8,
+    budget: *TypeWalkBudget,
+) TypeWalkError!bool {
+    try budget.enter();
+    defer budget.leave();
+
     return switch (t) {
         .struct_ref => |name| std.mem.eql(u8, name, owner_name),
-        .optional => |inner| zigTypeReachesStruct(inner.*, owner_name),
-        .ptr => |pointee| zigTypeReachesStruct(pointee.*, owner_name),
-        .list => |elem| zigTypeReachesStruct(elem.*, owner_name),
-        .map => |mt| zigTypeReachesStruct(mt.key.*, owner_name) or
-            zigTypeReachesStruct(mt.value.*, owner_name),
+        .optional => |inner| try zigTypeReachesStructBudgeted(inner.*, owner_name, budget),
+        .ptr => |pointee| try zigTypeReachesStructBudgeted(pointee.*, owner_name, budget),
+        .list => |elem| try zigTypeReachesStructBudgeted(elem.*, owner_name, budget),
+        .map => |mt| (try zigTypeReachesStructBudgeted(mt.key.*, owner_name, budget)) or
+            (try zigTypeReachesStructBudgeted(mt.value.*, owner_name, budget)),
         .tuple => |elems| blk: {
             for (elems) |elem| {
-                if (zigTypeReachesStruct(elem, owner_name)) break :blk true;
+                if (try zigTypeReachesStructBudgeted(elem, owner_name, budget)) break :blk true;
             }
             break :blk false;
         },
         .function => |ft| blk: {
             for (ft.params) |p| {
-                if (zigTypeReachesStruct(p, owner_name)) break :blk true;
+                if (try zigTypeReachesStructBudgeted(p, owner_name, budget)) break :blk true;
             }
-            break :blk zigTypeReachesStruct(ft.return_type.*, owner_name);
+            break :blk try zigTypeReachesStructBudgeted(ft.return_type.*, owner_name, budget);
         },
         // Primitives and tagged_union (a name reference, not a
         // structural type) cannot transitively reach a struct.
@@ -16736,7 +18530,8 @@ fn zigTypeReachesStructInCycle(
 ) !bool {
     var visited = std.StringHashMapUnmanaged(void){};
     defer visited.deinit(allocator);
-    return reachesStructInCycleImpl(allocator, t, owner_name, &visited, type_store, interner);
+    var budget = TypeWalkBudget{};
+    return reachesStructInCycleImpl(allocator, t, owner_name, &visited, type_store, interner, &budget);
 }
 
 fn reachesStructInCycleImpl(
@@ -16746,7 +18541,11 @@ fn reachesStructInCycleImpl(
     visited: *std.StringHashMapUnmanaged(void),
     type_store: *const types_mod.TypeStore,
     interner: *const ast.StringInterner,
+    budget: *TypeWalkBudget,
 ) !bool {
+    try budget.enter();
+    defer budget.leave();
+
     return switch (t) {
         .struct_ref => |name| blk: {
             if (std.mem.eql(u8, name, owner_name)) break :blk true;
@@ -16765,30 +18564,30 @@ fn reachesStructInCycleImpl(
                 const sname = interner.get(st.name);
                 if (!std.mem.eql(u8, sname, name)) continue;
                 for (st.fields) |f| {
-                    const f_zig_type = typeIdToZigTypeWithStore(f.type_id, type_store);
-                    if (try reachesStructInCycleImpl(allocator, f_zig_type, owner_name, visited, type_store, interner))
+                    const f_zig_type = try typeIdToZigTypeWithStoreBudgeted(f.type_id, type_store, budget);
+                    if (try reachesStructInCycleImpl(allocator, f_zig_type, owner_name, visited, type_store, interner, budget))
                         break :blk true;
                 }
                 break;
             }
             break :blk false;
         },
-        .optional => |inner| try reachesStructInCycleImpl(allocator, inner.*, owner_name, visited, type_store, interner),
-        .ptr => |pointee| try reachesStructInCycleImpl(allocator, pointee.*, owner_name, visited, type_store, interner),
-        .list => |elem| try reachesStructInCycleImpl(allocator, elem.*, owner_name, visited, type_store, interner),
-        .map => |mt| (try reachesStructInCycleImpl(allocator, mt.key.*, owner_name, visited, type_store, interner)) or
-            (try reachesStructInCycleImpl(allocator, mt.value.*, owner_name, visited, type_store, interner)),
+        .optional => |inner| try reachesStructInCycleImpl(allocator, inner.*, owner_name, visited, type_store, interner, budget),
+        .ptr => |pointee| try reachesStructInCycleImpl(allocator, pointee.*, owner_name, visited, type_store, interner, budget),
+        .list => |elem| try reachesStructInCycleImpl(allocator, elem.*, owner_name, visited, type_store, interner, budget),
+        .map => |mt| (try reachesStructInCycleImpl(allocator, mt.key.*, owner_name, visited, type_store, interner, budget)) or
+            (try reachesStructInCycleImpl(allocator, mt.value.*, owner_name, visited, type_store, interner, budget)),
         .tuple => |elems| blk: {
             for (elems) |elem| {
-                if (try reachesStructInCycleImpl(allocator, elem, owner_name, visited, type_store, interner)) break :blk true;
+                if (try reachesStructInCycleImpl(allocator, elem, owner_name, visited, type_store, interner, budget)) break :blk true;
             }
             break :blk false;
         },
         .function => |ft| blk: {
             for (ft.params) |p| {
-                if (try reachesStructInCycleImpl(allocator, p, owner_name, visited, type_store, interner)) break :blk true;
+                if (try reachesStructInCycleImpl(allocator, p, owner_name, visited, type_store, interner, budget)) break :blk true;
             }
-            break :blk try reachesStructInCycleImpl(allocator, ft.return_type.*, owner_name, visited, type_store, interner);
+            break :blk try reachesStructInCycleImpl(allocator, ft.return_type.*, owner_name, visited, type_store, interner, budget);
         },
         .void,
         .bool_type,
@@ -16864,8 +18663,8 @@ fn zigTypeToStr(zig_type: ZigType) []const u8 {
 
 /// Derives the string representation from the ZigType conversion,
 /// eliminating duplicate TypeStore lookups.
-fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const types_mod.TypeStore) []const u8 {
-    const zig_type = typeIdToZigTypeWithStore(type_id, type_store);
+fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const types_mod.TypeStore) TypeWalkError![]const u8 {
+    const zig_type = try typeIdToZigTypeWithStore(type_id, type_store);
     return zigTypeToStr(zig_type);
 }
 
@@ -16900,7 +18699,7 @@ test "list element type lookup does not default unknowns to i64" {
     var builder = IrBuilder.init(std.testing.allocator, &interner);
     defer builder.deinit();
 
-    try std.testing.expect(builder.listElementTypeFromHirMaybe(types_mod.TypeStore.I64) == null);
+    try std.testing.expect((try builder.listElementTypeFromHirMaybe(types_mod.TypeStore.I64)) == null);
     try std.testing.expect(builder.listElementTypeForLocal(42) == null);
 
     try builder.known_local_types.put(7, .i64);
@@ -16924,15 +18723,15 @@ test "IR build simple function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -16949,6 +18748,47 @@ test "IR build simple function" {
     try std.testing.expect(ir_program.functions[0].body[0].instructions.len > 0);
 }
 
+test "IR records pattern matrix budget diagnostics with source span" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+
+    const row_patterns = [_]?*const hir_mod.MatchPattern{null};
+    const rows = [_]hir_mod.PatternRow{.{
+        .patterns = &row_patterns,
+        .body_index = 0,
+        .guard = null,
+    }};
+    const scrutinee_ids = [_]u32{0};
+    var next_id: u32 = 1;
+    const span = ast.SourceSpan{ .start = 12, .end = 24, .line = 3, .col = 5 };
+
+    try std.testing.expectError(
+        error.PatternMatrixDecisionBudgetExceeded,
+        builder.compilePatternMatrixForIr(
+            .case_expression,
+            span,
+            .{ .rows = &rows, .column_count = 1 },
+            &scrutinee_ids,
+            &next_id,
+            .{ .max_nodes = 1, .max_depth = 16 },
+        ),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expectEqual(span.start, builder.errors.items[0].span.start);
+    try std.testing.expectEqual(span.line, builder.errors.items[0].span.line);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "pattern matching is too complex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "decision tree budget exceeded") != null);
+    try std.testing.expect(builder.errors.items[0].help != null);
+}
+
 test "IR param_get indices are unique for multi-parameter functions" {
     const source =
         \\pub struct Test {
@@ -16962,15 +18802,15 @@ test "IR param_get indices are unique for multi-parameter functions" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
 
     var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
@@ -17011,7 +18851,9 @@ test "IR param_get indices are unique for multi-parameter functions" {
 test "IR call preserves HIR arg modes" {
     const source =
         \\pub struct Test {
-        \\  pub fn apply(f :: fn(String) -> String, x :: String) {
+        \\  opaque Handle = String
+        \\
+        \\  pub fn apply(f :: fn(Handle) -> Handle, x :: Handle) {
         \\    f(x)
         \\  }
         \\}
@@ -17021,19 +18863,19 @@ test "IR call preserves HIR arg modes" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
-    const apply_clause = program.structs[0].items[0].function.clauses[0];
+    const apply_clause = program.structs[0].items[1].function.clauses[0];
     const clause_scope = collector.graph.node_scope_map.get(scope_mod.ScopeGraph.spanKey(apply_clause.meta.span)) orelse apply_clause.meta.scope_id;
     const f_binding = collector.graph.resolveBinding(clause_scope, apply_clause.params[0].pattern.bind.name).?;
     const f_type_id = collector.graph.bindings.items[f_binding].type_id.?.type_id;
@@ -17094,15 +18936,15 @@ test "IR named call preserves move mode" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -17153,15 +18995,15 @@ test "IR closure call preserves borrow mode without ARC ops" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -17229,15 +19071,15 @@ test "IR shared opaque call emits retain and release" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -17326,15 +19168,15 @@ test "rewriteTailCalls marks byref recursion for loopification" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
     var checker = types_mod.TypeChecker.initWithSharedStore(alloc, &type_store, parser.interner, &collector.graph);
     defer checker.deinit();
@@ -17394,15 +19236,15 @@ test "rewriteTailCalls still rewrites primitive-only recursion" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
     var checker = types_mod.TypeChecker.initWithSharedStore(alloc, &type_store, parser.interner, &collector.graph);
     defer checker.deinit();
@@ -17468,15 +19310,15 @@ test "rewriteTailCalls walks past intervening releases for ARC tail recursion" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var type_store = types_mod.TypeStore.init(alloc, parser.interner);
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
     defer type_store.deinit();
     var checker = types_mod.TypeChecker.initWithSharedStore(alloc, &type_store, parser.interner, &collector.graph);
     defer checker.deinit();
@@ -17679,17 +19521,19 @@ test "rewriteTailCalls elides matched share_value/release pair and substitutes c
     //
     // The fix: when the rewriter drops a trailing `.release{value=X}`,
     // it must also drop the matching `.share_value{dest=X, source=Y}`
-    // earlier in the body and substitute the call's arg `X` with `Y`.
+    // and its paired `.retain{value=X}` earlier in the body, then
+    // substitute the call's arg `X` with `Y`.
     //
     // Hand-built layout:
     //   share_value  %30 <- %10            // retain for call arg
+    //   retain       %30                   // paired with share (DROPPED)
     //   call_named   step args=[%30] -> %20
     //   release      %30                   // post-call cleanup (DROPPED)
     //   ret          %20
     //
     // After rewrite:
     //   tail_call    step args=[%10]       // arg substituted to source
-    //   (no share_value, no release, no call_named)
+    //   (no share_value, no retain, no release, no call_named)
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -17705,11 +19549,12 @@ test "rewriteTailCalls elides matched share_value/release pair and substitutes c
     const arg_modes = try alloc.alloc(ValueMode, 1);
     arg_modes[0] = .share;
 
-    const instrs = try alloc.alloc(Instruction, 4);
+    const instrs = try alloc.alloc(Instruction, 5);
     instrs[0] = .{ .share_value = .{ .dest = 30, .source = 10 } };
-    instrs[1] = .{ .call_named = .{ .dest = 20, .name = "step", .args = args, .arg_modes = arg_modes } };
-    instrs[2] = .{ .release = .{ .value = 30 } };
-    instrs[3] = .{ .ret = .{ .value = 20 } };
+    instrs[1] = .{ .retain = .{ .value = 30 } };
+    instrs[2] = .{ .call_named = .{ .dest = 20, .name = "step", .args = args, .arg_modes = arg_modes } };
+    instrs[3] = .{ .release = .{ .value = 30 } };
+    instrs[4] = .{ .ret = .{ .value = 20 } };
 
     const params = try alloc.alloc(Param, 1);
     params[0] = .{ .name = "c", .type_expr = .void, .type_id = null };
@@ -17718,6 +19563,7 @@ test "rewriteTailCalls elides matched share_value/release pair and substitutes c
 
     var saw_tail_call = false;
     var saw_share_value = false;
+    var saw_retain = false;
     var saw_release = false;
     var saw_call_named = false;
     var tail_call_arg: ?LocalId = null;
@@ -17728,6 +19574,7 @@ test "rewriteTailCalls elides matched share_value/release pair and substitutes c
                 if (tc.args.len > 0) tail_call_arg = tc.args[0];
             },
             .share_value => saw_share_value = true,
+            .retain => saw_retain = true,
             .release => saw_release = true,
             .call_named => saw_call_named = true,
             else => {},
@@ -17735,6 +19582,7 @@ test "rewriteTailCalls elides matched share_value/release pair and substitutes c
     }
     try std.testing.expect(saw_tail_call);
     try std.testing.expect(!saw_share_value);
+    try std.testing.expect(!saw_retain);
     try std.testing.expect(!saw_release);
     try std.testing.expect(!saw_call_named);
     // The tail_call's arg must be the original source local (10),
@@ -17797,6 +19645,66 @@ test "rewriteTailCalls handles unmatched release without breaking (Phase E.8)" {
     try std.testing.expectEqual(@as(?LocalId, 10), tail_call_arg);
 }
 
+test "rewriteTailCallsInBody elides matched share retain release in structural tail arm (Phase E.8)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    const args = try alloc.alloc(LocalId, 2);
+    args[0] = 19;
+    args[1] = 20;
+    const arg_modes = try alloc.alloc(ValueMode, 2);
+    arg_modes[0] = .share;
+    arg_modes[1] = .borrow;
+
+    const instrs = try alloc.alloc(Instruction, 6);
+    instrs[0] = .{ .move_value = .{ .dest = 18, .source = 1 } };
+    instrs[1] = .{ .share_value = .{ .dest = 19, .source = 18 } };
+    instrs[2] = .{ .retain = .{ .value = 19 } };
+    instrs[3] = .{ .borrow_value = .{ .dest = 20, .source = 3 } };
+    instrs[4] = .{ .call_named = .{ .dest = 22, .name = "step", .args = args, .arg_modes = arg_modes } };
+    instrs[5] = .{ .release = .{ .value = 19 } };
+
+    const rewritten = try ir_builder.rewriteTailCallsInBody(instrs, 22, "step", 0);
+
+    try std.testing.expect(rewritten.rewritten);
+    var saw_tail_call = false;
+    var saw_share_value = false;
+    var saw_retain = false;
+    var saw_release = false;
+    var saw_call_named = false;
+    var first_tail_arg: ?LocalId = null;
+    var second_tail_arg: ?LocalId = null;
+    for (rewritten.instrs) |instr| {
+        switch (instr) {
+            .tail_call => |tail_call| {
+                saw_tail_call = true;
+                if (tail_call.args.len > 0) first_tail_arg = tail_call.args[0];
+                if (tail_call.args.len > 1) second_tail_arg = tail_call.args[1];
+            },
+            .share_value => saw_share_value = true,
+            .retain => saw_retain = true,
+            .release => saw_release = true,
+            .call_named => saw_call_named = true,
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_tail_call);
+    try std.testing.expect(!saw_share_value);
+    try std.testing.expect(!saw_retain);
+    try std.testing.expect(!saw_release);
+    try std.testing.expect(!saw_call_named);
+    try std.testing.expectEqual(@as(?LocalId, 18), first_tail_arg);
+    try std.testing.expectEqual(@as(?LocalId, 20), second_tail_arg);
+}
+
 test "IR local_get of ARC-managed source emits retain on dest" {
     // Phase 6 — Option B ownership protocol: every named binding of an
     // ARC-managed value owns an independent +1 refcount on the underlying
@@ -17830,15 +19738,15 @@ test "IR local_get of ARC-managed source emits retain on dest" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -17871,6 +19779,64 @@ test "IR local_get of ARC-managed source emits retain on dest" {
     try std.testing.expect(found_pair);
 }
 
+test "IR repeated unique parameter references reuse canonical param local" {
+    // A function parameter has a single runtime ownership slot. Re-reading a
+    // `unique` parameter must therefore flow through the first `param_get`
+    // local, so ordinary alias classification can emit borrow/copy/move IR.
+    // Emitting two raw `param_get`s fabricates two owners for one slot; under
+    // Memory.Tracking, cursor-backed iterator states then alias and advance
+    // together instead of sharing independently.
+    const source =
+        \\pub struct Test {
+        \\  pub fn alias_then_return_original(list :: unique [i64]) -> [i64] {
+        \\    saved = list
+        \\    list
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    var saw_target = false;
+    for (program.functions) |func| {
+        if (std.mem.indexOf(u8, func.name, "alias_then_return_original") == null) continue;
+        saw_target = true;
+
+        var param_get_count: usize = 0;
+        var first_param_local: ?LocalId = null;
+        var saw_repeated_reference_alias = false;
+
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                switch (instr) {
+                    .param_get => |pg| {
+                        if (pg.index == 0) {
+                            param_get_count += 1;
+                            if (first_param_local == null) first_param_local = pg.dest;
+                        }
+                    },
+                    .local_get => |lg| {
+                        if (first_param_local) |param_local| {
+                            if (lg.source == param_local) saw_repeated_reference_alias = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        try std.testing.expectEqual(@as(usize, 1), param_get_count);
+        try std.testing.expect(saw_repeated_reference_alias);
+    }
+    try std.testing.expect(saw_target);
+}
+
 test "IR local_get of non-ARC source does NOT emit retain" {
     // Counter-test: scalar locals (e.g. i64) must not generate an extra
     // retain after `.local_get`. Phase 6 retain emission is gated on
@@ -17888,15 +19854,15 @@ test "IR local_get of non-ARC source does NOT emit retain" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -17978,15 +19944,15 @@ test "IR pattern-binding local_get of ARC-managed scrutinee emits retain" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -18067,15 +20033,15 @@ test "IR case expression records ARC-managed result ownership" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -18152,15 +20118,15 @@ test "IR list cons pattern with multiple heads uses indexed gets and one suffix 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -18249,15 +20215,15 @@ test "IR list assignment destructure with multiple heads uses indexed gets and o
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -18342,15 +20308,15 @@ test "ownership metadata: ARC-managed identity function gets borrowed param + ow
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -18390,6 +20356,184 @@ test "ownership metadata: ARC-managed identity function gets borrowed param + ow
     try std.testing.expectEqual(OwnershipClass.owned, id_func.local_ownership[0]);
 }
 
+test "ownership metadata: explicit unique ARC parameter gets owned convention" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn consume(xs :: unique [i64]) -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var found_consume_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "consume") != null) {
+            found_consume_func = function;
+            break;
+        }
+    }
+    const consume_func = found_consume_func orelse return error.MissingFunction;
+
+    try std.testing.expectEqual(@as(usize, 1), consume_func.params.len);
+    try std.testing.expectEqual(ParamConvention.owned, consume_func.param_conventions[0]);
+}
+
+test "ownership metadata: explicit unique protocol parameter owns move source" {
+    const source =
+        \\pub protocol Source(item) {
+        \\  fn next(state :: unique Source(item)) -> {Atom, item, Source(item)}
+        \\}
+        \\
+        \\pub struct Test {
+        \\  pub fn use(state :: unique Source(i64)) -> Nil { nil }
+        \\
+        \\  pub fn consume(state :: unique Source(i64)) -> Nil {
+        \\    use(state)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var consume_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "consume") != null) {
+            consume_func = function;
+            break;
+        }
+    }
+    const function = consume_func orelse return error.MissingFunction;
+
+    try std.testing.expectEqual(@as(usize, 1), function.params.len);
+    try std.testing.expectEqual(ParamConvention.owned, function.param_conventions[0]);
+
+    var found_move = false;
+    for (function.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .move_value => |move| {
+                    found_move = true;
+                    try std.testing.expect(move.source < function.local_ownership.len);
+                    try std.testing.expectEqual(OwnershipClass.owned, function.local_ownership[move.source]);
+                    try std.testing.expect(move.dest < function.local_ownership.len);
+                    try std.testing.expectEqual(OwnershipClass.owned, function.local_ownership[move.dest]);
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_move);
+}
+
+test "ownership metadata: move_value dest inherits ARC-managed local ownership" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn consume(xs :: unique [i64]) -> [i64] { xs }
+        \\
+        \\  pub fn run(xs :: [i64]) -> [i64] {
+        \\    Test.consume(xs)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var run_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "run") != null) {
+            run_func = function;
+            break;
+        }
+    }
+    const func = run_func orelse return error.MissingFunction;
+
+    var found_move = false;
+    for (func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .move_value => |move| {
+                    found_move = true;
+                    try std.testing.expect(move.source < func.local_ownership.len);
+                    try std.testing.expect(func.local_ownership[move.source] != .trivial);
+                    try std.testing.expect(move.dest < func.local_ownership.len);
+                    try std.testing.expect(func.local_ownership[move.dest] != .trivial);
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_move);
+}
+
 test "ownership metadata: non-ARC parameters classify as trivial" {
     // Phase A counter-test: scalar parameters (i64, Bool, ...) must
     // never receive a non-trivial calling convention. ARC discipline
@@ -18407,15 +20551,15 @@ test "ownership metadata: non-ARC parameters classify as trivial" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const ast_program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&ast_program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&ast_program);
 
@@ -18475,7 +20619,7 @@ test "ownership metadata: ARC predicate recognizes recursive boxed structs" {
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
 
-    var store = types_mod.TypeStore.init(std.testing.allocator, &interner);
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     const node_name = try interner.intern("Node");
@@ -18517,7 +20661,7 @@ test "ownership metadata: synthetic optional recursive params use borrowed conve
     var interner = ast.StringInterner.init(std.testing.allocator);
     defer interner.deinit();
 
-    var store = types_mod.TypeStore.init(std.testing.allocator, &interner);
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
     defer store.deinit();
 
     const node_name = try interner.intern("LinkedNode");
@@ -18577,6 +20721,69 @@ test "ownership metadata: synthetic optional recursive params use borrowed conve
     try std.testing.expectEqual(ParamConvention.borrowed, conventions_without_type_id[0]);
 }
 
+test "ownership metadata: explicit unique erased any parameter remains owned" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var ir_builder = IrBuilder.init(std.testing.allocator, &interner);
+    defer ir_builder.deinit();
+
+    const erased_unique_param = Param{
+        .name = "__arg_0",
+        .type_expr = .any,
+        .type_id = null,
+        .ownership = .unique,
+        .ownership_explicit = true,
+    };
+
+    const conventions = try ir_builder.computeParamConventions(&.{erased_unique_param});
+    defer std.testing.allocator.free(conventions);
+
+    try std.testing.expectEqual(ParamConvention.owned, conventions[0]);
+    try std.testing.expect(ir_builder.paramHasExplicitUniqueOwnershipUnit(erased_unique_param));
+}
+
+test "ownership metadata: boxed Callable param without HIR type stays ARC-classified" {
+    const source =
+        \\pub protocol Callable(args, result) {
+        \\  fn call(self, arguments :: args) -> result
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.scope_graph = &collector.graph;
+    defer ir_builder.deinit();
+
+    const boxed_callable_param = Param{
+        .name = "__arg_0",
+        .type_expr = .{ .protocol_box = "Callable_Tuple_i64_i64" },
+        .type_id = null,
+    };
+
+    const conventions = try ir_builder.computeParamConventions(&.{boxed_callable_param});
+    defer alloc.free(conventions);
+    try std.testing.expectEqual(ParamConvention.borrowed, conventions[0]);
+
+    try ir_builder.emitCanonicalParamLocals(&.{boxed_callable_param}, null);
+    const local_ownership = try ir_builder.computeLocalOwnership(ir_builder.next_local);
+    defer alloc.free(local_ownership);
+
+    try std.testing.expectEqual(@as(usize, 1), local_ownership.len);
+    try std.testing.expectEqual(OwnershipClass.owned, local_ownership[0]);
+}
+
 test "Phase E.5 Gap 1: share_value shared_local has ARC-managed local_ownership" {
     // When IrBuilder lowers a call argument with `.share` mode and an
     // ARC-managed expression type, it allocates a fresh `shared_local`
@@ -18603,15 +20810,15 @@ test "Phase E.5 Gap 1: share_value shared_local has ARC-managed local_ownership"
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -18684,15 +20891,15 @@ test "Phase E.5 Gap 2: param_get HIR-expression dest gets ARC-managed local_owne
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -18762,15 +20969,15 @@ test "Phase E.5 Gap 3: assignment-binding indices reserved before IR-level next_
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -18878,15 +21085,15 @@ test "Phase E.5 Gap 5: arc_managed_locals registers map_init / list_init / call 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -18996,15 +21203,15 @@ test "tuple destructure of ARC-managed value emits retain on extracted local" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -19094,15 +21301,15 @@ test "struct field_get of ARC-managed value emits retain on extracted local" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -19166,15 +21373,15 @@ test "tuple param-binding destructure of ARC-managed value emits retain" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
     defer checker.deinit();
     try checker.checkProgram(&program);
 
@@ -19218,6 +21425,115 @@ test "tuple param-binding destructure of ARC-managed value emits retain" {
     try std.testing.expect(!saw_non_arc_with_retain);
 }
 
+test "case tuple pattern extraction of ARC-managed value emits retain" {
+    // The decision-tree `check_tuple` path is separate from tuple-index
+    // expressions and tuple parameter bindings. It must still propagate the
+    // tuple slot's HIR type to the extracted local before calling
+    // `emitArcRetainOnAggregateExtract`, otherwise ARC-managed components
+    // captured by wildcard or ignored tuple slots are invisible to ownership
+    // and leak when a case arm abandons them.
+    const source =
+        \\pub struct Test {
+        \\  opaque Handle = String
+        \\
+        \\  fn next_like(h :: Handle) -> {Atom, i64, Handle} {
+        \\    {:cont, 10, h}
+        \\  }
+        \\
+        \\  pub fn first(h :: Handle) -> i64 {
+        \\    case Test.next_like(h) {
+        \\      {:cont, value, _state} -> value
+        \\      {:done, _, _} -> 0
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    const func = blk: {
+        for (ir_program.functions) |candidate| {
+            if (std.mem.indexOf(u8, candidate.name, "first") != null) break :blk candidate;
+        }
+        return error.MissingFunction;
+    };
+
+    const Walker = struct {
+        saw_arc_slot_retain: bool = false,
+        saw_non_arc_slot_retain: bool = false,
+
+        fn visit(self: *@This(), stream: []const Instruction) void {
+            for (stream, 0..) |instr, idx| {
+                if (instr == .index_get and idx + 1 < stream.len) {
+                    const next = stream[idx + 1];
+                    const has_retain = next == .retain and next.retain.value == instr.index_get.dest;
+                    if (instr.index_get.index == 2 and has_retain) {
+                        self.saw_arc_slot_retain = true;
+                    }
+                    if (instr.index_get.index == 1 and has_retain) {
+                        self.saw_non_arc_slot_retain = true;
+                    }
+                }
+                switch (instr) {
+                    .case_block => |cb| {
+                        self.visit(cb.pre_instrs);
+                        for (cb.arms) |arm| {
+                            self.visit(arm.cond_instrs);
+                            self.visit(arm.body_instrs);
+                        }
+                        self.visit(cb.default_instrs);
+                    },
+                    .guard_block => |gb| self.visit(gb.body),
+                    .if_expr => |ie| {
+                        self.visit(ie.then_instrs);
+                        self.visit(ie.else_instrs);
+                    },
+                    .switch_literal => |sw| {
+                        for (sw.cases) |case| self.visit(case.body_instrs);
+                        self.visit(sw.default_instrs);
+                    },
+                    .union_switch => |us| {
+                        for (us.cases) |case| self.visit(case.body_instrs);
+                        self.visit(us.else_instrs);
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+
+    var walker = Walker{};
+    for (func.body) |block| {
+        walker.visit(block.instructions);
+    }
+
+    try std.testing.expect(walker.saw_arc_slot_retain);
+    try std.testing.expect(!walker.saw_non_arc_slot_retain);
+}
+
 // ============================================================
 // Per-instantiation parametric type emission (Phase 1.1.5.d)
 // ============================================================
@@ -19233,7 +21549,7 @@ fn buildIrProgramForParametricTest(
     source: []const u8,
     interner_out: **ast.StringInterner,
 ) !Program {
-    const parser_local: Parser = Parser.init(arena_allocator, source);
+    const parser_local: Parser = try Parser.init(arena_allocator, source);
     // Move parser into a heap slot so its `interner` pointer stays
     // valid across the rest of the pipeline (every stage borrows it).
     const parser_box = try arena_allocator.create(Parser);
@@ -19242,10 +21558,10 @@ fn buildIrProgramForParametricTest(
     const program_box = try arena_allocator.create(ast.Program);
     program_box.* = program;
 
-    var collector = Collector.init(arena_allocator, parser_box.interner, null);
+    var collector = try Collector.init(arena_allocator, parser_box.interner, null);
     try collector.collectProgram(program_box);
 
-    var checker = types_mod.TypeChecker.init(arena_allocator, parser_box.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(arena_allocator, parser_box.interner, &collector.graph);
     try checker.checkProgram(program_box);
 
     var hir_builder = hir_mod.HirBuilder.init(arena_allocator, parser_box.interner, &collector.graph, checker.store);
@@ -19278,6 +21594,628 @@ fn findTypeDefByName(program: Program, name: []const u8) ?TypeDef {
         if (std.mem.eql(u8, type_def.name, name)) return type_def;
     }
     return null;
+}
+
+fn irTestMeta() ast.NodeMeta {
+    return .{ .span = .{ .start = 0, .end = 0 } };
+}
+
+fn irTestStructName(parts: []const ast.StringId) ast.StructName {
+    return .{ .parts = parts, .span = .{ .start = 0, .end = 0 } };
+}
+
+fn irTestTypeName(name: ast.StringId, args: []const *const ast.TypeExpr) ast.TypeExpr {
+    return .{ .name = .{ .meta = irTestMeta(), .name = name, .args = args } };
+}
+
+fn registerIrTestOptionType(
+    store: *types_mod.TypeStore,
+    interner: *ast.StringInterner,
+) !types_mod.TypeId {
+    const option_name = try interner.intern("Option");
+    const option_type_id = try store.addType(.{ .tagged_union = .{
+        .name = option_name,
+        .variants = &.{},
+        .type_params = &.{},
+    } });
+    try store.name_to_type.put(option_name, option_type_id);
+    return option_type_id;
+}
+
+fn fillIrTestTypeStoreCapacity(store: *types_mod.TypeStore) !void {
+    while (store.types.items.len < store.types.capacity) {
+        _ = try store.freshVar();
+    }
+}
+
+test "P4J2 materialized closure local marker reports OOM" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    const closure_type_id = try store.addType(.{ .function = .{
+        .params = &.{},
+        .return_type = types_mod.TypeStore.I64,
+    } });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var builder = IrBuilder.init(failing_allocator.allocator(), &interner);
+    defer builder.deinit();
+    builder.type_store = &store;
+
+    const span = ast.SourceSpan{ .start = 0, .end = 0 };
+    const receiver_expr = hir_mod.Expr{
+        .kind = .{ .local_get = 0 },
+        .type_id = types_mod.TypeStore.UNKNOWN,
+        .span = span,
+    };
+    const field_expr = hir_mod.Expr{
+        .kind = .{ .field_get = .{ .object = &receiver_expr, .field = 0 } },
+        .type_id = closure_type_id,
+        .span = span,
+    };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.noteMaterializedClosureLocal(7, &field_expr),
+    );
+    try std.testing.expect(!builder.materialized_closure_locals.contains(7));
+}
+
+test "P4J2 function record append rollback frees owned construction fields" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+
+    const return_inner = try alloc.create(ZigType);
+    return_inner.* = .i64;
+
+    const param_inner = try alloc.create(ZigType);
+    param_inner.* = .i64;
+    const params = try alloc.alloc(Param, 1);
+    params[0] = .{
+        .name = try alloc.dupe(u8, "__arg_0"),
+        .type_expr = .{ .optional = param_inner },
+        .type_id = types_mod.TypeStore.I64,
+    };
+
+    const capture_inner = try alloc.create(ZigType);
+    capture_inner.* = .string;
+    const captures = try alloc.alloc(Capture, 1);
+    captures[0] = .{
+        .name = try alloc.dupe(u8, "__cap_0"),
+        .type_expr = .{ .list = capture_inner },
+        .ownership = .shared,
+    };
+
+    const instructions = try alloc.alloc(Instruction, 1);
+    instructions[0] = .{ .const_nil = 0 };
+    const body = try alloc.alloc(Block, 1);
+    body[0] = .{ .label = 0, .instructions = instructions };
+
+    const defaults = try alloc.alloc(DefaultValue, 1);
+    defaults[0] = .nil;
+    const param_conventions = try alloc.alloc(ParamConvention, 1);
+    param_conventions[0] = .trivial;
+    const local_ownership = try alloc.alloc(OwnershipClass, 1);
+    local_ownership[0] = .trivial;
+
+    var protocol_box_locals: std.AutoHashMapUnmanaged(LocalId, []const u8) = .empty;
+    try protocol_box_locals.put(alloc, 0, try alloc.dupe(u8, "Error"));
+
+    var deep_release_owned_locals: std.AutoHashMapUnmanaged(LocalId, void) = .empty;
+    try deep_release_owned_locals.put(alloc, 0, {});
+
+    const function = Function{
+        .id = 1,
+        .name = try alloc.dupe(u8, "f__1"),
+        .scope_id = 0,
+        .arity = 1,
+        .local_name = try alloc.dupe(u8, "f__1"),
+        .params = params,
+        .return_type = .{ .optional = return_inner },
+        .body = body,
+        .is_closure = true,
+        .captures = captures,
+        .local_count = 1,
+        .defaults = defaults,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .protocol_box_locals = protocol_box_locals,
+        .deep_release_owned_locals = deep_release_owned_locals,
+    };
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.appendOwnedFunctionRecord(function, false),
+    );
+    try std.testing.expectEqual(@as(usize, 0), builder.functions.items.len);
+}
+
+test "P4J2 make_closure append rollback frees capture array" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing_allocator.allocator();
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+
+    const captures = try alloc.alloc(LocalId, 2);
+    captures[0] = 3;
+    captures[1] = 5;
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.appendOwnedMakeClosureInstruction(.{
+            .dest = 8,
+            .function = 13,
+            .captures = captures,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), builder.current_instrs.items.len);
+}
+
+fn deinitP4J2CommittedInstructionPayloads(allocator: std.mem.Allocator, instructions: []const Instruction) void {
+    for (instructions) |instruction| {
+        switch (instruction) {
+            .tuple_init => |tuple_init| {
+                allocator.free(tuple_init.elements);
+                if (tuple_init.component_types) |component_types| allocator.free(component_types);
+            },
+            .list_init => |list_init| allocator.free(list_init.elements),
+            .map_init => |map_init| allocator.free(map_init.entries),
+            .struct_init => |struct_init| allocator.free(struct_init.fields),
+            .call_named => |call_named| {
+                allocator.free(call_named.name);
+                allocator.free(call_named.args);
+                allocator.free(call_named.arg_modes);
+            },
+            .try_call_named => |try_call_named| {
+                allocator.free(try_call_named.name);
+                allocator.free(try_call_named.args);
+                allocator.free(try_call_named.arg_modes);
+                deinitP4J2CommittedInstructionPayloads(allocator, try_call_named.handler_instrs);
+                allocator.free(try_call_named.handler_instrs);
+                deinitP4J2CommittedInstructionPayloads(allocator, try_call_named.success_instrs);
+                allocator.free(try_call_named.success_instrs);
+            },
+            else => {},
+        }
+    }
+}
+
+fn deinitP4J2KnownLocalTypes(builder: *IrBuilder) void {
+    var values = builder.known_local_types.valueIterator();
+    while (values.next()) |zig_type| {
+        deinitConstructedZigType(builder.allocator, zig_type.*);
+    }
+}
+
+fn deinitP4J2TryVariantKeys(builder: *IrBuilder) void {
+    var keys = builder.try_variant_names.keyIterator();
+    while (keys.next()) |key| {
+        builder.allocator.free(key.*);
+    }
+}
+
+fn p4j2Span() ast.SourceSpan {
+    return .{ .start = 0, .end = 0 };
+}
+
+fn p4j2IntExpr(value: i64) hir_mod.Expr {
+    return .{
+        .kind = .{ .int_lit = value },
+        .type_id = types_mod.TypeStore.I64,
+        .span = p4j2Span(),
+    };
+}
+
+fn expectOutOfMemoryOrCleanupCommittedPayloads(
+    result: anyerror!LocalId,
+    builder: *IrBuilder,
+) !void {
+    if (result) |_| {
+        deinitP4J2CommittedInstructionPayloads(builder.allocator, builder.current_instrs.items);
+        deinitP4J2KnownLocalTypes(builder);
+    } else |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+    }
+}
+
+test "P4J2 error-pipe try variant registration frees duplicate formatted names" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var builder = IrBuilder.init(std.testing.allocator, &interner);
+    defer {
+        deinitP4J2TryVariantKeys(&builder);
+        builder.deinit();
+    }
+
+    const call_expr = hir_mod.Expr{
+        .kind = .{ .call = .{
+            .target = .{ .named = .{ .struct_name = null, .name = "step" } },
+            .args = &.{},
+        } },
+        .type_id = types_mod.TypeStore.I64,
+        .span = p4j2Span(),
+    };
+    const step = hir_mod.ErrorPipeStep{ .expr = &call_expr, .is_dispatched = true };
+
+    try builder.registerTryVariantForErrorPipeStep(step, null);
+    try builder.registerTryVariantForErrorPipeStep(step, null);
+
+    try std.testing.expectEqual(@as(usize, 1), builder.try_variant_names.count());
+    try std.testing.expect(builder.try_variant_names.contains("step__1"));
+}
+
+test "P4J2 lowerSingleErrorPipeCall rolls back owned call payloads on allocation failure" {
+    const arg_expr = p4j2IntExpr(41);
+    const args = [_]hir_mod.CallArg{.{ .expr = &arg_expr }};
+    const call_expr = hir_mod.Expr{
+        .kind = .{ .call = .{
+            .target = .{ .named = .{ .struct_name = null, .name = "step" } },
+            .args = args[0..],
+        } },
+        .type_id = types_mod.TypeStore.I64,
+        .span = p4j2Span(),
+    };
+    const step = hir_mod.ErrorPipeStep{ .expr = &call_expr, .is_dispatched = false };
+
+    for (0..16) |failure_offset| {
+        var interner = ast.StringInterner.init(std.testing.allocator);
+        defer interner.deinit();
+
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var builder = IrBuilder.init(failing_allocator.allocator(), &interner);
+        defer builder.deinit();
+
+        failing_allocator.fail_index = failing_allocator.alloc_index + failure_offset;
+        try expectOutOfMemoryOrCleanupCommittedPayloads(
+            builder.lowerSingleErrorPipeCall(step, 7),
+            &builder,
+        );
+    }
+}
+
+test "P4J2 aggregate literal lowering rolls back owned payload slices on allocation failure" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    const field_name = try interner.intern("value");
+
+    const key_expr = p4j2IntExpr(1);
+    const value_expr = p4j2IntExpr(2);
+    const list_elements = [_]*const hir_mod.Expr{ &key_expr, &value_expr };
+    const list_expr = hir_mod.Expr{
+        .kind = .{ .list_init = list_elements[0..] },
+        .type_id = types_mod.TypeStore.UNKNOWN,
+        .span = p4j2Span(),
+    };
+    const struct_fields = [_]hir_mod.StructFieldInit{.{
+        .name = field_name,
+        .value = &value_expr,
+    }};
+    const struct_expr = hir_mod.Expr{
+        .kind = .{ .struct_init = .{
+            .type_id = types_mod.TypeStore.UNKNOWN,
+            .fields = struct_fields[0..],
+        } },
+        .type_id = types_mod.TypeStore.UNKNOWN,
+        .span = p4j2Span(),
+    };
+    const map_entries = [_]hir_mod.MapEntry{.{
+        .key = &key_expr,
+        .value = &value_expr,
+    }};
+    const map_expr = hir_mod.Expr{
+        .kind = .{ .map_init = map_entries[0..] },
+        .type_id = types_mod.TypeStore.UNKNOWN,
+        .span = p4j2Span(),
+    };
+    const expressions = [_]*const hir_mod.Expr{ &list_expr, &struct_expr, &map_expr };
+
+    for (expressions) |expr| {
+        for (0..24) |failure_offset| {
+            var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var builder = IrBuilder.init(failing_allocator.allocator(), &interner);
+            defer builder.deinit();
+
+            failing_allocator.fail_index = failing_allocator.alloc_index + failure_offset;
+            try expectOutOfMemoryOrCleanupCommittedPayloads(builder.lowerExpr(expr), &builder);
+        }
+    }
+}
+
+test "P4J2 protocol-signature applied interning reports arg allocation OOM" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner);
+    defer store.deinit();
+    _ = try registerIrTestOptionType(&store, &interner);
+
+    const option_name = try interner.intern("Option");
+    const atom_name = try interner.intern("Atom");
+    const atom_expr = irTestTypeName(atom_name, &.{});
+    const option_args = [_]*const ast.TypeExpr{&atom_expr};
+    const option_expr = irTestTypeName(option_name, &option_args);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var builder = IrBuilder.init(failing_allocator.allocator(), &interner);
+    defer builder.deinit();
+    builder.type_store = &store;
+
+    const previous_type_count = store.types.items.len;
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.resolveConcreteAppliedTypeId(&option_expr),
+    );
+    try std.testing.expectEqual(previous_type_count, store.types.items.len);
+}
+
+test "P4J2 protocol-signature applied interning reports TypeStore addType OOM" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var failing_store_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = try types_mod.TypeStore.init(failing_store_allocator.allocator(), &interner);
+    defer store.deinit();
+    _ = try registerIrTestOptionType(&store, &interner);
+    try fillIrTestTypeStoreCapacity(&store);
+
+    const option_name = try interner.intern("Option");
+    const atom_name = try interner.intern("Atom");
+    const atom_expr = irTestTypeName(atom_name, &.{});
+    const option_args = [_]*const ast.TypeExpr{&atom_expr};
+    const option_expr = irTestTypeName(option_name, &option_args);
+
+    var builder = IrBuilder.init(std.testing.allocator, &interner);
+    defer builder.deinit();
+    builder.type_store = &store;
+
+    const previous_type_count = store.types.items.len;
+    failing_store_allocator.fail_index = failing_store_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.resolveConcreteAppliedTypeId(&option_expr),
+    );
+    try std.testing.expectEqual(previous_type_count, store.types.items.len);
+}
+
+test "P4J2 buildProgram propagates protocol-signature interning OOM" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    var failing_store_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var store = try types_mod.TypeStore.init(failing_store_allocator.allocator(), &interner);
+    defer store.deinit();
+    _ = try registerIrTestOptionType(&store, &interner);
+    try fillIrTestTypeStoreCapacity(&store);
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const protocol_name_id = try interner.intern("Error");
+    const method_name_id = try interner.intern("code");
+    const receiver_name_id = try interner.intern("error");
+    const option_name_id = try interner.intern("Option");
+    const atom_name_id = try interner.intern("Atom");
+
+    const atom_expr = irTestTypeName(atom_name_id, &.{});
+    const option_args = [_]*const ast.TypeExpr{&atom_expr};
+    const option_expr = irTestTypeName(option_name_id, &option_args);
+    const protocol_parts = [_]ast.StringId{protocol_name_id};
+    const protocol_params = [_]ast.ProtocolParam{.{
+        .meta = irTestMeta(),
+        .name = receiver_name_id,
+        .type_annotation = null,
+    }};
+    const protocol_functions = [_]ast.ProtocolFunctionSig{.{
+        .meta = irTestMeta(),
+        .name = method_name_id,
+        .params = &protocol_params,
+        .return_type = &option_expr,
+    }};
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = irTestMeta(),
+        .name = irTestStructName(&protocol_parts),
+        .functions = &protocol_functions,
+    };
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_decl.name,
+        .scope_id = graph.prelude_scope,
+        .decl = &protocol_decl,
+    });
+
+    var builder = IrBuilder.init(std.testing.allocator, &interner);
+    defer builder.deinit();
+    builder.type_store = &store;
+    builder.scope_graph = &graph;
+
+    const empty_hir = hir_mod.Program{ .structs = &.{}, .top_functions = &.{} };
+    failing_store_allocator.fail_index = failing_store_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.buildProgram(&empty_hir),
+    );
+}
+
+test "P4J2 structNameToPrefix reports OOM for multi-segment names" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const first = try interner.intern("Outer");
+    const second = try interner.intern("Inner");
+    const parts = [_]ast.StringId{ first, second };
+    const name = irTestStructName(&parts);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var builder = IrBuilder.init(failing_allocator.allocator(), &interner);
+    defer builder.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, builder.structNameToPrefix(name));
+}
+
+test "P4J2 structNameToPrefix preserves multi-segment prefix" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const first = try interner.intern("Outer");
+    const second = try interner.intern("Inner");
+    const parts = [_]ast.StringId{ first, second };
+    const name = irTestStructName(&parts);
+
+    var builder = IrBuilder.init(std.testing.allocator, &interner);
+    defer builder.deinit();
+
+    const prefix = try builder.structNameToPrefix(name);
+    defer std.testing.allocator.free(prefix);
+    try std.testing.expectEqualStrings("Outer_Inner", prefix);
+}
+
+test "P4J2 protocol vtable name join OOM propagates" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const namespace_id = try interner.intern("Domain");
+    const protocol_id = try interner.intern("Renderable");
+    const method_id = try interner.intern("render");
+    const receiver_id = try interner.intern("value");
+    const protocol_parts = [_]ast.StringId{ namespace_id, protocol_id };
+    const protocol_params = [_]ast.ProtocolParam{.{
+        .meta = irTestMeta(),
+        .name = receiver_id,
+        .type_annotation = null,
+    }};
+    const protocol_functions = [_]ast.ProtocolFunctionSig{.{
+        .meta = irTestMeta(),
+        .name = method_id,
+        .params = &protocol_params,
+        .return_type = null,
+    }};
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = irTestMeta(),
+        .name = irTestStructName(&protocol_parts),
+        .functions = &protocol_functions,
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_decl.name,
+        .scope_id = graph.prelude_scope,
+        .decl = &protocol_decl,
+    });
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var builder = IrBuilder.init(failing_allocator.allocator(), &interner);
+    defer builder.deinit();
+    builder.scope_graph = &graph;
+
+    var type_defs: std.ArrayList(TypeDef) = .empty;
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, builder.populateProtocolVTables(&type_defs));
+    try std.testing.expectEqual(@as(usize, 0), type_defs.items.len);
+}
+
+test "IR emits full multi-segment protocol vtable names" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const domain_id = try interner.intern("Domain");
+    const protocols_id = try interner.intern("Protocols");
+    const renderable_id = try interner.intern("Renderable");
+    const models_id = try interner.intern("Models");
+    const widget_id = try interner.intern("Widget");
+    const method_id = try interner.intern("render");
+    const receiver_id = try interner.intern("value");
+
+    const protocol_parts = [_]ast.StringId{ domain_id, protocols_id, renderable_id };
+    const target_parts = [_]ast.StringId{ domain_id, models_id, widget_id };
+    const protocol_name = irTestStructName(&protocol_parts);
+    const target_name = irTestStructName(&target_parts);
+    const protocol_params = [_]ast.ProtocolParam{.{
+        .meta = irTestMeta(),
+        .name = receiver_id,
+        .type_annotation = null,
+    }};
+    const protocol_functions = [_]ast.ProtocolFunctionSig{.{
+        .meta = irTestMeta(),
+        .name = method_id,
+        .params = &protocol_params,
+        .return_type = null,
+    }};
+    const protocol_decl = ast.ProtocolDecl{
+        .meta = irTestMeta(),
+        .name = protocol_name,
+        .functions = &protocol_functions,
+    };
+    const impl_decl = ast.ImplDecl{
+        .meta = irTestMeta(),
+        .protocol_name = protocol_name,
+        .target_type = target_name,
+        .functions = &.{},
+    };
+
+    var graph = try scope_mod.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+    try graph.protocols.append(std.testing.allocator, .{
+        .name = protocol_name,
+        .scope_id = graph.prelude_scope,
+        .decl = &protocol_decl,
+    });
+    try graph.impls.append(std.testing.allocator, .{
+        .protocol_name = protocol_name,
+        .target_type = target_name,
+        .scope_id = graph.prelude_scope,
+        .decl = &impl_decl,
+        .is_private = false,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+    builder.scope_graph = &graph;
+
+    var type_defs: std.ArrayList(TypeDef) = .empty;
+    try builder.populateProtocolVTables(&type_defs);
+
+    const vtable = findTypeDefByName(
+        .{ .functions = &.{}, .type_defs = type_defs.items, .entry = null },
+        "Domain_Protocols_RenderableVTable",
+    ) orelse return error.MissingMultiSegmentProtocolVTable;
+    try std.testing.expect(vtable.kind == .protocol_vtable_def);
+    const vtable_def = vtable.kind.protocol_vtable_def;
+    try std.testing.expectEqualStrings("Domain_Protocols_Renderable", vtable_def.protocol_name);
+    try std.testing.expectEqual(@as(usize, 1), vtable_def.methods.len);
+    try std.testing.expectEqualStrings("render", vtable_def.methods[0].name);
+
+    const instance = findTypeDefByName(
+        .{ .functions = &.{}, .type_defs = type_defs.items, .entry = null },
+        "Domain_Protocols_RenderableVTable_for_Domain_Models_Widget",
+    ) orelse return error.MissingMultiSegmentProtocolVTableInstance;
+    try std.testing.expect(instance.kind == .protocol_vtable_instance_def);
+    const instance_def = instance.kind.protocol_vtable_instance_def;
+    try std.testing.expectEqualStrings("Domain_Protocols_Renderable", instance_def.protocol_name);
+    try std.testing.expectEqualStrings("Domain_Models_Widget", instance_def.target_type_name);
+    try std.testing.expectEqual(@as(usize, 1), instance_def.methods.len);
+    try std.testing.expectEqualStrings("Domain_Models_Widget__render__1", instance_def.methods[0].impl_function_name);
 }
 
 test "IR emits per-instantiation TypeDef for each parametric struct applied form" {
@@ -19557,17 +22495,17 @@ test "IR builder's applied specialization table indexes by name and TypeId" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const parser_local: Parser = Parser.init(alloc, source);
+    const parser_local: Parser = try Parser.init(alloc, source);
     const parser_box = try alloc.create(Parser);
     parser_box.* = parser_local;
     const parsed = try parser_box.parseProgram();
     const program_ast = try alloc.create(ast.Program);
     program_ast.* = parsed;
 
-    var collector = Collector.init(alloc, parser_box.interner, null);
+    var collector = try Collector.init(alloc, parser_box.interner, null);
     try collector.collectProgram(program_ast);
 
-    var checker = types_mod.TypeChecker.init(alloc, parser_box.interner, &collector.graph);
+    var checker = try types_mod.TypeChecker.init(alloc, parser_box.interner, &collector.graph);
     try checker.checkProgram(program_ast);
 
     var hir_builder = hir_mod.HirBuilder.init(alloc, parser_box.interner, &collector.graph, checker.store);
@@ -19633,7 +22571,7 @@ fn buildIrProgramForProtocolTest(
     interner_out: **ast.StringInterner,
     graph_out: **const scope_mod.ScopeGraph,
 ) !Program {
-    const parser_local: Parser = Parser.init(arena_allocator, source);
+    const parser_local: Parser = try Parser.init(arena_allocator, source);
     const parser_box = try arena_allocator.create(Parser);
     parser_box.* = parser_local;
     const program = try parser_box.parseProgram();
@@ -19641,10 +22579,10 @@ fn buildIrProgramForProtocolTest(
     program_box.* = program;
 
     const collector_box = try arena_allocator.create(Collector);
-    collector_box.* = Collector.init(arena_allocator, parser_box.interner, null);
+    collector_box.* = try Collector.init(arena_allocator, parser_box.interner, null);
     try collector_box.collectProgram(program_box);
 
-    var checker = types_mod.TypeChecker.init(arena_allocator, parser_box.interner, &collector_box.graph);
+    var checker = try types_mod.TypeChecker.init(arena_allocator, parser_box.interner, &collector_box.graph);
     try checker.checkProgram(program_box);
 
     var hir_builder = hir_mod.HirBuilder.init(arena_allocator, parser_box.interner, &collector_box.graph, checker.store);
@@ -19857,7 +22795,7 @@ test "typeIdMangledName lowers protocol_constraint to its protocol bare name" {
     // every protocol-existential instantiation onto a single name.
     var interner_local = ast.StringInterner.init(std.testing.allocator);
     defer interner_local.deinit();
-    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner_local);
     defer store.deinit();
 
     const error_name_id = try interner_local.intern("Error");
@@ -19881,7 +22819,7 @@ test "typeIdToZigTypeWithStore lowers protocol_constraint to ZigType.protocol_bo
     // `zap_runtime.ProtocolBox` payload) rather than `anytype`.
     var interner_local = ast.StringInterner.init(std.testing.allocator);
     defer interner_local.deinit();
-    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner_local);
     defer store.deinit();
 
     const error_name_id = try interner_local.intern("Error");
@@ -19892,9 +22830,170 @@ test "typeIdToZigTypeWithStore lowers protocol_constraint to ZigType.protocol_bo
         },
     });
 
-    const zig_type = typeIdToZigTypeWithStore(pc_id, &store);
+    const zig_type = try typeIdToZigTypeWithStore(pc_id, &store);
     try std.testing.expect(zig_type == .protocol_box);
     try std.testing.expectEqualStrings("Error", zig_type.protocol_box);
+}
+
+test "typeIdToZigTypeWithStore returns depth error for pathological nested TypeIds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner_local = ast.StringInterner.init(alloc);
+    var store = try types_mod.TypeStore.init(alloc, &interner_local);
+    defer store.deinit();
+
+    var nested_type_id: types_mod.TypeId = types_mod.TypeStore.I64;
+    for (0..max_ir_type_walk_depth) |_| {
+        nested_type_id = try store.addType(.{ .list = .{ .element = nested_type_id } });
+    }
+
+    try std.testing.expectError(
+        error.IrStructuralBudgetExceeded,
+        typeIdToZigTypeWithStore(nested_type_id, &store),
+    );
+}
+
+test "typeIdToZigTypeWithStore returns OOM instead of any on converter allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = try types_mod.TypeStore.init(failing_alloc, &interner_local);
+    defer store.deinit();
+    try std.testing.expect(store.types.items.len > types_mod.TypeStore.F128);
+
+    const tuple_elements = try std.testing.allocator.alloc(types_mod.TypeId, 1);
+    defer std.testing.allocator.free(tuple_elements);
+    tuple_elements[0] = types_mod.TypeStore.I64;
+    const tuple_id = try store.addType(.{ .tuple = .{ .elements = tuple_elements } });
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        typeIdToZigTypeWithStore(tuple_id, &store),
+    );
+}
+
+test "P4J2: typeIdToZigTypeWithStore cleans partial tuple on later OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = try types_mod.TypeStore.init(failing_alloc, &interner_local);
+    defer store.deinit();
+
+    const list_id = try store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } });
+    const map_id = try store.addType(.{ .map = .{
+        .key = types_mod.TypeStore.I64,
+        .value = types_mod.TypeStore.I64,
+    } });
+    const tuple_elements = try std.testing.allocator.alloc(types_mod.TypeId, 2);
+    defer std.testing.allocator.free(tuple_elements);
+    tuple_elements[0] = list_id;
+    tuple_elements[1] = map_id;
+    const tuple_id = try store.addType(.{ .tuple = .{ .elements = tuple_elements } });
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 2;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        typeIdToZigTypeWithStore(tuple_id, &store),
+    );
+}
+
+test "P4J2: typeIdToZigTypeWithStore cleans list child pointer on nested OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = try types_mod.TypeStore.init(failing_alloc, &interner_local);
+    defer store.deinit();
+
+    const nested_map_id = try store.addType(.{ .map = .{
+        .key = types_mod.TypeStore.I64,
+        .value = types_mod.TypeStore.I64,
+    } });
+    const list_id = try store.addType(.{ .list = .{ .element = nested_map_id } });
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 2;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        typeIdToZigTypeWithStore(list_id, &store),
+    );
+}
+
+test "P4J2: typeIdToZigTypeWithStore cleans map key on value allocation OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = try types_mod.TypeStore.init(failing_alloc, &interner_local);
+    defer store.deinit();
+
+    const key_list_id = try store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } });
+    const map_id = try store.addType(.{ .map = .{
+        .key = key_list_id,
+        .value = types_mod.TypeStore.I64,
+    } });
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 2;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        typeIdToZigTypeWithStore(map_id, &store),
+    );
+}
+
+test "P4J2: typeIdToZigTypeWithStore cleans function params on return allocation OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = try types_mod.TypeStore.init(failing_alloc, &interner_local);
+    defer store.deinit();
+
+    const list_param_id = try store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } });
+    const params = try std.testing.allocator.alloc(types_mod.TypeId, 1);
+    defer std.testing.allocator.free(params);
+    params[0] = list_param_id;
+    const function_id = try store.addType(.{ .function = .{
+        .params = params,
+        .return_type = types_mod.TypeStore.I64,
+    } });
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 2;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        typeIdToZigTypeWithStore(function_id, &store),
+    );
+}
+
+test "P4J2: typeIdToZigTypeWithStore cleans optional payload on pointer allocation OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+
+    var interner_local = ast.StringInterner.init(std.testing.allocator);
+    defer interner_local.deinit();
+    var store = try types_mod.TypeStore.init(failing_alloc, &interner_local);
+    defer store.deinit();
+
+    const list_payload_id = try store.addType(.{ .list = .{ .element = types_mod.TypeStore.I64 } });
+    const members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
+    defer std.testing.allocator.free(members);
+    members[0] = list_payload_id;
+    members[1] = types_mod.TypeStore.NIL;
+    const union_id = try store.addType(.{ .union_type = .{ .members = members } });
+
+    failing_allocator.fail_index = failing_allocator.alloc_index + 1;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        typeIdToZigTypeWithStore(union_id, &store),
+    );
 }
 
 test "typeIdToZigTypeWithStore: two-member non-nil union does NOT lower to an optional (IR-3--01)" {
@@ -19908,7 +23007,7 @@ test "typeIdToZigTypeWithStore: two-member non-nil union does NOT lower to an op
     // the general path (`.any`), never the optional.
     var interner_local = ast.StringInterner.init(std.testing.allocator);
     defer interner_local.deinit();
-    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner_local);
     defer store.deinit();
 
     const members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
@@ -19917,7 +23016,7 @@ test "typeIdToZigTypeWithStore: two-member non-nil union does NOT lower to an op
     members[1] = types_mod.TypeStore.STRING;
     const union_id = try store.addType(.{ .union_type = .{ .members = members } });
 
-    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    const zig_type = try typeIdToZigTypeWithStore(union_id, &store);
     // The defining symptom of the bug was `.optional`; assert it is gone.
     try std.testing.expect(zig_type != .optional);
     // Non-nullable unions have no single runtime representation today, so they
@@ -19933,7 +23032,7 @@ test "typeIdToZigTypeWithStore: coercible two-member non-nil union does NOT lowe
     // path, not the optional.
     var interner_local = ast.StringInterner.init(std.testing.allocator);
     defer interner_local.deinit();
-    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner_local);
     defer store.deinit();
 
     const members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
@@ -19942,7 +23041,7 @@ test "typeIdToZigTypeWithStore: coercible two-member non-nil union does NOT lowe
     members[1] = types_mod.TypeStore.I64;
     const union_id = try store.addType(.{ .union_type = .{ .members = members } });
 
-    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    const zig_type = try typeIdToZigTypeWithStore(union_id, &store);
     try std.testing.expect(zig_type != .optional);
     try std.testing.expect(zig_type == .any);
 }
@@ -19953,7 +23052,7 @@ test "typeIdToZigTypeWithStore: genuine T | nil union still lowers to an optiona
     // it: `i64 | nil` lowers to `?i64`.
     var interner_local = ast.StringInterner.init(std.testing.allocator);
     defer interner_local.deinit();
-    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner_local);
     defer store.deinit();
 
     const members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
@@ -19962,7 +23061,7 @@ test "typeIdToZigTypeWithStore: genuine T | nil union still lowers to an optiona
     members[1] = types_mod.TypeStore.NIL;
     const union_id = try store.addType(.{ .union_type = .{ .members = members } });
 
-    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    const zig_type = try typeIdToZigTypeWithStore(union_id, &store);
     // The optional's inner ZigType is heap-allocated on the store allocator by
     // `typeIdToZigTypeWithStore`; in production that allocator is an arena, but
     // the leak-checking test allocator requires an explicit free here.
@@ -19978,7 +23077,7 @@ test "typeIdToZigTypeWithStore: nil member ordering does not change the genuine-
     // the explicit nil/non-nil counting makes order irrelevant.
     var interner_local = ast.StringInterner.init(std.testing.allocator);
     defer interner_local.deinit();
-    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner_local);
     defer store.deinit();
 
     const members = try std.testing.allocator.alloc(types_mod.TypeId, 2);
@@ -19987,7 +23086,7 @@ test "typeIdToZigTypeWithStore: nil member ordering does not change the genuine-
     members[1] = types_mod.TypeStore.I64;
     const union_id = try store.addType(.{ .union_type = .{ .members = members } });
 
-    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    const zig_type = try typeIdToZigTypeWithStore(union_id, &store);
     // See the sibling control test: free the heap-allocated optional inner type.
     defer std.testing.allocator.destroy(zig_type.optional);
     try std.testing.expect(zig_type == .optional);
@@ -20000,7 +23099,7 @@ test "typeIdToZigTypeWithStore: three-member union containing nil does NOT lower
     // exactly-one-nil-plus-exactly-one-non-nil shape is a genuine optional.
     var interner_local = ast.StringInterner.init(std.testing.allocator);
     defer interner_local.deinit();
-    var store = types_mod.TypeStore.init(std.testing.allocator, &interner_local);
+    var store = try types_mod.TypeStore.init(std.testing.allocator, &interner_local);
     defer store.deinit();
 
     const members = try std.testing.allocator.alloc(types_mod.TypeId, 3);
@@ -20010,7 +23109,7 @@ test "typeIdToZigTypeWithStore: three-member union containing nil does NOT lower
     members[2] = types_mod.TypeStore.NIL;
     const union_id = try store.addType(.{ .union_type = .{ .members = members } });
 
-    const zig_type = typeIdToZigTypeWithStore(union_id, &store);
+    const zig_type = try typeIdToZigTypeWithStore(union_id, &store);
     try std.testing.expect(zig_type != .optional);
     try std.testing.expect(zig_type == .any);
 }
@@ -20182,6 +23281,89 @@ test "ZigType.protocol_box round-trips through cloneZigType / cloneProgram" {
     // Distinct backing storage — the clone must not share the
     // original's pointer.
     try std.testing.expect(source.protocol_box.ptr != cloned.protocol_box.ptr);
+}
+
+fn testDeepUnaryZigType(
+    allocator: std.mem.Allocator,
+    comptime tag: enum { optional, list },
+    depth: usize,
+) !ZigType {
+    var current: ZigType = .i64;
+    var remaining = depth;
+    while (remaining != 0) : (remaining -= 1) {
+        const inner = try allocator.create(ZigType);
+        inner.* = current;
+        current = switch (tag) {
+            .optional => .{ .optional = inner },
+            .list => .{ .list = inner },
+        };
+    }
+    return current;
+}
+
+fn testDeepTupleZigType(allocator: std.mem.Allocator, depth: usize) !ZigType {
+    var current: ZigType = .i64;
+    var remaining = depth;
+    while (remaining != 0) : (remaining -= 1) {
+        const elements = try allocator.alloc(ZigType, 1);
+        elements[0] = current;
+        current = .{ .tuple = elements };
+    }
+    return current;
+}
+
+test "P4J2: ZigType mangling reports structural budget for deep tuple graphs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const deep_type = try testDeepTupleZigType(alloc, max_ir_type_walk_depth + 1);
+    try std.testing.expectError(
+        error.IrStructuralBudgetExceeded,
+        mangledNameForArgZigType(alloc, deep_type),
+    );
+}
+
+test "P4J2: cloneZigType reports structural budget for deep ZigType graphs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const deep_type = try testDeepUnaryZigType(alloc, .list, max_ir_type_walk_depth + 1);
+    try std.testing.expectError(
+        error.IrStructuralBudgetExceeded,
+        cloneZigType(alloc, deep_type),
+    );
+}
+
+test "P4J2: cloneProgram reports structural budget for deep ZigType graphs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const deep_type = try testDeepUnaryZigType(alloc, .optional, max_ir_type_walk_depth + 1);
+    const functions = try alloc.alloc(Function, 1);
+    functions[0] = .{
+        .id = 0,
+        .name = "deep",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = deep_type,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+    };
+
+    const program: Program = .{
+        .functions = functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+    try std.testing.expectError(
+        error.IrStructuralBudgetExceeded,
+        cloneProgram(alloc, program),
+    );
 }
 
 // ============================================================
@@ -20432,6 +23614,205 @@ test "IR emits protocol_dispatch when method call's receiver is a protocol_box" 
     try std.testing.expect(saw_protocol_dispatch);
 }
 
+test "protocol_dispatch Nil return leaves destination ownership trivial" {
+    // Regression for `Enumerable.dispose/1`: protocol dispatch carries both a
+    // Zig ABI return type and HIR ownership metadata. A method returning `Nil`
+    // lowers to Zig `void`; its destination local must stay trivial even when
+    // the receiver is an ARC-managed parametric protocol box. Otherwise drop
+    // insertion schedules a release that the ZIR backend lowers to
+    // `ArcRuntime.releaseAny(void)`.
+    const source =
+        \\pub protocol Disposable(element) {
+        \\  fn dispose(state :: unique Disposable(element)) -> Nil
+        \\}
+        \\pub struct Stream {
+        \\  value :: i64 = 0
+        \\}
+        \\pub impl Disposable(i64) for Stream {
+        \\  pub fn dispose(state :: unique Stream) -> Nil { nil }
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn stop(state :: Disposable(i64)) -> Nil {
+        \\    Disposable.dispose(state)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    var saw_protocol_dispatch = false;
+    for (program.functions) |func| {
+        if (!std.mem.eql(u8, func.name, "UseSite__stop__1")) continue;
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                if (instr != .protocol_dispatch) continue;
+                const dispatch = instr.protocol_dispatch;
+                try std.testing.expect(dispatch.return_type == .void);
+                try std.testing.expect(dispatch.dest < func.local_ownership.len);
+                try std.testing.expectEqual(
+                    OwnershipClass.trivial,
+                    func.local_ownership[dispatch.dest],
+                );
+                saw_protocol_dispatch = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_protocol_dispatch);
+}
+
+test "direct Nil statement call before ARC tail leaves destination ownership trivial" {
+    // Regression for the `Enum.dispose_and_return` lowering shape:
+    // a concrete `dispose/1 -> Nil` call used as a non-tail statement before
+    // returning an ARC-managed value must not inherit the block's tail/result
+    // type. The call result lowers to Zig `void`; marking that destination
+    // owned makes drop insertion emit `releaseAny(void)`.
+    const source =
+        \\pub struct RangeProbe {
+        \\  marker :: i64 = 0
+        \\  pub fn dispose(state :: unique RangeProbe) -> Nil { nil }
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn dispose_and_return(state :: unique RangeProbe, value :: [i64]) -> [i64] {
+        \\    RangeProbe.dispose(state)
+        \\    value
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    var saw_direct_dispose = false;
+    for (program.functions) |func| {
+        if (std.mem.indexOf(u8, func.name, "UseSite__dispose_and_return") == null) continue;
+        for (func.body) |block| {
+            for (block.instructions) |instr| {
+                switch (instr) {
+                    .call_direct => |call| {
+                        try std.testing.expectEqual(@as(usize, 1), call.arg_modes.len);
+                        try std.testing.expectEqual(ValueMode.move, call.arg_modes[0]);
+                        try std.testing.expect(call.dest < func.local_ownership.len);
+                        try std.testing.expectEqual(
+                            OwnershipClass.trivial,
+                            func.local_ownership[call.dest],
+                        );
+                        saw_direct_dispose = true;
+                    },
+                    .call_named => |call| {
+                        if (std.mem.indexOf(u8, call.name, "dispose") == null) continue;
+                        try std.testing.expectEqual(@as(usize, 1), call.arg_modes.len);
+                        try std.testing.expectEqual(ValueMode.move, call.arg_modes[0]);
+                        try std.testing.expect(call.dest < func.local_ownership.len);
+                        try std.testing.expectEqual(
+                            OwnershipClass.trivial,
+                            func.local_ownership[call.dest],
+                        );
+                        saw_direct_dispose = true;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    try std.testing.expect(saw_direct_dispose);
+}
+
+test "try rescue recovered error local is tracked for protocol-box release rewrite" {
+    // The landing-pad `take_recoverable_raise()` result is rebound to the
+    // rescue dispatch's `error_local`. That alias must keep its protocol-box
+    // metadata, because catching arms emit their owner release against
+    // `error_local`, and `rewriteProtocolBoxReleases` retags only releases
+    // whose value appears in `function.protocol_box_locals`.
+    const source =
+        \\pub protocol Error {
+        \\  fn message(e) -> String
+        \\}
+        \\pub struct Boom {
+        \\  message :: String = "boom"
+        \\}
+        \\pub impl Error for Boom {
+        \\  pub fn message(e :: Boom) -> String { e.message }
+        \\}
+        \\pub struct Kernel {
+        \\  pub fn do_raise(e :: Error) -> Never {
+        \\    :zig.Kernel.raise_with_kind("error", Error.message(e))
+        \\  }
+        \\  pub fn recoverable_raise(e :: Error) -> Nil { nil }
+        \\  pub fn raise_occurred() -> Bool { false }
+        \\  pub fn take_recoverable_raise() -> Error {
+        \\    %Boom{message: "recovered"}
+        \\  }
+        \\}
+        \\pub struct RescueOwner {
+        \\  pub fn risky() -> i64 {
+        \\    raise %Boom{message: "slow"}
+        \\  }
+        \\  pub fn catch_direct() -> i64 {
+        \\    try { raise %Boom{message: "fast"} } rescue {
+        \\      e :: Boom -> 1
+        \\    }
+        \\  }
+        \\  pub fn catch_call() -> i64 {
+        \\    try { risky() } rescue {
+        \\      e :: Boom -> 2
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    const Context = struct {
+        function: *const Function,
+        found_error_box_release: bool = false,
+
+        fn visit(self: *@This(), instr: *const Instruction) void {
+            if (instr.* != .release) return;
+            const release = instr.release;
+            const protocol_name = self.function.protocol_box_locals.get(release.value) orelse return;
+            if (std.mem.eql(u8, protocol_name, "Error")) {
+                self.found_error_box_release = true;
+            }
+        }
+    };
+
+    var saw_direct = false;
+    var saw_call = false;
+    for (program.functions, 0..) |_, index| {
+        const function = &program.functions[index];
+        if (std.mem.indexOf(u8, function.name, "catch_direct") != null or
+            std.mem.indexOf(u8, function.name, "catch_call") != null)
+        {
+            var context = Context{ .function = function };
+            try forEachInstruction(std.testing.allocator, function, &context, Context.visit);
+            try std.testing.expect(context.found_error_box_release);
+
+            if (std.mem.indexOf(u8, function.name, "catch_direct") != null) saw_direct = true;
+            if (std.mem.indexOf(u8, function.name, "catch_call") != null) saw_call = true;
+        }
+    }
+
+    try std.testing.expect(saw_direct);
+    try std.testing.expect(saw_call);
+}
+
 test "findProtocolImplVTable resolves parametric specialization" {
     // A parametric impl `impl Logger for Tagged(t)` instantiated at
     // `Tagged(i64)` produces an instance `LoggerVTable_for_Tagged_i64`.
@@ -20591,8 +23972,99 @@ test "countInstructionRecords counts every instruction including the union_switc
         }
     };
     var counter = Counter{};
-    forEachInstruction(&function, &counter, Counter.visit);
+    try forEachInstruction(std.testing.allocator, &function, &counter, Counter.visit);
     try std.testing.expectEqual(@as(usize, 6), counter.count);
+}
+
+test "forEachInstruction handles 16k nested child streams without native recursion" {
+    const allocator = std.testing.allocator;
+    const depth: usize = 16 * 1024;
+
+    const instructions = try buildDeepGuardInstructionStream(allocator, depth, .{ .const_nil = @intCast(depth) });
+    defer allocator.free(instructions);
+
+    const blocks = [_]Block{.{ .label = 0, .instructions = instructions[0..1] }};
+    const function = Function{
+        .id = 0,
+        .name = "deep_child_streams",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .any,
+        .body = &blocks,
+        .is_closure = false,
+        .captures = &.{},
+    };
+
+    const Counter = struct {
+        count: usize = 0,
+        fn visit(self: *@This(), instr: *const Instruction) void {
+            _ = instr;
+            self.count += 1;
+        }
+    };
+    var counter = Counter{};
+    try forEachInstruction(allocator, &function, &counter, Counter.visit);
+    try std.testing.expectEqual(depth + 1, counter.count);
+}
+
+fn buildDeepGuardInstructionStream(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    leaf: Instruction,
+) ![]Instruction {
+    const instructions = try allocator.alloc(Instruction, depth + 1);
+    instructions[depth] = leaf;
+
+    var index = depth;
+    while (index > 0) {
+        const child_index = index;
+        index -= 1;
+        instructions[index] = .{ .guard_block = .{
+            .condition = 0,
+            .body = instructions[child_index .. child_index + 1],
+        } };
+    }
+
+    return instructions;
+}
+
+test "IrBuilder.containsTailCall handles 16k nested child streams without native recursion" {
+    const allocator = std.testing.allocator;
+    const depth: usize = 16 * 1024;
+
+    const instructions = try buildDeepGuardInstructionStream(allocator, depth, .{
+        .tail_call = .{ .name = "deep_tail", .args = &.{} },
+    });
+    defer allocator.free(instructions);
+
+    try std.testing.expect(try IrBuilder.containsTailCall(allocator, instructions[0..1]));
+}
+
+test "propagateOwnedTransfersThroughLocalGets handles 16k nested child streams without native recursion" {
+    const allocator = std.testing.allocator;
+    const depth: usize = 16 * 1024;
+    const transfer_dest: LocalId = 200;
+    const transfer_source: LocalId = 100;
+
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    var builder = IrBuilder.init(allocator, &interner);
+    defer builder.deinit();
+
+    try builder.owned_transfer_locals.put(allocator, transfer_dest, {});
+
+    const instructions = try buildDeepGuardInstructionStream(allocator, depth, .{
+        .local_get = .{ .dest = transfer_dest, .source = transfer_source },
+    });
+    defer allocator.free(instructions);
+
+    try builder.propagateOwnedTransfersThroughLocalGets(instructions[0..1]);
+
+    try std.testing.expect(builder.owned_transfer_locals.contains(transfer_source));
+    try std.testing.expect(builder.deep_release_owned_locals.contains(transfer_dest));
+    try std.testing.expect(builder.deep_release_owned_locals.contains(transfer_source));
 }
 
 // ============================================================
@@ -20849,6 +24321,34 @@ test "collectValueEscapingFunctions: make_closure / call_dispatch / entry escape
     try std.testing.expect(!escaping.contains(50));
 }
 
+test "collectValueEscapingFunctions handles 16k nested child streams without native recursion" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const target = try buildEscapeTestFunction(arena, 60, "deep_target", null, &.{
+        .{ .ret = .{ .value = null } },
+    });
+
+    const captures = try arena.alloc(LocalId, 0);
+    const nested_instructions = try buildDeepGuardInstructionStream(arena, 16 * 1024, .{
+        .make_closure = .{ .dest = 5, .function = 60, .captures = captures },
+    });
+
+    const escaper = try buildEscapeTestFunction(arena, 61, "deep_escaper", null, nested_instructions[0..1]);
+
+    const functions = try arena.alloc(Function, 2);
+    functions[0] = target;
+    functions[1] = escaper;
+    const program = Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var escaping = try collectValueEscapingFunctions(std.testing.allocator, &program);
+    defer escaping.deinit(std.testing.allocator);
+
+    try std.testing.expect(escaping.contains(60));
+    try std.testing.expect(!escaping.contains(61));
+}
+
 // ============================================================
 // A binary `size(name)` reference that is not an earlier segment
 // binding must NOT silently resolve to local 0 (audit finding
@@ -20934,13 +24434,13 @@ fn dispatchEligibilityFixture(
     out_builder: *IrBuilder,
     out_type_store: *types_mod.TypeStore,
 ) !*const hir_mod.FunctionGroup {
-    var parser = Parser.init(arena, source);
+    var parser = try Parser.init(arena, source);
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(arena, parser.interner, null);
+    var collector = try Collector.init(arena, parser.interner, null);
     try collector.collectProgram(&program);
 
-    out_type_store.* = types_mod.TypeStore.init(arena, parser.interner);
+    out_type_store.* = try types_mod.TypeStore.init(arena, parser.interner);
 
     var hir_builder = hir_mod.HirBuilder.init(arena, parser.interner, &collector.graph, out_type_store);
     const hir_program = try hir_builder.buildProgram(&program);
@@ -20973,7 +24473,7 @@ test "canSwitchDispatch selects the param for a valid single-literal switch" {
     var builder: IrBuilder = undefined;
     var type_store: types_mod.TypeStore = undefined;
     const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
-    try std.testing.expectEqual(@as(?u32, 0), builder.canSwitchDispatch(group));
+    try std.testing.expectEqual(@as(?u32, 0), try builder.canSwitchDispatch(group));
 }
 
 test "canSwitchDispatch bails for a guarded last clause" {
@@ -20993,7 +24493,7 @@ test "canSwitchDispatch bails for a guarded last clause" {
     var builder: IrBuilder = undefined;
     var type_store: types_mod.TypeStore = undefined;
     const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
-    try std.testing.expectEqual(@as(?u32, null), builder.canSwitchDispatch(group));
+    try std.testing.expectEqual(@as(?u32, null), try builder.canSwitchDispatch(group));
 }
 
 test "canSwitchDispatch bails for a clause with two literal params" {
@@ -21013,7 +24513,7 @@ test "canSwitchDispatch bails for a clause with two literal params" {
     var builder: IrBuilder = undefined;
     var type_store: types_mod.TypeStore = undefined;
     const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
-    try std.testing.expectEqual(@as(?u32, null), builder.canSwitchDispatch(group));
+    try std.testing.expectEqual(@as(?u32, null), try builder.canSwitchDispatch(group));
 }
 
 test "canOptionalDispatch bails when a clause carries a refinement guard" {
@@ -21034,7 +24534,7 @@ test "canOptionalDispatch bails when a clause carries a refinement guard" {
     var builder: IrBuilder = undefined;
     var type_store: types_mod.TypeStore = undefined;
     const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
-    try std.testing.expect(builder.canOptionalDispatch(group, 0) == null);
+    try std.testing.expect((try builder.canOptionalDispatch(group, 0)) == null);
 }
 
 test "canOptionalDispatch accepts primitive optional payloads" {
@@ -21051,7 +24551,7 @@ test "canOptionalDispatch accepts primitive optional payloads" {
     var builder: IrBuilder = undefined;
     var type_store: types_mod.TypeStore = undefined;
     const group = try dispatchEligibilityFixture(alloc, source, "f", &builder, &type_store);
-    const candidate = builder.canOptionalDispatch(group, 0) orelse return error.TestExpectedOptionalDispatch;
+    const candidate = (try builder.canOptionalDispatch(group, 0)) orelse return error.TestExpectedOptionalDispatch;
     try std.testing.expectEqual(types_mod.TypeStore.I64, candidate.payload_type_id);
     try std.testing.expect(candidate.payload_type == .i64);
 }
@@ -21130,7 +24630,7 @@ test "maxLocalSetIndexInExpr walks a case nested inside a list_init element" {
 
     // Pre-GAP-P1-09 the list_init/case arms were swallowed by an `else` arm
     // and this returned 0; now it must reserve above local 42.
-    try std.testing.expectEqual(@as(LocalId, 43), maxLocalSetIndexInExpr(&list_expr));
+    try std.testing.expectEqual(@as(LocalId, 43), try maxLocalSetIndexInExpr(alloc, &list_expr));
 }
 
 test "maxLocalSetIndexInDecision walks bind and success-leaf bindings" {
@@ -21159,7 +24659,7 @@ test "maxLocalSetIndexInDecision walks bind and success-leaf bindings" {
 
     // Must reserve above the larger of the bind index (50) and the nested
     // success-leaf binding (30) -> 51. A non-recursing walker would miss one.
-    try std.testing.expectEqual(@as(LocalId, 51), maxLocalSetIndexInDecision(&decision));
+    try std.testing.expectEqual(@as(LocalId, 51), try maxLocalSetIndexInDecision(alloc, &decision));
 
     // And via a `match` expression wrapping that decision: the walker must
     // descend match -> decision.
@@ -21171,5 +24671,332 @@ test "maxLocalSetIndexInDecision walks bind and success-leaf bindings" {
 
     const match_expr: hir_mod.Expr = .{ .kind = .{ .match = .{ .scrutinee = match_scrutinee, .decision = decision_ptr } }, .type_id = types_mod.TypeStore.I64, .span = span };
 
-    try std.testing.expectEqual(@as(LocalId, 51), maxLocalSetIndexInExpr(&match_expr));
+    try std.testing.expectEqual(@as(LocalId, 51), try maxLocalSetIndexInExpr(alloc, &match_expr));
+}
+
+fn testExpr(alloc: std.mem.Allocator, kind: hir_mod.ExprKind) !*hir_mod.Expr {
+    const expr = try alloc.create(hir_mod.Expr);
+    expr.* = .{
+        .kind = kind,
+        .type_id = types_mod.TypeStore.UNKNOWN,
+        .span = .{ .start = 0, .end = 0 },
+    };
+    return expr;
+}
+
+fn testBlock(alloc: std.mem.Allocator, stmts: []const hir_mod.Stmt) !*hir_mod.Block {
+    const block = try alloc.create(hir_mod.Block);
+    block.* = .{ .stmts = stmts, .result_type = types_mod.TypeStore.UNKNOWN };
+    return block;
+}
+
+fn testSuccessDecision(alloc: std.mem.Allocator, body_index: u32) !*hir_mod.Decision {
+    const decision = try alloc.create(hir_mod.Decision);
+    decision.* = .{ .success = .{ .bindings = &.{}, .body_index = body_index } };
+    return decision;
+}
+
+fn testFailureDecision(alloc: std.mem.Allocator) !*hir_mod.Decision {
+    const decision = try alloc.create(hir_mod.Decision);
+    decision.* = .failure;
+    return decision;
+}
+
+fn testDeepUnaryExpr(alloc: std.mem.Allocator, leaf: *const hir_mod.Expr, depth: usize) !*const hir_mod.Expr {
+    var current = leaf;
+    var remaining = depth;
+    while (remaining != 0) : (remaining -= 1) {
+        current = try testExpr(alloc, .{ .unary = .{
+            .op = .not_op,
+            .operand = current,
+        } });
+    }
+    return current;
+}
+
+fn testDeepGuardDecision(alloc: std.mem.Allocator, depth: usize, body_index: u32) !*hir_mod.Decision {
+    const condition = try testExpr(alloc, .{ .param_get = 0 });
+    const failure = try testFailureDecision(alloc);
+    var current = try testSuccessDecision(alloc, body_index);
+    var remaining = depth;
+    while (remaining != 0) : (remaining -= 1) {
+        const next = try alloc.create(hir_mod.Decision);
+        next.* = .{ .guard = .{
+            .condition = condition,
+            .success = current,
+            .failure = failure,
+        } };
+        current = next;
+    }
+    return current;
+}
+
+test "raising-closure scan handles deep expression chains without native recursion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var store = try types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    const raising_function_type = try store.addType(.{ .function = .{
+        .params = &.{},
+        .return_type = types_mod.TypeStore.I64,
+        .raises = true,
+    } });
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+    builder.type_store = &store;
+
+    const callee = try testExpr(alloc, .{ .param_get = 0 });
+    callee.type_id = raising_function_type;
+    const closure_call = try testExpr(alloc, .{ .call = .{
+        .target = .{ .closure = callee },
+        .args = &.{},
+    } });
+    const deep_expr = try testDeepUnaryExpr(alloc, closure_call, 16_384);
+
+    const stmts = try alloc.alloc(hir_mod.Stmt, 1);
+    stmts[0] = .{ .expr = deep_expr };
+    const block = try testBlock(alloc, stmts);
+
+    try std.testing.expect(try builder.blockInvokesRaisingClosure(block, .{ .start = 0, .end = 0 }));
+}
+
+test "raising-closure scan reports structural budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+
+    const leaf = try testExpr(alloc, .nil_lit);
+    const deep_expr = try testDeepUnaryExpr(alloc, leaf, 32);
+    const stmts = try alloc.alloc(hir_mod.Stmt, 1);
+    stmts[0] = .{ .expr = deep_expr };
+    const block = try testBlock(alloc, stmts);
+
+    try std.testing.expectError(
+        error.IrStructuralBudgetExceeded,
+        builder.blockInvokesRaisingClosureBudgeted(block, .{ .start = 0, .end = 0 }, 8),
+    );
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "raising-closure scan") != null);
+}
+
+test "raising-closure scan preserves OutOfMemory from stack allocation" {
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    const block = try testBlock(std.testing.allocator, &.{});
+    defer std.testing.allocator.destroy(block);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const failing_alloc = failing_allocator.allocator();
+    var builder = IrBuilder.init(failing_alloc, &interner);
+    defer builder.deinit();
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        builder.blockInvokesRaisingClosure(block, .{ .start = 0, .end = 0 }),
+    );
+}
+
+test "groupInvokesRaisingClosureParam detects invoked raising closure parameter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var store = try types_mod.TypeStore.init(alloc, &interner);
+    defer store.deinit();
+    const raising_function_type = try store.addType(.{ .function = .{
+        .params = &.{},
+        .return_type = types_mod.TypeStore.I64,
+        .raises = true,
+    } });
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+    builder.type_store = &store;
+
+    const callee = try testExpr(alloc, .{ .param_get = 0 });
+    callee.type_id = raising_function_type;
+    const closure_call = try testExpr(alloc, .{ .call = .{
+        .target = .{ .closure = callee },
+        .args = &.{},
+    } });
+    const stmts = try alloc.alloc(hir_mod.Stmt, 1);
+    stmts[0] = .{ .local_set = .{
+        .index = 1,
+        .value = closure_call,
+    } };
+    const body = try testBlock(alloc, stmts);
+
+    const params = try alloc.alloc(hir_mod.TypedParam, 1);
+    params[0] = .{
+        .name = null,
+        .type_id = raising_function_type,
+        .pattern = null,
+    };
+    const clauses = try alloc.alloc(hir_mod.Clause, 1);
+    clauses[0] = .{
+        .params = params,
+        .return_type = types_mod.TypeStore.I64,
+        .decision = try testSuccessDecision(alloc, 0),
+        .body = body,
+        .refinement = null,
+        .tuple_bindings = &.{},
+    };
+    const group_name = try interner.intern("apply");
+    const group: hir_mod.FunctionGroup = .{
+        .id = 0,
+        .scope_id = 0,
+        .name = group_name,
+        .arity = 1,
+        .clauses = clauses,
+        .fallback_parent = null,
+    };
+
+    try std.testing.expect(try builder.groupInvokesRaisingClosureParam(&group));
+}
+
+test "lowerDecisionTreeForCase reports structural budget for deep guard chains" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+
+    var scrutinee_map = std.AutoHashMap(u32, LocalId).init(alloc);
+    defer scrutinee_map.deinit();
+    try scrutinee_map.put(0, 0);
+
+    const body = try testBlock(alloc, &.{});
+    const arms = try alloc.alloc(hir_mod.CaseArm, 1);
+    arms[0] = .{ .pattern = null, .guard = null, .body = body, .bindings = &.{} };
+
+    const decision = try testDeepGuardDecision(alloc, max_ir_decision_lowering_depth + 1, 0);
+    try std.testing.expectError(
+        error.IrStructuralBudgetExceeded,
+        builder.lowerDecisionTreeForCase(decision, arms, &scrutinee_map, 0),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "decision tree lowering") != null);
+    try std.testing.expect(builder.errors.items[0].help != null);
+}
+
+test "scanExprForTryVariants handles deep expression chains without native recursion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+
+    const handler = try testExpr(alloc, .nil_lit);
+    const dispatched_call = try testExpr(alloc, .{ .call = .{
+        .target = .{ .named = .{ .struct_name = null, .name = "step" } },
+        .args = &.{},
+    } });
+    const steps = try alloc.alloc(hir_mod.ErrorPipeStep, 1);
+    steps[0] = .{ .expr = dispatched_call, .is_dispatched = true };
+    var current = try testExpr(alloc, .{ .error_pipe = .{
+        .steps = steps,
+        .handler = handler,
+    } });
+
+    var depth: usize = 0;
+    while (depth < 16_384) : (depth += 1) {
+        const args = try alloc.alloc(hir_mod.CallArg, 1);
+        args[0] = .{ .expr = current };
+        current = try testExpr(alloc, .{ .call = .{
+            .target = .{ .builtin = "identity" },
+            .args = args,
+        } });
+    }
+
+    try builder.scanExprForTryVariants(current, null);
+    try std.testing.expect(builder.try_variant_names.contains("step__1"));
+}
+
+test "lowerErrorPipeTryStep reports structural budget for deep dispatched chains" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+
+    var builder = IrBuilder.init(alloc, &interner);
+    defer builder.deinit();
+
+    const steps = try alloc.alloc(hir_mod.ErrorPipeStep, max_ir_error_pipe_try_depth + 1);
+    for (steps) |*step| {
+        step.* = .{
+            .expr = try testExpr(alloc, .{ .call = .{
+                .target = .{ .named = .{ .struct_name = null, .name = "step" } },
+                .args = &.{},
+            } }),
+            .is_dispatched = true,
+        };
+    }
+    const handler = try testExpr(alloc, .nil_lit);
+
+    try std.testing.expectError(
+        error.IrStructuralBudgetExceeded,
+        builder.lowerErrorPipeTryStep(steps[0], 0, steps[1..], null, handler),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, builder.errors.items[0].message, "error-pipe try lowering") != null);
+}
+
+test "maxLocalSetIndex scans deep match decisions without native recursion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const leaf_bindings = try alloc.alloc(hir_mod.Binding, 1);
+    leaf_bindings[0] = .{ .name = 0, .local_index = 90_000 };
+
+    var current = try alloc.create(hir_mod.Decision);
+    current.* = .{ .success = .{ .bindings = leaf_bindings, .body_index = 0 } };
+
+    const source = try testExpr(alloc, .{ .param_get = 0 });
+    var depth: usize = 0;
+    while (depth < 16_384) : (depth += 1) {
+        const next = try alloc.create(hir_mod.Decision);
+        next.* = .{ .bind = .{
+            .name = 0,
+            .local_index = @intCast(depth),
+            .source = source,
+            .next = current,
+        } };
+        current = next;
+    }
+
+    try std.testing.expectEqual(@as(LocalId, 90_001), try maxLocalSetIndexInDecision(alloc, current));
+
+    const scrutinee = try testExpr(alloc, .{ .param_get = 0 });
+    const match_expr = try testExpr(alloc, .{ .match = .{ .scrutinee = scrutinee, .decision = current } });
+    try std.testing.expectEqual(@as(LocalId, 90_001), try maxLocalSetIndexInExpr(alloc, match_expr));
 }

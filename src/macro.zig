@@ -103,6 +103,8 @@ pub const MacroEngine = struct {
     /// back to a stable frontend function-body node.
     current_function_decl: ?*const ast.FunctionDecl = null,
     max_expansions: u32,
+    max_expansion_depth: u32,
+    expansion_depth: u32 = 0,
     errors: std.ArrayList(Error),
     macro_expansion_dependencies: std.ArrayList(MacroExpansionDependency),
     /// Optional CTFE-backed executor for macro families whose provider
@@ -139,6 +141,8 @@ pub const MacroEngine = struct {
         span: ast.SourceSpan,
     };
 
+    pub const MAX_EXPANSION_DEPTH: u32 = 2048;
+
     pub const BeforeCompileKey = struct {
         struct_scope: scope.ScopeId,
         hook_name: ast.StringId,
@@ -150,6 +154,7 @@ pub const MacroEngine = struct {
             .interner = interner,
             .graph = graph,
             .max_expansions = 100,
+            .max_expansion_depth = MAX_EXPANSION_DEPTH,
             .errors = .empty,
             .macro_expansion_dependencies = .empty,
             .compiled_executor = null,
@@ -327,7 +332,7 @@ pub const MacroEngine = struct {
             switch (item) {
                 .function => |func| {
                     // Try Kernel.fn macro first (Phase 5)
-                    if (self.tryExpandDeclarationMacro("fn", item)) |expanded_item| {
+                    if (try self.tryExpandDeclarationMacro("fn", item)) |expanded_item| {
                         try new_items.append(self.allocator, expanded_item);
                         changed = true;
                     } else {
@@ -338,7 +343,7 @@ pub const MacroEngine = struct {
                     }
                 },
                 .priv_function => |func| {
-                    if (self.tryExpandDeclarationMacro("fn", item)) |expanded_item| {
+                    if (try self.tryExpandDeclarationMacro("fn", item)) |expanded_item| {
                         try new_items.append(self.allocator, expanded_item);
                         changed = true;
                     } else {
@@ -348,28 +353,28 @@ pub const MacroEngine = struct {
                     }
                 },
                 .macro => |mac| {
-                    if (self.tryExpandDeclarationMacro("macro", item)) |expanded_item| {
+                    if (try self.tryExpandDeclarationMacro("macro", item)) |expanded_item| {
                         try new_items.append(self.allocator, expanded_item);
                         changed = true;
                     } else {
-                        const expanded = try self.expandFunctionDecl(mac);
-                        if (expanded.changed) changed = true;
-                        try new_items.append(self.allocator, .{ .macro = expanded.decl });
+                        // Macro bodies are templates evaluated later with
+                        // their parameters bound. Expanding them here would
+                        // execute helper macro calls against raw parameter
+                        // identifiers from the definition site.
+                        try new_items.append(self.allocator, .{ .macro = mac });
                     }
                 },
                 .priv_macro => |mac| {
-                    if (self.tryExpandDeclarationMacro("macro", item)) |expanded_item| {
+                    if (try self.tryExpandDeclarationMacro("macro", item)) |expanded_item| {
                         try new_items.append(self.allocator, expanded_item);
                         changed = true;
                     } else {
-                        const expanded = try self.expandFunctionDecl(mac);
-                        if (expanded.changed) changed = true;
-                        try new_items.append(self.allocator, .{ .priv_macro = expanded.decl });
+                        try new_items.append(self.allocator, .{ .priv_macro = mac });
                     }
                 },
                 .struct_decl => {
                     // Try Kernel.struct macro (Phase 5)
-                    if (self.tryExpandDeclarationMacro("struct", item)) |expanded_item| {
+                    if (try self.tryExpandDeclarationMacro("struct", item)) |expanded_item| {
                         try new_items.append(self.allocator, expanded_item);
                         changed = true;
                     } else {
@@ -379,7 +384,7 @@ pub const MacroEngine = struct {
                 },
                 .union_decl => {
                     // Try Kernel.union macro (Phase 5)
-                    if (self.tryExpandDeclarationMacro("union", item)) |expanded_item| {
+                    if (try self.tryExpandDeclarationMacro("union", item)) |expanded_item| {
                         try new_items.append(self.allocator, expanded_item);
                         changed = true;
                     } else {
@@ -397,16 +402,19 @@ pub const MacroEngine = struct {
                     changed = true;
 
                     // Step 2: Look up Struct.__using__/1 and inject returned items
-                    if (self.tryExpandUsing(ud)) |using_items| {
+                    if (try self.tryExpandUsing(ud)) |using_items| {
                         for (using_items) |using_item| {
                             try new_items.append(self.allocator, using_item);
                         }
                     }
                 },
                 .struct_level_expr => |expr| {
-                    const expanded_items = self.expandStructLevelExpr(expr) catch {
-                        try new_items.append(self.allocator, item);
-                        continue;
+                    const expanded_items = self.expandStructLevelExpr(expr) catch |err| switch (err) {
+                        error.OutOfMemory, error.MalformedMacroExpansion, error.MacroExpansionFailed => return err,
+                        else => {
+                            try new_items.append(self.allocator, item);
+                            continue;
+                        },
                     };
                     if (expanded_items.changed) changed = true;
                     for (expanded_items.items) |expanded_item| {
@@ -464,12 +472,10 @@ pub const MacroEngine = struct {
                 return .{ .item = .{ .priv_function = expanded.decl }, .changed = expanded.changed };
             },
             .macro => |mac| {
-                const expanded = try self.expandFunctionDecl(mac);
-                return .{ .item = .{ .macro = expanded.decl }, .changed = expanded.changed };
+                return .{ .item = .{ .macro = mac }, .changed = false };
             },
             .priv_macro => |mac| {
-                const expanded = try self.expandFunctionDecl(mac);
-                return .{ .item = .{ .priv_macro = expanded.decl }, .changed = expanded.changed };
+                return .{ .item = .{ .priv_macro = mac }, .changed = false };
             },
             .impl_decl => |impl| {
                 const expanded = try self.expandImplDecl(impl);
@@ -537,6 +543,51 @@ pub const MacroEngine = struct {
         changed: bool,
     };
 
+    const HookAtom = union(enum) {
+        borrowed: []const u8,
+        owned: []const u8,
+
+        fn name(self: HookAtom) []const u8 {
+            return switch (self) {
+                .borrowed, .owned => |bytes| bytes,
+            };
+        }
+
+        fn deinit(self: HookAtom, allocator: std.mem.Allocator) void {
+            switch (self) {
+                .borrowed => {},
+                .owned => |bytes| allocator.free(bytes),
+            }
+        }
+    };
+
+    fn deinitHookAtoms(
+        hook_atoms: *std.ArrayListUnmanaged(HookAtom),
+        allocator: std.mem.Allocator,
+    ) void {
+        for (hook_atoms.items) |hook_atom| {
+            hook_atom.deinit(allocator);
+        }
+        hook_atoms.deinit(allocator);
+    }
+
+    fn appendBorrowedHookAtom(
+        out: *std.ArrayListUnmanaged(HookAtom),
+        allocator: std.mem.Allocator,
+        name: []const u8,
+    ) !void {
+        try out.append(allocator, .{ .borrowed = name });
+    }
+
+    fn appendOwnedHookAtom(
+        out: *std.ArrayListUnmanaged(HookAtom),
+        allocator: std.mem.Allocator,
+        name: []const u8,
+    ) !void {
+        errdefer allocator.free(name);
+        try out.append(allocator, .{ .owned = name });
+    }
+
     /// Fire all not-yet-fired `@before_compile` hooks across structs
     /// and append their results into the corresponding struct's
     /// items. Returns either the input slice unchanged (when no hook
@@ -557,8 +608,8 @@ pub const MacroEngine = struct {
             const mod_scope = self.graph.findStructScope(mod.name) orelse continue;
             const mod_entry = self.graph.findStructByScope(mod_scope) orelse continue;
 
-            var hook_atoms: std.ArrayListUnmanaged([]const u8) = .empty;
-            defer hook_atoms.deinit(self.allocator);
+            var hook_atoms: std.ArrayListUnmanaged(HookAtom) = .empty;
+            defer deinitHookAtoms(&hook_atoms, self.allocator);
 
             for (mod_entry.attributes.items) |attr| {
                 if (attr.name != before_compile_id) continue;
@@ -583,7 +634,8 @@ pub const MacroEngine = struct {
             var appended_items: std.ArrayListUnmanaged(ast.StructItem) = .empty;
             defer appended_items.deinit(self.allocator);
 
-            for (hook_atoms.items) |hook_name_str| {
+            for (hook_atoms.items) |hook_atom| {
+                const hook_name_str = hook_atom.name();
                 const hook_name_id = try self.interner.intern(hook_name_str);
                 const fired_key: BeforeCompileKey = .{
                     .struct_scope = mod_scope,
@@ -596,8 +648,10 @@ pub const MacroEngine = struct {
                 const hook_items = self.invokeBeforeCompileHook(
                     mod_scope,
                     mod.name,
+                    mod.meta.span,
                     hook_name_str,
                 ) catch |err| {
+                    if (err == error.OutOfMemory or err == error.MalformedMacroExpansion or err == error.MacroExpansionFailed) return err;
                     try self.errors.append(self.allocator, .{
                         .message = try std.fmt.allocPrint(
                             self.allocator,
@@ -650,13 +704,13 @@ pub const MacroEngine = struct {
     /// Used to flatten an accumulated `@before_compile` list (which
     /// may be a single atom or a list of atoms from `put_attribute`).
     fn collectHookAtoms(
-        out: *std.ArrayListUnmanaged([]const u8),
+        out: *std.ArrayListUnmanaged(HookAtom),
         alloc: std.mem.Allocator,
         cv: ctfe.ConstValue,
     ) !void {
         switch (cv) {
-            .atom => |name| try out.append(alloc, name),
-            .string => |name| try out.append(alloc, name),
+            .atom => |name| try appendBorrowedHookAtom(out, alloc, name),
+            .string => |name| try appendBorrowedHookAtom(out, alloc, name),
             .list => |elems| for (elems) |e| try collectHookAtoms(out, alloc, e),
             else => {}, // ignore other shapes — invalid hook target
         }
@@ -668,20 +722,21 @@ pub const MacroEngine = struct {
     /// computed-value path supports, but for source-declared
     /// `@before_compile = :Foo` cases that have not yet been CTFE'd.
     fn collectHookAtomsFromExpr(
-        out: *std.ArrayListUnmanaged([]const u8),
+        out: *std.ArrayListUnmanaged(HookAtom),
         alloc: std.mem.Allocator,
         interner: *const ast.StringInterner,
         expr: *const ast.Expr,
     ) !void {
         switch (expr.*) {
-            .atom_literal => |a| try out.append(alloc, interner.get(a.value)),
-            .string_literal => |s| try out.append(alloc, interner.get(s.value)),
+            .atom_literal => |a| try appendBorrowedHookAtom(out, alloc, interner.get(a.value)),
+            .string_literal => |s| try appendBorrowedHookAtom(out, alloc, interner.get(s.value)),
             .list => |l| for (l.elements) |elem| {
                 try collectHookAtomsFromExpr(out, alloc, interner, elem);
             },
             .struct_ref => |m| {
                 if (m.name.parts.len > 0) {
-                    try out.append(alloc, try m.name.toDottedString(alloc, interner));
+                    const owned_name = try m.name.toDottedString(alloc, interner);
+                    try appendOwnedHookAtom(out, alloc, owned_name);
                 }
             },
             else => {},
@@ -696,6 +751,7 @@ pub const MacroEngine = struct {
         self: *MacroEngine,
         caller_struct_scope: scope.ScopeId,
         caller_struct_name: ast.StructName,
+        caller_span: ast.SourceSpan,
         hook_struct_name: []const u8,
     ) ![]ast.StructItem {
         // Resolve hook struct name → scope id → __before_compile__/1
@@ -736,37 +792,44 @@ pub const MacroEngine = struct {
         // name. A richer __ENV__ struct can come later; the atom is
         // enough for hooks that just want to read the caller's
         // attributes.
-        const macro_eval = @import("macro_eval.zig");
-        var store = ctfe.AllocationStore{};
-        var env = macro_eval.Env.init(self.allocator, &store);
+        var temporary_values = MacroCtValueOwner.init(self.allocator);
+        defer temporary_values.deinit();
+        const store = temporary_values.storePtr();
+
+        var env = macro_eval_mod.Env.init(self.allocator, store);
         defer env.deinit();
-        env.compiled_program = self.compiledProgram();
-        env.struct_ctx = .{
-            .graph = self.graph,
-            .interner = self.interner,
-            // Hooks read attributes from the *caller* struct, not the
-            // hook struct — that's the whole point of the pattern.
+        self.configureSelectedMacroEnv(&env, .{
+            .family = family,
+            .clause_ref = clause_ref,
+            .call_span = caller_span,
             .current_struct_scope = caller_struct_scope,
-        };
+            .attribute_struct_scope = caller_struct_scope,
+        });
 
         if (clause.params.len > 0 and clause.params[0].pattern.* == .bind) {
             const param_name = self.interner.get(clause.params[0].pattern.bind.name);
-            const env_arg = try self.structNameToAliasCtValue(&store, caller_struct_name);
+            const env_arg = try self.structNameToAliasCtValue(store, caller_struct_name);
+            try temporary_values.adopt(env_arg);
             try env.bind(param_name, env_arg);
         }
 
         // Evaluate the hook's body.
         var result: ctfe.CtValue = .nil;
         for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
-            const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt);
-            result = macro_eval.eval(&env, stmt_ct) catch .nil;
+            const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+            try temporary_values.adopt(stmt_ct);
+            result = macro_eval_mod.eval(&env, stmt_ct) catch |err| {
+                try self.appendSelectedMacroEvaluationFailure(self.interner.get(family.name), caller_span, err, env.last_capability_error);
+                return error.MacroExpansionFailed;
+            };
+            try temporary_values.adopt(result);
         }
 
         // Convert the result into struct items. Same logic as
-        // expandStructLevelExpr's __block__ handling — split mixed
-        // results, dropping anything that isn't a recognized
-        // declaration shape.
-        return try self.ctValueToStructItems(result);
+        // expandStructLevelExpr's __block__ handling: split nested
+        // blocks and require every non-empty element to be a
+        // declaration. Only explicit nil or empty output is a no-op.
+        return try self.ctValueToStructItems(result, caller_span, "@before_compile hook");
     }
 
     fn structNameToAliasCtValue(
@@ -774,17 +837,27 @@ pub const MacroEngine = struct {
         store: *ctfe.AllocationStore,
         struct_name: ast.StructName,
     ) !ctfe.CtValue {
+        var temporary_values = TemporaryCtValueOwner.init(self.allocator, store);
+        defer temporary_values.deinitRootList();
+        errdefer temporary_values.deinitValues();
+
         const parts = try self.allocator.alloc(ctfe.CtValue, struct_name.parts.len);
+        defer self.allocator.free(parts);
         for (struct_name.parts, 0..) |part_id, index| {
             parts[index] = .{ .atom = self.interner.get(part_id) };
         }
+
+        const meta = try ast_data.emptyList(self.allocator, store);
+        try temporary_values.adopt(meta);
+        const args = try ast_data.makeListFromSlice(self.allocator, store, parts);
+        try temporary_values.adopt(args);
 
         return ast_data.makeTuple3(
             self.allocator,
             store,
             .{ .atom = "__aliases__" },
-            try ast_data.emptyList(self.allocator, store),
-            try ast_data.makeListFromSlice(self.allocator, store, parts),
+            meta,
+            args,
         );
     }
 
@@ -813,42 +886,76 @@ pub const MacroEngine = struct {
     ///   - `__block__` whose elements are decls: each becomes an item.
     ///   - A bare list of decl-shaped CtValues.
     ///   - A single decl-shaped CtValue.
-    /// Anything else is ignored (the hook is expected to produce
-    /// declarations only — runtime expressions are not meaningful at
-    /// the bottom of a struct's body).
+    /// Explicit nil and empty declaration lists are no-ops.
+    /// Anything else is a macro expansion error: hook-like declaration
+    /// producers must not silently drop runtime expressions at struct
+    /// scope.
     fn ctValueToStructItems(
         self: *MacroEngine,
         result: ctfe.CtValue,
+        span: ast.SourceSpan,
+        output_source: []const u8,
     ) ![]ast.StructItem {
         var items: std.ArrayListUnmanaged(ast.StructItem) = .empty;
+        errdefer items.deinit(self.allocator);
+
+        if (isExplicitNilOutput(result)) {
+            return try items.toOwnedSlice(self.allocator);
+        }
+
         switch (result) {
-            .tuple => |t| if (t.elems.len == 3) {
-                const form = t.elems[0];
-                if (form == .atom and std.mem.eql(u8, form.atom, "__block__")) {
-                    if (t.elems[2] == .list) {
-                        for (t.elems[2].list.elems) |elem| {
-                            if (try ast_data.ctValueToStructItem(self.allocator, self.interner, elem)) |si| {
-                                try items.append(self.allocator, si);
-                            }
-                        }
+            .tuple => |t| {
+                if (t.elems.len == 3 and t.elems[0] == .atom and std.mem.eql(u8, t.elems[0].atom, "__block__")) {
+                    var flattened: std.ArrayList(ctfe.CtValue) = .empty;
+                    defer flattened.deinit(self.allocator);
+                    try self.flattenNestedBlocks(result, &flattened, span);
+                    for (flattened.items) |elem| {
+                        try self.appendRequiredMacroStructItem(&items, elem, span, output_source);
                     }
                 } else {
-                    if (try ast_data.ctValueToStructItem(self.allocator, self.interner, result)) |si| {
-                        try items.append(self.allocator, si);
-                    }
+                    try self.appendRequiredMacroStructItem(&items, result, span, output_source);
                 }
             },
             .list => |l| {
                 for (l.elems) |elem| {
-                    if (try ast_data.ctValueToStructItem(self.allocator, self.interner, elem)) |si| {
-                        try items.append(self.allocator, si);
+                    var flattened: std.ArrayList(ctfe.CtValue) = .empty;
+                    defer flattened.deinit(self.allocator);
+                    try self.flattenNestedBlocks(elem, &flattened, span);
+                    for (flattened.items) |flat_elem| {
+                        try self.appendRequiredMacroStructItem(&items, flat_elem, span, output_source);
                     }
                 }
             },
-            .nil => {}, // hook returned nothing — fine
-            else => {},
+            else => {
+                try self.reportNonDeclarationMacroOutput(output_source, span);
+                unreachable;
+            },
         }
         return items.toOwnedSlice(self.allocator);
+    }
+
+    fn isExplicitNilOutput(result: ctfe.CtValue) bool {
+        if (result == .nil) return true;
+        return result == .tuple and
+            result.tuple.elems.len == 3 and
+            result.tuple.elems[0] == .nil and
+            result.tuple.elems[2] == .nil;
+    }
+
+    fn appendRequiredMacroStructItem(
+        self: *MacroEngine,
+        items: *std.ArrayListUnmanaged(ast.StructItem),
+        value: ctfe.CtValue,
+        span: ast.SourceSpan,
+        output_source: []const u8,
+    ) !void {
+        if (try self.ctValueToMacroStructItem(value, span)) |item| {
+            try items.append(self.allocator, item);
+            return;
+        }
+
+        try self.reportNonDeclarationMacroOutput(output_source, span);
+        unreachable;
     }
 
     // ============================================================
@@ -985,6 +1092,16 @@ pub const MacroEngine = struct {
     };
 
     fn expandExpr(self: *MacroEngine, expr: *const ast.Expr) anyerror!ExpandedExpr {
+        if (self.expansion_depth >= self.max_expansion_depth) {
+            try self.errors.append(self.allocator, .{
+                .message = "macro expansion exceeded maximum depth; possible recursive macro expansion",
+                .span = expr.getMeta().span,
+            });
+            return error.MacroExpansionDepthExceeded;
+        }
+        self.expansion_depth += 1;
+        defer self.expansion_depth -= 1;
+
         switch (expr.*) {
             // Poison sentinel (Phase 4.b): a parse-error placeholder has no
             // macro to expand — leave it unchanged.
@@ -1184,7 +1301,7 @@ pub const MacroEngine = struct {
                 // the macro output so further-expandable forms inside the
                 // produced AST drain in the same iteration — see the bare
                 // macro call branch above for the full task #15 PART 2 reasoning.
-                if (self.tryExpandBinaryMacro(macro_name, lhs_pre.expr, rhs_pre.expr, bo.meta)) |result| {
+                if (try self.tryExpandBinaryMacro(macro_name, lhs_pre.expr, rhs_pre.expr, bo.meta)) |result| {
                     const drained = (try self.expandExpr(result)).expr;
                     return .{ .expr = drained, .changed = true };
                 }
@@ -1281,7 +1398,7 @@ pub const MacroEngine = struct {
                 // result so that further-expandable forms it contains
                 // drain in the same iteration — see the bare macro call
                 // branch for the full task #15 PART 2 reasoning.
-                if (self.tryExpandBinaryMacro("|>", pe.lhs, pe.rhs, pe.meta)) |result| {
+                if (try self.tryExpandBinaryMacro("|>", pe.lhs, pe.rhs, pe.meta)) |result| {
                     const drained = (try self.expandExpr(result)).expr;
                     return .{ .expr = drained, .changed = true };
                 }
@@ -1806,9 +1923,172 @@ pub const MacroEngine = struct {
         });
     }
 
+    fn ctValueToMacroExpr(
+        self: *MacroEngine,
+        value: ctfe.CtValue,
+        span: ast.SourceSpan,
+    ) !*const ast.Expr {
+        return ast_data.ctValueToExpr(self.allocator, self.interner, value) catch |err| {
+            try self.reportMalformedMacroCtValue("expression", span, err);
+            unreachable;
+        };
+    }
+
+    fn ctValueToMacroStructItem(
+        self: *MacroEngine,
+        value: ctfe.CtValue,
+        span: ast.SourceSpan,
+    ) !?ast.StructItem {
+        return ast_data.ctValueToStructItem(self.allocator, self.interner, value) catch |err| {
+            try self.reportMalformedMacroCtValue("struct item", span, err);
+            unreachable;
+        };
+    }
+
+    fn reportMalformedMacroCtValue(
+        self: *MacroEngine,
+        target: []const u8,
+        span: ast.SourceSpan,
+        err: ast_data.CtValueDecodeError,
+    ) !void {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.StructuralBudgetExceeded) {
+            try self.errors.append(self.allocator, .{
+                .message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "macro expansion {s} transformation exceeded structural budget; possible pathological macro output",
+                    .{target},
+                ),
+                .span = span,
+            });
+            return error.MalformedMacroExpansion;
+        }
+
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "macro expansion produced malformed AST {s}: {s}",
+                .{ target, @errorName(err) },
+            ),
+            .span = span,
+        });
+        return error.MalformedMacroExpansion;
+    }
+
+    fn reportMalformedMacroStructure(
+        self: *MacroEngine,
+        target: []const u8,
+        span: ast.SourceSpan,
+        detail: []const u8,
+    ) !void {
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "macro expansion produced malformed AST {s}: {s}",
+                .{ target, detail },
+            ),
+            .span = span,
+        });
+        return error.MalformedMacroExpansion;
+    }
+
+    fn reportNonDeclarationMacroOutput(
+        self: *MacroEngine,
+        output_source: []const u8,
+        span: ast.SourceSpan,
+    ) !void {
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} must return declarations, nil, or an empty declaration list; produced non-declaration or malformed declaration output",
+                .{output_source},
+            ),
+            .span = span,
+        });
+        return error.MalformedMacroExpansion;
+    }
+
+    fn appendSelectedMacroEvaluationFailure(
+        self: *MacroEngine,
+        macro_name: []const u8,
+        span: ast.SourceSpan,
+        err: anyerror,
+        evaluator_message: ?[]const u8,
+    ) !void {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+
+        const message = if (evaluator_message) |msg|
+            msg
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "macro expansion of `{s}` failed during evaluation: {s}",
+                .{ macro_name, @errorName(err) },
+            );
+
+        try self.errors.append(self.allocator, .{
+            .message = message,
+            .span = span,
+        });
+    }
+
+    const SelectedMacroEnvSetup = struct {
+        family: *const scope.MacroFamily,
+        clause_ref: scope.FunctionClauseRef,
+        call_span: ast.SourceSpan,
+        current_struct_scope: ?scope.ScopeId,
+        attribute_struct_scope: ?scope.ScopeId = null,
+        macro_name: ?[]const u8 = null,
+    };
+
+    fn configureSelectedMacroEnv(
+        self: *MacroEngine,
+        env: *macro_eval_mod.Env,
+        setup: SelectedMacroEnvSetup,
+    ) void {
+        env.compiled_program = self.compiledProgram();
+        env.struct_ctx = .{
+            .graph = self.graph,
+            .interner = self.interner,
+            .current_struct_scope = setup.current_struct_scope,
+            .attribute_struct_scope = setup.attribute_struct_scope,
+        };
+        env.current_macro_caps = setup.family.required_caps;
+        env.current_macro_name = setup.macro_name orelse self.interner.get(setup.family.name);
+        env.current_macro_span = setup.call_span;
+        env.current_macro_source_path = self.selectedMacroSourcePath(setup.clause_ref);
+    }
+
+    fn selectedMacroSourcePath(
+        self: *MacroEngine,
+        clause_ref: scope.FunctionClauseRef,
+    ) ?[]const u8 {
+        if (clause_ref.decl.meta.span.source_id) |source_id| {
+            if (self.graph.sourcePathById(source_id)) |source_path| return source_path;
+        }
+
+        const clause = clause_ref.decl.clauses[clause_ref.clause_index];
+        if (clause.meta.span.source_id) |source_id| {
+            return self.graph.sourcePathById(source_id);
+        }
+        return null;
+    }
+
     const MacroClauseSelection = struct {
         ref: scope.FunctionClauseRef,
         clause: *const ast.FunctionClause,
+    };
+
+    const MacroBodyEvaluation = union(enum) {
+        no_output,
+        value: OwnedMacroCtValue,
+
+        fn deinit(self: *MacroBodyEvaluation) void {
+            switch (self.*) {
+                .no_output => {},
+                .value => |*owned_value| owned_value.deinit(),
+            }
+        }
     };
 
     fn selectMacroClause(
@@ -1817,13 +2097,16 @@ pub const MacroEngine = struct {
         args: []const *const ast.Expr,
         call_span: ast.SourceSpan,
     ) !?MacroClauseSelection {
-        var selection_store = ctfe.AllocationStore{};
-        defer selection_store.deinit(self.allocator);
+        var temporary_values = MacroCtValueOwner.init(self.allocator);
+        defer temporary_values.deinit();
+        const selection_store = temporary_values.storePtr();
 
         const arg_cts = try self.allocator.alloc(ctfe.CtValue, args.len);
         defer self.allocator.free(arg_cts);
         for (args, 0..) |arg, index| {
-            arg_cts[index] = try ast_data.exprToCtValue(self.allocator, self.interner, &selection_store, arg);
+            const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, selection_store, arg);
+            try temporary_values.adopt(arg_ct);
+            arg_cts[index] = arg_ct;
         }
 
         for (family.clauses.items) |clause_ref| {
@@ -1879,10 +2162,11 @@ pub const MacroEngine = struct {
         arg_cts: []const ctfe.CtValue,
         call_span: ast.SourceSpan,
     ) !bool {
-        var guard_store = ctfe.AllocationStore{};
-        defer guard_store.deinit(self.allocator);
+        var temporary_values = MacroCtValueOwner.init(self.allocator);
+        defer temporary_values.deinit();
+        const guard_store = temporary_values.storePtr();
 
-        var env = macro_eval_mod.Env.init(self.allocator, &guard_store);
+        var env = macro_eval_mod.Env.init(self.allocator, guard_store);
         defer env.deinit();
         env.compiled_program = self.compiledProgram();
         env.struct_ctx = .{
@@ -1899,13 +2183,15 @@ pub const MacroEngine = struct {
             try env.bind(self.interner.get(name_id), arg_cts[index]);
         }
 
-        const refinement_ct = try ast_data.exprToCtValue(self.allocator, self.interner, &guard_store, refinement);
+        const refinement_ct = try ast_data.exprToCtValue(self.allocator, self.interner, guard_store, refinement);
+        try temporary_values.adopt(refinement_ct);
         const result = macro_eval_mod.eval(&env, refinement_ct) catch |err| {
             if (env.last_capability_error) |message| {
                 try self.errors.append(self.allocator, .{ .message = message, .span = call_span });
             }
             return err;
         };
+        try temporary_values.adopt(result);
         const value = unwrapAstLeaf(result);
         if (value == .bool_val) return value.bool_val;
 
@@ -1925,6 +2211,256 @@ pub const MacroEngine = struct {
         return self.macroPatternMatches(param.pattern, arg_ct, self.paramSpliceKind(param), store);
     }
 
+    const MACRO_PATTERN_MATCH_INLINE_STACK_CAPACITY: usize = 64;
+    const MACRO_PATTERN_MATCH_STEP_BUDGET: usize = 1_000_000;
+    const MACRO_RESULT_FLATTEN_INLINE_STACK_CAPACITY: usize = 64;
+    const MACRO_RESULT_FLATTEN_STEP_BUDGET: usize = 1_000_000;
+    const MACRO_CT_SUBSTITUTE_INLINE_STACK_CAPACITY: usize = 64;
+    const MACRO_CT_SUBSTITUTE_STEP_BUDGET: usize = 1_000_000;
+    const MACRO_TYPE_VALIDATION_INLINE_STACK_CAPACITY: usize = 64;
+    const MACRO_TYPE_VALIDATION_STEP_BUDGET: usize = 1_000_000;
+
+    const MacroPatternFrame = union(enum) {
+        pattern: struct {
+            pattern: *const ast.Pattern,
+            subject: ctfe.CtValue,
+            splice_kind: ?ast.MacroSpliceKind,
+        },
+        list_cons_tail: struct {
+            pattern: *const ast.Pattern,
+            subject_tail: []const ctfe.CtValue,
+        },
+    };
+
+    const MacroCtPatternFrame = struct {
+        pattern: ctfe.CtValue,
+        subject: ctfe.CtValue,
+    };
+
+    const MacroCtSubstituteFrame = union(enum) {
+        visit: ctfe.CtValue,
+        emit: MacroCtSubstituteResult,
+        finish_tuple3: struct {
+            tuple: ctfe.CtValue.CtTupleValue,
+            args_was_list: bool,
+        },
+        finish_tuple2: ctfe.CtValue.CtTupleValue,
+        finish_list: struct {
+            list: ctfe.CtValue.CtListValue,
+            output_count: usize,
+            forced_changed: bool,
+        },
+    };
+
+    const MacroCtSubstituteResult = struct {
+        value: ctfe.CtValue,
+        changed: bool,
+    };
+
+    const TemporaryCtValueOwner = struct {
+        allocator: std.mem.Allocator,
+        store: *ctfe.AllocationStore,
+        roots: std.ArrayListUnmanaged(ctfe.CtValue) = .empty,
+
+        fn init(allocator: std.mem.Allocator, store: *ctfe.AllocationStore) TemporaryCtValueOwner {
+            return .{
+                .allocator = allocator,
+                .store = store,
+            };
+        }
+
+        fn adopt(self: *TemporaryCtValueOwner, value: ctfe.CtValue) std.mem.Allocator.Error!void {
+            errdefer deinitTemporaryCtValue(self.allocator, self.store, value);
+            try self.roots.append(self.allocator, value);
+        }
+
+        fn deinitValues(self: *TemporaryCtValueOwner) void {
+            for (self.roots.items) |value| {
+                deinitTemporaryCtValue(self.allocator, self.store, value);
+            }
+        }
+
+        fn deinitRootList(self: *TemporaryCtValueOwner) void {
+            self.roots.deinit(self.allocator);
+        }
+
+        fn deinit(self: *TemporaryCtValueOwner) void {
+            self.deinitValues();
+            self.deinitRootList();
+        }
+    };
+
+    const MacroCtValueOwner = struct {
+        allocator: std.mem.Allocator,
+        store: ctfe.AllocationStore = .{},
+        roots: std.ArrayListUnmanaged(ctfe.CtValue) = .empty,
+
+        fn init(allocator: std.mem.Allocator) MacroCtValueOwner {
+            return .{ .allocator = allocator };
+        }
+
+        fn storePtr(self: *MacroCtValueOwner) *ctfe.AllocationStore {
+            return &self.store;
+        }
+
+        fn adopt(self: *MacroCtValueOwner, value: ctfe.CtValue) std.mem.Allocator.Error!void {
+            errdefer deinitTemporaryCtValue(self.allocator, &self.store, value);
+            try self.roots.append(self.allocator, value);
+        }
+
+        fn deinitValues(self: *MacroCtValueOwner) void {
+            for (self.roots.items) |value| {
+                deinitTemporaryCtValue(self.allocator, &self.store, value);
+            }
+        }
+
+        fn deinitRootList(self: *MacroCtValueOwner) void {
+            self.roots.deinit(self.allocator);
+        }
+
+        fn deinit(self: *MacroCtValueOwner) void {
+            self.deinitValues();
+            self.deinitRootList();
+            self.store.deinit(self.allocator);
+        }
+    };
+
+    const OwnedMacroCtValue = struct {
+        value: ctfe.CtValue,
+        owner: MacroCtValueOwner,
+
+        fn deinit(self: *OwnedMacroCtValue) void {
+            self.owner.deinit();
+        }
+    };
+
+    fn takeTemporaryCtAllocation(store: *ctfe.AllocationStore, alloc_id: ctfe.AllocId) bool {
+        if (alloc_id == 0) return false;
+        for (store.records.items) |*record| {
+            if (record.id == alloc_id) {
+                record.id = 0;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn deinitTemporaryCtValueSlice(
+        allocator: std.mem.Allocator,
+        store: *ctfe.AllocationStore,
+        values: []const ctfe.CtValue,
+    ) void {
+        for (values) |value| {
+            deinitTemporaryCtValue(allocator, store, value);
+        }
+    }
+
+    fn deinitTemporaryCtMapEntries(
+        allocator: std.mem.Allocator,
+        store: *ctfe.AllocationStore,
+        entries: []const ctfe.CtValue.CtMapEntry,
+    ) void {
+        for (entries) |entry| {
+            deinitTemporaryCtValue(allocator, store, entry.key);
+            deinitTemporaryCtValue(allocator, store, entry.value);
+        }
+    }
+
+    fn deinitTemporaryCtFieldValues(
+        allocator: std.mem.Allocator,
+        store: *ctfe.AllocationStore,
+        fields: []const ctfe.CtValue.CtFieldValue,
+    ) void {
+        for (fields) |field| {
+            deinitTemporaryCtValue(allocator, store, field.value);
+        }
+    }
+
+    fn deinitTemporaryCtValue(
+        allocator: std.mem.Allocator,
+        store: *ctfe.AllocationStore,
+        value: ctfe.CtValue,
+    ) void {
+        switch (value) {
+            .tuple => |tuple_value| {
+                if (!takeTemporaryCtAllocation(store, tuple_value.alloc_id)) return;
+                deinitTemporaryCtValueSlice(allocator, store, tuple_value.elems);
+                if (tuple_value.elems.len > 0) allocator.free(tuple_value.elems);
+            },
+            .list => |list_value| {
+                if (!takeTemporaryCtAllocation(store, list_value.alloc_id)) return;
+                deinitTemporaryCtValueSlice(allocator, store, list_value.elems);
+                if (list_value.elems.len > 0) allocator.free(list_value.elems);
+            },
+            .map => |map_value| {
+                if (!takeTemporaryCtAllocation(store, map_value.alloc_id)) return;
+                deinitTemporaryCtMapEntries(allocator, store, map_value.entries);
+                if (map_value.entries.len > 0) allocator.free(map_value.entries);
+            },
+            .struct_val => |struct_value| {
+                if (!takeTemporaryCtAllocation(store, struct_value.alloc_id)) return;
+                deinitTemporaryCtFieldValues(allocator, store, struct_value.fields);
+                if (struct_value.fields.len > 0) allocator.free(struct_value.fields);
+            },
+            .union_val => |union_value| {
+                if (!takeTemporaryCtAllocation(store, union_value.alloc_id)) return;
+                deinitTemporaryCtValue(allocator, store, union_value.payload.*);
+                allocator.destroy(@constCast(union_value.payload));
+            },
+            .closure => |closure_value| {
+                if (!takeTemporaryCtAllocation(store, closure_value.alloc_id)) return;
+                deinitTemporaryCtValueSlice(allocator, store, closure_value.captures);
+                if (closure_value.captures.len > 0) allocator.free(closure_value.captures);
+            },
+            .int,
+            .float,
+            .string,
+            .bool_val,
+            .atom,
+            .nil,
+            .void,
+            .consumed,
+            .reuse_token,
+            .enum_val,
+            .optional,
+            => {},
+        }
+    }
+
+    fn SmallInlineStack(comptime T: type, comptime inline_capacity: usize) type {
+        return struct {
+            inline_items: [inline_capacity]T = undefined,
+            inline_len: usize = 0,
+            spill: std.ArrayListUnmanaged(T) = .empty,
+
+            const Self = @This();
+
+            fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+                self.spill.deinit(allocator);
+            }
+
+            fn len(self: *const Self) usize {
+                return self.inline_len + self.spill.items.len;
+            }
+
+            fn append(self: *Self, allocator: std.mem.Allocator, item: T) std.mem.Allocator.Error!void {
+                if (self.spill.items.len == 0 and self.inline_len < inline_capacity) {
+                    self.inline_items[self.inline_len] = item;
+                    self.inline_len += 1;
+                    return;
+                }
+                try self.spill.append(allocator, item);
+            }
+
+            fn pop(self: *Self) T {
+                std.debug.assert(self.len() != 0);
+                if (self.spill.items.len != 0) return self.spill.pop().?;
+                self.inline_len -= 1;
+                return self.inline_items[self.inline_len];
+            }
+        };
+    }
+
     fn macroPatternMatches(
         self: *MacroEngine,
         pattern: *const ast.Pattern,
@@ -1932,46 +2468,145 @@ pub const MacroEngine = struct {
         splice_kind: ?ast.MacroSpliceKind,
         store: *ctfe.AllocationStore,
     ) !bool {
-        return switch (pattern.*) {
-            .wildcard => true,
-            .bind => |bind| blk: {
-                if (self.isConcreteTypePatternName(bind.name)) {
-                    break :blk self.typePatternNameMatches(bind.name, arg_ct);
-                }
-                break :blk true;
-            },
-            .literal => |literal| self.literalPatternMatches(literal, arg_ct),
-            .tuple => |tuple_pattern| blk: {
-                const elems = astNodeArgs(arg_ct, "{}") orelse break :blk false;
-                if (elems.len != tuple_pattern.elements.len) break :blk false;
-                for (tuple_pattern.elements, elems) |element_pattern, element_value| {
-                    if (!try self.macroPatternMatches(element_pattern, element_value, null, store)) break :blk false;
-                }
-                break :blk true;
-            },
-            .list => |list_pattern| blk: {
-                if (arg_ct != .list) break :blk false;
-                if (arg_ct.list.elems.len != list_pattern.elements.len) break :blk false;
-                for (list_pattern.elements, arg_ct.list.elems) |element_pattern, element_value| {
-                    if (!try self.macroPatternMatches(element_pattern, element_value, null, store)) break :blk false;
-                }
-                break :blk true;
-            },
-            .list_cons => |cons_pattern| blk: {
-                if (arg_ct != .list) break :blk false;
-                if (arg_ct.list.elems.len < cons_pattern.heads.len) break :blk false;
-                for (cons_pattern.heads, arg_ct.list.elems[0..cons_pattern.heads.len]) |head_pattern, head_value| {
-                    if (!try self.macroPatternMatches(head_pattern, head_value, null, store)) break :blk false;
-                }
-                const tail = try ast_data.makeListFromSlice(self.allocator, store, arg_ct.list.elems[cons_pattern.heads.len..]);
-                break :blk try self.macroPatternMatches(cons_pattern.tail, tail, null, store);
-            },
-            .map, .struct_pattern, .pin, .binary, .tagged_union_variant => blk: {
-                const pattern_ct = try ast_data.patternToCtValue(self.allocator, self.interner, store, pattern);
-                break :blk self.macroCtPatternMatches(pattern_ct, arg_ct);
-            },
-            .paren => |paren_pattern| self.macroPatternMatches(paren_pattern.inner, arg_ct, splice_kind, store),
-        };
+        return self.macroPatternMatchesWithBudget(
+            pattern,
+            arg_ct,
+            splice_kind,
+            store,
+            MACRO_PATTERN_MATCH_STEP_BUDGET,
+        );
+    }
+
+    fn macroPatternMatchesWithBudget(
+        self: *MacroEngine,
+        pattern: *const ast.Pattern,
+        arg_ct: ctfe.CtValue,
+        splice_kind: ?ast.MacroSpliceKind,
+        store: *ctfe.AllocationStore,
+        max_steps: usize,
+    ) !bool {
+        var temporary_values = TemporaryCtValueOwner.init(self.allocator, store);
+        defer temporary_values.deinit();
+        var steps_remaining = max_steps;
+        var stack: SmallInlineStack(MacroPatternFrame, MACRO_PATTERN_MATCH_INLINE_STACK_CAPACITY) = .{};
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, .{ .pattern = .{
+            .pattern = pattern,
+            .subject = arg_ct,
+            .splice_kind = splice_kind,
+        } });
+
+        while (stack.len() != 0) {
+            switch (stack.pop()) {
+                .pattern => |frame| {
+                    try self.consumeMacroPatternMatchStep(&steps_remaining, max_steps, frame.pattern.getMeta().span);
+                    switch (frame.pattern.*) {
+                        .wildcard => {},
+                        .bind => |bind| {
+                            if (self.isConcreteTypePatternName(bind.name) and !self.typePatternNameMatches(bind.name, frame.subject)) return false;
+                        },
+                        .literal => |literal| {
+                            if (!self.literalPatternMatches(literal, frame.subject)) return false;
+                        },
+                        .tuple => |tuple_pattern| {
+                            const elems = astNodeArgs(frame.subject, "{}") orelse return false;
+                            if (elems.len != tuple_pattern.elements.len) return false;
+                            try pushMacroPatternFrames(&stack, self.allocator, tuple_pattern.elements, elems, null);
+                        },
+                        .list => |list_pattern| {
+                            if (frame.subject != .list) return false;
+                            if (frame.subject.list.elems.len != list_pattern.elements.len) return false;
+                            try pushMacroPatternFrames(&stack, self.allocator, list_pattern.elements, frame.subject.list.elems, null);
+                        },
+                        .list_cons => |cons_pattern| {
+                            if (frame.subject != .list) return false;
+                            if (frame.subject.list.elems.len < cons_pattern.heads.len) return false;
+                            try stack.append(self.allocator, .{ .list_cons_tail = .{
+                                .pattern = cons_pattern.tail,
+                                .subject_tail = frame.subject.list.elems[cons_pattern.heads.len..],
+                            } });
+                            try pushMacroPatternFrames(
+                                &stack,
+                                self.allocator,
+                                cons_pattern.heads,
+                                frame.subject.list.elems[0..cons_pattern.heads.len],
+                                null,
+                            );
+                        },
+                        .map, .struct_pattern, .pin, .binary, .tagged_union_variant => {
+                            const pattern_ct = try ast_data.patternToCtValue(self.allocator, self.interner, store, frame.pattern);
+                            try temporary_values.adopt(pattern_ct);
+                            if (!try self.macroCtPatternMatchesWithBudget(
+                                pattern_ct,
+                                frame.subject,
+                                &steps_remaining,
+                                max_steps,
+                                frame.pattern.getMeta().span,
+                            )) return false;
+                        },
+                        .paren => |paren_pattern| {
+                            try stack.append(self.allocator, .{ .pattern = .{
+                                .pattern = paren_pattern.inner,
+                                .subject = frame.subject,
+                                .splice_kind = frame.splice_kind,
+                            } });
+                        },
+                    }
+                },
+                .list_cons_tail => |frame| {
+                    try self.consumeMacroPatternMatchStep(&steps_remaining, max_steps, frame.pattern.getMeta().span);
+                    const tail = try ast_data.makeListFromSlice(self.allocator, store, frame.subject_tail);
+                    try temporary_values.adopt(tail);
+                    try stack.append(self.allocator, .{ .pattern = .{
+                        .pattern = frame.pattern,
+                        .subject = tail,
+                        .splice_kind = null,
+                    } });
+                },
+            }
+        }
+        return true;
+    }
+
+    fn pushMacroPatternFrames(
+        stack: *SmallInlineStack(MacroPatternFrame, MACRO_PATTERN_MATCH_INLINE_STACK_CAPACITY),
+        allocator: std.mem.Allocator,
+        patterns: []const *const ast.Pattern,
+        subjects: []const ctfe.CtValue,
+        splice_kind: ?ast.MacroSpliceKind,
+    ) std.mem.Allocator.Error!void {
+        std.debug.assert(patterns.len == subjects.len);
+        var index = patterns.len;
+        while (index > 0) {
+            index -= 1;
+            try stack.append(allocator, .{ .pattern = .{
+                .pattern = patterns[index],
+                .subject = subjects[index],
+                .splice_kind = splice_kind,
+            } });
+        }
+    }
+
+    fn consumeMacroPatternMatchStep(
+        self: *MacroEngine,
+        steps_remaining: *usize,
+        budget_limit: usize,
+        span: ast.SourceSpan,
+    ) !void {
+        if (steps_remaining.* > 0) {
+            steps_remaining.* -= 1;
+            return;
+        }
+
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "macro pattern matching exceeded structural budget ({d}); possible pathological macro pattern or input",
+                .{budget_limit},
+            ),
+            .span = span,
+        });
+        return error.MacroPatternMatchBudgetExceeded;
     }
 
     fn literalPatternMatches(self: *const MacroEngine, literal: ast.LiteralPattern, arg_ct: ctfe.CtValue) bool {
@@ -1991,46 +2626,92 @@ pub const MacroEngine = struct {
         };
     }
 
-    fn macroCtPatternMatches(self: *MacroEngine, pattern: ctfe.CtValue, subject: ctfe.CtValue) bool {
-        if (pattern == .tuple and pattern.tuple.elems.len == 3) {
-            const form = pattern.tuple.elems[0];
-            const args = pattern.tuple.elems[2];
+    fn macroCtPatternMatches(self: *MacroEngine, pattern: ctfe.CtValue, subject: ctfe.CtValue) !bool {
+        var steps_remaining = MACRO_PATTERN_MATCH_STEP_BUDGET;
+        return self.macroCtPatternMatchesWithBudget(
+            pattern,
+            subject,
+            &steps_remaining,
+            MACRO_PATTERN_MATCH_STEP_BUDGET,
+            .{ .start = 0, .end = 0 },
+        );
+    }
 
-            if (form == .atom and args == .nil) {
-                const name = form.atom;
-                if (std.mem.eql(u8, name, "_")) return true;
-                if (name.len > 0 and (name[0] == '_' or std.ascii.isLower(name[0]))) return true;
-                return literalFormMatchesSubject(form, subject);
-            }
+    fn macroCtPatternMatchesWithBudget(
+        self: *MacroEngine,
+        pattern: ctfe.CtValue,
+        subject: ctfe.CtValue,
+        steps_remaining: *usize,
+        budget_limit: usize,
+        diagnostic_span: ast.SourceSpan,
+    ) !bool {
+        var stack: SmallInlineStack(MacroCtPatternFrame, MACRO_PATTERN_MATCH_INLINE_STACK_CAPACITY) = .{};
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, .{ .pattern = pattern, .subject = subject });
 
-            if (form == .atom and std.mem.eql(u8, form.atom, "{}")) {
-                const subject_args = astNodeArgs(subject, "{}") orelse return false;
-                if (args != .list or args.list.elems.len != subject_args.len) return false;
-                for (args.list.elems, subject_args) |pattern_elem, subject_elem| {
-                    if (!self.macroCtPatternMatches(pattern_elem, subject_elem)) return false;
+        while (stack.len() != 0) {
+            const frame = stack.pop();
+            try self.consumeMacroPatternMatchStep(steps_remaining, budget_limit, diagnostic_span);
+            if (frame.pattern == .tuple and frame.pattern.tuple.elems.len == 3) {
+                const form = frame.pattern.tuple.elems[0];
+                const args = frame.pattern.tuple.elems[2];
+
+                if (form == .atom and args == .nil) {
+                    const name = form.atom;
+                    if (std.mem.eql(u8, name, "_")) continue;
+                    if (name.len > 0 and (name[0] == '_' or std.ascii.isLower(name[0]))) continue;
+                    if (!try literalFormMatchesSubject(form, frame.subject)) return false;
+                    continue;
                 }
-                return true;
+
+                if (form == .atom and std.mem.eql(u8, form.atom, "{}")) {
+                    const subject_args = astNodeArgs(frame.subject, "{}") orelse return false;
+                    if (args != .list or args.list.elems.len != subject_args.len) return false;
+                    try pushMacroCtPatternFrames(&stack, self.allocator, args.list.elems, subject_args);
+                    continue;
+                }
+
+                if (form == .atom and args == .list) {
+                    const subject_args = astNodeArgs(frame.subject, form.atom) orelse return false;
+                    if (args.list.elems.len != subject_args.len) return false;
+                    try pushMacroCtPatternFrames(&stack, self.allocator, args.list.elems, subject_args);
+                    continue;
+                }
             }
 
-            if (form == .atom and args == .list) {
-                const subject_args = astNodeArgs(subject, form.atom) orelse return false;
-                if (args.list.elems.len != subject_args.len) return false;
-                for (args.list.elems, subject_args) |pattern_elem, subject_elem| {
-                    if (!self.macroCtPatternMatches(pattern_elem, subject_elem)) return false;
-                }
-                return true;
+            if (frame.pattern == .list and frame.subject == .list) {
+                if (frame.pattern.list.elems.len != frame.subject.list.elems.len) return false;
+                try pushMacroCtPatternFrames(&stack, self.allocator, frame.pattern.list.elems, frame.subject.list.elems);
+                continue;
             }
+
+            if (frame.pattern == .tuple and frame.subject == .tuple) {
+                if (frame.pattern.tuple.elems.len != frame.subject.tuple.elems.len) return false;
+                try pushMacroCtPatternFrames(&stack, self.allocator, frame.pattern.tuple.elems, frame.subject.tuple.elems);
+                continue;
+            }
+
+            if (!try frame.pattern.eql(frame.subject)) return false;
         }
 
-        if (pattern == .list and subject == .list) {
-            if (pattern.list.elems.len != subject.list.elems.len) return false;
-            for (pattern.list.elems, subject.list.elems) |pattern_elem, subject_elem| {
-                if (!self.macroCtPatternMatches(pattern_elem, subject_elem)) return false;
-            }
-            return true;
-        }
+        return true;
+    }
 
-        return pattern.eql(subject);
+    fn pushMacroCtPatternFrames(
+        stack: *SmallInlineStack(MacroCtPatternFrame, MACRO_PATTERN_MATCH_INLINE_STACK_CAPACITY),
+        allocator: std.mem.Allocator,
+        patterns: []const ctfe.CtValue,
+        subjects: []const ctfe.CtValue,
+    ) std.mem.Allocator.Error!void {
+        std.debug.assert(patterns.len == subjects.len);
+        var index = patterns.len;
+        while (index > 0) {
+            index -= 1;
+            try stack.append(allocator, .{
+                .pattern = patterns[index],
+                .subject = subjects[index],
+            });
+        }
     }
 
     fn isConcreteTypePatternName(self: *const MacroEngine, name_id: ast.StringId) bool {
@@ -2063,7 +2744,7 @@ pub const MacroEngine = struct {
         return null;
     }
 
-    fn literalFormMatchesSubject(form: ctfe.CtValue, subject: ctfe.CtValue) bool {
+    fn literalFormMatchesSubject(form: ctfe.CtValue, subject: ctfe.CtValue) ctfe.ValueTraversalError!bool {
         return form.eql(unwrapAstLeaf(subject));
     }
 
@@ -2114,6 +2795,7 @@ pub const MacroEngine = struct {
         // preserved without needing a thread-local "current expansion"
         // stack.
         const expansion_info = try self.allocator.create(ast.ExpansionInfo);
+        errdefer self.allocator.destroy(expansion_info);
         expansion_info.* = .{
             .call_site = call.meta.span,
             .macro_name = name,
@@ -2143,8 +2825,8 @@ pub const MacroEngine = struct {
         if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
             const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
             if (body_expr.* == .quote_expr) {
-                const expanded = try self.expandQuoteHygienic(body_expr, call.args, clause.params, use_scope, intro_scope);
-                stampExpansionOnExpr(expanded, expansion_info);
+                const expanded = try self.expandQuoteHygienic(body_expr, call.args, clause.params, call.meta.span, use_scope, intro_scope);
+                try stampExpansionOnExpr(self.allocator, &self.errors, expanded, expansion_info, call.meta.span);
                 return expanded;
             }
         }
@@ -2168,35 +2850,18 @@ pub const MacroEngine = struct {
         // legacy macro evaluator. This path remains for macro families
         // whose provider structs have not yet been staged and compiled.
         {
-            const macro_eval = @import("macro_eval.zig");
-            var store = ctfe.AllocationStore{};
-            var env = macro_eval.Env.init(self.allocator, &store);
+            var temporary_values = MacroCtValueOwner.init(self.allocator);
+            defer temporary_values.deinit();
+            const store = temporary_values.storePtr();
+
+            var env = macro_eval_mod.Env.init(self.allocator, store);
             defer env.deinit();
-            env.compiled_program = self.compiledProgram();
-            // Wire struct context so struct attribute intrinsics can
-            // reach the scope graph and the current struct's
-            // StructEntry. Falls back to a noop if no struct is
-            // active (e.g., top-level macro calls).
-            env.struct_ctx = .{
-                .graph = self.graph,
-                .interner = self.interner,
+            self.configureSelectedMacroEnv(&env, .{
+                .family = family,
+                .clause_ref = clause_ref,
+                .call_span = call.meta.span,
                 .current_struct_scope = self.current_struct_scope,
-            };
-            // Narrow the evaluator's capability set to whatever the
-            // macro family declared via `@requires`. The body's calls
-            // to impure intrinsics (and to other macros) will be
-            // checked against this set. Macros without an annotation
-            // default to `pure_only` — so adding the first impure call
-            // surfaces an under-declaration error.
-            env.current_macro_caps = family.required_caps;
-            env.current_macro_name = self.interner.get(name);
-            env.current_macro_span = call.meta.span;
-            env.current_macro_source_path = blk: {
-                if (clause_ref.decl.meta.span.source_id) |source_id| {
-                    break :blk self.graph.sourcePathById(source_id);
-                }
-                break :blk null;
-            };
+            });
 
             // Bind macro parameters to CtValue representations of the
             // arguments. Each argument's identifiers are tagged with
@@ -2207,35 +2872,29 @@ pub const MacroEngine = struct {
                 if (i < call.args.len) {
                     if (param.pattern.* == .bind) {
                         const param_name = self.interner.get(param.pattern.bind.name);
-                        const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, &store, call.args[i]);
-                        const marked_arg = try ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope);
+                        const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, store, call.args[i]);
+                        try temporary_values.adopt(arg_ct);
+                        const marked_arg = try ast_data.addScopeToIdentifiers(self.allocator, store, arg_ct, use_scope);
+                        try temporary_values.adopt(marked_arg);
                         try env.bind(param_name, marked_arg);
                     }
                 }
             }
 
             // Convert body statements to CtValue and evaluate them.
-            // A capability_violation surfaces as `EvalFailed` with a
-            // diagnostic stashed in `env.last_capability_error`; turn
-            // that into a real macro engine error so the author sees
-            // an actionable message at the macro call site.
+            // Once this macro has been selected, any evaluator failure
+            // is a failed expansion. Returning the original call here
+            // would silently preserve broken macro code as a user call.
             var result: ctfe.CtValue = .nil;
-            var capability_failed = false;
             for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
-                const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt);
-                result = macro_eval.eval(&env, stmt_ct) catch blk: {
-                    if (env.last_capability_error) |msg| {
-                        try self.errors.append(self.allocator, .{
-                            .message = msg,
-                            .span = call.meta.span,
-                        });
-                        capability_failed = true;
-                    }
-                    break :blk .nil;
+                const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+                try temporary_values.adopt(stmt_ct);
+                result = macro_eval_mod.eval(&env, stmt_ct) catch |err| {
+                    try self.appendSelectedMacroEvaluationFailure(self.interner.get(name), call.meta.span, err, env.last_capability_error);
+                    return error.MacroExpansionFailed;
                 };
-                if (capability_failed) break;
+                try temporary_values.adopt(result);
             }
-            if (capability_failed) return expr;
 
             // The eval path treats `quote` as a lazy form — its args
             // are returned without recursing into them. That means
@@ -2250,9 +2909,12 @@ pub const MacroEngine = struct {
             // user-supplied identifiers shed the mark they came in
             // with while template identifiers acquire it.
             if (result != .nil) {
-                result = try ast_data.addScopeToIdentifiers(self.allocator, &store, result, intro_scope);
-                result = try self.substituteCtValue(result, &env.bindings, &store);
-                result = try ast_data.flipScopeOnIdentifiers(self.allocator, &store, result, use_scope);
+                result = try ast_data.addScopeToIdentifiers(self.allocator, store, result, intro_scope);
+                try temporary_values.adopt(result);
+                result = try self.substituteCtValue(result, &env.bindings, store, call.meta.span);
+                try temporary_values.adopt(result);
+                result = try ast_data.flipScopeOnIdentifiers(self.allocator, store, result, use_scope);
+                try temporary_values.adopt(result);
 
                 // `quote { single_expr }` produces a list with one
                 // element (the body's sole statement). The fast path
@@ -2270,8 +2932,8 @@ pub const MacroEngine = struct {
             if (result != .nil) {
                 // If the result is a function declaration form, register it in
                 // the scope graph so calls to the generated function can resolve.
-                const expanded = ast_data.ctValueToExpr(self.allocator, self.interner, result) catch return expr;
-                stampExpansionOnExpr(expanded, expansion_info);
+                const expanded = try self.ctValueToMacroExpr(result, call.meta.span);
+                try stampExpansionOnExpr(self.allocator, &self.errors, expanded, expansion_info, call.meta.span);
                 return expanded;
             }
         }
@@ -2293,14 +2955,21 @@ pub const MacroEngine = struct {
         const call = expr.call;
         const family = &self.graph.macro_families.items[macro_family_id];
 
-        var store = ctfe.AllocationStore{};
+        var temporary_values = MacroCtValueOwner.init(self.allocator);
+        defer temporary_values.deinit();
+        const store = temporary_values.storePtr();
+
         const compiled_args = try self.allocator.alloc(ctfe.CtValue, call.args.len);
+        defer self.allocator.free(compiled_args);
         for (call.args, 0..) |arg, index| {
-            const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, &store, arg);
-            compiled_args[index] = try ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope);
+            const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, store, arg);
+            try temporary_values.adopt(arg_ct);
+            const marked_arg = try ast_data.addScopeToIdentifiers(self.allocator, store, arg_ct, use_scope);
+            try temporary_values.adopt(marked_arg);
+            compiled_args[index] = marked_arg;
         }
 
-        var interpreter = ctfe.Interpreter.init(self.allocator, executor.program);
+        var interpreter = try ctfe.Interpreter.init(self.allocator, executor.program);
         defer interpreter.deinit();
         interpreter.scope_graph = self.graph;
         interpreter.interner = self.interner;
@@ -2311,12 +2980,7 @@ pub const MacroEngine = struct {
         var result = interpreter.evalFunction(function_id, compiled_args) catch |err| {
             if (interpreter.errors.items.len > 0) {
                 for (interpreter.errors.items) |ctfe_err| {
-                    const formatted = ctfe.formatCtfeError(self.allocator, ctfe_err) catch
-                        try std.fmt.allocPrint(self.allocator, "compiled macro CTFE failed: {s}", .{ctfe_err.message});
-                    try self.errors.append(self.allocator, .{
-                        .message = formatted,
-                        .span = call.meta.span,
-                    });
+                    try self.appendCompiledCtfeErrorDiagnostic(call.meta.span, ctfe_err);
                 }
             } else {
                 try self.errors.append(self.allocator, .{
@@ -2330,15 +2994,33 @@ pub const MacroEngine = struct {
             }
             return expr;
         };
+        var interpreter_result_values = TemporaryCtValueOwner.init(self.allocator, &interpreter.allocation_store);
+        defer interpreter_result_values.deinit();
+        try interpreter_result_values.adopt(result);
 
         if (result == .nil) return expr;
 
-        result = try ast_data.addScopeToIdentifiers(self.allocator, &store, result, intro_scope);
-        result = try ast_data.flipScopeOnIdentifiers(self.allocator, &store, result, use_scope);
+        result = try ast_data.addScopeToIdentifiers(self.allocator, store, result, intro_scope);
+        try temporary_values.adopt(result);
+        result = try ast_data.flipScopeOnIdentifiers(self.allocator, store, result, use_scope);
+        try temporary_values.adopt(result);
 
-        const expanded = ast_data.ctValueToExpr(self.allocator, self.interner, result) catch return expr;
-        stampExpansionOnExpr(expanded, expansion_info);
+        const expanded = try self.ctValueToMacroExpr(result, call.meta.span);
+        try stampExpansionOnExpr(self.allocator, &self.errors, expanded, expansion_info, call.meta.span);
         return expanded;
+    }
+
+    fn appendCompiledCtfeErrorDiagnostic(
+        self: *MacroEngine,
+        span: ast.SourceSpan,
+        ctfe_err: ctfe.CtfeError,
+    ) !void {
+        const formatted = try ctfe.formatCtfeError(self.allocator, ctfe_err);
+        errdefer self.allocator.free(formatted);
+        try self.errors.append(self.allocator, .{
+            .message = formatted,
+            .span = span,
+        });
     }
 
     // ============================================================
@@ -2353,7 +3035,7 @@ pub const MacroEngine = struct {
         // scope ids, this wrapper can shrink to a forwarder.
         const use_scope = try self.freshUseScope();
         const intro_scope = try self.graph.createScope(null, .macro_expansion);
-        return self.expandQuoteHygienic(quote_expr, args, params, use_scope, intro_scope);
+        return self.expandQuoteHygienic(quote_expr, args, params, quote_expr.quote_expr.meta.span, use_scope, intro_scope);
     }
 
     /// Hygiene-aware quote expansion. The caller supplies a fresh
@@ -2368,12 +3050,16 @@ pub const MacroEngine = struct {
         quote_expr: *const ast.Expr,
         args: []const *const ast.Expr,
         params: []const ast.Param,
+        diagnostic_span: ast.SourceSpan,
         use_scope: scope.ScopeId,
         intro_scope: scope.ScopeId,
     ) anyerror!*const ast.Expr {
         const quote = quote_expr.quote_expr;
 
         var store = ctfe.AllocationStore{};
+        defer store.deinit(self.allocator);
+        var temporary_values = TemporaryCtValueOwner.init(self.allocator, &store);
+        defer temporary_values.deinit();
 
         // Convert each statement in the quote body to CtValue, then
         // tag every identifier in the template with the macro-
@@ -2383,11 +3069,14 @@ pub const MacroEngine = struct {
         // result, only template identifiers carry the use_scope, so
         // resolution sees them as different bindings even when their
         // textual names collide.
-        var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
-        for (quote.body) |stmt| {
+        const body_vals = try self.allocator.alloc(ctfe.CtValue, quote.body.len);
+        defer self.allocator.free(body_vals);
+        for (quote.body, 0..) |stmt, index| {
             const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt);
+            try temporary_values.adopt(stmt_ct);
             const marked = try ast_data.addScopeToIdentifiers(self.allocator, &store, stmt_ct, intro_scope);
-            try body_vals.append(self.allocator, marked);
+            try temporary_values.adopt(marked);
+            body_vals[index] = marked;
         }
 
         // Build parameter name (string) → CtValue argument mapping.
@@ -2398,22 +3087,34 @@ pub const MacroEngine = struct {
         // had it, so the flip *adds* it for them.
         var param_map = std.StringHashMap(ctfe.CtValue).init(self.allocator);
         defer param_map.deinit();
+        var bound_param_count: usize = 0;
+        for (params, 0..) |param, i| {
+            if (i < args.len and param.pattern.* == .bind) {
+                bound_param_count += 1;
+            }
+        }
+        try param_map.ensureTotalCapacity(@intCast(bound_param_count));
 
         for (params, 0..) |param, i| {
             if (i < args.len) {
                 if (param.pattern.* == .bind) {
                     const name = self.interner.get(param.pattern.bind.name);
                     const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, &store, args[i]);
+                    try temporary_values.adopt(arg_ct);
                     const marked_arg = try ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope);
-                    try param_map.put(name, marked_arg);
+                    try temporary_values.adopt(marked_arg);
+                    param_map.putAssumeCapacity(name, marked_arg);
                 }
             }
         }
 
         // Substitute :unquote nodes in the CtValue tree.
-        var substituted_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
-        for (body_vals.items) |val| {
-            try substituted_vals.append(self.allocator, try self.substituteCtValue(val, &param_map, &store));
+        const substituted_vals = try self.allocator.alloc(ctfe.CtValue, body_vals.len);
+        defer self.allocator.free(substituted_vals);
+        for (body_vals, 0..) |val, index| {
+            const substituted = try self.substituteCtValue(val, &param_map, &store, diagnostic_span);
+            try temporary_values.adopt(substituted);
+            substituted_vals[index] = substituted;
         }
 
         // Flip the use_scope across the whole result. User-supplied
@@ -2421,27 +3122,30 @@ pub const MacroEngine = struct {
         // identifiers (which didn't) acquire it. After this flip,
         // template ids carry both intro_scope and use_scope while
         // user ids carry their original scope set unchanged.
-        var flipped_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
-        for (substituted_vals.items) |val| {
+        const flipped_vals = try self.allocator.alloc(ctfe.CtValue, substituted_vals.len);
+        defer self.allocator.free(flipped_vals);
+        for (substituted_vals, 0..) |val, index| {
             const flipped = try ast_data.flipScopeOnIdentifiers(self.allocator, &store, val, use_scope);
-            try flipped_vals.append(self.allocator, flipped);
+            try temporary_values.adopt(flipped);
+            flipped_vals[index] = flipped;
         }
 
         // Convert back to ast.Expr
-        if (flipped_vals.items.len == 1) {
-            return ast_data.ctValueToExpr(self.allocator, self.interner, flipped_vals.items[0]);
+        if (flipped_vals.len == 1) {
+            return try self.ctValueToMacroExpr(flipped_vals[0], diagnostic_span);
         }
 
         // Multiple statements → wrap in block
-        var stmts: std.ArrayListUnmanaged(ast.Stmt) = .empty;
-        for (flipped_vals.items) |val| {
-            const expr = try ast_data.ctValueToExpr(self.allocator, self.interner, val);
-            try stmts.append(self.allocator, .{ .expr = expr });
+        const stmts = try self.allocator.alloc(ast.Stmt, flipped_vals.len);
+        errdefer self.allocator.free(stmts);
+        for (flipped_vals, 0..) |val, index| {
+            const expr = try self.ctValueToMacroExpr(val, diagnostic_span);
+            stmts[index] = .{ .expr = expr };
         }
         return try self.create(ast.Expr, .{
             .block = .{
                 .meta = quote.meta,
-                .stmts = try stmts.toOwnedSlice(self.allocator),
+                .stmts = stmts,
             },
         });
     }
@@ -2453,107 +3157,270 @@ pub const MacroEngine = struct {
         value: ctfe.CtValue,
         param_map: *std.StringHashMap(ctfe.CtValue),
         store: *ctfe.AllocationStore,
+        diagnostic_span: ast.SourceSpan,
     ) anyerror!ctfe.CtValue {
-        // Check if this is an :unquote node: {atom("unquote"), meta, [inner]}
-        if (value == .tuple and value.tuple.elems.len == 3) {
-            const form = value.tuple.elems[0];
-            const args = value.tuple.elems[2];
+        return self.substituteCtValueWithBudget(
+            value,
+            param_map,
+            store,
+            diagnostic_span,
+            MACRO_CT_SUBSTITUTE_STEP_BUDGET,
+        );
+    }
 
-            if (form == .atom and std.mem.eql(u8, form.atom, "unquote")) {
-                if (args == .list and args.list.elems.len == 1) {
-                    const inner = args.list.elems[0];
-                    // If inner is a variable reference {:name, _, nil}, look up in param_map
-                    if (inner == .tuple and inner.tuple.elems.len == 3) {
-                        if (inner.tuple.elems[0] == .atom and inner.tuple.elems[2] == .nil) {
-                            const var_name = inner.tuple.elems[0].atom;
-                            if (param_map.get(var_name)) |replacement| {
-                                return replacement;
+    fn substituteCtValueWithBudget(
+        self: *MacroEngine,
+        value: ctfe.CtValue,
+        param_map: *std.StringHashMap(ctfe.CtValue),
+        store: *ctfe.AllocationStore,
+        diagnostic_span: ast.SourceSpan,
+        max_steps: usize,
+    ) anyerror!ctfe.CtValue {
+        var steps_remaining = max_steps;
+        var frames: SmallInlineStack(MacroCtSubstituteFrame, MACRO_CT_SUBSTITUTE_INLINE_STACK_CAPACITY) = .{};
+        defer frames.deinit(self.allocator);
+        var results: SmallInlineStack(MacroCtSubstituteResult, MACRO_CT_SUBSTITUTE_INLINE_STACK_CAPACITY) = .{};
+        defer results.deinit(self.allocator);
+        var created_values = TemporaryCtValueOwner.init(self.allocator, store);
+        defer created_values.deinitRootList();
+        errdefer created_values.deinitValues();
+
+        try frames.append(self.allocator, .{ .visit = value });
+        while (frames.len() != 0) {
+            switch (frames.pop()) {
+                .emit => |result| try results.append(self.allocator, result),
+                .visit => |current| {
+                    try self.consumeMacroCtSubstitutionStep(&steps_remaining, max_steps, diagnostic_span);
+
+                    if (substituteDirectUnquote(current, param_map)) |replacement| {
+                        try results.append(self.allocator, .{
+                            .value = replacement,
+                            .changed = true,
+                        });
+                        continue;
+                    }
+
+                    if (current == .tuple and current.tuple.elems.len == 3) {
+                        // Recurse into form and list args, but not meta. Recursing into
+                        // form is what makes `quote { unquote(name)() }` work.
+                        const args = current.tuple.elems[2];
+                        try frames.append(self.allocator, .{ .finish_tuple3 = .{
+                            .tuple = current.tuple,
+                            .args_was_list = args == .list,
+                        } });
+                        if (args == .list) {
+                            try frames.append(self.allocator, .{ .visit = args });
+                        }
+                        try frames.append(self.allocator, .{ .visit = current.tuple.elems[0] });
+                        continue;
+                    }
+
+                    if (current == .tuple and current.tuple.elems.len == 2) {
+                        try frames.append(self.allocator, .{ .finish_tuple2 = current.tuple });
+                        try frames.append(self.allocator, .{ .visit = current.tuple.elems[1] });
+                        continue;
+                    }
+
+                    if (current == .list) {
+                        var output_count: usize = 0;
+                        var forced_changed = false;
+                        for (current.list.elems) |elem| {
+                            if (substituteDirectUnquoteSplicing(elem, param_map)) |spliced| {
+                                forced_changed = true;
+                                output_count += spliced.len;
+                            } else {
+                                output_count += 1;
                             }
                         }
-                    }
-                    // Not a param reference — return the inner value as-is
-                    return inner;
-                }
-            }
 
-            // Recurse into all three positions: form, meta, args.
-            //
-            // Recursing into form is what makes `quote { unquote(name)() }`
-            // work — the outer call's form slot holds the unquote 3-tuple
-            // `{:unquote, [], [name_var]}`, and substituting it replaces
-            // the whole form with the bound value (typically an atom),
-            // turning the call into `name(...)`. Without this, unquote in
-            // callee position silently decays to a literal call to a
-            // function actually named `"unquote"`.
-            //
-            // For ordinary calls like `{:foo, [], [arg]}` the form is a
-            // bare atom; recursion bottoms out at the leaf-value branch
-            // below, returning the atom unchanged.
-            const new_form = try self.substituteCtValue(value.tuple.elems[0], param_map, store);
-            const new_args = if (args == .list) blk: {
-                var new_elems = try self.allocator.alloc(ctfe.CtValue, args.list.elems.len);
-                for (args.list.elems, 0..) |elem, i| {
-                    new_elems[i] = try self.substituteCtValue(elem, param_map, store);
-                }
-                const id = store.alloc(self.allocator, .list, null);
-                break :blk ctfe.CtValue{ .list = .{ .alloc_id = id, .elems = new_elems } };
-            } else args;
+                        try frames.append(self.allocator, .{ .finish_list = .{
+                            .list = current.list,
+                            .output_count = output_count,
+                            .forced_changed = forced_changed,
+                        } });
 
-            const new_tuple = try self.allocator.alloc(ctfe.CtValue, 3);
-            new_tuple[0] = new_form;
-            new_tuple[1] = value.tuple.elems[1]; // meta stays — line/col annotations
-            new_tuple[2] = new_args;
-            const id = store.alloc(self.allocator, .tuple, null);
-            return ctfe.CtValue{ .tuple = .{ .alloc_id = id, .elems = new_tuple } };
-        }
-
-        // Recurse into 2-tuples (keyword pairs like {:do, value})
-        if (value == .tuple and value.tuple.elems.len == 2) {
-            const new_elems = try self.allocator.alloc(ctfe.CtValue, 2);
-            new_elems[0] = value.tuple.elems[0]; // key stays
-            new_elems[1] = try self.substituteCtValue(value.tuple.elems[1], param_map, store);
-            const id = store.alloc(self.allocator, .tuple, null);
-            return ctfe.CtValue{ .tuple = .{ .alloc_id = id, .elems = new_elems } };
-        }
-
-        // Recurse into bare lists — with unquote_splicing support
-        if (value == .list) {
-            var result_elems: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
-            var changed = false;
-            for (value.list.elems) |elem| {
-                // Check for unquote_splicing: {:unquote_splicing, _, [list_expr]}
-                if (elem == .tuple and elem.tuple.elems.len == 3) {
-                    if (elem.tuple.elems[0] == .atom and std.mem.eql(u8, elem.tuple.elems[0].atom, "unquote_splicing")) {
-                        if (elem.tuple.elems[2] == .list and elem.tuple.elems[2].list.elems.len == 1) {
-                            const inner = elem.tuple.elems[2].list.elems[0];
-                            // If inner is a variable, look up in param_map
-                            if (inner == .tuple and inner.tuple.elems.len == 3 and inner.tuple.elems[0] == .atom and inner.tuple.elems[2] == .nil) {
-                                if (param_map.get(inner.tuple.elems[0].atom)) |replacement| {
-                                    // Splice the replacement list into our result
-                                    if (replacement == .list) {
-                                        for (replacement.list.elems) |splice_elem| {
-                                            try result_elems.append(self.allocator, splice_elem);
-                                        }
-                                        changed = true;
-                                        continue;
-                                    }
+                        var index = current.list.elems.len;
+                        while (index > 0) {
+                            index -= 1;
+                            const elem = current.list.elems[index];
+                            if (substituteDirectUnquoteSplicing(elem, param_map)) |spliced| {
+                                var splice_index = spliced.len;
+                                while (splice_index > 0) {
+                                    splice_index -= 1;
+                                    try frames.append(self.allocator, .{ .emit = .{
+                                        .value = spliced[splice_index],
+                                        .changed = false,
+                                    } });
                                 }
+                                continue;
                             }
+
+                            try frames.append(self.allocator, .{ .visit = elem });
                         }
+                        continue;
                     }
-                }
-                const substituted = try self.substituteCtValue(elem, param_map, store);
-                if (!substituted.eql(elem)) changed = true;
-                try result_elems.append(self.allocator, substituted);
+
+                    try results.append(self.allocator, .{ .value = current, .changed = false });
+                },
+                .finish_tuple3 => |finish| {
+                    const transformed_args = if (finish.args_was_list) results.pop() else null;
+                    const transformed_form = results.pop();
+                    const args = if (transformed_args) |result| result.value else finish.tuple.elems[2];
+                    const changed = transformed_form.changed or if (transformed_args) |result| result.changed else false;
+                    if (!changed) {
+                        try results.append(self.allocator, .{
+                            .value = .{ .tuple = finish.tuple },
+                            .changed = false,
+                        });
+                        continue;
+                    }
+
+                    const new_tuple = try self.allocator.alloc(ctfe.CtValue, 3);
+                    var new_tuple_transferred = false;
+                    errdefer if (!new_tuple_transferred) self.allocator.free(new_tuple);
+                    new_tuple[0] = transformed_form.value;
+                    new_tuple[1] = finish.tuple.elems[1];
+                    new_tuple[2] = args;
+                    const id = try store.alloc(self.allocator, .tuple, null);
+                    const transformed = ctfe.CtValue{ .tuple = .{ .alloc_id = id, .elems = new_tuple } };
+                    new_tuple_transferred = true;
+                    try created_values.adopt(transformed);
+                    try results.append(self.allocator, .{
+                        .value = transformed,
+                        .changed = changed,
+                    });
+                },
+                .finish_tuple2 => |tuple| {
+                    const transformed_value = results.pop();
+                    if (!transformed_value.changed) {
+                        try results.append(self.allocator, .{
+                            .value = .{ .tuple = tuple },
+                            .changed = false,
+                        });
+                        continue;
+                    }
+
+                    const new_elems = try self.allocator.alloc(ctfe.CtValue, 2);
+                    var new_elems_transferred = false;
+                    errdefer if (!new_elems_transferred) self.allocator.free(new_elems);
+                    new_elems[0] = tuple.elems[0];
+                    new_elems[1] = transformed_value.value;
+                    const id = try store.alloc(self.allocator, .tuple, null);
+                    const transformed = ctfe.CtValue{ .tuple = .{ .alloc_id = id, .elems = new_elems } };
+                    new_elems_transferred = true;
+                    try created_values.adopt(transformed);
+                    try results.append(self.allocator, .{
+                        .value = transformed,
+                        .changed = transformed_value.changed,
+                    });
+                },
+                .finish_list => |finish| {
+                    var reversed_values: SmallInlineStack(ctfe.CtValue, MACRO_CT_SUBSTITUTE_INLINE_STACK_CAPACITY) = .{};
+                    defer reversed_values.deinit(self.allocator);
+
+                    var changed = finish.forced_changed or finish.output_count != finish.list.elems.len;
+                    var remaining = finish.output_count;
+                    while (remaining > 0) {
+                        remaining -= 1;
+                        const result = results.pop();
+                        if (result.changed) changed = true;
+                        try reversed_values.append(self.allocator, result.value);
+                    }
+
+                    if (!changed) {
+                        try results.append(self.allocator, .{
+                            .value = .{ .list = finish.list },
+                            .changed = false,
+                        });
+                        continue;
+                    }
+
+                    const new_elems = try self.allocator.alloc(ctfe.CtValue, finish.output_count);
+                    var new_elems_transferred = false;
+                    errdefer if (!new_elems_transferred) self.allocator.free(new_elems);
+                    var output_index: usize = 0;
+                    while (reversed_values.len() != 0) {
+                        new_elems[output_index] = reversed_values.pop();
+                        output_index += 1;
+                    }
+                    const id = try store.alloc(self.allocator, .list, null);
+                    const transformed = ctfe.CtValue{ .list = .{ .alloc_id = id, .elems = new_elems } };
+                    new_elems_transferred = true;
+                    try created_values.adopt(transformed);
+                    try results.append(self.allocator, .{
+                        .value = transformed,
+                        .changed = changed,
+                    });
+                },
             }
-            if (!changed) return value;
-            const new_elems = try result_elems.toOwnedSlice(self.allocator);
-            const id = store.alloc(self.allocator, .list, null);
-            return ctfe.CtValue{ .list = .{ .alloc_id = id, .elems = new_elems } };
         }
 
-        // Leaf values — no substitution
-        return value;
+        std.debug.assert(results.len() == 1);
+        return results.pop().value;
+    }
+
+    fn consumeMacroCtSubstitutionStep(
+        self: *MacroEngine,
+        steps_remaining: *usize,
+        budget_limit: usize,
+        span: ast.SourceSpan,
+    ) !void {
+        if (steps_remaining.* > 0) {
+            steps_remaining.* -= 1;
+            return;
+        }
+
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "macro quote substitution exceeded structural budget ({d}); possible pathological macro output",
+                .{budget_limit},
+            ),
+            .span = span,
+        });
+        return error.MacroCtSubstitutionBudgetExceeded;
+    }
+
+    fn substituteDirectUnquote(
+        value: ctfe.CtValue,
+        param_map: *std.StringHashMap(ctfe.CtValue),
+    ) ?ctfe.CtValue {
+        if (value != .tuple or value.tuple.elems.len != 3) return null;
+        const form = value.tuple.elems[0];
+        const args = value.tuple.elems[2];
+        if (form != .atom or !std.mem.eql(u8, form.atom, "unquote")) return null;
+        if (args != .list or args.list.elems.len != 1) return null;
+
+        const inner = args.list.elems[0];
+        if (inner == .tuple and inner.tuple.elems.len == 3 and
+            inner.tuple.elems[0] == .atom and inner.tuple.elems[2] == .nil)
+        {
+            if (param_map.get(inner.tuple.elems[0].atom)) |replacement| {
+                return replacement;
+            }
+        }
+        return inner;
+    }
+
+    fn substituteDirectUnquoteSplicing(
+        value: ctfe.CtValue,
+        param_map: *std.StringHashMap(ctfe.CtValue),
+    ) ?[]const ctfe.CtValue {
+        if (value != .tuple or value.tuple.elems.len != 3) return null;
+        const form = value.tuple.elems[0];
+        const args = value.tuple.elems[2];
+        if (form != .atom or !std.mem.eql(u8, form.atom, "unquote_splicing")) return null;
+        if (args != .list or args.list.elems.len != 1) return null;
+
+        const inner = args.list.elems[0];
+        if (inner == .tuple and inner.tuple.elems.len == 3 and
+            inner.tuple.elems[0] == .atom and inner.tuple.elems[2] == .nil)
+        {
+            if (param_map.get(inner.tuple.elems[0].atom)) |replacement| {
+                if (replacement == .list) return replacement.list.elems;
+            }
+        }
+        return null;
     }
 
     // ============================================================
@@ -2782,7 +3649,7 @@ pub const MacroEngine = struct {
         args: []const *const ast.Expr,
         meta: ast.NodeMeta,
     ) !?*const ast.Expr {
-        const name_id = self.interner.intern(op_name) catch return null;
+        const name_id = try self.interner.intern(op_name);
         if (self.findFunction(name_id, @intCast(args.len)) == null) return null;
 
         const callee = try self.create(ast.Expr, .{ .var_ref = .{ .meta = meta, .name = name_id } });
@@ -2803,13 +3670,19 @@ pub const MacroEngine = struct {
         lhs: *const ast.Expr,
         rhs: *const ast.Expr,
         meta: ast.NodeMeta,
-    ) ?*const ast.Expr {
-        const name_id = self.interner.intern(macro_name) catch return null;
+    ) !?*const ast.Expr {
+        const name_id = try self.interner.intern(macro_name);
         const macro_id = self.findMacro(name_id, 2) orelse return null;
 
         const family = &self.graph.macro_families.items[macro_id];
-        if (family.clauses.items.len == 0) return null;
-        self.recordMacroExpansion(macro_id) catch return null;
+        if (family.clauses.items.len == 0) {
+            try self.errors.append(self.allocator, .{
+                .message = "macro has no clauses",
+                .span = meta.span,
+            });
+            return error.MacroExpansionFailed;
+        }
+        try self.recordMacroExpansion(macro_id);
 
         const clause_ref = family.clauses.items[0];
         const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
@@ -2838,10 +3711,13 @@ pub const MacroEngine = struct {
         }
 
         // Non-identity macro — convert args to CtValue, expand through template or evaluator
-        var store = ctfe.AllocationStore{};
-        const lhs_ct = ast_data.exprToCtValue(self.allocator, self.interner, &store, lhs) catch return null;
-        const rhs_ct = ast_data.exprToCtValue(self.allocator, self.interner, &store, rhs) catch return null;
-        _ = meta;
+        var temporary_values = MacroCtValueOwner.init(self.allocator);
+        defer temporary_values.deinit();
+        const store = temporary_values.storePtr();
+        const lhs_ct = try ast_data.exprToCtValue(self.allocator, self.interner, store, lhs);
+        try temporary_values.adopt(lhs_ct);
+        const rhs_ct = try ast_data.exprToCtValue(self.allocator, self.interner, store, rhs);
+        try temporary_values.adopt(rhs_ct);
 
         if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
             const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
@@ -2850,50 +3726,62 @@ pub const MacroEngine = struct {
                 var param_map = std.StringHashMap(ctfe.CtValue).init(self.allocator);
                 defer param_map.deinit();
                 if (clause.params.len >= 1 and clause.params[0].pattern.* == .bind) {
-                    param_map.put(self.interner.get(clause.params[0].pattern.bind.name), lhs_ct) catch return null;
+                    try param_map.put(self.interner.get(clause.params[0].pattern.bind.name), lhs_ct);
                 }
                 if (clause.params.len >= 2 and clause.params[1].pattern.* == .bind) {
-                    param_map.put(self.interner.get(clause.params[1].pattern.bind.name), rhs_ct) catch return null;
+                    try param_map.put(self.interner.get(clause.params[1].pattern.bind.name), rhs_ct);
                 }
 
                 var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+                defer body_vals.deinit(self.allocator);
                 for (body_expr.quote_expr.body) |stmt| {
-                    const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
-                    body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
+                    const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+                    try temporary_values.adopt(stmt_ct);
+                    const substituted = try self.substituteCtValue(stmt_ct, &param_map, store, meta.span);
+                    try temporary_values.adopt(substituted);
+                    try body_vals.append(self.allocator, substituted);
                 }
 
                 if (body_vals.items.len == 1) {
-                    const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                    return ast_data.ctValueToExpr(self.allocator, interner_mut, body_vals.items[0]) catch null;
+                    return try self.ctValueToMacroExpr(body_vals.items[0], meta.span);
                 }
             }
         }
 
         // Non-template macro body — evaluate through CTFE evaluator
         {
-            const macro_eval = @import("macro_eval.zig");
-            var env = macro_eval.Env.init(self.allocator, &store);
+            var env = macro_eval_mod.Env.init(self.allocator, store);
             defer env.deinit();
-            env.compiled_program = self.compiledProgram();
+            self.configureSelectedMacroEnv(&env, .{
+                .family = family,
+                .clause_ref = clause_ref,
+                .call_span = meta.span,
+                .current_struct_scope = self.current_struct_scope,
+                .macro_name = macro_name,
+            });
 
             // Bind params to CtValue arg representations
             if (clause.params.len >= 1 and clause.params[0].pattern.* == .bind) {
-                env.bind(self.interner.get(clause.params[0].pattern.bind.name), lhs_ct) catch return null;
+                try env.bind(self.interner.get(clause.params[0].pattern.bind.name), lhs_ct);
             }
             if (clause.params.len >= 2 and clause.params[1].pattern.* == .bind) {
-                env.bind(self.interner.get(clause.params[1].pattern.bind.name), rhs_ct) catch return null;
+                try env.bind(self.interner.get(clause.params[1].pattern.bind.name), rhs_ct);
             }
 
             // Evaluate the macro body
             var result: ctfe.CtValue = .nil;
             for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
-                const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
-                result = macro_eval.eval(&env, stmt_ct) catch return null;
+                const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+                try temporary_values.adopt(stmt_ct);
+                result = macro_eval_mod.eval(&env, stmt_ct) catch |err| {
+                    try self.appendSelectedMacroEvaluationFailure(macro_name, meta.span, err, env.last_capability_error);
+                    return error.MacroExpansionFailed;
+                };
+                try temporary_values.adopt(result);
             }
 
             if (result != .nil) {
-                const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                return ast_data.ctValueToExpr(self.allocator, interner_mut, result) catch null;
+                return try self.ctValueToMacroExpr(result, meta.span);
             }
         }
 
@@ -2930,32 +3818,109 @@ pub const MacroEngine = struct {
         return mi;
     }
 
-    /// Recursively flatten nested `__block__` AST nodes into a flat
-    /// list of CtValues. A macro that composes other macros (e.g.
-    /// `describe` emitting a `test()` call which itself returns a
-    /// `__block__` of [fn_decl, tracking_call]) produces nested
-    /// blocks; without flattening, the inner blocks survive as
-    /// opaque expressions at struct scope and the per-element
-    /// struct-item conversion never sees the underlying decls.
+    fn structItemSpan(item: ast.StructItem) ast.SourceSpan {
+        return switch (item) {
+            .type_decl => |decl| decl.meta.span,
+            .opaque_decl => |decl| decl.meta.span,
+            .struct_decl => |decl| decl.meta.span,
+            .union_decl => |decl| decl.meta.span,
+            .function => |decl| decl.meta.span,
+            .priv_function => |decl| decl.meta.span,
+            .macro => |decl| decl.meta.span,
+            .priv_macro => |decl| decl.meta.span,
+            .alias_decl => |decl| decl.meta.span,
+            .import_decl => |decl| decl.meta.span,
+            .use_decl => |decl| decl.meta.span,
+            .attribute => |decl| decl.meta.span,
+            .struct_level_expr => |expr| expr.getMeta().span,
+        };
+    }
+
+    /// Flatten nested `__block__` AST nodes into a flat list of CtValues.
+    /// A macro that composes other macros (e.g. `describe` emitting a
+    /// `test()` call which itself returns a `__block__` of [fn_decl,
+    /// tracking_call]) produces nested blocks; without flattening, the
+    /// inner blocks survive as opaque expressions at struct scope and the
+    /// per-element struct-item conversion never sees the underlying decls.
     fn flattenNestedBlocks(
         self: *MacroEngine,
         value: ctfe.CtValue,
         out: *std.ArrayList(ctfe.CtValue),
-    ) std.mem.Allocator.Error!void {
-        if (value != .tuple or value.tuple.elems.len != 3) {
-            try out.append(self.allocator, value);
-            return;
-        }
-        const form = value.tuple.elems[0];
-        if (form != .atom or !std.mem.eql(u8, form.atom, "__block__")) {
-            try out.append(self.allocator, value);
-            return;
-        }
-        if (value.tuple.elems[2] == .list) {
-            for (value.tuple.elems[2].list.elems) |elem| {
-                try self.flattenNestedBlocks(elem, out);
+        span: ast.SourceSpan,
+    ) !void {
+        try self.flattenNestedBlocksWithBudget(
+            value,
+            out,
+            span,
+            MACRO_RESULT_FLATTEN_STEP_BUDGET,
+        );
+    }
+
+    fn flattenNestedBlocksWithBudget(
+        self: *MacroEngine,
+        value: ctfe.CtValue,
+        out: *std.ArrayList(ctfe.CtValue),
+        span: ast.SourceSpan,
+        max_steps: usize,
+    ) !void {
+        var steps_remaining = max_steps;
+        var stack: SmallInlineStack(ctfe.CtValue, MACRO_RESULT_FLATTEN_INLINE_STACK_CAPACITY) = .{};
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, value);
+
+        while (stack.len() != 0) {
+            try self.consumeMacroResultFlattenStep(&steps_remaining, max_steps, span);
+            const current = stack.pop();
+
+            if (current != .tuple or current.tuple.elems.len != 3) {
+                try out.append(self.allocator, current);
+                continue;
+            }
+
+            const form = current.tuple.elems[0];
+            if (form != .atom or !std.mem.eql(u8, form.atom, "__block__")) {
+                try out.append(self.allocator, current);
+                continue;
+            }
+
+            const block_body = current.tuple.elems[2];
+            if (block_body != .list) {
+                try self.reportMalformedMacroStructure(
+                    "__block__",
+                    span,
+                    "expected block body to be a list",
+                );
+                unreachable;
+            }
+
+            var index = block_body.list.elems.len;
+            while (index > 0) {
+                index -= 1;
+                try stack.append(self.allocator, block_body.list.elems[index]);
             }
         }
+    }
+
+    fn consumeMacroResultFlattenStep(
+        self: *MacroEngine,
+        steps_remaining: *usize,
+        budget_limit: usize,
+        span: ast.SourceSpan,
+    ) !void {
+        if (steps_remaining.* > 0) {
+            steps_remaining.* -= 1;
+            return;
+        }
+
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "macro expansion __block__ flattening exceeded structural budget ({d}); possible pathological macro output",
+                .{budget_limit},
+            ),
+            .span = span,
+        });
+        return error.MacroResultFlattenBudgetExceeded;
     }
 
     fn expandStructLevelExpr(self: *MacroEngine, expr: *const ast.Expr) !ExpandedStructItems {
@@ -2974,102 +3939,96 @@ pub const MacroEngine = struct {
                     // Allocate Flatt-2016 hygiene scopes for this
                     // expansion. See `expandMacroCall` for the full
                     // rationale; this struct-level path mirrors it.
-                    const use_scope = self.freshUseScope() catch {
-                        const expanded = try self.expandExpr(expr);
-                        const items = try self.allocator.alloc(ast.StructItem, 1);
-                        items[0] = .{ .struct_level_expr = expanded.expr };
-                        return .{ .items = items, .changed = expanded.changed };
-                    };
-                    const intro_scope = self.introScopeFor(macro_family_id) catch {
-                        const expanded = try self.expandExpr(expr);
-                        const items = try self.allocator.alloc(ast.StructItem, 1);
-                        items[0] = .{ .struct_level_expr = expanded.expr };
-                        return .{ .items = items, .changed = expanded.changed };
-                    };
+                    const use_scope = try self.freshUseScope();
+                    const intro_scope = try self.introScopeFor(macro_family_id);
 
                     // Evaluate the macro and get the CtValue result
-                    const result_ct = self.evaluateMacroBodyToCtValue(
+                    var evaluation = try self.evaluateMacroBodyToCtValue(
+                        family,
+                        clause_ref,
                         clause,
                         expr.call.args,
                         use_scope,
                         intro_scope,
-                    ) orelse {
-                        // Macro evaluation failed — keep as expression
-                        const expanded = try self.expandExpr(expr);
-                        const items = try self.allocator.alloc(ast.StructItem, 1);
-                        items[0] = .{ .struct_level_expr = expanded.expr };
-                        return .{ .items = items, .changed = expanded.changed };
+                        self.interner.get(name),
+                        expr.call.meta.span,
+                    );
+                    defer evaluation.deinit();
+                    const result_ct = switch (evaluation) {
+                        .value => |*owned_value| owned_value.value,
+                        .no_output => {
+                            // Intentional no-output macro - keep as expression.
+                            const expanded = try self.expandExpr(expr);
+                            const items = try self.allocator.alloc(ast.StructItem, 1);
+                            items[0] = .{ .struct_level_expr = expanded.expr };
+                            return .{ .items = items, .changed = expanded.changed };
+                        },
                     };
 
                     // Try converting the result to struct items.
                     // Patch source spans so generated declarations inherit the call site's
                     // position — this ensures the scope collector associates them with the
                     // correct struct scope (not the default prelude scope).
-                    const interner_mut: *ast.StringInterner = @constCast(self.interner);
                     const call_span = expr.call.meta.span;
 
                     // Single struct item (e.g., function declaration)
-                    if (ast_data.ctValueToStructItem(self.allocator, interner_mut, result_ct) catch null) |mi| {
+                    if (try self.ctValueToMacroStructItem(result_ct, call_span)) |mi| {
                         const items = try self.allocator.alloc(ast.StructItem, 1);
                         items[0] = patchStructItemSpan(mi, call_span);
                         return .{ .items = items, .changed = true };
                     }
 
                     // Block of struct items (e.g., describe expanding to multiple functions).
-                    // Recursively flatten nested __block__ tuples first so a macro that
+                    // Iteratively flatten nested __block__ tuples first so a macro that
                     // composes other macros (each of which returns its own __block__)
                     // produces a flat list of struct items instead of opaque inner blocks
                     // surviving as struct_level_exprs.
                     if (result_ct == .tuple and result_ct.tuple.elems.len == 3) {
                         if (result_ct.tuple.elems[0] == .atom) {
                             if (std.mem.eql(u8, result_ct.tuple.elems[0].atom, "__block__")) {
-                                if (result_ct.tuple.elems[2] == .list) {
-                                    var flattened: std.ArrayList(ctfe.CtValue) = .empty;
-                                    defer flattened.deinit(self.allocator);
-                                    for (result_ct.tuple.elems[2].list.elems) |elem| {
-                                        try self.flattenNestedBlocks(elem, &flattened);
-                                    }
+                                var flattened: std.ArrayList(ctfe.CtValue) = .empty;
+                                defer flattened.deinit(self.allocator);
+                                try self.flattenNestedBlocks(result_ct, &flattened, call_span);
 
-                                    // Check if ALL elements are struct items. If any element
-                                    // is not a struct item (e.g., an assignment like ctx = 42),
-                                    // keep the entire block as a single struct_level_expr to
-                                    // preserve variable bindings and control flow.
-                                    var all_struct_items = true;
-                                    for (flattened.items) |elem| {
-                                        if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |_| {
-                                            // is a struct item
-                                        } else {
-                                            all_struct_items = false;
-                                            break;
-                                        }
-                                    }
-
-                                    if (all_struct_items) {
-                                        var items: std.ArrayList(ast.StructItem) = .empty;
-                                        for (flattened.items) |elem| {
-                                            if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem) catch null) |mi| {
-                                                try items.append(self.allocator, patchStructItemSpan(mi, call_span));
-                                            }
-                                        }
-                                        if (items.items.len > 0) {
-                                            return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
-                                        }
+                                // Check if ALL elements are struct items. If any element
+                                // is not a struct item (e.g., an assignment like ctx = 42),
+                                // keep the entire block as a single struct_level_expr to
+                                // preserve variable bindings and control flow.
+                                var all_struct_items = true;
+                                for (flattened.items) |elem| {
+                                    if (try self.ctValueToMacroStructItem(elem, call_span)) |_| {
+                                        // is a struct item
                                     } else {
-                                        // Mixed content: extract each element individually.
-                                        // Function declarations → StructItem::function
-                                        // Expressions → StructItem::struct_level_expr
-                                        var items: std.ArrayList(ast.StructItem) = .empty;
-                                        for (flattened.items) |elem_expr| {
-                                            if (ast_data.ctValueToStructItem(self.allocator, interner_mut, elem_expr) catch null) |mi| {
-                                                try items.append(self.allocator, patchStructItemSpan(mi, call_span));
-                                            } else {
-                                                const converted = ast_data.ctValueToExpr(self.allocator, self.interner, elem_expr) catch continue;
-                                                try items.append(self.allocator, .{ .struct_level_expr = converted });
-                                            }
+                                        all_struct_items = false;
+                                        break;
+                                    }
+                                }
+
+                                if (all_struct_items) {
+                                    var items: std.ArrayList(ast.StructItem) = .empty;
+                                    for (flattened.items) |elem| {
+                                        if (try self.ctValueToMacroStructItem(elem, call_span)) |mi| {
+                                            try items.append(self.allocator, patchStructItemSpan(mi, call_span));
                                         }
-                                        if (items.items.len > 0) {
-                                            return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
+                                    }
+                                    if (items.items.len > 0) {
+                                        return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
+                                    }
+                                } else {
+                                    // Mixed content: extract each element individually.
+                                    // Function declarations → StructItem::function
+                                    // Expressions → StructItem::struct_level_expr
+                                    var items: std.ArrayList(ast.StructItem) = .empty;
+                                    for (flattened.items) |elem_expr| {
+                                        if (try self.ctValueToMacroStructItem(elem_expr, call_span)) |mi| {
+                                            try items.append(self.allocator, patchStructItemSpan(mi, call_span));
+                                        } else {
+                                            const converted = try self.ctValueToMacroExpr(elem_expr, call_span);
+                                            try items.append(self.allocator, .{ .struct_level_expr = converted });
                                         }
+                                    }
+                                    if (items.items.len > 0) {
+                                        return .{ .items = try items.toOwnedSlice(self.allocator), .changed = true };
                                     }
                                 }
                             }
@@ -3080,10 +4039,10 @@ pub const MacroEngine = struct {
                     if (result_ct == .list) {
                         var items: std.ArrayList(ast.StructItem) = .empty;
                         for (result_ct.list.elems) |list_elem| {
-                            if (ast_data.ctValueToStructItem(self.allocator, interner_mut, list_elem) catch null) |mi| {
+                            if (try self.ctValueToMacroStructItem(list_elem, call_span)) |mi| {
                                 try items.append(self.allocator, patchStructItemSpan(mi, call_span));
                             } else {
-                                const list_expr = ast_data.ctValueToExpr(self.allocator, self.interner, list_elem) catch continue;
+                                const list_expr = try self.ctValueToMacroExpr(list_elem, call_span);
                                 try items.append(self.allocator, .{ .struct_level_expr = list_expr });
                             }
                         }
@@ -3093,11 +4052,7 @@ pub const MacroEngine = struct {
                     }
 
                     // Not a struct item — convert to expression and keep as struct_level_expr
-                    const result_expr = ast_data.ctValueToExpr(self.allocator, self.interner, result_ct) catch {
-                        const items = try self.allocator.alloc(ast.StructItem, 1);
-                        items[0] = .{ .struct_level_expr = expr };
-                        return .{ .items = items, .changed = false };
-                    };
+                    const result_expr = try self.ctValueToMacroExpr(result_ct, call_span);
                     const items = try self.allocator.alloc(ast.StructItem, 1);
                     items[0] = .{ .struct_level_expr = result_expr };
                     return .{ .items = items, .changed = true };
@@ -3112,23 +4067,32 @@ pub const MacroEngine = struct {
         return .{ .items = items, .changed = expanded.changed };
     }
 
-    /// Evaluate a macro's body given its clause and arguments, returning the
-    /// raw CtValue result. Returns null if evaluation fails.
+    /// Evaluate a selected macro's body given its clause and arguments.
+    /// Returns `.no_output` only for an intentional nil/empty body; hard
+    /// evaluator or CtValue conversion failures are reported and returned
+    /// as errors so callers do not mistake them for "no macro expanded".
     /// `use_scope` is a fresh per-call scope added to user-supplied
     /// argument identifiers and flipped on the result; `intro_scope`
     /// is the per-family macro-introduction scope added to template
     /// identifiers. See `expandMacroCall` for the full algorithm.
     fn evaluateMacroBodyToCtValue(
         self: *MacroEngine,
+        family: *const scope.MacroFamily,
+        clause_ref: scope.FunctionClauseRef,
         clause: *const ast.FunctionClause,
         args: []const *const ast.Expr,
         use_scope: scope.ScopeId,
         intro_scope: scope.ScopeId,
-    ) ?ctfe.CtValue {
-        var store = ctfe.AllocationStore{};
+        macro_name: []const u8,
+        call_span: ast.SourceSpan,
+    ) !MacroBodyEvaluation {
+        var temporary_values = MacroCtValueOwner.init(self.allocator);
+        var temporary_values_transferred = false;
+        defer if (!temporary_values_transferred) temporary_values.deinit();
+        const store = temporary_values.storePtr();
 
-        // Fast path: bare quote body → template expansion returning CtValue
-        const clause_body = clause.body orelse return null;
+        // Fast path: bare quote body -> template expansion returning CtValue.
+        const clause_body = clause.body orelse return .no_output;
         if (clause_body.len == 1 and clause_body[0] == .expr) {
             const body_expr = clause_body[0].expr;
             if (body_expr.* == .quote_expr) {
@@ -3138,70 +4102,101 @@ pub const MacroEngine = struct {
                     if (i < args.len) {
                         if (param.pattern.* == .bind) {
                             const pname = self.interner.get(param.pattern.bind.name);
-                            const arg_ct = ast_data.exprToCtValue(self.allocator, self.interner, &store, args[i]) catch return null;
+                            const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, store, args[i]);
+                            try temporary_values.adopt(arg_ct);
                             // Mark user-supplied identifiers with the
                             // per-call use_scope so the post-result
                             // flip can shed it (template ids that
                             // never had it then acquire it instead).
-                            const marked = ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope) catch return null;
-                            param_map.put(pname, marked) catch return null;
+                            const marked = ast_data.addScopeToIdentifiers(self.allocator, store, arg_ct, use_scope) catch |err| {
+                                try self.reportMalformedMacroCtValue("expression", call_span, err);
+                                unreachable;
+                            };
+                            try temporary_values.adopt(marked);
+                            try param_map.put(pname, marked);
                         }
                     }
                 }
 
                 var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+                defer body_vals.deinit(self.allocator);
                 for (body_expr.quote_expr.body) |stmt| {
-                    const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
+                    const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+                    try temporary_values.adopt(stmt_ct);
                     // Tag template identifiers with the per-family
                     // intro_scope before substitution embeds the
                     // user's args into them.
-                    const marked = ast_data.addScopeToIdentifiers(self.allocator, &store, stmt_ct, intro_scope) catch return null;
-                    const substituted = self.substituteCtValue(marked, &param_map, &store) catch return null;
-                    const flipped = ast_data.flipScopeOnIdentifiers(self.allocator, &store, substituted, use_scope) catch return null;
-                    body_vals.append(self.allocator, flipped) catch return null;
+                    const marked = ast_data.addScopeToIdentifiers(self.allocator, store, stmt_ct, intro_scope) catch |err| {
+                        try self.reportMalformedMacroCtValue("expression", call_span, err);
+                        unreachable;
+                    };
+                    try temporary_values.adopt(marked);
+                    const substituted = try self.substituteCtValue(marked, &param_map, store, call_span);
+                    try temporary_values.adopt(substituted);
+                    const flipped = ast_data.flipScopeOnIdentifiers(self.allocator, store, substituted, use_scope) catch |err| {
+                        try self.reportMalformedMacroCtValue("expression", call_span, err);
+                        unreachable;
+                    };
+                    try temporary_values.adopt(flipped);
+                    try body_vals.append(self.allocator, flipped);
                 }
 
-                if (body_vals.items.len == 1) return body_vals.items[0];
+                if (body_vals.items.len == 1) {
+                    const value = body_vals.items[0];
+                    temporary_values_transferred = true;
+                    return .{ .value = .{ .value = value, .owner = temporary_values } };
+                }
                 // Multiple values: wrap in __block__
                 if (body_vals.items.len > 1) {
-                    const block_args = ast_data.makeListFromSlice(self.allocator, &store, body_vals.items) catch return null;
-                    const empty = ast_data.emptyList(self.allocator, &store) catch return null;
-                    return ast_data.makeTuple3(self.allocator, &store, .{ .atom = "__block__" }, empty, block_args) catch return null;
+                    const block_args = try ast_data.makeListFromSlice(self.allocator, store, body_vals.items);
+                    try temporary_values.adopt(block_args);
+                    const empty = try ast_data.emptyList(self.allocator, store);
+                    try temporary_values.adopt(empty);
+                    const block = try ast_data.makeTuple3(self.allocator, store, .{ .atom = "__block__" }, empty, block_args);
+                    try temporary_values.adopt(block);
+                    temporary_values_transferred = true;
+                    return .{ .value = .{ .value = block, .owner = temporary_values } };
                 }
-                return null;
+                return .no_output;
             }
         }
 
         // Phase 3: evaluator path
-        const macro_eval = @import("macro_eval.zig");
-        var env = macro_eval.Env.init(self.allocator, &store);
+        var env = macro_eval_mod.Env.init(self.allocator, store);
         defer env.deinit();
-        env.compiled_program = self.compiledProgram();
-        // Wire struct context so struct attribute and other comptime
-        // intrinsics that consult the scope graph reach the right
-        // struct — same wiring as the expression-level expandMacroCall
-        // eval path.
-        env.struct_ctx = .{
-            .graph = self.graph,
-            .interner = self.interner,
+        self.configureSelectedMacroEnv(&env, .{
+            .family = family,
+            .clause_ref = clause_ref,
+            .call_span = call_span,
             .current_struct_scope = self.current_struct_scope,
-        };
+            .macro_name = macro_name,
+        });
 
         for (clause.params, 0..) |param, i| {
             if (i < args.len) {
                 if (param.pattern.* == .bind) {
                     const param_name = self.interner.get(param.pattern.bind.name);
-                    const arg_ct = ast_data.exprToCtValue(self.allocator, self.interner, &store, args[i]) catch return null;
-                    const marked_arg = ast_data.addScopeToIdentifiers(self.allocator, &store, arg_ct, use_scope) catch return null;
-                    env.bind(param_name, marked_arg) catch return null;
+                    const arg_ct = try ast_data.exprToCtValue(self.allocator, self.interner, store, args[i]);
+                    try temporary_values.adopt(arg_ct);
+                    const marked_arg = ast_data.addScopeToIdentifiers(self.allocator, store, arg_ct, use_scope) catch |err| {
+                        try self.reportMalformedMacroCtValue("expression", call_span, err);
+                        unreachable;
+                    };
+                    try temporary_values.adopt(marked_arg);
+                    try env.bind(param_name, marked_arg);
                 }
             }
         }
 
         var result: ctfe.CtValue = .nil;
         for (clause_body) |stmt| {
-            const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
-            result = macro_eval.eval(&env, stmt_ct) catch return null;
+            const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+            try temporary_values.adopt(stmt_ct);
+            result = macro_eval_mod.eval(&env, stmt_ct) catch |err| {
+                try self.appendSelectedMacroEvaluationFailure(macro_name, call_span, err, env.last_capability_error);
+                return error.MacroExpansionFailed;
+            };
+            try temporary_values.adopt(result);
         }
 
         // The eval path treats `quote` as lazy: its body is returned
@@ -3212,9 +4207,18 @@ pub const MacroEngine = struct {
         // it. Mirrors the pattern used by `expandMacroCall`'s eval
         // path for expression-level macros.
         if (result != .nil) {
-            result = ast_data.addScopeToIdentifiers(self.allocator, &store, result, intro_scope) catch return null;
-            result = self.substituteCtValue(result, &env.bindings, &store) catch return null;
-            result = ast_data.flipScopeOnIdentifiers(self.allocator, &store, result, use_scope) catch return null;
+            result = ast_data.addScopeToIdentifiers(self.allocator, store, result, intro_scope) catch |err| {
+                try self.reportMalformedMacroCtValue("expression", call_span, err);
+                unreachable;
+            };
+            try temporary_values.adopt(result);
+            result = try self.substituteCtValue(result, &env.bindings, store, call_span);
+            try temporary_values.adopt(result);
+            result = ast_data.flipScopeOnIdentifiers(self.allocator, store, result, use_scope) catch |err| {
+                try self.reportMalformedMacroCtValue("expression", call_span, err);
+                unreachable;
+            };
+            try temporary_values.adopt(result);
             // `quote { single_expr }` produces a list with one element
             // (the body's sole statement). Unwrap so authors don't see
             // a stray list literal wrapping their result. Multi-stmt
@@ -3225,8 +4229,11 @@ pub const MacroEngine = struct {
             }
         }
 
-        if (result != .nil) return result;
-        return null;
+        if (result != .nil) {
+            temporary_values_transferred = true;
+            return .{ .value = .{ .value = result, .owner = temporary_values } };
+        }
+        return .no_output;
     }
 
     // ============================================================
@@ -3236,9 +4243,9 @@ pub const MacroEngine = struct {
     /// Try to expand a declaration (fn/macro/struct) through a Kernel macro.
     /// Returns the expanded StructItem if a Kernel macro exists, null otherwise.
     /// When null, the caller should use the bootstrap fallback.
-    fn tryExpandDeclarationMacro(self: *MacroEngine, form_name: []const u8, item: ast.StructItem) ?ast.StructItem {
+    fn tryExpandDeclarationMacro(self: *MacroEngine, form_name: []const u8, item: ast.StructItem) !?ast.StructItem {
         // Look up a Kernel macro with the declaration form name (fn, struct, struct, macro)
-        const name_id = self.interner.intern(form_name) catch return null;
+        const name_id = try self.interner.intern(form_name);
         const macro_id = self.findMacro(name_id, 1) orelse return null;
 
         // Found a Kernel declaration macro.
@@ -3263,11 +4270,15 @@ pub const MacroEngine = struct {
             }
         }
 
-        self.recordMacroExpansion(macro_id) catch return null;
+        try self.recordMacroExpansion(macro_id);
 
         // Non-identity macro — convert declaration to CtValue and evaluate
-        var store = ctfe.AllocationStore{};
-        const item_ct = ast_data.structItemToCtValue(self.allocator, self.interner, &store, item) catch return null;
+        var temporary_values = MacroCtValueOwner.init(self.allocator);
+        defer temporary_values.deinit();
+        const store = temporary_values.storePtr();
+        const item_span = structItemSpan(item);
+        const item_ct = try ast_data.structItemToCtValue(self.allocator, self.interner, store, item);
+        try temporary_values.adopt(item_ct);
 
         if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
             const body_expr = (clause.body orelse @as([]const ast.Stmt, &.{}))[0].expr;
@@ -3278,44 +4289,56 @@ pub const MacroEngine = struct {
                 for (clause.params) |param| {
                     if (param.pattern.* == .bind) {
                         const pname = self.interner.get(param.pattern.bind.name);
-                        decl_param_map.put(pname, item_ct) catch return null;
+                        try decl_param_map.put(pname, item_ct);
                     }
                 }
 
                 var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+                defer body_vals.deinit(self.allocator);
                 for (body_expr.quote_expr.body) |stmt| {
-                    const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
-                    body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &decl_param_map, &store) catch return null) catch return null;
+                    const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+                    try temporary_values.adopt(stmt_ct);
+                    const substituted = try self.substituteCtValue(stmt_ct, &decl_param_map, store, item_span);
+                    try temporary_values.adopt(substituted);
+                    try body_vals.append(self.allocator, substituted);
                 }
 
                 const result_ct = if (body_vals.items.len == 1) body_vals.items[0] else return null;
-                const interner_mut: *ast.StringInterner = @constCast(self.interner);
-                return ast_data.ctValueToStructItem(self.allocator, interner_mut, result_ct) catch return null;
+                return try self.ctValueToMacroStructItem(result_ct, item_span);
             }
         }
 
         // Non-template macro body — use the evaluator
-        const macro_eval = @import("macro_eval.zig");
-        var env = macro_eval.Env.init(self.allocator, &store);
+        var env = macro_eval_mod.Env.init(self.allocator, store);
         defer env.deinit();
-        env.compiled_program = self.compiledProgram();
+        self.configureSelectedMacroEnv(&env, .{
+            .family = family,
+            .clause_ref = clause_ref,
+            .call_span = item_span,
+            .current_struct_scope = self.current_struct_scope,
+            .macro_name = form_name,
+        });
 
         for (clause.params) |param| {
             if (param.pattern.* == .bind) {
                 const pname = self.interner.get(param.pattern.bind.name);
-                env.bind(pname, item_ct) catch return null;
+                try env.bind(pname, item_ct);
             }
         }
 
         var result: ctfe.CtValue = .nil;
         for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
-            const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
-            result = macro_eval.eval(&env, stmt_ct) catch return null;
+            const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+            try temporary_values.adopt(stmt_ct);
+            result = macro_eval_mod.eval(&env, stmt_ct) catch |err| {
+                try self.appendSelectedMacroEvaluationFailure(form_name, item_span, err, env.last_capability_error);
+                return error.MacroExpansionFailed;
+            };
+            try temporary_values.adopt(result);
         }
 
         if (result != .nil) {
-            const interner_mut: *ast.StringInterner = @constCast(self.interner);
-            return ast_data.ctValueToStructItem(self.allocator, interner_mut, result) catch return null;
+            return try self.ctValueToMacroStructItem(result, item_span);
         }
         return null;
     }
@@ -3328,26 +4351,29 @@ pub const MacroEngine = struct {
     /// reachable through the consumer's imports — so when a consumer does
     /// `use Foo` and `use Bar` (both defining `__using__/1`), `use Bar` would
     /// silently invoke Foo's `__using__` instead of Bar's.
-    fn tryExpandUsing(self: *MacroEngine, ud: *const ast.UseDecl) ?[]const ast.StructItem {
+    fn tryExpandUsing(self: *MacroEngine, ud: *const ast.UseDecl) !?[]const ast.StructItem {
         // Build the __using__ name
-        const using_name = self.interner.intern("__using__") catch return null;
+        const using_name = try self.interner.intern("__using__");
 
         // Look up __using__/1 directly in the use target's scope
         const macro_id = self.findMacroInStruct(ud.struct_path, using_name, 1) orelse return null;
 
         const family = &self.graph.macro_families.items[macro_id];
         if (family.clauses.items.len == 0) return null;
-        self.recordMacroExpansion(macro_id) catch return null;
+        try self.recordMacroExpansion(macro_id);
 
         const clause_ref = family.clauses.items[0];
         const clause = &clause_ref.decl.clauses[clause_ref.clause_index];
 
         // Build the opts argument: use the opts from UseDecl, or nil if none
-        var store = ctfe.AllocationStore{};
-        const opts_ct: ctfe.CtValue = if (ud.opts) |opts|
-            ast_data.exprToCtValue(self.allocator, self.interner, &store, opts) catch return null
-        else
-            .nil;
+        var temporary_values = MacroCtValueOwner.init(self.allocator);
+        defer temporary_values.deinit();
+        const store = temporary_values.storePtr();
+        const opts_ct: ctfe.CtValue = if (ud.opts) |opts| blk: {
+            const value = try ast_data.exprToCtValue(self.allocator, self.interner, store, opts);
+            try temporary_values.adopt(value);
+            break :blk value;
+        } else .nil;
 
         // Evaluate the __using__ macro body
         if ((clause.body orelse @as([]const ast.Stmt, &.{})).len == 1 and (clause.body orelse @as([]const ast.Stmt, &.{}))[0] == .expr) {
@@ -3359,71 +4385,62 @@ pub const MacroEngine = struct {
                 for (clause.params) |param| {
                     if (param.pattern.* == .bind) {
                         const pname = self.interner.get(param.pattern.bind.name);
-                        param_map.put(pname, opts_ct) catch return null;
+                        try param_map.put(pname, opts_ct);
                     }
                 }
 
                 var body_vals: std.ArrayListUnmanaged(ctfe.CtValue) = .empty;
+                defer body_vals.deinit(self.allocator);
                 for (body_expr.quote_expr.body) |stmt| {
-                    const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
-                    body_vals.append(self.allocator, self.substituteCtValue(stmt_ct, &param_map, &store) catch return null) catch return null;
+                    const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+                    try temporary_values.adopt(stmt_ct);
+                    const substituted = try self.substituteCtValue(stmt_ct, &param_map, store, ud.meta.span);
+                    try temporary_values.adopt(substituted);
+                    try body_vals.append(self.allocator, substituted);
                 }
 
                 // Convert each result value to a struct item
                 var items: std.ArrayList(ast.StructItem) = .empty;
-                const interner_mut: *ast.StringInterner = @constCast(self.interner);
+                errdefer items.deinit(self.allocator);
                 for (body_vals.items) |val| {
-                    if (ast_data.ctValueToStructItem(self.allocator, interner_mut, val) catch null) |mi| {
-                        items.append(self.allocator, mi) catch return null;
+                    if (try self.ctValueToMacroStructItem(val, ud.meta.span)) |mi| {
+                        try items.append(self.allocator, mi);
                     }
                 }
-                return items.toOwnedSlice(self.allocator) catch return null;
+                return try items.toOwnedSlice(self.allocator);
             }
         }
 
         // Non-template macro body — use the evaluator
-        const macro_eval = @import("macro_eval.zig");
-        var env = macro_eval.Env.init(self.allocator, &store);
+        var env = macro_eval_mod.Env.init(self.allocator, store);
         defer env.deinit();
-        env.compiled_program = self.compiledProgram();
-        env.struct_ctx = .{
-            .graph = self.graph,
-            .interner = self.interner,
+        self.configureSelectedMacroEnv(&env, .{
+            .family = family,
+            .clause_ref = clause_ref,
+            .call_span = ud.meta.span,
             .current_struct_scope = self.current_struct_scope,
-        };
-        env.current_macro_caps = family.required_caps;
-        env.current_macro_name = self.interner.get(family.name);
-        env.current_macro_span = ud.meta.span;
-        env.current_macro_source_path = blk: {
-            if (clause_ref.decl.meta.span.source_id) |source_id| {
-                break :blk self.graph.sourcePathById(source_id);
-            }
-            break :blk null;
-        };
+        });
 
         for (clause.params) |param| {
             if (param.pattern.* == .bind) {
                 const pname = self.interner.get(param.pattern.bind.name);
-                env.bind(pname, opts_ct) catch return null;
+                try env.bind(pname, opts_ct);
             }
         }
 
         var result: ctfe.CtValue = .nil;
         for (clause.body orelse @as([]const ast.Stmt, &.{})) |stmt| {
-            const stmt_ct = ast_data.stmtToCtValue(self.allocator, self.interner, &store, stmt) catch return null;
-            result = macro_eval.eval(&env, stmt_ct) catch {
-                if (env.last_capability_error) |msg| {
-                    self.errors.append(self.allocator, .{
-                        .message = msg,
-                        .span = ud.meta.span,
-                    }) catch return null;
-                }
-                return null;
+            const stmt_ct = try ast_data.stmtToCtValue(self.allocator, self.interner, store, stmt);
+            try temporary_values.adopt(stmt_ct);
+            result = macro_eval_mod.eval(&env, stmt_ct) catch |err| {
+                try self.appendSelectedMacroEvaluationFailure("__using__", ud.meta.span, err, env.last_capability_error);
+                return error.MacroExpansionFailed;
             };
+            try temporary_values.adopt(result);
         }
 
         if (result != .nil) {
-            return self.ctValueToStructItems(result) catch return null;
+            return try self.ctValueToStructItems(result, ud.meta.span, "__using__ macro");
         }
         return null;
     }
@@ -3514,7 +4531,7 @@ pub const MacroEngine = struct {
     ) anyerror!void {
         switch (expr.*) {
             .nil_literal => |nl| {
-                if (!self.typeAllowsNil(return_type)) {
+                if (!try self.typeAllowsNil(return_type)) {
                     const type_name = self.getTypeName(return_type);
                     const msg = try std.fmt.allocPrint(
                         self.allocator,
@@ -3534,7 +4551,7 @@ pub const MacroEngine = struct {
                     try self.validateQuoteBody(else_block, return_type, params);
                 } else {
                     // No else branch implicitly returns nil
-                    if (!self.typeAllowsNil(return_type)) {
+                    if (!try self.typeAllowsNil(return_type)) {
                         const type_name = self.getTypeName(return_type);
                         const msg = try std.fmt.allocPrint(
                             self.allocator,
@@ -3557,7 +4574,7 @@ pub const MacroEngine = struct {
                                 .bind => |bind| {
                                     if (bind.name == vr.name) {
                                         if (param.type_annotation) |param_type| {
-                                            if (!self.typesMatch(param_type, return_type)) {
+                                            if (!try self.typesMatch(param_type, return_type)) {
                                                 const pt = self.getTypeName(param_type);
                                                 const rt = self.getTypeName(return_type);
                                                 const msg = try std.fmt.allocPrint(
@@ -3592,53 +4609,100 @@ pub const MacroEngine = struct {
     }
 
     /// Check if a type expression allows nil values.
-    fn typeAllowsNil(self: *MacroEngine, type_expr: *const ast.TypeExpr) bool {
-        switch (type_expr.*) {
-            .name => |n| {
-                const name = self.interner.get(n.name);
-                return std.mem.eql(u8, name, "nil") or std.mem.eql(u8, name, "Nil");
-            },
-            .literal => |lit| {
-                return lit.value == .nil;
-            },
-            .union_type => |u| {
-                for (u.members) |member| {
-                    if (self.typeAllowsNil(member)) return true;
-                }
-                return false;
-            },
-            else => return false,
+    fn typeAllowsNil(self: *MacroEngine, type_expr: *const ast.TypeExpr) !bool {
+        var steps_remaining = MACRO_TYPE_VALIDATION_STEP_BUDGET;
+        var stack: SmallInlineStack(*const ast.TypeExpr, MACRO_TYPE_VALIDATION_INLINE_STACK_CAPACITY) = .{};
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, type_expr);
+
+        while (stack.len() != 0) {
+            const current = stack.pop();
+            try self.consumeMacroTypeValidationStep(
+                &steps_remaining,
+                MACRO_TYPE_VALIDATION_STEP_BUDGET,
+                current.getMeta().span,
+            );
+            switch (current.*) {
+                .name => |n| {
+                    const name = self.interner.get(n.name);
+                    if (std.mem.eql(u8, name, "nil") or std.mem.eql(u8, name, "Nil")) return true;
+                },
+                .literal => |lit| {
+                    if (lit.value == .nil) return true;
+                },
+                .union_type => |u| {
+                    var index = u.members.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try stack.append(self.allocator, u.members[index]);
+                    }
+                },
+                else => {},
+            }
         }
+        return false;
     }
 
     /// Check if type `a` is compatible with type `b`.
     /// For union return types, `a` is compatible if it is a member of the union.
-    fn typesMatch(self: *MacroEngine, a: *const ast.TypeExpr, b: *const ast.TypeExpr) bool {
+    fn typesMatch(self: *MacroEngine, a: *const ast.TypeExpr, b: *const ast.TypeExpr) !bool {
         // Expr is a macro meta-type — it's compatible with any type
         if (self.isExprType(a) or self.isExprType(b)) return true;
 
-        switch (b.*) {
-            .union_type => |u| {
-                // a is compatible if it matches any member of the union
-                for (u.members) |member| {
-                    if (self.typesMatch(a, member)) return true;
-                }
-                return false;
-            },
-            .name => |bn| {
-                switch (a.*) {
-                    .name => |an| return an.name == bn.name,
-                    else => return false,
-                }
-            },
-            .literal => |bl| {
-                switch (a.*) {
-                    .literal => |al| return std.meta.activeTag(al.value) == std.meta.activeTag(bl.value),
-                    else => return false,
-                }
-            },
-            else => return true, // For complex types, assume compatible
+        var steps_remaining = MACRO_TYPE_VALIDATION_STEP_BUDGET;
+        var stack: SmallInlineStack(*const ast.TypeExpr, MACRO_TYPE_VALIDATION_INLINE_STACK_CAPACITY) = .{};
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, b);
+
+        while (stack.len() != 0) {
+            const current_b = stack.pop();
+            try self.consumeMacroTypeValidationStep(
+                &steps_remaining,
+                MACRO_TYPE_VALIDATION_STEP_BUDGET,
+                current_b.getMeta().span,
+            );
+            if (self.isExprType(current_b)) return true;
+
+            switch (current_b.*) {
+                .union_type => |u| {
+                    var index = u.members.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try stack.append(self.allocator, u.members[index]);
+                    }
+                },
+                .name => |bn| {
+                    if (a.* == .name and a.name.name == bn.name) return true;
+                },
+                .literal => |bl| {
+                    if (a.* == .literal and std.meta.activeTag(a.literal.value) == std.meta.activeTag(bl.value)) return true;
+                },
+                else => return true, // For complex types, assume compatible
+            }
         }
+        return false;
+    }
+
+    fn consumeMacroTypeValidationStep(
+        self: *MacroEngine,
+        steps_remaining: *usize,
+        budget_limit: usize,
+        span: ast.SourceSpan,
+    ) !void {
+        if (steps_remaining.* > 0) {
+            steps_remaining.* -= 1;
+            return;
+        }
+
+        try self.errors.append(self.allocator, .{
+            .message = try std.fmt.allocPrint(
+                self.allocator,
+                "macro type validation exceeded structural budget ({d}); possible pathological macro type",
+                .{budget_limit},
+            ),
+            .span = span,
+        });
+        return error.MacroTypeValidationBudgetExceeded;
     }
 
     /// Check if a type expression is the special macro meta-type `Expr`.
@@ -3860,9 +4924,9 @@ pub const MacroEngine = struct {
 // would lose the inner provenance. The outer call's frame is reachable
 // from the inner one via `parent`.
 //
-// The walker is exhaustive over every AST union variant — when a new
-// variant is added, the corresponding `inline else` falls through and
-// the variant-count tripwire test in `ast.zig` will catch the omission.
+// The walker is exhaustive over every AST union variant. The explicit stack
+// keeps macro-produced trees from consuming the host call stack; a structural
+// budget failure records a diagnostic at the macro call span before aborting.
 // ============================================================
 
 fn stampMetaIfUnset(meta_ptr: *ast.NodeMeta, info: *const ast.ExpansionInfo) void {
@@ -3871,7 +4935,143 @@ fn stampMetaIfUnset(meta_ptr: *ast.NodeMeta, info: *const ast.ExpansionInfo) voi
     }
 }
 
-fn stampExpansionOnExpr(expr: *const ast.Expr, info: *const ast.ExpansionInfo) void {
+const EXPANSION_STAMP_INLINE_STACK_CAPACITY: usize = 128;
+const EXPANSION_STAMP_STEP_BUDGET: usize = 1_000_000;
+
+const ExpansionStampFrame = union(enum) {
+    expr: *const ast.Expr,
+    stmt: ast.Stmt,
+    pattern: *const ast.Pattern,
+    type_expr: *const ast.TypeExpr,
+    case_clause: *const ast.CaseClause,
+    cond_clause: *const ast.CondClause,
+    with_step: *const ast.WithStep,
+    function_decl: *const ast.FunctionDecl,
+    function_clause: *const ast.FunctionClause,
+    param: *const ast.Param,
+    binary_segment: *const ast.BinarySegment,
+};
+
+const ExpansionStampStack = MacroEngine.SmallInlineStack(
+    ExpansionStampFrame,
+    EXPANSION_STAMP_INLINE_STACK_CAPACITY,
+);
+
+fn stampExpansionOnExpr(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList(MacroEngine.Error),
+    expr: *const ast.Expr,
+    info: *const ast.ExpansionInfo,
+    diagnostic_span: ast.SourceSpan,
+) !void {
+    try stampExpansionOnExprWithBudget(
+        allocator,
+        errors,
+        expr,
+        info,
+        diagnostic_span,
+        EXPANSION_STAMP_STEP_BUDGET,
+    );
+}
+
+fn stampExpansionOnExprWithBudget(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList(MacroEngine.Error),
+    expr: *const ast.Expr,
+    info: *const ast.ExpansionInfo,
+    diagnostic_span: ast.SourceSpan,
+    max_steps: usize,
+) !void {
+    var stack: ExpansionStampStack = .{};
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .expr = expr });
+    try stampExpansionFrames(allocator, errors, &stack, info, diagnostic_span, max_steps);
+}
+
+fn stampExpansionOnPatternWithBudget(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList(MacroEngine.Error),
+    pattern: *const ast.Pattern,
+    info: *const ast.ExpansionInfo,
+    diagnostic_span: ast.SourceSpan,
+    max_steps: usize,
+) !void {
+    var stack: ExpansionStampStack = .{};
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .pattern = pattern });
+    try stampExpansionFrames(allocator, errors, &stack, info, diagnostic_span, max_steps);
+}
+
+fn stampExpansionOnTypeExprWithBudget(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList(MacroEngine.Error),
+    type_expr: *const ast.TypeExpr,
+    info: *const ast.ExpansionInfo,
+    diagnostic_span: ast.SourceSpan,
+    max_steps: usize,
+) !void {
+    var stack: ExpansionStampStack = .{};
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .type_expr = type_expr });
+    try stampExpansionFrames(allocator, errors, &stack, info, diagnostic_span, max_steps);
+}
+
+fn stampExpansionFrames(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList(MacroEngine.Error),
+    stack: *ExpansionStampStack,
+    info: *const ast.ExpansionInfo,
+    diagnostic_span: ast.SourceSpan,
+    max_steps: usize,
+) !void {
+    var steps_remaining = max_steps;
+    while (stack.len() != 0) {
+        try consumeExpansionStampStep(allocator, errors, &steps_remaining, max_steps, diagnostic_span);
+        switch (stack.pop()) {
+            .expr => |expr| try stampExpansionExprFrame(allocator, stack, expr, info),
+            .stmt => |stmt| try stampExpansionStmtFrame(allocator, stack, stmt, info),
+            .pattern => |pattern| try stampExpansionPatternFrame(allocator, stack, pattern, info),
+            .type_expr => |type_expr| try stampExpansionTypeExprFrame(allocator, stack, type_expr, info),
+            .case_clause => |clause| try stampExpansionCaseClauseFrame(allocator, stack, clause, info),
+            .cond_clause => |clause| try stampExpansionCondClauseFrame(allocator, stack, clause, info),
+            .with_step => |step| try stampExpansionWithStepFrame(allocator, stack, step, info),
+            .function_decl => |decl| try stampExpansionFunctionDeclFrame(allocator, stack, decl, info),
+            .function_clause => |clause| try stampExpansionFunctionClauseFrame(allocator, stack, clause, info),
+            .param => |param| try stampExpansionParamFrame(allocator, stack, param, info),
+            .binary_segment => |segment| try stampExpansionBinarySegmentFrame(allocator, stack, segment, info),
+        }
+    }
+}
+
+fn consumeExpansionStampStep(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList(MacroEngine.Error),
+    steps_remaining: *usize,
+    budget_limit: usize,
+    diagnostic_span: ast.SourceSpan,
+) !void {
+    if (steps_remaining.* > 0) {
+        steps_remaining.* -= 1;
+        return;
+    }
+
+    try errors.append(allocator, .{
+        .message = try std.fmt.allocPrint(
+            allocator,
+            "macro expansion provenance stamping exceeded structural budget ({d}); possible pathological macro output",
+            .{budget_limit},
+        ),
+        .span = diagnostic_span,
+    });
+    return error.MacroExpansionStampBudgetExceeded;
+}
+
+fn stampExpansionExprFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    expr: *const ast.Expr,
+    info: *const ast.ExpansionInfo,
+) !void {
     const mut: *ast.Expr = @constCast(expr);
     switch (mut.*) {
         .int_literal => |*v| stampMetaIfUnset(&v.meta, info),
@@ -3879,10 +5079,14 @@ fn stampExpansionOnExpr(expr: *const ast.Expr, info: *const ast.ExpansionInfo) v
         .string_literal => |*v| stampMetaIfUnset(&v.meta, info),
         .string_interpolation => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.parts) |part| switch (part) {
-                .literal => {},
-                .expr => |child| stampExpansionOnExpr(child, info),
-            };
+            var index = v.parts.len;
+            while (index > 0) {
+                index -= 1;
+                switch (v.parts[index]) {
+                    .literal => {},
+                    .expr => |child| try stack.append(allocator, .{ .expr = child }),
+                }
+            }
         },
         .atom_literal => |*v| stampMetaIfUnset(&v.meta, info),
         .bool_literal => |*v| stampMetaIfUnset(&v.meta, info),
@@ -3891,163 +5095,162 @@ fn stampExpansionOnExpr(expr: *const ast.Expr, info: *const ast.ExpansionInfo) v
         .struct_ref => |*v| stampMetaIfUnset(&v.meta, info),
         .tuple => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.elements) |elem| stampExpansionOnExpr(elem, info);
+            try pushExprsReverse(allocator, stack, v.elements);
         },
         .list => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.elements) |elem| stampExpansionOnExpr(elem, info);
+            try pushExprsReverse(allocator, stack, v.elements);
         },
         .map => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            if (v.update_source) |src| stampExpansionOnExpr(src, info);
-            for (v.fields) |field| {
-                stampExpansionOnExpr(field.key, info);
-                stampExpansionOnExpr(field.value, info);
+            var index = v.fields.len;
+            while (index > 0) {
+                index -= 1;
+                try stack.append(allocator, .{ .expr = v.fields[index].value });
+                try stack.append(allocator, .{ .expr = v.fields[index].key });
             }
+            if (v.update_source) |src| try stack.append(allocator, .{ .expr = src });
         },
         .struct_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            if (v.update_source) |src| stampExpansionOnExpr(src, info);
-            for (v.fields) |field| stampExpansionOnExpr(field.value, info);
+            var index = v.fields.len;
+            while (index > 0) {
+                index -= 1;
+                try stack.append(allocator, .{ .expr = v.fields[index].value });
+            }
+            if (v.update_source) |src| try stack.append(allocator, .{ .expr = src });
         },
         .range => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.start, info);
-            stampExpansionOnExpr(v.end, info);
-            if (v.step) |s| stampExpansionOnExpr(s, info);
+            if (v.step) |s| try stack.append(allocator, .{ .expr = s });
+            try stack.append(allocator, .{ .expr = v.end });
+            try stack.append(allocator, .{ .expr = v.start });
         },
         .binary_op => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.lhs, info);
-            stampExpansionOnExpr(v.rhs, info);
+            try stack.append(allocator, .{ .expr = v.rhs });
+            try stack.append(allocator, .{ .expr = v.lhs });
         },
         .unary_op => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.operand, info);
+            try stack.append(allocator, .{ .expr = v.operand });
         },
         .call => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.callee, info);
-            for (v.args) |arg| stampExpansionOnExpr(arg, info);
+            try pushExprsReverse(allocator, stack, v.args);
+            try stack.append(allocator, .{ .expr = v.callee });
         },
         .field_access => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.object, info);
+            try stack.append(allocator, .{ .expr = v.object });
         },
         .pipe => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.lhs, info);
-            stampExpansionOnExpr(v.rhs, info);
+            try stack.append(allocator, .{ .expr = v.rhs });
+            try stack.append(allocator, .{ .expr = v.lhs });
         },
         .unwrap => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.expr, info);
+            try stack.append(allocator, .{ .expr = v.expr });
         },
         .try_rescue => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.body) |stmt| stampExpansionOnStmt(stmt, info);
-            for (v.rescue_clauses) |*clause| stampExpansionOnCaseClause(clause, info);
-            if (v.after_block) |after_block| {
-                for (after_block) |stmt| stampExpansionOnStmt(stmt, info);
-            }
+            if (v.after_block) |after_block| try pushStmtsReverse(allocator, stack, after_block);
+            try pushCaseClausesReverse(allocator, stack, v.rescue_clauses);
+            try pushStmtsReverse(allocator, stack, v.body);
         },
         .if_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.condition, info);
-            for (v.then_block) |stmt| stampExpansionOnStmt(stmt, info);
-            if (v.else_block) |else_block| {
-                for (else_block) |stmt| stampExpansionOnStmt(stmt, info);
-            }
+            if (v.else_block) |else_block| try pushStmtsReverse(allocator, stack, else_block);
+            try pushStmtsReverse(allocator, stack, v.then_block);
+            try stack.append(allocator, .{ .expr = v.condition });
         },
         .case_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.scrutinee, info);
-            for (v.clauses) |*clause| stampExpansionOnCaseClause(clause, info);
+            try pushCaseClausesReverse(allocator, stack, v.clauses);
+            try stack.append(allocator, .{ .expr = v.scrutinee });
         },
         .cond_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.clauses) |*clause| {
-                stampMetaIfUnset(&@as(*ast.CondClause, @constCast(clause)).meta, info);
-                stampExpansionOnExpr(clause.condition, info);
-                for (clause.body) |stmt| stampExpansionOnStmt(stmt, info);
+            var index = v.clauses.len;
+            while (index > 0) {
+                index -= 1;
+                try stack.append(allocator, .{ .cond_clause = &v.clauses[index] });
             }
         },
         .for_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnPattern(v.var_pattern, info);
-            if (v.var_type_annotation) |ta| stampExpansionOnTypeExpr(ta, info);
-            stampExpansionOnExpr(v.iterable, info);
-            if (v.filter) |f| stampExpansionOnExpr(f, info);
-            stampExpansionOnExpr(v.body, info);
+            try stack.append(allocator, .{ .expr = v.body });
+            if (v.filter) |f| try stack.append(allocator, .{ .expr = f });
+            try stack.append(allocator, .{ .expr = v.iterable });
+            if (v.var_type_annotation) |ta| try stack.append(allocator, .{ .type_expr = ta });
+            try stack.append(allocator, .{ .pattern = v.var_pattern });
         },
         .with_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.steps) |*step| {
-                stampMetaIfUnset(&@as(*ast.WithStep, @constCast(step)).meta, info);
-                stampExpansionOnPattern(step.pattern, info);
-                if (step.type_annotation) |ta| stampExpansionOnTypeExpr(ta, info);
-                stampExpansionOnExpr(step.expr, info);
-            }
-            for (v.do_body) |stmt| stampExpansionOnStmt(stmt, info);
-            if (v.else_clauses) |clauses| {
-                for (clauses) |*clause| stampExpansionOnCaseClause(clause, info);
+            if (v.else_clauses) |clauses| try pushCaseClausesReverse(allocator, stack, clauses);
+            try pushStmtsReverse(allocator, stack, v.do_body);
+            var index = v.steps.len;
+            while (index > 0) {
+                index -= 1;
+                try stack.append(allocator, .{ .with_step = &v.steps[index] });
             }
         },
         .list_cons_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.head, info);
-            stampExpansionOnExpr(v.tail, info);
+            try stack.append(allocator, .{ .expr = v.tail });
+            try stack.append(allocator, .{ .expr = v.head });
         },
         .quote_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.body) |stmt| stampExpansionOnStmt(stmt, info);
+            try pushStmtsReverse(allocator, stack, v.body);
         },
         .unquote_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.expr, info);
+            try stack.append(allocator, .{ .expr = v.expr });
         },
         .unquote_splicing_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.expr, info);
+            try stack.append(allocator, .{ .expr = v.expr });
         },
         .panic_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.message, info);
+            try stack.append(allocator, .{ .expr = v.message });
         },
         .raise_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.value, info);
+            try stack.append(allocator, .{ .expr = v.value });
         },
         .error_pipe => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.chain, info);
             switch (v.handler) {
-                .block => |arms| for (arms) |*clause| stampExpansionOnCaseClause(clause, info),
-                .function => |fn_expr| stampExpansionOnExpr(fn_expr, info),
+                .block => |arms| try pushCaseClausesReverse(allocator, stack, arms),
+                .function => |fn_expr| try stack.append(allocator, .{ .expr = fn_expr }),
             }
+            try stack.append(allocator, .{ .expr = v.chain });
         },
         .block => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.stmts) |stmt| stampExpansionOnStmt(stmt, info);
+            try pushStmtsReverse(allocator, stack, v.stmts);
         },
         .intrinsic => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.args) |arg| stampExpansionOnExpr(arg, info);
+            try pushExprsReverse(allocator, stack, v.args);
         },
         .attr_ref => |*v| stampMetaIfUnset(&v.meta, info),
         .binary_literal => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.segments) |*seg| stampExpansionOnBinarySegment(seg, info);
+            try pushBinarySegmentsReverse(allocator, stack, v.segments);
         },
         .function_ref => |*v| stampMetaIfUnset(&v.meta, info),
         .anonymous_function => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnFunctionDecl(v.decl, info);
+            try stack.append(allocator, .{ .function_decl = v.decl });
         },
         .type_annotated => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnExpr(v.expr, info);
-            stampExpansionOnTypeExpr(v.type_expr, info);
+            try stack.append(allocator, .{ .type_expr = v.type_expr });
+            try stack.append(allocator, .{ .expr = v.expr });
         },
         // Poison sentinel (Phase 4.b): stamp the expansion provenance like any
         // other node so a diagnostic on a poisoned node produced inside a macro
@@ -4056,30 +5259,40 @@ fn stampExpansionOnExpr(expr: *const ast.Expr, info: *const ast.ExpansionInfo) v
     }
 }
 
-fn stampExpansionOnStmt(stmt: ast.Stmt, info: *const ast.ExpansionInfo) void {
+fn stampExpansionStmtFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    stmt: ast.Stmt,
+    info: *const ast.ExpansionInfo,
+) !void {
     switch (stmt) {
-        .expr => |e| stampExpansionOnExpr(e, info),
-        .assignment => |a| {
-            const mut: *ast.Assignment = @constCast(a);
+        .expr => |expr| try stack.append(allocator, .{ .expr = expr }),
+        .assignment => |assignment| {
+            const mut: *ast.Assignment = @constCast(assignment);
             stampMetaIfUnset(&mut.meta, info);
-            stampExpansionOnPattern(a.pattern, info);
-            stampExpansionOnExpr(a.value, info);
+            try stack.append(allocator, .{ .expr = assignment.value });
+            try stack.append(allocator, .{ .pattern = assignment.pattern });
         },
-        .function_decl => |fd| stampExpansionOnFunctionDecl(fd, info),
-        .macro_decl => |fd| stampExpansionOnFunctionDecl(fd, info),
-        .import_decl => |id| {
-            const mut: *ast.ImportDecl = @constCast(id);
+        .function_decl => |decl| try stack.append(allocator, .{ .function_decl = decl }),
+        .macro_decl => |decl| try stack.append(allocator, .{ .function_decl = decl }),
+        .import_decl => |decl| {
+            const mut: *ast.ImportDecl = @constCast(decl);
             stampMetaIfUnset(&mut.meta, info);
         },
         .attribute => |attr| {
             const mut: *ast.AttributeDecl = @constCast(attr);
             stampMetaIfUnset(&mut.meta, info);
-            if (attr.value) |value| stampExpansionOnExpr(value, info);
+            if (attr.value) |value| try stack.append(allocator, .{ .expr = value });
         },
     }
 }
 
-fn stampExpansionOnPattern(pattern: *const ast.Pattern, info: *const ast.ExpansionInfo) void {
+fn stampExpansionPatternFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    pattern: *const ast.Pattern,
+    info: *const ast.ExpansionInfo,
+) !void {
     const mut: *ast.Pattern = @constCast(pattern);
     switch (mut.*) {
         .wildcard => |*v| stampMetaIfUnset(&v.meta, info),
@@ -4094,128 +5307,277 @@ fn stampExpansionOnPattern(pattern: *const ast.Pattern, info: *const ast.Expansi
         },
         .tuple => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.elements) |elem| stampExpansionOnPattern(elem, info);
+            try pushPatternsReverse(allocator, stack, v.elements);
         },
         .list => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.elements) |elem| stampExpansionOnPattern(elem, info);
+            try pushPatternsReverse(allocator, stack, v.elements);
         },
         .list_cons => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.heads) |h| stampExpansionOnPattern(h, info);
-            stampExpansionOnPattern(v.tail, info);
+            try stack.append(allocator, .{ .pattern = v.tail });
+            try pushPatternsReverse(allocator, stack, v.heads);
         },
         .map => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.fields) |field| {
-                stampExpansionOnExpr(field.key, info);
-                stampExpansionOnPattern(field.value, info);
+            var index = v.fields.len;
+            while (index > 0) {
+                index -= 1;
+                try stack.append(allocator, .{ .pattern = v.fields[index].value });
+                try stack.append(allocator, .{ .expr = v.fields[index].key });
             }
         },
         .struct_pattern => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.fields) |field| stampExpansionOnPattern(field.pattern, info);
+            var index = v.fields.len;
+            while (index > 0) {
+                index -= 1;
+                try stack.append(allocator, .{ .pattern = v.fields[index].pattern });
+            }
         },
         .pin => |*v| stampMetaIfUnset(&v.meta, info),
         .paren => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnPattern(v.inner, info);
+            try stack.append(allocator, .{ .pattern = v.inner });
         },
         .binary => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.segments) |*seg| stampExpansionOnBinarySegment(seg, info);
+            try pushBinarySegmentsReverse(allocator, stack, v.segments);
         },
         .tagged_union_variant => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.type_args) |ta| stampExpansionOnTypeExpr(ta, info);
-            if (v.payload) |payload| stampExpansionOnPattern(payload, info);
+            if (v.payload) |payload| try stack.append(allocator, .{ .pattern = payload });
+            try pushTypeExprsReverse(allocator, stack, v.type_args);
         },
     }
 }
 
-fn stampExpansionOnTypeExpr(type_expr: *const ast.TypeExpr, info: *const ast.ExpansionInfo) void {
+fn stampExpansionTypeExprFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    type_expr: *const ast.TypeExpr,
+    info: *const ast.ExpansionInfo,
+) !void {
     const mut: *ast.TypeExpr = @constCast(type_expr);
     switch (mut.*) {
         .name => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.args) |arg| stampExpansionOnTypeExpr(arg, info);
+            try pushTypeExprsReverse(allocator, stack, v.args);
         },
         .variable => |*v| stampMetaIfUnset(&v.meta, info),
         .tuple => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.elements) |elem| stampExpansionOnTypeExpr(elem, info);
+            try pushTypeExprsReverse(allocator, stack, v.elements);
         },
         .list => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnTypeExpr(v.element, info);
+            try stack.append(allocator, .{ .type_expr = v.element });
         },
         .map => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.fields) |field| {
-                stampExpansionOnTypeExpr(field.key, info);
-                stampExpansionOnTypeExpr(field.value, info);
+            var index = v.fields.len;
+            while (index > 0) {
+                index -= 1;
+                try stack.append(allocator, .{ .type_expr = v.fields[index].value });
+                try stack.append(allocator, .{ .type_expr = v.fields[index].key });
             }
         },
         .struct_type => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.fields) |field| stampExpansionOnTypeExpr(field.type_expr, info);
+            var index = v.fields.len;
+            while (index > 0) {
+                index -= 1;
+                try stack.append(allocator, .{ .type_expr = v.fields[index].type_expr });
+            }
         },
         .union_type => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.members) |m| stampExpansionOnTypeExpr(m, info);
+            try pushTypeExprsReverse(allocator, stack, v.members);
         },
         .function => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            for (v.params) |p| stampExpansionOnTypeExpr(p, info);
-            stampExpansionOnTypeExpr(v.return_type, info);
+            try stack.append(allocator, .{ .type_expr = v.return_type });
+            try pushTypeExprsReverse(allocator, stack, v.params);
         },
         .literal => |*v| stampMetaIfUnset(&v.meta, info),
         .never => |*v| stampMetaIfUnset(&v.meta, info),
         .paren => |*v| {
             stampMetaIfUnset(&v.meta, info);
-            stampExpansionOnTypeExpr(v.inner, info);
+            try stack.append(allocator, .{ .type_expr = v.inner });
         },
     }
 }
 
-fn stampExpansionOnCaseClause(clause: *const ast.CaseClause, info: *const ast.ExpansionInfo) void {
+fn stampExpansionCaseClauseFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    clause: *const ast.CaseClause,
+    info: *const ast.ExpansionInfo,
+) !void {
     const mut: *ast.CaseClause = @constCast(clause);
     stampMetaIfUnset(&mut.meta, info);
-    stampExpansionOnPattern(clause.pattern, info);
-    if (clause.type_annotation) |ta| stampExpansionOnTypeExpr(ta, info);
-    if (clause.guard) |g| stampExpansionOnExpr(g, info);
-    for (clause.body) |stmt| stampExpansionOnStmt(stmt, info);
+    try pushStmtsReverse(allocator, stack, clause.body);
+    if (clause.guard) |guard| try stack.append(allocator, .{ .expr = guard });
+    if (clause.type_annotation) |type_annotation| try stack.append(allocator, .{ .type_expr = type_annotation });
+    try stack.append(allocator, .{ .pattern = clause.pattern });
 }
 
-fn stampExpansionOnFunctionDecl(decl: *const ast.FunctionDecl, info: *const ast.ExpansionInfo) void {
+fn stampExpansionCondClauseFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    clause: *const ast.CondClause,
+    info: *const ast.ExpansionInfo,
+) !void {
+    const mut: *ast.CondClause = @constCast(clause);
+    stampMetaIfUnset(&mut.meta, info);
+    try pushStmtsReverse(allocator, stack, clause.body);
+    try stack.append(allocator, .{ .expr = clause.condition });
+}
+
+fn stampExpansionWithStepFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    step: *const ast.WithStep,
+    info: *const ast.ExpansionInfo,
+) !void {
+    const mut: *ast.WithStep = @constCast(step);
+    stampMetaIfUnset(&mut.meta, info);
+    try stack.append(allocator, .{ .expr = step.expr });
+    if (step.type_annotation) |type_annotation| try stack.append(allocator, .{ .type_expr = type_annotation });
+    try stack.append(allocator, .{ .pattern = step.pattern });
+}
+
+fn stampExpansionFunctionDeclFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    decl: *const ast.FunctionDecl,
+    info: *const ast.ExpansionInfo,
+) !void {
     const mut: *ast.FunctionDecl = @constCast(decl);
     stampMetaIfUnset(&mut.meta, info);
-    if (decl.name_expr) |ne| stampExpansionOnExpr(ne, info);
-    for (decl.clauses) |*clause| {
-        const cmut: *ast.FunctionClause = @constCast(clause);
-        stampMetaIfUnset(&cmut.meta, info);
-        for (clause.params) |*param| {
-            const pmut: *ast.Param = @constCast(param);
-            stampMetaIfUnset(&pmut.meta, info);
-            stampExpansionOnPattern(param.pattern, info);
-            if (param.type_annotation) |ta| stampExpansionOnTypeExpr(ta, info);
-            if (param.default) |d| stampExpansionOnExpr(d, info);
-        }
-        if (clause.return_type) |rt| stampExpansionOnTypeExpr(rt, info);
-        if (clause.refinement) |r| stampExpansionOnExpr(r, info);
-        if (clause.body) |body| {
-            for (body) |stmt| stampExpansionOnStmt(stmt, info);
-        }
+    var index = decl.clauses.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .function_clause = &decl.clauses[index] });
+    }
+    if (decl.name_expr) |name_expr| try stack.append(allocator, .{ .expr = name_expr });
+}
+
+fn stampExpansionFunctionClauseFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    clause: *const ast.FunctionClause,
+    info: *const ast.ExpansionInfo,
+) !void {
+    const mut: *ast.FunctionClause = @constCast(clause);
+    stampMetaIfUnset(&mut.meta, info);
+    if (clause.body) |body| try pushStmtsReverse(allocator, stack, body);
+    if (clause.refinement) |refinement| try stack.append(allocator, .{ .expr = refinement });
+    if (clause.return_type) |return_type| try stack.append(allocator, .{ .type_expr = return_type });
+    var index = clause.params.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .param = &clause.params[index] });
     }
 }
 
-fn stampExpansionOnBinarySegment(seg: *const ast.BinarySegment, info: *const ast.ExpansionInfo) void {
-    const mut: *ast.BinarySegment = @constCast(seg);
+fn stampExpansionParamFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    param: *const ast.Param,
+    info: *const ast.ExpansionInfo,
+) !void {
+    const mut: *ast.Param = @constCast(param);
     stampMetaIfUnset(&mut.meta, info);
-    switch (seg.value) {
-        .expr => |e| stampExpansionOnExpr(e, info),
-        .pattern => |p| stampExpansionOnPattern(p, info),
+    if (param.default) |default| try stack.append(allocator, .{ .expr = default });
+    if (param.type_annotation) |type_annotation| try stack.append(allocator, .{ .type_expr = type_annotation });
+    try stack.append(allocator, .{ .pattern = param.pattern });
+}
+
+fn stampExpansionBinarySegmentFrame(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    segment: *const ast.BinarySegment,
+    info: *const ast.ExpansionInfo,
+) !void {
+    const mut: *ast.BinarySegment = @constCast(segment);
+    stampMetaIfUnset(&mut.meta, info);
+    switch (segment.value) {
+        .expr => |expr| try stack.append(allocator, .{ .expr = expr }),
+        .pattern => |pattern| try stack.append(allocator, .{ .pattern = pattern }),
         .string_literal => {},
+    }
+}
+
+fn pushExprsReverse(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    exprs: []const *const ast.Expr,
+) std.mem.Allocator.Error!void {
+    var index = exprs.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .expr = exprs[index] });
+    }
+}
+
+fn pushPatternsReverse(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    patterns: []const *const ast.Pattern,
+) std.mem.Allocator.Error!void {
+    var index = patterns.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .pattern = patterns[index] });
+    }
+}
+
+fn pushTypeExprsReverse(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    type_exprs: []const *const ast.TypeExpr,
+) std.mem.Allocator.Error!void {
+    var index = type_exprs.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .type_expr = type_exprs[index] });
+    }
+}
+
+fn pushStmtsReverse(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    stmts: []const ast.Stmt,
+) std.mem.Allocator.Error!void {
+    var index = stmts.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .stmt = stmts[index] });
+    }
+}
+
+fn pushCaseClausesReverse(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    clauses: []const ast.CaseClause,
+) std.mem.Allocator.Error!void {
+    var index = clauses.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .case_clause = &clauses[index] });
+    }
+}
+
+fn pushBinarySegmentsReverse(
+    allocator: std.mem.Allocator,
+    stack: *ExpansionStampStack,
+    segments: []const ast.BinarySegment,
+) std.mem.Allocator.Error!void {
+    var index = segments.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .binary_segment = &segments[index] });
     }
 }
 
@@ -4225,6 +5587,16 @@ fn stampExpansionOnBinarySegment(seg: *const ast.BinarySegment, info: *const ast
 
 const Parser = @import("parser.zig").Parser;
 const Collector = @import("collector.zig").Collector;
+const capability_inference = @import("capability_inference.zig");
+
+fn inferCapabilitiesForTest(
+    allocator: std.mem.Allocator,
+    collector: *Collector,
+    interner: *const ast.StringInterner,
+) !void {
+    var failure: capability_inference.Failure = .{};
+    try capability_inference.inferAndApply(allocator, &collector.graph, interner, &failure);
+}
 
 test "macro engine no-op on program without macros" {
     const source =
@@ -4239,11 +5611,11 @@ test "macro engine no-op on program without macros" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4278,11 +5650,11 @@ test "macro engine expands simple macro" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4321,11 +5693,11 @@ test "macro engine expands qualified Struct.macro calls" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4358,6 +5730,63 @@ test "macro engine expands qualified Struct.macro calls" {
     try std.testing.expectEqual(@as(i64, 42), stmt.expr.int_literal.value);
 }
 
+test "macro expansion preserves macro declaration bodies until invocation" {
+    const source =
+        \\pub struct Test {
+        \\  macro helper(value :: Expr) -> Expr {
+        \\    quote { unquote(value) }
+        \\  }
+        \\
+        \\  pub macro outer(value :: Expr) -> Expr {
+        \\    Test.helper(value)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+
+    var outer_decl: ?*const ast.FunctionDecl = null;
+    for (expanded.structs) |mod| {
+        for (mod.items) |item| {
+            const decl = switch (item) {
+                .macro => |macro_decl| macro_decl,
+                .priv_macro => |macro_decl| macro_decl,
+                else => continue,
+            };
+            if (std.mem.eql(u8, parser.interner.get(decl.name), "outer")) {
+                outer_decl = decl;
+                break;
+            }
+        }
+    }
+
+    const outer = outer_decl orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), outer.clauses.len);
+    const body = outer.clauses[0].body orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 1), body.len);
+    try std.testing.expect(body[0] == .expr);
+    try std.testing.expect(body[0].expr.* == .call);
+    const callee = body[0].expr.call.callee;
+    try std.testing.expect(callee.* == .field_access);
+    try std.testing.expectEqualStrings("helper", parser.interner.get(callee.field_access.field));
+}
+
 test "macro engine invokes registered compiled macro through CTFE" {
     const source =
         \\pub struct Provider {
@@ -4379,11 +5808,11 @@ test "macro engine invokes registered compiled macro through CTFE" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4450,6 +5879,118 @@ test "macro engine invokes registered compiled macro through CTFE" {
     try std.testing.expectEqual(@as(i64, 42), consumer_body.?[0].expr.int_literal.value);
 }
 
+test "compiled macro CTFE diagnostics preserve rich formatting" {
+    const source =
+        \\pub struct Provider {
+        \\  pub macro explode() -> Expr {
+        \\    0
+        \\  }
+        \\}
+        \\
+        \\pub struct Consumer {
+        \\  import Provider
+        \\
+        \\  pub fn use_it() -> i64 {
+        \\    explode()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    const provider_scope = collector.graph.findStructScope(program.structs[0].name).?;
+    const explode_name = try parser.interner.intern("explode");
+    const macro_family_id = collector.graph.resolveMacro(provider_scope, explode_name, 0).?;
+
+    const compiled_body = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 1 } },
+        .{ .const_int = .{ .dest = 1, .value = 0 } },
+        .{ .binary_op = .{ .dest = 2, .op = .div, .lhs = 0, .rhs = 1 } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    const compiled_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &compiled_body },
+    };
+    const compiled_functions = [_]ir.Function{
+        .{
+            .id = 0,
+            .name = "explode",
+            .struct_name = "Provider",
+            .local_name = "explode__0",
+            .scope_id = provider_scope,
+            .arity = 0,
+            .params = &.{},
+            .return_type = .any,
+            .body = &compiled_blocks,
+            .is_closure = false,
+            .captures = &.{},
+            .local_count = 3,
+        },
+    };
+    const compiled_program = ir.Program{
+        .functions = &compiled_functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    var executor = CompiledMacroExecutor.init(alloc, &compiled_program);
+    defer executor.deinit();
+    try executor.registerMacroFunction(macro_family_id, 0);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    engine.setCompiledExecutor(&executor);
+    _ = try engine.expandProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    const diagnostic = engine.errors.items[0].message;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "error: division by zero") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "while evaluating `explode`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "help: ensure the divisor is non-zero at compile time") != null);
+}
+
+test "compiled macro CTFE diagnostic formatting propagates OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    var interner = ast.StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    var engine = MacroEngine.init(failing_allocator.allocator(), &interner, &graph);
+    defer engine.deinit();
+
+    const ctfe_error = ctfe.CtfeError{
+        .message = "division by zero",
+        .kind = .division_by_zero,
+        .call_stack = &.{
+            .{
+                .function_name = "explode",
+                .function_id = 0,
+                .instruction_index = 2,
+                .source_span = .{ .start = 10, .end = 20, .line = 4, .col = 7 },
+            },
+        },
+    };
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        engine.appendCompiledCtfeErrorDiagnostic(.{ .start = 100, .end = 109 }, ctfe_error),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+}
+
 test "macro engine reaches fixed point" {
     const source =
         \\pub struct Test {
@@ -4463,11 +6004,11 @@ test "macro engine reaches fixed point" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4503,11 +6044,11 @@ test "typed macro: nil in String return position is an error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4543,11 +6084,11 @@ test "typed macro: valid types produce no errors" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4580,11 +6121,11 @@ test "typed macro: missing else branch is an error for non-nil return type" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4616,11 +6157,11 @@ test "typed macro: param type mismatch with return type" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4655,11 +6196,11 @@ test "macro substitution into case_expr and block" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4708,11 +6249,11 @@ test "bootstrap `or` fallback binds the left operand once (stdlib-core--01)" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4808,11 +6349,11 @@ test "typed splice: Atom param accepts atom literals" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4847,11 +6388,11 @@ test "typed splice: Atom param rejects integer literal" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4890,11 +6431,11 @@ test "typed splice: Integer param accepts integer literals" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4928,11 +6469,11 @@ test "typed splice: List param accepts list literals" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -4969,11 +6510,11 @@ test "typed splice: Type param accepts primitive numeric type names" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5009,11 +6550,11 @@ test "struct attribute intrinsics: put writes to current StructEntry" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5077,11 +6618,11 @@ test "@before_compile: hook fires and splices result into target struct" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5123,6 +6664,159 @@ test "@before_compile: hook fires and splices result into target struct" {
     try std.testing.expect(found_injected);
 }
 
+test "@before_compile: hook evaluator reports denied read_file capability" {
+    const source =
+        \\pub struct Hooks {
+        \\  pub macro __before_compile__(_env :: Expr) -> Decl {
+        \\    read_file("zap_missing_before_compile_capability_asset.txt")
+        \\  }
+        \\}
+        \\
+        \\pub struct Target {
+        \\  @before_compile = :Hooks
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    try std.testing.expectError(error.MacroExpansionFailed, engine.expandProgram(&program));
+
+    var found_capability_diagnostic = false;
+    for (engine.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "macro `__before_compile__` reached `read_file` without the inferred read_file capability") != null) {
+            found_capability_diagnostic = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_capability_diagnostic);
+}
+
+test "@before_compile: non-declaration hook output fails diagnostically" {
+    const source =
+        \\pub struct Hooks {
+        \\  pub macro __before_compile__(_env :: Expr) -> Decl {
+        \\    quote {
+        \\      123
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\pub struct Target {
+        \\  @before_compile = :Hooks
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    const target_span = blk: {
+        for (program.structs) |mod| {
+            if (mod.name.parts.len != 1) continue;
+            if (std.mem.eql(u8, parser.interner.get(mod.name.parts[0]), "Target")) {
+                break :blk mod.meta.span;
+            }
+        }
+        return error.TargetMissing;
+    };
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+
+    try std.testing.expectError(error.MalformedMacroExpansion, engine.expandProgram(&program));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "@before_compile hook must return declarations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "non-declaration") != null);
+    try std.testing.expectEqual(target_span.start, engine.errors.items[0].span.start);
+    try std.testing.expectEqual(target_span.end, engine.errors.items[0].span.end);
+}
+
+test "@before_compile: explicit nil and empty output remain no-ops" {
+    const source =
+        \\pub struct NilHook {
+        \\  pub macro __before_compile__(_env :: Expr) -> Decl {
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub struct EmptyHook {
+        \\  pub macro __before_compile__(_env :: Expr) -> Decl {
+        \\    []
+        \\  }
+        \\}
+        \\
+        \\pub struct NilTarget {
+        \\  pub fn original() -> i64 {
+        \\    1
+        \\  }
+        \\
+        \\  @before_compile = :NilHook
+        \\}
+        \\
+        \\pub struct EmptyTarget {
+        \\  @before_compile = :EmptyHook
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+
+    var nil_target_functions: usize = 0;
+    var empty_target_functions: usize = 0;
+    for (expanded.structs) |mod| {
+        if (mod.name.parts.len != 1) continue;
+        const struct_name = parser.interner.get(mod.name.parts[0]);
+        if (!std.mem.eql(u8, struct_name, "NilTarget") and !std.mem.eql(u8, struct_name, "EmptyTarget")) continue;
+
+        for (mod.items) |item| {
+            if (item != .function) continue;
+            if (std.mem.eql(u8, struct_name, "NilTarget")) {
+                nil_target_functions += 1;
+            } else {
+                empty_target_functions += 1;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), nil_target_functions);
+    try std.testing.expectEqual(@as(usize, 0), empty_target_functions);
+}
+
 test "@before_compile: hook target may be a nested struct" {
     const source =
         \\pub struct Hooks.Nested {
@@ -5148,11 +6842,11 @@ test "@before_compile: hook target may be a nested struct" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5176,6 +6870,85 @@ test "@before_compile: hook target may be a nested struct" {
     }
 
     try std.testing.expect(found_injected);
+}
+
+test "P4J2: hook atom cleanup frees owned dotted struct names" {
+    const allocator = std.testing.allocator;
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const atom_hook_id = try interner.intern("AtomHook");
+    const string_hook_id = try interner.intern("StringHook");
+    const hooks_id = try interner.intern("Hooks");
+    const nested_id = try interner.intern("Nested");
+    const nested_name_parts = [_]ast.StringId{ hooks_id, nested_id };
+
+    const atom_expr = ast.Expr{ .atom_literal = .{
+        .meta = meta,
+        .value = atom_hook_id,
+    } };
+    const string_expr = ast.Expr{ .string_literal = .{
+        .meta = meta,
+        .value = string_hook_id,
+    } };
+    const struct_expr = ast.Expr{ .struct_ref = .{
+        .meta = meta,
+        .name = .{
+            .parts = nested_name_parts[0..],
+            .span = meta.span,
+        },
+    } };
+    const elements = [_]*const ast.Expr{ &atom_expr, &string_expr, &struct_expr };
+    const list_expr = ast.Expr{ .list = .{
+        .meta = meta,
+        .elements = elements[0..],
+    } };
+
+    var hook_atoms: std.ArrayListUnmanaged(MacroEngine.HookAtom) = .empty;
+    defer MacroEngine.deinitHookAtoms(&hook_atoms, allocator);
+
+    try MacroEngine.collectHookAtomsFromExpr(&hook_atoms, allocator, &interner, &list_expr);
+
+    try std.testing.expectEqual(@as(usize, 3), hook_atoms.items.len);
+    try std.testing.expectEqualStrings("AtomHook", hook_atoms.items[0].name());
+    try std.testing.expectEqualStrings("StringHook", hook_atoms.items[1].name());
+    try std.testing.expectEqualStrings("Hooks.Nested", hook_atoms.items[2].name());
+}
+
+fn collectNestedStructHookAtomWithAllocator(allocator: std.mem.Allocator) !void {
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+
+    const hooks_id = try interner.intern("Hooks");
+    const nested_id = try interner.intern("Nested");
+    const nested_name_parts = [_]ast.StringId{ hooks_id, nested_id };
+    const struct_expr = ast.Expr{ .struct_ref = .{
+        .meta = meta,
+        .name = .{
+            .parts = nested_name_parts[0..],
+            .span = meta.span,
+        },
+    } };
+
+    var hook_atoms: std.ArrayListUnmanaged(MacroEngine.HookAtom) = .empty;
+    defer MacroEngine.deinitHookAtoms(&hook_atoms, allocator);
+
+    try MacroEngine.collectHookAtomsFromExpr(&hook_atoms, allocator, &interner, &struct_expr);
+
+    try std.testing.expectEqual(@as(usize, 1), hook_atoms.items.len);
+    try std.testing.expectEqualStrings("Hooks.Nested", hook_atoms.items[0].name());
+}
+
+test "P4J2: hook atom collection frees owned dotted names on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        collectNestedStructHookAtomWithAllocator,
+        .{},
+    );
 }
 
 test "use macro struct attributes apply to the caller struct" {
@@ -5207,11 +6980,11 @@ test "use macro struct attributes apply to the caller struct" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5274,11 +7047,11 @@ test "Zest test/2 macro: multi-stmt quote body matches lib/zest/case.zap shape" 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5343,11 +7116,11 @@ test "Zest test/2 macro: multiple tests with setup/teardown sibling calls" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5408,11 +7181,11 @@ test "Zest test/2 macro: multiple tests through a passthrough wrapper" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5474,11 +7247,11 @@ test "Zest test/2 macro: works through a passthrough wrapper macro" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5537,11 +7310,11 @@ test "Zest test/2 macro: generates dynamically-named fn + tracking call" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5611,11 +7384,11 @@ test "comptime function dispatch: refuses impure function (zig interop)" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5680,11 +7453,11 @@ test "comptime function dispatch: transitive — function calls function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5740,11 +7513,11 @@ test "comptime function dispatch: macro calls pure user-defined function" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5798,11 +7571,11 @@ test "comptime for: iterates list and accumulates body results" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5860,11 +7633,11 @@ test "comptime for: filter clause excludes elements" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5917,11 +7690,11 @@ test "comptime intrinsics: slugify produces snake_case from string" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -5978,11 +7751,11 @@ test "comptime intrinsics: source_text returns user expression source" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
     try collector.graph.registerSourceFileWithContent(0, "source_text_test.zap", source);
-    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+    try inferCapabilitiesForTest(alloc, &collector, parser.interner);
 
     var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
@@ -6034,11 +7807,11 @@ test "comptime intrinsics: source_location returns user expression location" {
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
     try collector.graph.registerSourceFileWithContent(0, "source_location_test.zap", source);
-    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+    try inferCapabilitiesForTest(alloc, &collector, parser.interner);
 
     var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
@@ -6096,11 +7869,11 @@ test "comptime intrinsics: slugify + intern produces dynamic fn name" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6158,11 +7931,11 @@ test "dynamic fn name: unquote in fn-name position resolves at expansion" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6232,11 +8005,11 @@ test "@before_compile: hook reads caller's accumulated attributes" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6257,9 +8030,10 @@ test "@before_compile: hook reads caller's accumulated attributes" {
         return error.TargetMissing;
     };
     const tests_id = try parser.interner.intern("tests");
-    const accumulated = (try collector.graph.getStructAttribute(target_entry, tests_id)) orelse return error.AttributeMissing;
-    try std.testing.expect(accumulated == .list);
-    try std.testing.expectEqual(@as(usize, 2), accumulated.list.len);
+    var accumulated = (try collector.graph.getStructAttribute(target_entry, tests_id)) orelse return error.AttributeMissing;
+    defer accumulated.deinit(collector.graph.allocator);
+    try std.testing.expect(accumulated.value == .list);
+    try std.testing.expectEqual(@as(usize, 2), accumulated.value.list.len);
 }
 
 test "@before_compile: hook fires at most once per (struct, hook)" {
@@ -6286,11 +8060,11 @@ test "@before_compile: hook fires at most once per (struct, hook)" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6339,11 +8113,11 @@ test "struct attribute intrinsics: register makes attribute accumulate" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6363,17 +8137,18 @@ test "struct attribute intrinsics: register makes attribute accumulate" {
 
     // Two values were appended; the read should produce a list of
     // both atoms in append order.
-    const attr_value = blk: {
+    var attr_value = blk: {
         const tests_id = try parser.interner.intern("tests");
         const v = try collector.graph.getStructAttribute(test_struct, tests_id);
         break :blk v orelse return error.AttributeMissing;
     };
-    try std.testing.expect(attr_value == .list);
-    try std.testing.expectEqual(@as(usize, 2), attr_value.list.len);
-    try std.testing.expect(attr_value.list[0] == .atom);
-    try std.testing.expect(attr_value.list[1] == .atom);
-    try std.testing.expectEqualStrings("foo", attr_value.list[0].atom);
-    try std.testing.expectEqualStrings("bar", attr_value.list[1].atom);
+    defer attr_value.deinit(collector.graph.allocator);
+    try std.testing.expect(attr_value.value == .list);
+    try std.testing.expectEqual(@as(usize, 2), attr_value.value.list.len);
+    try std.testing.expect(attr_value.value.list[0] == .atom);
+    try std.testing.expect(attr_value.value.list[1] == .atom);
+    try std.testing.expectEqualStrings("foo", attr_value.value.list[0].atom);
+    try std.testing.expectEqualStrings("bar", attr_value.value.list[1].atom);
 }
 
 // ============================================================
@@ -6397,16 +8172,16 @@ test "capability inference: macro using read_file gets read_file in its set" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), collector.errors.items.len);
 
-    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+    try inferCapabilitiesForTest(alloc, &collector, parser.interner);
 
     try std.testing.expect(collector.graph.macro_families.items.len > 0);
     const family = collector.graph.macro_families.items[0];
@@ -6426,15 +8201,15 @@ test "capability inference: pure macro has empty cap set" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+    try inferCapabilitiesForTest(alloc, &collector, parser.interner);
 
     try std.testing.expect(collector.graph.macro_families.items.len > 0);
     const family = collector.graph.macro_families.items[0];
@@ -6456,15 +8231,15 @@ test "capability inference: caps propagate transitively through macro-to-macro c
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
-    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+    try inferCapabilitiesForTest(alloc, &collector, parser.interner);
 
     // Both macros must have read_file in their inferred set: `inner`
     // because it directly calls `read_file`, and `outer` because the
@@ -6488,11 +8263,11 @@ test "capability inference: writing @requires is a compile error" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6549,16 +8324,16 @@ test "capability: macro using read_file expands without diagnostics" {
     , .{tmp_path});
     const source = try buildCapTestSource(alloc, macros_decl, "embed_fixture()");
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), collector.errors.items.len);
 
-    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+    try inferCapabilitiesForTest(alloc, &collector, parser.interner);
 
     var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
@@ -6566,6 +8341,100 @@ test "capability: macro using read_file expands without diagnostics" {
 
     for (engine.errors.items) |err| {
         try std.testing.expect(std.mem.find(u8, err.message, "read_file") == null);
+    }
+}
+
+test "capability: declaration macro evaluator reports denied read_file capability" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro fn(decl :: Expr) -> Expr {
+        \\    read_file("zap_missing_declaration_capability_asset.txt")
+        \\    decl
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    1
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    try std.testing.expectError(error.MacroExpansionFailed, engine.expandProgram(&program));
+
+    var found_capability_diagnostic = false;
+    for (engine.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "macro `fn` reached `read_file` without the inferred read_file capability") != null) {
+            found_capability_diagnostic = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_capability_diagnostic);
+}
+
+test "capability: declaration macro read_file resolves relative to macro source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const asset_name = "zap_decl_macro_source_relative_asset.txt";
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = asset_name,
+        .data = "source-relative fixture",
+    });
+
+    const source = try std.fmt.allocPrint(alloc,
+        \\pub struct Test {{
+        \\  pub macro fn(decl :: Expr) -> Expr {{
+        \\    _fixture = read_file("{s}")
+        \\    decl
+        \\  }}
+        \\
+        \\  pub fn run() -> i64 {{
+        \\    1
+        \\  }}
+        \\}}
+    , .{asset_name});
+    try tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "macro_provider.zap",
+        .data = source,
+    });
+    const macro_source_path = try tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, "macro_provider.zap", alloc);
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var parser = Parser.initWithSharedInterner(alloc, source, &interner, 0);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+    try collector.graph.registerSourceFileWithContent(0, macro_source_path, source);
+    try inferCapabilitiesForTest(alloc, &collector, parser.interner);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    _ = try engine.expandProgram(&program);
+
+    try std.testing.expect(engine.expansionDependencies().len > 0);
+    for (engine.errors.items) |err| {
+        try std.testing.expect(std.mem.indexOf(u8, err.message, "read_file") == null);
     }
 }
 
@@ -6586,17 +8455,18 @@ test "macro eval rejects bare underscore-prefixed call in macro body" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
     var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
-    _ = try engine.expandProgram(&program);
+    try std.testing.expectError(error.MacroExpansionFailed, engine.expandProgram(&program));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
 
     var found_error = false;
     for (engine.errors.items) |err| {
@@ -6631,17 +8501,18 @@ test "macro eval rejects qualified underscore-prefixed call in macro body" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
     var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
-    _ = try engine.expandProgram(&program);
+    try std.testing.expectError(error.MacroExpansionFailed, engine.expandProgram(&program));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
 
     var found_error = false;
     for (engine.errors.items) |err| {
@@ -6671,11 +8542,11 @@ test "collector rejects defining a single-underscore-prefixed macro" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6710,11 +8581,11 @@ test "macro engine rejects direct qualified __using__ macro call" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6756,16 +8627,16 @@ test "capability: macro-to-macro chain expands cleanly when inference grants cap
     , .{tmp_path});
     const source = try buildCapTestSource(alloc, macros_decl, "outer_io()");
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
     try std.testing.expectEqual(@as(usize, 0), collector.errors.items.len);
 
-    try @import("capability_inference.zig").inferAndApply(alloc, &collector.graph, parser.interner);
+    try inferCapabilitiesForTest(alloc, &collector, parser.interner);
 
     var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
     defer engine.deinit();
@@ -6794,11 +8665,11 @@ test "typed splice: untyped param accepts anything (back-compat)" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6885,11 +8756,11 @@ test "Zest describe migration T1: single test generates fn test_<group>_<test> w
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -6944,11 +8815,11 @@ test "Zest describe migration T2: two tests in describe produce two distinct fn 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7011,11 +8882,11 @@ test "Zest describe migration T3: setup body threads through ctx binding into te
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7073,11 +8944,11 @@ test "Zest describe migration T4: teardown body appended as a statement in each 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7159,11 +9030,11 @@ test "Zest describe migration T5: bare test outside describe produces test_<slug
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7228,11 +9099,11 @@ test "Flatt-2016 hygiene: swap-macro discriminates user vs template identifiers 
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7408,11 +9279,11 @@ test "Flatt-2016 hygiene: resolveBindingHygienic discriminates user vs macro-int
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7649,11 +9520,11 @@ test "expansion provenance: macro output carries call_site and macro_name" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7705,11 +9576,11 @@ test "expansion provenance: nested macro chains via parent" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7753,11 +9624,11 @@ test "expansion provenance: source-level nodes have no expansion stamp" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7796,11 +9667,11 @@ test "use macro receives explicit empty option list" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7845,11 +9716,11 @@ test "use macro receives bare pattern keyword option list" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7919,11 +9790,11 @@ test "use macro looks up __using__ in the use target's own scope, not the consum
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     defer parser.deinit();
     const program = try parser.parseProgram();
 
-    var collector = Collector.init(alloc, parser.interner, null);
+    var collector = try Collector.init(alloc, parser.interner, null);
     defer collector.deinit();
     try collector.collectProgram(&program);
 
@@ -7946,4 +9817,1619 @@ test "use macro looks up __using__ in the use target's own scope, not the consum
 
     try std.testing.expect(found_first_marker);
     try std.testing.expect(found_second_marker);
+}
+
+fn makeMatcherTestMeta() ast.NodeMeta {
+    return .{ .span = .{ .start = 0, .end = 0 } };
+}
+
+fn makeNestedTuplePatternForMatcherTest(
+    alloc: std.mem.Allocator,
+    depth: usize,
+) !*const ast.Pattern {
+    const meta = makeMatcherTestMeta();
+    var current = try alloc.create(ast.Pattern);
+    current.* = .{ .wildcard = .{ .meta = meta } };
+
+    for (0..depth) |_| {
+        const elements = try alloc.alloc(*const ast.Pattern, 1);
+        elements[0] = current;
+
+        const next = try alloc.create(ast.Pattern);
+        next.* = .{ .tuple = .{
+            .meta = meta,
+            .elements = elements,
+        } };
+        current = next;
+    }
+
+    return current;
+}
+
+fn makeNestedTupleCtForMatcherTest(
+    alloc: std.mem.Allocator,
+    store: *ctfe.AllocationStore,
+    depth: usize,
+) !ctfe.CtValue {
+    const empty_meta = try ast_data.emptyList(alloc, store);
+    var current: ctfe.CtValue = .{ .int = 1 };
+
+    for (0..depth) |_| {
+        const args = try ast_data.makeList(alloc, store, &.{current});
+        current = try ast_data.makeTuple3(alloc, store, .{ .atom = "{}" }, empty_meta, args);
+    }
+
+    return current;
+}
+
+fn makeNestedListCtForMatcherTest(
+    alloc: std.mem.Allocator,
+    store: *ctfe.AllocationStore,
+    depth: usize,
+) !ctfe.CtValue {
+    var current: ctfe.CtValue = .{ .int = 1 };
+    for (0..depth) |_| {
+        current = try ast_data.makeList(alloc, store, &.{current});
+    }
+    return current;
+}
+
+fn wrapCtInNestedListsForSubstitutionTest(
+    alloc: std.mem.Allocator,
+    store: *ctfe.AllocationStore,
+    leaf: ctfe.CtValue,
+    depth: usize,
+) !ctfe.CtValue {
+    var current = leaf;
+    for (0..depth) |_| {
+        current = try ast_data.makeList(alloc, store, &.{current});
+    }
+    return current;
+}
+
+fn makeVarRefCtForSubstitutionTest(
+    alloc: std.mem.Allocator,
+    store: *ctfe.AllocationStore,
+    name: []const u8,
+) !ctfe.CtValue {
+    const empty_meta = try ast_data.emptyList(alloc, store);
+    return ast_data.makeTuple3(alloc, store, .{ .atom = name }, empty_meta, .nil);
+}
+
+fn makeUnquoteCtForSubstitutionTest(
+    alloc: std.mem.Allocator,
+    store: *ctfe.AllocationStore,
+    name: []const u8,
+) !ctfe.CtValue {
+    const empty_meta = try ast_data.emptyList(alloc, store);
+    const var_ref = try makeVarRefCtForSubstitutionTest(alloc, store, name);
+    const args = try ast_data.makeList(alloc, store, &.{var_ref});
+    return ast_data.makeTuple3(alloc, store, .{ .atom = "unquote" }, empty_meta, args);
+}
+
+fn deinitHygienicQuoteTestExpr(allocator: std.mem.Allocator, expr: *const ast.Expr) void {
+    const mutable = @constCast(expr);
+    switch (mutable.*) {
+        .binary_op => |binary| {
+            deinitHygienicQuoteTestExpr(allocator, binary.lhs);
+            deinitHygienicQuoteTestExpr(allocator, binary.rhs);
+            var meta = binary.meta;
+            meta.scopes.deinit(allocator);
+        },
+        .var_ref => |var_ref| {
+            var meta = var_ref.meta;
+            meta.scopes.deinit(allocator);
+        },
+        .block => |block| {
+            for (block.stmts) |stmt| {
+                if (stmt == .expr) {
+                    deinitHygienicQuoteTestExpr(allocator, stmt.expr);
+                }
+            }
+            allocator.free(block.stmts);
+            var meta = block.meta;
+            meta.scopes.deinit(allocator);
+        },
+        .int_literal => |literal| {
+            var meta = literal.meta;
+            meta.scopes.deinit(allocator);
+        },
+        else => {
+            var meta = mutable.getMeta();
+            meta.scopes.deinit(allocator);
+        },
+    }
+    allocator.destroy(mutable);
+}
+
+fn expandSimpleHygienicQuoteWithAllocator(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const tmp_name = try interner.intern("tmp");
+    const user_name = try interner.intern("user_id");
+    const meta = ast.NodeMeta{ .span = .{ .start = 10, .end = 20 } };
+
+    const template_ref = ast.Expr{ .var_ref = .{
+        .meta = meta,
+        .name = tmp_name,
+    } };
+    const unquote_name = ast.Expr{ .var_ref = .{
+        .meta = meta,
+        .name = user_name,
+    } };
+    const unquote_expr = ast.Expr{ .unquote_expr = .{
+        .meta = meta,
+        .expr = &unquote_name,
+    } };
+    const binary_expr = ast.Expr{ .binary_op = .{
+        .meta = meta,
+        .op = .add,
+        .lhs = &template_ref,
+        .rhs = &unquote_expr,
+    } };
+    const quote_body = [_]ast.Stmt{.{ .expr = &binary_expr }};
+    const quote_expr = ast.Expr{ .quote_expr = .{
+        .meta = meta,
+        .body = &quote_body,
+    } };
+
+    const arg_ref = ast.Expr{ .var_ref = .{
+        .meta = meta,
+        .name = tmp_name,
+    } };
+    const args = [_]*const ast.Expr{&arg_ref};
+    const param_pattern = ast.Pattern{ .bind = .{
+        .meta = meta,
+        .name = user_name,
+    } };
+    const params = [_]ast.Param{.{
+        .meta = meta,
+        .pattern = &param_pattern,
+        .type_annotation = null,
+    }};
+
+    var engine = MacroEngine.init(allocator, &interner, &graph);
+    defer engine.deinit();
+
+    const use_scope: scope.ScopeId = 77;
+    const intro_scope: scope.ScopeId = 99;
+    const expanded = try engine.expandQuoteHygienic(
+        &quote_expr,
+        &args,
+        &params,
+        meta.span,
+        use_scope,
+        intro_scope,
+    );
+    defer deinitHygienicQuoteTestExpr(allocator, expanded);
+
+    try std.testing.expect(expanded.* == .binary_op);
+    try std.testing.expect(expanded.binary_op.lhs.* == .var_ref);
+    try std.testing.expect(expanded.binary_op.rhs.* == .var_ref);
+    const template_scopes = expanded.binary_op.lhs.var_ref.meta.scopes;
+    const user_scopes = expanded.binary_op.rhs.var_ref.meta.scopes;
+    try std.testing.expect(template_scopes.contains(use_scope));
+    try std.testing.expect(template_scopes.contains(intro_scope));
+    try std.testing.expect(!user_scopes.contains(use_scope));
+    try std.testing.expect(!user_scopes.contains(intro_scope));
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+}
+
+fn makeNestedBlockCtForMacroTest(
+    alloc: std.mem.Allocator,
+    store: *ctfe.AllocationStore,
+    depth: usize,
+) !ctfe.CtValue {
+    const empty_meta = try ast_data.emptyList(alloc, store);
+    var current: ctfe.CtValue = .{ .int = 1 };
+    for (0..depth) |_| {
+        const block_args = try ast_data.makeList(alloc, store, &.{current});
+        current = try ast_data.makeTuple3(alloc, store, .{ .atom = "__block__" }, empty_meta, block_args);
+    }
+    return current;
+}
+
+fn makeNestedTupleExprForStampTest(
+    alloc: std.mem.Allocator,
+    depth: usize,
+) !*const ast.Expr {
+    const meta = makeMatcherTestMeta();
+    var current = try alloc.create(ast.Expr);
+    current.* = .{ .int_literal = .{ .meta = meta, .value = 1 } };
+
+    for (0..depth) |_| {
+        const elements = try alloc.alloc(*const ast.Expr, 1);
+        elements[0] = current;
+
+        const next = try alloc.create(ast.Expr);
+        next.* = .{ .tuple = .{
+            .meta = meta,
+            .elements = elements,
+        } };
+        current = next;
+    }
+
+    return current;
+}
+
+fn makeNestedNameTypeForStampTest(
+    alloc: std.mem.Allocator,
+    name: ast.StringId,
+    depth: usize,
+) !*const ast.TypeExpr {
+    const meta = makeMatcherTestMeta();
+    var current = try alloc.create(ast.TypeExpr);
+    current.* = .{ .variable = .{ .meta = meta, .name = name } };
+
+    for (0..depth) |_| {
+        const args = try alloc.alloc(*const ast.TypeExpr, 1);
+        args[0] = current;
+
+        const next = try alloc.create(ast.TypeExpr);
+        next.* = .{ .name = .{
+            .meta = meta,
+            .name = name,
+            .args = args,
+        } };
+        current = next;
+    }
+
+    return current;
+}
+
+fn makeExpansionInfoForStampTest() ast.ExpansionInfo {
+    return .{
+        .call_site = .{ .start = 10, .end = 20 },
+        .macro_name = 0,
+    };
+}
+
+test "macro result flattening handles deeply nested __block__ iteratively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var store = ctfe.AllocationStore{};
+
+    const nested_block = try makeNestedBlockCtForMacroTest(alloc, &store, 20_000);
+    var flattened: std.ArrayList(ctfe.CtValue) = .empty;
+    defer flattened.deinit(alloc);
+
+    var engine = MacroEngine.init(alloc, &interner, &graph);
+    defer engine.deinit();
+
+    try engine.flattenNestedBlocks(nested_block, &flattened, .{ .start = 100, .end = 110 });
+    try std.testing.expectEqual(@as(usize, 1), flattened.items.len);
+    try std.testing.expect(flattened.items[0] == .int);
+    try std.testing.expectEqual(@as(i64, 1), flattened.items[0].int);
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+}
+
+test "macro result flattening reports structural budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var store = ctfe.AllocationStore{};
+
+    const nested_block = try makeNestedBlockCtForMacroTest(alloc, &store, 4);
+    var flattened: std.ArrayList(ctfe.CtValue) = .empty;
+    defer flattened.deinit(alloc);
+
+    var engine = MacroEngine.init(alloc, &interner, &graph);
+    defer engine.deinit();
+    const span = ast.SourceSpan{ .start = 100, .end = 110 };
+
+    try std.testing.expectError(
+        error.MacroResultFlattenBudgetExceeded,
+        engine.flattenNestedBlocksWithBudget(nested_block, &flattened, span, 2),
+    );
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expectEqual(span.start, engine.errors.items[0].span.start);
+    try std.testing.expectEqual(span.end, engine.errors.items[0].span.end);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "__block__ flattening exceeded structural budget (2)") != null);
+}
+
+test "macro expansion stamping handles deeply nested expression trees iteratively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const depth: usize = 20_000;
+    const expr = try makeNestedTupleExprForStampTest(alloc, depth);
+    var info = makeExpansionInfoForStampTest();
+    var errors: std.ArrayList(MacroEngine.Error) = .empty;
+    defer errors.deinit(alloc);
+
+    try stampExpansionOnExpr(alloc, &errors, expr, &info, info.call_site);
+    try std.testing.expectEqual(@as(usize, 0), errors.items.len);
+
+    var current = expr;
+    for (0..depth) |_| {
+        try std.testing.expect(current.getMeta().expansion == &info);
+        current = current.tuple.elements[0];
+    }
+    try std.testing.expect(current.getMeta().expansion == &info);
+}
+
+test "macro expansion stamping handles deeply nested pattern trees iteratively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const depth: usize = 20_000;
+    const pattern = try makeNestedTuplePatternForMatcherTest(alloc, depth);
+    var info = makeExpansionInfoForStampTest();
+    var errors: std.ArrayList(MacroEngine.Error) = .empty;
+    defer errors.deinit(alloc);
+
+    try stampExpansionOnPatternWithBudget(alloc, &errors, pattern, &info, info.call_site, EXPANSION_STAMP_STEP_BUDGET);
+    try std.testing.expectEqual(@as(usize, 0), errors.items.len);
+
+    var current = pattern;
+    for (0..depth) |_| {
+        try std.testing.expect(current.getMeta().expansion == &info);
+        current = current.tuple.elements[0];
+    }
+    try std.testing.expect(current.getMeta().expansion == &info);
+}
+
+test "macro expansion stamping handles deeply nested type trees iteratively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    const name = try interner.intern("Box");
+
+    const depth: usize = 20_000;
+    const type_expr = try makeNestedNameTypeForStampTest(alloc, name, depth);
+    var info = makeExpansionInfoForStampTest();
+    var errors: std.ArrayList(MacroEngine.Error) = .empty;
+    defer errors.deinit(alloc);
+
+    try stampExpansionOnTypeExprWithBudget(alloc, &errors, type_expr, &info, info.call_site, EXPANSION_STAMP_STEP_BUDGET);
+    try std.testing.expectEqual(@as(usize, 0), errors.items.len);
+
+    var current = type_expr;
+    for (0..depth) |_| {
+        try std.testing.expect(current.getMeta().expansion == &info);
+        current = current.name.args[0];
+    }
+    try std.testing.expect(current.getMeta().expansion == &info);
+}
+
+test "macro expansion stamping reports structural budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const expr = try makeNestedTupleExprForStampTest(alloc, 4);
+    var info = makeExpansionInfoForStampTest();
+    var errors: std.ArrayList(MacroEngine.Error) = .empty;
+    defer errors.deinit(alloc);
+
+    try std.testing.expectError(
+        error.MacroExpansionStampBudgetExceeded,
+        stampExpansionOnExprWithBudget(alloc, &errors, expr, &info, info.call_site, 2),
+    );
+    try std.testing.expectEqual(@as(usize, 1), errors.items.len);
+    try std.testing.expectEqual(info.call_site.start, errors.items[0].span.start);
+    try std.testing.expectEqual(info.call_site.end, errors.items[0].span.end);
+    try std.testing.expect(std.mem.indexOf(u8, errors.items[0].message, "provenance stamping exceeded structural budget (2)") != null);
+}
+
+test "macro pattern matcher handles deeply nested tuple patterns iteratively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var store = ctfe.AllocationStore{};
+
+    const depth: usize = 20_000;
+    const pattern = try makeNestedTuplePatternForMatcherTest(alloc, depth);
+    const subject = try makeNestedTupleCtForMatcherTest(alloc, &store, depth);
+
+    var engine = MacroEngine.init(alloc, &interner, &graph);
+    defer engine.deinit();
+
+    try std.testing.expect(try engine.macroPatternMatches(pattern, subject, null, &store));
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+}
+
+test "macro CtValue matcher handles deeply nested list patterns iteratively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var store = ctfe.AllocationStore{};
+
+    const depth: usize = 20_000;
+    const pattern = try makeNestedListCtForMatcherTest(alloc, &store, depth);
+    const subject = try makeNestedListCtForMatcherTest(alloc, &store, depth);
+
+    var engine = MacroEngine.init(alloc, &interner, &graph);
+    defer engine.deinit();
+
+    try std.testing.expect(try engine.macroCtPatternMatches(pattern, subject));
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+}
+
+test "hygienic quote expansion deinitializes temporary CtValues after AST conversion" {
+    try expandSimpleHygienicQuoteWithAllocator(std.testing.allocator);
+}
+
+test "hygienic quote expansion deinitializes temporary CtValues on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expandSimpleHygienicQuoteWithAllocator,
+        .{},
+    );
+}
+
+fn exerciseAliasTupleCtValueOwnership(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(allocator);
+    defer graph.deinit();
+    var store = ctfe.AllocationStore{};
+    defer store.deinit(allocator);
+
+    const outer = try interner.intern("Outer");
+    const inner = try interner.intern("Inner");
+    const parts = [_]ast.StringId{ outer, inner };
+    const struct_name = ast.StructName{
+        .parts = &parts,
+        .span = .{ .start = 0, .end = 0 },
+    };
+
+    var engine = MacroEngine.init(allocator, &interner, &graph);
+    defer engine.deinit();
+
+    const alias_value = try engine.structNameToAliasCtValue(&store, struct_name);
+    defer MacroEngine.deinitTemporaryCtValue(allocator, &store, alias_value);
+
+    try std.testing.expect(alias_value == .tuple);
+    try std.testing.expectEqual(@as(usize, 3), alias_value.tuple.elems.len);
+    try std.testing.expect(alias_value.tuple.elems[0] == .atom);
+    try std.testing.expectEqualStrings("__aliases__", alias_value.tuple.elems[0].atom);
+    try std.testing.expect(alias_value.tuple.elems[2] == .list);
+    try std.testing.expectEqual(@as(usize, 2), alias_value.tuple.elems[2].list.elems.len);
+}
+
+test "P4J2: alias tuple construction cleans temporary children on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseAliasTupleCtValueOwnership,
+        .{},
+    );
+}
+
+fn registerMacroClauseForOwnershipTest(
+    allocator: std.mem.Allocator,
+    graph: *scope.ScopeGraph,
+    scope_id: scope.ScopeId,
+    name: ast.StringId,
+    arity: u32,
+    decl: *const ast.FunctionDecl,
+) !scope.MacroFamilyId {
+    const family_id = try graph.createMacroFamily(scope_id, name, arity);
+    try graph.macro_families.items[family_id].clauses.append(allocator, .{
+        .decl = decl,
+        .clause_index = 0,
+    });
+    return family_id;
+}
+
+fn deinitMacroOwnershipTestFunctionDecl(allocator: std.mem.Allocator, decl: *const ast.FunctionDecl) void {
+    const mutable_decl = @constCast(decl);
+    for (mutable_decl.clauses) |clause| {
+        for (clause.params) |param| {
+            const mutable_pattern = @constCast(param.pattern);
+            var pattern_meta = mutable_pattern.getMeta();
+            pattern_meta.scopes.deinit(allocator);
+            allocator.destroy(mutable_pattern);
+            if (param.type_annotation) |type_annotation| {
+                allocator.destroy(@constCast(type_annotation));
+            }
+        }
+        if (clause.params.len > 0) allocator.free(clause.params);
+        if (clause.body) |body| {
+            for (body) |stmt| switch (stmt) {
+                .expr => |expr| deinitHygienicQuoteTestExpr(allocator, expr),
+                .function_decl => |function_decl| deinitMacroOwnershipTestFunctionDecl(allocator, function_decl),
+                else => {},
+            };
+            if (body.len > 0) allocator.free(body);
+        }
+        if (clause.return_type) |return_type| {
+            allocator.destroy(@constCast(return_type));
+        }
+    }
+    if (mutable_decl.clauses.len > 0) allocator.free(mutable_decl.clauses);
+    allocator.destroy(mutable_decl);
+}
+
+fn deinitMacroOwnershipTestStructItem(allocator: std.mem.Allocator, item: ast.StructItem) void {
+    switch (item) {
+        .function, .priv_function, .macro, .priv_macro => |decl| {
+            deinitMacroOwnershipTestFunctionDecl(allocator, decl);
+        },
+        .struct_level_expr => |expr| deinitHygienicQuoteTestExpr(allocator, expr),
+        else => {},
+    }
+}
+
+fn exerciseExpressionEvaluatorMacroCtValueOwnership(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const macro_name = try interner.intern("identity_eval");
+    const value_name = try interner.intern("value");
+    const meta = makeMatcherTestMeta();
+
+    const param_pattern = ast.Pattern{ .bind = .{ .meta = meta, .name = value_name } };
+    const params = [_]ast.Param{.{
+        .meta = meta,
+        .pattern = &param_pattern,
+        .type_annotation = null,
+    }};
+    const body_ref = ast.Expr{ .var_ref = .{ .meta = meta, .name = value_name } };
+    const body_stmts = [_]ast.Stmt{.{ .expr = &body_ref }};
+    const clauses = [_]ast.FunctionClause{.{
+        .meta = meta,
+        .params = &params,
+        .return_type = null,
+        .refinement = null,
+        .body = &body_stmts,
+    }};
+    const macro_decl = ast.FunctionDecl{
+        .meta = meta,
+        .name = macro_name,
+        .clauses = &clauses,
+        .visibility = .public,
+    };
+    const family_id = try registerMacroClauseForOwnershipTest(
+        allocator,
+        &graph,
+        graph.prelude_scope,
+        macro_name,
+        1,
+        &macro_decl,
+    );
+
+    const arg_expr = ast.Expr{ .int_literal = .{ .meta = meta, .value = 42 } };
+    const args = [_]*const ast.Expr{&arg_expr};
+    const callee = ast.Expr{ .var_ref = .{ .meta = meta, .name = macro_name } };
+    const call_expr = ast.Expr{ .call = .{
+        .meta = meta,
+        .callee = &callee,
+        .args = &args,
+    } };
+
+    var engine = MacroEngine.init(allocator, &interner, &graph);
+    defer engine.deinit();
+
+    const expanded = try engine.expandMacroCall(&call_expr, macro_name, family_id);
+    const expansion_info = expanded.getMeta().expansion;
+    defer if (expansion_info) |info| allocator.destroy(@constCast(info));
+    defer if (expanded != &call_expr) deinitHygienicQuoteTestExpr(allocator, expanded);
+
+    try std.testing.expect(expanded.* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 42), expanded.int_literal.value);
+}
+
+test "P4J2: expression macro evaluator deinitializes temporary CtValues" {
+    try exerciseExpressionEvaluatorMacroCtValueOwnership(std.testing.allocator);
+}
+
+test "P4J2: expression macro evaluator deinitializes temporary CtValues on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseExpressionEvaluatorMacroCtValueOwnership,
+        .{},
+    );
+}
+
+fn exerciseStructLevelMacroCtValueOwnership(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const macro_name = try interner.intern("emit_expr");
+    const value_name = try interner.intern("value");
+    const meta = makeMatcherTestMeta();
+
+    const param_pattern = ast.Pattern{ .bind = .{ .meta = meta, .name = value_name } };
+    const params = [_]ast.Param{.{
+        .meta = meta,
+        .pattern = &param_pattern,
+        .type_annotation = null,
+    }};
+    const body_ref = ast.Expr{ .var_ref = .{ .meta = meta, .name = value_name } };
+    const body_stmts = [_]ast.Stmt{.{ .expr = &body_ref }};
+    const clauses = [_]ast.FunctionClause{.{
+        .meta = meta,
+        .params = &params,
+        .return_type = null,
+        .refinement = null,
+        .body = &body_stmts,
+    }};
+    const macro_decl = ast.FunctionDecl{
+        .meta = meta,
+        .name = macro_name,
+        .clauses = &clauses,
+        .visibility = .public,
+    };
+    const family_id = try registerMacroClauseForOwnershipTest(
+        allocator,
+        &graph,
+        graph.prelude_scope,
+        macro_name,
+        1,
+        &macro_decl,
+    );
+
+    const arg_expr = ast.Expr{ .int_literal = .{ .meta = meta, .value = 7 } };
+    const args = [_]*const ast.Expr{&arg_expr};
+    const use_scope = try graph.createScope(null, .macro_expansion);
+    const intro_scope = try graph.createScope(null, .macro_expansion);
+
+    var engine = MacroEngine.init(allocator, &interner, &graph);
+    defer engine.deinit();
+
+    var evaluation = try engine.evaluateMacroBodyToCtValue(
+        &graph.macro_families.items[family_id],
+        graph.macro_families.items[family_id].clauses.items[0],
+        &clauses[0],
+        &args,
+        use_scope,
+        intro_scope,
+        interner.get(macro_name),
+        meta.span,
+    );
+    defer evaluation.deinit();
+
+    const result_ct = switch (evaluation) {
+        .value => |*owned_value| owned_value.value,
+        .no_output => return error.TestExpectedEqual,
+    };
+    const expanded = try engine.ctValueToMacroExpr(result_ct, meta.span);
+    defer deinitHygienicQuoteTestExpr(allocator, expanded);
+
+    try std.testing.expect(expanded.* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 7), expanded.int_literal.value);
+}
+
+test "P4J2: struct-level macro evaluation returns owned CtValue temporaries" {
+    try exerciseStructLevelMacroCtValueOwnership(std.testing.allocator);
+}
+
+test "P4J2: struct-level macro evaluation cleans owned CtValue temporaries on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseStructLevelMacroCtValueOwnership,
+        .{},
+    );
+}
+
+fn exerciseDeclarationMacroCtValueOwnership(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const fn_macro_name = try interner.intern("fn");
+    const decl_param_name = try interner.intern("decl");
+    const original_name = try interner.intern("original");
+    const meta = makeMatcherTestMeta();
+
+    const macro_param_pattern = ast.Pattern{ .bind = .{ .meta = meta, .name = decl_param_name } };
+    const macro_params = [_]ast.Param{.{
+        .meta = meta,
+        .pattern = &macro_param_pattern,
+        .type_annotation = null,
+    }};
+    const macro_body_ref = ast.Expr{ .var_ref = .{ .meta = meta, .name = decl_param_name } };
+    const macro_body = [_]ast.Stmt{.{ .expr = &macro_body_ref }};
+    const macro_clauses = [_]ast.FunctionClause{.{
+        .meta = meta,
+        .params = &macro_params,
+        .return_type = null,
+        .refinement = null,
+        .body = &macro_body,
+    }};
+    const macro_decl = ast.FunctionDecl{
+        .meta = meta,
+        .name = fn_macro_name,
+        .clauses = &macro_clauses,
+        .visibility = .public,
+    };
+    _ = try registerMacroClauseForOwnershipTest(
+        allocator,
+        &graph,
+        graph.prelude_scope,
+        fn_macro_name,
+        1,
+        &macro_decl,
+    );
+
+    const original_clauses = [_]ast.FunctionClause{.{
+        .meta = meta,
+        .params = &.{},
+        .return_type = null,
+        .refinement = null,
+        .body = null,
+    }};
+    const original_decl = ast.FunctionDecl{
+        .meta = meta,
+        .name = original_name,
+        .clauses = &original_clauses,
+        .visibility = .public,
+    };
+
+    var engine = MacroEngine.init(allocator, &interner, &graph);
+    defer engine.deinit();
+
+    const expanded = (try engine.tryExpandDeclarationMacro("fn", .{ .function = &original_decl })) orelse {
+        return error.TestExpectedEqual;
+    };
+    defer deinitMacroOwnershipTestStructItem(allocator, expanded);
+
+    try std.testing.expect(expanded == .function);
+    try std.testing.expectEqualStrings("original", interner.get(expanded.function.name));
+}
+
+fn exerciseDeclarationMacroNoOutputCtValueOwnership(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const fn_macro_name = try interner.intern("fn");
+    const decl_param_name = try interner.intern("decl");
+    const original_name = try interner.intern("original");
+    const meta = makeMatcherTestMeta();
+
+    const macro_param_pattern = ast.Pattern{ .bind = .{ .meta = meta, .name = decl_param_name } };
+    const macro_params = [_]ast.Param{.{
+        .meta = meta,
+        .pattern = &macro_param_pattern,
+        .type_annotation = null,
+    }};
+    const macro_body_expr = ast.Expr{ .nil_literal = .{ .meta = meta } };
+    const macro_body = [_]ast.Stmt{.{ .expr = &macro_body_expr }};
+    const macro_clauses = [_]ast.FunctionClause{.{
+        .meta = meta,
+        .params = &macro_params,
+        .return_type = null,
+        .refinement = null,
+        .body = &macro_body,
+    }};
+    const macro_decl = ast.FunctionDecl{
+        .meta = meta,
+        .name = fn_macro_name,
+        .clauses = &macro_clauses,
+        .visibility = .public,
+    };
+    _ = try registerMacroClauseForOwnershipTest(
+        allocator,
+        &graph,
+        graph.prelude_scope,
+        fn_macro_name,
+        1,
+        &macro_decl,
+    );
+
+    const original_clauses = [_]ast.FunctionClause{.{
+        .meta = meta,
+        .params = &.{},
+        .return_type = null,
+        .refinement = null,
+        .body = null,
+    }};
+    const original_decl = ast.FunctionDecl{
+        .meta = meta,
+        .name = original_name,
+        .clauses = &original_clauses,
+        .visibility = .public,
+    };
+
+    var engine = MacroEngine.init(allocator, &interner, &graph);
+    defer engine.deinit();
+
+    const expanded = try engine.tryExpandDeclarationMacro("fn", .{ .function = &original_decl });
+    try std.testing.expect(expanded == null);
+}
+
+test "P4J2: declaration macro evaluator deinitializes temporary CtValues" {
+    try exerciseDeclarationMacroCtValueOwnership(std.testing.allocator);
+}
+
+test "P4J2: declaration macro evaluator deinitializes temporary CtValues on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseDeclarationMacroNoOutputCtValueOwnership,
+        .{},
+    );
+}
+
+fn exerciseUsingMacroCtValueOwnership(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const provider_name = try interner.intern("Provider");
+    const using_name = try interner.intern("__using__");
+    const opts_name = try interner.intern("opts");
+    const meta = makeMatcherTestMeta();
+
+    const provider_parts = [_]ast.StringId{provider_name};
+    const provider_struct_name = ast.StructName{ .parts = &provider_parts, .span = meta.span };
+    const provider_decl = ast.StructDecl{
+        .meta = meta,
+        .name = provider_struct_name,
+    };
+    const provider_scope = try graph.createScope(graph.prelude_scope, .struct_scope);
+    try graph.registerStruct(provider_struct_name, provider_scope, &provider_decl);
+
+    const param_pattern = ast.Pattern{ .bind = .{ .meta = meta, .name = opts_name } };
+    const params = [_]ast.Param{.{
+        .meta = meta,
+        .pattern = &param_pattern,
+        .type_annotation = null,
+    }};
+    const quote_body_expr = ast.Expr{ .int_literal = .{ .meta = meta, .value = 1 } };
+    const quote_body = [_]ast.Stmt{.{ .expr = &quote_body_expr }};
+    const quote_expr = ast.Expr{ .quote_expr = .{
+        .meta = meta,
+        .body = &quote_body,
+    } };
+    const macro_body = [_]ast.Stmt{.{ .expr = &quote_expr }};
+    const macro_clauses = [_]ast.FunctionClause{.{
+        .meta = meta,
+        .params = &params,
+        .return_type = null,
+        .refinement = null,
+        .body = &macro_body,
+    }};
+    const macro_decl = ast.FunctionDecl{
+        .meta = meta,
+        .name = using_name,
+        .clauses = &macro_clauses,
+        .visibility = .public,
+    };
+    _ = try registerMacroClauseForOwnershipTest(
+        allocator,
+        &graph,
+        provider_scope,
+        using_name,
+        1,
+        &macro_decl,
+    );
+
+    const opts_expr = ast.Expr{ .int_literal = .{ .meta = meta, .value = 99 } };
+    const use_decl = ast.UseDecl{
+        .meta = meta,
+        .struct_path = provider_struct_name,
+        .opts = &opts_expr,
+    };
+
+    var engine = MacroEngine.init(allocator, &interner, &graph);
+    defer engine.deinit();
+
+    const items = (try engine.tryExpandUsing(&use_decl)) orelse return error.TestExpectedEqual;
+    defer {
+        for (items) |item| deinitMacroOwnershipTestStructItem(allocator, item);
+        if (items.len > 0) allocator.free(items);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), items.len);
+}
+
+test "P4J2: use macro deinitializes temporary CtValues" {
+    try exerciseUsingMacroCtValueOwnership(std.testing.allocator);
+}
+
+test "P4J2: use macro deinitializes temporary CtValues on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseUsingMacroCtValueOwnership,
+        .{},
+    );
+}
+
+fn exerciseCompiledMacroArgsCtValueOwnership(allocator: std.mem.Allocator) !void {
+    var interner = ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(allocator);
+    defer graph.deinit();
+
+    const macro_name = try interner.intern("compiled_identity");
+    const meta = makeMatcherTestMeta();
+    const family_id = try graph.createMacroFamily(graph.prelude_scope, macro_name, 1);
+
+    const compiled_params = [_]ir.Param{.{
+        .name = "value",
+        .type_expr = .any,
+    }};
+    const compiled_body = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 1, .index = 0 } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    const compiled_blocks = [_]ir.Block{
+        .{ .label = 0, .instructions = &compiled_body },
+    };
+    const compiled_functions = [_]ir.Function{.{
+        .id = 0,
+        .name = "compiled_identity",
+        .scope_id = graph.prelude_scope,
+        .arity = 1,
+        .params = &compiled_params,
+        .return_type = .any,
+        .body = &compiled_blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 2,
+    }};
+    const compiled_program = ir.Program{
+        .functions = &compiled_functions,
+        .type_defs = &.{},
+        .entry = null,
+    };
+
+    var executor = CompiledMacroExecutor.init(allocator, &compiled_program);
+    defer executor.deinit();
+    try executor.registerMacroFunction(family_id, 0);
+
+    const arg_expr = ast.Expr{ .int_literal = .{ .meta = meta, .value = 123 } };
+    const args = [_]*const ast.Expr{&arg_expr};
+    const callee = ast.Expr{ .var_ref = .{ .meta = meta, .name = macro_name } };
+    const call_expr = ast.Expr{ .call = .{
+        .meta = meta,
+        .callee = &callee,
+        .args = &args,
+    } };
+    const use_scope = try graph.createScope(null, .macro_expansion);
+    const intro_scope = try graph.createScope(null, .macro_expansion);
+    var expansion_info = ast.ExpansionInfo{
+        .call_site = meta.span,
+        .macro_name = macro_name,
+    };
+
+    var engine = MacroEngine.init(allocator, &interner, &graph);
+    defer engine.deinit();
+    engine.setCompiledExecutor(&executor);
+
+    const expanded = try engine.expandCompiledMacroCall(
+        &call_expr,
+        family_id,
+        0,
+        use_scope,
+        intro_scope,
+        &expansion_info,
+    );
+    defer if (expanded != &call_expr) deinitHygienicQuoteTestExpr(allocator, expanded);
+
+    try std.testing.expect(expanded.* == .int_literal);
+    try std.testing.expectEqual(@as(i64, 123), expanded.int_literal.value);
+}
+
+test "P4J2: compiled macro args deinitialize temporary CtValues and arg slice" {
+    try exerciseCompiledMacroArgsCtValueOwnership(std.testing.allocator);
+}
+
+test "P4J2: compiled macro args clean temporary CtValues and arg slice on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseCompiledMacroArgsCtValueOwnership,
+        .{},
+    );
+}
+
+test "quote CtValue substitution handles deeply nested macro-produced lists iteratively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var store = ctfe.AllocationStore{};
+    defer store.deinit(alloc);
+
+    var engine = MacroEngine.init(alloc, &interner, &graph);
+    defer engine.deinit();
+    var param_map = std.StringHashMap(ctfe.CtValue).init(alloc);
+    defer param_map.deinit();
+    try param_map.put("value", .{ .int = 42 });
+
+    const depth: usize = 20_000;
+    const unquote_value = try makeUnquoteCtForSubstitutionTest(alloc, &store, "value");
+    const nested = try wrapCtInNestedListsForSubstitutionTest(alloc, &store, unquote_value, depth);
+    const substituted = try engine.substituteCtValue(nested, &param_map, &store, .{ .start = 12, .end = 18 });
+
+    var current = substituted;
+    for (0..depth) |_| {
+        try std.testing.expect(current == .list);
+        try std.testing.expectEqual(@as(usize, 1), current.list.elems.len);
+        current = current.list.elems[0];
+    }
+    try std.testing.expect(current == .int);
+    try std.testing.expectEqual(@as(i64, 42), current.int);
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+}
+
+test "quote CtValue substitution reports structural budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var store = ctfe.AllocationStore{};
+    defer store.deinit(alloc);
+
+    var engine = MacroEngine.init(alloc, &interner, &graph);
+    defer engine.deinit();
+    var param_map = std.StringHashMap(ctfe.CtValue).init(alloc);
+    defer param_map.deinit();
+    try param_map.put("value", .{ .int = 42 });
+
+    const span = ast.SourceSpan{ .start = 55, .end = 61 };
+    const unquote_value = try makeUnquoteCtForSubstitutionTest(alloc, &store, "value");
+    const nested = try wrapCtInNestedListsForSubstitutionTest(alloc, &store, unquote_value, 4);
+
+    try std.testing.expectError(
+        error.MacroCtSubstitutionBudgetExceeded,
+        engine.substituteCtValueWithBudget(nested, &param_map, &store, span, 2),
+    );
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expectEqual(span.start, engine.errors.items[0].span.start);
+    try std.testing.expectEqual(span.end, engine.errors.items[0].span.end);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "quote substitution exceeded structural budget (2)") != null);
+}
+
+test "macro pattern matcher reports structural budget exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var store = ctfe.AllocationStore{};
+
+    const pattern = try makeNestedTuplePatternForMatcherTest(alloc, 4);
+    const subject = try makeNestedTupleCtForMatcherTest(alloc, &store, 4);
+
+    var engine = MacroEngine.init(alloc, &interner, &graph);
+    defer engine.deinit();
+
+    try std.testing.expectError(
+        error.MacroPatternMatchBudgetExceeded,
+        engine.macroPatternMatchesWithBudget(pattern, subject, null, &store, 2),
+    );
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "structural budget (2)") != null);
+}
+
+test "macro expansion depth rejects self-recursive macro output" {
+    const source =
+        \\pub struct Bomb {
+        \\  pub macro loop(value :: Expr) -> Expr {
+        \\    quote {
+        \\      loop(unquote(value))
+        \\    }
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    loop(1)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    engine.max_expansion_depth = 32;
+    try std.testing.expectError(error.MacroExpansionDepthExceeded, engine.expandProgram(&program));
+    try std.testing.expect(engine.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "macro expansion exceeded maximum depth") != null);
+}
+
+test "macro expansion reports malformed expression CtValue at call span" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro bad() -> Expr {
+        \\    make_call("&", [intern_atom("target"), -1])
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    bad()
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var call_span: ?ast.SourceSpan = null;
+    for (program.structs[0].items) |item| {
+        if (item != .function) continue;
+        if (!std.mem.eql(u8, parser.interner.get(item.function.name), "run")) continue;
+        const body = item.function.clauses[0].body orelse return error.TestExpectedABody;
+        try std.testing.expect(body[0] == .expr);
+        try std.testing.expect(body[0].expr.* == .call);
+        call_span = body[0].expr.call.meta.span;
+    }
+    try std.testing.expect(call_span != null);
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    try std.testing.expectError(error.MalformedMacroExpansion, engine.expandProgram(&program));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "malformed AST expression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "InvalidCtValueInteger") != null);
+    try std.testing.expectEqual(call_span.?.start, engine.errors.items[0].span.start);
+    try std.testing.expectEqual(call_span.?.end, engine.errors.items[0].span.end);
+}
+
+test "quote substitution decode reports malformed CtValue at call span" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+    var store = ctfe.AllocationStore{};
+    defer store.deinit(alloc);
+
+    var engine = MacroEngine.init(alloc, &interner, &graph);
+    defer engine.deinit();
+
+    var param_map = std.StringHashMap(ctfe.CtValue).init(alloc);
+    defer param_map.deinit();
+    try param_map.put("bad", .void);
+
+    const empty_meta = try ast_data.emptyList(alloc, &store);
+    const bad_ref = try ast_data.makeTuple3(alloc, &store, .{ .atom = "bad" }, empty_meta, .nil);
+    const unquote_args = try ast_data.makeList(alloc, &store, &.{bad_ref});
+    const unquote_value = try ast_data.makeTuple3(alloc, &store, .{ .atom = "unquote" }, empty_meta, unquote_args);
+    const substituted = try engine.substituteCtValue(unquote_value, &param_map, &store, .{ .start = 0, .end = 0 });
+
+    try std.testing.expect(substituted == .void);
+
+    const call_span = ast.SourceSpan{ .start = 42, .end = 47 };
+    try std.testing.expectError(error.MalformedMacroExpansion, engine.ctValueToMacroExpr(substituted, call_span));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "malformed AST expression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "InvalidCtValueShape") != null);
+    try std.testing.expectEqual(call_span.start, engine.errors.items[0].span.start);
+    try std.testing.expectEqual(call_span.end, engine.errors.items[0].span.end);
+}
+
+test "selected expression macro evaluator failure aborts instead of falling back" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro read_unused(_value :: Expr) -> Expr {
+        \\    _value
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    read_unused(1)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+
+    try std.testing.expectError(error.MacroExpansionFailed, engine.expandProgram(&program));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "cannot read `_value`") != null);
+}
+
+test "operator macro evaluator failure aborts instead of falling back" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro read_unused(_value :: Expr) -> Expr {
+        \\    _value
+        \\  }
+        \\
+        \\  pub macro +(left :: Expr, right :: Expr) -> Expr {
+        \\    read_unused(left)
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    1 + 2
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+
+    try std.testing.expectError(error.MacroExpansionFailed, engine.expandProgram(&program));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "cannot read `_value`") != null);
+}
+
+test "operator function dispatch interner failure aborts instead of falling back" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var backing_buffer: [0]u8 = .{};
+    var fixed_buffer = std.heap.FixedBufferAllocator.init(&backing_buffer);
+    var interner = ast.StringInterner.init(fixed_buffer.allocator());
+    defer interner.deinit();
+    var graph = try scope.ScopeGraph.init(alloc);
+    defer graph.deinit();
+
+    var engine = MacroEngine.init(alloc, &interner, &graph);
+    defer engine.deinit();
+
+    const meta = ast.NodeMeta{ .span = .{ .start = 0, .end = 0 } };
+    const lhs = try alloc.create(ast.Expr);
+    lhs.* = .{ .int_literal = .{ .meta = meta, .value = 1 } };
+    const rhs = try alloc.create(ast.Expr);
+    rhs.* = .{ .int_literal = .{ .meta = meta, .value = 2 } };
+
+    try std.testing.expectError(error.OutOfMemory, engine.tryDispatchToFunction("+", &.{ lhs, rhs }, meta));
+}
+
+test "expression without a macro remains a legitimate fallback" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() -> i64 {
+        \\    not_a_macro(1)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+    const expr = findFunctionBodyExpr(&expanded, parser.interner, "run") orelse return error.TestExpectedABody;
+    try std.testing.expect(expr.* == .call);
+    try std.testing.expect(expr.call.callee.* == .var_ref);
+    try std.testing.expectEqualStrings("not_a_macro", parser.interner.get(expr.call.callee.var_ref.name));
+}
+
+test "operator expression without a macro remains a legitimate fallback" {
+    const source =
+        \\pub struct Test {
+        \\  pub fn run() -> i64 {
+        \\    1 + 2
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+    const expr = findFunctionBodyExpr(&expanded, parser.interner, "run") orelse return error.TestExpectedABody;
+    try std.testing.expect(expr.* == .binary_op);
+    try std.testing.expectEqual(ast.BinaryOp.Op.add, expr.binary_op.op);
+}
+
+test "struct-level macro expansion reports malformed expression CtValue at call span" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro bad_items() -> Expr {
+        \\    [make_call("&", [intern_atom("target"), -1])]
+        \\  }
+        \\
+        \\  bad_items()
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var call_span: ?ast.SourceSpan = null;
+    for (program.structs[0].items) |item| {
+        if (item != .struct_level_expr) continue;
+        try std.testing.expect(item.struct_level_expr.* == .call);
+        call_span = item.struct_level_expr.call.meta.span;
+    }
+    try std.testing.expect(call_span != null);
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    try std.testing.expectError(error.MalformedMacroExpansion, engine.expandProgram(&program));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "malformed AST expression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "InvalidCtValueInteger") != null);
+    try std.testing.expectEqual(call_span.?.start, engine.errors.items[0].span.start);
+    try std.testing.expectEqual(call_span.?.end, engine.errors.items[0].span.end);
+}
+
+test "selected struct-level macro evaluator failure aborts instead of falling back" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro read_unused(_value :: Expr) -> Expr {
+        \\    _value
+        \\  }
+        \\
+        \\  read_unused(1)
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+
+    try std.testing.expectError(error.MacroExpansionFailed, engine.expandProgram(&program));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "cannot read `_value`") != null);
+}
+
+test "selected struct-level macro conversion failure aborts instead of preserving the call" {
+    const source =
+        \\pub struct Test {
+        \\  pub macro malformed() -> Expr {
+        \\    make_call("&", [intern_atom("target"), -1])
+        \\  }
+        \\
+        \\  malformed()
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+
+    try std.testing.expectError(error.MalformedMacroExpansion, engine.expandProgram(&program));
+    try std.testing.expectEqual(@as(usize, 1), engine.errors.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "malformed AST expression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "InvalidCtValueInteger") != null);
+}
+
+test "struct-level expression without a macro remains a legitimate fallback" {
+    const source =
+        \\pub struct Test {
+        \\  not_a_macro(1)
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    const expanded = try engine.expandProgram(&program);
+
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), expanded.structs.len);
+    try std.testing.expectEqual(@as(usize, 1), expanded.structs[0].items.len);
+    try std.testing.expect(expanded.structs[0].items[0] == .struct_level_expr);
+    const expr = expanded.structs[0].items[0].struct_level_expr;
+    try std.testing.expect(expr.* == .call);
+    try std.testing.expect(expr.call.callee.* == .var_ref);
+    try std.testing.expectEqualStrings("not_a_macro", parser.interner.get(expr.call.callee.var_ref.name));
+}
+
+test "macro expansion depth rejects mutually recursive macro output" {
+    const source =
+        \\pub struct Bomb {
+        \\  pub macro first(value :: Expr) -> Expr {
+        \\    quote {
+        \\      second(unquote(value))
+        \\    }
+        \\  }
+        \\
+        \\  pub macro second(value :: Expr) -> Expr {
+        \\    quote {
+        \\      first(unquote(value))
+        \\    }
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    first(1)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    engine.max_expansion_depth = 32;
+    try std.testing.expectError(error.MacroExpansionDepthExceeded, engine.expandProgram(&program));
+    try std.testing.expect(engine.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, engine.errors.items[0].message, "macro expansion exceeded maximum depth") != null);
+}
+
+test "macro expansion depth allows finite nested macro output" {
+    const source =
+        \\pub struct Finite {
+        \\  pub macro inner(value :: Expr) -> Expr {
+        \\    quote {
+        \\      unquote(value)
+        \\    }
+        \\  }
+        \\
+        \\  pub macro outer(value :: Expr) -> Expr {
+        \\    quote {
+        \\      inner(unquote(value))
+        \\    }
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    outer(1)
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var engine = MacroEngine.init(alloc, parser.interner, &collector.graph);
+    defer engine.deinit();
+    engine.max_expansion_depth = 32;
+    _ = try engine.expandProgram(&program);
+    try std.testing.expectEqual(@as(usize, 0), engine.errors.items.len);
 }

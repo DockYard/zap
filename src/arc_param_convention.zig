@@ -8,6 +8,94 @@ const uniqueness_interprocedural = @import("uniqueness_interprocedural.zig");
 const uniqueness_decision = @import("uniqueness_decision.zig");
 const elision = @import("memory/elision.zig");
 
+const inline_walk_frame_capacity: usize = 64;
+const inline_child_stream_capacity: usize = 16;
+
+const InstructionStreamFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+};
+
+fn InlineStack(comptime T: type, comptime inline_capacity: usize) type {
+    return struct {
+        inline_items: [inline_capacity]T = undefined,
+        inline_len: usize = 0,
+        spill: std.ArrayListUnmanaged(T) = .empty,
+
+        const Self = @This();
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.spill.deinit(allocator);
+        }
+
+        fn clearRetainingCapacity(self: *Self) void {
+            self.inline_len = 0;
+            self.spill.clearRetainingCapacity();
+        }
+
+        fn len(self: *const Self) usize {
+            return self.inline_len + self.spill.items.len;
+        }
+
+        fn append(self: *Self, allocator: std.mem.Allocator, item: T) std.mem.Allocator.Error!void {
+            if (self.spill.items.len == 0 and self.inline_len < inline_capacity) {
+                self.inline_items[self.inline_len] = item;
+                self.inline_len += 1;
+                return;
+            }
+            try self.spill.append(allocator, item);
+        }
+
+        fn get(self: *const Self, index: usize) T {
+            std.debug.assert(index < self.len());
+            if (index < self.inline_len) return self.inline_items[index];
+            return self.spill.items[index - self.inline_len];
+        }
+
+        fn topPtr(self: *Self) *T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) {
+                return &self.spill.items[self.spill.items.len - 1];
+            }
+            return &self.inline_items[self.inline_len - 1];
+        }
+
+        fn pop(self: *Self) T {
+            std.debug.assert(self.len() != 0);
+            if (self.spill.items.len != 0) return self.spill.pop().?;
+            self.inline_len -= 1;
+            return self.inline_items[self.inline_len];
+        }
+    };
+}
+
+fn collectChildStreams(
+    allocator: std.mem.Allocator,
+    instr: *const ir.Instruction,
+    child_streams: *InlineStack([]const ir.Instruction, inline_child_stream_capacity),
+) std.mem.Allocator.Error!void {
+    child_streams.clearRetainingCapacity();
+    const ChildStreamCollector = struct {
+        allocator: std.mem.Allocator,
+        child_streams: *InlineStack([]const ir.Instruction, inline_child_stream_capacity),
+        err: ?std.mem.Allocator.Error = null,
+
+        fn onStream(ctx: *@This(), child: ir.ChildStream) void {
+            if (ctx.err != null or child.stream.len == 0) return;
+            ctx.child_streams.append(ctx.allocator, child.stream) catch |err| {
+                ctx.err = err;
+            };
+        }
+    };
+
+    var collector = ChildStreamCollector{
+        .allocator = allocator,
+        .child_streams = child_streams,
+    };
+    ir.forEachChildStream(instr, &collector, ChildStreamCollector.onStream);
+    if (collector.err) |err| return err;
+}
+
 // ============================================================
 // Whole-program parameter-convention inference (Phase E.9).
 //
@@ -236,10 +324,10 @@ fn specializeRecursiveOwnershipVariants(
 
     for (program.functions, 0..) |*function, fn_index| {
         // Only self-recursive functions can exhibit the clone cascade.
-        if (!functionIsSelfRecursive(function)) continue;
+        if (!try functionIsSelfRecursive(allocator, function)) continue;
         for (function.param_conventions, 0..) |conv, slot| {
             if (conv != .borrowed) continue;
-            if (!selfRecursionClonesSlot(function, slot)) continue;
+            if (!try selfRecursionClonesSlot(allocator, function, slot)) continue;
             // Dedup on (name, slot) so duplicate copies of the same
             // function don't each spawn a same-named variant.
             const key = try std.fmt.allocPrint(allocator, "{s}#{d}", .{ function.name, slot });
@@ -320,7 +408,10 @@ fn specializeRecursiveOwnershipVariants(
 }
 
 /// Does `function` contain a self-recursive call (by name or id)?
-fn functionIsSelfRecursive(function: *const ir.Function) bool {
+fn functionIsSelfRecursive(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+) std.mem.Allocator.Error!bool {
     const Probe = struct {
         name: []const u8,
         local_name: []const u8,
@@ -333,7 +424,7 @@ fn functionIsSelfRecursive(function: *const ir.Function) bool {
         }
     };
     var probe = Probe{ .name = function.name, .local_name = function.local_name, .id = function.id, .found = false };
-    ir.forEachInstruction(function, &probe, Probe.visit);
+    try ir.forEachInstruction(allocator, function, &probe, Probe.visit);
     return probe.found;
 }
 
@@ -353,21 +444,30 @@ fn functionIsSelfRecursive(function: *const ir.Function) bool {
 /// param), tail-recursive loop bodies (no per-level clone), and any
 /// recursion whose argument is an external value. Only the
 /// indirect-storage recursive-struct walker matches.
-fn selfRecursionClonesSlot(function: *const ir.Function, slot: usize) bool {
+fn selfRecursionClonesSlot(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    slot: usize,
+) std.mem.Allocator.Error!bool {
     const Probe = struct {
         name: []const u8,
         local_name: []const u8,
         id: ir.FunctionId,
         slot: usize,
         function: *const ir.Function,
+        allocator: std.mem.Allocator,
         found: bool,
+        err: ?std.mem.Allocator.Error = null,
 
         fn visit(self: *@This(), instr: *const ir.Instruction) void {
-            if (self.found) return;
+            if (self.found or self.err != null) return;
             if (!callTargetsFunction(instr, self.name, self.local_name, self.id)) return;
             const args = callArgsOf(instr) orelse return;
             if (self.slot >= args.len) return;
-            if (recursionArgIsParamFieldClone(self.function, args[self.slot], self.slot)) self.found = true;
+            if (recursionArgIsParamFieldClone(self.allocator, self.function, args[self.slot], self.slot) catch |err| {
+                self.err = err;
+                return;
+            }) self.found = true;
         }
     };
     var probe = Probe{
@@ -376,26 +476,37 @@ fn selfRecursionClonesSlot(function: *const ir.Function, slot: usize) bool {
         .id = function.id,
         .slot = slot,
         .function = function,
+        .allocator = allocator,
         .found = false,
     };
-    ir.forEachInstruction(function, &probe, Probe.visit);
+    try ir.forEachInstruction(allocator, function, &probe, Probe.visit);
+    if (probe.err) |err| return err;
     return probe.found;
 }
 
 /// True when `arg_local` is a `share_value` clone whose source resolves
 /// (through alias forms) to a `field_get` whose object resolves to a
 /// `param_get index=slot` — the recursive-struct field descent.
-fn recursionArgIsParamFieldClone(function: *const ir.Function, arg_local: ir.LocalId, slot: usize) bool {
+fn recursionArgIsParamFieldClone(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    arg_local: ir.LocalId,
+    slot: usize,
+) std.mem.Allocator.Error!bool {
     // `arg_local` must be the dest of a `share_value` (the clone).
-    const share_source = shareValueSourceOf(function, arg_local) orelse return false;
+    const share_source = (try shareValueSourceOf(allocator, function, arg_local)) orelse return false;
     // The clone source must resolve to a `field_get` (a field extract).
-    const field_object = fieldGetObjectOf(function, resolveAliasRoot(function, share_source)) orelse return false;
+    const field_object = (try fieldGetObjectOf(allocator, function, try resolveAliasRoot(allocator, function, share_source))) orelse return false;
     // The field's object must resolve to `param_get index=slot`.
-    return paramGetIndexOf(function, resolveAliasRoot(function, field_object)) == slot;
+    return (try paramGetIndexOf(allocator, function, try resolveAliasRoot(allocator, function, field_object))) == slot;
 }
 
 /// If `local_id` is the dest of a `share_value`, return its source.
-fn shareValueSourceOf(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalId {
+fn shareValueSourceOf(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) std.mem.Allocator.Error!?ir.LocalId {
     const Probe = struct {
         target: ir.LocalId,
         result: ?ir.LocalId,
@@ -405,12 +516,16 @@ fn shareValueSourceOf(function: *const ir.Function, local_id: ir.LocalId) ?ir.Lo
         }
     };
     var probe = Probe{ .target = local_id, .result = null };
-    ir.forEachInstruction(function, &probe, Probe.visit);
+    try ir.forEachInstruction(allocator, function, &probe, Probe.visit);
     return probe.result;
 }
 
 /// If `local_id` is the dest of a `field_get`, return its object local.
-fn fieldGetObjectOf(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalId {
+fn fieldGetObjectOf(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) std.mem.Allocator.Error!?ir.LocalId {
     const Probe = struct {
         target: ir.LocalId,
         result: ?ir.LocalId,
@@ -420,12 +535,16 @@ fn fieldGetObjectOf(function: *const ir.Function, local_id: ir.LocalId) ?ir.Loca
         }
     };
     var probe = Probe{ .target = local_id, .result = null };
-    ir.forEachInstruction(function, &probe, Probe.visit);
+    try ir.forEachInstruction(allocator, function, &probe, Probe.visit);
     return probe.result;
 }
 
 /// If `local_id` is the dest of a `param_get`, return its index.
-fn paramGetIndexOf(function: *const ir.Function, local_id: ir.LocalId) ?usize {
+fn paramGetIndexOf(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) std.mem.Allocator.Error!?usize {
     const Probe = struct {
         target: ir.LocalId,
         result: ?usize,
@@ -435,7 +554,7 @@ fn paramGetIndexOf(function: *const ir.Function, local_id: ir.LocalId) ?usize {
         }
     };
     var probe = Probe{ .target = local_id, .result = null };
-    ir.forEachInstruction(function, &probe, Probe.visit);
+    try ir.forEachInstruction(allocator, function, &probe, Probe.visit);
     return probe.result;
 }
 
@@ -443,17 +562,25 @@ fn paramGetIndexOf(function: *const ir.Function, local_id: ir.LocalId) ?usize {
 /// `borrow_value`, `copy_value`, `move_value`) to its root. Note:
 /// `share_value` is intentionally NOT followed here (it is the clone
 /// boundary we anchor on separately).
-fn resolveAliasRoot(function: *const ir.Function, local_id: ir.LocalId) ir.LocalId {
+fn resolveAliasRoot(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) std.mem.Allocator.Error!ir.LocalId {
     var current = local_id;
     var hops: usize = 0;
     while (hops < 16) : (hops += 1) {
-        const next = aliasRootStep(function, current) orelse break;
+        const next = (try aliasRootStep(allocator, function, current)) orelse break;
         current = next;
     }
     return current;
 }
 
-fn aliasRootStep(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalId {
+fn aliasRootStep(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) std.mem.Allocator.Error!?ir.LocalId {
     const Probe = struct {
         target: ir.LocalId,
         result: ?ir.LocalId,
@@ -469,7 +596,7 @@ fn aliasRootStep(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalId
         }
     };
     var probe = Probe{ .target = local_id, .result = null };
-    ir.forEachInstruction(function, &probe, Probe.visit);
+    try ir.forEachInstruction(allocator, function, &probe, Probe.visit);
     return probe.result;
 }
 
@@ -793,6 +920,7 @@ fn runConventionInferenceFixpoint(
             if (escaping.contains(function.id)) continue;
             const before = countOwnedSlots(function);
             try evaluateFunction(
+                allocator,
                 function,
                 &sites_by_target,
                 ownerships,
@@ -846,7 +974,7 @@ fn runConventionInferenceFixpoint(
         const conventions: MutableConventions = @constCast(function.param_conventions);
         for (conventions, 0..) |conv, slot_index| {
             if (conv != .borrowed) continue;
-            if (!arc_liveness.functionForwardsParamIntoSideChannelStash(function, slot_index)) continue;
+            if (!try arc_liveness.functionForwardsParamIntoSideChannelStash(allocator, function, slot_index)) continue;
             conventions[slot_index] = .owned;
         }
     }
@@ -958,6 +1086,7 @@ fn computeLiftSet(
                 if (conv != .borrowed) continue;
                 if (liftSetContains(&lift_set, function.id, slot_index)) continue;
                 if (!try slotPassesAuditConditions(
+                    allocator,
                     function,
                     slot_index,
                     signatures,
@@ -1112,6 +1241,7 @@ fn pruneOptimisticCandidates(
                 continue;
             };
             if (!try slotPassesAuditConditions(
+                allocator,
                 function,
                 slot,
                 signatures,
@@ -1371,39 +1501,67 @@ const ShareSetWalker = struct {
     result: *RewrittenShareSet,
     next_id: arc_liveness.InstructionId,
 
+    const StreamFrame = struct {
+        stream: []const ir.Instruction,
+        next_index: usize = 0,
+        share_dest_to_id: std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) = .empty,
+
+        fn deinit(self: *StreamFrame, allocator: std.mem.Allocator) void {
+            self.share_dest_to_id.deinit(allocator);
+        }
+    };
+
     /// Per-stream side table: dest-LocalId → InstructionId of the
     /// most-recent share_value in this stream. share_values do not
     /// cross structural boundaries (the IR builder emits each share
     /// in the same stream as its consume call), so a per-stream
     /// table is sufficient.
     fn walkStream(self: *ShareSetWalker, stream: []const ir.Instruction) error{OutOfMemory}!void {
-        var share_dest_to_id: std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) = .empty;
-        defer share_dest_to_id.deinit(self.allocator);
+        var stack: InlineStack(StreamFrame, inline_walk_frame_capacity) = .{};
+        var child_streams: InlineStack([]const ir.Instruction, inline_child_stream_capacity) = .{};
+        defer {
+            while (stack.len() != 0) {
+                var frame = stack.pop();
+                frame.deinit(self.allocator);
+            }
+            stack.deinit(self.allocator);
+            child_streams.deinit(self.allocator);
+        }
 
-        for (stream) |*instr| {
+        if (stream.len != 0) {
+            try stack.append(self.allocator, .{ .stream = stream });
+        }
+
+        while (stack.len() != 0) {
+            const frame = stack.topPtr();
+            if (frame.next_index >= frame.stream.len) {
+                var done = stack.pop();
+                done.deinit(self.allocator);
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            frame.next_index += 1;
+
             const my_id = self.next_id;
             self.next_id += 1;
-            try self.processInstruction(instr, my_id, &share_dest_to_id);
-            try self.recurseChildren(instr);
+            try self.processInstruction(instr, my_id, &frame.share_dest_to_id);
+            try self.pushChildren(instr, &stack, &child_streams);
         }
     }
 
-    fn recurseChildren(self: *ShareSetWalker, instr: *const ir.Instruction) error{OutOfMemory}!void {
-        // Recurse into every child stream via the canonical enumerator
-        // (covers union_switch.else_instrs, previously skipped).
-        const Ctx = struct {
-            walker: *ShareSetWalker,
-            err: ?error{OutOfMemory} = null,
-            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
-                if (ctx.err != null) return;
-                ctx.walker.walkStream(child.stream) catch |e| {
-                    ctx.err = e;
-                };
-            }
-        };
-        var ctx = Ctx{ .walker = self };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
+    fn pushChildren(
+        self: *ShareSetWalker,
+        instr: *const ir.Instruction,
+        stack: *InlineStack(StreamFrame, inline_walk_frame_capacity),
+        child_streams: *InlineStack([]const ir.Instruction, inline_child_stream_capacity),
+    ) error{OutOfMemory}!void {
+        try collectChildStreams(self.allocator, instr, child_streams);
+        var child_index = child_streams.len();
+        while (child_index > 0) {
+            child_index -= 1;
+            try stack.append(self.allocator, .{ .stream = child_streams.get(child_index) });
+        }
     }
 
     fn processInstruction(
@@ -2069,14 +2227,536 @@ const TentativeAnalyzer = struct {
         return result;
     }
 
+    const IfExprStage = enum { then_branch, else_branch, finish };
+    const CaseBlockStage = enum { pre_stream, post_pre_snapshot, arm_cond, arm_body, after_arm, default_stream, finish };
+    const SwitchWithDefaultStage = enum { case_body, after_case, default_body, finish };
+    const UnionSwitchStage = enum { case_body, after_case, else_body, after_else, finish };
+    const UnionSwitchReturnStage = enum { case_body, after_case, finish };
+    const GuardBlockStage = enum { body, finish };
+    const OptionalDispatchStage = enum { nil_branch, struct_branch, finish };
+    const TryCallStage = enum { handler_branch, after_handler, after_success };
+
+    const IfExprFrame = struct {
+        expr: *const ir.IfExpr,
+        snapshot: TentativeSnapshot,
+        stage: IfExprStage = .then_branch,
+    };
+
+    const CaseBlockFrame = struct {
+        block: *const ir.CaseBlock,
+        snapshot: TentativeSnapshot,
+        post_pre: ?TentativeSnapshot = null,
+        arm_index: usize = 0,
+        stage: CaseBlockStage = .pre_stream,
+    };
+
+    const SwitchLiteralFrame = struct {
+        switch_literal: *const ir.SwitchLiteral,
+        snapshot: TentativeSnapshot,
+        case_index: usize = 0,
+        stage: SwitchWithDefaultStage = .case_body,
+    };
+
+    const SwitchReturnFrame = struct {
+        switch_return: *const ir.SwitchReturn,
+        snapshot: TentativeSnapshot,
+        case_index: usize = 0,
+        stage: SwitchWithDefaultStage = .case_body,
+    };
+
+    const UnionSwitchFrame = struct {
+        union_switch: *const ir.UnionSwitch,
+        snapshot: TentativeSnapshot,
+        case_index: usize = 0,
+        stage: UnionSwitchStage = .case_body,
+    };
+
+    const UnionSwitchReturnFrame = struct {
+        union_switch_return: *const ir.UnionSwitchReturn,
+        snapshot: TentativeSnapshot,
+        case_index: usize = 0,
+        stage: UnionSwitchReturnStage = .case_body,
+    };
+
+    const GuardBlockFrame = struct {
+        guard_block: *const ir.GuardBlock,
+        snapshot: TentativeSnapshot,
+        stage: GuardBlockStage = .body,
+    };
+
+    const OptionalDispatchFrame = struct {
+        optional_dispatch: *const ir.OptionalDispatch,
+        snapshot: TentativeSnapshot,
+        stage: OptionalDispatchStage = .nil_branch,
+    };
+
+    const TryCallFrame = struct {
+        call: *const ir.TryCallNamed,
+        snapshot: TentativeSnapshot,
+        success_payload_unique: bool,
+        handler_arm_unique: bool = false,
+        stage: TryCallStage = .handler_branch,
+    };
+
+    const WalkFrame = union(enum) {
+        stream: InstructionStreamFrame,
+        if_expr: IfExprFrame,
+        case_block: CaseBlockFrame,
+        switch_literal: SwitchLiteralFrame,
+        switch_return: SwitchReturnFrame,
+        union_switch: UnionSwitchFrame,
+        union_switch_return: UnionSwitchReturnFrame,
+        try_call_named: TryCallFrame,
+        guard_block: GuardBlockFrame,
+        optional_dispatch: OptionalDispatchFrame,
+
+        fn deinit(self: *WalkFrame, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .stream => {},
+                .if_expr => |*frame| frame.snapshot.deinit(allocator),
+                .case_block => |*frame| {
+                    frame.snapshot.deinit(allocator);
+                    if (frame.post_pre) |*post_pre| post_pre.deinit(allocator);
+                },
+                .switch_literal => |*frame| frame.snapshot.deinit(allocator),
+                .switch_return => |*frame| frame.snapshot.deinit(allocator),
+                .union_switch => |*frame| frame.snapshot.deinit(allocator),
+                .union_switch_return => |*frame| frame.snapshot.deinit(allocator),
+                .try_call_named => |*frame| frame.snapshot.deinit(allocator),
+                .guard_block => |*frame| frame.snapshot.deinit(allocator),
+                .optional_dispatch => |*frame| frame.snapshot.deinit(allocator),
+            }
+        }
+    };
+
     fn walkStream(self: *TentativeAnalyzer, stream: []const ir.Instruction) error{OutOfMemory}!void {
-        for (stream) |*instr| {
-            const my_id = self.next_id;
-            self.next_id += 1;
-            try self.classifyCallSite(instr, my_id);
-            try self.applyEffect(instr, my_id);
-            try self.promoteAtLastUse(my_id);
-            try self.walkChildren(instr, my_id);
+        var stack: InlineStack(WalkFrame, inline_walk_frame_capacity) = .{};
+        defer self.deinitWalkStack(&stack);
+
+        try self.pushWalkStream(&stack, stream);
+        while (stack.len() != 0) {
+            switch (stack.topPtr().*) {
+                .stream => |*frame| try self.stepStreamFrame(&stack, frame),
+                .if_expr => |*frame| try self.stepIfExprFrame(&stack, frame),
+                .case_block => |*frame| try self.stepCaseBlockFrame(&stack, frame),
+                .switch_literal => |*frame| try self.stepSwitchLiteralFrame(&stack, frame),
+                .switch_return => |*frame| try self.stepSwitchReturnFrame(&stack, frame),
+                .union_switch => |*frame| try self.stepUnionSwitchFrame(&stack, frame),
+                .union_switch_return => |*frame| try self.stepUnionSwitchReturnFrame(&stack, frame),
+                .try_call_named => |*frame| try self.stepTryCallFrame(&stack, frame),
+                .guard_block => |*frame| try self.stepGuardBlockFrame(&stack, frame),
+                .optional_dispatch => |*frame| try self.stepOptionalDispatchFrame(&stack, frame),
+            }
+        }
+    }
+
+    fn pushWalkStream(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        stream: []const ir.Instruction,
+    ) error{OutOfMemory}!void {
+        if (stream.len == 0) return;
+        try stack.append(self.allocator, .{ .stream = .{ .stream = stream } });
+    }
+
+    fn popWalkFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+    ) void {
+        var frame = stack.pop();
+        frame.deinit(self.allocator);
+    }
+
+    fn deinitWalkStack(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+    ) void {
+        while (stack.len() != 0) self.popWalkFrame(stack);
+        stack.deinit(self.allocator);
+    }
+
+    fn stepStreamFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *InstructionStreamFrame,
+    ) error{OutOfMemory}!void {
+        if (frame.next_index >= frame.stream.len) {
+            self.popWalkFrame(stack);
+            return;
+        }
+
+        const instr = &frame.stream[frame.next_index];
+        frame.next_index += 1;
+
+        const my_id = self.next_id;
+        self.next_id += 1;
+        try self.classifyCallSite(instr, my_id);
+        try self.applyEffect(instr, my_id);
+        try self.promoteAtLastUse(my_id);
+        try self.pushChildFrame(stack, instr, my_id);
+    }
+
+    fn pushChildFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        instr: *const ir.Instruction,
+        my_id: arc_liveness.InstructionId,
+    ) error{OutOfMemory}!void {
+        switch (instr.*) {
+            .if_expr => {
+                var snapshot_value = try self.snapshot();
+                stack.append(self.allocator, .{ .if_expr = .{
+                    .expr = &instr.if_expr,
+                    .snapshot = snapshot_value,
+                } }) catch |err| {
+                    snapshot_value.deinit(self.allocator);
+                    return err;
+                };
+            },
+            .case_block => {
+                var snapshot_value = try self.snapshot();
+                stack.append(self.allocator, .{ .case_block = .{
+                    .block = &instr.case_block,
+                    .snapshot = snapshot_value,
+                } }) catch |err| {
+                    snapshot_value.deinit(self.allocator);
+                    return err;
+                };
+            },
+            .switch_literal => {
+                var snapshot_value = try self.snapshot();
+                stack.append(self.allocator, .{ .switch_literal = .{
+                    .switch_literal = &instr.switch_literal,
+                    .snapshot = snapshot_value,
+                } }) catch |err| {
+                    snapshot_value.deinit(self.allocator);
+                    return err;
+                };
+            },
+            .switch_return => {
+                var snapshot_value = try self.snapshot();
+                stack.append(self.allocator, .{ .switch_return = .{
+                    .switch_return = &instr.switch_return,
+                    .snapshot = snapshot_value,
+                } }) catch |err| {
+                    snapshot_value.deinit(self.allocator);
+                    return err;
+                };
+            },
+            .union_switch => {
+                var snapshot_value = try self.snapshot();
+                stack.append(self.allocator, .{ .union_switch = .{
+                    .union_switch = &instr.union_switch,
+                    .snapshot = snapshot_value,
+                } }) catch |err| {
+                    snapshot_value.deinit(self.allocator);
+                    return err;
+                };
+            },
+            .union_switch_return => {
+                var snapshot_value = try self.snapshot();
+                stack.append(self.allocator, .{ .union_switch_return = .{
+                    .union_switch_return = &instr.union_switch_return,
+                    .snapshot = snapshot_value,
+                } }) catch |err| {
+                    snapshot_value.deinit(self.allocator);
+                    return err;
+                };
+            },
+            .try_call_named => {
+                const success_payload_unique = self.try_call_success_unique.get(my_id) orelse false;
+                var snapshot_value = try self.snapshot();
+                stack.append(self.allocator, .{ .try_call_named = .{
+                    .call = &instr.try_call_named,
+                    .snapshot = snapshot_value,
+                    .success_payload_unique = success_payload_unique,
+                } }) catch |err| {
+                    snapshot_value.deinit(self.allocator);
+                    return err;
+                };
+            },
+            .guard_block => {
+                var snapshot_value = try self.snapshot();
+                stack.append(self.allocator, .{ .guard_block = .{
+                    .guard_block = &instr.guard_block,
+                    .snapshot = snapshot_value,
+                } }) catch |err| {
+                    snapshot_value.deinit(self.allocator);
+                    return err;
+                };
+            },
+            .optional_dispatch => {
+                var snapshot_value = try self.snapshot();
+                stack.append(self.allocator, .{ .optional_dispatch = .{
+                    .optional_dispatch = &instr.optional_dispatch,
+                    .snapshot = snapshot_value,
+                } }) catch |err| {
+                    snapshot_value.deinit(self.allocator);
+                    return err;
+                };
+            },
+            else => {},
+        }
+    }
+
+    fn stepIfExprFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *IfExprFrame,
+    ) error{OutOfMemory}!void {
+        switch (frame.stage) {
+            .then_branch => {
+                frame.stage = .else_branch;
+                try self.pushWalkStream(stack, frame.expr.then_instrs);
+            },
+            .else_branch => {
+                try self.restore(&frame.snapshot);
+                frame.stage = .finish;
+                try self.pushWalkStream(stack, frame.expr.else_instrs);
+            },
+            .finish => {
+                try self.restore(&frame.snapshot);
+                self.popWalkFrame(stack);
+            },
+        }
+    }
+
+    fn stepCaseBlockFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *CaseBlockFrame,
+    ) error{OutOfMemory}!void {
+        switch (frame.stage) {
+            .pre_stream => {
+                frame.stage = .post_pre_snapshot;
+                try self.pushWalkStream(stack, frame.block.pre_instrs);
+            },
+            .post_pre_snapshot => {
+                frame.post_pre = try self.snapshot();
+                frame.stage = .arm_cond;
+            },
+            .arm_cond => {
+                if (frame.arm_index >= frame.block.arms.len) {
+                    frame.stage = .default_stream;
+                    return;
+                }
+                frame.stage = .arm_body;
+                try self.pushWalkStream(stack, frame.block.arms[frame.arm_index].cond_instrs);
+            },
+            .arm_body => {
+                frame.stage = .after_arm;
+                try self.pushWalkStream(stack, frame.block.arms[frame.arm_index].body_instrs);
+            },
+            .after_arm => {
+                if (frame.post_pre) |*post_pre| {
+                    try self.restore(post_pre);
+                } else unreachable;
+                frame.arm_index += 1;
+                frame.stage = .arm_cond;
+            },
+            .default_stream => {
+                frame.stage = .finish;
+                try self.pushWalkStream(stack, frame.block.default_instrs);
+            },
+            .finish => {
+                try self.restore(&frame.snapshot);
+                self.popWalkFrame(stack);
+            },
+        }
+    }
+
+    fn stepSwitchLiteralFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *SwitchLiteralFrame,
+    ) error{OutOfMemory}!void {
+        switch (frame.stage) {
+            .case_body => {
+                if (frame.case_index >= frame.switch_literal.cases.len) {
+                    frame.stage = .default_body;
+                    return;
+                }
+                frame.stage = .after_case;
+                try self.pushWalkStream(stack, frame.switch_literal.cases[frame.case_index].body_instrs);
+            },
+            .after_case => {
+                try self.restore(&frame.snapshot);
+                frame.case_index += 1;
+                frame.stage = .case_body;
+            },
+            .default_body => {
+                frame.stage = .finish;
+                try self.pushWalkStream(stack, frame.switch_literal.default_instrs);
+            },
+            .finish => {
+                try self.restore(&frame.snapshot);
+                self.popWalkFrame(stack);
+            },
+        }
+    }
+
+    fn stepSwitchReturnFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *SwitchReturnFrame,
+    ) error{OutOfMemory}!void {
+        switch (frame.stage) {
+            .case_body => {
+                if (frame.case_index >= frame.switch_return.cases.len) {
+                    frame.stage = .default_body;
+                    return;
+                }
+                frame.stage = .after_case;
+                try self.pushWalkStream(stack, frame.switch_return.cases[frame.case_index].body_instrs);
+            },
+            .after_case => {
+                try self.restore(&frame.snapshot);
+                frame.case_index += 1;
+                frame.stage = .case_body;
+            },
+            .default_body => {
+                frame.stage = .finish;
+                try self.pushWalkStream(stack, frame.switch_return.default_instrs);
+            },
+            .finish => {
+                try self.restore(&frame.snapshot);
+                self.popWalkFrame(stack);
+            },
+        }
+    }
+
+    fn stepUnionSwitchFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *UnionSwitchFrame,
+    ) error{OutOfMemory}!void {
+        switch (frame.stage) {
+            .case_body => {
+                if (frame.case_index >= frame.union_switch.cases.len) {
+                    frame.stage = if (frame.union_switch.has_else) .else_body else .finish;
+                    return;
+                }
+                frame.stage = .after_case;
+                try self.pushWalkStream(stack, frame.union_switch.cases[frame.case_index].body_instrs);
+            },
+            .after_case => {
+                try self.restore(&frame.snapshot);
+                frame.case_index += 1;
+                frame.stage = .case_body;
+            },
+            .else_body => {
+                frame.stage = .after_else;
+                try self.pushWalkStream(stack, frame.union_switch.else_instrs);
+            },
+            .after_else => {
+                try self.restore(&frame.snapshot);
+                frame.stage = .finish;
+            },
+            .finish => self.popWalkFrame(stack),
+        }
+    }
+
+    fn stepUnionSwitchReturnFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *UnionSwitchReturnFrame,
+    ) error{OutOfMemory}!void {
+        switch (frame.stage) {
+            .case_body => {
+                if (frame.case_index >= frame.union_switch_return.cases.len) {
+                    frame.stage = .finish;
+                    return;
+                }
+                frame.stage = .after_case;
+                try self.pushWalkStream(stack, frame.union_switch_return.cases[frame.case_index].body_instrs);
+            },
+            .after_case => {
+                try self.restore(&frame.snapshot);
+                frame.case_index += 1;
+                frame.stage = .case_body;
+            },
+            .finish => self.popWalkFrame(stack),
+        }
+    }
+
+    fn stepTryCallFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *TryCallFrame,
+    ) error{OutOfMemory}!void {
+        switch (frame.stage) {
+            .handler_branch => {
+                frame.stage = .after_handler;
+                try self.pushWalkStream(stack, frame.call.handler_instrs);
+            },
+            .after_handler => {
+                frame.handler_arm_unique = if (frame.call.handler_result) |hr|
+                    self.unique.contains(hr)
+                else
+                    false;
+                try self.restore(&frame.snapshot);
+                if (frame.call.payload_local) |pl| {
+                    if (frame.success_payload_unique) {
+                        try self.unique.put(self.allocator, pl, {});
+                    } else {
+                        _ = self.unique.remove(pl);
+                    }
+                }
+                frame.stage = .after_success;
+                try self.pushWalkStream(stack, frame.call.success_instrs);
+            },
+            .after_success => {
+                const success_arm_unique = if (frame.call.success_result) |sr|
+                    self.unique.contains(sr)
+                else
+                    frame.success_payload_unique;
+                try self.restore(&frame.snapshot);
+                if (frame.handler_arm_unique and success_arm_unique) {
+                    try self.unique.put(self.allocator, frame.call.dest, {});
+                } else {
+                    _ = self.unique.remove(frame.call.dest);
+                }
+                self.popWalkFrame(stack);
+            },
+        }
+    }
+
+    fn stepGuardBlockFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *GuardBlockFrame,
+    ) error{OutOfMemory}!void {
+        switch (frame.stage) {
+            .body => {
+                frame.stage = .finish;
+                try self.pushWalkStream(stack, frame.guard_block.body);
+            },
+            .finish => {
+                try self.restore(&frame.snapshot);
+                self.popWalkFrame(stack);
+            },
+        }
+    }
+
+    fn stepOptionalDispatchFrame(
+        self: *TentativeAnalyzer,
+        stack: *InlineStack(WalkFrame, inline_walk_frame_capacity),
+        frame: *OptionalDispatchFrame,
+    ) error{OutOfMemory}!void {
+        switch (frame.stage) {
+            .nil_branch => {
+                frame.stage = .struct_branch;
+                try self.pushWalkStream(stack, frame.optional_dispatch.nil_instrs);
+            },
+            .struct_branch => {
+                try self.restore(&frame.snapshot);
+                frame.stage = .finish;
+                try self.pushWalkStream(stack, frame.optional_dispatch.struct_instrs);
+            },
+            .finish => {
+                try self.restore(&frame.snapshot);
+                self.popWalkFrame(stack);
+            },
         }
     }
 
@@ -2094,148 +2774,6 @@ const TentativeAnalyzer = struct {
         var it = self.tuple_pending.keyIterator();
         while (it.next()) |k| try keys.append(self.allocator, k.*);
         for (keys.items) |k| try self.promoteExtractedAt(k, my_id);
-    }
-
-    fn walkChildren(self: *TentativeAnalyzer, instr: *const ir.Instruction, my_id: arc_liveness.InstructionId) error{OutOfMemory}!void {
-        switch (instr.*) {
-            .if_expr => |ie| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                try self.walkStream(ie.then_instrs);
-                try self.restore(&snap);
-                try self.walkStream(ie.else_instrs);
-                try self.restore(&snap);
-            },
-            .case_block => |cb| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                try self.walkStream(cb.pre_instrs);
-                const post_pre = try self.snapshot();
-                defer post_pre.deinit(self.allocator);
-                for (cb.arms) |arm| {
-                    try self.walkStream(arm.cond_instrs);
-                    try self.walkStream(arm.body_instrs);
-                    try self.restore(&post_pre);
-                }
-                try self.walkStream(cb.default_instrs);
-                try self.restore(&snap);
-            },
-            .switch_literal => |sl| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                for (sl.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    try self.restore(&snap);
-                }
-                try self.walkStream(sl.default_instrs);
-                try self.restore(&snap);
-            },
-            .switch_return => |sr| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                for (sr.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    try self.restore(&snap);
-                }
-                try self.walkStream(sr.default_instrs);
-                try self.restore(&snap);
-            },
-            .union_switch => |us| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                for (us.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    try self.restore(&snap);
-                }
-                // The catch-all `_` prong is walked like a case arm so its
-                // call sites (which the tentative-rewrite dataflow audits)
-                // are seen and its id space stays aligned. See audit
-                // findings uniqueness--04 / arc-own-1--01.
-                if (us.has_else) {
-                    try self.walkStream(us.else_instrs);
-                    try self.restore(&snap);
-                }
-            },
-            .union_switch_return => |usr| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                for (usr.cases) |c| {
-                    try self.walkStream(c.body_instrs);
-                    try self.restore(&snap);
-                }
-            },
-            .try_call_named => |tcn| {
-                // GAP-P2-03T — `tcn.dest` is the if-else MERGE of the
-                // success-arm value and the handler-arm value (ir.zig
-                // TryCallNamed; the ZIR builder binds both `success_result` and
-                // `handler_result` into `dest`). dest is unique iff BOTH arms
-                // yield a unique value. Walk each arm from the pre-call
-                // snapshot, observe each arm's result-local uniqueness, then
-                // MEET them into dest — mirroring `uniqueness.Analyzer`'s
-                // `walkChildren` so the two analyzers agree. Walk order
-                // (handler first, then success) matches
-                // `arc_liveness.flattenChildren` / `ir.forEachChildStream` so
-                // the InstructionId space stays aligned.
-                //
-                // The success-arm value is `success_result` when present, else
-                // the unwrapped callee payload — whose uniqueness is the
-                // success-callee contract stashed in `applyEffect` under the
-                // uniqueness--04 freshness gate. The handler-arm value is
-                // `handler_result` when present, else void (never unique).
-                const success_payload_unique = self.try_call_success_unique.get(my_id) orelse false;
-
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-
-                // Handler arm.
-                try self.walkStream(tcn.handler_instrs);
-                const handler_arm_unique = if (tcn.handler_result) |hr|
-                    self.unique.contains(hr)
-                else
-                    false;
-                try self.restore(&snap);
-
-                // Success arm. Bind the unwrapped payload's uniqueness so any
-                // destructure/mutation inside `success_instrs` observes it —
-                // matching the ZIR lowering that binds the payload before
-                // emitting `success_instrs`.
-                if (tcn.payload_local) |pl| {
-                    if (success_payload_unique) {
-                        try self.unique.put(self.allocator, pl, {});
-                    } else {
-                        _ = self.unique.remove(pl);
-                    }
-                }
-                try self.walkStream(tcn.success_instrs);
-                const success_arm_unique = if (tcn.success_result) |sr|
-                    self.unique.contains(sr)
-                else
-                    success_payload_unique;
-                try self.restore(&snap);
-
-                // Meet both arm results into dest.
-                if (handler_arm_unique and success_arm_unique) {
-                    try self.unique.put(self.allocator, tcn.dest, {});
-                } else {
-                    _ = self.unique.remove(tcn.dest);
-                }
-            },
-            .guard_block => |gb| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                try self.walkStream(gb.body);
-                try self.restore(&snap);
-            },
-            .optional_dispatch => |od| {
-                const snap = try self.snapshot();
-                defer snap.deinit(self.allocator);
-                try self.walkStream(od.nil_instrs);
-                try self.restore(&snap);
-                try self.walkStream(od.struct_instrs);
-                try self.restore(&snap);
-            },
-            else => {},
-        }
     }
 
     fn classifyCallSite(self: *TentativeAnalyzer, instr: *const ir.Instruction, my_id: arc_liveness.InstructionId) error{OutOfMemory}!void {
@@ -2508,7 +3046,7 @@ const TentativeAnalyzer = struct {
                 // success contract alone.
                 const pre = try self.snapshotArgUnique(tcn.args);
                 defer self.allocator.free(pre);
-                const success_payload_unique = self.calleeContractResultUnique(tcn.name, pre);
+                const success_payload_unique = try self.calleeContractResultUnique(tcn.name, pre);
                 try self.try_call_success_unique.put(self.allocator, my_id, success_payload_unique);
 
                 for (tcn.args) |arg| {
@@ -2714,13 +3252,14 @@ const TentativeAnalyzer = struct {
     /// the pre-call per-arg uniqueness snapshot. Delegates to the shared
     /// `uniqueness_decision` authority — the SAME function the canonical
     /// `uniqueness.Analyzer` consumes — so the `try_call_named`
-    /// success-arm classification is identical in both analyzers.
+    /// success-arm classification is identical in both analyzers. Propagates
+    /// fresh-wrapper recognition OOM instead of demoting it to "not unique."
     fn calleeContractResultUnique(
         self: *const TentativeAnalyzer,
         name: []const u8,
         pre_arg_unique: []const bool,
-    ) bool {
-        return uniqueness_decision.calleeContractResultUnique(self.signatures, self.program, name, pre_arg_unique);
+    ) std.mem.Allocator.Error!bool {
+        return try uniqueness_decision.calleeContractResultUnique(self.allocator, self.signatures, self.program, name, pre_arg_unique);
     }
 
     /// GAP-P2-03T (tentative mirror) — the receiver slot a `try_call_named`
@@ -2751,7 +3290,7 @@ const TentativeAnalyzer = struct {
         // uniqueness--04: fresh-allocator wrappers (unique on every path)
         // take precedence over the convention-pair gate, mirroring the
         // canonical `uniqueness.Analyzer`.
-        if (self.calleeIsFreshAllocatorWrapper(name)) {
+        if (try self.calleeIsFreshAllocatorWrapper(name)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
@@ -2795,7 +3334,7 @@ const TentativeAnalyzer = struct {
         }
         // uniqueness--04: fresh-allocator wrappers take precedence over the
         // convention-pair gate.
-        if (uniqueness_decision.isFreshAllocatorWrapper(function, self.program)) {
+        if (try uniqueness_decision.isFreshAllocatorWrapper(self.allocator, function, self.program)) {
             try self.unique.put(self.allocator, dest, {});
             return;
         }
@@ -2818,8 +3357,8 @@ const TentativeAnalyzer = struct {
         try self.synthesizeReturnPendingFromSig(function.id, args, dest, pre_arg_unique);
     }
 
-    fn calleeIsFreshAllocatorWrapper(self: *const TentativeAnalyzer, name: []const u8) bool {
-        return uniqueness_decision.isFreshAllocatorWrapperByName(self.program, name);
+    fn calleeIsFreshAllocatorWrapper(self: *const TentativeAnalyzer, name: []const u8) std.mem.Allocator.Error!bool {
+        return try uniqueness_decision.isFreshAllocatorWrapperByName(self.allocator, self.program, name);
     }
 
     fn snapshot(self: *TentativeAnalyzer) error{OutOfMemory}!TentativeSnapshot {
@@ -2875,30 +3414,37 @@ const TentativeDemotionWalker = struct {
     next_id: arc_liveness.InstructionId,
 
     fn walkStream(self: *TentativeDemotionWalker, stream: []const ir.Instruction) error{OutOfMemory}!void {
-        for (stream) |*instr| {
+        var stack: InlineStack(InstructionStreamFrame, inline_walk_frame_capacity) = .{};
+        var child_streams: InlineStack([]const ir.Instruction, inline_child_stream_capacity) = .{};
+        defer {
+            stack.deinit(self.allocator);
+            child_streams.deinit(self.allocator);
+        }
+
+        if (stream.len != 0) {
+            try stack.append(self.allocator, .{ .stream = stream });
+        }
+
+        while (stack.len() != 0) {
+            const frame = stack.topPtr();
+            if (frame.next_index >= frame.stream.len) {
+                _ = stack.pop();
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            frame.next_index += 1;
+
             const my_id = self.next_id;
             self.next_id += 1;
             try self.maybeDemoteCallee(my_id);
-            try self.walkChildren(instr);
-        }
-    }
-
-    fn walkChildren(self: *TentativeDemotionWalker, instr: *const ir.Instruction) error{OutOfMemory}!void {
-        // Recurse into every child stream via the canonical enumerator
-        // (covers union_switch.else_instrs, previously skipped).
-        const Ctx = struct {
-            walker: *TentativeDemotionWalker,
-            err: ?error{OutOfMemory} = null,
-            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
-                if (ctx.err != null) return;
-                ctx.walker.walkStream(child.stream) catch |e| {
-                    ctx.err = e;
-                };
+            try collectChildStreams(self.allocator, instr, &child_streams);
+            var child_index = child_streams.len();
+            while (child_index > 0) {
+                child_index -= 1;
+                try stack.append(self.allocator, .{ .stream = child_streams.get(child_index) });
             }
-        };
-        var ctx = Ctx{ .walker = self };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
+        }
     }
 
     fn maybeDemoteCallee(self: *TentativeDemotionWalker, my_id: arc_liveness.InstructionId) error{OutOfMemory}!void {
@@ -2957,6 +3503,7 @@ fn lookupFunctionMut(program: *const ir.Program, function_id: ir.FunctionId) ?*i
 /// slot is already in the set — fixpoint iteration ensures we
 /// converge to the largest consistent set.
 fn slotPassesAuditConditions(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     slot_index: usize,
     signatures: *const uniqueness_signature.ProgramSignatures,
@@ -2979,6 +3526,7 @@ fn slotPassesAuditConditions(
     for (sites) |site| {
         if (site.args.len <= slot_index) continue;
         const eligible = try siteAuditEligible(
+            allocator,
             site,
             slot_index,
             ownerships,
@@ -3034,6 +3582,7 @@ fn slotPassesAuditConditions(
 /// check but replaces the hard borrowed-source veto with a recursive
 /// chain-eligibility query against the in-progress `lift_set`.
 fn siteAuditEligible(
+    allocator: std.mem.Allocator,
     site: CallSite,
     slot_index: usize,
     ownerships: *const arc_liveness.ProgramArcOwnership,
@@ -3060,10 +3609,10 @@ fn siteAuditEligible(
             if (last_use != share_id) return false;
 
             const caller_func = function_index.get(site.enclosing_function_id) orelse return false;
-            if (!chainIsConsumeMode(caller_func, fn_ownership, source, share_id)) return false;
+            if (!try chainIsConsumeMode(allocator, caller_func, fn_ownership, source, share_id)) return false;
 
-            const root_local = traceAliasChainToRoot(caller_func, source);
-            if (paramSlotForLocal(caller_func, root_local)) |param_slot| {
+            const root_local = try traceAliasChainToRoot(allocator, caller_func, source);
+            if (try paramSlotForLocal(allocator, caller_func, root_local)) |param_slot| {
                 // Phase 1.8 item #4 — bounded-borrow refinement. Compute
                 // the consume call's last-use id from the share_value's
                 // dest (= site.args[slot_index]). Refetches whose
@@ -3075,7 +3624,7 @@ fn siteAuditEligible(
                 const last_use_map_opt: ?*const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) =
                     if (consume_last_use_opt != null) &fn_ownership.last_use_map else null;
                 const consume_last_use: arc_liveness.InstructionId = consume_last_use_opt orelse 0;
-                if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id, last_use_map_opt, consume_last_use)) return false;
+                if (try paramSlotIsRefetchedAfter(allocator, caller_func, param_slot, root_local, share_id, last_use_map_opt, consume_last_use)) return false;
                 // Reflexive self-loop bootstrap. When a self-recursive
                 // call passes the SAME slot straight back to itself
                 // (chain root is `param_get` of `slot_index`, and this
@@ -3237,53 +3786,72 @@ const SiteWalker = struct {
     /// `walkStream` invocation so nested recursion does not clobber
     /// outer-scope tables.
     fn walkStream(self: *SiteWalker, stream: []const ir.Instruction) error{OutOfMemory}!void {
-        var share_dest_to_source = std.AutoHashMap(ir.LocalId, ir.LocalId).init(self.allocator);
-        defer share_dest_to_source.deinit();
-        var share_dest_to_id = std.AutoHashMap(ir.LocalId, arc_liveness.InstructionId).init(self.allocator);
-        defer share_dest_to_id.deinit();
+        const StreamFrame = struct {
+            stream: []const ir.Instruction,
+            next_index: usize = 0,
+            share_dest_to_source: std.AutoHashMapUnmanaged(ir.LocalId, ir.LocalId) = .empty,
+            share_dest_to_id: std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) = .empty,
 
-        for (stream) |*instr| {
+            fn deinit(frame: *@This(), allocator: std.mem.Allocator) void {
+                frame.share_dest_to_source.deinit(allocator);
+                frame.share_dest_to_id.deinit(allocator);
+            }
+        };
+
+        var stack: InlineStack(StreamFrame, inline_walk_frame_capacity) = .{};
+        var child_streams: InlineStack([]const ir.Instruction, inline_child_stream_capacity) = .{};
+        defer {
+            while (stack.len() != 0) {
+                var frame = stack.pop();
+                frame.deinit(self.allocator);
+            }
+            stack.deinit(self.allocator);
+            child_streams.deinit(self.allocator);
+        }
+
+        if (stream.len != 0) {
+            try stack.append(self.allocator, .{ .stream = stream });
+        }
+
+        while (stack.len() != 0) {
+            const frame = stack.topPtr();
+            if (frame.next_index >= frame.stream.len) {
+                var done = stack.pop();
+                done.deinit(self.allocator);
+                continue;
+            }
+
+            const instr = &frame.stream[frame.next_index];
+            frame.next_index += 1;
+
             const id = self.next_id;
             self.next_id += 1;
             try self.processInstruction(
                 instr,
                 id,
-                &share_dest_to_source,
-                &share_dest_to_id,
+                &frame.share_dest_to_source,
+                &frame.share_dest_to_id,
             );
-            try self.recurseChildren(instr);
-        }
-    }
-
-    fn recurseChildren(self: *SiteWalker, instr: *const ir.Instruction) error{OutOfMemory}!void {
-        // Recurse into every child stream via the canonical enumerator
-        // (covers union_switch.else_instrs, previously skipped).
-        const Ctx = struct {
-            walker: *SiteWalker,
-            err: ?error{OutOfMemory} = null,
-            fn onStream(ctx: *@This(), child: ir.ChildStream) void {
-                if (ctx.err != null) return;
-                ctx.walker.walkStream(child.stream) catch |e| {
-                    ctx.err = e;
-                };
+            try collectChildStreams(self.allocator, instr, &child_streams);
+            var child_index = child_streams.len();
+            while (child_index > 0) {
+                child_index -= 1;
+                try stack.append(self.allocator, .{ .stream = child_streams.get(child_index) });
             }
-        };
-        var ctx = Ctx{ .walker = self };
-        ir.forEachChildStream(instr, &ctx, Ctx.onStream);
-        if (ctx.err) |e| return e;
+        }
     }
 
     fn processInstruction(
         self: *SiteWalker,
         instr: *const ir.Instruction,
         id: arc_liveness.InstructionId,
-        share_dest_to_source: *std.AutoHashMap(ir.LocalId, ir.LocalId),
-        share_dest_to_id: *std.AutoHashMap(ir.LocalId, arc_liveness.InstructionId),
+        share_dest_to_source: *std.AutoHashMapUnmanaged(ir.LocalId, ir.LocalId),
+        share_dest_to_id: *std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
     ) !void {
         switch (instr.*) {
             .share_value => |sv| {
-                try share_dest_to_source.put(sv.dest, sv.source);
-                try share_dest_to_id.put(sv.dest, id);
+                try share_dest_to_source.put(self.allocator, sv.dest, sv.source);
+                try share_dest_to_id.put(self.allocator, sv.dest, id);
             },
             .tail_call => |tc| {
                 // Self-recursive tail call. By Phase E.8 invariants
@@ -3353,8 +3921,8 @@ const SiteWalker = struct {
         self: *SiteWalker,
         target_id: ir.FunctionId,
         args: []const ir.LocalId,
-        share_dest_to_source: *const std.AutoHashMap(ir.LocalId, ir.LocalId),
-        share_dest_to_id: *const std.AutoHashMap(ir.LocalId, arc_liveness.InstructionId),
+        share_dest_to_source: *const std.AutoHashMapUnmanaged(ir.LocalId, ir.LocalId),
+        share_dest_to_id: *const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
     ) !void {
         const share_sources = try self.allocator.alloc(?ir.LocalId, args.len);
         const share_ids = try self.allocator.alloc(?arc_liveness.InstructionId, args.len);
@@ -3380,6 +3948,7 @@ const SiteWalker = struct {
 };
 
 fn evaluateFunction(
+    allocator: std.mem.Allocator,
     function: *ir.Function,
     sites_by_target: *const SitesByTarget,
     ownerships: *const arc_liveness.ProgramArcOwnership,
@@ -3400,13 +3969,14 @@ fn evaluateFunction(
     const conventions: MutableConventions = @constCast(function.param_conventions);
     for (conventions, 0..) |*conv_ptr, slot_index| {
         if (conv_ptr.* != .borrowed) continue;
-        if (try shouldPromoteSlot(function, slot_index, sites, ownerships, function_index, lift_set, name_to_id, program)) {
+        if (try shouldPromoteSlot(allocator, function, slot_index, sites, ownerships, function_index, lift_set, name_to_id, program)) {
             conv_ptr.* = .owned;
         }
     }
 }
 
 fn shouldPromoteSlot(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     slot_index: usize,
     sites: []const CallSite,
@@ -3425,7 +3995,7 @@ fn shouldPromoteSlot(
             // Zap functions today have fixed arity).
             continue;
         }
-        const consumes = try siteConsumesSlot(site, slot_index, ownerships, function_index, lift_set);
+        const consumes = try siteConsumesSlot(allocator, site, slot_index, ownerships, function_index, lift_set);
         if (!consumes) return false;
         if (site.is_self_recursive) has_self_recursive = true;
     }
@@ -3871,6 +4441,7 @@ fn streamHasOwnedBuiltinConsumingAlias(
 /// Does this call site pass `args[slot_index]` in a "consume"
 /// position — i.e. is the source dead at the call?
 fn siteConsumesSlot(
+    allocator: std.mem.Allocator,
     site: CallSite,
     slot_index: usize,
     ownerships: *const arc_liveness.ProgramArcOwnership,
@@ -3950,10 +4521,10 @@ fn siteConsumesSlot(
             // The walk also stops at `param_get` and checks whether
             // the parameter slot is refetched elsewhere in the body.
             const caller_func = function_index.get(site.enclosing_function_id) orelse return false;
-            if (!chainIsConsumeMode(caller_func, fn_ownership, source, share_id)) return false;
+            if (!try chainIsConsumeMode(allocator, caller_func, fn_ownership, source, share_id)) return false;
 
-            const root_local = traceAliasChainToRoot(caller_func, source);
-            if (paramSlotForLocal(caller_func, root_local)) |param_slot| {
+            const root_local = try traceAliasChainToRoot(allocator, caller_func, source);
+            if (try paramSlotForLocal(allocator, caller_func, root_local)) |param_slot| {
                 // Phase 1.8 item #4 — bounded-borrow refinement. Compute
                 // the consume call's last-use id from the share_value's
                 // dest (= site.args[slot_index]). Refetches whose
@@ -3965,7 +4536,7 @@ fn siteConsumesSlot(
                 const last_use_map_opt: ?*const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId) =
                     if (consume_last_use_opt != null) &fn_ownership.last_use_map else null;
                 const consume_last_use: arc_liveness.InstructionId = consume_last_use_opt orelse 0;
-                if (paramSlotIsRefetchedAfter(caller_func, param_slot, root_local, share_id, last_use_map_opt, consume_last_use)) return false;
+                if (try paramSlotIsRefetchedAfter(allocator, caller_func, param_slot, root_local, share_id, last_use_map_opt, consume_last_use)) return false;
                 // Phase 1.3 chain-consistency lift (research2.md §1.5).
                 //
                 // Historical soundness gate: when the alias chain's
@@ -4013,12 +4584,16 @@ fn siteConsumesSlot(
 /// The walk is bounded by an iteration cap to defend against
 /// pathological IR shapes; in practice the IrBuilder's chains are
 /// shallow (at most 3-4 hops between named binding and call arg).
-fn traceAliasChainToRoot(function: *const ir.Function, local_id: ir.LocalId) ir.LocalId {
+fn traceAliasChainToRoot(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) std.mem.Allocator.Error!ir.LocalId {
     var current = local_id;
     const max_hops: usize = 16;
     var hop: usize = 0;
     while (hop < max_hops) : (hop += 1) {
-        const next_opt = aliasSourceFor(function, current);
+        const next_opt = try aliasSourceFor(allocator, function, current);
         if (next_opt) |next_local| {
             current = next_local;
         } else {
@@ -4040,9 +4615,10 @@ const AliasStep = struct {
 };
 
 fn aliasStepFor(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     local_id: ir.LocalId,
-) ?AliasStep {
+) std.mem.Allocator.Error!?AliasStep {
     const Visitor = struct {
         target: ir.LocalId,
         result: ?AliasStep,
@@ -4066,14 +4642,18 @@ fn aliasStepFor(
         }
     };
     var visitor = Visitor{ .target = local_id, .result = null, .next_id = 0 };
-    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    try ir.forEachInstruction(allocator, function, &visitor, Visitor.visit);
     return visitor.result;
 }
 
 /// Convenience: just the source local. Used by `traceAliasChainToRoot`
 /// where the instruction id is not needed.
-fn aliasSourceFor(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalId {
-    if (aliasStepFor(function, local_id)) |step| return step.source;
+fn aliasSourceFor(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) std.mem.Allocator.Error!?ir.LocalId {
+    if (try aliasStepFor(allocator, function, local_id)) |step| return step.source;
     return null;
 }
 
@@ -4089,11 +4669,12 @@ fn aliasSourceFor(function: *const ir.Function, local_id: ir.LocalId) ?ir.LocalI
 /// where the source has post-alias uses (i.e., the underlying
 /// binding is alive past the call).
 fn chainIsConsumeMode(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     fn_ownership: *const arc_liveness.ArcOwnership,
     chain_start: ir.LocalId,
     share_id: arc_liveness.InstructionId,
-) bool {
+) std.mem.Allocator.Error!bool {
     var current = chain_start;
     var current_consume_id: arc_liveness.InstructionId = share_id;
     const max_hops: usize = 16;
@@ -4121,7 +4702,7 @@ fn chainIsConsumeMode(
         // alias instruction, the source becomes the new `current`
         // and the alias instruction's id becomes the new last-use
         // anchor. If `current` is a root (no alias step), we're done.
-        const step_opt = aliasStepFor(function, current);
+        const step_opt = try aliasStepFor(allocator, function, current);
         if (step_opt) |step| {
             current = step.source;
             current_consume_id = step.instr_id;
@@ -4143,7 +4724,11 @@ fn chainIsConsumeMode(
 /// drop-insertion pass runs strictly AFTER uniqueness). Both helpers share
 /// the same semantics: find the unique `param_get` dest mapping for
 /// a candidate LocalId.
-fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
+fn paramSlotForLocal(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    local_id: ir.LocalId,
+) std.mem.Allocator.Error!?u32 {
     const Visitor = struct {
         target: ir.LocalId,
         result: ?u32,
@@ -4155,7 +4740,7 @@ fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
         }
     };
     var visitor = Visitor{ .target = local_id, .result = null };
-    ir.forEachInstruction(function, &visitor, Visitor.visit);
+    try ir.forEachInstruction(allocator, function, &visitor, Visitor.visit);
     return visitor.result;
 }
 
@@ -4209,13 +4794,14 @@ fn paramSlotForLocal(function: *const ir.Function, local_id: ir.LocalId) ?u32 {
 /// with it, the refetch's bounded lifetime is recognised and
 /// promotion succeeds.
 fn paramSlotIsRefetchedAfter(
+    allocator: std.mem.Allocator,
     function: *const ir.Function,
     param_slot: u32,
     share_source: ir.LocalId,
     share_id: arc_liveness.InstructionId,
     last_use_map: ?*const std.AutoHashMapUnmanaged(ir.LocalId, arc_liveness.InstructionId),
     consume_last_use_id: arc_liveness.InstructionId,
-) bool {
+) std.mem.Allocator.Error!bool {
     var ctx = SuccessorScan{
         .slot = param_slot,
         .excluded_dest = share_source,
@@ -4226,7 +4812,7 @@ fn paramSlotIsRefetchedAfter(
         .consume_last_use_id = consume_last_use_id,
     };
     for (function.body) |block| {
-        const status = scanStreamSuccessors(block.instructions, &ctx);
+        const status = try scanStreamSuccessors(allocator, block.instructions, &ctx);
         if (ctx.found) return true;
         if (status == .target_found_and_done) break;
     }
@@ -4242,7 +4828,7 @@ fn paramSlotIsRefetchedAfter(
 ///     not the excluded source, and whose id is strictly greater
 ///     than the target. Only on the SAME structural path as the
 ///     share — sibling arms of the structure that contained the
-///     share are pruned by `scanInstructionChildrenPostTarget`.
+///     share are pruned by the pre-target child-search frame.
 const SuccessorScan = struct {
     slot: u32,
     excluded_dest: ir.LocalId,
@@ -4287,6 +4873,36 @@ const StreamStatus = enum {
     target_found_and_done,
 };
 
+const SuccessorStreamFrame = struct {
+    stream: []const ir.Instruction,
+    next_index: usize = 0,
+    post_target: bool = false,
+    status: StreamStatus = .target_not_found,
+};
+
+const SuccessorChildSearchFrame = struct {
+    child_streams: InlineStack([]const ir.Instruction, inline_child_stream_capacity) = .{},
+    next_index: usize = 0,
+    any_target: bool = false,
+
+    fn deinit(self: *SuccessorChildSearchFrame, allocator: std.mem.Allocator) void {
+        self.child_streams.deinit(allocator);
+    }
+};
+
+const SuccessorFrame = union(enum) {
+    stream: SuccessorStreamFrame,
+    child_search: SuccessorChildSearchFrame,
+    post_stream: InstructionStreamFrame,
+
+    fn deinit(self: *SuccessorFrame, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .child_search => |*frame| frame.deinit(allocator),
+            .stream, .post_stream => {},
+        }
+    }
+};
+
 /// Scan a stream from beginning to end. Within the stream, we either:
 ///   * never see the target id (target_not_found),
 ///   * or hit it; from that point onward in the same stream we run
@@ -4295,250 +4911,163 @@ const StreamStatus = enum {
 ///     we visit children of those successors fully in post-target
 ///     mode.
 fn scanStreamSuccessors(
+    allocator: std.mem.Allocator,
     stream: []const ir.Instruction,
     ctx: *SuccessorScan,
-) StreamStatus {
-    var status: StreamStatus = .target_not_found;
-    var post_target = false;
-    for (stream) |*instr| {
-        const my_id = ctx.next_id;
-        ctx.next_id += 1;
-        if (post_target) {
-            // We're past the share in this stream — every instruction
-            // here and its children are reachable successors.
-            checkParamGet(instr, my_id, ctx);
-            if (ctx.found) return status;
-            scanInstructionChildrenPostTarget(instr, ctx);
-            if (ctx.found) return status;
-        } else {
-            // Pre-target: assign ids to children but only check
-            // refetches if we discover the target inside.
-            const sub_status = scanInstructionChildrenMaybeTarget(instr, my_id, ctx);
-            if (ctx.found) return status;
-            if (sub_status == .target_found_and_done) {
-                post_target = true;
-                status = .target_found_and_done;
-            }
+) std.mem.Allocator.Error!StreamStatus {
+    var stack: InlineStack(SuccessorFrame, inline_walk_frame_capacity) = .{};
+    var post_child_streams: InlineStack([]const ir.Instruction, inline_child_stream_capacity) = .{};
+    defer {
+        while (stack.len() != 0) {
+            var frame = stack.pop();
+            frame.deinit(allocator);
+        }
+        stack.deinit(allocator);
+        post_child_streams.deinit(allocator);
+    }
+
+    var root_status: StreamStatus = .target_not_found;
+    try appendSuccessorStreamFrame(allocator, &stack, stream);
+    while (stack.len() != 0 and !ctx.found) {
+        switch (stack.topPtr().*) {
+            .stream => |*frame| {
+                if (frame.next_index >= frame.stream.len) {
+                    const completed_status = frame.status;
+                    var done = stack.pop();
+                    done.deinit(allocator);
+                    propagateSuccessorStatus(&stack, &root_status, completed_status);
+                    continue;
+                }
+
+                const instr = &frame.stream[frame.next_index];
+                frame.next_index += 1;
+
+                const my_id = ctx.next_id;
+                ctx.next_id += 1;
+                if (frame.post_target) {
+                    checkParamGet(instr, my_id, ctx);
+                    if (ctx.found) continue;
+                    try pushPostTargetChildren(allocator, &stack, &post_child_streams, instr);
+                    continue;
+                }
+
+                if (my_id == ctx.target_id) {
+                    // The target instruction itself. No children to check (the
+                    // target is a share_value, which has no nested instructions).
+                    frame.status = .target_found_and_done;
+                    frame.post_target = true;
+                    continue;
+                }
+
+                try pushSuccessorChildSearchFrame(allocator, &stack, instr);
+            },
+            .child_search => |*frame| {
+                if (frame.next_index >= frame.child_streams.len()) {
+                    const completed_status: StreamStatus = if (frame.any_target)
+                        .target_found_and_done
+                    else
+                        .target_not_found;
+                    var done = stack.pop();
+                    done.deinit(allocator);
+                    propagateSuccessorStatus(&stack, &root_status, completed_status);
+                    continue;
+                }
+
+                const child_stream = frame.child_streams.get(frame.next_index);
+                frame.next_index += 1;
+                try appendSuccessorStreamFrame(allocator, &stack, child_stream);
+            },
+            .post_stream => |*frame| {
+                if (frame.next_index >= frame.stream.len) {
+                    var done = stack.pop();
+                    done.deinit(allocator);
+                    continue;
+                }
+
+                const instr = &frame.stream[frame.next_index];
+                frame.next_index += 1;
+
+                const my_id = ctx.next_id;
+                ctx.next_id += 1;
+                checkParamGet(instr, my_id, ctx);
+                if (ctx.found) continue;
+                try pushPostTargetChildren(allocator, &stack, &post_child_streams, instr);
+            },
         }
     }
-    return status;
+
+    return root_status;
 }
 
-/// Pre-target mode: visit `instr`'s children. If we find the target
-/// id (either as `instr` itself or inside a child), switch the
-/// child-walk to post-target for subsequent sibling instructions in
-/// the same stream and propagate the status up.
-fn scanInstructionChildrenMaybeTarget(
-    instr: *const ir.Instruction,
-    instr_id: arc_liveness.InstructionId,
-    ctx: *SuccessorScan,
-) StreamStatus {
-    if (instr_id == ctx.target_id) {
-        // The target instruction itself. No children to check (the
-        // target is a share_value, which has no nested instructions).
-        return .target_found_and_done;
-    }
-    return scanChildStreamsMaybeTarget(instr, ctx);
-}
-
-/// Walk every child stream of `instr` in pre-target mode. If any
-/// child stream contains the target, the remaining sibling streams
-/// are walked in post-target mode (they're successors of the share
-/// once control flow leaves the structure that contained it). Returns
-/// the aggregate status.
-fn scanChildStreamsMaybeTarget(
-    instr: *const ir.Instruction,
-    ctx: *SuccessorScan,
-) StreamStatus {
-    switch (instr.*) {
-        .if_expr => |ie| {
-            const t = scanStreamSuccessors(ie.then_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            const e = scanStreamSuccessors(ie.else_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            if (t == .target_found_and_done or e == .target_found_and_done)
-                return .target_found_and_done;
-            return .target_not_found;
-        },
-        .case_block => |cb| {
-            const pre = scanStreamSuccessors(cb.pre_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            var any_target = pre == .target_found_and_done;
-            for (cb.arms) |arm| {
-                const cond = scanStreamSuccessors(arm.cond_instrs, ctx);
-                if (ctx.found) return .target_not_found;
-                if (cond == .target_found_and_done) any_target = true;
-                const body = scanStreamSuccessors(arm.body_instrs, ctx);
-                if (ctx.found) return .target_not_found;
-                if (body == .target_found_and_done) any_target = true;
-            }
-            const default = scanStreamSuccessors(cb.default_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            if (default == .target_found_and_done) any_target = true;
-            if (any_target) return .target_found_and_done;
-            return .target_not_found;
-        },
-        .switch_literal => |sl| {
-            var any_target = false;
-            for (sl.cases) |c| {
-                const s = scanStreamSuccessors(c.body_instrs, ctx);
-                if (ctx.found) return .target_not_found;
-                if (s == .target_found_and_done) any_target = true;
-            }
-            const def = scanStreamSuccessors(sl.default_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            if (def == .target_found_and_done) any_target = true;
-            if (any_target) return .target_found_and_done;
-            return .target_not_found;
-        },
-        .switch_return => |sr| {
-            var any_target = false;
-            for (sr.cases) |c| {
-                const s = scanStreamSuccessors(c.body_instrs, ctx);
-                if (ctx.found) return .target_not_found;
-                if (s == .target_found_and_done) any_target = true;
-            }
-            const def = scanStreamSuccessors(sr.default_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            if (def == .target_found_and_done) any_target = true;
-            if (any_target) return .target_found_and_done;
-            return .target_not_found;
-        },
-        .union_switch => |us| {
-            var any_target = false;
-            for (us.cases) |c| {
-                const s = scanStreamSuccessors(c.body_instrs, ctx);
-                if (ctx.found) return .target_not_found;
-                if (s == .target_found_and_done) any_target = true;
-            }
-            // The catch-all `_` prong is a peer arm and must be scanned
-            // for the target like any case body. Previously skipped.
-            if (us.has_else) {
-                const s = scanStreamSuccessors(us.else_instrs, ctx);
-                if (ctx.found) return .target_not_found;
-                if (s == .target_found_and_done) any_target = true;
-            }
-            if (any_target) return .target_found_and_done;
-            return .target_not_found;
-        },
-        .union_switch_return => |usr| {
-            var any_target = false;
-            for (usr.cases) |c| {
-                const s = scanStreamSuccessors(c.body_instrs, ctx);
-                if (ctx.found) return .target_not_found;
-                if (s == .target_found_and_done) any_target = true;
-            }
-            if (any_target) return .target_found_and_done;
-            return .target_not_found;
-        },
-        .try_call_named => |tcn| {
-            const h = scanStreamSuccessors(tcn.handler_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            const s = scanStreamSuccessors(tcn.success_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            if (h == .target_found_and_done or s == .target_found_and_done)
-                return .target_found_and_done;
-            return .target_not_found;
-        },
-        .guard_block => |gb| {
-            return scanStreamSuccessors(gb.body, ctx);
-        },
-        .optional_dispatch => |od| {
-            const n = scanStreamSuccessors(od.nil_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            const s = scanStreamSuccessors(od.struct_instrs, ctx);
-            if (ctx.found) return .target_not_found;
-            if (n == .target_found_and_done or s == .target_found_and_done)
-                return .target_found_and_done;
-            return .target_not_found;
-        },
-        else => return .target_not_found,
-    }
-}
-
-/// Post-target mode: visit every child stream of `instr` and check
-/// every `param_get` for refetches. Every child here is a structural
-/// successor of the share (the share lives in some ancestor stream
-/// that has already been crossed), so all paths matter.
-fn scanInstructionChildrenPostTarget(
-    instr: *const ir.Instruction,
-    ctx: *SuccessorScan,
-) void {
-    switch (instr.*) {
-        .if_expr => |ie| {
-            scanStreamPostTarget(ie.then_instrs, ctx);
-            if (ctx.found) return;
-            scanStreamPostTarget(ie.else_instrs, ctx);
-        },
-        .case_block => |cb| {
-            scanStreamPostTarget(cb.pre_instrs, ctx);
-            if (ctx.found) return;
-            for (cb.arms) |arm| {
-                scanStreamPostTarget(arm.cond_instrs, ctx);
-                if (ctx.found) return;
-                scanStreamPostTarget(arm.body_instrs, ctx);
-                if (ctx.found) return;
-            }
-            scanStreamPostTarget(cb.default_instrs, ctx);
-        },
-        .switch_literal => |sl| {
-            for (sl.cases) |c| {
-                scanStreamPostTarget(c.body_instrs, ctx);
-                if (ctx.found) return;
-            }
-            scanStreamPostTarget(sl.default_instrs, ctx);
-        },
-        .switch_return => |sr| {
-            for (sr.cases) |c| {
-                scanStreamPostTarget(c.body_instrs, ctx);
-                if (ctx.found) return;
-            }
-            scanStreamPostTarget(sr.default_instrs, ctx);
-        },
-        .union_switch => |us| {
-            for (us.cases) |c| {
-                scanStreamPostTarget(c.body_instrs, ctx);
-                if (ctx.found) return;
-            }
-            // The catch-all `_` prong is a structural successor of the
-            // share like any case body; scan it for refetches too.
-            if (us.has_else) {
-                scanStreamPostTarget(us.else_instrs, ctx);
-                if (ctx.found) return;
-            }
-        },
-        .union_switch_return => |usr| {
-            for (usr.cases) |c| {
-                scanStreamPostTarget(c.body_instrs, ctx);
-                if (ctx.found) return;
-            }
-        },
-        .try_call_named => |tcn| {
-            scanStreamPostTarget(tcn.handler_instrs, ctx);
-            if (ctx.found) return;
-            scanStreamPostTarget(tcn.success_instrs, ctx);
-        },
-        .guard_block => |gb| scanStreamPostTarget(gb.body, ctx),
-        .optional_dispatch => |od| {
-            scanStreamPostTarget(od.nil_instrs, ctx);
-            if (ctx.found) return;
-            scanStreamPostTarget(od.struct_instrs, ctx);
-        },
-        else => {},
-    }
-}
-
-fn scanStreamPostTarget(
+fn appendSuccessorStreamFrame(
+    allocator: std.mem.Allocator,
+    stack: *InlineStack(SuccessorFrame, inline_walk_frame_capacity),
     stream: []const ir.Instruction,
-    ctx: *SuccessorScan,
+) std.mem.Allocator.Error!void {
+    if (stream.len == 0) return;
+    try stack.append(allocator, .{ .stream = .{ .stream = stream } });
+}
+
+fn appendPostTargetStreamFrame(
+    allocator: std.mem.Allocator,
+    stack: *InlineStack(SuccessorFrame, inline_walk_frame_capacity),
+    stream: []const ir.Instruction,
+) std.mem.Allocator.Error!void {
+    if (stream.len == 0) return;
+    try stack.append(allocator, .{ .post_stream = .{ .stream = stream } });
+}
+
+fn propagateSuccessorStatus(
+    stack: *InlineStack(SuccessorFrame, inline_walk_frame_capacity),
+    root_status: *StreamStatus,
+    status: StreamStatus,
 ) void {
-    for (stream) |*instr| {
-        const my_id = ctx.next_id;
-        ctx.next_id += 1;
-        checkParamGet(instr, my_id, ctx);
-        if (ctx.found) return;
-        scanInstructionChildrenPostTarget(instr, ctx);
-        if (ctx.found) return;
+    if (status != .target_found_and_done) return;
+    if (stack.len() == 0) {
+        root_status.* = .target_found_and_done;
+        return;
+    }
+    switch (stack.topPtr().*) {
+        .child_search => |*frame| frame.any_target = true,
+        .stream => |*frame| {
+            frame.status = .target_found_and_done;
+            frame.post_target = true;
+        },
+        .post_stream => {},
+    }
+}
+
+fn pushSuccessorChildSearchFrame(
+    allocator: std.mem.Allocator,
+    stack: *InlineStack(SuccessorFrame, inline_walk_frame_capacity),
+    instr: *const ir.Instruction,
+) std.mem.Allocator.Error!void {
+    var child_frame = SuccessorChildSearchFrame{};
+    collectChildStreams(allocator, instr, &child_frame.child_streams) catch |err| {
+        child_frame.deinit(allocator);
+        return err;
+    };
+    if (child_frame.child_streams.len() == 0) {
+        child_frame.deinit(allocator);
+        return;
+    }
+    stack.append(allocator, .{ .child_search = child_frame }) catch |err| {
+        child_frame.deinit(allocator);
+        return err;
+    };
+}
+
+fn pushPostTargetChildren(
+    allocator: std.mem.Allocator,
+    stack: *InlineStack(SuccessorFrame, inline_walk_frame_capacity),
+    child_streams: *InlineStack([]const ir.Instruction, inline_child_stream_capacity),
+    instr: *const ir.Instruction,
+) std.mem.Allocator.Error!void {
+    try collectChildStreams(allocator, instr, child_streams);
+    var child_index = child_streams.len();
+    while (child_index > 0) {
+        child_index -= 1;
+        try appendPostTargetStreamFrame(allocator, stack, child_streams.get(child_index));
     }
 }
 
@@ -4735,7 +5264,7 @@ test "arc_param_convention: paramSlotIsRefetchedAfter ignores refetches in disjo
     // The pre-fix flat-id check would return TRUE (id 5's param_get
     // is > id 3). The new structural-successor check must return
     // FALSE: case[1] is on a path disjoint from the share.
-    try std.testing.expect(!paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, null, 0));
+    try std.testing.expect(!(try paramSlotIsRefetchedAfter(std.testing.allocator, &function, 0, share_source, share_id, null, 0)));
 }
 
 test "arc_param_convention: paramSlotIsRefetchedAfter detects refetch on the same flow path" {
@@ -4792,7 +5321,7 @@ test "arc_param_convention: paramSlotIsRefetchedAfter detects refetch on the sam
 
     // The second param_get is on the SAME flow path as the share.
     // The check must catch it.
-    try std.testing.expect(paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, null, 0));
+    try std.testing.expect(try paramSlotIsRefetchedAfter(std.testing.allocator, &function, 0, share_source, share_id, null, 0));
 }
 
 test "arc_param_convention: paramSlotIsRefetchedAfter ignores refetch bounded within consume call's arg eval (Phase 1.8 item #4)" {
@@ -4864,12 +5393,12 @@ test "arc_param_convention: paramSlotIsRefetchedAfter ignores refetch bounded wi
 
     // Without the bounded-borrow refinement (legacy behavior — null
     // bounded_by) the check returns true.
-    try std.testing.expect(paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, null, 0));
+    try std.testing.expect(try paramSlotIsRefetchedAfter(std.testing.allocator, &function, 0, share_source, share_id, null, 0));
 
     // With the bounded-borrow refinement: refetch's last-use (3) is
     // <= consume call's last-use (4), so the refetch is bounded and
     // ignored.
-    try std.testing.expect(!paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, &last_use_map, consume_last_use_id));
+    try std.testing.expect(!(try paramSlotIsRefetchedAfter(std.testing.allocator, &function, 0, share_source, share_id, &last_use_map, consume_last_use_id)));
 }
 
 test "arc_param_convention: paramSlotIsRefetchedAfter still detects unbounded refetch even with bounded_by enabled" {
@@ -4932,7 +5461,143 @@ test "arc_param_convention: paramSlotIsRefetchedAfter still detects unbounded re
 
     // Refetch's last use (4) is > consume call last use (3), so the
     // refetch IS still live past the consume call and must be flagged.
-    try std.testing.expect(paramSlotIsRefetchedAfter(&function, 0, share_source, share_id, &last_use_map, consume_last_use_id));
+    try std.testing.expect(try paramSlotIsRefetchedAfter(std.testing.allocator, &function, 0, share_source, share_id, &last_use_map, consume_last_use_id));
+}
+
+fn buildDeepGuardRefetchFunction(arena: std.mem.Allocator, depth: usize) !ir.Function {
+    std.debug.assert(depth > 0);
+
+    var nested_stream = try arena.dupe(ir.Instruction, &[_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .share_value = .{ .dest = 1, .source = 0, .mode = .retain } },
+        .{ .ret = .{ .value = 1 } },
+    });
+
+    var remaining_depth = depth;
+    while (remaining_depth > 0) : (remaining_depth -= 1) {
+        const wrapper = try arena.alloc(ir.Instruction, 1);
+        wrapper[0] = .{ .guard_block = .{
+            .condition = 0,
+            .body = nested_stream,
+        } };
+        nested_stream = wrapper;
+    }
+
+    const top = try arena.alloc(ir.Instruction, 2);
+    top[0] = nested_stream[0];
+    top[1] = .{ .param_get = .{ .dest = 2, .index = 0 } };
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = top };
+
+    const local_ownership = try arena.dupe(ir.OwnershipClass, &[_]ir.OwnershipClass{
+        .owned, .owned, .owned,
+    });
+    const param_conventions = try arena.dupe(ir.ParamConvention, &[_]ir.ParamConvention{.borrowed});
+
+    return ir.Function{
+        .id = 302,
+        .name = "deep_guard_refetch",
+        .scope_id = 0,
+        .arity = 1,
+        .params = &.{},
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 3,
+        .param_conventions = param_conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+}
+
+test "arc_param_convention: paramSlotIsRefetchedAfter scans deep child streams iteratively" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const depth = inline_walk_frame_capacity + 32;
+    var function = try buildDeepGuardRefetchFunction(arena, depth);
+
+    const share_id: arc_liveness.InstructionId = @intCast(depth + 1);
+    try std.testing.expect(try paramSlotIsRefetchedAfter(std.testing.allocator, &function, 0, 0, share_id, null, 0));
+}
+
+test "arc_param_convention: paramSlotIsRefetchedAfter propagates explicit stack OOM" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const depth = inline_walk_frame_capacity + 32;
+    var function = try buildDeepGuardRefetchFunction(arena, depth);
+
+    const share_id: arc_liveness.InstructionId = @intCast(depth + 1);
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        paramSlotIsRefetchedAfter(failing_allocator.allocator(), &function, 0, 0, share_id, null, 0),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "arc_param_convention: side-channel stash forwarding promotes wrapper slot to owned" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    const args = try arena.alloc(ir.LocalId, 1);
+    args[0] = 2;
+    const arg_modes = try arena.alloc(ir.ValueMode, 1);
+    arg_modes[0] = .move;
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .move_value = .{ .dest = 1, .source = 0 } },
+        .{ .share_value = .{ .dest = 2, .source = 1, .mode = .retain } },
+        .{ .call_builtin = .{
+            .dest = 3,
+            .name = "Kernel.recoverable_raise",
+            .args = args,
+            .arg_modes = arg_modes,
+        } },
+        .{ .ret = .{ .value = 3 } },
+    };
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = try arena.dupe(ir.Instruction, &instrs) };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 4);
+    for (local_ownership) |*ownership_class| ownership_class.* = .owned;
+
+    const conventions = try arena.alloc(ir.ParamConvention, 1);
+    conventions[0] = .borrowed;
+
+    const params = try arena.alloc(ir.Param, 1);
+    params[0] = .{ .name = "box", .type_expr = .void };
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = .{
+        .id = 0,
+        .name = "recoverable_raise_wrapper",
+        .scope_id = 0,
+        .arity = 1,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 4,
+        .param_conventions = conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
+    defer ownerships.deinit();
+    try runConventionInferenceFixpoint(std.testing.allocator, &program, &ownerships);
+
+    try std.testing.expectEqual(ir.ParamConvention.owned, conventions[0]);
 }
 
 // ============================================================

@@ -114,6 +114,44 @@ pub const ToolchainIdentityStats = struct {
     manifest_hit: bool = false,
 };
 
+/// Failure classes surfaced while computing build-cache toolchain identity.
+///
+/// These errors keep allocator pressure, canonicalization, manifest IO, live
+/// file metadata, directory traversal, and content hashing distinguishable at
+/// the caller boundary without changing the successful identity fast path.
+pub const ToolchainIdentityError = std.mem.Allocator.Error || error{
+    ZigLibCanonicalizationFailed,
+    ZigLibIdentityManifestReadFailed,
+    ZigLibIdentityManifestStatUnavailable,
+    ZigLibIdentityManifestWriteFailed,
+    ZigLibDirectoryOpenFailed,
+    ZigLibDirectoryWalkFailed,
+    ZigLibFileStatUnavailable,
+    ZigLibFileOpenFailed,
+    ZigLibFileHashUnavailable,
+    CompilerExecutablePathUnavailable,
+    CompilerExecutableCanonicalizationFailed,
+    CompilerIdentityManifestReadFailed,
+    CompilerIdentityManifestStatUnavailable,
+    CompilerIdentityManifestWriteFailed,
+    CompilerFileStatUnavailable,
+    CompilerFileNotRegular,
+    CompilerFileHashUnavailable,
+    ToolchainIdentityFileTooLarge,
+};
+
+const ReadZigLibIdentityManifestError = std.mem.Allocator.Error || error{
+    FileNotFound,
+    InvalidZigLibIdentityManifest,
+    ZigLibIdentityManifestReadFailed,
+};
+
+const ReadCompilerIdentityManifestError = std.mem.Allocator.Error || error{
+    FileNotFound,
+    InvalidCompilerIdentityManifest,
+    CompilerIdentityManifestReadFailed,
+};
+
 pub const ValidationStats = struct {
     file_stats_checked: usize = 0,
     files_hashed: usize = 0,
@@ -272,6 +310,11 @@ pub const ValidationInputs = struct {
     stats: ?*ValidationStats = null,
 };
 
+pub const ValidationResult = enum {
+    valid,
+    miss,
+};
+
 pub fn snapshotPath(allocator: std.mem.Allocator, cache_dir: []const u8, target_name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}.build-plan", .{ cache_dir, target_name });
 }
@@ -285,21 +328,58 @@ pub fn artifactPath(
     return std.fs.path.join(allocator, &.{ cache_dir, "o", cache_key_hex, artifact_filename });
 }
 
+fn toolchainIdentityError(err: anyerror, mapped_error: ToolchainIdentityError) ToolchainIdentityError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => mapped_error,
+    };
+}
+
+fn toolchainIdentityHashError(err: anyerror, mapped_error: ToolchainIdentityError) ToolchainIdentityError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.ToolchainIdentityFileTooLarge,
+        else => mapped_error,
+    };
+}
+
+fn canonicalizeZigLibDir(
+    allocator: std.mem.Allocator,
+    zig_lib_dir: []const u8,
+) ToolchainIdentityError![:0]u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(
+        std.Options.debug_io,
+        zig_lib_dir,
+        allocator,
+    ) catch |err| return toolchainIdentityError(err, error.ZigLibCanonicalizationFailed);
+}
+
+fn resolveCompilerExecutablePath(allocator: std.mem.Allocator) ToolchainIdentityError![]u8 {
+    return std.process.executablePathAlloc(std.Options.debug_io, allocator) catch |err|
+        return toolchainIdentityError(err, error.CompilerExecutablePathUnavailable);
+}
+
+fn canonicalizeCompilerExecutablePath(
+    allocator: std.mem.Allocator,
+    executable_path: []const u8,
+) ToolchainIdentityError![:0]u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(
+        std.Options.debug_io,
+        executable_path,
+        allocator,
+    ) catch |err| return toolchainIdentityError(err, error.CompilerExecutableCanonicalizationFailed);
+}
+
 pub fn zigLibIdentityDigest(
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     zig_lib_dir: []const u8,
     maybe_stats: ?*ToolchainIdentityStats,
-) !ToolchainDigest {
+) ToolchainIdentityError!ToolchainDigest {
     if (maybe_stats) |stats| stats.* = .{};
 
-    const canonical_zig_lib_dir_z = std.Io.Dir.cwd().realPathFileAlloc(
-        std.Options.debug_io,
-        zig_lib_dir,
-        allocator,
-    ) catch return error.ZigLibUnreadable;
-    defer allocator.free(canonical_zig_lib_dir_z);
-    const canonical_zig_lib_dir: []const u8 = canonical_zig_lib_dir_z;
+    const canonical_zig_lib_dir = try canonicalizeZigLibDir(allocator, zig_lib_dir);
+    defer allocator.free(canonical_zig_lib_dir);
 
     const manifest_path = try zigLibIdentityManifestPath(allocator, cache_dir, canonical_zig_lib_dir);
     defer allocator.free(manifest_path);
@@ -307,25 +387,28 @@ pub fn zigLibIdentityDigest(
     if (readZigLibIdentityManifest(allocator, manifest_path)) |manifest_value| {
         var manifest = manifest_value;
         defer manifest.deinit(allocator);
-        const manifest_mtime_nanos = cwdFileMtimeNanos(manifest_path) catch return error.ZigLibUnreadable;
-        if (validateZigLibIdentityManifest(
+        const manifest_mtime_nanos = cwdFileMtimeNanos(manifest_path) catch |err|
+            return toolchainIdentityError(err, error.ZigLibIdentityManifestStatUnavailable);
+        if (try validateZigLibIdentityManifest(
             allocator,
             canonical_zig_lib_dir,
             manifest,
             manifest_mtime_nanos,
             maybe_stats,
-        ) catch return error.ZigLibUnreadable) {
+        )) {
             if (maybe_stats) |stats| stats.manifest_hit = true;
             return manifest.identity_digest;
         }
     } else |err| switch (err) {
         error.FileNotFound, error.InvalidZigLibIdentityManifest => {},
-        else => return err,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ZigLibIdentityManifestReadFailed => return error.ZigLibIdentityManifestReadFailed,
     }
 
     var rebuilt = try rebuildZigLibIdentityManifest(allocator, canonical_zig_lib_dir, maybe_stats);
     defer rebuilt.deinit(allocator);
-    try writeZigLibIdentityManifestAtomic(allocator, manifest_path, rebuilt);
+    writeZigLibIdentityManifestAtomic(allocator, manifest_path, rebuilt) catch |err|
+        return toolchainIdentityError(err, error.ZigLibIdentityManifestWriteFailed);
     return rebuilt.identity_digest;
 }
 
@@ -333,19 +416,13 @@ pub fn compilerIdentityDigest(
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
     maybe_stats: ?*ToolchainIdentityStats,
-) !ToolchainDigest {
+) ToolchainIdentityError!ToolchainDigest {
     if (maybe_stats) |stats| stats.* = .{};
 
-    const exe_path = std.process.executablePathAlloc(std.Options.debug_io, allocator) catch
-        return error.CompilerIdentityUnavailable;
+    const exe_path = try resolveCompilerExecutablePath(allocator);
     defer allocator.free(exe_path);
-    const canonical_exe_path_z = std.Io.Dir.cwd().realPathFileAlloc(
-        std.Options.debug_io,
-        exe_path,
-        allocator,
-    ) catch return error.CompilerIdentityUnavailable;
-    defer allocator.free(canonical_exe_path_z);
-    const canonical_exe_path: []const u8 = canonical_exe_path_z;
+    const canonical_exe_path = try canonicalizeCompilerExecutablePath(allocator, exe_path);
+    defer allocator.free(canonical_exe_path);
 
     return compilerIdentityDigestForPath(allocator, cache_dir, canonical_exe_path, maybe_stats);
 }
@@ -355,7 +432,7 @@ pub fn compilerIdentityDigestForPath(
     cache_dir: []const u8,
     canonical_exe_path: []const u8,
     maybe_stats: ?*ToolchainIdentityStats,
-) !ToolchainDigest {
+) ToolchainIdentityError!ToolchainDigest {
     if (maybe_stats) |stats| stats.* = .{};
 
     const manifest_path = try compilerIdentityManifestPath(allocator, cache_dir, canonical_exe_path);
@@ -364,24 +441,27 @@ pub fn compilerIdentityDigestForPath(
     if (readCompilerIdentityManifest(allocator, manifest_path)) |manifest_value| {
         var manifest = manifest_value;
         defer manifest.deinit(allocator);
-        const manifest_mtime_nanos = cwdFileMtimeNanos(manifest_path) catch return error.CompilerIdentityUnavailable;
-        if (validateCompilerIdentityManifest(
+        const manifest_mtime_nanos = cwdFileMtimeNanos(manifest_path) catch |err|
+            return toolchainIdentityError(err, error.CompilerIdentityManifestStatUnavailable);
+        if (try validateCompilerIdentityManifest(
             canonical_exe_path,
             manifest,
             manifest_mtime_nanos,
             maybe_stats,
-        ) catch return error.CompilerIdentityUnavailable) {
+        )) {
             if (maybe_stats) |stats| stats.manifest_hit = true;
             return manifest.identity_digest;
         }
     } else |err| switch (err) {
         error.FileNotFound, error.InvalidCompilerIdentityManifest => {},
-        else => return err,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.CompilerIdentityManifestReadFailed => return error.CompilerIdentityManifestReadFailed,
     }
 
     var rebuilt = try rebuildCompilerIdentityManifest(allocator, canonical_exe_path, maybe_stats);
     defer rebuilt.deinit(allocator);
-    try writeCompilerIdentityManifestAtomic(allocator, manifest_path, rebuilt);
+    writeCompilerIdentityManifestAtomic(allocator, manifest_path, rebuilt) catch |err|
+        return toolchainIdentityError(err, error.CompilerIdentityManifestWriteFailed);
     return rebuilt.identity_digest;
 }
 
@@ -566,81 +646,100 @@ pub fn validateSnapshot(
     allocator: std.mem.Allocator,
     snapshot: Snapshot,
     inputs: ValidationInputs,
-) bool {
+) !ValidationResult {
     if (inputs.stats) |stats| stats.* = .{};
 
     if (!std.mem.eql(u8, &snapshot.invocation_identity, &inputs.invocation_identity)) {
         recordValidationMiss(inputs.stats, .invocation_identity_changed, "");
-        return false;
+        return .miss;
     }
     if (!cachedArtifactPathMatchesKey(snapshot)) {
         recordValidationMiss(inputs.stats, .cached_artifact_path_mismatch, snapshot.cached_artifact_path);
-        return false;
+        return .miss;
     }
 
-    std.Io.Dir.cwd().access(std.Options.debug_io, snapshot.cached_artifact_path, .{}) catch {
-        recordValidationMiss(inputs.stats, .cached_artifact_missing, snapshot.cached_artifact_path);
-        return false;
-    };
+    switch (try validateCachedPathAccess(
+        snapshot.cached_artifact_path,
+        .cached_artifact_missing,
+        snapshot.cached_artifact_path,
+        inputs.stats,
+    )) {
+        .valid => {},
+        .miss => return .miss,
+    }
     if (snapshot.debug_symbols_required) {
-        const debug_path = std.fmt.allocPrint(allocator, "{s}.dSYM", .{snapshot.cached_artifact_path}) catch return false;
+        const debug_path = try std.fmt.allocPrint(allocator, "{s}.dSYM", .{snapshot.cached_artifact_path});
         defer allocator.free(debug_path);
-        std.Io.Dir.cwd().access(std.Options.debug_io, debug_path, .{}) catch {
-            recordValidationMiss(inputs.stats, .debug_symbols_missing, snapshot.cached_artifact_path);
-            return false;
-        };
+        switch (try validateCachedPathAccess(
+            debug_path,
+            .debug_symbols_missing,
+            snapshot.cached_artifact_path,
+            inputs.stats,
+        )) {
+            .valid => {},
+            .miss => return .miss,
+        }
     }
 
     for (snapshot.files) |expected| {
-        if (!validateFileFingerprint(
-            allocator,
+        switch (try validateFileFingerprint(
             expected,
             inputs.snapshot_mtime_nanos,
             inputs.stats,
-        )) return false;
+        )) {
+            .valid => {},
+            .miss => return .miss,
+        }
     }
     for (snapshot.directories) |expected| {
-        const current = directoryFingerprint(allocator, expected.path, expected.recursive) catch {
-            recordValidationMiss(inputs.stats, .directory_unreadable, expected.path);
-            return false;
-        };
+        const current = try directoryFingerprint(allocator, expected.path, expected.recursive);
         defer allocator.free(current.path);
         if (current.present != expected.present) {
             recordValidationMiss(inputs.stats, .directory_presence_changed, expected.path);
-            return false;
+            return .miss;
         }
         if (current.listing_hash != expected.listing_hash) {
             recordValidationMiss(inputs.stats, .directory_listing_changed, expected.path);
-            return false;
+            return .miss;
         }
     }
     for (snapshot.env_vars) |expected| {
-        const current = envFingerprint(allocator, expected.name) catch {
-            recordValidationMiss(inputs.stats, .env_unreadable, expected.name);
-            return false;
-        };
+        const current = try envFingerprint(allocator, expected.name);
         defer allocator.free(current.name);
         if (current.present != expected.present) {
             recordValidationMiss(inputs.stats, .env_presence_changed, expected.name);
-            return false;
+            return .miss;
         }
         if (current.value_hash != expected.value_hash) {
             recordValidationMiss(inputs.stats, .env_value_changed, expected.name);
-            return false;
+            return .miss;
         }
     }
     for (snapshot.globs) |expected| {
-        const current = globFingerprint(allocator, expected.pattern) catch {
-            recordValidationMiss(inputs.stats, .glob_unreadable, expected.pattern);
-            return false;
-        };
+        const current = try globFingerprint(allocator, expected.pattern);
         defer allocator.free(current.pattern);
         if (current.result_hash != expected.result_hash) {
             recordValidationMiss(inputs.stats, .glob_result_changed, expected.pattern);
-            return false;
+            return .miss;
         }
     }
-    return true;
+    return .valid;
+}
+
+fn validateCachedPathAccess(
+    path: []const u8,
+    missing_reason: ValidationMissReason,
+    miss_path: []const u8,
+    maybe_stats: ?*ValidationStats,
+) !ValidationResult {
+    std.Io.Dir.cwd().access(std.Options.debug_io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            recordValidationMiss(maybe_stats, missing_reason, miss_path);
+            return .miss;
+        },
+        else => return err,
+    };
+    return .valid;
 }
 
 fn cachedArtifactPathMatchesKey(snapshot: Snapshot) bool {
@@ -922,7 +1021,11 @@ fn readPipeline(allocator: std.mem.Allocator, reader: *Reader) !Pipeline {
                 const arg_count = try reader.readCount();
                 var arg_index: usize = 0;
                 while (arg_index < arg_count) : (arg_index += 1) {
-                    try args.append(allocator, try reader.readString(allocator));
+                    const arg = try reader.readString(allocator);
+                    var arg_transferred = false;
+                    errdefer if (!arg_transferred) allocator.free(arg);
+                    try args.append(allocator, arg);
+                    arg_transferred = true;
                 }
                 const owned_args = try args.toOwnedSlice(allocator);
                 args_transferred = true;
@@ -1042,7 +1145,10 @@ fn zigLibIdentityManifestPath(
     );
 }
 
-fn readZigLibIdentityManifest(allocator: std.mem.Allocator, path: []const u8) !ZigLibIdentityManifest {
+fn readZigLibIdentityManifest(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ReadZigLibIdentityManifestError!ZigLibIdentityManifest {
     const bytes = std.Io.Dir.cwd().readFileAlloc(
         std.Options.debug_io,
         path,
@@ -1050,7 +1156,8 @@ fn readZigLibIdentityManifest(allocator: std.mem.Allocator, path: []const u8) !Z
         .limited(MAX_TOOLCHAIN_MANIFEST_BYTES),
     ) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
-        else => return err,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ZigLibIdentityManifestReadFailed,
     };
     defer allocator.free(bytes);
     return deserializeZigLibIdentityManifest(allocator, bytes);
@@ -1156,7 +1263,10 @@ fn compilerIdentityManifestPath(
     );
 }
 
-fn readCompilerIdentityManifest(allocator: std.mem.Allocator, path: []const u8) !CompilerIdentityManifest {
+fn readCompilerIdentityManifest(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ReadCompilerIdentityManifestError!CompilerIdentityManifest {
     const bytes = std.Io.Dir.cwd().readFileAlloc(
         std.Options.debug_io,
         path,
@@ -1164,7 +1274,8 @@ fn readCompilerIdentityManifest(allocator: std.mem.Allocator, path: []const u8) 
         .limited(MAX_TOOLCHAIN_MANIFEST_BYTES),
     ) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
-        else => return err,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CompilerIdentityManifestReadFailed,
     };
     defer allocator.free(bytes);
     return deserializeCompilerIdentityManifest(allocator, bytes);
@@ -1231,7 +1342,7 @@ fn validateZigLibIdentityManifest(
     manifest: ZigLibIdentityManifest,
     manifest_mtime_nanos: i128,
     maybe_stats: ?*ToolchainIdentityStats,
-) !bool {
+) ToolchainIdentityError!bool {
     if (!std.mem.eql(u8, canonical_zig_lib_dir, manifest.canonical_dir)) return false;
 
     const current = try collectZigLibRecords(allocator, canonical_zig_lib_dir, false, maybe_stats);
@@ -1254,10 +1365,11 @@ fn validateCompilerIdentityManifest(
     manifest: CompilerIdentityManifest,
     manifest_mtime_nanos: i128,
     maybe_stats: ?*ToolchainIdentityStats,
-) !bool {
+) ToolchainIdentityError!bool {
     if (!std.mem.eql(u8, canonical_exe_path, manifest.canonical_path)) return false;
 
-    const stat = cwdFileStat(canonical_exe_path) catch return error.CompilerIdentityUnavailable;
+    const stat = cwdFileStat(canonical_exe_path) catch |err|
+        return toolchainIdentityError(err, error.CompilerFileStatUnavailable);
     if (maybe_stats) |stats| stats.files_discovered += 1;
     if (stat.kind != .file) return false;
     if (manifest.size != stat.size) return false;
@@ -1272,7 +1384,7 @@ fn rebuildZigLibIdentityManifest(
     allocator: std.mem.Allocator,
     canonical_zig_lib_dir: []const u8,
     maybe_stats: ?*ToolchainIdentityStats,
-) !ZigLibIdentityManifest {
+) ToolchainIdentityError!ZigLibIdentityManifest {
     const canonical_dir = try allocator.dupe(u8, canonical_zig_lib_dir);
     errdefer allocator.free(canonical_dir);
 
@@ -1290,12 +1402,13 @@ fn rebuildCompilerIdentityManifest(
     allocator: std.mem.Allocator,
     canonical_exe_path: []const u8,
     maybe_stats: ?*ToolchainIdentityStats,
-) !CompilerIdentityManifest {
+) ToolchainIdentityError!CompilerIdentityManifest {
     const canonical_path = try allocator.dupe(u8, canonical_exe_path);
     errdefer allocator.free(canonical_path);
 
-    const stat = cwdFileStat(canonical_exe_path) catch return error.CompilerIdentityUnavailable;
-    if (stat.kind != .file) return error.CompilerIdentityUnavailable;
+    const stat = cwdFileStat(canonical_exe_path) catch |err|
+        return toolchainIdentityError(err, error.CompilerFileStatUnavailable);
+    if (stat.kind != .file) return error.CompilerFileNotRegular;
     if (maybe_stats) |stats| stats.files_discovered += 1;
     const content_digest = try hashCompilerFileContents(allocator, canonical_exe_path, maybe_stats);
 
@@ -1315,12 +1428,12 @@ fn collectZigLibRecords(
     canonical_zig_lib_dir: []const u8,
     comptime hash_contents: bool,
     maybe_stats: ?*ToolchainIdentityStats,
-) ![]ZigLibFileRecord {
+) ToolchainIdentityError![]ZigLibFileRecord {
     var dir = std.Io.Dir.cwd().openDir(
         std.Options.debug_io,
         canonical_zig_lib_dir,
         .{ .iterate = true },
-    ) catch return error.ZigLibUnreadable;
+    ) catch |err| return toolchainIdentityError(err, error.ZigLibDirectoryOpenFailed);
     defer dir.close(std.Options.debug_io);
 
     var records: std.ArrayListUnmanaged(ZigLibFileRecord) = .empty;
@@ -1329,25 +1442,32 @@ fn collectZigLibRecords(
         records.deinit(allocator);
     }
 
-    var walker = std.Io.Dir.walk(dir, allocator) catch return error.ZigLibUnreadable;
+    var walker = std.Io.Dir.walk(dir, allocator) catch |err|
+        return toolchainIdentityError(err, error.ZigLibDirectoryWalkFailed);
     defer walker.deinit();
-    while (walker.next(std.Options.debug_io) catch return error.ZigLibUnreadable) |entry| {
+    while (walker.next(std.Options.debug_io) catch |err|
+        return toolchainIdentityError(err, error.ZigLibDirectoryWalkFailed)) |entry|
+    {
         if (entry.kind != .file) continue;
-        const stat = zigLibFileStat(dir, entry.path) catch return error.ZigLibUnreadable;
+        const stat = try zigLibFileStat(dir, entry.path);
         if (stat.kind != .file) continue;
         const digest: FileDigest = if (hash_contents)
             try hashZigLibFileContents(allocator, dir, entry.path, maybe_stats)
         else
             [_]u8{0} ** 32;
         if (maybe_stats) |stats| stats.files_discovered += 1;
+        const record_path = try allocator.dupe(u8, entry.path);
+        var path_transferred = false;
+        errdefer if (!path_transferred) allocator.free(record_path);
         try records.append(allocator, .{
-            .path = try allocator.dupe(u8, entry.path),
+            .path = record_path,
             .size = stat.size,
             .inode = @intCast(stat.inode),
             .mtime_nanos = stat.mtime.nanoseconds,
             .ctime_nanos = stat.ctime.nanoseconds,
             .content_digest = digest,
         });
+        path_transferred = true;
     }
 
     std.mem.sort(ZigLibFileRecord, records.items, {}, struct {
@@ -1358,13 +1478,14 @@ fn collectZigLibRecords(
     return try records.toOwnedSlice(allocator);
 }
 
-fn zigLibFileStat(dir: std.Io.Dir, relative_path: []const u8) !std.Io.File.Stat {
+fn zigLibFileStat(dir: std.Io.Dir, relative_path: []const u8) ToolchainIdentityError!std.Io.File.Stat {
     var file = dir.openFile(std.Options.debug_io, relative_path, .{
         .allow_directory = false,
         .path_only = true,
-    }) catch return error.ZigLibUnreadable;
+    }) catch |err| return toolchainIdentityError(err, error.ZigLibFileStatUnavailable);
     defer file.close(std.Options.debug_io);
-    return file.stat(std.Options.debug_io) catch return error.ZigLibUnreadable;
+    return file.stat(std.Options.debug_io) catch |err|
+        return toolchainIdentityError(err, error.ZigLibFileStatUnavailable);
 }
 
 fn cwdFileStat(path: []const u8) !std.Io.File.Stat {
@@ -1471,52 +1592,44 @@ fn statIdentityMatches(left: std.Io.File.Stat, right: std.Io.File.Stat) bool {
 }
 
 fn validateFileFingerprint(
-    allocator: std.mem.Allocator,
     expected: FileFingerprint,
     snapshot_mtime_nanos: i128,
     maybe_stats: ?*ValidationStats,
-) bool {
+) !ValidationResult {
     const stat = cwdFileStat(expected.path) catch |err| switch (err) {
         error.FileNotFound => {
-            if (!expected.present) return true;
+            if (!expected.present) return .valid;
             recordValidationMiss(maybe_stats, .file_missing, expected.path);
-            return false;
+            return .miss;
         },
-        else => {
-            recordValidationMiss(maybe_stats, .file_unreadable, expected.path);
-            return false;
-        },
+        else => return err,
     };
     if (maybe_stats) |stats| stats.file_stats_checked += 1;
     if (!expected.present) {
         recordValidationMiss(maybe_stats, .file_unexpectedly_present, expected.path);
-        return false;
+        return .miss;
     }
     if (stat.kind != .file) {
         recordValidationMiss(maybe_stats, .file_not_regular, expected.path);
-        return false;
+        return .miss;
     }
 
     if (fileStatMatchesFingerprint(stat, expected) and fileStatPredatesSnapshot(stat, snapshot_mtime_nanos)) {
-        return true;
+        return .valid;
     }
 
-    _ = allocator;
     const current_digest = hashFingerprintFileContents(expected.path, maybe_stats) catch |err| switch (err) {
         error.FileNotFound => {
             recordValidationMiss(maybe_stats, .file_missing, expected.path);
-            return false;
+            return .miss;
         },
-        else => {
-            recordValidationMiss(maybe_stats, .file_unreadable, expected.path);
-            return false;
-        },
+        else => return err,
     };
     if (!std.mem.eql(u8, current_digest[0..], expected.content_digest[0..])) {
         recordValidationMiss(maybe_stats, .file_content_changed, expected.path);
-        return false;
+        return .miss;
     }
-    return true;
+    return .valid;
 }
 
 fn fileStatMatchesFingerprint(stat: std.Io.File.Stat, expected: FileFingerprint) bool {
@@ -1551,13 +1664,14 @@ fn hashZigLibFileContents(
     dir: std.Io.Dir,
     relative_path: []const u8,
     maybe_stats: ?*ToolchainIdentityStats,
-) !FileDigest {
+) ToolchainIdentityError!FileDigest {
     _ = allocator;
     var file = dir.openFile(std.Options.debug_io, relative_path, .{
         .allow_directory = false,
-    }) catch return error.ZigLibUnreadable;
+    }) catch |err| return toolchainIdentityError(err, error.ZigLibFileOpenFailed);
     defer file.close(std.Options.debug_io);
-    const digest = hashOpenedFileContents(file, MAX_TOOLCHAIN_FILE_BYTES) catch return error.ZigLibUnreadable;
+    const digest = hashOpenedFileContents(file, MAX_TOOLCHAIN_FILE_BYTES) catch |err|
+        return toolchainIdentityHashError(err, error.ZigLibFileHashUnavailable);
     if (maybe_stats) |stats| stats.files_hashed += 1;
     return digest;
 }
@@ -1566,10 +1680,10 @@ fn hashCompilerFileContents(
     allocator: std.mem.Allocator,
     canonical_exe_path: []const u8,
     maybe_stats: ?*ToolchainIdentityStats,
-) !FileDigest {
+) ToolchainIdentityError!FileDigest {
     _ = allocator;
-    const digest = hashFileContentsFromCwd(canonical_exe_path, MAX_TOOLCHAIN_FILE_BYTES) catch
-        return error.CompilerIdentityUnavailable;
+    const digest = hashFileContentsFromCwd(canonical_exe_path, MAX_TOOLCHAIN_FILE_BYTES) catch |err|
+        return toolchainIdentityHashError(err, error.CompilerFileHashUnavailable);
     if (maybe_stats) |stats| stats.files_hashed += 1;
     return digest;
 }
@@ -1653,13 +1767,17 @@ fn hashDirectoryListing(allocator: std.mem.Allocator, path: []const u8, recursiv
             if (!std.mem.endsWith(u8, entry.basename, ".zap")) continue;
             const stat = try directoryEntryStat(dir, entry.path);
             if (stat.kind != .file) continue;
+            const entry_path = try allocator.dupe(u8, entry.path);
+            var path_transferred = false;
+            errdefer if (!path_transferred) allocator.free(entry_path);
             try entries.append(allocator, .{
-                .path = try allocator.dupe(u8, entry.path),
+                .path = entry_path,
                 .size = stat.size,
                 .inode = @intCast(stat.inode),
                 .mtime_nanos = stat.mtime.nanoseconds,
                 .ctime_nanos = stat.ctime.nanoseconds,
             });
+            path_transferred = true;
         }
     } else {
         var iterator = dir.iterate();
@@ -1668,13 +1786,17 @@ fn hashDirectoryListing(allocator: std.mem.Allocator, path: []const u8, recursiv
             if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
             const stat = try directoryEntryStat(dir, entry.name);
             if (stat.kind != .file) continue;
+            const entry_path = try allocator.dupe(u8, entry.name);
+            var path_transferred = false;
+            errdefer if (!path_transferred) allocator.free(entry_path);
             try entries.append(allocator, .{
-                .path = try allocator.dupe(u8, entry.name),
+                .path = entry_path,
                 .size = stat.size,
                 .inode = @intCast(stat.inode),
                 .mtime_nanos = stat.mtime.nanoseconds,
                 .ctime_nanos = stat.ctime.nanoseconds,
             });
+            path_transferred = true;
         }
     }
 
@@ -1956,6 +2078,34 @@ test "stable snapshot read rejects invalid snapshot bytes" {
     try std.testing.expectError(error.InvalidSnapshot, readStableSnapshot(allocator, snapshot_path));
 }
 
+test "stable snapshot read preserves allocation failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const snapshot_path = try std.fs.path.join(allocator, &.{ tmp_path, ".zap-cache/target.build-plan" });
+    defer allocator.free(snapshot_path);
+
+    const snapshot: Snapshot = .{
+        .invocation_identity = testDigest(99),
+        .cache_key_hex = "abcd",
+        .cached_artifact_path = ".zap-cache/o/abcd/app",
+        .output_path = "zap-out/bin/app",
+        .kind = .bin,
+        .debug_symbols_required = false,
+    };
+    try writeSnapshotAtomic(allocator, snapshot_path, snapshot);
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        readStableSnapshot(failing_allocator.allocator(), snapshot_path),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
 test "snapshot deserialization frees owned strings on malformed data" {
     const allocator = std.testing.allocator;
     var bytes: std.ArrayListUnmanaged(u8) = .empty;
@@ -2057,7 +2207,7 @@ test "snapshot validation reuses content digest when stat tuple predates snapsho
         .stats = &stats,
     };
 
-    try std.testing.expect(validateSnapshot(allocator, snapshot, inputs));
+    try std.testing.expectEqual(ValidationResult.valid, try validateSnapshot(allocator, snapshot, inputs));
     try std.testing.expectEqual(@as(usize, 1), stats.file_stats_checked);
     try std.testing.expectEqual(@as(usize, 0), stats.files_hashed);
 }
@@ -2103,7 +2253,7 @@ test "snapshot validation falls back to content hash on file stat mismatch" {
         .stats = &stats,
     };
 
-    try std.testing.expect(validateSnapshot(allocator, snapshot, inputs));
+    try std.testing.expectEqual(ValidationResult.valid, try validateSnapshot(allocator, snapshot, inputs));
     try std.testing.expectEqual(@as(usize, 1), stats.file_stats_checked);
     try std.testing.expectEqual(@as(usize, 1), stats.files_hashed);
 }
@@ -2146,7 +2296,7 @@ test "snapshot validation rejects same-size file content edits" {
         .snapshot_mtime_nanos = std.math.maxInt(i128),
     };
 
-    try std.testing.expect(validateSnapshot(allocator, snapshot, inputs));
+    try std.testing.expectEqual(ValidationResult.valid, try validateSnapshot(allocator, snapshot, inputs));
     tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "app.zap", .data = "bbbb" }) catch return error.Unexpected;
     var changed_stats: ValidationStats = .{};
     const changed_inputs: ValidationInputs = .{
@@ -2154,7 +2304,7 @@ test "snapshot validation rejects same-size file content edits" {
         .snapshot_mtime_nanos = std.math.maxInt(i128),
         .stats = &changed_stats,
     };
-    try std.testing.expect(!validateSnapshot(allocator, snapshot, changed_inputs));
+    try std.testing.expectEqual(ValidationResult.miss, try validateSnapshot(allocator, snapshot, changed_inputs));
     try std.testing.expectEqual(ValidationMissReason.file_content_changed, changed_stats.miss_reason.?);
     try std.testing.expectEqualStrings(file_path, changed_stats.miss_path);
 }
@@ -2350,6 +2500,45 @@ test "Zig lib identity manifest preserves OOM while reading canonical dir" {
     );
 }
 
+test "Zig lib identity digest preserves OOM during canonicalization" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "zig-lib") catch return error.Unexpected;
+    const root = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(root);
+    const zig_lib_dir = try std.fs.path.join(allocator, &.{ root, "zig-lib" });
+    defer allocator.free(zig_lib_dir);
+    const cache_dir = try std.fs.path.join(allocator, &.{ root, ".zap-cache" });
+    defer allocator.free(cache_dir);
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        zigLibIdentityDigest(failing_allocator.allocator(), cache_dir, zig_lib_dir, null),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "Zig lib identity digest reports canonicalization failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const root = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(root);
+    const missing_zig_lib_dir = try std.fs.path.join(allocator, &.{ root, "missing-zig-lib" });
+    defer allocator.free(missing_zig_lib_dir);
+    const cache_dir = try std.fs.path.join(allocator, &.{ root, ".zap-cache" });
+    defer allocator.free(cache_dir);
+
+    try std.testing.expectError(
+        error.ZigLibCanonicalizationFailed,
+        zigLibIdentityDigest(allocator, cache_dir, missing_zig_lib_dir, null),
+    );
+}
+
 test "Zig lib identity manifest read errors are not treated as corrupt bytes" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
@@ -2488,6 +2677,68 @@ test "compiler identity manifest preserves OOM while reading canonical path" {
     );
 }
 
+test "compiler identity digest preserves OOM while resolving executable path" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        compilerIdentityDigest(failing_allocator.allocator(), ".zap-cache/toolchain", null),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "compiler identity canonicalization preserves OOM" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zap", .data = "compiler bytes" }) catch return error.Unexpected;
+    const root = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(root);
+    const compiler_path = try std.fs.path.join(allocator, &.{ root, "zap" });
+    defer allocator.free(compiler_path);
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        canonicalizeCompilerExecutablePath(failing_allocator.allocator(), compiler_path),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "compiler identity digest reports executable stat failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const root = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(root);
+    const missing_compiler_path = try std.fs.path.join(allocator, &.{ root, "missing-zap" });
+    defer allocator.free(missing_compiler_path);
+    const cache_dir = try std.fs.path.join(allocator, &.{ root, ".zap-cache/toolchain" });
+    defer allocator.free(cache_dir);
+
+    try std.testing.expectError(
+        error.CompilerFileStatUnavailable,
+        compilerIdentityDigestForPath(allocator, cache_dir, missing_compiler_path, null),
+    );
+}
+
+test "compiler identity hash helper reports hash failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const root = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(root);
+    const missing_compiler_path = try std.fs.path.join(allocator, &.{ root, "missing-zap" });
+    defer allocator.free(missing_compiler_path);
+
+    try std.testing.expectError(
+        error.CompilerFileHashUnavailable,
+        hashCompilerFileContents(allocator, missing_compiler_path, null),
+    );
+}
+
 test "snapshot validation rejects changed file cached artifact glob env and missing dSYM" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
@@ -2539,35 +2790,193 @@ test "snapshot validation rejects changed file cached artifact glob env and miss
         .invocation_identity = testDigest(1),
         .snapshot_mtime_nanos = std.math.maxInt(i128),
     };
-    try std.testing.expect(validateSnapshot(allocator, snapshot, inputs));
+    try std.testing.expectEqual(ValidationResult.valid, try validateSnapshot(allocator, snapshot, inputs));
 
     var wrong_cache_key = snapshot;
     wrong_cache_key.cache_key_hex = "different";
-    try std.testing.expect(!validateSnapshot(allocator, wrong_cache_key, inputs));
+    try std.testing.expectEqual(ValidationResult.miss, try validateSnapshot(allocator, wrong_cache_key, inputs));
 
     tmp_dir.dir.deleteFile(std.Options.debug_io, "zap-out/bin/app") catch return error.Unexpected;
-    try std.testing.expect(validateSnapshot(allocator, snapshot, inputs));
+    try std.testing.expectEqual(ValidationResult.valid, try validateSnapshot(allocator, snapshot, inputs));
     tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "zap-out/bin/app", .data = "binary" }) catch return error.Unexpected;
 
     tmp_dir.dir.deleteFile(std.Options.debug_io, ".zap-cache/o/abcd/app") catch return error.Unexpected;
-    try std.testing.expect(!validateSnapshot(allocator, snapshot, inputs));
+    try std.testing.expectEqual(ValidationResult.miss, try validateSnapshot(allocator, snapshot, inputs));
     tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".zap-cache/o/abcd/app", .data = "binary" }) catch return error.Unexpected;
 
     tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/app.zap", .data = "pub struct Changed {}" }) catch return error.Unexpected;
-    try std.testing.expect(!validateSnapshot(allocator, snapshot, inputs));
+    try std.testing.expectEqual(ValidationResult.miss, try validateSnapshot(allocator, snapshot, inputs));
     tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/app.zap", .data = "pub struct App {}" }) catch return error.Unexpected;
 
     tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/extra.zap", .data = "pub struct Extra {}" }) catch return error.Unexpected;
-    try std.testing.expect(!validateSnapshot(allocator, snapshot, inputs));
+    try std.testing.expectEqual(ValidationResult.miss, try validateSnapshot(allocator, snapshot, inputs));
     tmp_dir.dir.deleteFile(std.Options.debug_io, "lib/extra.zap") catch return error.Unexpected;
 
     var missing_dsym = snapshot;
     missing_dsym.debug_symbols_required = true;
-    try std.testing.expect(!validateSnapshot(allocator, missing_dsym, inputs));
+    try std.testing.expectEqual(ValidationResult.miss, try validateSnapshot(allocator, missing_dsym, inputs));
 
     var env_mismatch = snapshot;
     env_mismatch.env_vars = &bad_env;
-    try std.testing.expect(!validateSnapshot(allocator, env_mismatch, inputs));
+    try std.testing.expectEqual(ValidationResult.miss, try validateSnapshot(allocator, env_mismatch, inputs));
+}
+
+test "snapshot validation propagates cached artifact access failures" {
+    const allocator = std.testing.allocator;
+
+    const too_long_prefix = try allocator.alloc(u8, std.fs.max_path_bytes + 1);
+    defer allocator.free(too_long_prefix);
+    @memset(too_long_prefix, 'a');
+    const cached_artifact_path = try std.fmt.allocPrint(allocator, "{s}/abcd/app", .{too_long_prefix});
+    defer allocator.free(cached_artifact_path);
+
+    const snapshot: Snapshot = .{
+        .invocation_identity = testDigest(1),
+        .cache_key_hex = "abcd",
+        .cached_artifact_path = cached_artifact_path,
+        .output_path = "zap-out/bin/app",
+        .kind = .bin,
+        .debug_symbols_required = false,
+    };
+    const inputs: ValidationInputs = .{
+        .invocation_identity = testDigest(1),
+        .snapshot_mtime_nanos = std.math.maxInt(i128),
+    };
+
+    try std.testing.expectError(error.NameTooLong, validateSnapshot(allocator, snapshot, inputs));
+}
+
+test "snapshot validation propagates directory fingerprint allocation failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, ".zap-cache/o/abcd") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".zap-cache/o/abcd/app", .data = "binary" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const cached_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, ".zap-cache/o/abcd/app" });
+    defer allocator.free(cached_artifact_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "zap-out/bin/app" });
+    defer allocator.free(output_path);
+    const dir_path = try std.fs.path.join(allocator, &.{ tmp_path, "lib" });
+    defer allocator.free(dir_path);
+
+    const directories = [_]DirectoryFingerprint{.{
+        .path = dir_path,
+        .recursive = false,
+        .present = true,
+        .listing_hash = 0,
+    }};
+    const snapshot: Snapshot = .{
+        .invocation_identity = testDigest(1),
+        .cache_key_hex = "abcd",
+        .cached_artifact_path = cached_artifact_path,
+        .output_path = output_path,
+        .kind = .bin,
+        .debug_symbols_required = false,
+        .directories = &directories,
+    };
+    const inputs: ValidationInputs = .{
+        .invocation_identity = testDigest(1),
+        .snapshot_mtime_nanos = std.math.maxInt(i128),
+    };
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        validateSnapshot(failing_allocator.allocator(), snapshot, inputs),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "snapshot validation propagates env fingerprint allocation failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, ".zap-cache/o/abcd") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".zap-cache/o/abcd/app", .data = "binary" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const cached_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, ".zap-cache/o/abcd/app" });
+    defer allocator.free(cached_artifact_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "zap-out/bin/app" });
+    defer allocator.free(output_path);
+
+    const env_vars = [_]EnvFingerprint{.{
+        .name = "ZAP_SNAPSHOT_VALIDATION_OOM_TEST",
+        .present = false,
+        .value_hash = 0,
+    }};
+    const snapshot: Snapshot = .{
+        .invocation_identity = testDigest(1),
+        .cache_key_hex = "abcd",
+        .cached_artifact_path = cached_artifact_path,
+        .output_path = output_path,
+        .kind = .bin,
+        .debug_symbols_required = false,
+        .env_vars = &env_vars,
+    };
+    const inputs: ValidationInputs = .{
+        .invocation_identity = testDigest(1),
+        .snapshot_mtime_nanos = std.math.maxInt(i128),
+    };
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        validateSnapshot(failing_allocator.allocator(), snapshot, inputs),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "snapshot validation propagates glob fingerprint allocation failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, ".zap-cache/o/abcd") catch return error.Unexpected;
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = ".zap-cache/o/abcd/app", .data = "binary" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{ .sub_path = "lib/app.zap", .data = "pub struct App {}" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const cached_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, ".zap-cache/o/abcd/app" });
+    defer allocator.free(cached_artifact_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "zap-out/bin/app" });
+    defer allocator.free(output_path);
+    const glob_pattern = try std.fs.path.join(allocator, &.{ tmp_path, "lib/*.zap" });
+    defer allocator.free(glob_pattern);
+
+    const globs = [_]GlobFingerprint{.{
+        .pattern = glob_pattern,
+        .result_hash = 0,
+    }};
+    const snapshot: Snapshot = .{
+        .invocation_identity = testDigest(1),
+        .cache_key_hex = "abcd",
+        .cached_artifact_path = cached_artifact_path,
+        .output_path = output_path,
+        .kind = .bin,
+        .debug_symbols_required = false,
+        .globs = &globs,
+    };
+    const inputs: ValidationInputs = .{
+        .invocation_identity = testDigest(1),
+        .snapshot_mtime_nanos = std.math.maxInt(i128),
+    };
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        validateSnapshot(failing_allocator.allocator(), snapshot, inputs),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
 }
 
 test "snapshot serialization preserves an opt-in build pipeline" {
@@ -2605,4 +3014,107 @@ test "snapshot serialization preserves an opt-in build pipeline" {
     try std.testing.expectEqualStrings("--only", pipeline.steps[1].run.args[0]);
     try std.testing.expectEqualStrings("math", pipeline.steps[1].run.args[1]);
     try std.testing.expect(pipeline.steps[1].run.forward_args);
+}
+
+fn exerciseReadPipelineAllocationFailures(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    var reader: Reader = .{ .bytes = bytes };
+    const pipeline = try readPipeline(allocator, &reader);
+    defer freePipeline(allocator, pipeline);
+
+    try std.testing.expectEqual(@as(usize, 1), pipeline.steps.len);
+    try std.testing.expect(pipeline.steps[0] == .run);
+    try std.testing.expectEqualStrings("--only", pipeline.steps[0].run.args[0]);
+}
+
+test "P4J2: readPipeline frees read arg when args append fails" {
+    const allocator = std.testing.allocator;
+
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(allocator);
+    try appendInt(allocator, u32, &bytes, 1);
+    try appendInt(allocator, u8, &bytes, 2);
+    try appendBool(allocator, &bytes, false);
+    try appendInt(allocator, u32, &bytes, 1);
+    try appendString(allocator, &bytes, "--only");
+
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        exerciseReadPipelineAllocationFailures,
+        .{bytes.items},
+    );
+}
+
+fn exerciseCollectZigLibRecordsAllocationFailures(
+    allocator: std.mem.Allocator,
+    zig_lib_dir: []const u8,
+) !void {
+    const records = try collectZigLibRecords(allocator, zig_lib_dir, false, null);
+    defer freeZigLibRecords(allocator, records);
+
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    try std.testing.expect(recordsAreStrictlySorted(records));
+}
+
+test "P4J2: collectZigLibRecords frees duplicated record paths when append fails" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "zig-lib/std") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "zig-lib/std/start.zig",
+        .data = "pub const start = true;",
+    }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "zig-lib/build_runner.zig",
+        .data = "pub fn main() void {}",
+    }) catch return error.Unexpected;
+
+    const root = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(root);
+    const zig_lib_dir = try std.fs.path.join(allocator, &.{ root, "zig-lib" });
+    defer allocator.free(zig_lib_dir);
+
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        exerciseCollectZigLibRecordsAllocationFailures,
+        .{zig_lib_dir},
+    );
+}
+
+fn exerciseHashDirectoryListingAllocationFailures(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) !void {
+    const shallow_hash = try hashDirectoryListing(allocator, dir_path, false);
+    const recursive_hash = try hashDirectoryListing(allocator, dir_path, true);
+
+    try std.testing.expect(shallow_hash != recursive_hash);
+}
+
+test "P4J2: hashDirectoryListing frees duplicated entry paths when append fails" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(std.Options.debug_io, "lib/nested") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "lib/app.zap",
+        .data = "pub struct App {}",
+    }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "lib/nested/extra.zap",
+        .data = "pub struct Extra {}",
+    }) catch return error.Unexpected;
+
+    const root = tmp_dir.dir.realPathFileAlloc(std.Options.debug_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(root);
+    const dir_path = try std.fs.path.join(allocator, &.{ root, "lib" });
+    defer allocator.free(dir_path);
+
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        exerciseHashDirectoryListingAllocationFailures,
+        .{dir_path},
+    );
 }

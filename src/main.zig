@@ -282,7 +282,7 @@ fn cmdBuild(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
     if (parsed.watch) {
-        watchAndRebuild(allocator, project_root, target, parsed.build_opts, parsed.build_overrides, .none, &.{}, parsed.collect_arc_stats, parsed.zap_lib_dir);
+        try watchAndRebuild(allocator, project_root, target, parsed.build_opts, parsed.build_overrides, .none, &.{}, parsed.collect_arc_stats, parsed.zap_lib_dir);
         return;
     }
 
@@ -372,16 +372,22 @@ fn firstPositionalIndex(args: []const []const u8) ?usize {
 /// nothing exists on disk does it fall back to manifest-target
 /// behavior. Symlinks are resolved before the file-vs-`build.zap`
 /// decision so a symlinked script is still treated as a script.
-fn classifyRunPositional(allocator: std.mem.Allocator, args: []const []const u8) RunPositionalKind {
+fn classifyRunPositional(allocator: std.mem.Allocator, args: []const []const u8) !RunPositionalKind {
     const idx = firstPositionalIndex(args) orelse return .manifest;
     const raw = args[idx];
 
     // Resolve symlinks first; a path that does not exist falls through
     // to manifest-target semantics (unchanged behavior).
-    const real = std.Io.Dir.cwd().realPathFileAlloc(global_io, raw, allocator) catch return .manifest;
+    const real = std.Io.Dir.cwd().realPathFileAlloc(global_io, raw, allocator) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return .manifest,
+        else => |real_path_err| return real_path_err,
+    };
     defer allocator.free(real);
 
-    const stat = std.Io.Dir.cwd().statFile(global_io, real, .{}) catch return .manifest;
+    const stat = std.Io.Dir.cwd().statFile(global_io, real, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return .manifest,
+        else => |stat_err| return stat_err,
+    };
     switch (stat.kind) {
         .directory => {
             // A directory positional only changes nothing today; if it
@@ -406,7 +412,7 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // no positional, a dir, a `build.zap` file, or a non-existent
     // positional — stays on the manifest path with byte-identical
     // behavior.
-    switch (classifyRunPositional(allocator, args)) {
+    switch (try classifyRunPositional(allocator, args)) {
         .script => |s| return cmdRunScript(allocator, args, s.path, s.arg_index),
         .manifest, .manifest_path => {},
     }
@@ -426,14 +432,14 @@ fn cmdRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Phase 4.c: thread the leak-report knobs to the runtime of the program
     // we will run (same seam as the script path) — the spawned binary
     // inherits this process's `ZAP_ERROR_FORMAT` / `ZAP_LEAKS_FATAL`.
-    propagateLeakReportEnv(parsed.build_overrides);
+    propagateLeakReportEnv(parsed.build_overrides) catch |err| failLeakReportEnvPropagation(err);
 
     const target = parsed.target orelse "default";
 
     const project_root = try discoverBuildFile(allocator, parsed.build_file);
     defer allocator.free(project_root);
     if (parsed.watch) {
-        watchAndRebuild(allocator, project_root, target, parsed.build_opts, parsed.build_overrides, .program, parsed.run_args, parsed.collect_arc_stats, parsed.zap_lib_dir);
+        try watchAndRebuild(allocator, project_root, target, parsed.build_opts, parsed.build_overrides, .program, parsed.run_args, parsed.collect_arc_stats, parsed.zap_lib_dir);
         return;
     }
 
@@ -1372,7 +1378,7 @@ fn cmdRunScript(
     // `ZAP_LEAKS_FATAL`; set them in THIS process's environment now so the
     // child binary `runBinary` spawns inherits them. Set before any compile
     // or run work so the eventual spawn always sees them.
-    propagateLeakReportEnv(overrides);
+    propagateLeakReportEnv(overrides) catch |err| failLeakReportEnvPropagation(err);
 
     // Script mode is single-file with no dependency graph, so a
     // `-Dmemory=` value MUST be a stdlib manager — reject third-party
@@ -1414,14 +1420,14 @@ fn cmdRunScript(
     // compile. D1: no one-struct-per-file validation is run over the
     // script unit. ---------------------------------------------------------
     {
-        var contract_parser = zap.Parser.initScript(alloc, script_source);
+        var contract_parser = try zap.Parser.initScript(alloc, script_source);
         defer contract_parser.deinit();
         const program = contract_parser.parseProgram() catch {
             // Phase 4.b: route the script's parser errors through the UNIFIED
             // renderer / `--error-format=json` path (was a bare-string minimal
             // printer that bypassed both). Same visual language as every other
             // compile diagnostic; JSON consumers see parser errors too.
-            compiler.emitScriptParseErrors(alloc, contract_parser.errors.items, script_path, script_source);
+            try compiler.emitScriptParseErrors(alloc, contract_parser.errors.items, script_path, script_source);
             std.process.exit(1);
         };
         _ = program;
@@ -1449,13 +1455,10 @@ fn cmdRunScript(
     // The embedded fork stdlib MUST outrank a system Zig because the latter
     // is upstream and lacks the fork-only `std.debug` dSYM fallback the crash
     // reporter needs to resolve backtraces to Zap source.
-    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse
-        (extractEmbeddedZigLib(alloc) catch null) orelse
-        zir_backend.detectZigLibDirSystemFallback(alloc) orelse
-        {
-            std.debug.print("Error: could not find or extract Zig lib\n", .{});
-            std.process.exit(1);
-        };
+    const zig_lib_dir = resolveZigLibDir(alloc) catch |err| {
+        std.debug.print("Error: could not resolve Zig lib: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
 
     // ----- Assemble source roots (stdlib ONLY — no project, no deps) ------
     // This is also what structurally forbids external packages in
@@ -1467,9 +1470,7 @@ fn cmdRunScript(
     try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
     {
         const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
-        if (std.Io.Dir.cwd().access(global_io, zap_subdir, .{})) |_| {
-            try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir });
-        } else |_| {}
+        _ = try appendOptionalSourceRoot(alloc, &source_roots, "zap_stdlib", zap_subdir);
     }
 
     // ----- Assemble source units: ALL stdlib + the ONE synthetic unit ----
@@ -1572,18 +1573,30 @@ fn cmdRunScript(
     // run-or-report contract (foreign-target reporting, arg
     // forwarding, exit-code propagation) is identical to a fresh
     // build because both paths go through `runScriptArtifactAndExit`.
-    if (std.Io.Dir.cwd().access(global_io, published_path, .{})) |_| {
-        const debug_symbols_ready = artifactHasRequiredDebugSymbols(alloc, config, published_path) catch {
-            std.debug.print("Error: out of memory checking script debug symbols\n", .{});
-            std.process.exit(1);
-        };
-        if (!debug_symbols_ready) {
-            std.debug.print("[script-cache miss] {s} debug symbols missing\n", .{published_path});
-        } else {
-            std.debug.print("[script-cache hit] {s}\n", .{published_path});
-            runScriptArtifactAndExit(allocator, config.target, published_path, forwarded.items);
-        }
-    } else |_| {}
+    switch (cachedArtifactAccess(published_path) catch |err| {
+        std.debug.print("Error: could not access cached script artifact {s}: {s}\n", .{ published_path, @errorName(err) });
+        std.process.exit(1);
+    }) {
+        .present => {
+            const debug_symbols_ready = artifactHasRequiredDebugSymbols(alloc, config, published_path) catch |err| {
+                std.debug.print("Error: could not validate cached script debug symbols for {s}: {s}\n", .{ published_path, @errorName(err) });
+                std.process.exit(1);
+            };
+            const symbol_table_sidecar_ready = artifactHasRequiredSymbolTableSidecar(alloc, published_path) catch |err| {
+                std.debug.print("Error: could not validate cached script symbol table sidecar for {s}: {s}\n", .{ published_path, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (!debug_symbols_ready) {
+                std.debug.print("[script-cache miss] {s} debug symbols missing\n", .{published_path});
+            } else if (!symbol_table_sidecar_ready) {
+                std.debug.print("[script-cache miss] {s} symbol table sidecar missing\n", .{published_path});
+            } else {
+                std.debug.print("[script-cache hit] {s}\n", .{published_path});
+                runScriptArtifactAndExit(allocator, config.target, published_path, forwarded.items);
+            }
+        },
+        .missing => {},
+    }
 
     // ----- Miss: compile into a PRIVATE staging dir, then publish -------
     // Concurrent identical runs race to produce the same content key;
@@ -1636,46 +1649,77 @@ fn cmdRunScript(
         std.process.exit(1);
     }
 
-    // Atomically publish the freshly-built binary into the shared
-    // content-key directory. `rename` within the same cache root is
-    // atomic on POSIX, so a concurrent run either sees the old
-    // (absent) state and builds its own, or the fully-written final
-    // binary — never a partial file. A racing publisher that already
-    // moved an identical binary into place is fine: the rename simply
-    // replaces it with a byte-identical result for the same key.
-    std.Io.Dir.cwd().rename(artifact.path, std.Io.Dir.cwd(), published_path, global_io) catch |err| {
-        // A cross-device rename cannot happen here (staging and key
-        // dirs share the cache root); any other failure is a real,
-        // surfaced error rather than a silent fallback.
-        std.debug.print("Error: could not publish script artifact to the cache: {s}\n", .{@errorName(err)});
+    publishScriptArtifactToCache(
+        alloc,
+        config,
+        "script",
+        artifact.path,
+        published_path,
+        staging_dir,
+    ) catch |err| {
+        std.debug.print("Error: script artifact publish failed: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    publishScriptDebugSymbolsIfNeeded(alloc, config, artifact.path, published_path) catch |err| {
-        if (err == error.OutOfMemory) {
-            std.debug.print("Error: out of memory publishing script debug symbols\n", .{});
-        }
-        std.process.exit(1);
-    };
-
-    // Publish the `<artifact>.zap-symbols` sidecar alongside the binary so
-    // the Phase 2 crash reporter can resolve mangled frames to Zap symbols
-    // at runtime. The sidecar is emitted into the staging dir by the ZIR
-    // backend; without this copy it would be discarded with the staging
-    // tree (the rename above only moves the binary itself), and the crash
-    // printer would degrade to mangled names. Best-effort: a script that
-    // never crashes does not need it, so a publish failure is non-fatal.
-    publishScriptSymbolTableSidecar(alloc, artifact.path, published_path);
-
-    // The artifact is now safely published; the staging directory has
-    // served its purpose. Best-effort removal keeps the cache root
-    // tidy — a failure here is irrelevant to correctness (the binary
-    // is already in its content-key directory) so it is intentionally
-    // ignored rather than surfaced.
-    std.Io.Dir.cwd().deleteTree(global_io, staging_dir) catch {};
 
     // Run the published binary (identical run-or-report contract as
     // the fast path — one shared tail, no duplication).
     runScriptArtifactAndExit(allocator, config.target, published_path, forwarded.items);
+}
+
+const LeakReportEnvPropagationError = error{
+    LeakReportEnvUnavailable,
+    OutOfMemory,
+};
+
+fn leakReportEnvPropagationRequested(overrides: BuildOverrides) bool {
+    if (overrides.error_format) |fmt| {
+        if (fmt == .json) return true;
+    }
+    return overrides.leaks_fatal;
+}
+
+/// Phase 4.c — propagate the leak-report knobs (`-Derror-format=json`,
+/// `-Dleaks-fatal`) into THIS process's environment so the child binary that
+/// `runBinary` spawns inherits them. The runtime's deinit-time leak reporter
+/// (active only under `Memory.Tracking`) reads `ZAP_ERROR_FORMAT` /
+/// `ZAP_LEAKS_FATAL`; threading them via env is the seam that does not
+/// require widening `runBinary`'s signature (it inherits the parent
+/// environment). A no-op when neither knob is set, so a normal run touches
+/// no environment. Propagation failures are surfaced before any child artifact
+/// is spawned so requested runtime leak-report behavior cannot silently fall
+/// back to the default text/non-fatal policy.
+fn propagateLeakReportEnv(overrides: BuildOverrides) LeakReportEnvPropagationError!void {
+    if (!leakReportEnvPropagationRequested(overrides)) return;
+
+    // Put the knobs into the live process env map captured at startup; the
+    // child binary `runBinary` spawns is given this exact map as its
+    // `environ_map`, so it observes the keys. Mutating the `std`-managed env
+    // map (rather than libc `setenv`) is portable and is the same map the
+    // spawn path consumes — no reliance on a captured `std.os.environ`
+    // snapshot.
+    const env_map = global_env_map orelse return error.LeakReportEnvUnavailable;
+    if (overrides.error_format) |fmt| {
+        if (fmt == .json) {
+            try env_map.put("ZAP_ERROR_FORMAT", "json");
+        }
+    }
+    if (overrides.leaks_fatal) {
+        try env_map.put("ZAP_LEAKS_FATAL", "1");
+    }
+}
+
+fn failLeakReportEnvPropagation(err: LeakReportEnvPropagationError) noreturn {
+    switch (err) {
+        error.LeakReportEnvUnavailable => std.debug.print(
+            "Error: leak-report environment propagation was requested, but the process environment map is unavailable\n",
+            .{},
+        ),
+        error.OutOfMemory => std.debug.print(
+            "Error: out of memory propagating leak-report environment\n",
+            .{},
+        ),
+    }
+    std.process.exit(1);
 }
 
 /// Shared, non-returning tail for BOTH the script cache-hit fast path
@@ -1688,34 +1732,6 @@ fn cmdRunScript(
 /// ⇒ runnable; a foreign `arch-os-abi` triple ⇒ report + exit 0,
 /// exactly as `zap build -Dtarget=<foreign>` and Phase 4 established —
 /// unchanged whether the artifact was just built or served from cache).
-/// Phase 4.c — propagate the leak-report knobs (`-Derror-format=json`,
-/// `-Dleaks-fatal`) into THIS process's environment so the child binary that
-/// `runBinary` spawns inherits them. The runtime's deinit-time leak reporter
-/// (active only under `Memory.Tracking`) reads `ZAP_ERROR_FORMAT` /
-/// `ZAP_LEAKS_FATAL`; threading them via env is the seam that does not
-/// require widening `runBinary`'s signature (it inherits the parent
-/// environment). A no-op when neither knob is set, so a normal run touches
-/// no environment. `setenv` failures are non-fatal — the report simply falls
-/// back to its text/non-fatal default.
-fn propagateLeakReportEnv(overrides: BuildOverrides) void {
-    // Put the knobs into the live process env map captured at startup; the
-    // child binary `runBinary` spawns is given this exact map as its
-    // `environ_map`, so it observes the keys. Mutating the `std`-managed env
-    // map (rather than libc `setenv`) is portable and is the same map the
-    // spawn path consumes — no reliance on a captured `std.os.environ`
-    // snapshot. `.put` failures are non-fatal: the report falls back to its
-    // text / non-fatal default.
-    const env_map = global_env_map orelse return;
-    if (overrides.error_format) |fmt| {
-        if (fmt == .json) {
-            env_map.put("ZAP_ERROR_FORMAT", "json") catch {};
-        }
-    }
-    if (overrides.leaks_fatal) {
-        env_map.put("ZAP_LEAKS_FATAL", "1") catch {};
-    }
-}
-
 fn runScriptArtifactAndExit(
     allocator: std.mem.Allocator,
     target: ?[]const u8,
@@ -1776,6 +1792,295 @@ fn appendTestRunArgs(
     for (forwarded_args) |arg| {
         try test_run_args.append(allocator, arg);
     }
+}
+
+const SingleFileTestInfo = struct {
+    struct_order: []const []const u8,
+    test_struct_names: []const []const u8,
+};
+
+fn structUsesZestCase(struct_decl: zap.ast.StructDecl, interner: *const zap.ast.StringInterner) bool {
+    for (struct_decl.items) |item| {
+        if (item != .use_decl) continue;
+        const use_decl = item.use_decl;
+        if (use_decl.struct_path.parts.len != 2) continue;
+        if (!std.mem.eql(u8, interner.get(use_decl.struct_path.parts[0]), "Zest")) continue;
+        if (!std.mem.eql(u8, interner.get(use_decl.struct_path.parts[1]), "Case")) continue;
+        return true;
+    }
+    return false;
+}
+
+fn makeSingleFileTestRunnerSource(allocator: std.mem.Allocator, test_struct_names: []const []const u8) ![]const u8 {
+    var generated: std.Io.Writer.Allocating = .init(allocator);
+    errdefer generated.deinit();
+
+    try generated.writer.writeAll(
+        \\pub struct TestRunner {
+        \\  pub fn main(_args :: [String]) -> u8 {
+        \\    Zest.Runner.configure()
+        \\
+    );
+    for (test_struct_names) |struct_name| {
+        try generated.writer.print("    {s}.run()\n", .{struct_name});
+    }
+    try generated.writer.writeAll(
+        \\    Zest.Runner.run()
+        \\  }
+        \\}
+        \\
+    );
+
+    return try generated.toOwnedSlice();
+}
+
+fn singleFileTestInfo(
+    allocator: std.mem.Allocator,
+    test_path: []const u8,
+    test_source: []const u8,
+) !SingleFileTestInfo {
+    var interner = zap.ast.StringInterner.init(allocator);
+    defer interner.deinit();
+    var parser = zap.Parser.initWithSharedInterner(allocator, test_source, &interner, 0);
+    defer parser.deinit();
+
+    const program = parser.parseProgram() catch {
+        try compiler.emitScriptParseErrors(allocator, parser.errors.items, test_path, test_source);
+        return error.ParseFailed;
+    };
+
+    var order: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer order.deinit(allocator);
+    var test_struct_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer test_struct_names.deinit(allocator);
+    for (program.structs) |struct_decl| {
+        const struct_name = try struct_decl.name.toDottedString(allocator, &interner);
+        try order.append(allocator, struct_name);
+        if (structUsesZestCase(struct_decl, &interner)) {
+            try test_struct_names.append(allocator, struct_name);
+        }
+    }
+    try order.append(allocator, "TestRunner");
+    return .{
+        .struct_order = try order.toOwnedSlice(allocator),
+        .test_struct_names = try test_struct_names.toOwnedSlice(allocator),
+    };
+}
+
+fn cmdTestScript(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    test_path: []const u8,
+    test_arg_index: usize,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parsed = try parseTargetArgs(alloc, args[0..test_arg_index]);
+    defer parsed.deinit(alloc);
+    if (parsed.build_file != null) {
+        std.debug.print("Error: --build-file is not valid with single-file zap test\n", .{});
+        std.process.exit(1);
+    }
+    if (parsed.watch) {
+        std.debug.print("Error: --watch is not supported with single-file zap test\n", .{});
+        std.process.exit(1);
+    }
+    if (parsed.no_deps) {
+        std.debug.print("Error: --no-deps is not valid with single-file zap test\n", .{});
+        std.process.exit(1);
+    }
+
+    applyIncrementalTraceFlag(parsed.trace_incremental);
+    defer clearIncrementalTraceFlag(parsed.trace_incremental);
+    propagateLeakReportEnv(parsed.build_overrides) catch |err| failLeakReportEnvPropagation(err);
+
+    if (parsed.build_overrides.memory) |mgr| {
+        if (!validateScriptMemoryManager(mgr)) {
+            std.debug.print(
+                "Error: unsupported memory manager '{s}' — single-file test mode has no dependency graph and supports only the stdlib managers: Memory.ARC, Memory.Arena, Memory.NoOp, Memory.Leak, Memory.Tracking, Memory.GC\n",
+                .{mgr},
+            );
+            std.process.exit(1);
+        }
+    }
+
+    var test_run_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    try appendTestRunArgs(
+        alloc,
+        &test_run_args,
+        parsed.seed,
+        parsed.timings,
+        parsed.slowest,
+        args[test_arg_index + 1 ..],
+    );
+
+    const test_source = std.Io.Dir.cwd().readFileAlloc(global_io, test_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
+        std.debug.print("Error: could not read test file '{s}': {}\n", .{ test_path, err });
+        std.process.exit(1);
+    };
+    const test_info = singleFileTestInfo(alloc, test_path, test_source) catch |err| switch (err) {
+        error.ParseFailed => std.process.exit(1),
+        else => return err,
+    };
+
+    const zap_lib_dir = resolveZapLibDir(alloc, parsed.zap_lib_dir, null) catch {
+        std.debug.print("Error: could not resolve Zap stdlib directory\n", .{});
+        std.process.exit(1);
+    };
+    const zap_lib = zap_lib_dir orelse {
+        std.debug.print("Error: could not locate the Zap stdlib (set ZAP_LIB_DIR or pass --zap-lib-dir)\n", .{});
+        std.process.exit(1);
+    };
+
+    const zig_lib_dir = resolveZigLibDir(alloc) catch |err| {
+        std.debug.print("Error: could not resolve Zig lib: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
+    try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
+    {
+        const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
+        _ = try appendOptionalSourceRoot(alloc, &source_roots, "zap_stdlib", zap_subdir);
+    }
+
+    var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    zap.builder.readStdlibSourceUnits(alloc, zap_lib, &source_units) catch |err| {
+        std.debug.print("Error: could not read Zap stdlib sources: {}\n", .{err});
+        std.process.exit(1);
+    };
+    try source_units.append(alloc, .{
+        .file_path = test_path,
+        .source = test_source,
+    });
+    const runner_source = try makeSingleFileTestRunnerSource(alloc, test_info.test_struct_names);
+    try source_units.append(alloc, .{
+        .file_path = "<zap single-file test runner>",
+        .source = runner_source,
+    });
+
+    var config = zap.builder.scriptManifest(alloc, "TestRunner") catch {
+        std.debug.print("Error: could not synthesize single-file test manifest\n", .{});
+        std.process.exit(1);
+    };
+    config.name = "zap_test";
+    applyBuildOverrides(&config, parsed.build_overrides);
+    const test_optimize_policy = optimizePolicyForBuildConfig(config.optimize);
+
+    const stdlib_identity_digest = hashStdlibIdentity(alloc, zap_lib) catch |err| {
+        std.debug.print("Error: could not hash Zap stdlib identity for the test cache key: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const script_cache_root_for_identity = resolveScriptCacheRoot(alloc) catch |err| {
+        std.debug.print("Error: could not resolve script cache root for the toolchain identity cache: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const script_toolchain_cache_dir = std.fs.path.join(alloc, &.{ script_cache_root_for_identity, "zap", "toolchains" }) catch {
+        std.debug.print("Error: out of memory resolving the toolchain identity cache directory\n", .{});
+        std.process.exit(1);
+    };
+    const compiler_identity_digest = hashCompilerIdentity(alloc, script_toolchain_cache_dir) catch |err| {
+        std.debug.print("Error: could not hash compiler identity for the test cache key: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const zig_lib_identity_digest = hashZigLibIdentity(alloc, script_toolchain_cache_dir, zig_lib_dir) catch |err| {
+        std.debug.print("Error: could not hash Zig lib identity for the test cache key: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const cache_source = try std.fmt.allocPrint(alloc, "{s}\n{s}", .{ test_source, runner_source });
+    const content_key = computeScriptContentKey(alloc, cache_source, stdlib_identity_digest, compiler_identity_digest, zig_lib_identity_digest, .{
+        .optimize = config.optimize,
+        .frontend_policy_tag = test_optimize_policy.frontend_policy_tag,
+        .memory_manager_name = if (config.memory_manager) |m| m.type_name else "",
+        .target = config.target orelse "",
+        .cpu = config.cpu orelse "",
+        .debug_info_tag = debugInfoCacheTagFor(config.debug_info),
+        .frame_pointers_tag = framePointersCacheTagFor(config.frame_pointers),
+    }) catch {
+        std.debug.print("Error: out of memory computing the test content key\n", .{});
+        std.process.exit(1);
+    };
+
+    const key_dir = scriptArtifactDirForKey(alloc, content_key) catch |err| {
+        std.debug.print("Error: could not create test artifact directory: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    const artifact_filename = buildArtifactFilename(alloc, config) catch {
+        std.debug.print("Error: out of memory resolving test artifact filename\n", .{});
+        std.process.exit(1);
+    };
+    const published_path = try std.fs.path.join(alloc, &.{ key_dir, artifact_filename });
+
+    switch (cachedArtifactAccess(published_path) catch |err| {
+        std.debug.print("Error: could not access cached test artifact {s}: {s}\n", .{ published_path, @errorName(err) });
+        std.process.exit(1);
+    }) {
+        .present => {
+            const debug_symbols_ready = artifactHasRequiredDebugSymbols(alloc, config, published_path) catch |err| {
+                std.debug.print("Error: could not validate cached test debug symbols for {s}: {s}\n", .{ published_path, @errorName(err) });
+                std.process.exit(1);
+            };
+            const symbol_table_sidecar_ready = artifactHasRequiredSymbolTableSidecar(alloc, published_path) catch |err| {
+                std.debug.print("Error: could not validate cached test symbol table sidecar for {s}: {s}\n", .{ published_path, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (!debug_symbols_ready) {
+                std.debug.print("[script-cache miss] {s} debug symbols missing\n", .{published_path});
+            } else if (!symbol_table_sidecar_ready) {
+                std.debug.print("[script-cache miss] {s} symbol table sidecar missing\n", .{published_path});
+            } else {
+                std.debug.print("[script-cache hit] {s}\n", .{published_path});
+                runScriptArtifactAndExit(allocator, config.target, published_path, test_run_args.items);
+            }
+        },
+        .missing => {},
+    }
+
+    const staging_dir = makeScriptStagingDir(alloc) catch |err| {
+        std.debug.print("Error: could not create test staging directory: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    const artifact = try compileAndLinkOrIce(allocator, alloc, "Z9102", .{
+        .config = config,
+        .source_roots = source_roots.items,
+        .source_units = source_units.items,
+        .struct_order = test_info.struct_order,
+        .level_boundaries = null,
+        .manifest_result_hash = 0,
+        .cache_source = cache_source,
+        .target_name = "test",
+        .build_opts = parsed.build_opts,
+        .zap_lib_dir = zap_lib_dir,
+        .zig_lib_dir = zig_lib_dir,
+        .compiler_identity_digest = compiler_identity_digest,
+        .zig_lib_identity_digest = zig_lib_identity_digest,
+        .project_root = std.fs.path.dirname(zap_lib) orelse zap_lib,
+        .collect_arc_stats = parsed.collect_arc_stats,
+        .layout = .{ .script = .{ .base_dir = staging_dir } },
+    });
+    defer artifact.deinit(allocator);
+
+    if (artifact.kind != .bin) {
+        std.debug.print("Error: single-file test did not produce a runnable binary\n", .{});
+        std.process.exit(1);
+    }
+
+    publishScriptArtifactToCache(
+        alloc,
+        config,
+        "test",
+        artifact.path,
+        published_path,
+        staging_dir,
+    ) catch |err| {
+        std.debug.print("Error: test artifact publish failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    runScriptArtifactAndExit(allocator, config.target, published_path, test_run_args.items);
 }
 
 fn buildPipelineRunArgs(
@@ -1897,6 +2202,11 @@ fn executePipelineAfterInitialCompile(
 }
 
 fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    switch (try classifyRunPositional(allocator, args)) {
+        .script => |s| return cmdTestScript(allocator, args, s.path, s.arg_index),
+        .manifest, .manifest_path => {},
+    }
+
     var parsed = try parseTargetArgs(allocator, args);
     defer parsed.deinit(allocator);
     applyIncrementalTraceFlag(parsed.trace_incremental);
@@ -1911,7 +2221,7 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try appendTestRunArgs(allocator, &test_run_args, parsed.seed, parsed.timings, parsed.slowest, parsed.run_args);
 
     if (parsed.watch) {
-        watchAndRebuild(allocator, project_root, "test", parsed.build_opts, parsed.build_overrides, .tests, test_run_args.items, parsed.collect_arc_stats, parsed.zap_lib_dir);
+        try watchAndRebuild(allocator, project_root, "test", parsed.build_opts, parsed.build_overrides, .tests, test_run_args.items, parsed.collect_arc_stats, parsed.zap_lib_dir);
         return;
     }
 
@@ -2069,15 +2379,24 @@ fn cmdDeps(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     };
 
+    var existing_lockfile: ?zap.lockfile.OwnedLockfile = null;
+    defer if (existing_lockfile) |*lockfile| lockfile.deinit();
+    const read_result = try zap.lockfile.readLockfile(allocator, project_root);
+    switch (read_result) {
+        .absent => {},
+        .present => |lockfile| existing_lockfile = lockfile,
+    }
+
     var lock_entries: std.ArrayListUnmanaged(zap.lockfile.LockEntry) = .empty;
+    defer lock_entries.deinit(allocator);
 
     for (config.deps) |dep| {
         // If specific dep requested, skip others
         if (specific_dep) |name| {
             if (!std.mem.eql(u8, dep.name, name)) {
                 // Keep existing lock entry for skipped deps
-                if (zap.lockfile.readLockfile(allocator, project_root)) |existing| {
-                    if (zap.lockfile.findEntry(existing, dep.name)) |entry| {
+                if (existing_lockfile) |*lockfile| {
+                    if (zap.lockfile.findEntry(lockfile.entries, dep.name)) |entry| {
                         try lock_entries.append(allocator, entry);
                     }
                 }
@@ -2175,7 +2494,13 @@ fn cmdExplain(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(2);
     }
 
-    const lib_dir = resolveZapLibDir(allocator, lib_dir_flag, null) catch null orelse {
+    const lib_dir = resolveZapLibDir(allocator, lib_dir_flag, null) catch |err| {
+        std.debug.print(
+            "Error: could not resolve the Zap stdlib directory: {s}\n",
+            .{@errorName(err)},
+        );
+        std.process.exit(1);
+    } orelse {
         std.debug.print(
             "Error: could not locate the Zap stdlib directory (set ZAP_LIB_DIR or pass --zap-lib-dir).\n",
             .{},
@@ -2276,6 +2601,8 @@ const Addr2LineUsage =
     \\
 ;
 
+const Addr2LineStdinMaxBytes = 4 * 1024 * 1024;
+
 /// Parse a `0x`-prefixed hex or bare decimal address. Tolerates surrounding
 /// whitespace (so stdin lines and copy-pasted report fragments work).
 fn parseAddress(raw: []const u8) ?u64 {
@@ -2285,6 +2612,51 @@ fn parseAddress(raw: []const u8) ?u64 {
         return std.fmt.parseInt(u64, trimmed[2..], 16) catch null;
     }
     return std.fmt.parseInt(u64, trimmed, 10) catch null;
+}
+
+fn readAddr2LineStdin(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    limit: std.Io.Limit,
+) std.Io.Reader.LimitedAllocError![]u8 {
+    return reader.allocRemaining(allocator, limit);
+}
+
+test "P4J2: addr2line stdin read returns true empty input" {
+    var reader = std.Io.Reader.fixed("");
+    const data = try readAddr2LineStdin(std.testing.allocator, &reader, .limited(Addr2LineStdinMaxBytes));
+    defer std.testing.allocator.free(data);
+
+    try std.testing.expectEqual(@as(usize, 0), data.len);
+}
+
+test "P4J2: addr2line stdin read propagates allocation failure" {
+    var reader = std.Io.Reader.fixed("0x10\n");
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        readAddr2LineStdin(failing_allocator.allocator(), &reader, .limited(Addr2LineStdinMaxBytes)),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: addr2line stdin read propagates stream limit failure" {
+    var reader = std.Io.Reader.fixed("0x1234\n");
+
+    try std.testing.expectError(
+        error.StreamTooLong,
+        readAddr2LineStdin(std.testing.allocator, &reader, .limited(3)),
+    );
+}
+
+test "P4J2: addr2line stdin read propagates read failure" {
+    var reader = std.Io.Reader.failing;
+
+    try std.testing.expectError(
+        error.ReadFailed,
+        readAddr2LineStdin(std.testing.allocator, &reader, .limited(Addr2LineStdinMaxBytes)),
+    );
 }
 
 fn cmdAddr2line(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -2325,8 +2697,6 @@ fn cmdAddr2line(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // given — one per line from stdin (so a captured report can be piped in).
     var addresses: std.ArrayListUnmanaged(u64) = .empty;
     defer addresses.deinit(allocator);
-    var stdin_buf: ?[]u8 = null;
-    defer if (stdin_buf) |b| allocator.free(b);
 
     if (address_args.items.len > 0) {
         for (address_args.items) |raw| {
@@ -2341,8 +2711,18 @@ fn cmdAddr2line(allocator: std.mem.Allocator, args: []const []const u8) !void {
         // Streaming (not positional): stdin is typically a pipe/tty with no
         // seek, so positional reads would fail.
         var stdin_reader = std.Io.File.stdin().readerStreaming(global_io, &stdin_read_buf);
-        const data: []u8 = stdin_reader.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch &.{};
-        if (data.len > 0) stdin_buf = data;
+        const data = readAddr2LineStdin(allocator, &stdin_reader.interface, .limited(Addr2LineStdinMaxBytes)) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.ReadFailed => {
+                std.debug.print("Error: failed to read addresses from stdin: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            },
+            error.StreamTooLong => {
+                std.debug.print("Error: stdin address input exceeds the {d} byte limit\n", .{Addr2LineStdinMaxBytes});
+                std.process.exit(2);
+            },
+        };
+        defer allocator.free(data);
         var lines = std.mem.tokenizeAny(u8, data, "\r\n");
         while (lines.next()) |line| {
             if (parseAddress(line)) |addr| try addresses.append(allocator, addr);
@@ -2418,6 +2798,68 @@ fn printAddr2LineFrame(frame: zap.addr2line.Frame) void {
     std.debug.print("\n", .{});
 }
 
+const InitDirectoryStatus = enum {
+    empty,
+    not_empty,
+};
+
+fn initDirectoryStatusWithIo(dir: std.Io.Dir, io: std.Io) std.Io.Dir.Iterator.Error!InitDirectoryStatus {
+    var iter = dir.iterate();
+    return if (try iter.next(io)) |_| .not_empty else .empty;
+}
+
+fn initDirectoryStatus(dir: std.Io.Dir) std.Io.Dir.Iterator.Error!InitDirectoryStatus {
+    return initDirectoryStatusWithIo(dir, global_io);
+}
+
+test "P4J2: init directory status preserves true empty directory" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    var dir = try std.Io.Dir.cwd().openDir(global_io, tmp_path, .{ .iterate = true });
+    defer dir.close(global_io);
+
+    try std.testing.expectEqual(InitDirectoryStatus.empty, try initDirectoryStatus(dir));
+}
+
+test "P4J2: init directory status reports true non-empty directory" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "existing.txt", .data = "present" });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    var dir = try std.Io.Dir.cwd().openDir(global_io, tmp_path, .{ .iterate = true });
+    defer dir.close(global_io);
+
+    try std.testing.expectEqual(InitDirectoryStatus.not_empty, try initDirectoryStatus(dir));
+}
+
+fn failInitDirectoryRead(
+    userdata: ?*anyopaque,
+    dir_reader: *std.Io.Dir.Reader,
+    buffer: []std.Io.Dir.Entry,
+) std.Io.Dir.Reader.Error!usize {
+    _ = userdata;
+    _ = dir_reader;
+    _ = buffer;
+    return error.AccessDenied;
+}
+
+test "P4J2: init directory status propagates iterator failure" {
+    var vtable = std.Io.failing.vtable.*;
+    vtable.dirRead = failInitDirectoryRead;
+    const failing_io: std.Io = .{
+        .userdata = null,
+        .vtable = &vtable,
+    };
+    const dir: std.Io.Dir = .{ .handle = 0 };
+
+    try std.testing.expectError(error.AccessDenied, initDirectoryStatusWithIo(dir, failing_io));
+}
+
 fn cmdInit(allocator: std.mem.Allocator) !void {
     // Check directory is empty
     var dir = std.Io.Dir.cwd().openDir(global_io, ".", .{ .iterate = true }) catch {
@@ -2427,11 +2869,16 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
     };
     defer dir.close(global_io);
 
-    var iter = dir.iterate();
-    if (iter.next(global_io) catch null) |_| {
-        // stderr writer removed in 0.16
-        std.debug.print("Error: directory is not empty\n", .{});
+    switch (initDirectoryStatus(dir) catch |err| {
+        std.debug.print("Error: cannot read current directory: {s}\n", .{@errorName(err)});
         std.process.exit(1);
+    }) {
+        .empty => {},
+        .not_empty => {
+            // stderr writer removed in 0.16
+            std.debug.print("Error: directory is not empty\n", .{});
+            std.process.exit(1);
+        },
     }
 
     // Derive names from directory
@@ -2566,8 +3013,30 @@ fn cmdInit(allocator: std.mem.Allocator) !void {
 /// hint.
 const ZapLibDirError = error{
     InvalidZapLibDir,
+    ZapLibDirAccessFailed,
+    ZapLibDirCanonicalizeFailed,
+    ZapLibDirResolveFailed,
     OutOfMemory,
 };
+
+const ZapLibDirProbeError = error{
+    ZapLibDirAccessFailed,
+    OutOfMemory,
+};
+
+fn isMissingZapLibPathError(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound, error.NotDir => true,
+        else => false,
+    };
+}
+
+fn zapLibDirAccessError(err: anyerror) ZapLibDirProbeError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ZapLibDirAccessFailed,
+    };
+}
 
 /// Pure precedence resolver for the Zap stdlib directory.
 ///
@@ -2595,10 +3064,13 @@ fn chooseZapLibDir(
 /// Returns true when `dir` is a usable Zap stdlib root, i.e. it
 /// directly contains a readable `kernel.zap`. Used to validate explicit
 /// flag/env overrides before accepting them.
-fn zapLibDirContainsKernel(allocator: std.mem.Allocator, dir: []const u8) bool {
-    const kernel_path = std.fs.path.join(allocator, &.{ dir, "kernel.zap" }) catch return false;
+fn zapLibDirContainsKernel(allocator: std.mem.Allocator, dir: []const u8) ZapLibDirProbeError!bool {
+    const kernel_path = std.fs.path.join(allocator, &.{ dir, "kernel.zap" }) catch return error.OutOfMemory;
     defer allocator.free(kernel_path);
-    std.Io.Dir.cwd().access(global_io, kernel_path, .{}) catch return false;
+    std.Io.Dir.cwd().access(global_io, kernel_path, .{}) catch |err| {
+        if (isMissingZapLibPathError(err)) return false;
+        return zapLibDirAccessError(err);
+    };
     return true;
 }
 
@@ -2610,32 +3082,41 @@ fn zapLibDirContainsKernel(allocator: std.mem.Allocator, dir: []const u8) bool {
 /// is already canonical, is a safe no-op). The resolver then walks up
 /// from the real executable directory looking for a `lib/` directory
 /// that contains `kernel.zap`. Returns null when no such directory is
-/// found or the executable path cannot be determined; the caller's
-/// lower-precedence cwd fallback then applies.
-fn resolveExeRelativeZapLibDir(allocator: std.mem.Allocator) ?[]const u8 {
-    const exe_path = std.process.executablePathAlloc(global_io, allocator) catch return null;
+/// found. Executable path, realpath, allocation, and access failures are
+/// infrastructure errors and are returned to the caller rather than being
+/// treated as lower-precedence absence.
+fn resolveExeRelativeZapLibDir(allocator: std.mem.Allocator) ZapLibDirError!?[]const u8 {
+    const exe_path = std.process.executablePathAlloc(global_io, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ZapLibDirResolveFailed,
+    };
     defer allocator.free(exe_path);
 
     // Canonicalise through realpath so symlinked install locations
     // resolve to their real prefix. realpath of an already-canonical
-    // dev path is a safe no-op; if realpath fails (e.g. the path was
-    // unlinked) fall back to the raw executable path so detection still
-    // has a chance to succeed.
+    // dev path is a safe no-op. Failure here is not semantic absence: it
+    // means the executable location could not be trusted as a discovery
+    // root, so the resolver must surface it.
     //
     // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8` whose
     // backing allocation is `len + 1` bytes; it must be freed through
     // the sentinel slice (freeing a coerced `[]const u8` would
-    // under-count by one byte and trip the testing allocator). The
-    // fallback simply reuses the already-owned non-sentinel `exe_path`,
-    // so the two shapes are tracked independently.
-    const real_exe_path_z: ?[:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(global_io, exe_path, allocator) catch null;
-    defer if (real_exe_path_z) |p| allocator.free(p);
-    const real_exe_path: []const u8 = if (real_exe_path_z) |p| p else exe_path;
+    // under-count by one byte and trip the testing allocator).
+    const real_exe_path_z = std.Io.Dir.cwd().realPathFileAlloc(global_io, exe_path, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ZapLibDirCanonicalizeFailed,
+    };
+    defer allocator.free(real_exe_path_z);
+    const real_exe_path: []const u8 = real_exe_path_z;
 
     var dir_path = std.fs.path.dirname(real_exe_path);
     while (dir_path) |dp| {
-        const lib_dir = std.fs.path.join(allocator, &.{ dp, "lib" }) catch return null;
-        if (zapLibDirContainsKernel(allocator, lib_dir)) {
+        const lib_dir = std.fs.path.join(allocator, &.{ dp, "lib" }) catch return error.OutOfMemory;
+        const contains_kernel = zapLibDirContainsKernel(allocator, lib_dir) catch |err| {
+            allocator.free(lib_dir);
+            return err;
+        };
+        if (contains_kernel) {
             return lib_dir;
         }
         allocator.free(lib_dir);
@@ -2678,7 +3159,7 @@ fn resolveExeRelativeZapLibDir(allocator: std.mem.Allocator) ?[]const u8 {
 fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8, project_root: ?[]const u8) ZapLibDirError!?[]const u8 {
     // 1. Explicit `--zap-lib-dir` flag — validated; wrong is fatal.
     if (flag) |flag_dir| {
-        if (!zapLibDirContainsKernel(allocator, flag_dir)) {
+        if (!(try zapLibDirContainsKernel(allocator, flag_dir))) {
             zap.diagnostics.emitStderrFmt(
                 "Error: --zap-lib-dir '{s}' is not a valid Zap stdlib directory (no kernel.zap found)\n",
                 .{flag_dir},
@@ -2690,7 +3171,7 @@ fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8, project_roo
 
     // 2. `ZAP_LIB_DIR` environment variable — validated; wrong is fatal.
     if (env.getenv("ZAP_LIB_DIR")) |env_dir| {
-        if (!zapLibDirContainsKernel(allocator, env_dir)) {
+        if (!(try zapLibDirContainsKernel(allocator, env_dir))) {
             zap.diagnostics.emitStderrFmt(
                 "Error: ZAP_LIB_DIR '{s}' is not a valid Zap stdlib directory (no kernel.zap found)\n",
                 .{env_dir},
@@ -2711,7 +3192,11 @@ fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8, project_roo
     defer if (project_relative) |p| allocator.free(p);
     if (project_root) |root| {
         const proj_lib = std.fs.path.join(allocator, &.{ root, "lib" }) catch return error.OutOfMemory;
-        if (zapLibDirContainsKernel(allocator, proj_lib)) {
+        const contains_kernel = zapLibDirContainsKernel(allocator, proj_lib) catch |err| {
+            allocator.free(proj_lib);
+            return err;
+        };
+        if (contains_kernel) {
             project_relative = proj_lib;
         } else {
             allocator.free(proj_lib);
@@ -2719,7 +3204,7 @@ fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8, project_roo
     }
 
     // 4. Executable-relative walk-up (symlinks resolved via realpath).
-    const exe_relative = resolveExeRelativeZapLibDir(allocator);
+    const exe_relative = try resolveExeRelativeZapLibDir(allocator);
     defer if (exe_relative) |x| allocator.free(x);
 
     // 5. cwd `./lib` fallback (unchanged from the legacy behavior):
@@ -2728,7 +3213,9 @@ fn resolveZapLibDir(allocator: std.mem.Allocator, flag: ?[]const u8, project_roo
     defer if (cwd_fallback) |c| allocator.free(c);
     if (std.Io.Dir.cwd().access(global_io, "lib/kernel.zap", .{})) |_| {
         cwd_fallback = allocator.dupe(u8, "lib") catch return error.OutOfMemory;
-    } else |_| {}
+    } else |err| {
+        if (!isMissingZapLibPathError(err)) return zapLibDirAccessError(err);
+    }
 
     const chosen = chooseZapLibDir(null, null, project_relative, exe_relative, cwd_fallback) orelse return null;
     return allocator.dupe(u8, chosen) catch return error.OutOfMemory;
@@ -2991,20 +3478,238 @@ fn debugSymbolBundlePath(alloc: std.mem.Allocator, artifact_path: []const u8) er
     return std.fmt.allocPrint(alloc, "{s}.dSYM", .{artifact_path});
 }
 
-fn cwdPathExists(path: []const u8) bool {
-    std.Io.Dir.cwd().access(global_io, path, .{}) catch return false;
-    return true;
+const CachedArtifactAccessResult = enum {
+    present,
+    missing,
+};
+
+fn isMissingPathAccessError(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound, error.NotDir => true,
+        else => false,
+    };
+}
+
+fn cachedArtifactAccess(path: []const u8) !CachedArtifactAccessResult {
+    std.Io.Dir.cwd().access(global_io, path, .{}) catch |err| {
+        if (isMissingPathAccessError(err)) return .missing;
+        return err;
+    };
+    return .present;
+}
+
+const ArtifactStagingCleanupError = error{
+    ArtifactStagingCleanupAccessFailed,
+    ArtifactStagingCleanupFailed,
+};
+
+fn cleanupRequiredPublishedArtifactStaging(
+    artifact_label: []const u8,
+    staging_dir: []const u8,
+) ArtifactStagingCleanupError!void {
+    // `deleteTree` deliberately treats an already-missing initial path as
+    // success. For private script/test staging directories that is not a safe
+    // success signal: the publish phase owns this path and must prove cleanup
+    // happened before the artifact is reported or run.
+    switch (cachedArtifactAccess(staging_dir) catch |err| {
+        std.debug.print(
+            "Error: could not access {s} artifact staging directory {s} before cleanup: {s}\n",
+            .{ artifact_label, staging_dir, @errorName(err) },
+        );
+        return error.ArtifactStagingCleanupAccessFailed;
+    }) {
+        .present => {},
+        .missing => {
+            std.debug.print(
+                "Error: {s} artifact staging directory disappeared before required cleanup: {s}\n",
+                .{ artifact_label, staging_dir },
+            );
+            return error.ArtifactStagingCleanupFailed;
+        },
+    }
+
+    std.Io.Dir.cwd().deleteTree(global_io, staging_dir) catch |err| {
+        std.debug.print(
+            "Error: could not remove {s} artifact staging directory {s}: {s}\n",
+            .{ artifact_label, staging_dir, @errorName(err) },
+        );
+        return error.ArtifactStagingCleanupFailed;
+    };
+
+    // A missing result after a confirmed-present cleanup target is the only
+    // benign missing race here: the staged tree is gone. Any surviving target,
+    // or an inability to verify its absence, leaves cache-root state uncertain.
+    switch (cachedArtifactAccess(staging_dir) catch |err| {
+        std.debug.print(
+            "Error: could not verify {s} artifact staging cleanup for {s}: {s}\n",
+            .{ artifact_label, staging_dir, @errorName(err) },
+        );
+        return error.ArtifactStagingCleanupAccessFailed;
+    }) {
+        .missing => {},
+        .present => {
+            std.debug.print(
+                "Error: {s} artifact staging directory still exists after required cleanup: {s}\n",
+                .{ artifact_label, staging_dir },
+            );
+            return error.ArtifactStagingCleanupFailed;
+        },
+    }
+}
+
+test "cached artifact access treats not-directory path components as missing" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "artifact-parent", .data = "not a directory" });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cached_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "artifact-parent/app" });
+    defer allocator.free(cached_artifact_path);
+
+    try std.testing.expectEqual(CachedArtifactAccessResult.missing, try cachedArtifactAccess(cached_artifact_path));
+}
+
+test "cached artifact access propagates non-missing access failures" {
+    const allocator = std.testing.allocator;
+
+    const too_long_prefix = try allocator.alloc(u8, std.fs.max_path_bytes + 1);
+    defer allocator.free(too_long_prefix);
+    @memset(too_long_prefix, 'a');
+    const cached_artifact_path = try std.fmt.allocPrint(allocator, "{s}/abcd/app", .{too_long_prefix});
+    defer allocator.free(cached_artifact_path);
+
+    try std.testing.expectError(error.NameTooLong, cachedArtifactAccess(cached_artifact_path));
+}
+
+test "cached artifact access propagates symlink-loop access failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.symLink(global_io, "artifact", "artifact", .{});
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cached_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "artifact" });
+    defer allocator.free(cached_artifact_path);
+
+    try std.testing.expectError(error.SymLinkLoop, cachedArtifactAccess(cached_artifact_path));
 }
 
 fn artifactHasRequiredDebugSymbols(
     alloc: std.mem.Allocator,
     config: zap.builder.BuildConfig,
     artifact_path: []const u8,
-) error{OutOfMemory}!bool {
+) !bool {
     if (!needsDarwinDebugSymbols(config)) return true;
     const dsym_path = try debugSymbolBundlePath(alloc, artifact_path);
     defer alloc.free(dsym_path);
-    return cwdPathExists(dsym_path);
+    return switch (try cachedArtifactAccess(dsym_path)) {
+        .present => true,
+        .missing => false,
+    };
+}
+
+fn darwinDebugSymbolTestConfig() zap.builder.BuildConfig {
+    return .{
+        .name = "probe",
+        .version = "0.0.0",
+        .kind = .bin,
+        .optimize = .debug,
+        .target = "aarch64-macos-none",
+    };
+}
+
+test "artifact debug symbol check reports missing dSYM bundle as false" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "app" });
+    defer allocator.free(artifact_path);
+
+    try std.testing.expect(!(try artifactHasRequiredDebugSymbols(allocator, darwinDebugSymbolTestConfig(), artifact_path)));
+}
+
+test "artifact debug symbol check accepts present dSYM bundle" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "app.dSYM");
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "app" });
+    defer allocator.free(artifact_path);
+
+    try std.testing.expect(try artifactHasRequiredDebugSymbols(allocator, darwinDebugSymbolTestConfig(), artifact_path));
+}
+
+test "artifact debug symbol check propagates dSYM access failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.symLink(global_io, "app.dSYM", "app.dSYM", .{});
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "app" });
+    defer allocator.free(artifact_path);
+
+    try std.testing.expectError(error.SymLinkLoop, artifactHasRequiredDebugSymbols(allocator, darwinDebugSymbolTestConfig(), artifact_path));
+}
+
+fn symbolTableSidecarPath(alloc: std.mem.Allocator, artifact_path: []const u8) error{OutOfMemory}![]const u8 {
+    return std.fmt.allocPrint(alloc, "{s}.zap-symbols", .{artifact_path});
+}
+
+fn symbolTableSidecarFileAccess(path: []const u8) !CachedArtifactAccessResult {
+    const stat = std.Io.Dir.cwd().statFile(global_io, path, .{}) catch |err| {
+        if (isMissingPathAccessError(err)) return .missing;
+        return err;
+    };
+    return if (stat.kind == .file) .present else .missing;
+}
+
+fn artifactHasRequiredSymbolTableSidecar(
+    alloc: std.mem.Allocator,
+    artifact_path: []const u8,
+) !bool {
+    const sidecar_path = try symbolTableSidecarPath(alloc, artifact_path);
+    defer alloc.free(sidecar_path);
+    return switch (try symbolTableSidecarFileAccess(sidecar_path)) {
+        .present => true,
+        .missing => false,
+    };
+}
+
+test "artifact symbol table sidecar check requires a regular file" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "app" });
+    defer allocator.free(artifact_path);
+
+    try std.testing.expect(!(try artifactHasRequiredSymbolTableSidecar(allocator, artifact_path)));
+
+    const sidecar_path = try symbolTableSidecarPath(allocator, artifact_path);
+    defer allocator.free(sidecar_path);
+    try std.Io.Dir.cwd().createDirPath(global_io, sidecar_path);
+    try std.testing.expect(!(try artifactHasRequiredSymbolTableSidecar(allocator, artifact_path)));
+
+    try std.Io.Dir.cwd().deleteTree(global_io, sidecar_path);
+    try std.Io.Dir.cwd().writeFile(global_io, .{ .sub_path = sidecar_path, .data = "symbols" });
+    try std.testing.expect(try artifactHasRequiredSymbolTableSidecar(allocator, artifact_path));
 }
 
 fn copyFileCwd(source_path: []const u8, destination_path: []const u8) !void {
@@ -3022,8 +3727,9 @@ fn copyTreeCwd(
     source_path: []const u8,
     destination_path: []const u8,
 ) !void {
-    if (cwdPathExists(destination_path)) {
-        try std.Io.Dir.cwd().deleteTree(global_io, destination_path);
+    switch (try cachedArtifactAccess(destination_path)) {
+        .present => try std.Io.Dir.cwd().deleteTree(global_io, destination_path),
+        .missing => {},
     }
     try std.Io.Dir.cwd().createDirPath(global_io, destination_path);
 
@@ -3085,6 +3791,8 @@ fn publishManifestArtifactToCache(
 const DarwinDebugSymbolError = error{
     OutOfMemory,
     DsymutilFailed,
+    DebugSymbolAccessFailed,
+    DebugSymbolCleanupFailed,
     DebugSymbolPublishFailed,
 };
 
@@ -3124,10 +3832,16 @@ fn generateDarwinDebugSymbols(
     }
 
     if (progress) |reporter| reporter.stage("Debug symbols: verifying output bundle", .{});
-    if (!cwdPathExists(dsym_path)) {
-        std.debug.print("Error: dsymutil did not create {s}\n", .{dsym_path});
-        printProcessOutput(result.stdout, result.stderr);
-        return error.DsymutilFailed;
+    switch (cachedArtifactAccess(dsym_path) catch |err| {
+        std.debug.print("Error: could not access dsymutil output {s}: {s}\n", .{ dsym_path, @errorName(err) });
+        return error.DebugSymbolAccessFailed;
+    }) {
+        .present => {},
+        .missing => {
+            std.debug.print("Error: dsymutil did not create {s}\n", .{dsym_path});
+            printProcessOutput(result.stdout, result.stderr);
+            return error.DsymutilFailed;
+        },
     }
 }
 
@@ -3205,6 +3919,57 @@ fn stripDarwinDebugMapOrExit(
     };
 }
 
+fn cleanupRedundantStagedDebugSymbols(staged_dsym_path: []const u8) DarwinDebugSymbolError!void {
+    // The staged `.dSYM` lives under a process-private staging directory and
+    // was already observed before this cleanup phase. Missing before cleanup
+    // is therefore not a benign race; it means the cache-root publish state is
+    // no longer under this process's control.
+    switch (cachedArtifactAccess(staged_dsym_path) catch |err| {
+        std.debug.print(
+            "Error: could not access redundant staged script debug symbols {s} before cleanup: {s}\n",
+            .{ staged_dsym_path, @errorName(err) },
+        );
+        return error.DebugSymbolAccessFailed;
+    }) {
+        .present => {},
+        .missing => {
+            std.debug.print(
+                "Error: redundant staged script debug symbols disappeared before required cleanup: {s}\n",
+                .{staged_dsym_path},
+            );
+            return error.DebugSymbolCleanupFailed;
+        },
+    }
+
+    std.Io.Dir.cwd().deleteTree(global_io, staged_dsym_path) catch |err| {
+        std.debug.print(
+            "Error: could not remove redundant staged script debug symbols {s}: {s}\n",
+            .{ staged_dsym_path, @errorName(err) },
+        );
+        return error.DebugSymbolCleanupFailed;
+    };
+
+    // Once the target was confirmed present, a post-cleanup missing result is
+    // the safe terminal state. A surviving path or unverifiable path remains a
+    // required cleanup failure and must stop artifact reporting/execution.
+    switch (cachedArtifactAccess(staged_dsym_path) catch |err| {
+        std.debug.print(
+            "Error: could not verify redundant staged script debug symbol cleanup for {s}: {s}\n",
+            .{ staged_dsym_path, @errorName(err) },
+        );
+        return error.DebugSymbolAccessFailed;
+    }) {
+        .missing => {},
+        .present => {
+            std.debug.print(
+                "Error: redundant staged script debug symbols still exist after required cleanup: {s}\n",
+                .{staged_dsym_path},
+            );
+            return error.DebugSymbolCleanupFailed;
+        },
+    }
+}
+
 /// Publish the freshly-built `.dSYM` debug-symbol bundle from the staging
 /// directory into the shared content-key cache location, race-safely against
 /// concurrent invocations on the SAME script.
@@ -3219,7 +3984,8 @@ fn stripDarwinDebugMapOrExit(
 ///    to the one we just staged for the same key — overwriting it is both
 ///    wasteful and racy (`deleteTree` then `rename` is a TOCTOU window that
 ///    triggers `error.DirNotEmpty` when a concurrent publisher repopulates
-///    the destination). Best-effort cleans up the redundant staged copy.
+///    the destination). Required cleanup removes the redundant staged copy
+///    before the artifact may be reported or run.
 ///
 /// 2. **Atomic publish with race-loss acceptance:** otherwise, attempt
 ///    `rename(staged, published)` directly (no preceding deletion).
@@ -3230,7 +3996,9 @@ fn stripDarwinDebugMapOrExit(
 ///      nonempty directory, so this is the only race-loss error variant
 ///      that surfaces for a directory rename. Return success — the
 ///      content-key invariant guarantees the winning bundle has the same
-///      bytes ours would have. Best-effort cleans up our staged copy.
+///      bytes ours would have. Required cleanup removes our staged copy
+///      before the artifact may be reported or run.
+///    - On cleanup failure: surface as `error.DebugSymbolCleanupFailed`.
 ///    - On any other error: surface as `error.DebugSymbolPublishFailed`.
 ///
 /// This is the standard "if it's already there, or it gets there, we're good"
@@ -3245,31 +4013,43 @@ fn publishScriptDebugSymbolsIfNeeded(
 
     const staged_dsym_path = try debugSymbolBundlePath(alloc, staged_artifact_path);
     defer alloc.free(staged_dsym_path);
-    if (!cwdPathExists(staged_dsym_path)) {
-        std.debug.print("Error: Debug script artifact did not produce required debug symbols: {s}\n", .{staged_dsym_path});
-        return error.DebugSymbolPublishFailed;
+    switch (cachedArtifactAccess(staged_dsym_path) catch |err| {
+        std.debug.print("Error: could not access staged script debug symbols {s}: {s}\n", .{ staged_dsym_path, @errorName(err) });
+        return error.DebugSymbolAccessFailed;
+    }) {
+        .present => {},
+        .missing => {
+            std.debug.print("Error: Debug script artifact did not produce required debug symbols: {s}\n", .{staged_dsym_path});
+            return error.DebugSymbolPublishFailed;
+        },
     }
 
     const published_dsym_path = try debugSymbolBundlePath(alloc, published_artifact_path);
     defer alloc.free(published_dsym_path);
 
     // (1) Cache hit — the destination already holds an identical bundle
-    // (content-keyed cache). Skip the publish entirely; best-effort sweep
-    // the now-redundant staged copy so the staging dir's `deleteTree` at
-    // the caller is a no-op for this subtree.
-    if (cwdPathExists(published_dsym_path)) {
-        std.Io.Dir.cwd().deleteTree(global_io, staged_dsym_path) catch {};
-        return;
+    // (content-keyed cache). Skip the publish entirely, but require removal
+    // of the now-redundant staged copy so the cache root cannot accumulate
+    // leaked staging artifacts after a successful publish.
+    switch (cachedArtifactAccess(published_dsym_path) catch |err| {
+        std.debug.print("Error: could not access published script debug symbols {s}: {s}\n", .{ published_dsym_path, @errorName(err) });
+        return error.DebugSymbolAccessFailed;
+    }) {
+        .present => {
+            try cleanupRedundantStagedDebugSymbols(staged_dsym_path);
+            return;
+        },
+        .missing => {},
     }
 
     // (2) Atomic publish. POSIX `rename` cannot atomically replace a
     // NONEMPTY directory with another directory and reports
     // `error.DirNotEmpty` in that race-loss case — a concurrent publisher
     // beat us with byte-identical content for this content-key. Accept
-    // and best-effort clean the redundant staged bundle.
+    // only after required cleanup removes the redundant staged bundle.
     std.Io.Dir.cwd().rename(staged_dsym_path, std.Io.Dir.cwd(), published_dsym_path, global_io) catch |err| switch (err) {
         error.DirNotEmpty => {
-            std.Io.Dir.cwd().deleteTree(global_io, staged_dsym_path) catch {};
+            try cleanupRedundantStagedDebugSymbols(staged_dsym_path);
             return;
         },
         else => {
@@ -3278,6 +4058,13 @@ fn publishScriptDebugSymbolsIfNeeded(
         },
     };
 }
+
+const SymbolTableSidecarPublishError = error{
+    OutOfMemory,
+    SymbolTableSidecarAccessFailed,
+    SymbolTableSidecarMissing,
+    SymbolTableSidecarPublishFailed,
+};
 
 /// Publish the `.zap-symbols` reversible-symbol sidecar from the staging
 /// directory to the content-key directory, next to the published binary.
@@ -3288,45 +4075,313 @@ fn publishScriptDebugSymbolsIfNeeded(
 /// mangled frames back to Zap symbols, so the sidecar must travel with the
 /// binary into its stable cache location.
 ///
-/// Race-safety mirrors `publishScriptDebugSymbolsIfNeeded`: the cache is
-/// content-keyed, so the same `published` path always implies identical
-/// sidecar bytes. Cache-hit → return (best-effort sweep the staged copy).
-/// Otherwise rename directly. Unlike the dSYM directory case, a POSIX file
-/// `rename` atomically REPLACES an existing destination, so a concurrent
-/// winner with byte-identical content is just silently overwritten — there
-/// is no race-loss error variant to handle for a file rename.
+/// Race-safety mirrors the binary publish path: rename the staged sidecar
+/// directly into the published location. Unlike the dSYM directory case, a
+/// POSIX file `rename` atomically REPLACES an existing destination, so a
+/// concurrent winner with byte-identical content is just silently overwritten
+/// and a stale regular file at the destination cannot survive a fresh publish.
 ///
-/// Best-effort: a missing sidecar only degrades crash reports to mangled
-/// names, never breaks the run — so rename failures are intentionally
-/// swallowed rather than aborting an otherwise-successful build.
+/// The sidecar is a required part of the script/test artifact contract:
+/// missing staged output, access failures, allocation failures, and publish
+/// failures all surface to the caller so the command cannot report a
+/// successful binary whose crash-symbol sidecar is absent or unusable.
 fn publishScriptSymbolTableSidecar(
     alloc: std.mem.Allocator,
     staged_artifact_path: []const u8,
     published_artifact_path: []const u8,
-) void {
-    const suffix = ".zap-symbols";
-    const staged = std.fmt.allocPrint(alloc, "{s}{s}", .{ staged_artifact_path, suffix }) catch return;
+) SymbolTableSidecarPublishError!void {
+    const staged = try symbolTableSidecarPath(alloc, staged_artifact_path);
     defer alloc.free(staged);
-    if (!cwdPathExists(staged)) return;
-
-    const published = std.fmt.allocPrint(alloc, "{s}{s}", .{ published_artifact_path, suffix }) catch return;
-    defer alloc.free(published);
-
-    // Cache hit — sidecar already published by a prior or concurrent
-    // run with the same content key (so the bytes match). Skip and
-    // best-effort clean up the redundant staged copy.
-    if (cwdPathExists(published)) {
-        std.Io.Dir.cwd().deleteFile(global_io, staged) catch {};
-        return;
+    switch (symbolTableSidecarFileAccess(staged) catch |err| {
+        std.debug.print("Error: could not access staged script symbol table sidecar {s}: {s}\n", .{ staged, @errorName(err) });
+        return error.SymbolTableSidecarAccessFailed;
+    }) {
+        .present => {},
+        .missing => {
+            std.debug.print("Error: script artifact did not produce required symbol table sidecar: {s}\n", .{staged});
+            return error.SymbolTableSidecarMissing;
+        },
     }
+
+    const published = try symbolTableSidecarPath(alloc, published_artifact_path);
+    defer alloc.free(published);
 
     // Atomic publish. POSIX `rename` of a file atomically REPLACES an
     // existing destination, so a concurrent publisher that beat us with
     // byte-identical content simply gets its copy replaced with our
-    // (identical) copy — no race-loss error to handle. Any other rename
-    // failure is intentionally swallowed: a missing sidecar only
-    // degrades crash reports to mangled names, never breaks the run.
-    std.Io.Dir.cwd().rename(staged, std.Io.Dir.cwd(), published, global_io) catch {};
+    // (identical) copy. A pre-existing stale regular file is replaced too.
+    std.Io.Dir.cwd().rename(staged, std.Io.Dir.cwd(), published, global_io) catch |err| {
+        std.debug.print("Error: could not publish script symbol table sidecar to {s}: {s}\n", .{ published, @errorName(err) });
+        return error.SymbolTableSidecarPublishFailed;
+    };
+}
+
+const ScriptArtifactPublishError = DarwinDebugSymbolError ||
+    SymbolTableSidecarPublishError ||
+    ArtifactStagingCleanupError ||
+    error{ScriptArtifactPublishFailed};
+
+fn publishScriptArtifactToCache(
+    alloc: std.mem.Allocator,
+    config: zap.builder.BuildConfig,
+    artifact_label: []const u8,
+    staged_artifact_path: []const u8,
+    published_artifact_path: []const u8,
+    staging_dir: []const u8,
+) ScriptArtifactPublishError!void {
+    // Atomically publish the freshly-built binary into the shared
+    // content-key directory. `rename` within the same cache root is atomic on
+    // POSIX, so a concurrent run either sees the old absent state and builds
+    // its own, or the fully-written final binary — never a partial file. A
+    // racing publisher that already moved an identical binary into place is
+    // fine: the rename replaces it with a byte-identical result for the same
+    // key.
+    std.Io.Dir.cwd().rename(staged_artifact_path, std.Io.Dir.cwd(), published_artifact_path, global_io) catch |err| {
+        // A cross-device rename cannot happen here because staging and key
+        // dirs share the cache root. Any failure is a real publish failure,
+        // not a fallback opportunity.
+        std.debug.print(
+            "Error: could not publish {s} artifact to the cache: {s}\n",
+            .{ artifact_label, @errorName(err) },
+        );
+        return error.ScriptArtifactPublishFailed;
+    };
+
+    publishScriptDebugSymbolsIfNeeded(alloc, config, staged_artifact_path, published_artifact_path) catch |err| {
+        if (err == error.OutOfMemory) {
+            std.debug.print("Error: out of memory publishing {s} debug symbols\n", .{artifact_label});
+        }
+        return err;
+    };
+
+    // Publish the `<artifact>.zap-symbols` sidecar alongside the binary so the
+    // Phase 2 crash reporter can resolve mangled frames to Zap symbols at
+    // runtime. The sidecar is emitted into the staging dir by the ZIR backend;
+    // without this publish it would be discarded with the staging tree, so a
+    // script/test artifact is not complete until the required sidecar is also
+    // present.
+    publishScriptSymbolTableSidecar(alloc, staged_artifact_path, published_artifact_path) catch |err| {
+        if (err == error.OutOfMemory) {
+            std.debug.print("Error: out of memory publishing {s} symbol table sidecar\n", .{artifact_label});
+        }
+        return err;
+    };
+
+    // Cleanup is part of the publish contract: once the binary and required
+    // sidecars are visible in the content-key directory, the private staging
+    // tree must be removed before the caller may report or run the artifact.
+    try cleanupRequiredPublishedArtifactStaging(artifact_label, staging_dir);
+}
+
+test "P4J2: script symbol table sidecar publish installs the staged sidecar" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "staged");
+    try tmp_dir.dir.createDirPath(global_io, "published");
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const staged_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "staged", "app" });
+    defer allocator.free(staged_artifact_path);
+    const published_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "published", "app" });
+    defer allocator.free(published_artifact_path);
+    const staged_sidecar_path = try symbolTableSidecarPath(allocator, staged_artifact_path);
+    defer allocator.free(staged_sidecar_path);
+    const published_sidecar_path = try symbolTableSidecarPath(allocator, published_artifact_path);
+    defer allocator.free(published_sidecar_path);
+
+    try std.Io.Dir.cwd().writeFile(global_io, .{ .sub_path = staged_sidecar_path, .data = "symbols" });
+
+    try publishScriptSymbolTableSidecar(allocator, staged_artifact_path, published_artifact_path);
+
+    try std.testing.expectEqual(CachedArtifactAccessResult.missing, try symbolTableSidecarFileAccess(staged_sidecar_path));
+    try std.testing.expectEqual(CachedArtifactAccessResult.present, try symbolTableSidecarFileAccess(published_sidecar_path));
+    const published_bytes = try std.Io.Dir.cwd().readFileAlloc(global_io, published_sidecar_path, allocator, .limited(64));
+    defer allocator.free(published_bytes);
+    try std.testing.expectEqualStrings("symbols", published_bytes);
+}
+
+test "P4J2: script symbol table sidecar publish replaces an existing sidecar" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "staged");
+    try tmp_dir.dir.createDirPath(global_io, "published");
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const staged_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "staged", "app" });
+    defer allocator.free(staged_artifact_path);
+    const published_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "published", "app" });
+    defer allocator.free(published_artifact_path);
+    const staged_sidecar_path = try symbolTableSidecarPath(allocator, staged_artifact_path);
+    defer allocator.free(staged_sidecar_path);
+    const published_sidecar_path = try symbolTableSidecarPath(allocator, published_artifact_path);
+    defer allocator.free(published_sidecar_path);
+
+    try std.Io.Dir.cwd().writeFile(global_io, .{ .sub_path = staged_sidecar_path, .data = "fresh" });
+    try std.Io.Dir.cwd().writeFile(global_io, .{ .sub_path = published_sidecar_path, .data = "stale" });
+
+    try publishScriptSymbolTableSidecar(allocator, staged_artifact_path, published_artifact_path);
+
+    const published_bytes = try std.Io.Dir.cwd().readFileAlloc(global_io, published_sidecar_path, allocator, .limited(64));
+    defer allocator.free(published_bytes);
+    try std.testing.expectEqualStrings("fresh", published_bytes);
+}
+
+test "P4J2: script symbol table sidecar publish rejects missing staged sidecar" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const staged_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "staged", "app" });
+    defer allocator.free(staged_artifact_path);
+    const published_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "published", "app" });
+    defer allocator.free(published_artifact_path);
+
+    try std.testing.expectError(
+        error.SymbolTableSidecarMissing,
+        publishScriptSymbolTableSidecar(allocator, staged_artifact_path, published_artifact_path),
+    );
+}
+
+test "P4J2: script symbol table sidecar publish preserves allocation failures" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        publishScriptSymbolTableSidecar(failing_allocator.allocator(), "staged/app", "published/app"),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: script symbol table sidecar publish maps staged access failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "staged");
+    try tmp_dir.dir.symLink(global_io, "app.zap-symbols", "staged/app.zap-symbols", .{});
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const staged_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "staged", "app" });
+    defer allocator.free(staged_artifact_path);
+    const published_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "published", "app" });
+    defer allocator.free(published_artifact_path);
+
+    try std.testing.expectError(
+        error.SymbolTableSidecarAccessFailed,
+        publishScriptSymbolTableSidecar(allocator, staged_artifact_path, published_artifact_path),
+    );
+}
+
+test "P4J2: script symbol table sidecar publish maps rename failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "staged");
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "published", .data = "not a directory" });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const staged_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "staged", "app" });
+    defer allocator.free(staged_artifact_path);
+    const published_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "published", "app" });
+    defer allocator.free(published_artifact_path);
+    const staged_sidecar_path = try symbolTableSidecarPath(allocator, staged_artifact_path);
+    defer allocator.free(staged_sidecar_path);
+    try std.Io.Dir.cwd().writeFile(global_io, .{ .sub_path = staged_sidecar_path, .data = "symbols" });
+
+    try std.testing.expectError(
+        error.SymbolTableSidecarPublishFailed,
+        publishScriptSymbolTableSidecar(allocator, staged_artifact_path, published_artifact_path),
+    );
+    try std.testing.expectEqual(CachedArtifactAccessResult.present, try symbolTableSidecarFileAccess(staged_sidecar_path));
+}
+
+test "P4J2: script artifact publish propagates required staging cleanup failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "staging/run");
+    try tmp_dir.dir.createDirPath(global_io, "published");
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "staging/run/app", .data = "binary" });
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "staging/run/app.zap-symbols", .data = "symbols" });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const staged_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "staging", "run", "app" });
+    defer allocator.free(staged_artifact_path);
+    const published_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "published", "app" });
+    defer allocator.free(published_artifact_path);
+    const staging_dir = try std.fs.path.join(allocator, &.{ tmp_path, "staging", "run" });
+    defer allocator.free(staging_dir);
+    const staging_parent = try std.fs.path.join(allocator, &.{ tmp_path, "staging" });
+    defer allocator.free(staging_parent);
+
+    try std.Io.Dir.cwd().setFilePermissions(global_io, staging_parent, std.Io.File.Permissions.fromMode(0o555), .{});
+    defer std.Io.Dir.cwd().setFilePermissions(global_io, staging_parent, std.Io.File.Permissions.fromMode(0o755), .{}) catch {};
+
+    const config = zap.builder.BuildConfig{
+        .name = "probe",
+        .version = "0.0.0",
+        .kind = .bin,
+        .optimize = .debug,
+        .target = "aarch64-linux-gnu",
+    };
+
+    try std.testing.expectError(
+        error.ArtifactStagingCleanupFailed,
+        publishScriptArtifactToCache(
+            allocator,
+            config,
+            "script",
+            staged_artifact_path,
+            published_artifact_path,
+            staging_dir,
+        ),
+    );
+    try std.testing.expectEqual(CachedArtifactAccessResult.present, try cachedArtifactAccess(published_artifact_path));
+    try std.testing.expect(try artifactHasRequiredSymbolTableSidecar(allocator, published_artifact_path));
+}
+
+test "P4J2: script dSYM publish propagates redundant staged cleanup failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "staging/run/app.dSYM/Contents");
+    try tmp_dir.dir.createDirPath(global_io, "published/app.dSYM/Contents");
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const staged_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "staging", "run", "app" });
+    defer allocator.free(staged_artifact_path);
+    const published_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, "published", "app" });
+    defer allocator.free(published_artifact_path);
+    const staging_dir = try std.fs.path.join(allocator, &.{ tmp_path, "staging", "run" });
+    defer allocator.free(staging_dir);
+
+    try std.Io.Dir.cwd().setFilePermissions(global_io, staging_dir, std.Io.File.Permissions.fromMode(0o555), .{});
+    defer std.Io.Dir.cwd().setFilePermissions(global_io, staging_dir, std.Io.File.Permissions.fromMode(0o755), .{}) catch {};
+
+    try std.testing.expectError(
+        error.DebugSymbolCleanupFailed,
+        publishScriptDebugSymbolsIfNeeded(
+            allocator,
+            darwinDebugSymbolTestConfig(),
+            staged_artifact_path,
+            published_artifact_path,
+        ),
+    );
 }
 
 fn buildOverrideIdentity(overrides: BuildOverrides) build_cache.OverrideIdentity {
@@ -3471,47 +4526,61 @@ fn tryManifestSnapshotHit(
     invocation_identity: build_cache.InvocationIdentity,
     progress: ?*zap.progress.Reporter,
     progress_node: ?zap.progress.Node,
-) ?BuildArtifact {
-    var stable_snapshot = build_cache.readStableSnapshot(scratch_allocator, snapshot_path) catch {
-        if (progress_node) |node| node.cacheMiss("snapshot", "snapshot_unreadable");
-        incrementalTrace("manifest-snapshot result=miss reason=snapshot_unreadable path={s}", .{snapshot_path});
-        return null;
+) !?BuildArtifact {
+    var stable_snapshot = build_cache.readStableSnapshot(scratch_allocator, snapshot_path) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (progress_node) |node| node.cacheMiss("snapshot", "snapshot_missing");
+            incrementalTrace("manifest-snapshot result=miss reason=snapshot_missing path={s}", .{snapshot_path});
+            return null;
+        },
+        else => {
+            incrementalTrace(
+                "manifest-snapshot result=error reason={s} path={s}",
+                .{ @errorName(err), snapshot_path },
+            );
+            return err;
+        },
     };
     defer stable_snapshot.deinit(scratch_allocator);
 
     var validation_stats: build_cache.ValidationStats = .{};
-    if (!build_cache.validateSnapshot(scratch_allocator, stable_snapshot.snapshot, .{
+    switch (try build_cache.validateSnapshot(scratch_allocator, stable_snapshot.snapshot, .{
         .invocation_identity = invocation_identity,
         .snapshot_mtime_nanos = stable_snapshot.mtime_nanos,
         .stats = &validation_stats,
     })) {
-        if (progress_node) |node| {
+        .valid => {},
+        .miss => {
+            if (progress_node) |node| {
+                if (build_cache.validationMissDetailAlloc(scratch_allocator, validation_stats)) |miss_detail| {
+                    defer scratch_allocator.free(miss_detail);
+                    node.cacheMiss("snapshot", miss_detail);
+                } else |_| {
+                    node.cacheMiss("snapshot", build_cache.validationMissReasonLabel(validation_stats.miss_reason));
+                }
+            }
             if (build_cache.validationMissDetailAlloc(scratch_allocator, validation_stats)) |miss_detail| {
                 defer scratch_allocator.free(miss_detail);
-                node.cacheMiss("snapshot", miss_detail);
+                incrementalTrace(
+                    "manifest-snapshot result=miss reason={s} path={s}",
+                    .{ miss_detail, snapshot_path },
+                );
             } else |_| {
-                node.cacheMiss("snapshot", build_cache.validationMissReasonLabel(validation_stats.miss_reason));
+                incrementalTrace(
+                    "manifest-snapshot result=miss reason={s} path={s}",
+                    .{ build_cache.validationMissReasonLabel(validation_stats.miss_reason), snapshot_path },
+                );
             }
-        }
-        if (build_cache.validationMissDetailAlloc(scratch_allocator, validation_stats)) |miss_detail| {
-            defer scratch_allocator.free(miss_detail);
-            incrementalTrace(
-                "manifest-snapshot result=miss reason={s} path={s}",
-                .{ miss_detail, snapshot_path },
-            );
-        } else |_| {
-            incrementalTrace(
-                "manifest-snapshot result=miss reason={s} path={s}",
-                .{ build_cache.validationMissReasonLabel(validation_stats.miss_reason), snapshot_path },
-            );
-        }
-        return null;
+            return null;
+        },
     }
 
-    installCachedManifestArtifact(scratch_allocator, stable_snapshot.snapshot) catch {
-        if (progress_node) |node| node.cacheMiss("snapshot", "install_failed");
-        incrementalTrace("manifest-snapshot result=miss reason=install_failed path={s}", .{snapshot_path});
-        return null;
+    installCachedManifestArtifact(scratch_allocator, stable_snapshot.snapshot) catch |err| {
+        incrementalTrace(
+            "manifest-snapshot result=error reason=install_failed:{s} path={s}",
+            .{ @errorName(err), snapshot_path },
+        );
+        return err;
     };
 
     if (progress_node) |node| node.cacheHit("snapshot", snapshot_path);
@@ -3524,24 +4593,98 @@ fn tryManifestSnapshotHit(
     } else {
         std.debug.print("[cached] {s}\n", .{stable_snapshot.snapshot.output_path});
     }
-    const path = artifact_allocator.dupe(u8, stable_snapshot.snapshot.output_path) catch return null;
+    const path = try artifact_allocator.dupe(u8, stable_snapshot.snapshot.output_path);
+    errdefer artifact_allocator.free(path);
     const target = if (stable_snapshot.snapshot.target) |target_path| blk: {
-        break :blk artifact_allocator.dupe(u8, target_path) catch {
-            artifact_allocator.free(path);
-            return null;
-        };
+        break :blk try artifact_allocator.dupe(u8, target_path);
     } else null;
-    const pipeline = configPipelineFromBuildCache(artifact_allocator, stable_snapshot.snapshot.pipeline) catch {
-        artifact_allocator.free(path);
-        if (target) |target_value| artifact_allocator.free(target_value);
-        return null;
-    };
+    errdefer if (target) |target_value| artifact_allocator.free(target_value);
+    const pipeline = try configPipelineFromBuildCache(artifact_allocator, stable_snapshot.snapshot.pipeline);
+    errdefer if (pipeline) |pipeline_value| freeBuildPipeline(artifact_allocator, pipeline_value);
     return .{
         .path = path,
         .kind = configKindFromBuildCache(stable_snapshot.snapshot.kind),
         .target = target,
         .pipeline = pipeline,
     };
+}
+
+test "manifest snapshot hit propagates stable snapshot read allocation failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const snapshot_path = try std.fs.path.join(allocator, &.{ tmp_path, ".zap-cache/target.build-plan" });
+    defer allocator.free(snapshot_path);
+
+    const invocation_identity = testBuildCacheDigest(1);
+    const snapshot: build_cache.Snapshot = .{
+        .invocation_identity = invocation_identity,
+        .cache_key_hex = "abcd",
+        .cached_artifact_path = ".zap-cache/o/abcd/app",
+        .output_path = "zap-out/bin/app",
+        .kind = .bin,
+        .debug_symbols_required = false,
+    };
+    try build_cache.writeSnapshotAtomic(allocator, snapshot_path, snapshot);
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        tryManifestSnapshotHit(
+            allocator,
+            failing_allocator.allocator(),
+            snapshot_path,
+            invocation_identity,
+            null,
+            null,
+        ),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "manifest snapshot hit propagates cached artifact installation failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(global_io, ".zap-cache/o/abcd") catch return error.Unexpected;
+    tmp_dir.dir.writeFile(global_io, .{ .sub_path = ".zap-cache/o/abcd/app", .data = "binary" }) catch return error.Unexpected;
+    tmp_dir.dir.writeFile(global_io, .{ .sub_path = "zap-out", .data = "not a directory" }) catch return error.Unexpected;
+
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator) catch return error.Unexpected;
+    defer allocator.free(tmp_path);
+    const snapshot_path = try std.fs.path.join(allocator, &.{ tmp_path, ".zap-cache/target.build-plan" });
+    defer allocator.free(snapshot_path);
+    const cached_artifact_path = try std.fs.path.join(allocator, &.{ tmp_path, ".zap-cache/o/abcd/app" });
+    defer allocator.free(cached_artifact_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "zap-out/bin/app" });
+    defer allocator.free(output_path);
+
+    const invocation_identity = testBuildCacheDigest(1);
+    const snapshot: build_cache.Snapshot = .{
+        .invocation_identity = invocation_identity,
+        .cache_key_hex = "abcd",
+        .cached_artifact_path = cached_artifact_path,
+        .output_path = output_path,
+        .kind = .bin,
+        .debug_symbols_required = false,
+    };
+    try build_cache.writeSnapshotAtomic(allocator, snapshot_path, snapshot);
+
+    try std.testing.expectError(
+        error.NotDir,
+        tryManifestSnapshotHit(
+            allocator,
+            allocator,
+            snapshot_path,
+            invocation_identity,
+            null,
+            null,
+        ),
+    );
 }
 
 const MANIFEST_EVAL_CACHE_MAGIC: u32 = 0x5a_4d_45_31; // "ZME1"
@@ -3571,13 +4714,26 @@ fn tryReadManifestEvalCache(
     scratch_allocator: std.mem.Allocator,
     path: []const u8,
     invocation_identity: build_cache.InvocationIdentity,
-) ?CachedManifestEval {
+) !?CachedManifestEval {
     return readManifestEvalCache(allocator, scratch_allocator, path, invocation_identity) catch |err| {
-        incrementalTrace(
-            "manifest-eval-cache result=miss reason={s} path={s}",
-            .{ @errorName(err), path },
-        );
-        return null;
+        switch (err) {
+            error.FileNotFound,
+            error.StaleManifestEvalCache,
+            => {
+                incrementalTrace(
+                    "manifest-eval-cache result=miss reason={s} path={s}",
+                    .{ @errorName(err), path },
+                );
+                return null;
+            },
+            else => {
+                incrementalTrace(
+                    "manifest-eval-cache result=error reason={s} path={s}",
+                    .{ @errorName(err), path },
+                );
+                return err;
+            },
+        }
     };
 }
 
@@ -3605,8 +4761,10 @@ fn readManifestEvalCache(
     const config = try readManifestEvalBuildConfig(cache_allocator, &reader);
     const dependencies = try readManifestEvalCtDependencies(cache_allocator, &reader);
     const result_hash = try reader.takeInt(u64, .little);
+    if (reader.seek != reader.end) return error.InvalidManifestEvalCache;
 
-    if (!zap.ctfe.PersistentCache.validateDependencies(scratch_allocator, dependencies, null, null)) {
+    const dependencies_valid = try zap.ctfe.PersistentCache.validateDependencies(scratch_allocator, dependencies, null, null);
+    if (!dependencies_valid) {
         return error.StaleManifestEvalCache;
     }
 
@@ -3627,21 +4785,104 @@ fn writeManifestEvalCache(
     invocation_identity: build_cache.InvocationIdentity,
     manifest_eval: zap.builder.ManifestEval,
 ) !void {
-    var serialized: std.Io.Writer.Allocating = .init(allocator);
+    try writeManifestEvalCacheWithWriter(allocator, path, invocation_identity, manifest_eval, ManifestEvalCacheFileWriter{});
+}
+
+fn writeRequiredManifestEvalCache(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    invocation_identity: build_cache.InvocationIdentity,
+    manifest_eval: zap.builder.ManifestEval,
+) IncrementalError!void {
+    return writeRequiredManifestEvalCacheWithWriter(allocator, path, invocation_identity, manifest_eval, ManifestEvalCacheFileWriter{});
+}
+
+fn writeRequiredManifestEvalCacheWithWriter(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    invocation_identity: build_cache.InvocationIdentity,
+    manifest_eval: zap.builder.ManifestEval,
+    file_writer: anytype,
+) IncrementalError!void {
+    writeManifestEvalCacheWithWriter(allocator, path, invocation_identity, manifest_eval, file_writer) catch |err| {
+        incrementalTrace(
+            "manifest-eval-cache result=write_failed reason={s} path={s}",
+            .{ @errorName(err), path },
+        );
+        return incrementalErrorOrStatus(err, error.CacheMetadataError);
+    };
+}
+
+const ManifestEvalCacheFileWriter = struct {
+    fn writeFileAtomic(
+        _: ManifestEvalCacheFileWriter,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        contents: []const u8,
+    ) !void {
+        try build_cache.writeFileAtomic(allocator, path, contents);
+    }
+};
+
+const ManifestEvalCacheSerializer = struct {
+    allocator: std.mem.Allocator,
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) ManifestEvalCacheSerializer {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *ManifestEvalCacheSerializer) void {
+        self.bytes.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn written(self: *const ManifestEvalCacheSerializer) []const u8 {
+        return self.bytes.items;
+    }
+
+    fn writeAll(self: *ManifestEvalCacheSerializer, bytes: []const u8) !void {
+        try self.bytes.appendSlice(self.allocator, bytes);
+    }
+
+    fn writeByte(self: *ManifestEvalCacheSerializer, byte: u8) !void {
+        try self.bytes.append(self.allocator, byte);
+    }
+
+    fn writeInt(
+        self: *ManifestEvalCacheSerializer,
+        comptime Int: type,
+        value: Int,
+        endian: std.builtin.Endian,
+    ) !void {
+        var bytes: [@sizeOf(Int)]u8 = undefined;
+        std.mem.writeInt(Int, &bytes, value, endian);
+        try self.writeAll(&bytes);
+    }
+};
+
+fn writeManifestEvalCacheWithWriter(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    invocation_identity: build_cache.InvocationIdentity,
+    manifest_eval: zap.builder.ManifestEval,
+    file_writer: anytype,
+) !void {
+    var serialized = ManifestEvalCacheSerializer.init(allocator);
     defer serialized.deinit();
 
-    try serialized.writer.writeInt(u32, MANIFEST_EVAL_CACHE_MAGIC, .little);
-    try serialized.writer.writeInt(u16, MANIFEST_EVAL_CACHE_VERSION, .little);
-    try serialized.writer.writeAll(&invocation_identity);
-    try writeManifestEvalBuildConfig(&serialized.writer, manifest_eval.config);
-    try writeManifestEvalCtDependencies(&serialized.writer, manifest_eval.dependencies);
-    try serialized.writer.writeInt(u64, manifest_eval.result_hash, .little);
+    try serialized.writeInt(u32, MANIFEST_EVAL_CACHE_MAGIC, .little);
+    try serialized.writeInt(u16, MANIFEST_EVAL_CACHE_VERSION, .little);
+    try serialized.writeAll(&invocation_identity);
+    try writeManifestEvalBuildConfig(&serialized, manifest_eval.config);
+    try writeManifestEvalCtDependencies(&serialized, manifest_eval.dependencies);
+    try serialized.writeInt(u64, manifest_eval.result_hash, .little);
 
-    try build_cache.writeFileAtomic(allocator, path, serialized.written());
+    try file_writer.writeFileAtomic(allocator, path, serialized.written());
     incrementalTrace("manifest-eval-cache result=write path={s}", .{path});
 }
 
-fn writeManifestEvalString(writer: *std.Io.Writer, value: []const u8) !void {
+fn writeManifestEvalString(writer: *ManifestEvalCacheSerializer, value: []const u8) !void {
     const len = std.math.cast(u32, value.len) orelse return error.ManifestEvalCacheTooLarge;
     try writer.writeInt(u32, len, .little);
     try writer.writeAll(value);
@@ -3655,7 +4896,7 @@ fn readManifestEvalString(allocator: std.mem.Allocator, reader: *std.Io.Reader) 
     return out;
 }
 
-fn writeManifestEvalOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+fn writeManifestEvalOptionalString(writer: *ManifestEvalCacheSerializer, value: ?[]const u8) !void {
     try writer.writeByte(if (value != null) 1 else 0);
     if (value) |some| try writeManifestEvalString(writer, some);
 }
@@ -3668,7 +4909,7 @@ fn readManifestEvalOptionalString(allocator: std.mem.Allocator, reader: *std.Io.
     };
 }
 
-fn writeManifestEvalBool(writer: *std.Io.Writer, value: bool) !void {
+fn writeManifestEvalBool(writer: *ManifestEvalCacheSerializer, value: bool) !void {
     try writer.writeByte(if (value) 1 else 0);
 }
 
@@ -3680,7 +4921,7 @@ fn readManifestEvalBool(reader: *std.Io.Reader) !bool {
     };
 }
 
-fn writeManifestEvalStringSlice(writer: *std.Io.Writer, values: []const []const u8) !void {
+fn writeManifestEvalStringSlice(writer: *ManifestEvalCacheSerializer, values: []const []const u8) !void {
     const count = std.math.cast(u32, values.len) orelse return error.ManifestEvalCacheTooLarge;
     try writer.writeInt(u32, count, .little);
     for (values) |value| try writeManifestEvalString(writer, value);
@@ -3715,7 +4956,7 @@ fn readManifestEvalOptimize(reader: *std.Io.Reader) !zap.builder.BuildConfig.Opt
 }
 
 fn writeManifestEvalOptionalDebugInfo(
-    writer: *std.Io.Writer,
+    writer: *ManifestEvalCacheSerializer,
     value: ?zap.builder.BuildConfig.DebugInfo,
 ) !void {
     try writer.writeByte(if (value != null) 1 else 0);
@@ -3735,7 +4976,7 @@ fn readManifestEvalOptionalDebugInfo(reader: *std.Io.Reader) !?zap.builder.Build
     };
 }
 
-fn writeManifestEvalOptionalBool(writer: *std.Io.Writer, value: ?bool) !void {
+fn writeManifestEvalOptionalBool(writer: *ManifestEvalCacheSerializer, value: ?bool) !void {
     try writer.writeByte(if (value != null) 1 else 0);
     if (value) |some| try writeManifestEvalBool(writer, some);
 }
@@ -3749,7 +4990,7 @@ fn readManifestEvalOptionalBool(reader: *std.Io.Reader) !?bool {
 }
 
 fn writeManifestEvalBuildConfigDeps(
-    writer: *std.Io.Writer,
+    writer: *ManifestEvalCacheSerializer,
     deps: []const zap.builder.BuildConfig.Dep,
 ) !void {
     const count = std.math.cast(u32, deps.len) orelse return error.ManifestEvalCacheTooLarge;
@@ -3801,7 +5042,7 @@ fn readManifestEvalBuildConfigDeps(
 }
 
 fn writeManifestEvalBuildOpts(
-    writer: *std.Io.Writer,
+    writer: *ManifestEvalCacheSerializer,
     build_opts: std.StringHashMapUnmanaged([]const u8),
 ) !void {
     const count = std.math.cast(u32, build_opts.count()) orelse return error.ManifestEvalCacheTooLarge;
@@ -3830,7 +5071,7 @@ fn readManifestEvalBuildOpts(
 }
 
 fn writeManifestEvalMemoryManager(
-    writer: *std.Io.Writer,
+    writer: *ManifestEvalCacheSerializer,
     memory_manager: ?zap.builder.BuildConfig.MemoryManager,
 ) !void {
     try writer.writeByte(if (memory_manager != null) 1 else 0);
@@ -3854,7 +5095,7 @@ fn readManifestEvalMemoryManager(
 }
 
 fn writeManifestEvalDocGroups(
-    writer: *std.Io.Writer,
+    writer: *ManifestEvalCacheSerializer,
     doc_groups: []const zap.builder.BuildConfig.DocGroup,
 ) !void {
     const count = std.math.cast(u32, doc_groups.len) orelse return error.ManifestEvalCacheTooLarge;
@@ -3881,7 +5122,7 @@ fn readManifestEvalDocGroups(
 }
 
 fn writeManifestEvalBuildConfig(
-    writer: *std.Io.Writer,
+    writer: *ManifestEvalCacheSerializer,
     config: zap.builder.BuildConfig,
 ) !void {
     try writeManifestEvalString(writer, config.name);
@@ -3937,7 +5178,7 @@ fn readManifestEvalBuildConfig(
 }
 
 fn writeManifestEvalCtDependencies(
-    writer: *std.Io.Writer,
+    writer: *ManifestEvalCacheSerializer,
     dependencies: []const zap.ctfe.CtDependency,
 ) !void {
     const count = std.math.cast(u32, dependencies.len) orelse return error.ManifestEvalCacheTooLarge;
@@ -4046,9 +5287,22 @@ const SourceRootResolutionOptions = struct {
     print_local_overrides: bool = true,
 };
 
+const SourceRootLockfileWriter = struct {
+    fn writeLockfile(
+        _: SourceRootLockfileWriter,
+        allocator: std.mem.Allocator,
+        project_root: []const u8,
+        entries: []const zap.lockfile.LockEntry,
+    ) !void {
+        try zap.lockfile.writeLockfile(allocator, project_root, entries);
+    }
+};
+
 const ManifestSources = struct {
+    allocator: std.mem.Allocator,
     source_roots: []const zap.discovery.SourceRoot,
     source_units: []const compiler.SourceUnit,
+    owned_source_paths: []const []const u8,
     struct_order: ?[]const []const u8,
     level_boundaries: ?[]const u32,
     source_file_to_struct: std.StringHashMap([]const u8),
@@ -4060,9 +5314,51 @@ const ManifestSources = struct {
     mapped_files: []compiler.MappedFile,
 
     fn deinit(self: *ManifestSources) void {
+        const allocator = self.allocator;
         for (self.mapped_files) |*mapped_file| mapped_file.deinit(global_io);
+        allocator.free(self.mapped_files);
+        allocator.free(self.source_units);
+        for (self.owned_source_paths) |source_path| allocator.free(source_path);
+        allocator.free(self.owned_source_paths);
+        if (self.struct_order) |struct_order| freeOwnedStringSlice(allocator, struct_order);
+        if (self.level_boundaries) |level_boundaries| allocator.free(level_boundaries);
+        deinitOwnedStringValueMap(allocator, &self.source_file_to_struct);
+        deinitOwnedStringSliceMap(allocator, &self.source_file_to_structs);
+        deinitOwnedStringSliceMap(allocator, &self.source_file_imports);
+        deinitOwnedStringSliceMap(allocator, &self.source_file_imported_by);
+        deinitOwnedStringSliceMap(allocator, &self.source_file_compile_after_globs);
+        deinitOwnedStringSliceMap(allocator, &self.source_file_compile_after_files);
     }
 };
+
+fn freeOwnedStringSlice(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
+}
+
+fn deinitOwnedStringValueMap(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMap([]const u8),
+) void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    map.deinit();
+}
+
+fn deinitOwnedStringSliceMap(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMap([]const []const u8),
+) void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        freeOwnedStringSlice(allocator, entry.value_ptr.*);
+    }
+    map.deinit();
+}
 
 const ComputedIncrementalHashes = struct {
     allocator: std.mem.Allocator,
@@ -4885,35 +6181,86 @@ fn freeOwnedModuleHashKeys(allocator: std.mem.Allocator, module_hashes: *std.Str
     while (iter.next()) |entry| allocator.free(entry.key_ptr.*);
 }
 
+const OptionalSourceRootSkipReason = enum {
+    missing,
+    not_directory,
+};
+
+fn optionalSourceRootSkipReason(err: anyerror) ?OptionalSourceRootSkipReason {
+    return switch (err) {
+        error.FileNotFound => .missing,
+        error.NotDir => .not_directory,
+        else => null,
+    };
+}
+
+fn optionalDirectorySkipReason(path: []const u8) !?OptionalSourceRootSkipReason {
+    var dir = std.Io.Dir.cwd().openDir(global_io, path, .{}) catch |err| {
+        if (optionalSourceRootSkipReason(err)) |reason| return reason;
+        return err;
+    };
+    dir.close(global_io);
+    return null;
+}
+
+fn appendImmediateSubdirectoryRootsFromOpenDir(
+    alloc: std.mem.Allocator,
+    source_roots: *std.ArrayListUnmanaged(zap.discovery.SourceRoot),
+    root_name: []const u8,
+    root_path: []const u8,
+    dir: *std.Io.Dir,
+) !void {
+    var it = dir.iterate();
+    while (try it.next(global_io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len > 0 and entry.name[0] == '.') continue;
+        const subdir = try std.fs.path.join(alloc, &.{ root_path, entry.name });
+        try source_roots.append(alloc, .{ .name = root_name, .path = subdir });
+    }
+}
+
 fn appendImmediateSubdirectoryRoots(
     alloc: std.mem.Allocator,
     source_roots: *std.ArrayListUnmanaged(zap.discovery.SourceRoot),
     root_name: []const u8,
     root_path: []const u8,
 ) !void {
-    if (std.Io.Dir.cwd().openDir(global_io, root_path, .{ .iterate = true })) |dir_handle| {
-        var dir = dir_handle;
-        defer dir.close(global_io);
-        var it = dir.iterate();
-        while (it.next(global_io) catch null) |entry| {
-            if (entry.kind != .directory) continue;
-            if (entry.name.len > 0 and entry.name[0] == '.') continue;
-            const subdir = try std.fs.path.join(alloc, &.{ root_path, entry.name });
-            try source_roots.append(alloc, .{ .name = root_name, .path = subdir });
-        }
-    } else |_| {}
+    var dir = try std.Io.Dir.cwd().openDir(global_io, root_path, .{ .iterate = true });
+    defer dir.close(global_io);
+    try appendImmediateSubdirectoryRootsFromOpenDir(alloc, source_roots, root_name, root_path, &dir);
 }
 
-fn appendExistingSourceRootWithSubdirs(
+fn appendOptionalSourceRoot(
     alloc: std.mem.Allocator,
     source_roots: *std.ArrayListUnmanaged(zap.discovery.SourceRoot),
     root_name: []const u8,
     root_path: []const u8,
-) !bool {
-    std.Io.Dir.cwd().access(global_io, root_path, .{}) catch return false;
+) !?OptionalSourceRootSkipReason {
+    var dir = std.Io.Dir.cwd().openDir(global_io, root_path, .{}) catch |err| {
+        if (optionalSourceRootSkipReason(err)) |reason| return reason;
+        return err;
+    };
+    defer dir.close(global_io);
+
     try source_roots.append(alloc, .{ .name = root_name, .path = root_path });
-    try appendImmediateSubdirectoryRoots(alloc, source_roots, root_name, root_path);
-    return true;
+    return null;
+}
+
+fn appendOptionalSourceRootWithSubdirs(
+    alloc: std.mem.Allocator,
+    source_roots: *std.ArrayListUnmanaged(zap.discovery.SourceRoot),
+    root_name: []const u8,
+    root_path: []const u8,
+) !?OptionalSourceRootSkipReason {
+    var dir = std.Io.Dir.cwd().openDir(global_io, root_path, .{ .iterate = true }) catch |err| {
+        if (optionalSourceRootSkipReason(err)) |reason| return reason;
+        return err;
+    };
+    defer dir.close(global_io);
+
+    try source_roots.append(alloc, .{ .name = root_name, .path = root_path });
+    try appendImmediateSubdirectoryRootsFromOpenDir(alloc, source_roots, root_name, root_path, &dir);
+    return null;
 }
 
 fn appendPackageSourceRoots(
@@ -4923,10 +6270,7 @@ fn appendPackageSourceRoots(
     package_dir: []const u8,
 ) !void {
     const lib_dir = try std.fs.path.join(alloc, &.{ package_dir, "lib" });
-    const selected_root = if (std.Io.Dir.cwd().access(global_io, lib_dir, .{})) |_|
-        lib_dir
-    else |_|
-        package_dir;
+    const selected_root = if (try optionalDirectorySkipReason(lib_dir) == null) lib_dir else package_dir;
     try source_roots.append(alloc, .{ .name = root_name, .path = selected_root });
     try appendImmediateSubdirectoryRoots(alloc, source_roots, root_name, selected_root);
 }
@@ -4937,13 +6281,13 @@ fn appendProjectSourceRoots(
     project_root: []const u8,
 ) !void {
     const lib_dir = try std.fs.path.join(alloc, &.{ project_root, "lib" });
-    _ = try appendExistingSourceRootWithSubdirs(alloc, source_roots, "project", lib_dir);
+    _ = try appendOptionalSourceRootWithSubdirs(alloc, source_roots, "project", lib_dir);
 
     const test_dir = try std.fs.path.join(alloc, &.{ project_root, "test" });
-    _ = try appendExistingSourceRootWithSubdirs(alloc, source_roots, "project", test_dir);
+    _ = try appendOptionalSourceRootWithSubdirs(alloc, source_roots, "project", test_dir);
 
     const tools_dir = try std.fs.path.join(alloc, &.{ project_root, "tools" });
-    _ = try appendExistingSourceRootWithSubdirs(alloc, source_roots, "project", tools_dir);
+    _ = try appendOptionalSourceRootWithSubdirs(alloc, source_roots, "project", tools_dir);
 
     try source_roots.append(alloc, .{ .name = "project", .path = project_root });
 }
@@ -4956,9 +6300,21 @@ fn appendZapStdlibSourceRoots(
     const zap_lib = zap_lib_dir orelse return;
     try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_lib });
     const zap_subdir = try std.fs.path.join(alloc, &.{ zap_lib, "zap" });
-    if (std.Io.Dir.cwd().access(global_io, zap_subdir, .{})) |_| {
-        try source_roots.append(alloc, .{ .name = "zap_stdlib", .path = zap_subdir });
-    } else |_| {}
+    _ = try appendOptionalSourceRoot(alloc, source_roots, "zap_stdlib", zap_subdir);
+}
+
+fn lockEntryChanged(previous: zap.lockfile.LockEntry, current: zap.lockfile.LockEntry) bool {
+    return !std.mem.eql(u8, previous.name, current.name) or
+        !std.mem.eql(u8, previous.source_type, current.source_type) or
+        !std.mem.eql(u8, previous.url, current.url) or
+        !std.mem.eql(u8, previous.resolved_ref, current.resolved_ref) or
+        !std.mem.eql(u8, previous.commit, current.commit) or
+        !std.mem.eql(u8, previous.integrity, current.integrity);
+}
+
+fn lockEntryMissingOrChanged(previous: ?zap.lockfile.LockEntry, current: zap.lockfile.LockEntry) bool {
+    const previous_entry = previous orelse return true;
+    return lockEntryChanged(previous_entry, current);
 }
 
 fn resolveManifestSourceRoots(
@@ -4968,31 +6324,57 @@ fn resolveManifestSourceRoots(
     zap_lib_dir: ?[]const u8,
     options: SourceRootResolutionOptions,
 ) ![]const zap.discovery.SourceRoot {
+    return resolveManifestSourceRootsWithLockfileWriter(
+        alloc,
+        project_root,
+        config,
+        zap_lib_dir,
+        options,
+        SourceRootLockfileWriter{},
+    );
+}
+
+fn resolveManifestSourceRootsWithLockfileWriter(
+    alloc: std.mem.Allocator,
+    project_root: []const u8,
+    config: zap.builder.BuildConfig,
+    zap_lib_dir: ?[]const u8,
+    options: SourceRootResolutionOptions,
+    lockfile_writer: anytype,
+) ![]const zap.discovery.SourceRoot {
     var source_roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
     try appendProjectSourceRoots(alloc, &source_roots, project_root);
 
-    const lock_entries = zap.lockfile.readLockfile(alloc, project_root);
+    var lockfile: ?zap.lockfile.OwnedLockfile = null;
+    defer if (lockfile) |*owned| owned.deinit();
+    var lockfile_present = false;
+    const read_result = try zap.lockfile.readLockfile(alloc, project_root);
+    switch (read_result) {
+        .absent => {},
+        .present => |owned| {
+            lockfile = owned;
+            lockfile_present = true;
+        },
+    }
     var new_lock_entries: std.ArrayListUnmanaged(zap.lockfile.LockEntry) = .empty;
+    defer new_lock_entries.deinit(alloc);
     var lockfile_changed = false;
 
     var git_requests: std.ArrayListUnmanaged(zap.lockfile.GitDepRequest) = .empty;
+    defer git_requests.deinit(alloc);
     for (config.deps) |dep| {
         if (dep.local_override != null) continue;
         switch (dep.source) {
             .git => |git| {
-                const locked = if (lock_entries) |entries|
-                    zap.lockfile.findEntry(entries, dep.name)
-                else
-                    null;
-                const locked_commit: ?[]const u8 = if (locked) |lock_entry|
-                    (if (std.mem.eql(u8, lock_entry.commit, "-")) null else lock_entry.commit)
+                const locked = if (lockfile) |*owned|
+                    zap.lockfile.findEntry(owned.entries, dep.name)
                 else
                     null;
                 try git_requests.append(alloc, .{
                     .name = dep.name,
                     .url = git.url,
                     .ref = git.tag orelse git.branch orelse git.rev,
-                    .locked_commit = locked_commit,
+                    .locked = locked,
                 });
             },
             else => {},
@@ -5000,6 +6382,13 @@ fn resolveManifestSourceRoots(
     }
 
     const git_results = zap.lockfile.fetchGitDepsParallel(alloc, git_requests.items) catch |err| {
+        switch (err) {
+            error.LockfileCommitMismatch, error.LockfileIntegrityMismatch, error.LockfileSourceDrift => {
+                std.debug.print("Error: locked git dependency validation failed: {s}\n", .{@errorName(err)});
+                return err;
+            },
+            else => {},
+        }
         std.debug.print("Error: failed to fetch git dependencies: {s}\n", .{@errorName(err)});
         return error.GitDependencyFetchFailed;
     };
@@ -5007,18 +6396,24 @@ fn resolveManifestSourceRoots(
 
     for (config.deps) |dep| {
         const dep_name = try std.fmt.allocPrint(alloc, "dep:{s}", .{dep.name});
+        const locked = if (lockfile) |*owned|
+            zap.lockfile.findEntry(owned.entries, dep.name)
+        else
+            null;
 
         if (dep.local_override) |override_path| {
             const dep_dir = try std.fs.path.join(alloc, &.{ project_root, override_path });
             try appendPackageSourceRoots(alloc, &source_roots, dep_name, dep_dir);
-            try new_lock_entries.append(alloc, .{
+            const new_lock_entry = zap.lockfile.LockEntry{
                 .name = dep.name,
                 .source_type = "path",
                 .url = override_path,
                 .resolved_ref = "-",
                 .commit = "-",
                 .integrity = "-",
-            });
+            };
+            try new_lock_entries.append(alloc, new_lock_entry);
+            if (lockEntryMissingOrChanged(locked, new_lock_entry)) lockfile_changed = true;
             if (options.print_local_overrides) {
                 std.debug.print("  {s}: local override -> {s}\n", .{ dep.name, override_path });
             }
@@ -5029,56 +6424,45 @@ fn resolveManifestSourceRoots(
             .path => |dep_path| {
                 const dep_dir = try std.fs.path.join(alloc, &.{ project_root, dep_path });
                 try appendPackageSourceRoots(alloc, &source_roots, dep_name, dep_dir);
-                try new_lock_entries.append(alloc, .{
+                const new_lock_entry = zap.lockfile.LockEntry{
                     .name = dep.name,
                     .source_type = "path",
                     .url = dep_path,
                     .resolved_ref = "-",
                     .commit = "-",
                     .integrity = "-",
-                });
+                };
+                try new_lock_entries.append(alloc, new_lock_entry);
+                if (lockEntryMissingOrChanged(locked, new_lock_entry)) lockfile_changed = true;
             },
             .git => |git| {
                 if (git_result_index >= git_results.len) return error.GitDependencyFetchFailed;
                 const result = git_results[git_result_index];
                 git_result_index += 1;
 
-                if (result.fetch_error) {
-                    std.debug.print("Error: failed to fetch dep `{s}`\n", .{dep.name});
-                    return error.GitDependencyFetchFailed;
-                }
-
                 try appendPackageSourceRoots(alloc, &source_roots, dep_name, result.path);
 
                 const ref = git.tag orelse git.branch orelse git.rev;
-                try new_lock_entries.append(alloc, .{
+                const new_lock_entry = zap.lockfile.LockEntry{
                     .name = dep.name,
                     .source_type = "git",
                     .url = git.url,
                     .resolved_ref = ref orelse "-",
                     .commit = result.commit,
                     .integrity = result.integrity,
-                });
-
-                const locked = if (lock_entries) |entries|
-                    zap.lockfile.findEntry(entries, dep.name)
-                else
-                    null;
-                const locked_commit: ?[]const u8 = if (locked) |lock_entry|
-                    (if (std.mem.eql(u8, lock_entry.commit, "-")) null else lock_entry.commit)
-                else
-                    null;
-                if (locked_commit == null or !std.mem.eql(u8, locked_commit.?, result.commit)) {
-                    lockfile_changed = true;
-                }
+                };
+                try new_lock_entries.append(alloc, new_lock_entry);
+                if (lockEntryMissingOrChanged(locked, new_lock_entry)) lockfile_changed = true;
             },
         }
     }
 
-    if (options.write_lockfile and (lock_entries == null or lockfile_changed)) {
-        zap.lockfile.writeLockfile(alloc, project_root, new_lock_entries.items) catch |err| {
-            std.debug.print("Warning: could not write zap.lock: {}\n", .{err});
-        };
+    if (lockfile) |owned| {
+        if (owned.entries.len != new_lock_entries.items.len) lockfile_changed = true;
+    }
+
+    if (options.write_lockfile and (!lockfile_present or lockfile_changed)) {
+        try lockfile_writer.writeLockfile(alloc, project_root, new_lock_entries.items);
     }
 
     try appendZapStdlibSourceRoots(alloc, &source_roots, zap_lib_dir);
@@ -5094,28 +6478,66 @@ fn sourceRootShouldScanRecursively(root: zap.discovery.SourceRoot) bool {
         std.mem.eql(u8, root.name, "zap_stdlib");
 }
 
+fn deinitOwnedPathSet(alloc: std.mem.Allocator, paths: *std.StringHashMap(void)) void {
+    var iter = paths.iterator();
+    while (iter.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+    }
+    paths.deinit();
+}
+
+fn deinitOwnedPathList(alloc: std.mem.Allocator, paths: *std.ArrayListUnmanaged([]const u8)) void {
+    for (paths.items) |path| {
+        if (path.len > 0) alloc.free(path);
+    }
+    paths.deinit(alloc);
+}
+
+fn appendUniqueOwnedSourcePath(
+    alloc: std.mem.Allocator,
+    source_files: *std.ArrayListUnmanaged([]const u8),
+    discovered: *std.StringHashMap(void),
+    owned_full_path: []const u8,
+) !bool {
+    const full_path = owned_full_path;
+    var full_path_owned = true;
+    defer if (full_path_owned) alloc.free(full_path);
+
+    const key = try std.fs.path.resolve(alloc, &.{full_path});
+    var key_owned = true;
+    defer if (key_owned) alloc.free(key);
+
+    if (discovered.contains(key)) return false;
+
+    try discovered.put(key, {});
+    key_owned = false;
+    errdefer {
+        if (discovered.remove(key)) {
+            alloc.free(key);
+        }
+    }
+
+    try source_files.append(alloc, full_path);
+    full_path_owned = false;
+    return true;
+}
+
 fn appendImmediateProjectZapFiles(
     alloc: std.mem.Allocator,
     root_path: []const u8,
     source_files: *std.ArrayListUnmanaged([]const u8),
     discovered: *std.StringHashMap(void),
 ) !void {
-    if (std.Io.Dir.cwd().openDir(global_io, root_path, .{ .iterate = true })) |dir_handle| {
-        var dir = dir_handle;
-        defer dir.close(global_io);
-        var it = dir.iterate();
-        while (it.next(global_io) catch null) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
-            if (std.mem.eql(u8, entry.name, "build.zap")) continue;
-            const file_path = try std.fs.path.join(alloc, &.{ root_path, entry.name });
-            const key = std.fs.path.resolve(alloc, &.{file_path}) catch file_path;
-            if (!discovered.contains(key)) {
-                try source_files.append(alloc, file_path);
-                try discovered.put(key, {});
-            }
-        }
-    } else |_| {}
+    var dir = try std.Io.Dir.cwd().openDir(global_io, root_path, .{ .iterate = true });
+    defer dir.close(global_io);
+    var it = dir.iterate();
+    while (try it.next(global_io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".zap")) continue;
+        if (std.mem.eql(u8, entry.name, "build.zap")) continue;
+        const file_path = try std.fs.path.join(alloc, &.{ root_path, entry.name });
+        _ = try appendUniqueOwnedSourcePath(alloc, source_files, discovered, file_path);
+    }
 }
 
 /// Strip a leading `./` (or repeated `././`) and any leading slash from a
@@ -5194,8 +6616,14 @@ fn appendProtocolAndImplSourceFiles(
     source_files: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     var discovered = std.StringHashMap(void).init(alloc);
+    defer deinitOwnedPathSet(alloc, &discovered);
     for (source_files.items) |source_file| {
-        const key = std.fs.path.resolve(alloc, &.{source_file}) catch source_file;
+        const key = try std.fs.path.resolve(alloc, &.{source_file});
+        errdefer alloc.free(key);
+        if (discovered.contains(key)) {
+            alloc.free(key);
+            continue;
+        }
         try discovered.put(key, {});
     }
     for (source_roots) |root| {
@@ -5206,13 +6634,18 @@ fn appendProtocolAndImplSourceFiles(
                 // recursive roots; dependency and stdlib roots scan fully.
                 var scanned: std.ArrayListUnmanaged([]const u8) = .empty;
                 var scanned_seen = std.StringHashMap(void).init(alloc);
+                defer deinitOwnedPathList(alloc, &scanned);
+                defer deinitOwnedPathSet(alloc, &scanned_seen);
                 try scanZapFilesRecursive(alloc, root.path, &scanned, &scanned_seen);
-                for (scanned.items) |candidate| {
-                    if (!try projectSourceFileMatchesManifestPaths(alloc, manifest_paths, project_root, candidate)) continue;
-                    const key = std.fs.path.resolve(alloc, &.{candidate}) catch candidate;
-                    if (discovered.contains(key)) continue;
-                    try discovered.put(key, {});
-                    try source_files.append(alloc, candidate);
+                var index: usize = 0;
+                while (index < scanned.items.len) {
+                    const candidate = scanned.items[index];
+                    if (!try projectSourceFileMatchesManifestPaths(alloc, manifest_paths, project_root, candidate)) {
+                        index += 1;
+                        continue;
+                    }
+                    _ = scanned.orderedRemove(index);
+                    _ = try appendUniqueOwnedSourcePath(alloc, source_files, &discovered, candidate);
                 }
                 continue;
             }
@@ -5225,18 +6658,72 @@ fn appendProtocolAndImplSourceFiles(
     }
 }
 
+fn canonicalPathAlloc(alloc: std.mem.Allocator, file_path: []const u8) std.Io.Dir.RealPathFileAllocError![]const u8 {
+    const canonical_path_z = try std.Io.Dir.cwd().realPathFileAlloc(global_io, file_path, alloc);
+    defer alloc.free(canonical_path_z);
+    return try alloc.dupe(u8, canonical_path_z[0..canonical_path_z.len]);
+}
+
+fn cloneStringSliceDeep(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    const cloned = try alloc.alloc([]const u8, values.len);
+    var cloned_count: usize = 0;
+    errdefer {
+        for (cloned[0..cloned_count]) |value| alloc.free(value);
+        alloc.free(cloned);
+    }
+    for (values, 0..) |value, index| {
+        cloned[index] = try alloc.dupe(u8, value);
+        cloned_count = index + 1;
+    }
+    return cloned;
+}
+
+fn putOwnedStringValueIfAbsent(
+    alloc: std.mem.Allocator,
+    map: *std.StringHashMap([]const u8),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (map.contains(key)) return;
+
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+
+    try map.put(owned_key, owned_value);
+}
+
+fn putOwnedStringSliceIfAbsent(
+    alloc: std.mem.Allocator,
+    map: *std.StringHashMap([]const []const u8),
+    key: []const u8,
+    values: []const []const u8,
+) !void {
+    if (map.contains(key)) return;
+
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const owned_values = try cloneStringSliceDeep(alloc, values);
+    errdefer freeOwnedStringSlice(alloc, owned_values);
+
+    try map.put(owned_key, owned_values);
+}
+
 fn putPathSliceWithCanonical(
     alloc: std.mem.Allocator,
     map: *std.StringHashMap([]const []const u8),
     file_path: []const u8,
     values: []const []const u8,
 ) !void {
-    const owned_values = try alloc.dupe([]const u8, values);
-    try map.put(file_path, owned_values);
-    const canonical_path = std.Io.Dir.cwd().realPathFileAlloc(global_io, file_path, alloc) catch null;
-    if (canonical_path) |path| {
-        try map.put(path, owned_values);
+    const canonical_path = try canonicalPathAlloc(alloc, file_path);
+    defer alloc.free(canonical_path);
+
+    try putOwnedStringSliceIfAbsent(alloc, map, file_path, values);
+    if (std.mem.eql(u8, canonical_path, file_path)) {
+        return;
     }
+    try putOwnedStringSliceIfAbsent(alloc, map, canonical_path, values);
 }
 
 fn putPathVoidWithCanonical(
@@ -5244,11 +6731,36 @@ fn putPathVoidWithCanonical(
     map: *std.StringHashMap(void),
     file_path: []const u8,
 ) !void {
-    try map.put(file_path, {});
-    const canonical_path = std.Io.Dir.cwd().realPathFileAlloc(global_io, file_path, alloc) catch null;
-    if (canonical_path) |path| {
-        try map.put(path, {});
+    const canonical_path = try canonicalPathAlloc(alloc, file_path);
+    errdefer alloc.free(canonical_path);
+
+    var additional_count: usize = if (map.contains(file_path)) 0 else 1;
+    const should_insert_canonical = !std.mem.eql(u8, canonical_path, file_path) and !map.contains(canonical_path);
+    if (should_insert_canonical) additional_count += 1;
+
+    try map.ensureUnusedCapacity(@intCast(additional_count));
+    map.putAssumeCapacity(file_path, {});
+    if (std.mem.eql(u8, canonical_path, file_path) or !should_insert_canonical) {
+        alloc.free(canonical_path);
+    } else {
+        map.putAssumeCapacity(canonical_path, {});
     }
+}
+
+fn putPathStringWithCanonical(
+    alloc: std.mem.Allocator,
+    map: *std.StringHashMap([]const u8),
+    file_path: []const u8,
+    value: []const u8,
+) !void {
+    const canonical_path = try canonicalPathAlloc(alloc, file_path);
+    defer alloc.free(canonical_path);
+
+    try putOwnedStringValueIfAbsent(alloc, map, file_path, value);
+    if (std.mem.eql(u8, canonical_path, file_path)) {
+        return;
+    }
+    try putOwnedStringValueIfAbsent(alloc, map, canonical_path, value);
 }
 
 fn copyGraphListMap(
@@ -5260,6 +6772,23 @@ fn copyGraphListMap(
     while (iter.next()) |entry| {
         try putPathSliceWithCanonical(alloc, destination, entry.key_ptr.*, entry.value_ptr.items);
     }
+}
+
+const StderrDiscoveryDiagnosticPrinter = struct {
+    fn print(_: StderrDiscoveryDiagnosticPrinter, comptime format: []const u8, args: anytype) !void {
+        std.debug.print(format, args);
+    }
+};
+
+fn printStructNotFoundDiscoveryDiagnostic(
+    alloc: std.mem.Allocator,
+    printer: anytype,
+    struct_name: []const u8,
+) !void {
+    const expected_path = try zap.discovery.structNameToRelPath(alloc, struct_name);
+    defer alloc.free(expected_path);
+
+    try printer.print("Error: Struct `{s}` not found — expected {s} in one of the source roots\n", .{ struct_name, expected_path });
 }
 
 fn discoverManifestSources(
@@ -5275,15 +6804,31 @@ fn discoverManifestSources(
     }
 
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var source_files_transferred = false;
+    errdefer if (!source_files_transferred) deinitOwnedPathList(alloc, &source_files);
     var explicit_source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitOwnedPathList(alloc, &explicit_source_files);
     var source_file_to_struct = std.StringHashMap([]const u8).init(alloc);
+    errdefer deinitOwnedStringValueMap(alloc, &source_file_to_struct);
     var source_file_to_structs = std.StringHashMap([]const []const u8).init(alloc);
+    errdefer deinitOwnedStringSliceMap(alloc, &source_file_to_structs);
     var source_file_imports = std.StringHashMap([]const []const u8).init(alloc);
+    errdefer deinitOwnedStringSliceMap(alloc, &source_file_imports);
     var source_file_imported_by = std.StringHashMap([]const []const u8).init(alloc);
+    errdefer deinitOwnedStringSliceMap(alloc, &source_file_imported_by);
     var source_file_compile_after_globs = std.StringHashMap([]const []const u8).init(alloc);
+    errdefer deinitOwnedStringSliceMap(alloc, &source_file_compile_after_globs);
     var source_file_compile_after_files = std.StringHashMap([]const []const u8).init(alloc);
+    errdefer deinitOwnedStringSliceMap(alloc, &source_file_compile_after_files);
     var struct_order: std.ArrayListUnmanaged([]const u8) = .empty;
+    var struct_order_transferred = false;
+    errdefer if (!struct_order_transferred) {
+        for (struct_order.items) |struct_name| alloc.free(struct_name);
+        struct_order.deinit(alloc);
+    };
     var level_boundaries: std.ArrayListUnmanaged(u32) = .empty;
+    var level_boundaries_transferred = false;
+    errdefer if (!level_boundaries_transferred) level_boundaries.deinit(alloc);
 
     for (config.paths) |pattern| {
         try globCollectFiles(alloc, project_root, pattern, &explicit_source_files);
@@ -5308,8 +6853,7 @@ fn discoverManifestSources(
     ) catch |err| switch (err) {
         error.StructNotFound => {
             if (discovery_err_info.unresolved_struct) |mod| {
-                const expected = zap.discovery.structNameToRelPath(alloc, mod) catch "?";
-                std.debug.print("Error: Struct `{s}` not found — expected {s} in one of the source roots\n", .{ mod, expected });
+                try printStructNotFoundDiscoveryDiagnostic(alloc, StderrDiscoveryDiagnosticPrinter{}, mod);
             } else if (discovery_err_info.boundary_struct) |mod| {
                 std.debug.print("Error: Struct `{s}` is private (struct without pub) in {s} — cannot be accessed from {s}\n", .{
                     mod,
@@ -5329,6 +6873,7 @@ fn discoverManifestSources(
             std.debug.print("Error: could not read source file\n", .{});
             return error.DiscoveryFailed;
         },
+        error.OutOfMemory => return error.OutOfMemory,
         else => {
             std.debug.print("Error: file discovery failed\n", .{});
             return error.DiscoveryFailed;
@@ -5339,11 +6884,7 @@ fn discoverManifestSources(
     {
         var iter = file_graph.file_to_struct.iterator();
         while (iter.next()) |entry| {
-            try source_file_to_struct.put(entry.key_ptr.*, entry.value_ptr.*);
-            const canonical_path = std.Io.Dir.cwd().realPathFileAlloc(global_io, entry.key_ptr.*, alloc) catch null;
-            if (canonical_path) |path| {
-                try source_file_to_struct.put(path, entry.value_ptr.*);
-            }
+            try putPathStringWithCanonical(alloc, &source_file_to_struct, entry.key_ptr.*, entry.value_ptr.*);
         }
     }
     try copyGraphListMap(alloc, &source_file_to_structs, &file_graph.file_to_structs);
@@ -5353,7 +6894,11 @@ fn discoverManifestSources(
     try copyGraphListMap(alloc, &source_file_compile_after_files, &file_graph.file_compile_after_files);
 
     for (file_graph.topo_order.items) |file_path| {
-        try source_files.append(alloc, file_path);
+        const owned_file_path = try alloc.dupe(u8, file_path);
+        var file_path_transferred = false;
+        errdefer if (!file_path_transferred) alloc.free(owned_file_path);
+        try source_files.append(alloc, owned_file_path);
+        file_path_transferred = true;
     }
 
     try appendProtocolAndImplSourceFiles(alloc, source_roots, project_root, config.paths, &source_files);
@@ -5364,7 +6909,11 @@ fn discoverManifestSources(
         while (file_index < file_boundary) : (file_index += 1) {
             const file_path = file_graph.topo_order.items[file_index];
             for (file_graph.structsForFile(file_path)) |struct_name| {
-                try struct_order.append(alloc, struct_name);
+                const owned_struct_name = try alloc.dupe(u8, struct_name);
+                var struct_name_transferred = false;
+                errdefer if (!struct_name_transferred) alloc.free(owned_struct_name);
+                try struct_order.append(alloc, owned_struct_name);
+                struct_name_transferred = true;
                 struct_count += 1;
             }
         }
@@ -5377,15 +6926,26 @@ fn discoverManifestSources(
 
     {
         var seen = std.StringHashMap(void).init(alloc);
+        defer deinitOwnedPathSet(alloc, &seen);
         var deduped: std.ArrayListUnmanaged([]const u8) = .empty;
-        for (source_files.items) |source_file| {
-            const key = std.Io.Dir.cwd().realPathFileAlloc(global_io, source_file, alloc) catch try alloc.dupe(u8, source_file);
+        var deduped_transferred = false;
+        errdefer if (!deduped_transferred) deinitOwnedPathList(alloc, &deduped);
+        for (source_files.items) |*source_file_slot| {
+            const source_file = source_file_slot.*;
+            const key = try canonicalPathAlloc(alloc, source_file);
             if (!seen.contains(key)) {
                 try seen.put(key, {});
                 try deduped.append(alloc, source_file);
+                source_file_slot.* = &.{};
+            } else {
+                alloc.free(key);
+                alloc.free(source_file);
+                source_file_slot.* = &.{};
             }
         }
+        source_files.deinit(alloc);
         source_files = deduped;
+        deduped_transferred = true;
     }
 
     if (source_files.items.len == 0) {
@@ -5396,8 +6956,14 @@ fn discoverManifestSources(
     if (progress) |reporter| reporter.stage("Sources: reading {d} files", .{source_files.items.len});
 
     var source_units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
+    var source_units_transferred = false;
+    errdefer if (!source_units_transferred) source_units.deinit(alloc);
     var mapped_files: std.ArrayListUnmanaged(compiler.MappedFile) = .empty;
-    errdefer for (mapped_files.items) |*mapped_file| mapped_file.deinit(global_io);
+    var mapped_files_transferred = false;
+    errdefer if (!mapped_files_transferred) {
+        for (mapped_files.items) |*mapped_file| mapped_file.deinit(global_io);
+        mapped_files.deinit(alloc);
+    };
 
     var validation_failed = false;
     for (source_files.items) |source_file| {
@@ -5422,6 +6988,7 @@ fn discoverManifestSources(
                     else
                         root.path;
                     const root_slash = try std.fmt.allocPrint(alloc, "{s}/", .{norm_root});
+                    defer alloc.free(root_slash);
                     if (std.mem.startsWith(u8, norm_source_file, root_slash)) break :blk true;
                 }
             }
@@ -5437,6 +7004,7 @@ fn discoverManifestSources(
                 else
                     root.path;
                 const root_slash = try std.fmt.allocPrint(alloc, "{s}/", .{norm_root});
+                defer alloc.free(root_slash);
                 if (std.mem.startsWith(u8, norm_source_file, root_slash)) {
                     break :blk norm_source_file[root_slash.len..];
                 }
@@ -5452,25 +7020,55 @@ fn discoverManifestSources(
             break :blk rel_path;
         };
 
-        if (compiler.validateOneStructPerFile(alloc, mapped.bytes(), lib_rel)) |err_msg| {
+        if (try compiler.validateOneStructPerFile(alloc, mapped.bytes(), lib_rel)) |err_msg| {
             std.debug.print("Error: {s}\n", .{err_msg});
             validation_failed = true;
         }
     }
     if (validation_failed) return error.ValidationFailed;
 
+    const owned_source_paths = try source_files.toOwnedSlice(alloc);
+    source_files_transferred = true;
+    errdefer {
+        for (owned_source_paths) |source_path| alloc.free(source_path);
+        alloc.free(owned_source_paths);
+    }
+    const owned_source_units = try source_units.toOwnedSlice(alloc);
+    source_units_transferred = true;
+    errdefer alloc.free(owned_source_units);
+    const owned_mapped_files = try mapped_files.toOwnedSlice(alloc);
+    mapped_files_transferred = true;
+    errdefer {
+        for (owned_mapped_files) |*mapped_file| mapped_file.deinit(global_io);
+        alloc.free(owned_mapped_files);
+    }
+    const owned_struct_order = if (struct_order.items.len > 0) blk: {
+        const slice = try struct_order.toOwnedSlice(alloc);
+        struct_order_transferred = true;
+        break :blk slice;
+    } else null;
+    errdefer if (owned_struct_order) |order| freeOwnedStringSlice(alloc, order);
+    const owned_level_boundaries = if (level_boundaries.items.len > 0) blk: {
+        const slice = try level_boundaries.toOwnedSlice(alloc);
+        level_boundaries_transferred = true;
+        break :blk slice;
+    } else null;
+    errdefer if (owned_level_boundaries) |boundaries| alloc.free(boundaries);
+
     return .{
+        .allocator = alloc,
         .source_roots = source_roots,
-        .source_units = source_units.items,
-        .struct_order = if (struct_order.items.len > 0) struct_order.items else null,
-        .level_boundaries = if (level_boundaries.items.len > 0) level_boundaries.items else null,
+        .source_units = owned_source_units,
+        .owned_source_paths = owned_source_paths,
+        .struct_order = owned_struct_order,
+        .level_boundaries = owned_level_boundaries,
         .source_file_to_struct = source_file_to_struct,
         .source_file_to_structs = source_file_to_structs,
         .source_file_imports = source_file_imports,
         .source_file_imported_by = source_file_imported_by,
         .source_file_compile_after_globs = source_file_compile_after_globs,
         .source_file_compile_after_files = source_file_compile_after_files,
-        .mapped_files = mapped_files.items,
+        .mapped_files = owned_mapped_files,
     };
 }
 
@@ -5531,13 +7129,10 @@ fn buildTarget(
     // Precedence: trusted (env or exe-relative fork stdlib) → embedded fork
     // stdlib → system Zig last (see the script-mode call site for why the
     // embedded fork stdlib must outrank a system install).
-    const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse
-        (extractEmbeddedZigLib(alloc) catch null) orelse
-        zir_backend.detectZigLibDirSystemFallback(alloc) orelse
-        {
-            std.debug.print("Error: could not find or extract Zig lib\n", .{});
-            std.process.exit(1);
-        };
+    const zig_lib_dir = resolveZigLibDir(alloc) catch |err| {
+        std.debug.print("Error: could not resolve Zig lib: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
     zig_stdlib_node.updateCurrentItem(zig_lib_dir, "Toolchain: resolving Zig stdlib", .{});
     zig_stdlib_node.succeed();
 
@@ -5574,9 +7169,9 @@ fn buildTarget(
     var manifest_cache_node = ScopedProgressNode.start(progress_reporter, progress_root, "Check manifest cache");
     defer manifest_cache_node.deinit();
     manifest_cache_node.updateCurrentItem(manifest_snapshot_path, "Manifest: checking cache", .{});
-    if (tryManifestSnapshotHit(allocator, alloc, manifest_snapshot_path, manifest_invocation_identity, progress_reporter, manifest_cache_node.node)) |artifact| {
+    if (try tryManifestSnapshotHit(allocator, alloc, manifest_snapshot_path, manifest_invocation_identity, progress_reporter, manifest_cache_node.node)) |artifact| {
         manifest_cache_node.succeed();
-        warmManifestDaemon(
+        switch (try warmManifestDaemon(
             alloc,
             manifest_invocation_identity,
             project_root,
@@ -5585,7 +7180,9 @@ fn buildTarget(
             build_overrides,
             collect_arc_stats,
             zap_lib_dir_override,
-        );
+        )) {
+            .sent, .pending_request => {},
+        }
         return artifact;
     }
     manifest_cache_node.succeed();
@@ -5593,7 +7190,7 @@ fn buildTarget(
     var daemon_node = ScopedProgressNode.start(progress_reporter, progress_root, "Manifest daemon");
     defer daemon_node.deinit();
     daemon_node.updateCurrentItem("querying incremental daemon", "Manifest: querying incremental daemon", .{});
-    if (tryManifestDaemonBuild(
+    switch (try tryManifestDaemonBuild(
         allocator,
         alloc,
         manifest_invocation_identity,
@@ -5604,20 +7201,26 @@ fn buildTarget(
         collect_arc_stats,
         zap_lib_dir_override,
         daemon_node.node,
-    )) |artifact| {
-        daemon_node.succeed();
-        if (tryManifestSnapshotHit(allocator, alloc, manifest_snapshot_path, manifest_invocation_identity, progress_reporter, null)) |validated_artifact| {
-            artifact.deinit(allocator);
-            return validated_artifact;
-        }
+    )) {
+        .artifact => |artifact| {
+            daemon_node.succeed();
+            if (try tryManifestSnapshotHit(allocator, alloc, manifest_snapshot_path, manifest_invocation_identity, progress_reporter, null)) |validated_artifact| {
+                artifact.deinit(allocator);
+                return validated_artifact;
+            }
 
-        artifact.deinit(allocator);
-        var stale_node = ScopedProgressNode.start(progress_reporter, progress_root, "Manifest daemon");
-        defer stale_node.deinit();
-        stale_node.updateCurrentItem("daemon result stale; rebuilding", "Manifest: daemon result stale; rebuilding", .{});
-        stale_node.succeed();
-    } else {
-        daemon_node.skip();
+            artifact.deinit(allocator);
+            var stale_node = ScopedProgressNode.start(progress_reporter, progress_root, "Manifest daemon");
+            defer stale_node.deinit();
+            const fallback_message = manifestDaemonFallbackMessage(.stale_artifact);
+            stale_node.updateCurrentItem(fallback_message, "Manifest: {s}", .{fallback_message});
+            stale_node.succeed();
+        },
+        .fallback => |fallback_reason| {
+            const fallback_message = manifestDaemonFallbackMessage(fallback_reason);
+            daemon_node.updateCurrentItem(fallback_message, "Manifest: {s}", .{fallback_message});
+            daemon_node.skip();
+        },
     }
 
     // Extract manifest from build.zap via CTFE.
@@ -5627,7 +7230,7 @@ fn buildTarget(
     var cached_manifest_eval: ?CachedManifestEval = null;
     defer if (cached_manifest_eval) |*cached| cached.deinit();
     manifest_eval_node.updateCurrentItem(manifest_eval_cache_path, "Manifest: checking eval cache", .{});
-    const manifest_eval = if (tryReadManifestEvalCache(
+    const manifest_eval = if (try tryReadManifestEvalCache(
         allocator,
         alloc,
         manifest_eval_cache_path,
@@ -5642,11 +7245,9 @@ fn buildTarget(
             std.debug.print("Error: failed to evaluate build.zap manifest via CTFE: {}\n", .{err});
             std.process.exit(1);
         };
-        writeManifestEvalCache(alloc, manifest_eval_cache_path, manifest_invocation_identity, evaluated) catch |err| {
-            incrementalTrace(
-                "manifest-eval-cache result=write_failed reason={s} path={s}",
-                .{ @errorName(err), manifest_eval_cache_path },
-            );
+        writeRequiredManifestEvalCache(alloc, manifest_eval_cache_path, manifest_invocation_identity, evaluated) catch |err| {
+            std.debug.print("Error: could not write manifest evaluation cache entry: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
         };
         break :blk evaluated;
     };
@@ -5708,7 +7309,7 @@ fn buildTarget(
         },
     });
     compile_tail_node.succeed();
-    warmManifestDaemon(
+    switch (try warmManifestDaemon(
         alloc,
         manifest_invocation_identity,
         project_root,
@@ -5717,7 +7318,9 @@ fn buildTarget(
         build_overrides,
         collect_arc_stats,
         zap_lib_dir_override,
-    );
+    )) {
+        .sent, .pending_request => {},
+    }
     return artifact;
 }
 
@@ -5777,17 +7380,57 @@ const ManifestCacheInputs = struct {
     dependencies: []const zap.ctfe.CtDependency,
 };
 
+const ManifestCacheKeyFailureStage = enum {
+    active_manager_source_hash,
+    build_input_hash,
+    hex_encoding,
+};
+
+const ManifestCacheKeyFailure = struct {
+    stage: ManifestCacheKeyFailureStage = .build_input_hash,
+    active_manager_source_path: ?[]const u8 = null,
+};
+
+fn emitManifestCacheKeyFailureDiagnostic(failure: ManifestCacheKeyFailure, err: anyerror) void {
+    switch (failure.stage) {
+        .active_manager_source_hash => {
+            if (failure.active_manager_source_path) |source_path| {
+                zap.diagnostics.emitStderrFmt(
+                    "Error: could not hash active memory manager source for manifest cache key ({s}): {s}\n",
+                    .{ source_path, @errorName(err) },
+                );
+            } else {
+                zap.diagnostics.emitStderrFmt(
+                    "Error: could not hash active memory manager source for manifest cache key: {s}\n",
+                    .{@errorName(err)},
+                );
+            }
+        },
+        .build_input_hash => zap.diagnostics.emitStderrFmt(
+            "Error: could not hash manifest cache key inputs: {s}\n",
+            .{@errorName(err)},
+        ),
+        .hex_encoding => zap.diagnostics.emitStderrFmt(
+            "Error: could not encode manifest cache key digest: {s}\n",
+            .{@errorName(err)},
+        ),
+    }
+}
+
 fn computeManifestCacheKeyHex(
     alloc: std.mem.Allocator,
     inputs: CompileAndLinkInputs,
     config: zap.builder.BuildConfig,
     active_manager_source_path: []const u8,
+    failure: ?*ManifestCacheKeyFailure,
 ) ![]const u8 {
-    const active_manager_source_digest = hashActiveManagerSource(alloc, active_manager_source_path) catch |err| {
-        std.debug.print("Error: could not hash active memory manager source: {}\n", .{err});
-        return err;
+    if (failure) |failure_info| failure_info.* = .{
+        .stage = .active_manager_source_hash,
+        .active_manager_source_path = active_manager_source_path,
     };
+    const active_manager_source_digest = try hashActiveManagerSource(alloc, active_manager_source_path);
     const optimize_policy = optimizePolicyForBuildConfig(config.optimize);
+    if (failure) |failure_info| failure_info.* = .{ .stage = .build_input_hash };
     const cache_digest = try computeBuildCacheKey(alloc, inputs.cache_source, inputs.source_units, inputs.target_name, .{
         .manifest_result_hash = inputs.manifest_result_hash,
         .active_manager_source_digest = active_manager_source_digest,
@@ -5802,6 +7445,7 @@ fn computeManifestCacheKeyHex(
         .debug_info_tag = debugInfoCacheTagFor(config.debug_info),
         .frame_pointers_tag = framePointersCacheTagFor(config.frame_pointers),
     });
+    if (failure) |failure_info| failure_info.* = .{ .stage = .hex_encoding };
     return digestHexAlloc(alloc, cache_digest);
 }
 
@@ -5868,9 +7512,32 @@ fn compileAndLinkOrIce(
 ) !BuildArtifact {
     return compileAndLink(allocator, alloc, inputs) catch |err| {
         if (isUserDiagnosedCompileError(err)) return err;
-        compiler.emitIceFromError(alloc, "compile_and_link", ice_code, "code generation / link failed", err);
+        try compiler.emitIceFromError(alloc, "compile_and_link", ice_code, "code generation / link failed", err);
         std.process.exit(1);
     };
+}
+
+const CwdRequiredDirCreator = struct {
+    fn createDirPath(_: *CwdRequiredDirCreator, dir: []const u8) !void {
+        try std.Io.Dir.cwd().createDirPath(global_io, dir);
+    }
+};
+
+fn prepareRequiredOutputCacheDirsWithCreator(
+    creator: anytype,
+    backend_cache_dir: []const u8,
+    out_dir: []const u8,
+) !void {
+    try creator.createDirPath(backend_cache_dir);
+    try creator.createDirPath(out_dir);
+}
+
+fn prepareRequiredOutputCacheDirs(
+    backend_cache_dir: []const u8,
+    out_dir: []const u8,
+) !void {
+    var creator = CwdRequiredDirCreator{};
+    try prepareRequiredOutputCacheDirsWithCreator(&creator, backend_cache_dir, out_dir);
 }
 
 fn compileAndLink(
@@ -5977,8 +7644,7 @@ fn compileAndLink(
     var output_cache_node = ScopedProgressNode.start(progress, compile_parent_node, "Output/cache preparation");
     defer output_cache_node.deinit();
     output_cache_node.updateCurrentItem(out_dir, "Cache: preparing output directories", .{});
-    std.Io.Dir.cwd().createDirPath(global_io, backend_cache_dir) catch {};
-    std.Io.Dir.cwd().createDirPath(global_io, out_dir) catch {};
+    try prepareRequiredOutputCacheDirs(backend_cache_dir, out_dir);
 
     const output_filename = try buildArtifactFilename(alloc, config);
     const output_path = try std.fs.path.join(alloc, &.{ out_dir, output_filename });
@@ -6072,7 +7738,15 @@ fn compileAndLink(
     defer input_hash_node.deinit();
     var cache_inputs = inputs;
     cache_inputs.manifest_result_hash = effective_manifest_hash;
-    const cache_key_hex = computeManifestCacheKeyHex(alloc, cache_inputs, config, source_selection.active_manager_source_path) catch {
+    var cache_key_failure: ManifestCacheKeyFailure = .{};
+    const cache_key_hex = computeManifestCacheKeyHex(
+        alloc,
+        cache_inputs,
+        config,
+        source_selection.active_manager_source_path,
+        &cache_key_failure,
+    ) catch |err| {
+        emitManifestCacheKeyFailureDiagnostic(cache_key_failure, err);
         std.process.exit(1);
     };
     input_hash_node.updateCurrentItem(cache_key_hex, "Cache: hashing build inputs", .{});
@@ -6088,9 +7762,15 @@ fn compileAndLink(
         const cache_valid = blk: {
             const cached_path = cached_manifest_artifact_path orelse break :blk false;
             artifact_cache_node.updateCurrentItem(cached_path, "Cache: checking artifact", .{});
-            std.Io.Dir.cwd().access(global_io, cached_path, .{}) catch break :blk false;
-            const debug_symbols_ready = artifactHasRequiredDebugSymbols(alloc, config, cached_path) catch {
-                std.debug.print("Error: out of memory checking debug symbol cache state\n", .{});
+            switch (cachedArtifactAccess(cached_path) catch |err| {
+                std.debug.print("Error: could not access cached artifact {s}: {s}\n", .{ cached_path, @errorName(err) });
+                std.process.exit(1);
+            }) {
+                .present => {},
+                .missing => break :blk false,
+            }
+            const debug_symbols_ready = artifactHasRequiredDebugSymbols(alloc, config, cached_path) catch |err| {
+                std.debug.print("Error: could not validate debug symbol cache state for {s}: {s}\n", .{ cached_path, @errorName(err) });
                 std.process.exit(1);
             };
             if (!debug_symbols_ready) break :blk false;
@@ -6175,8 +7855,11 @@ fn compileAndLink(
         .ctfe_optimize = @tagName(config.optimize),
         .io = global_io,
         .declared_caps = resolved_manager.declared_caps,
-    }) catch {
-        std.process.exit(1);
+    }) catch |err| {
+        if (isUserDiagnosedCompileError(err)) {
+            std.process.exit(1);
+        }
+        return err;
     };
     frontend_node.succeed();
 
@@ -6364,43 +8047,8 @@ fn compileProjectFrontend(
     var ctx = try compiler.collectAllFromUnits(alloc, source_units, options);
 
     var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    if (options.struct_order) |graph_order| {
-        for (graph_order) |struct_name| {
-            names.append(alloc, struct_name) catch {};
-        }
-        // The precomputed `struct_order` is the discovery-time topological
-        // ordering of the SOURCE structs. Structs that only exist after
-        // desugaring — notably the `pub struct Foo` every `pub error Foo`
-        // rewrite produces — are absent from it because discovery ran
-        // before `applyErrorDeclDesugar`. They ARE present in
-        // `ctx.struct_programs` (built from the fully desugared programs).
-        // Compiling only `struct_order` silently drops these structs from
-        // the per-struct compile, so their `pub impl Error` method bodies
-        // (`TimeoutError.message`, …) are never lowered: a call to
-        // `Error.message(e)` then resolves against a `TimeoutError` module
-        // that exports no `message`, surfacing as "struct 'TimeoutError'
-        // has no member named 'message'". Append every collected struct
-        // program missing from the precomputed order so the compilation
-        // set is the union of the discovery order and the actually
-        // collected structs. This mirrors the daemon/incremental path in
-        // `compiler.buildIncremental` (the #186 fix); the per-struct loops
-        // downstream dedup by name, so appending an already-present name
-        // is harmless.
-        for (ctx.struct_programs) |mp| {
-            var already_ordered = false;
-            for (names.items) |existing| {
-                if (std.mem.eql(u8, existing, mp.name)) {
-                    already_ordered = true;
-                    break;
-                }
-            }
-            if (!already_ordered) names.append(alloc, mp.name) catch {};
-        }
-    } else {
-        for (ctx.struct_programs) |mp| {
-            names.append(alloc, mp.name) catch {};
-        }
-    }
+    defer names.deinit(alloc);
+    try compiler.appendStructCompileOrderNames(alloc, &names, options.struct_order, ctx.struct_programs);
 
     return try compiler.compileStructByStruct(alloc, &ctx, names.items, options);
 }
@@ -6467,17 +8115,21 @@ fn refreshManifestSnapshot(
                 }
             },
             .env_var => |env_var| {
-                try env_vars.append(alloc, .{
-                    .name = try alloc.dupe(u8, env_var.name),
-                    .present = env_var.present,
-                    .value_hash = env_var.value_hash,
-                });
+                try appendManifestEnvFingerprint(
+                    alloc,
+                    &env_vars,
+                    env_var.name,
+                    env_var.present,
+                    env_var.value_hash,
+                );
             },
             .glob => |glob_dep| {
-                try globs.append(alloc, .{
-                    .pattern = try alloc.dupe(u8, glob_dep.pattern),
-                    .result_hash = glob_dep.result_hash,
-                });
+                try appendManifestGlobFingerprint(
+                    alloc,
+                    &globs,
+                    glob_dep.pattern,
+                    glob_dep.result_hash,
+                );
             },
             .reflected_struct, .reflected_source => {
                 // Build-manifest reflection is conservatively covered
@@ -6515,7 +8167,9 @@ fn appendFileFingerprint(
     for (files.items) |existing| {
         if (std.mem.eql(u8, existing.path, path)) return;
     }
-    try files.append(alloc, try build_cache.fileFingerprint(alloc, path));
+    const fingerprint = try build_cache.fileFingerprint(alloc, path);
+    errdefer alloc.free(fingerprint.path);
+    try files.append(alloc, fingerprint);
 }
 
 fn appendAbsentFileFingerprint(
@@ -6526,7 +8180,7 @@ fn appendAbsentFileFingerprint(
     for (files.items) |existing| {
         if (std.mem.eql(u8, existing.path, path)) return;
     }
-    try files.append(alloc, .{
+    const fingerprint: build_cache.FileFingerprint = .{
         .path = try alloc.dupe(u8, path),
         .present = false,
         .content_digest = [_]u8{0} ** @sizeOf(build_cache.FileDigest),
@@ -6534,7 +8188,9 @@ fn appendAbsentFileFingerprint(
         .inode = 0,
         .mtime_nanos = 0,
         .ctime_nanos = 0,
-    });
+    };
+    errdefer alloc.free(fingerprint.path);
+    try files.append(alloc, fingerprint);
 }
 
 fn appendDirectoryFingerprint(
@@ -6546,7 +8202,39 @@ fn appendDirectoryFingerprint(
     for (directories.items) |existing| {
         if (existing.recursive == recursive and std.mem.eql(u8, existing.path, path)) return;
     }
-    try directories.append(alloc, try build_cache.directoryFingerprint(alloc, path, recursive));
+    const fingerprint = try build_cache.directoryFingerprint(alloc, path, recursive);
+    errdefer alloc.free(fingerprint.path);
+    try directories.append(alloc, fingerprint);
+}
+
+fn appendManifestEnvFingerprint(
+    alloc: std.mem.Allocator,
+    env_vars: *std.ArrayListUnmanaged(build_cache.EnvFingerprint),
+    name: []const u8,
+    present: bool,
+    value_hash: u64,
+) !void {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    try env_vars.append(alloc, .{
+        .name = owned_name,
+        .present = present,
+        .value_hash = value_hash,
+    });
+}
+
+fn appendManifestGlobFingerprint(
+    alloc: std.mem.Allocator,
+    globs: *std.ArrayListUnmanaged(build_cache.GlobFingerprint),
+    pattern: []const u8,
+    result_hash: u64,
+) !void {
+    const owned_pattern = try alloc.dupe(u8, pattern);
+    errdefer alloc.free(owned_pattern);
+    try globs.append(alloc, .{
+        .pattern = owned_pattern,
+        .result_hash = result_hash,
+    });
 }
 
 fn globBaseDirectory(
@@ -6570,19 +8258,37 @@ fn collectMemoryAdapterSourceUnits(
     source_roots: []const zap.discovery.SourceRoot,
 ) ![]const compiler.SourceUnit {
     var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer source_files.deinit(alloc);
+    var transferred_source_file_count: usize = 0;
+    errdefer {
+        for (source_files.items[transferred_source_file_count..]) |file_path| {
+            alloc.free(file_path);
+        }
+    }
+
     var discovered = std.StringHashMap(void).init(alloc);
+    defer deinitOwnedPathSet(alloc, &discovered);
     for (source_roots) |root| {
         if (!sourceRootShouldScanRecursively(root)) continue;
         try scanZapFilesRecursive(alloc, root.path, &source_files, &discovered);
     }
 
     var units: std.ArrayListUnmanaged(compiler.SourceUnit) = .empty;
-    for (source_files.items) |file_path| {
+    errdefer {
+        for (units.items) |unit| {
+            alloc.free(unit.file_path);
+            alloc.free(unit.source);
+        }
+        units.deinit(alloc);
+    }
+    for (source_files.items, 0..) |file_path, index| {
         const source = try std.Io.Dir.cwd().readFileAlloc(global_io, file_path, alloc, .limited(10 * 1024 * 1024));
+        errdefer alloc.free(source);
         try units.append(alloc, .{
             .file_path = file_path,
             .source = source,
         });
+        transferred_source_file_count = index + 1;
     }
     return try units.toOwnedSlice(alloc);
 }
@@ -6812,6 +8518,13 @@ fn hashUpdateLenPrefixed(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8
     hasher.update(bytes);
 }
 
+fn stdlibIdentityError(err: anyerror) error{ OutOfMemory, StdlibUnreadable } {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.StdlibUnreadable,
+    };
+}
+
 /// Stable IDENTITY hash of the resolved Zap stdlib at `stdlib_dir`:
 /// the absolute directory path plus every `.zap` file's path and
 /// contents, folded in a deterministic (sorted) order. Two stdlibs
@@ -6831,15 +8544,14 @@ fn hashStdlibIdentity(alloc: std.mem.Allocator, stdlib_dir: []const u8) !BuildCa
     // The resolved directory IS part of identity (path-sensitive on
     // purpose): same contents at a different path is still a distinct
     // stdlib for caching.
-    const abs_dir = std.fs.path.resolve(alloc, &.{stdlib_dir}) catch
-        try alloc.dupe(u8, stdlib_dir);
+    const abs_dir = try std.fs.path.resolve(alloc, &.{stdlib_dir});
     defer alloc.free(abs_dir);
     hashUpdateLenPrefixed(&hasher, abs_dir);
 
     // Collect every `.zap` path beneath the stdlib root, sort for a
     // filesystem-order-independent digest, then fold path+contents.
-    var dir = std.Io.Dir.cwd().openDir(global_io, stdlib_dir, .{ .iterate = true }) catch
-        return error.StdlibUnreadable;
+    var dir = std.Io.Dir.cwd().openDir(global_io, stdlib_dir, .{ .iterate = true }) catch |err|
+        return stdlibIdentityError(err);
     defer dir.close(global_io);
 
     var rel_paths: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -6848,12 +8560,14 @@ fn hashStdlibIdentity(alloc: std.mem.Allocator, stdlib_dir: []const u8) !BuildCa
         rel_paths.deinit(alloc);
     }
     {
-        var walker = std.Io.Dir.walk(dir, alloc) catch return error.StdlibUnreadable;
+        var walker = try std.Io.Dir.walk(dir, alloc);
         defer walker.deinit();
-        while (walker.next(global_io) catch return error.StdlibUnreadable) |entry| {
+        while (walker.next(global_io) catch |err| return stdlibIdentityError(err)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.basename, ".zap")) continue;
-            try rel_paths.append(alloc, try alloc.dupe(u8, entry.path));
+            const rel_path = try alloc.dupe(u8, entry.path);
+            errdefer alloc.free(rel_path);
+            try rel_paths.append(alloc, rel_path);
         }
     }
     std.mem.sort([]const u8, rel_paths.items, {}, struct {
@@ -6866,8 +8580,8 @@ fn hashStdlibIdentity(alloc: std.mem.Allocator, stdlib_dir: []const u8) !BuildCa
     hasher.update(std.mem.asBytes(&file_count));
     for (rel_paths.items) |rel| {
         hashUpdateLenPrefixed(&hasher, rel);
-        const contents = dir.readFileAlloc(global_io, rel, alloc, .limited(16 * 1024 * 1024)) catch
-            return error.StdlibUnreadable;
+        const contents = dir.readFileAlloc(global_io, rel, alloc, .limited(16 * 1024 * 1024)) catch |err|
+            return stdlibIdentityError(err);
         defer alloc.free(contents);
         hashUpdateLenPrefixed(&hasher, contents);
     }
@@ -6884,7 +8598,7 @@ fn hashZigLibIdentity(
     alloc: std.mem.Allocator,
     cache_dir: []const u8,
     zig_lib_dir: []const u8,
-) !BuildCacheDigest {
+) build_cache.ToolchainIdentityError!BuildCacheDigest {
     return build_cache.zigLibIdentityDigest(alloc, cache_dir, zig_lib_dir, null);
 }
 
@@ -6897,7 +8611,10 @@ fn hashZigLibIdentity(
 /// brittle hand-maintained version string). A hard error on failure —
 /// silently dropping compiler identity from the key would risk a
 /// stale-binary false hit across compiler versions.
-fn hashCompilerIdentity(alloc: std.mem.Allocator, cache_dir: []const u8) !BuildCacheDigest {
+fn hashCompilerIdentity(
+    alloc: std.mem.Allocator,
+    cache_dir: []const u8,
+) build_cache.ToolchainIdentityError!BuildCacheDigest {
     return build_cache.compilerIdentityDigest(alloc, cache_dir, null);
 }
 
@@ -6977,34 +8694,53 @@ fn deinitDiscoveredWatchPaths(allocator: std.mem.Allocator, discovered: *std.Str
     discovered.deinit();
 }
 
+fn appendWatchPathWithOwnedKey(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayListUnmanaged([]const u8),
+    discovered: *std.StringHashMap(void),
+    path: []const u8,
+    key: []const u8,
+) !void {
+    if (discovered.contains(key)) {
+        allocator.free(key);
+        return;
+    }
+    var key_inserted = false;
+    errdefer if (!key_inserted) allocator.free(key);
+    const path_copy = try allocator.dupe(u8, path);
+    errdefer allocator.free(path_copy);
+    discovered.put(key, {}) catch |err| {
+        return err;
+    };
+    key_inserted = true;
+    errdefer {
+        _ = discovered.remove(key);
+        allocator.free(key);
+    }
+    try paths.append(allocator, path_copy);
+}
+
 fn appendWatchPath(
     allocator: std.mem.Allocator,
     paths: *std.ArrayListUnmanaged([]const u8),
     discovered: *std.StringHashMap(void),
     path: []const u8,
 ) !void {
-    const key = blk: {
-        const real_path = std.Io.Dir.cwd().realPathFileAlloc(global_io, path, allocator) catch {
-            break :blk try allocator.dupe(u8, path);
-        };
-        defer allocator.free(real_path);
-        break :blk try allocator.dupe(u8, real_path);
+    const key = try canonicalPathAlloc(allocator, path);
+    try appendWatchPathWithOwnedKey(allocator, paths, discovered, path, key);
+}
+
+fn appendWatchPathAllowMissingFile(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayListUnmanaged([]const u8),
+    discovered: *std.StringHashMap(void),
+    path: []const u8,
+) !void {
+    const key = canonicalPathAlloc(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, path),
+        else => return err,
     };
-    if (discovered.contains(key)) {
-        allocator.free(key);
-        return;
-    }
-    const path_copy = try allocator.dupe(u8, path);
-    errdefer allocator.free(path_copy);
-    discovered.put(key, {}) catch |err| {
-        allocator.free(key);
-        return err;
-    };
-    errdefer {
-        _ = discovered.remove(key);
-        allocator.free(key);
-    }
-    try paths.append(allocator, path_copy);
+    try appendWatchPathWithOwnedKey(allocator, paths, discovered, path, key);
 }
 
 fn collectWatchEntriesRecursive(
@@ -7013,11 +8749,35 @@ fn collectWatchEntriesRecursive(
     paths: *std.ArrayListUnmanaged([]const u8),
     discovered: *std.StringHashMap(void),
 ) !void {
-    var dir = std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true }) catch return;
+    var dir = try std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true });
     defer dir.close(global_io);
+    try collectWatchEntriesFromOpenDir(allocator, dir_path, dir, paths, discovered);
+}
+
+fn collectOptionalProjectWatchEntriesRecursive(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    paths: *std.ArrayListUnmanaged([]const u8),
+    discovered: *std.StringHashMap(void),
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true }) catch |err| {
+        if (optionalSourceRootSkipReason(err) != null) return;
+        return err;
+    };
+    defer dir.close(global_io);
+    try collectWatchEntriesFromOpenDir(allocator, dir_path, dir, paths, discovered);
+}
+
+fn collectWatchEntriesFromOpenDir(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    dir: std.Io.Dir,
+    paths: *std.ArrayListUnmanaged([]const u8),
+    discovered: *std.StringHashMap(void),
+) !void {
     try appendWatchPath(allocator, paths, discovered, dir_path);
 
-    var walker = std.Io.Dir.walk(dir, allocator) catch return;
+    var walker = try std.Io.Dir.walk(dir, allocator);
     defer walker.deinit();
 
     while (try walker.next(global_io)) |entry| {
@@ -7043,22 +8803,71 @@ fn collectWatchEntriesRecursive(
     }
 }
 
+const WatchSnapshotSetupError = InteractiveWatchSetupError;
+
+const WatchSnapshotInitError = WatchSnapshotSetupError || error{
+    WatchManifestMissing,
+};
+
+const WatchSnapshotFallbackReason = enum {
+    missing_manifest,
+};
+
+const WatchSnapshotInitFailureAction = union(enum) {
+    use_project_only: WatchSnapshotFallbackReason,
+    propagate_setup_error: WatchSnapshotSetupError,
+};
+
+fn watchSnapshotSetupErrorOrStatus(err: anyerror, status: WatchSnapshotSetupError) WatchSnapshotSetupError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => status,
+    };
+}
+
+fn watchSnapshotBuildManifestReadError(err: anyerror) WatchSnapshotInitError {
+    return switch (err) {
+        error.FileNotFound => error.WatchManifestMissing,
+        else => watchSnapshotSetupErrorOrStatus(err, error.ReadError),
+    };
+}
+
+fn classifyWatchSnapshotInitFailure(err: WatchSnapshotInitError) WatchSnapshotInitFailureAction {
+    return switch (err) {
+        error.WatchManifestMissing => .{ .use_project_only = .missing_manifest },
+        else => |setup_err| .{ .propagate_setup_error = setup_err },
+    };
+}
+
+fn refreshWatchSnapshotInitError(err: WatchSnapshotInitError) WatchSnapshotSetupError {
+    return switch (classifyWatchSnapshotInitFailure(err)) {
+        .use_project_only => error.ReadError,
+        .propagate_setup_error => |setup_err| setup_err,
+    };
+}
+
 fn collectProjectWatchPathsWithoutManifest(
     allocator: std.mem.Allocator,
     project_root: []const u8,
-) ![]const []const u8 {
+) WatchSnapshotSetupError![]const []const u8 {
     var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
     var discovered = std.StringHashMap(void).init(allocator);
     defer deinitDiscoveredWatchPaths(allocator, &discovered);
 
     const build_zap_path = try std.fs.path.join(allocator, &.{ project_root, "build.zap" });
     defer allocator.free(build_zap_path);
-    try appendWatchPath(allocator, &paths, &discovered, build_zap_path);
+    appendWatchPathAllowMissingFile(allocator, &paths, &discovered, build_zap_path) catch |err|
+        return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
 
     for ([_][]const u8{ "lib", "test", "tools" }) |dir_name| {
         const dir_path = try std.fs.path.join(allocator, &.{ project_root, dir_name });
         defer allocator.free(dir_path);
-        try collectWatchEntriesRecursive(allocator, dir_path, &paths, &discovered);
+        collectOptionalProjectWatchEntriesRecursive(allocator, dir_path, &paths, &discovered) catch |err|
+            return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
     }
 
     return try paths.toOwnedSlice(allocator);
@@ -7076,31 +8885,41 @@ fn collectWatchPaths(
     build_overrides: BuildOverrides,
     zap_lib_dir_override: ?[]const u8,
     extra_watch_path: ?[]const u8,
-) ![]const []const u8 {
+) WatchSnapshotInitError![]const []const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const build_zap_path = try std.fs.path.join(alloc, &.{ project_root, "build.zap" });
-    const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_zap_path, alloc, .limited(10 * 1024 * 1024)) catch return error.ReadError;
-    const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch return error.ManifestError;
-    const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, target_name, build_overrides.target, build_opts, zap_lib_dir) catch return error.ManifestError;
+    const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_zap_path, alloc, .limited(10 * 1024 * 1024)) catch |err|
+        return watchSnapshotBuildManifestReadError(err);
+    const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch |err|
+        return watchSnapshotSetupErrorOrStatus(err, error.ToolchainError);
+    const manifest_eval = zap.builder.ctfeManifestDetailed(alloc, build_source, target_name, build_overrides.target, build_opts, zap_lib_dir) catch |err|
+        return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
     var config = manifest_eval.config;
     applyBuildOverrides(&config, build_overrides);
-    const source_roots = try resolveManifestSourceRoots(alloc, project_root, config, zap_lib_dir, .{
+    const source_roots = resolveManifestSourceRoots(alloc, project_root, config, zap_lib_dir, .{
         .write_lockfile = true,
         .print_local_overrides = false,
-    });
+    }) catch |err| return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
 
     var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
     var discovered = std.StringHashMap(void).init(allocator);
     defer deinitDiscoveredWatchPaths(allocator, &discovered);
-    try appendWatchPath(allocator, &paths, &discovered, build_zap_path);
+    appendWatchPath(allocator, &paths, &discovered, build_zap_path) catch |err|
+        return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
     for (source_roots) |root| {
-        try collectWatchEntriesRecursive(allocator, root.path, &paths, &discovered);
+        collectWatchEntriesRecursive(allocator, root.path, &paths, &discovered) catch |err|
+            return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
     }
     if (extra_watch_path) |path| {
-        try appendWatchPath(allocator, &paths, &discovered, path);
+        appendWatchPath(allocator, &paths, &discovered, path) catch |err|
+            return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
     }
     return try paths.toOwnedSlice(allocator);
 }
@@ -7110,21 +8929,44 @@ fn collectWatchPathsFromSourceRoots(
     project_root: []const u8,
     source_roots: []const zap.discovery.SourceRoot,
     extra_watch_path: ?[]const u8,
-) ![]const []const u8 {
+) WatchSnapshotSetupError![]const []const u8 {
     var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
     var discovered = std.StringHashMap(void).init(allocator);
     defer deinitDiscoveredWatchPaths(allocator, &discovered);
 
     const build_zap_path = try std.fs.path.join(allocator, &.{ project_root, "build.zap" });
     defer allocator.free(build_zap_path);
-    try appendWatchPath(allocator, &paths, &discovered, build_zap_path);
+    appendWatchPath(allocator, &paths, &discovered, build_zap_path) catch |err|
+        return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
     for (source_roots) |root| {
-        try collectWatchEntriesRecursive(allocator, root.path, &paths, &discovered);
+        collectWatchEntriesRecursive(allocator, root.path, &paths, &discovered) catch |err|
+            return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
     }
     if (extra_watch_path) |path| {
-        try appendWatchPath(allocator, &paths, &discovered, path);
+        appendWatchPath(allocator, &paths, &discovered, path) catch |err|
+            return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
     }
     return try paths.toOwnedSlice(allocator);
+}
+
+test "collectWatchEntriesRecursive propagates missing required root" {
+    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    var discovered = std.StringHashMap(void).init(std.testing.allocator);
+    defer deinitDiscoveredWatchPaths(std.testing.allocator, &discovered);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        collectWatchEntriesRecursive(
+            std.testing.allocator,
+            "missing-required-watch-root",
+            &paths,
+            &discovered,
+        ),
+    );
 }
 
 /// Recursively collect all .zap files under a directory using the
@@ -7141,9 +8983,9 @@ fn scanZapFilesRecursive(
     results: *std.ArrayListUnmanaged([]const u8),
     discovered: *std.StringHashMap(void),
 ) !void {
-    var dir = std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true }) catch return;
+    var dir = try std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true });
     defer dir.close(global_io);
-    var walker = std.Io.Dir.walk(dir, allocator) catch return;
+    var walker = try std.Io.Dir.walk(dir, allocator);
     defer walker.deinit();
 
     while (try walker.next(global_io)) |entry| {
@@ -7156,10 +8998,7 @@ fn scanZapFilesRecursive(
         if (std.mem.eql(u8, entry.basename, "build.zap")) continue;
 
         const full_path = try std.fs.path.join(allocator, &.{ dir_path, entry.path });
-        const key = try std.fs.path.resolve(allocator, &.{full_path});
-        if (discovered.contains(key)) continue;
-        try discovered.put(key, {});
-        try results.append(allocator, full_path);
+        _ = try appendUniqueOwnedSourcePath(allocator, results, discovered, full_path);
     }
 }
 
@@ -7414,6 +9253,300 @@ fn clonePinnedManifestState(
     };
 }
 
+const IncrementalInitError = build_cache.ToolchainIdentityError || error{
+    ReadError,
+    ManifestError,
+    ToolchainError,
+    MemoryManagerError,
+    BackendError,
+    OutOfMemory,
+};
+
+const IncrementalError = error{
+    ReadError,
+    ManifestError,
+    DiscoveryError,
+    FrontendError,
+    ContextInvalidated,
+    BackendContextInvalidated,
+    IncrementalError,
+    BackendError,
+    CacheMetadataError,
+    OutOfMemory,
+};
+
+const InteractiveWatchSetupError = IncrementalInitError || IncrementalError;
+
+const InteractiveWatchSetupFailureDisposition = enum {
+    retry_after_change,
+    fail_command,
+};
+
+const InteractiveWatchRebuildFailureAction = enum {
+    wait_for_next_change,
+    rebuild_fresh_context,
+};
+
+fn incrementalInitErrorOrStatus(err: anyerror, status: IncrementalInitError) IncrementalInitError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => status,
+    };
+}
+
+fn incrementalErrorOrStatus(err: anyerror, status: IncrementalError) IncrementalError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => status,
+    };
+}
+
+fn incrementalBackendErrorOrStatus(err: anyerror, status: IncrementalError) IncrementalError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.PreparedUpdateAbortFailed => error.BackendContextInvalidated,
+        else => status,
+    };
+}
+
+fn incrementalToolchainIdentityError(err: build_cache.ToolchainIdentityError) IncrementalInitError {
+    return err;
+}
+
+fn classifyInteractiveWatchSetupFailure(
+    err: InteractiveWatchSetupError,
+) InteractiveWatchSetupFailureDisposition {
+    return switch (err) {
+        error.FrontendError,
+        error.ContextInvalidated,
+        error.ReadError,
+        error.ManifestError,
+        error.DiscoveryError,
+        => .retry_after_change,
+
+        error.OutOfMemory,
+        error.ToolchainError,
+        error.ZigLibCanonicalizationFailed,
+        error.ZigLibIdentityManifestReadFailed,
+        error.ZigLibIdentityManifestStatUnavailable,
+        error.ZigLibIdentityManifestWriteFailed,
+        error.ZigLibDirectoryOpenFailed,
+        error.ZigLibDirectoryWalkFailed,
+        error.ZigLibFileStatUnavailable,
+        error.ZigLibFileOpenFailed,
+        error.ZigLibFileHashUnavailable,
+        error.CompilerExecutablePathUnavailable,
+        error.CompilerExecutableCanonicalizationFailed,
+        error.CompilerIdentityManifestReadFailed,
+        error.CompilerIdentityManifestStatUnavailable,
+        error.CompilerIdentityManifestWriteFailed,
+        error.CompilerFileStatUnavailable,
+        error.CompilerFileNotRegular,
+        error.CompilerFileHashUnavailable,
+        error.ToolchainIdentityFileTooLarge,
+        error.MemoryManagerError,
+        error.BackendError,
+        error.BackendContextInvalidated,
+        error.IncrementalError,
+        error.CacheMetadataError,
+        => .fail_command,
+    };
+}
+
+fn failInteractiveWatchSetupOnSevereError(err: InteractiveWatchSetupError) InteractiveWatchSetupError!void {
+    switch (classifyInteractiveWatchSetupFailure(err)) {
+        .retry_after_change => {},
+        .fail_command => return err,
+    }
+}
+
+fn classifyInteractiveWatchRebuildFailure(
+    err: IncrementalError,
+) InteractiveWatchSetupError!InteractiveWatchRebuildFailureAction {
+    if (err == error.BackendContextInvalidated) {
+        return .rebuild_fresh_context;
+    }
+
+    switch (classifyInteractiveWatchSetupFailure(err)) {
+        .retry_after_change => {},
+        .fail_command => return err,
+    }
+
+    return switch (err) {
+        error.ContextInvalidated => .rebuild_fresh_context,
+        else => .wait_for_next_change,
+    };
+}
+
+fn resolveIncrementalZigLibDir(alloc: std.mem.Allocator) IncrementalInitError![]const u8 {
+    return resolveZigLibDir(alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ToolchainError,
+    };
+}
+
+test "incremental watch error classifiers preserve OOM and status buckets" {
+    try std.testing.expectEqual(
+        @as(IncrementalInitError, error.OutOfMemory),
+        incrementalInitErrorOrStatus(error.OutOfMemory, error.ToolchainError),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalInitError, error.ToolchainError),
+        incrementalInitErrorOrStatus(error.FileNotFound, error.ToolchainError),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalError, error.OutOfMemory),
+        incrementalErrorOrStatus(error.OutOfMemory, error.CacheMetadataError),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalError, error.CacheMetadataError),
+        incrementalErrorOrStatus(error.AccessDenied, error.CacheMetadataError),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalError, error.ContextInvalidated),
+        incrementalErrorOrStatus(error.FileNotFound, error.ContextInvalidated),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalError, error.BackendError),
+        incrementalErrorOrStatus(error.CompilationFailed, error.BackendError),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalError, error.BackendContextInvalidated),
+        incrementalBackendErrorOrStatus(error.PreparedUpdateAbortFailed, error.BackendError),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalError, error.BackendError),
+        incrementalBackendErrorOrStatus(error.CompilationFailed, error.BackendError),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalError, error.OutOfMemory),
+        incrementalBackendErrorOrStatus(error.OutOfMemory, error.BackendError),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalInitError, error.CompilerFileStatUnavailable),
+        incrementalToolchainIdentityError(error.CompilerFileStatUnavailable),
+    );
+    try std.testing.expectEqual(
+        @as(IncrementalInitError, error.ZigLibCanonicalizationFailed),
+        incrementalToolchainIdentityError(error.ZigLibCanonicalizationFailed),
+    );
+}
+
+test "interactive watch setup classification fails severe infrastructure errors" {
+    const severe_errors = [_]InteractiveWatchSetupError{
+        error.OutOfMemory,
+        error.BackendError,
+        error.IncrementalError,
+        error.CacheMetadataError,
+        error.ToolchainError,
+        error.BackendContextInvalidated,
+        error.ZigLibCanonicalizationFailed,
+        error.ZigLibIdentityManifestReadFailed,
+        error.ZigLibIdentityManifestStatUnavailable,
+        error.ZigLibIdentityManifestWriteFailed,
+        error.ZigLibDirectoryOpenFailed,
+        error.ZigLibDirectoryWalkFailed,
+        error.ZigLibFileStatUnavailable,
+        error.ZigLibFileOpenFailed,
+        error.ZigLibFileHashUnavailable,
+        error.CompilerExecutablePathUnavailable,
+        error.CompilerExecutableCanonicalizationFailed,
+        error.CompilerIdentityManifestReadFailed,
+        error.CompilerIdentityManifestStatUnavailable,
+        error.CompilerIdentityManifestWriteFailed,
+        error.CompilerFileStatUnavailable,
+        error.CompilerFileNotRegular,
+        error.CompilerFileHashUnavailable,
+        error.ToolchainIdentityFileTooLarge,
+        error.MemoryManagerError,
+    };
+
+    for (severe_errors) |err| {
+        try std.testing.expectEqual(
+            InteractiveWatchSetupFailureDisposition.fail_command,
+            classifyInteractiveWatchSetupFailure(err),
+        );
+        try std.testing.expectError(err, failInteractiveWatchSetupOnSevereError(err));
+    }
+}
+
+test "interactive watch setup classification retries user-editable input failures" {
+    const retryable_errors = [_]InteractiveWatchSetupError{
+        error.ReadError,
+        error.ManifestError,
+        error.DiscoveryError,
+        error.FrontendError,
+        error.ContextInvalidated,
+    };
+
+    for (retryable_errors) |err| {
+        try std.testing.expectEqual(
+            InteractiveWatchSetupFailureDisposition.retry_after_change,
+            classifyInteractiveWatchSetupFailure(err),
+        );
+        try failInteractiveWatchSetupOnSevereError(err);
+    }
+}
+
+test "interactive watch rebuild classification fails severe infrastructure errors" {
+    const severe_errors = [_]IncrementalError{
+        error.OutOfMemory,
+        error.BackendError,
+        error.IncrementalError,
+        error.CacheMetadataError,
+    };
+
+    for (severe_errors) |err| {
+        try std.testing.expectError(
+            err,
+            classifyInteractiveWatchRebuildFailure(err),
+        );
+    }
+}
+
+test "interactive watch rebuild classification preserves retry actions" {
+    const wait_for_next_change_errors = [_]IncrementalError{
+        error.ReadError,
+        error.ManifestError,
+        error.DiscoveryError,
+        error.FrontendError,
+    };
+
+    for (wait_for_next_change_errors) |err| {
+        try std.testing.expectEqual(
+            InteractiveWatchRebuildFailureAction.wait_for_next_change,
+            try classifyInteractiveWatchRebuildFailure(err),
+        );
+    }
+
+    try std.testing.expectEqual(
+        InteractiveWatchRebuildFailureAction.rebuild_fresh_context,
+        try classifyInteractiveWatchRebuildFailure(error.ContextInvalidated),
+    );
+    try std.testing.expectEqual(
+        InteractiveWatchRebuildFailureAction.rebuild_fresh_context,
+        try classifyInteractiveWatchRebuildFailure(error.BackendContextInvalidated),
+    );
+}
+
+test "incremental watch init propagates allocator OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        IncrementalWatchState.init(
+            failing_allocator.allocator(),
+            ".",
+            "default",
+            .empty,
+            .{},
+            false,
+            null,
+            null,
+        ),
+    );
+}
+
 /// Persistent state for incremental watch-mode compilation.
 ///
 /// Holds a Zig ZirContext that persists across rebuilds so the Zig compiler's
@@ -7530,7 +9663,7 @@ const IncrementalWatchState = struct {
         collect_arc_stats: bool,
         zap_lib_dir_override: ?[]const u8,
         progress: ?*zap.progress.Reporter,
-    ) ?IncrementalWatchState {
+    ) IncrementalInitError!IncrementalWatchState {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -7541,11 +9674,18 @@ const IncrementalWatchState = struct {
         // on every rebuild exactly as a one-shot build does.
         if (progress) |reporter| reporter.stage("Planning target :{s}", .{target_name});
         if (progress) |reporter| reporter.stage("Manifest: reading build.zap", .{});
-        const build_file_path = std.fs.path.join(alloc, &.{ project_root, "build.zap" }) catch return null;
-        const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch return null;
+        const build_file_path = std.fs.path.join(alloc, &.{ project_root, "build.zap" }) catch return error.OutOfMemory;
+        const build_source = std.Io.Dir.cwd().readFileAlloc(global_io, build_file_path, alloc, .limited(10 * 1024 * 1024)) catch |err| {
+            std.debug.print("Error: watch-mode build.zap read failed: {s}\n", .{@errorName(err)});
+            return incrementalInitErrorOrStatus(err, error.ReadError);
+        };
         if (progress) |reporter| reporter.stage("Toolchain: resolving Zap stdlib", .{});
-        const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch return null;
-        const manifest_eval = zap.builder.ctfeManifestDetailedWithProgress(alloc, build_source, target_name, build_overrides.target, build_opts, zap_lib_dir, progress) catch return null;
+        const zap_lib_dir = resolveZapLibDir(alloc, zap_lib_dir_override, project_root) catch |err|
+            return incrementalInitErrorOrStatus(err, error.ToolchainError);
+        const manifest_eval = zap.builder.ctfeManifestDetailedWithProgress(alloc, build_source, target_name, build_overrides.target, build_opts, zap_lib_dir, progress) catch |err| {
+            std.debug.print("Error: watch-mode manifest evaluation failed: {s}\n", .{@errorName(err)});
+            return incrementalInitErrorOrStatus(err, error.ManifestError);
+        };
         var config = manifest_eval.config;
         applyBuildOverrides(&config, build_overrides);
         const compile_target: ?[]const u8 = config.target;
@@ -7554,23 +9694,28 @@ const IncrementalWatchState = struct {
 
         if (progress) |reporter| reporter.stage("Toolchain: resolving Zig stdlib", .{});
         // Trusted detection → embedded fork stdlib → system Zig last resort.
-        const zig_lib_dir = zir_backend.detectZigLibDir(alloc) orelse
-            (extractEmbeddedZigLib(alloc) catch null) orelse
-            zir_backend.detectZigLibDirSystemFallback(alloc) orelse
-            return null;
+        const zig_lib_dir = try resolveIncrementalZigLibDir(alloc);
         const toolchain_cache_dir = ".zap-cache/toolchain";
         if (progress) |reporter| reporter.stage("Toolchain: checking compiler identity", .{});
-        const compiler_identity_digest = hashCompilerIdentity(alloc, toolchain_cache_dir) catch return null;
-        const zig_lib_identity_digest = hashZigLibIdentity(alloc, toolchain_cache_dir, zig_lib_dir) catch return null;
+        const compiler_identity_digest = hashCompilerIdentity(alloc, toolchain_cache_dir) catch |err|
+            return incrementalToolchainIdentityError(err);
+        const zig_lib_identity_digest = hashZigLibIdentity(alloc, toolchain_cache_dir, zig_lib_dir) catch |err|
+            return incrementalToolchainIdentityError(err);
 
         if (progress) |reporter| reporter.stage("Sources: resolving roots", .{});
         const watch_source_roots = resolveManifestSourceRoots(alloc, project_root, config, zap_lib_dir, .{
             .write_lockfile = true,
             .print_local_overrides = false,
-        }) catch return null;
+        }) catch |err| {
+            std.debug.print("Error: watch-mode source-root resolution failed: {s}\n", .{@errorName(err)});
+            return incrementalInitErrorOrStatus(err, error.ManifestError);
+        };
 
         if (progress) |reporter| reporter.stage("Memory: resolving manifest adapter", .{});
-        const memory_source_units = collectMemoryAdapterSourceUnits(alloc, watch_source_roots) catch return null;
+        const memory_source_units = collectMemoryAdapterSourceUnits(alloc, watch_source_roots) catch |err| {
+            std.debug.print("Error: watch-mode memory adapter source discovery failed: {s}\n", .{@errorName(err)});
+            return incrementalInitErrorOrStatus(err, error.ManifestError);
+        };
         const memory_adapter_eval = zap.builder.evaluateMemoryManagerAdapterFromSources(
             alloc,
             watch_source_roots,
@@ -7580,9 +9725,9 @@ const IncrementalWatchState = struct {
             build_opts,
         ) catch |err| {
             std.debug.print("Error: watch-mode Memory.Manager adapter evaluation failed: {}\n", .{err});
-            return null;
+            return incrementalInitErrorOrStatus(err, error.ManifestError);
         };
-        const manifest_memory_manager = memory_adapter_eval.manager orelse return null;
+        const manifest_memory_manager = memory_adapter_eval.manager orelse return error.ManifestError;
 
         // Resolve the active memory manager — mirror `buildTarget`'s
         // flow so the watch-session uses the same active manager source,
@@ -7603,7 +9748,8 @@ const IncrementalWatchState = struct {
                     .type_name = manifest_memory_manager.type_name,
                     .adapter_source_path = manifest_memory_manager.adapter_source_path,
                 },
-                .source_roots = sourceRootsForMemoryDriver(alloc, watch_source_roots) catch return null,
+                .source_roots = sourceRootsForMemoryDriver(alloc, watch_source_roots) catch |err|
+                    return incrementalInitErrorOrStatus(err, error.MemoryManagerError),
                 .project_root = project_root,
                 .zap_source_root = zap_source_tree_root,
                 .cache_dir = ".zap-cache/memory",
@@ -7624,10 +9770,11 @@ const IncrementalWatchState = struct {
             if (driver_diag.text().len > 0) {
                 std.debug.print("  {s}\n", .{driver_diag.text()});
             }
-            return null;
+            return incrementalInitErrorOrStatus(err, error.MemoryManagerError);
         };
         defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
-        const active_manager_source_digest = hashActiveManagerSource(alloc, resolved_manager.active_manager_source_path) catch return null;
+        const active_manager_source_digest = hashActiveManagerSource(alloc, resolved_manager.active_manager_source_path) catch |err|
+            return incrementalInitErrorOrStatus(err, error.MemoryManagerError);
 
         // Watch mode supports every manager that produces a valid
         // `.zapmem` section:
@@ -7642,7 +9789,8 @@ const IncrementalWatchState = struct {
         // it so every subsequent `rebuild` reuses the same value.
         const declared_caps = resolved_manager.declared_caps;
         const refcount_sized_extension = resolved_manager.refcount_sized_extension;
-        const active_manager_source_path_owned = allocator.dupe(u8, resolved_manager.active_manager_source_path) catch return null;
+        const active_manager_source_path_owned = allocator.dupe(u8, resolved_manager.active_manager_source_path) catch return error.OutOfMemory;
+        errdefer allocator.free(active_manager_source_path_owned);
 
         const output_name_raw = if (config.asset_name) |an| (if (an.len > 0) an else config.name) else config.name;
         const out_dir: []const u8 = switch (config.kind) {
@@ -7652,10 +9800,10 @@ const IncrementalWatchState = struct {
         };
         const output_filename = switch (config.kind) {
             .bin => output_name_raw,
-            .lib => std.fmt.allocPrint(alloc, "{s}.a", .{output_name_raw}) catch return null,
-            .obj => std.fmt.allocPrint(alloc, "{s}.o", .{output_name_raw}) catch return null,
+            .lib => std.fmt.allocPrint(alloc, "{s}.a", .{output_name_raw}) catch return error.OutOfMemory,
+            .obj => std.fmt.allocPrint(alloc, "{s}.o", .{output_name_raw}) catch return error.OutOfMemory,
         };
-        const output_path = std.fs.path.join(alloc, &.{ out_dir, output_filename }) catch return null;
+        const output_path = std.fs.path.join(alloc, &.{ out_dir, output_filename }) catch return error.OutOfMemory;
 
         const output_mode_val: u8 = switch (config.kind) {
             .bin => 0,
@@ -7666,31 +9814,17 @@ const IncrementalWatchState = struct {
         const optimize_mode_val: u8 = optimize_policy.backend_optimize_mode;
 
         // Dupe strings into the persistent allocator
-        const zig_lib_duped = allocator.dupe(u8, zig_lib_dir) catch {
-            allocator.free(active_manager_source_path_owned);
-            return null;
-        };
-        const output_path_duped = allocator.dupe(u8, output_path) catch {
-            allocator.free(active_manager_source_path_owned);
-            allocator.free(zig_lib_duped);
-            return null;
-        };
-        const output_name_duped = allocator.dupe(u8, output_name_raw) catch {
-            allocator.free(active_manager_source_path_owned);
-            allocator.free(zig_lib_duped);
-            allocator.free(output_path_duped);
-            return null;
-        };
+        const zig_lib_duped = allocator.dupe(u8, zig_lib_dir) catch return error.OutOfMemory;
+        errdefer allocator.free(zig_lib_duped);
+        const output_path_duped = allocator.dupe(u8, output_path) catch return error.OutOfMemory;
+        errdefer allocator.free(output_path_duped);
+        const output_name_duped = allocator.dupe(u8, output_name_raw) catch return error.OutOfMemory;
+        errdefer allocator.free(output_name_duped);
         const target_duped: ?[]const u8 = if (compile_target) |target_value|
-            (allocator.dupe(u8, target_value) catch {
-                allocator.free(active_manager_source_path_owned);
-                allocator.free(zig_lib_duped);
-                allocator.free(output_path_duped);
-                allocator.free(output_name_duped);
-                return null;
-            })
+            (allocator.dupe(u8, target_value) catch return error.OutOfMemory)
         else
             null;
+        errdefer if (target_duped) |target_value| allocator.free(target_value);
 
         // Create persistent ZirContext. The runtime source is rewritten
         // against `declared_caps` so the generated runtime matches the
@@ -7735,14 +9869,8 @@ const IncrementalWatchState = struct {
             .active_manager_source_path = active_manager_source_path_owned,
             .debug_info_policy = watch_dbg_resolution.in_binary,
             .frame_pointer_policy = zir_backend.FramePointerPolicy.fromOptional(watch_dbg_resolution.frame_pointers),
-        }) catch {
-            allocator.free(zig_lib_duped);
-            allocator.free(output_path_duped);
-            allocator.free(output_name_duped);
-            if (target_duped) |target_value| allocator.free(target_value);
-            allocator.free(active_manager_source_path_owned);
-            return null;
-        };
+        }) catch |err| return incrementalInitErrorOrStatus(err, error.BackendError);
+        errdefer zir_backend.destroyContext(ctx);
 
         const pinned_manifest = clonePinnedManifestState(
             allocator,
@@ -7752,15 +9880,7 @@ const IncrementalWatchState = struct {
             manifest_eval.result_hash,
             watch_source_roots,
             zap_lib_dir,
-        ) catch {
-            zir_backend.destroyContext(ctx);
-            allocator.free(zig_lib_duped);
-            allocator.free(output_path_duped);
-            allocator.free(output_name_duped);
-            if (target_duped) |target_value| allocator.free(target_value);
-            allocator.free(active_manager_source_path_owned);
-            return null;
-        };
+        ) catch |err| return incrementalInitErrorOrStatus(err, error.ManifestError);
 
         return .{
             .zir_ctx = ctx,
@@ -7916,7 +10036,8 @@ const IncrementalWatchState = struct {
         const source_roots = self.manifest_source_roots;
 
         if (progress) |reporter| reporter.stage("Sources: resolving roots", .{});
-        var manifest_sources = discoverManifestSources(alloc, project_root, config, source_roots, progress) catch return error.DiscoveryError;
+        var manifest_sources = discoverManifestSources(alloc, project_root, config, source_roots, progress) catch |err|
+            return incrementalErrorOrStatus(err, error.DiscoveryError);
         defer manifest_sources.deinit();
         profileLap(&profile_timer, "planning", .{});
 
@@ -7926,7 +10047,8 @@ const IncrementalWatchState = struct {
         }
 
         if (progress) |reporter| reporter.stage("Memory: validating pinned manager", .{});
-        const memory_source_units = collectMemoryAdapterSourceUnits(alloc, source_roots) catch return error.ManifestError;
+        const memory_source_units = collectMemoryAdapterSourceUnits(alloc, source_roots) catch |err|
+            return incrementalErrorOrStatus(err, error.ManifestError);
         const memory_adapter_eval = zap.builder.evaluateMemoryManagerAdapterFromSources(
             alloc,
             source_roots,
@@ -7934,12 +10056,13 @@ const IncrementalWatchState = struct {
             config.memory_manager,
             target_name,
             build_opts,
-        ) catch return error.ManifestError;
+        ) catch |err| return incrementalErrorOrStatus(err, error.ManifestError);
         _ = memory_adapter_eval.manager orelse return error.ManifestError;
         if (memory_adapter_eval.result_hash != self.memory_adapter_result_hash) {
             return error.ContextInvalidated;
         }
-        const current_active_manager_source_digest = hashActiveManagerSource(alloc, self.active_manager_source_path) catch return error.ContextInvalidated;
+        const current_active_manager_source_digest = hashActiveManagerSource(alloc, self.active_manager_source_path) catch |err|
+            return incrementalErrorOrStatus(err, error.ContextInvalidated);
         if (!std.mem.eql(u8, current_active_manager_source_digest[0..], self.active_manager_source_digest[0..])) {
             return error.ContextInvalidated;
         }
@@ -7971,7 +10094,7 @@ const IncrementalWatchState = struct {
             // code did) would strip every refcount op even under a
             // REFCOUNT_V1 manager and silently leak every Arc cell.
             .declared_caps = self.declared_caps,
-        }) catch return error.FrontendError;
+        }) catch |err| return incrementalErrorOrStatus(err, error.FrontendError);
         defer frontend_prepared.deinit();
         var result = frontend_prepared.result;
         profileLap(&profile_timer, "frontend", .{});
@@ -8023,14 +10146,15 @@ const IncrementalWatchState = struct {
                 self.root_module_hash,
                 &self.module_hashes,
                 &current_hashes,
-            ) catch return error.ContextInvalidated
+            ) catch |err| return incrementalErrorOrStatus(err, error.ContextInvalidated)
         else
             PreparedIncrementalBackendPlan{
                 .selection = .{ .struct_names = &.{}, .include_root = false },
                 .invalidation = .compare_source_hashes,
             };
         const backend_selection = backend_plan.selection;
-        const backend_module_selection = normalizeIncrementalSelectionForBackend(alloc, backend_selection) catch return error.ContextInvalidated;
+        const backend_module_selection = normalizeIncrementalSelectionForBackend(alloc, backend_selection) catch |err|
+            return incrementalErrorOrStatus(err, error.ContextInvalidated);
         defer backend_module_selection.deinit(alloc);
         const needs_backend_update = !prepared_update or
             backend_module_selection.include_root or
@@ -8088,19 +10212,22 @@ const IncrementalWatchState = struct {
         // ask the fork to mark every source hash in the prepared files stale.
         if (prepared_update and needs_backend_update) {
             if (progress) |reporter| reporter.stage("Backend: preparing incremental update", .{});
-            var update_prepared = false;
             zir_backend.prepareSelectedUpdate(
                 alloc,
                 self.zir_ctx,
                 backend_module_selection.struct_names,
                 backend_module_selection.include_root,
                 backend_plan.invalidation,
-            ) catch {
-                zir_backend.abortUpdate(self.zir_ctx) catch {};
-                return error.ContextInvalidated;
+            ) catch |err| {
+                zir_backend.abortUpdate(self.zir_ctx) catch |abort_err| {
+                    std.debug.print(
+                        "Error: failed to abort prepared incremental update after prepare failure ({s}); context must be discarded: {s}\n",
+                        .{ @errorName(err), @errorName(abort_err) },
+                    );
+                    return error.BackendContextInvalidated;
+                };
+                return incrementalBackendErrorOrStatus(err, error.BackendError);
             };
-            update_prepared = true;
-            errdefer if (update_prepared) zir_backend.abortUpdate(self.zir_ctx) catch {};
             profileLap(&profile_timer, "backend prepare", .{});
 
             const backend_options = self.backendOptions(alloc, &result, progress);
@@ -8112,13 +10239,13 @@ const IncrementalWatchState = struct {
                 backend_options,
                 backend_module_selection.struct_names,
                 backend_module_selection.include_root,
-            ) catch return error.ContextInvalidated;
-            update_prepared = false;
+            ) catch |err| return incrementalBackendErrorOrStatus(err, error.BackendError);
             profileLap(&profile_timer, "backend incremental update", .{});
         } else if (!prepared_update) {
             const backend_options = self.backendOptions(alloc, &result, progress);
             if (progress) |reporter| reporter.stage("Backend: compiling ZIR and linking", .{});
-            zir_backend.injectAndUpdate(alloc, result.ir_program, self.zir_ctx, backend_options) catch return error.BackendError;
+            zir_backend.injectAndUpdate(alloc, result.ir_program, self.zir_ctx, backend_options) catch |err|
+                return incrementalErrorOrStatus(err, error.BackendError);
             profileLap(&profile_timer, "backend full update", .{});
         }
 
@@ -8143,8 +10270,9 @@ const IncrementalWatchState = struct {
             self.zig_lib_dir,
             self.compiler_identity_digest,
             self.zig_lib_identity_digest,
-        ) catch return error.CacheMetadataError;
-        const manifest_snapshot_path = build_cache.snapshotPath(alloc, ".zap-cache", target_name) catch return error.CacheMetadataError;
+        ) catch |err| return incrementalErrorOrStatus(err, error.CacheMetadataError);
+        const manifest_snapshot_path = build_cache.snapshotPath(alloc, ".zap-cache", target_name) catch |err|
+            return incrementalErrorOrStatus(err, error.CacheMetadataError);
         const metadata_inputs = CompileAndLinkInputs{
             .config = config,
             .source_roots = manifest_sources.source_roots,
@@ -8173,27 +10301,20 @@ const IncrementalWatchState = struct {
                 .dependencies = self.manifest_dependencies,
             },
         };
-        const cache_key_hex = computeManifestCacheKeyHex(alloc, metadata_inputs, config, self.active_manager_source_path) catch return error.CacheMetadataError;
-        const output_filename = buildArtifactFilename(alloc, config) catch return error.CacheMetadataError;
-        const cached_artifact_path = build_cache.artifactPath(alloc, ".zap-cache", cache_key_hex, output_filename) catch return error.CacheMetadataError;
-        publishManifestArtifactToCache(alloc, config, self.output_path, cached_artifact_path) catch return error.CacheMetadataError;
-        writeManifestCacheMetadata(alloc, metadata_inputs, config, self.output_path, cached_artifact_path, cache_key_hex, self.active_manager_source_path) catch return error.CacheMetadataError;
+        const cache_key_hex = computeManifestCacheKeyHex(alloc, metadata_inputs, config, self.active_manager_source_path, null) catch |err|
+            return incrementalErrorOrStatus(err, error.CacheMetadataError);
+        const output_filename = buildArtifactFilename(alloc, config) catch |err|
+            return incrementalErrorOrStatus(err, error.CacheMetadataError);
+        const cached_artifact_path = build_cache.artifactPath(alloc, ".zap-cache", cache_key_hex, output_filename) catch |err|
+            return incrementalErrorOrStatus(err, error.CacheMetadataError);
+        publishManifestArtifactToCache(alloc, config, self.output_path, cached_artifact_path) catch |err|
+            return incrementalErrorOrStatus(err, error.CacheMetadataError);
+        writeManifestCacheMetadata(alloc, metadata_inputs, config, self.output_path, cached_artifact_path, cache_key_hex, self.active_manager_source_path) catch |err|
+            return incrementalErrorOrStatus(err, error.CacheMetadataError);
         profileLap(&profile_timer, "manifest metadata", .{});
 
         self.baseline_established = true;
     }
-
-    const IncrementalError = error{
-        ReadError,
-        ManifestError,
-        DiscoveryError,
-        FrontendError,
-        ContextInvalidated,
-        IncrementalError,
-        BackendError,
-        CacheMetadataError,
-        OutOfMemory,
-    };
 };
 
 fn runWatchBuiltArtifact(
@@ -8437,14 +10558,15 @@ const WatchSnapshot = struct {
         build_overrides: BuildOverrides,
         zap_lib_dir_override: ?[]const u8,
         extra_watch_path: ?[]const u8,
-    ) !WatchSnapshot {
+    ) WatchSnapshotInitError!WatchSnapshot {
         const paths = try collectWatchPaths(allocator, project_root, target_name, build_opts, build_overrides, zap_lib_dir_override, extra_watch_path);
         errdefer freeOwnedPathSlice(allocator, paths);
 
         const fingerprints = try allocator.alloc(WatchPathFingerprint, paths.len);
         errdefer allocator.free(fingerprints);
         for (paths, 0..) |path, index| {
-            fingerprints[index] = try watchPathFingerprint(allocator, path, null);
+            fingerprints[index] = watchPathFingerprint(allocator, path, null) catch |err|
+                return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
         }
         return .{ .paths = paths, .fingerprints = fingerprints };
     }
@@ -8452,14 +10574,15 @@ const WatchSnapshot = struct {
     fn initProjectOnly(
         allocator: std.mem.Allocator,
         project_root: []const u8,
-    ) !WatchSnapshot {
+    ) WatchSnapshotSetupError!WatchSnapshot {
         const paths = try collectProjectWatchPathsWithoutManifest(allocator, project_root);
         errdefer freeOwnedPathSlice(allocator, paths);
 
         const fingerprints = try allocator.alloc(WatchPathFingerprint, paths.len);
         errdefer allocator.free(fingerprints);
         for (paths, 0..) |path, index| {
-            fingerprints[index] = try watchPathFingerprint(allocator, path, null);
+            fingerprints[index] = watchPathFingerprint(allocator, path, null) catch |err|
+                return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
         }
         return .{ .paths = paths, .fingerprints = fingerprints };
     }
@@ -8469,14 +10592,15 @@ const WatchSnapshot = struct {
         project_root: []const u8,
         source_roots: []const zap.discovery.SourceRoot,
         extra_watch_path: ?[]const u8,
-    ) !WatchSnapshot {
+    ) WatchSnapshotSetupError!WatchSnapshot {
         const paths = try collectWatchPathsFromSourceRoots(allocator, project_root, source_roots, extra_watch_path);
         errdefer freeOwnedPathSlice(allocator, paths);
 
         const fingerprints = try allocator.alloc(WatchPathFingerprint, paths.len);
         errdefer allocator.free(fingerprints);
         for (paths, 0..) |path, index| {
-            fingerprints[index] = try watchPathFingerprint(allocator, path, null);
+            fingerprints[index] = watchPathFingerprint(allocator, path, null) catch |err|
+                return watchSnapshotSetupErrorOrStatus(err, error.ManifestError);
         }
         return .{ .paths = paths, .fingerprints = fingerprints };
     }
@@ -8489,11 +10613,12 @@ const WatchSnapshot = struct {
 
     fn changedPaths(self: *WatchSnapshot, allocator: std.mem.Allocator) ![]const []const u8 {
         var changed_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer changed_paths.deinit(allocator);
         for (self.paths, 0..) |path, index| {
             const current_fingerprint = try watchPathFingerprint(allocator, path, self.fingerprints[index]);
             if (!watchPathFingerprintContentEqual(self.fingerprints[index], current_fingerprint)) {
-                self.fingerprints[index] = current_fingerprint;
                 try changed_paths.append(allocator, path);
+                self.fingerprints[index] = current_fingerprint;
             } else if (!watchPathFingerprintsEqual(self.fingerprints[index], current_fingerprint)) {
                 self.fingerprints[index] = current_fingerprint;
             }
@@ -8537,6 +10662,95 @@ test "watch snapshot detects same-size file content edits" {
     try std.testing.expectEqualStrings(file_path, changed_paths[0]);
 }
 
+test "watch snapshot changedPaths preserves OutOfMemory" {
+    const allocator = std.testing.allocator;
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, "missing-watch-input.zap");
+    errdefer freeOwnedPathSlice(allocator, paths);
+
+    const fingerprints = try allocator.alloc(WatchPathFingerprint, 1);
+    errdefer allocator.free(fingerprints);
+    fingerprints[0] = .{ .kind = .file };
+
+    var snapshot: WatchSnapshot = .{
+        .paths = paths,
+        .fingerprints = fingerprints,
+    };
+    defer snapshot.deinit(allocator);
+
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, snapshot.changedPaths(failing_allocator.allocator()));
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(WatchPathKind.file, snapshot.fingerprints[0].kind);
+}
+
+test "watch snapshot init failure falls back only for missing manifest sentinel" {
+    switch (classifyWatchSnapshotInitFailure(error.WatchManifestMissing)) {
+        .use_project_only => |reason| try std.testing.expectEqual(WatchSnapshotFallbackReason.missing_manifest, reason),
+        .propagate_setup_error => return error.TestExpectedEqual,
+    }
+
+    const propagated_errors = [_]WatchSnapshotInitError{
+        error.ReadError,
+        error.ManifestError,
+        error.ToolchainError,
+        error.CacheMetadataError,
+        error.OutOfMemory,
+    };
+
+    for (propagated_errors) |expected_err| {
+        switch (classifyWatchSnapshotInitFailure(expected_err)) {
+            .use_project_only => return error.TestExpectedEqual,
+            .propagate_setup_error => |actual_err| try std.testing.expectEqual(expected_err, actual_err),
+        }
+    }
+}
+
+test "watch snapshot project-only fallback records absent build manifest" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(project_root);
+
+    const build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    try std.testing.expectError(
+        error.WatchManifestMissing,
+        WatchSnapshot.init(allocator, project_root, "default", build_opts, .{}, null, null),
+    );
+
+    var snapshot = try WatchSnapshot.initProjectOnly(allocator, project_root);
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.paths.len);
+    try std.testing.expectEqualStrings("build.zap", std.fs.path.basename(snapshot.paths[0]));
+    try std.testing.expectEqual(WatchPathKind.missing, snapshot.fingerprints[0].kind);
+}
+
+test "watch snapshot source-root canonicalization failure propagates setup error" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "build.zap", .data = "" });
+    tmp_dir.dir.symLink(global_io, "loop", "loop", .{}) catch return error.SkipZigTest;
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(project_root);
+    const loop_path = try std.fs.path.join(allocator, &.{ project_root, "loop" });
+    defer allocator.free(loop_path);
+    const source_roots = [_]zap.discovery.SourceRoot{.{
+        .name = "project",
+        .path = loop_path,
+    }};
+
+    try std.testing.expectError(
+        error.ManifestError,
+        WatchSnapshot.initFromSourceRoots(allocator, project_root, &source_roots, null),
+    );
+}
+
 fn refreshWatchSnapshot(
     snapshot: *WatchSnapshot,
     allocator: std.mem.Allocator,
@@ -8546,11 +10760,9 @@ fn refreshWatchSnapshot(
     build_overrides: BuildOverrides,
     zap_lib_dir_override: ?[]const u8,
     extra_watch_path: ?[]const u8,
-) void {
-    const new_snapshot = WatchSnapshot.init(allocator, project_root, target_name, build_opts, build_overrides, zap_lib_dir_override, extra_watch_path) catch |err| {
-        std.debug.print("Error: could not refresh watch inputs: {s}\n", .{@errorName(err)});
-        return;
-    };
+) !void {
+    const new_snapshot = WatchSnapshot.init(allocator, project_root, target_name, build_opts, build_overrides, zap_lib_dir_override, extra_watch_path) catch |err|
+        return refreshWatchSnapshotInitError(err);
     snapshot.deinit(allocator);
     snapshot.* = new_snapshot;
 }
@@ -8561,11 +10773,8 @@ fn refreshWatchSnapshotFromSourceRoots(
     project_root: []const u8,
     source_roots: []const zap.discovery.SourceRoot,
     extra_watch_path: ?[]const u8,
-) void {
-    const new_snapshot = WatchSnapshot.initFromSourceRoots(allocator, project_root, source_roots, extra_watch_path) catch |err| {
-        std.debug.print("Error: could not refresh watch inputs: {s}\n", .{@errorName(err)});
-        return;
-    };
+) !void {
+    const new_snapshot = try WatchSnapshot.initFromSourceRoots(allocator, project_root, source_roots, extra_watch_path);
     snapshot.deinit(allocator);
     snapshot.* = new_snapshot;
 }
@@ -8575,6 +10784,7 @@ const MANIFEST_DAEMON_REQUEST_MAGIC: u32 = 0x5a_44_52_31; // "ZDR1"
 const MANIFEST_DAEMON_RESPONSE_MAGIC: u32 = 0x5a_44_53_31; // "ZDS1"
 const MANIFEST_DAEMON_PROTOCOL_VERSION: u16 = 5;
 const MANIFEST_DAEMON_IDLE_TIMEOUT_MS: i32 = 5 * 60 * 1000;
+const MANIFEST_DAEMON_REQUEST_DISPATCH_TIMEOUT_MS: i64 = 2 * 1000;
 const MANIFEST_DAEMON_REQUEST_HEADER_LEN: usize = 7;
 
 const ManifestDaemonRequestMode = enum(u8) {
@@ -8619,6 +10829,57 @@ const ManifestDaemonResponseStatus = enum(u8) {
 const ManifestDaemonResponse = union(enum) {
     ok: BuildArtifact,
     failed: []const u8,
+};
+
+fn deinitManifestDaemonBuildOverrides(allocator: std.mem.Allocator, overrides: BuildOverrides) void {
+    if (overrides.memory) |memory| allocator.free(memory);
+    if (overrides.target) |target| allocator.free(target);
+    if (overrides.cpu) |cpu| allocator.free(cpu);
+}
+
+fn deinitManifestDaemonBuildOpts(
+    allocator: std.mem.Allocator,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+) void {
+    var mutable_build_opts = build_opts;
+    var iterator = mutable_build_opts.iterator();
+    while (iterator.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    mutable_build_opts.deinit(allocator);
+}
+
+fn deinitManifestDaemonRequest(allocator: std.mem.Allocator, request: ManifestDaemonRequest) void {
+    if (request.response_path) |response_path| allocator.free(response_path);
+    if (request.progress_path) |progress_path| allocator.free(progress_path);
+    allocator.free(request.project_root);
+    allocator.free(request.target_name);
+    deinitManifestDaemonBuildOpts(allocator, request.build_opts);
+    deinitManifestDaemonBuildOverrides(allocator, request.build_overrides);
+    if (request.zap_lib_dir_override) |zap_lib_dir_override| allocator.free(zap_lib_dir_override);
+}
+
+fn deinitManifestDaemonResponse(allocator: std.mem.Allocator, response: ManifestDaemonResponse) void {
+    switch (response) {
+        .ok => |artifact| artifact.deinit(allocator),
+        .failed => |message| allocator.free(message),
+    }
+}
+
+const ManifestDaemonFallbackReason = enum {
+    daemon_unavailable,
+    stale_artifact,
+};
+
+const ManifestDaemonBuildResult = union(enum) {
+    artifact: BuildArtifact,
+    fallback: ManifestDaemonFallbackReason,
+};
+
+const ManifestDaemonWarmResult = enum {
+    sent,
+    pending_request,
 };
 
 const ManifestDaemonState = struct {
@@ -8674,6 +10935,11 @@ fn manifestDaemonRequestPath(alloc: std.mem.Allocator, invocation_identity: buil
     return std.fmt.allocPrint(alloc, "{s}/{s}.{x:0>16}.req", .{ MANIFEST_DAEMON_DIR, identity_hex, request_id });
 }
 
+fn manifestDaemonRequestAckPath(alloc: std.mem.Allocator, request_path: []const u8) ![]const u8 {
+    if (!std.mem.endsWith(u8, request_path, ".req")) return error.InvalidDaemonProtocol;
+    return std.fmt.allocPrint(alloc, "{s}.ack", .{request_path[0 .. request_path.len - ".req".len]});
+}
+
 fn manifestDaemonResponsePath(alloc: std.mem.Allocator, invocation_identity: build_cache.InvocationIdentity, request_id: u64) ![]const u8 {
     const identity_hex = try manifestDaemonIdentityHexAlloc(alloc, invocation_identity);
     defer alloc.free(identity_hex);
@@ -8689,6 +10955,39 @@ fn manifestDaemonProgressPath(alloc: std.mem.Allocator, invocation_identity: bui
 const MANIFEST_DAEMON_PROGRESS_MAGIC: u32 = 0x5a_44_50_31; // "ZDP1"
 const MANIFEST_DAEMON_PROGRESS_VERSION: u16 = 1;
 const MANIFEST_DAEMON_PROGRESS_HEADER_LEN: usize = 11;
+
+const ManifestDaemonProgressSetupError = error{
+    OutOfMemory,
+    ManifestDaemonProgressSetupFailed,
+};
+
+const ManifestDaemonProgressWriterError = ManifestDaemonProgressSetupError || error{
+    ManifestDaemonProgressRecordTooLarge,
+    ManifestDaemonProgressWriteFailed,
+};
+
+const ManifestDaemonProgressApplyError = std.mem.Allocator.Error || zap.progress.ProgressError || error{
+    InvalidDaemonProgress,
+};
+
+const ManifestDaemonProgressPollError = ManifestDaemonProgressApplyError || error{
+    ManifestDaemonProgressReadFailed,
+};
+
+fn manifestDaemonProgressSetupError(err: anyerror) ManifestDaemonProgressSetupError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ManifestDaemonProgressSetupFailed,
+    };
+}
+
+fn manifestDaemonProgressWriteError(err: anyerror) ManifestDaemonProgressWriterError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ManifestDaemonProgressRecordTooLarge => error.ManifestDaemonProgressRecordTooLarge,
+        else => error.ManifestDaemonProgressWriteFailed,
+    };
+}
 
 const ManifestDaemonProgressTag = enum(u8) {
     stage = 1,
@@ -8990,13 +11289,13 @@ fn manifestDaemonProgressNodeKey(node_id: zap.progress.NodeId) u64 {
 const ManifestDaemonProgressWriter = struct {
     allocator: std.mem.Allocator,
     file: ?std.Io.File,
-    disabled: bool = false,
+    failure: ?ManifestDaemonProgressWriterError = null,
 
-    fn init(allocator: std.mem.Allocator, progress_path: []const u8) !ManifestDaemonProgressWriter {
+    fn init(allocator: std.mem.Allocator, progress_path: []const u8) ManifestDaemonProgressSetupError!ManifestDaemonProgressWriter {
         if (std.fs.path.dirname(progress_path)) |dir| {
-            try std.Io.Dir.cwd().createDirPath(global_io, dir);
+            std.Io.Dir.cwd().createDirPath(global_io, dir) catch |err| return manifestDaemonProgressSetupError(err);
         }
-        const file = try std.Io.Dir.cwd().createFile(global_io, progress_path, .{ .truncate = false });
+        const file = std.Io.Dir.cwd().createFile(global_io, progress_path, .{ .truncate = false }) catch |err| return manifestDaemonProgressSetupError(err);
         return .{
             .allocator = allocator,
             .file = file,
@@ -9024,16 +11323,23 @@ const ManifestDaemonProgressWriter = struct {
     }
 
     fn write(self: *ManifestDaemonProgressWriter, event: ManifestDaemonProgressEvent) void {
-        if (self.disabled) return;
-        const file = self.file orelse return;
-        const record = serializeManifestDaemonProgressRecord(self.allocator, event) catch {
-            self.disabled = true;
+        if (self.failure != null) return;
+        const file = self.file orelse {
+            self.failure = error.ManifestDaemonProgressWriteFailed;
+            return;
+        };
+        const record = serializeManifestDaemonProgressRecord(self.allocator, event) catch |err| {
+            self.failure = manifestDaemonProgressWriteError(err);
             return;
         };
         defer self.allocator.free(record);
         file.writeStreamingAll(global_io, record) catch {
-            self.disabled = true;
+            self.failure = error.ManifestDaemonProgressWriteFailed;
         };
+    }
+
+    fn check(self: *const ManifestDaemonProgressWriter) ManifestDaemonProgressWriterError!void {
+        if (self.failure) |err| return err;
     }
 
     fn fromContext(context: *anyopaque) *ManifestDaemonProgressWriter {
@@ -9120,17 +11426,16 @@ const ManifestDaemonProgressPoller = struct {
     pending_bytes: std.ArrayListUnmanaged(u8) = .empty,
     nodes: std.AutoHashMap(u64, zap.progress.Node),
     node_order: std.ArrayListUnmanaged(u64) = .empty,
-    disabled: bool = false,
 
     fn init(
         allocator: std.mem.Allocator,
         progress_path: []const u8,
         parent_node: ?zap.progress.Node,
-    ) !ManifestDaemonProgressPoller {
-        const fd = try std.posix.openat(std.posix.AT.FDCWD, progress_path, .{
+    ) ManifestDaemonProgressSetupError!ManifestDaemonProgressPoller {
+        const fd = std.posix.openat(std.posix.AT.FDCWD, progress_path, .{
             .ACCMODE = .RDONLY,
             .CLOEXEC = true,
-        }, 0);
+        }, 0) catch |err| return manifestDaemonProgressSetupError(err);
         return .{
             .allocator = allocator,
             .string_arena = std.heap.ArenaAllocator.init(allocator),
@@ -9149,18 +11454,12 @@ const ManifestDaemonProgressPoller = struct {
         self.string_arena.deinit();
     }
 
-    fn poll(self: *ManifestDaemonProgressPoller) void {
-        if (self.disabled) return;
-        self.readAvailable() catch {
-            self.disabled = true;
-            return;
-        };
-        self.consumePending() catch {
-            self.disabled = true;
-        };
+    fn poll(self: *ManifestDaemonProgressPoller) ManifestDaemonProgressPollError!void {
+        try self.readAvailable();
+        try self.consumePending();
     }
 
-    fn readAvailable(self: *ManifestDaemonProgressPoller) !void {
+    fn readAvailable(self: *ManifestDaemonProgressPoller) ManifestDaemonProgressPollError!void {
         var buffer: [8192]u8 = undefined;
         while (true) {
             const bytes_read = try preadManifestDaemonProgress(self.fd, &buffer, self.read_offset);
@@ -9171,12 +11470,12 @@ const ManifestDaemonProgressPoller = struct {
         }
     }
 
-    fn consumePending(self: *ManifestDaemonProgressPoller) !void {
+    fn consumePending(self: *ManifestDaemonProgressPoller) ManifestDaemonProgressPollError!void {
         var consumed_total: usize = 0;
         while (consumed_total < self.pending_bytes.items.len) {
             var consumed_len: usize = 0;
             const event = try readManifestDaemonProgressRecord(self.pending_bytes.items[consumed_total..], &consumed_len) orelse break;
-            self.apply(event);
+            try self.apply(event);
             consumed_total += consumed_len;
         }
 
@@ -9191,60 +11490,70 @@ const ManifestDaemonProgressPoller = struct {
         self.pending_bytes.shrinkRetainingCapacity(remaining_len);
     }
 
-    fn apply(self: *ManifestDaemonProgressPoller, event: ManifestDaemonProgressEvent) void {
+    fn apply(self: *ManifestDaemonProgressPoller, event: ManifestDaemonProgressEvent) ManifestDaemonProgressApplyError!void {
         switch (event) {
             .stage => |message| {
-                const owned_message = self.dupeString(message) catch return;
-                if (self.parent_node) |node| node.updateCurrentItem(owned_message);
+                const node = self.parent_node orelse return error.InvalidDaemonProgress;
+                const owned_message = try self.dupeString(message);
+                node.updateCurrentItem(owned_message);
             },
             .output => |message| {
-                const owned_message = self.dupeString(message) catch return;
-                if (self.parent_node) |node| node.output(owned_message);
+                const node = self.parent_node orelse return error.InvalidDaemonProgress;
+                const owned_message = try self.dupeString(message);
+                node.output(owned_message);
             },
             .begin => |begin| {
                 const maybe_parent = if (begin.parent_id.index == 0)
                     self.parent_node
                 else
                     self.nodes.get(manifestDaemonProgressNodeKey(begin.parent_id));
-                const parent = maybe_parent orelse return;
-                const owned_label = self.dupeString(begin.label) catch return;
-                const local_node = parent.start(owned_label, begin.options) catch return;
+                const parent = maybe_parent orelse return error.InvalidDaemonProgress;
+                const owned_label = try self.dupeString(begin.label);
+                const local_node = try parent.start(owned_label, begin.options);
                 const key = manifestDaemonProgressNodeKey(begin.node_id);
-                self.nodes.put(key, local_node) catch {
+                if (self.nodes.get(key) != null) {
                     local_node.finish(.cancelled);
-                    return;
+                    return error.InvalidDaemonProgress;
+                }
+                self.nodes.put(key, local_node) catch |err| {
+                    local_node.finish(.cancelled);
+                    return err;
                 };
-                self.node_order.append(self.allocator, key) catch {
+                self.node_order.append(self.allocator, key) catch |err| {
                     if (self.nodes.fetchRemove(key)) |entry| entry.value.finish(.cancelled);
-                    return;
+                    return err;
                 };
             },
             .update_label => |update| {
-                const owned_label = self.dupeString(update.label) catch return;
-                if (self.nodes.get(manifestDaemonProgressNodeKey(update.node_id))) |node| node.updateLabel(owned_label);
+                const node = self.nodes.get(manifestDaemonProgressNodeKey(update.node_id)) orelse return error.InvalidDaemonProgress;
+                const owned_label = try self.dupeString(update.label);
+                node.updateLabel(owned_label);
             },
             .update_current_item => |update| {
-                const owned_current_item = self.dupeString(update.current_item) catch return;
-                if (self.nodes.get(manifestDaemonProgressNodeKey(update.node_id))) |node| node.updateCurrentItem(owned_current_item);
+                const node = self.nodes.get(manifestDaemonProgressNodeKey(update.node_id)) orelse return error.InvalidDaemonProgress;
+                const owned_current_item = try self.dupeString(update.current_item);
+                node.updateCurrentItem(owned_current_item);
             },
             .set_completed_count => |update| {
-                if (self.nodes.get(manifestDaemonProgressNodeKey(update.node_id))) |node| node.setCompletedCount(update.completed_count);
+                const node = self.nodes.get(manifestDaemonProgressNodeKey(update.node_id)) orelse return error.InvalidDaemonProgress;
+                node.setCompletedCount(update.completed_count);
             },
             .complete_one => |node_id| {
-                if (self.nodes.get(manifestDaemonProgressNodeKey(node_id))) |node| node.completeOne();
+                const node = self.nodes.get(manifestDaemonProgressNodeKey(node_id)) orelse return error.InvalidDaemonProgress;
+                node.completeOne();
             },
             .finish => |finish| {
                 const key = manifestDaemonProgressNodeKey(finish.node_id);
-                if (self.nodes.fetchRemove(key)) |entry| entry.value.finish(finish.result);
+                const entry = self.nodes.fetchRemove(key) orelse return error.InvalidDaemonProgress;
+                entry.value.finish(finish.result);
             },
             .cache_event => |cache_event| {
-                if (self.nodes.get(manifestDaemonProgressNodeKey(cache_event.node_id))) |node| {
-                    const owned_label = self.dupeString(cache_event.label) catch return;
-                    const owned_item = self.dupeString(cache_event.item) catch return;
-                    switch (cache_event.kind) {
-                        .hit => node.cacheHit(owned_label, owned_item),
-                        .miss => node.cacheMiss(owned_label, owned_item),
-                    }
+                const node = self.nodes.get(manifestDaemonProgressNodeKey(cache_event.node_id)) orelse return error.InvalidDaemonProgress;
+                const owned_label = try self.dupeString(cache_event.label);
+                const owned_item = try self.dupeString(cache_event.item);
+                switch (cache_event.kind) {
+                    .hit => node.cacheHit(owned_label, owned_item),
+                    .miss => node.cacheMiss(owned_label, owned_item),
                 }
             },
         }
@@ -9333,6 +11642,113 @@ test "manifest daemon progress records round trip direct output events" {
     }
 }
 
+test "P4J2: manifest daemon request reports requested progress setup failure" {
+    const allocator = std.testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xd5);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0x1237);
+    defer allocator.free(request_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+
+    const response_path = try manifestDaemonResponsePath(allocator, invocation_identity, 0x1237);
+    defer allocator.free(response_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, response_path) catch {};
+    std.Io.Dir.cwd().deleteFile(global_io, response_path) catch {};
+
+    const blocker_path = try std.fmt.allocPrint(allocator, "{s}/p4j2-progress-blocker-d5", .{MANIFEST_DAEMON_DIR});
+    defer allocator.free(blocker_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, blocker_path) catch {};
+    std.Io.Dir.cwd().deleteFile(global_io, blocker_path) catch {};
+    try writeFile(blocker_path, "not a directory");
+
+    const progress_path = try std.fmt.allocPrint(allocator, "{s}/stream.progress", .{blocker_path});
+    defer allocator.free(progress_path);
+
+    const build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    try writeManifestDaemonRequestFile(
+        allocator,
+        request_path,
+        .build,
+        invocation_identity,
+        response_path,
+        progress_path,
+        ".",
+        "default",
+        build_opts,
+        .{},
+        false,
+        false,
+        null,
+    );
+
+    var daemon_state: ManifestDaemonState = .{};
+    defer daemon_state.deinit(allocator);
+
+    try std.testing.expect(!try handleManifestDaemonRequestFile(allocator, request_path, &daemon_state));
+
+    const response = try readManifestDaemonResponseFile(allocator, allocator, response_path);
+    defer deinitManifestDaemonResponse(allocator, response);
+    switch (response) {
+        .failed => |message| try std.testing.expectEqualStrings("ManifestDaemonProgressSetupFailed", message),
+        .ok => return error.ExpectedManifestDaemonProgressSetupFailure,
+    }
+}
+
+test "P4J2: manifest daemon progress apply propagates event allocation failure" {
+    const allocator = std.testing.allocator;
+    const progress_path = try std.fmt.allocPrint(allocator, "{s}/p4j2-progress-alloc-failure.progress", .{MANIFEST_DAEMON_DIR});
+    defer allocator.free(progress_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, progress_path) catch {};
+    std.Io.Dir.cwd().deleteFile(global_io, progress_path) catch {};
+    try truncateManifestDaemonProgress(progress_path);
+
+    var reporter = zap.progress.Reporter.init("Compiling", false);
+    const root_node = reporter.rootNode();
+
+    var fixed_buffer: [0]u8 = .{};
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+    var poller = try ManifestDaemonProgressPoller.init(fixed_allocator.allocator(), progress_path, root_node);
+    defer poller.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        poller.apply(.{ .stage = "Planning target :default" }),
+    );
+}
+
+test "P4J2: manifest daemon progress apply propagates node start failure" {
+    const allocator = std.testing.allocator;
+    const progress_path = try std.fmt.allocPrint(allocator, "{s}/p4j2-progress-node-failure.progress", .{MANIFEST_DAEMON_DIR});
+    defer allocator.free(progress_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, progress_path) catch {};
+    std.Io.Dir.cwd().deleteFile(global_io, progress_path) catch {};
+    try truncateManifestDaemonProgress(progress_path);
+
+    var reporter = zap.progress.Reporter.init("Compiling", false);
+    const root_node = reporter.rootNode();
+    while (true) {
+        _ = root_node.start("reserved progress slot", .{}) catch |err| {
+            try std.testing.expectEqual(error.ProgressNodeCapacityExceeded, err);
+            break;
+        };
+    }
+
+    var poller = try ManifestDaemonProgressPoller.init(allocator, progress_path, root_node);
+    defer poller.deinit();
+
+    try std.testing.expectError(
+        error.ProgressNodeCapacityExceeded,
+        poller.apply(.{ .begin = .{
+            .parent_id = .{ .index = 0, .generation = 1 },
+            .node_id = .{ .index = 7, .generation = 42 },
+            .label = "overflowing progress node",
+            .options = .{},
+        } }),
+    );
+}
+
 test "manifest daemon request names are tied to full invocation identities" {
     var identity: build_cache.InvocationIdentity = undefined;
     @memset(&identity, 0xab);
@@ -9369,6 +11785,160 @@ test "manifest daemon request header parser identifies warm build and shutdown m
         bytes[6] = case[0];
         try std.testing.expectEqual(case[1], try readManifestDaemonRequestModeHeader(&bytes));
     }
+}
+
+test "manifest daemon response reader rejects trailing bytes" {
+    const allocator = std.testing.allocator;
+    const run_args = [_][]const u8{"--list"};
+    const steps = [_]zap.builder.BuildConfig.Step{
+        .{ .compile = .{} },
+        .{ .run = .{ .args = &run_args, .forward_args = true } },
+    };
+    const pipeline: zap.builder.BuildConfig.Pipeline = .{ .steps = &steps };
+
+    var serialized: std.Io.Writer.Allocating = .init(allocator);
+    defer serialized.deinit();
+    try serialized.writer.writeInt(u32, MANIFEST_DAEMON_RESPONSE_MAGIC, .little);
+    try serialized.writer.writeInt(u16, MANIFEST_DAEMON_PROTOCOL_VERSION, .little);
+    try serialized.writer.writeByte(@intFromEnum(ManifestDaemonResponseStatus.ok));
+    try serialized.writer.writeByte(0);
+    try writeDaemonOptionalString(&serialized.writer, "native-target");
+    try writeDaemonString(&serialized.writer, "zig-out/bin/app");
+    try writeDaemonPipeline(&serialized.writer, @as(?zap.builder.BuildConfig.Pipeline, pipeline));
+    try serialized.writer.writeAll("trailing");
+
+    var reader: std.Io.Reader = .fixed(serialized.written());
+    try std.testing.expectError(
+        error.InvalidDaemonProtocol,
+        readManifestDaemonResponse(allocator, &reader),
+    );
+}
+
+test "manifest daemon request reader rejects trailing bytes" {
+    const allocator = std.testing.allocator;
+
+    var invocation_identity: build_cache.InvocationIdentity = undefined;
+    @memset(&invocation_identity, 0xbc);
+
+    var build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer build_opts.deinit(allocator);
+    try build_opts.put(allocator, "profile", "dev");
+
+    var serialized: std.Io.Writer.Allocating = .init(allocator);
+    defer serialized.deinit();
+    try writeManifestDaemonRequest(
+        &serialized.writer,
+        .build,
+        invocation_identity,
+        "response.zapd",
+        "progress.zapd",
+        "/tmp/project",
+        "app",
+        build_opts,
+        .{
+            .memory = "Memory.ARC",
+            .target = "aarch64-macos-none",
+            .cpu = "apple_m1",
+        },
+        true,
+        true,
+        "/opt/zap/lib",
+    );
+    try serialized.writer.writeAll("trailing");
+
+    var reader: std.Io.Reader = .fixed(serialized.written());
+    try std.testing.expectError(
+        error.InvalidDaemonProtocol,
+        readManifestDaemonRequest(allocator, &reader),
+    );
+}
+
+test "P4J2: manifest eval cache required write preserves serialization OOM" {
+    const allocator = std.testing.allocator;
+
+    const NoopManifestEvalCacheFileWriter = struct {
+        fn writeFileAtomic(
+            _: @This(),
+            file_allocator: std.mem.Allocator,
+            path: []const u8,
+            contents: []const u8,
+        ) !void {
+            _ = file_allocator;
+            _ = path;
+            _ = contents;
+        }
+    };
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0x42);
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        writeRequiredManifestEvalCacheWithWriter(
+            failing_allocator.allocator(),
+            "unused.manifest-eval",
+            identity,
+            .{
+                .config = .{
+                    .name = "zap_test",
+                    .version = "1.2.3",
+                    .kind = .bin,
+                },
+                .dependencies = &.{},
+                .result_hash = 0,
+            },
+            NoopManifestEvalCacheFileWriter{},
+        ),
+    );
+    try std.testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: manifest eval cache required write maps install failures to cache metadata errors" {
+    const allocator = std.testing.allocator;
+
+    const FailingManifestEvalCacheFileWriter = struct {
+        calls: usize = 0,
+        bytes_len: usize = 0,
+
+        fn writeFileAtomic(
+            self: *@This(),
+            file_allocator: std.mem.Allocator,
+            path: []const u8,
+            contents: []const u8,
+        ) !void {
+            _ = file_allocator;
+            _ = path;
+            self.calls += 1;
+            self.bytes_len = contents.len;
+            return error.AccessDenied;
+        }
+    };
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0x42);
+    var file_writer = FailingManifestEvalCacheFileWriter{};
+
+    try std.testing.expectError(
+        error.CacheMetadataError,
+        writeRequiredManifestEvalCacheWithWriter(
+            allocator,
+            "unused.manifest-eval",
+            identity,
+            .{
+                .config = .{
+                    .name = "zap_test",
+                    .version = "1.2.3",
+                    .kind = .bin,
+                },
+                .dependencies = &.{},
+                .result_hash = 0,
+            },
+            &file_writer,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), file_writer.calls);
+    try std.testing.expect(file_writer.bytes_len > 0);
 }
 
 test "manifest eval cache round trips full manifest config" {
@@ -9519,6 +12089,86 @@ test "manifest eval cache rejects mismatched invocation identity" {
     );
 }
 
+test "manifest eval cache lookup returns null for missing entry" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cache_path = try std.fs.path.join(allocator, &.{ tmp_path, "missing.manifest-eval" });
+    defer allocator.free(cache_path);
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0x42);
+
+    try std.testing.expect((try tryReadManifestEvalCache(allocator, allocator, cache_path, identity)) == null);
+}
+
+test "manifest eval cache lookup propagates malformed entry errors" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "default.manifest-eval", .data = "not a manifest eval cache" });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cache_path = try std.fs.path.join(allocator, &.{ tmp_path, "default.manifest-eval" });
+    defer allocator.free(cache_path);
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0x42);
+
+    try std.testing.expectError(
+        error.InvalidManifestEvalCache,
+        tryReadManifestEvalCache(allocator, allocator, cache_path, identity),
+    );
+}
+
+test "manifest eval cache rejects trailing garbage" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cache_path = try std.fs.path.join(allocator, &.{ tmp_path, "default.manifest-eval" });
+    defer allocator.free(cache_path);
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0x42);
+
+    try writeManifestEvalCache(allocator, cache_path, identity, .{
+        .config = .{
+            .name = "zap_test",
+            .version = "1.2.3",
+            .kind = .bin,
+        },
+        .dependencies = &.{},
+        .result_hash = 0x1234_5678,
+    });
+
+    const cache_bytes = try std.Io.Dir.cwd().readFileAlloc(global_io, cache_path, allocator, .limited(MAX_MANIFEST_EVAL_CACHE_BYTES));
+    defer allocator.free(cache_bytes);
+    const corrupt_bytes = try allocator.alloc(u8, cache_bytes.len + 4);
+    defer allocator.free(corrupt_bytes);
+    @memcpy(corrupt_bytes[0..cache_bytes.len], cache_bytes);
+    @memcpy(corrupt_bytes[cache_bytes.len..], "junk");
+
+    try std.Io.Dir.cwd().writeFile(global_io, .{
+        .sub_path = cache_path,
+        .data = corrupt_bytes,
+    });
+
+    var cached = readManifestEvalCache(allocator, allocator, cache_path, identity) catch |err| {
+        try std.testing.expectEqual(error.InvalidManifestEvalCache, err);
+        return;
+    };
+    cached.deinit();
+    try std.testing.expect(false);
+}
+
 test "manifest eval cache invalidates when CTFE file dependency changes" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
@@ -9562,6 +12212,54 @@ test "manifest eval cache invalidates when CTFE file dependency changes" {
     );
 }
 
+test "manifest eval cache lookup propagates CTFE dependency validation OOM" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const dependency_content = try allocator.alloc(u8, 4096);
+    defer allocator.free(dependency_content);
+    @memset(dependency_content, 'x');
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "manifest-input.txt", .data = dependency_content });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const cache_path = try std.fs.path.join(allocator, &.{ tmp_path, "default.manifest-eval" });
+    defer allocator.free(cache_path);
+    const dep_path = try std.fs.path.join(allocator, &.{ tmp_path, "manifest-input.txt" });
+    defer allocator.free(dep_path);
+
+    var identity: build_cache.InvocationIdentity = undefined;
+    @memset(&identity, 0x42);
+    const dependencies = [_]zap.ctfe.CtDependency{
+        .{ .file = .{
+            .path = dep_path,
+            .content_hash = std.hash.Wyhash.hash(0, dependency_content),
+        } },
+    };
+
+    try writeManifestEvalCache(allocator, cache_path, identity, .{
+        .config = .{
+            .name = "zap_test",
+            .version = "1.2.3",
+            .kind = .bin,
+        },
+        .dependencies = &dependencies,
+        .result_hash = 0,
+    });
+
+    const cache_bytes = try std.Io.Dir.cwd().readFileAlloc(global_io, cache_path, allocator, .limited(MAX_MANIFEST_EVAL_CACHE_BYTES));
+    defer allocator.free(cache_bytes);
+    const scratch_bytes = try allocator.alloc(u8, cache_bytes.len + 1024);
+    defer allocator.free(scratch_bytes);
+    var scratch_allocator = std.heap.FixedBufferAllocator.init(scratch_bytes);
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        tryReadManifestEvalCache(allocator, scratch_allocator.allocator(), cache_path, identity),
+    );
+}
+
 fn manifestDaemonNowMs() i64 {
     return Io.Timestamp.now(global_io, .awake).toMilliseconds();
 }
@@ -9581,12 +12279,12 @@ fn nextManifestDaemonRequestId(invocation_identity: build_cache.InvocationIdenti
     return hasher.final();
 }
 
-fn writeDaemonString(writer: *std.Io.Writer, value: []const u8) !void {
+fn writeDaemonString(writer: anytype, value: []const u8) !void {
     try writer.writeInt(u32, @intCast(value.len), .little);
     try writer.writeAll(value);
 }
 
-fn writeDaemonOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+fn writeDaemonOptionalString(writer: anytype, value: ?[]const u8) !void {
     try writer.writeByte(if (value != null) 1 else 0);
     if (value) |some| try writeDaemonString(writer, some);
 }
@@ -9608,7 +12306,7 @@ fn readDaemonOptionalString(allocator: std.mem.Allocator, reader: *std.Io.Reader
     };
 }
 
-fn writeDaemonPipeline(writer: *std.Io.Writer, pipeline: ?zap.builder.BuildConfig.Pipeline) !void {
+fn writeDaemonPipeline(writer: anytype, pipeline: ?zap.builder.BuildConfig.Pipeline) !void {
     try writer.writeByte(if (pipeline != null) 1 else 0);
     const concrete_pipeline = pipeline orelse return;
     try writer.writeInt(u32, @intCast(concrete_pipeline.steps.len), .little);
@@ -9677,7 +12375,9 @@ fn readDaemonPipeline(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?za
                 const arg_count = try reader.takeInt(u32, .little);
                 var arg_index: u32 = 0;
                 while (arg_index < arg_count) : (arg_index += 1) {
-                    try args.append(allocator, try readDaemonString(allocator, reader));
+                    const arg = try readDaemonString(allocator, reader);
+                    errdefer allocator.free(arg);
+                    try args.append(allocator, arg);
                 }
                 const owned_args = try args.toOwnedSlice(allocator);
                 args_transferred = true;
@@ -9698,6 +12398,36 @@ fn readDaemonPipeline(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?za
     return .{ .steps = try steps.toOwnedSlice(allocator) };
 }
 
+fn exerciseReadDaemonPipelineRunArgsAllocationFailures(allocator: std.mem.Allocator) !void {
+    const bytes = [_]u8{
+        1, // pipeline present
+        1, 0, 0, 0, // one step
+        2, // run step
+        1, // forward args
+        1, 0, 0, 0, // one arg
+        6,   0,   0,   0, // arg byte length
+        's', 'e', 'r', 'v',
+        'e', 'r',
+    };
+    var reader: std.Io.Reader = .fixed(&bytes);
+    const pipeline = (try readDaemonPipeline(allocator, &reader)).?;
+    defer freeBuildPipeline(allocator, pipeline);
+
+    try testing.expectEqual(@as(usize, 1), pipeline.steps.len);
+    try testing.expect(pipeline.steps[0] == .run);
+    try testing.expect(pipeline.steps[0].run.forward_args);
+    try testing.expectEqual(@as(usize, 1), pipeline.steps[0].run.args.len);
+    try testing.expectEqualStrings("server", pipeline.steps[0].run.args[0]);
+}
+
+test "P4J2: readDaemonPipeline frees decoded run arg when args append fails" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseReadDaemonPipelineRunArgsAllocationFailures,
+        .{},
+    );
+}
+
 fn writeDaemonBuildOverrides(writer: *std.Io.Writer, overrides: BuildOverrides) !void {
     try writer.writeByte(if (overrides.optimize != null) 1 else 0);
     if (overrides.optimize) |optimize| {
@@ -9710,6 +12440,8 @@ fn writeDaemonBuildOverrides(writer: *std.Io.Writer, overrides: BuildOverrides) 
 
 fn readDaemonBuildOverrides(allocator: std.mem.Allocator, reader: *std.Io.Reader) !BuildOverrides {
     var overrides: BuildOverrides = .{};
+    errdefer deinitManifestDaemonBuildOverrides(allocator, overrides);
+
     const has_optimize = try reader.takeInt(u8, .little);
     switch (has_optimize) {
         0 => {},
@@ -9766,7 +12498,7 @@ fn writeManifestDaemonRequest(
     }
 }
 
-fn readManifestDaemonRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !ManifestDaemonRequest {
+fn readManifestDaemonRequestPayload(allocator: std.mem.Allocator, reader: *std.Io.Reader) !ManifestDaemonRequest {
     if (try reader.takeInt(u32, .little) != MANIFEST_DAEMON_REQUEST_MAGIC) return error.InvalidDaemonProtocol;
     if (try reader.takeInt(u16, .little) != MANIFEST_DAEMON_PROTOCOL_VERSION) return error.InvalidDaemonProtocol;
     const mode_tag = try reader.takeInt(u8, .little);
@@ -9791,18 +12523,28 @@ fn readManifestDaemonRequest(allocator: std.mem.Allocator, reader: *std.Io.Reade
         else => return error.InvalidDaemonProtocol,
     };
     const response_path = try readDaemonOptionalString(allocator, reader);
+    errdefer if (response_path) |response_path_value| allocator.free(response_path_value);
     const progress_path = try readDaemonOptionalString(allocator, reader);
+    errdefer if (progress_path) |progress_path_value| allocator.free(progress_path_value);
     const project_root = try readDaemonString(allocator, reader);
+    errdefer allocator.free(project_root);
     const target_name = try readDaemonString(allocator, reader);
+    errdefer allocator.free(target_name);
     const zap_lib_dir_override = try readDaemonOptionalString(allocator, reader);
+    errdefer if (zap_lib_dir_override) |zap_lib_dir_override_value| allocator.free(zap_lib_dir_override_value);
     const build_overrides = try readDaemonBuildOverrides(allocator, reader);
+    errdefer deinitManifestDaemonBuildOverrides(allocator, build_overrides);
 
     var build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    errdefer deinitManifestDaemonBuildOpts(allocator, build_opts);
     const build_opt_count = try reader.takeInt(u32, .little);
     var index: u32 = 0;
     while (index < build_opt_count) : (index += 1) {
         const key = try readDaemonString(allocator, reader);
+        errdefer allocator.free(key);
         const value = try readDaemonString(allocator, reader);
+        errdefer allocator.free(value);
+        if (build_opts.contains(key)) return error.InvalidDaemonProtocol;
         try build_opts.put(allocator, key, value);
     }
 
@@ -9819,6 +12561,13 @@ fn readManifestDaemonRequest(allocator: std.mem.Allocator, reader: *std.Io.Reade
         .trace_enabled = trace_enabled,
         .zap_lib_dir_override = zap_lib_dir_override,
     };
+}
+
+fn readManifestDaemonRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !ManifestDaemonRequest {
+    const request = try readManifestDaemonRequestPayload(allocator, reader);
+    errdefer deinitManifestDaemonRequest(allocator, request);
+    if (reader.seek != reader.end) return error.InvalidDaemonProtocol;
+    return request;
 }
 
 fn writeManifestDaemonOkResponse(writer: *std.Io.Writer, state: *const IncrementalWatchState) !void {
@@ -9842,7 +12591,7 @@ fn writeManifestDaemonErrorResponse(writer: *std.Io.Writer, message: []const u8)
     try writeDaemonString(writer, message);
 }
 
-fn readManifestDaemonResponse(
+fn readManifestDaemonResponsePayload(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
 ) !ManifestDaemonResponse {
@@ -9879,8 +12628,22 @@ fn readManifestDaemonResponse(
                 .pipeline = pipeline,
             } };
         },
-        .failed => .{ .failed = try readDaemonString(allocator, reader) },
+        .failed => blk: {
+            const message = try readDaemonString(allocator, reader);
+            errdefer allocator.free(message);
+            break :blk .{ .failed = message };
+        },
     };
+}
+
+fn readManifestDaemonResponse(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+) !ManifestDaemonResponse {
+    const response = try readManifestDaemonResponsePayload(allocator, reader);
+    errdefer deinitManifestDaemonResponse(allocator, response);
+    if (reader.seek != reader.end) return error.InvalidDaemonProtocol;
+    return response;
 }
 
 const ManifestDaemonEndpoint = struct {
@@ -9899,6 +12662,79 @@ fn closeFd(fd: std.posix.fd_t, nonblocking: bool) void {
         .flags = .{ .nonblocking = nonblocking },
     };
     file.close(global_io);
+}
+
+fn manifestDaemonPathExists(path: []const u8) !bool {
+    std.Io.Dir.cwd().access(global_io, path, .{}) catch |err| {
+        if (isMissingPathAccessError(err)) return false;
+        return err;
+    };
+    return true;
+}
+
+fn deleteManifestDaemonFileIfPresent(path: []const u8) !void {
+    std.Io.Dir.cwd().deleteFile(global_io, path) catch |err| {
+        if (isMissingPathAccessError(err)) return;
+        return err;
+    };
+}
+
+test "P4J2: manifest daemon path existence preserves missing and present states" {
+    const allocator = testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const missing_path = try std.fs.path.join(allocator, &.{ tmp_path, "missing.fifo" });
+    defer allocator.free(missing_path);
+    try testing.expect(!(try manifestDaemonPathExists(missing_path)));
+
+    const present_path = try std.fs.path.join(allocator, &.{ tmp_path, "present.fifo" });
+    defer allocator.free(present_path);
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "present.fifo", .data = "" });
+    try testing.expect(try manifestDaemonPathExists(present_path));
+}
+
+test "P4J2: manifest daemon path existence treats not-directory components as missing" {
+    const allocator = testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "endpoint-parent", .data = "not a directory" });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const endpoint_path = try std.fs.path.join(allocator, &.{ tmp_path, "endpoint-parent/daemon.fifo" });
+    defer allocator.free(endpoint_path);
+
+    try testing.expect(!(try manifestDaemonPathExists(endpoint_path)));
+}
+
+test "P4J2: manifest daemon path existence propagates non-missing access failures" {
+    const allocator = testing.allocator;
+
+    const too_long_prefix = try allocator.alloc(u8, std.fs.max_path_bytes + 1);
+    defer allocator.free(too_long_prefix);
+    @memset(too_long_prefix, 'a');
+    const endpoint_path = try std.fmt.allocPrint(allocator, "{s}/daemon.fifo", .{too_long_prefix});
+    defer allocator.free(endpoint_path);
+
+    try testing.expectError(error.NameTooLong, manifestDaemonPathExists(endpoint_path));
+}
+
+fn isBenignManifestDaemonEndpointOpenError(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.NoDevice,
+        error.WouldBlock,
+        error.BrokenPipe,
+        error.ConnectionRefused,
+        => true,
+        else => false,
+    };
 }
 
 fn openManifestDaemonEndpointForWrite(endpoint_path: []const u8) !std.posix.fd_t {
@@ -9974,22 +12810,22 @@ fn notifyManifestDaemon(endpoint_path: []const u8, request_path: []const u8) !vo
     try writeAllFd(write_fd, "\n");
 }
 
-fn waitForManifestDaemon(allocator: std.mem.Allocator, endpoint_path: []const u8) bool {
+fn waitForManifestDaemon(allocator: std.mem.Allocator, endpoint_path: []const u8) !bool {
     var attempts: usize = 0;
     while (attempts < 80) : (attempts += 1) {
-        if (manifestDaemonEndpointIsLive(allocator, endpoint_path)) return true;
+        if (try manifestDaemonEndpointIsLive(allocator, endpoint_path)) return true;
         global_io.sleep(std.Io.Duration.fromMilliseconds(25), .awake) catch {};
     }
     return false;
 }
 
-fn waitForManifestDaemonEndpointRemoval(endpoint_path: []const u8) bool {
+fn waitForManifestDaemonEndpointRemoval(endpoint_path: []const u8) !bool {
     var attempts: usize = 0;
     while (attempts < 80) : (attempts += 1) {
-        if (!cwdPathExists(endpoint_path)) return true;
+        if (!try manifestDaemonPathExists(endpoint_path)) return true;
         global_io.sleep(std.Io.Duration.fromMilliseconds(25), .awake) catch {};
     }
-    return !cwdPathExists(endpoint_path);
+    return !(try manifestDaemonPathExists(endpoint_path));
 }
 
 fn hexValue(byte: u8) ?u8 {
@@ -10025,8 +12861,14 @@ fn parseManifestDaemonInvocationIdentityFromRequestName(name: []const u8) ?build
     return parseManifestDaemonInvocationIdentityHex(name[0..dot_index]);
 }
 
-fn manifestDaemonRequestNameMatchesIdentity(name: []const u8, invocation_identity: build_cache.InvocationIdentity) bool {
-    if (!std.mem.endsWith(u8, name, ".req")) return false;
+fn parseManifestDaemonInvocationIdentityFromAckName(name: []const u8) ?build_cache.InvocationIdentity {
+    if (!std.mem.endsWith(u8, name, ".ack")) return null;
+    const dot_index = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+    return parseManifestDaemonInvocationIdentityHex(name[0..dot_index]);
+}
+
+fn manifestDaemonRequestArtifactNameMatchesIdentity(name: []const u8, invocation_identity: build_cache.InvocationIdentity, suffix: []const u8) bool {
+    if (!std.mem.endsWith(u8, name, suffix)) return false;
 
     var identity_hex_buffer: [@sizeOf(build_cache.InvocationIdentity) * 2]u8 = undefined;
     for (invocation_identity, 0..) |byte, index| {
@@ -10034,8 +12876,16 @@ fn manifestDaemonRequestNameMatchesIdentity(name: []const u8, invocation_identit
         identity_hex_buffer[index * 2 + 1] = std.fmt.digitToChar(byte & 0xf, .lower);
     }
     if (!std.mem.startsWith(u8, name, &identity_hex_buffer)) return false;
-    if (name.len <= identity_hex_buffer.len + ".req".len) return false;
+    if (name.len <= identity_hex_buffer.len + suffix.len) return false;
     return name[identity_hex_buffer.len] == '.';
+}
+
+fn manifestDaemonRequestNameMatchesIdentity(name: []const u8, invocation_identity: build_cache.InvocationIdentity) bool {
+    return manifestDaemonRequestArtifactNameMatchesIdentity(name, invocation_identity, ".req");
+}
+
+fn manifestDaemonRequestAckNameMatchesIdentity(name: []const u8, invocation_identity: build_cache.InvocationIdentity) bool {
+    return manifestDaemonRequestArtifactNameMatchesIdentity(name, invocation_identity, ".ack");
 }
 
 fn readManifestDaemonRequestModeHeader(bytes: []const u8) !ManifestDaemonRequestMode {
@@ -10069,57 +12919,127 @@ fn readManifestDaemonRequestModeFromFile(path: []const u8) !ManifestDaemonReques
     return readManifestDaemonRequestModeHeader(&header);
 }
 
+const ManifestDaemonPendingRequestStatus = enum {
+    none,
+    unacknowledged,
+    acknowledged,
+};
+
+fn manifestDaemonPendingRequestStatus(
+    allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
+    mode_filter: ?ManifestDaemonRequestMode,
+) !ManifestDaemonPendingRequestStatus {
+    var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return .none,
+        else => |open_err| return open_err,
+    };
+    defer dir.close(global_io);
+
+    var saw_unacknowledged = false;
+    var iterator = dir.iterate();
+    while (try iterator.next(global_io)) |entry| {
+        if (!manifestDaemonRequestNameMatchesIdentity(entry.name, invocation_identity)) continue;
+
+        const request_path = try std.fs.path.join(allocator, &.{ MANIFEST_DAEMON_DIR, entry.name });
+        defer allocator.free(request_path);
+
+        if (mode_filter) |expected_mode| {
+            const request_mode = try readManifestDaemonRequestModeFromFile(request_path);
+            if (request_mode != expected_mode) continue;
+        }
+
+        const ack_path = try manifestDaemonRequestAckPath(allocator, request_path);
+        defer allocator.free(ack_path);
+        if (try manifestDaemonPathExists(ack_path)) return .acknowledged;
+        saw_unacknowledged = true;
+    }
+
+    return if (saw_unacknowledged) .unacknowledged else .none;
+}
+
 fn manifestDaemonHasPendingRequest(
     allocator: std.mem.Allocator,
     invocation_identity: build_cache.InvocationIdentity,
     mode_filter: ?ManifestDaemonRequestMode,
-) bool {
-    var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch return false;
+) !bool {
+    const status = try manifestDaemonPendingRequestStatus(allocator, invocation_identity, mode_filter);
+    return status != .none;
+}
+
+fn deleteManifestDaemonPendingRequestEntryIfMatched(
+    allocator: std.mem.Allocator,
+    daemon_dir: []const u8,
+    invocation_identity: build_cache.InvocationIdentity,
+    entry_name: []const u8,
+) !void {
+    if (!manifestDaemonRequestNameMatchesIdentity(entry_name, invocation_identity) and
+        !manifestDaemonRequestAckNameMatchesIdentity(entry_name, invocation_identity)) return;
+    const request_path = try std.fs.path.join(allocator, &.{ daemon_dir, entry_name });
+    defer allocator.free(request_path);
+    try deleteManifestDaemonFileIfPresent(request_path);
+}
+
+fn deleteManifestDaemonPendingRequestsFromIterator(
+    allocator: std.mem.Allocator,
+    daemon_dir: []const u8,
+    invocation_identity: build_cache.InvocationIdentity,
+    iterator: anytype,
+) !void {
+    while (try iterator.next(global_io)) |entry| {
+        try deleteManifestDaemonPendingRequestEntryIfMatched(allocator, daemon_dir, invocation_identity, entry.name);
+    }
+}
+
+fn deleteManifestDaemonPendingRequestsInDir(
+    allocator: std.mem.Allocator,
+    daemon_dir: []const u8,
+    invocation_identity: build_cache.InvocationIdentity,
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(global_io, daemon_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => |open_err| return open_err,
+    };
     defer dir.close(global_io);
 
     var iterator = dir.iterate();
-    while (iterator.next(global_io) catch null) |entry| {
-        if (!manifestDaemonRequestNameMatchesIdentity(entry.name, invocation_identity)) continue;
-        if (mode_filter == null) return true;
-
-        const request_path = std.fs.path.join(allocator, &.{ MANIFEST_DAEMON_DIR, entry.name }) catch return true;
-        defer allocator.free(request_path);
-        const request_mode = readManifestDaemonRequestModeFromFile(request_path) catch return true;
-        if (request_mode == mode_filter.?) return true;
-    }
-    return false;
+    try deleteManifestDaemonPendingRequestsFromIterator(allocator, daemon_dir, invocation_identity, &iterator);
 }
 
 fn deleteManifestDaemonPendingRequests(
     allocator: std.mem.Allocator,
     invocation_identity: build_cache.InvocationIdentity,
-) void {
-    var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch return;
-    defer dir.close(global_io);
-
-    var iterator = dir.iterate();
-    while (iterator.next(global_io) catch null) |entry| {
-        if (!manifestDaemonRequestNameMatchesIdentity(entry.name, invocation_identity)) continue;
-        const request_path = std.fs.path.join(allocator, &.{ MANIFEST_DAEMON_DIR, entry.name }) catch continue;
-        defer allocator.free(request_path);
-        std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
-    }
+) !void {
+    try deleteManifestDaemonPendingRequestsInDir(allocator, MANIFEST_DAEMON_DIR, invocation_identity);
 }
 
-fn cleanupManifestDaemonOrphanRequests(allocator: std.mem.Allocator) void {
-    var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch return;
+fn cleanupManifestDaemonOrphanRequestArtifact(
+    allocator: std.mem.Allocator,
+    artifact_name: []const u8,
+) !void {
+    const invocation_identity =
+        parseManifestDaemonInvocationIdentityFromRequestName(artifact_name) orelse
+        parseManifestDaemonInvocationIdentityFromAckName(artifact_name) orelse
+        return;
+    const endpoint_path = try manifestDaemonEndpointPath(allocator, invocation_identity);
+    defer allocator.free(endpoint_path);
+    if (try manifestDaemonPathExists(endpoint_path)) return;
+
+    const daemon_artifact_path = try std.fs.path.join(allocator, &.{ MANIFEST_DAEMON_DIR, artifact_name });
+    defer allocator.free(daemon_artifact_path);
+    try deleteManifestDaemonFileIfPresent(daemon_artifact_path);
+}
+
+fn cleanupManifestDaemonOrphanRequests(allocator: std.mem.Allocator) !void {
+    var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => |open_err| return open_err,
+    };
     defer dir.close(global_io);
 
     var iterator = dir.iterate();
-    while (iterator.next(global_io) catch null) |entry| {
-        const invocation_identity = parseManifestDaemonInvocationIdentityFromRequestName(entry.name) orelse continue;
-        const endpoint_path = manifestDaemonEndpointPath(allocator, invocation_identity) catch continue;
-        defer allocator.free(endpoint_path);
-        if (cwdPathExists(endpoint_path)) continue;
-
-        const request_path = std.fs.path.join(allocator, &.{ MANIFEST_DAEMON_DIR, entry.name }) catch continue;
-        defer allocator.free(request_path);
-        std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+    while (try iterator.next(global_io)) |entry| {
+        try cleanupManifestDaemonOrphanRequestArtifact(allocator, entry.name);
     }
 }
 
@@ -10141,67 +13061,98 @@ fn readManifestDaemonPid(allocator: std.mem.Allocator, pid_path: []const u8) !st
     return std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch error.InvalidDaemonPid;
 }
 
-fn manifestDaemonProcessIsAlive(pid: std.posix.pid_t) bool {
+fn manifestDaemonProcessIsAlive(pid: std.posix.pid_t) !bool {
     if (pid <= 0) return false;
     const no_signal: std.posix.SIG = @enumFromInt(0);
-    switch (std.posix.errno(std.posix.system.kill(pid, no_signal))) {
-        .SUCCESS, .PERM => return true,
-        .SRCH => return false,
-        else => return false,
-    }
+    std.posix.kill(pid, no_signal) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        error.PermissionDenied => return true,
+        else => |probe_err| return probe_err,
+    };
+    return true;
 }
 
-fn manifestDaemonEndpointIsLive(allocator: std.mem.Allocator, endpoint_path: []const u8) bool {
-    const pid_path = manifestDaemonPidPathFromEndpointPath(allocator, endpoint_path) catch return false;
+fn manifestDaemonEndpointIsLive(allocator: std.mem.Allocator, endpoint_path: []const u8) !bool {
+    const pid_path = try manifestDaemonPidPathFromEndpointPath(allocator, endpoint_path);
     defer allocator.free(pid_path);
 
-    const pid = readManifestDaemonPid(allocator, pid_path) catch return false;
-    if (!manifestDaemonProcessIsAlive(pid)) return false;
+    const pid = readManifestDaemonPid(allocator, pid_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.InvalidDaemonPid => return false,
+        else => |read_pid_err| return read_pid_err,
+    };
+    if (!try manifestDaemonProcessIsAlive(pid)) return false;
 
-    if (openManifestDaemonEndpointForWrite(endpoint_path)) |write_fd| {
-        closeFd(write_fd, true);
-        return true;
-    } else |_| {
-        return false;
-    }
+    const write_fd = openManifestDaemonEndpointForWrite(endpoint_path) catch |err| {
+        if (isBenignManifestDaemonEndpointOpenError(err)) return false;
+        return err;
+    };
+    closeFd(write_fd, true);
+    return true;
 }
 
 fn cleanupManifestDaemonEndpointFiles(
     allocator: std.mem.Allocator,
     invocation_identity: build_cache.InvocationIdentity,
     endpoint_path: []const u8,
-) void {
-    std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch {};
-    const pid_path = manifestDaemonPidPath(allocator, invocation_identity) catch return;
+) !void {
+    const pid_path = try manifestDaemonPidPath(allocator, invocation_identity);
     defer allocator.free(pid_path);
-    std.Io.Dir.cwd().deleteFile(global_io, pid_path) catch {};
-    deleteManifestDaemonPendingRequests(allocator, invocation_identity);
+    try deleteManifestDaemonPendingRequests(allocator, invocation_identity);
+    try deleteManifestDaemonFileIfPresent(pid_path);
+    try deleteManifestDaemonFileIfPresent(endpoint_path);
+}
+
+fn signalManifestDaemonProcess(pid: std.posix.pid_t, signal: std.posix.SIG) !void {
+    std.posix.kill(pid, signal) catch |err| switch (err) {
+        error.ProcessNotFound => return,
+        else => |kill_err| return kill_err,
+    };
+}
+
+const ManifestDaemonSignalFn = *const fn (std.posix.pid_t, std.posix.SIG) anyerror!void;
+
+fn waitForManifestDaemonProcessExit(pid: std.posix.pid_t) !bool {
+    var attempts: usize = 0;
+    while (attempts < 80) : (attempts += 1) {
+        if (!try manifestDaemonProcessIsAlive(pid)) return true;
+        try global_io.sleep(std.Io.Duration.fromMilliseconds(25), .awake);
+    }
+    return !(try manifestDaemonProcessIsAlive(pid));
 }
 
 fn terminateManifestDaemonEndpoint(
     allocator: std.mem.Allocator,
     invocation_identity: build_cache.InvocationIdentity,
     endpoint_path: []const u8,
-) void {
-    const pid_path = manifestDaemonPidPath(allocator, invocation_identity) catch return;
+) !void {
+    try terminateManifestDaemonEndpointWithSignal(allocator, invocation_identity, endpoint_path, signalManifestDaemonProcess);
+}
+
+fn terminateManifestDaemonEndpointWithSignal(
+    allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
+    endpoint_path: []const u8,
+    signal_process: ManifestDaemonSignalFn,
+) !void {
+    const pid_path = try manifestDaemonPidPath(allocator, invocation_identity);
     defer allocator.free(pid_path);
-    const pid = readManifestDaemonPid(allocator, pid_path) catch {
-        cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
-        return;
+    const pid = readManifestDaemonPid(allocator, pid_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.InvalidDaemonPid => {
+            try cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
+            return;
+        },
+        else => |read_pid_err| return read_pid_err,
     };
 
-    if (manifestDaemonProcessIsAlive(pid)) {
-        std.posix.kill(pid, .TERM) catch {};
-        var attempts: usize = 0;
-        while (attempts < 80 and manifestDaemonProcessIsAlive(pid)) : (attempts += 1) {
-            global_io.sleep(std.Io.Duration.fromMilliseconds(25), .awake) catch {};
-        }
-        if (manifestDaemonProcessIsAlive(pid)) {
-            std.posix.kill(pid, .KILL) catch {};
+    if (try manifestDaemonProcessIsAlive(pid)) {
+        try signal_process(pid, .TERM);
+        if (!try waitForManifestDaemonProcessExit(pid)) {
+            try signal_process(pid, .KILL);
+            if (!try waitForManifestDaemonProcessExit(pid)) return error.DaemonTerminationFailed;
         }
     }
 
-    cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
+    try cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
 }
 
 fn shutdownManifestDaemonEndpoint(
@@ -10209,13 +13160,13 @@ fn shutdownManifestDaemonEndpoint(
     invocation_identity: build_cache.InvocationIdentity,
     endpoint_path: []const u8,
 ) !void {
-    if (!manifestDaemonEndpointIsLive(allocator, endpoint_path)) {
-        cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
+    if (!try manifestDaemonEndpointIsLive(allocator, endpoint_path)) {
+        try cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
         return;
     }
 
     const build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
-    const request_path = sendManifestDaemonRequest(
+    const request_path = try sendManifestDaemonRequest(
         allocator,
         endpoint_path,
         .shutdown,
@@ -10229,17 +13180,17 @@ fn shutdownManifestDaemonEndpoint(
         false,
         false,
         null,
-    ) catch return;
+    );
     defer allocator.free(request_path);
 
-    if (!waitForManifestDaemonEndpointRemoval(endpoint_path)) {
-        terminateManifestDaemonEndpoint(allocator, invocation_identity, endpoint_path);
+    if (!try waitForManifestDaemonEndpointRemoval(endpoint_path)) {
+        try terminateManifestDaemonEndpoint(allocator, invocation_identity, endpoint_path);
     }
 }
 
 fn shutdownManifestDaemonsInCwd(allocator: std.mem.Allocator) !void {
     var dir = std.Io.Dir.cwd().openDir(global_io, MANIFEST_DAEMON_DIR, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound, error.NotDir => return,
         else => return err,
     };
     defer dir.close(global_io);
@@ -10252,12 +13203,12 @@ fn shutdownManifestDaemonsInCwd(allocator: std.mem.Allocator) !void {
         try shutdownManifestDaemonEndpoint(allocator, invocation_identity, endpoint_path);
     }
 
-    cleanupManifestDaemonOrphanRequests(allocator);
+    try cleanupManifestDaemonOrphanRequests(allocator);
 }
 
-fn truncateManifestDaemonLog(log_path: []const u8) void {
-    std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR) catch return;
-    var log_file = std.Io.Dir.cwd().createFile(global_io, log_path, .{ .truncate = true }) catch return;
+fn truncateManifestDaemonLog(log_path: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+    var log_file = try std.Io.Dir.cwd().createFile(global_io, log_path, .{ .truncate = true });
     log_file.close(global_io);
 }
 
@@ -10295,12 +13246,13 @@ fn spawnDetachedManifestDaemon(
     endpoint_path: [:0]const u8,
     stderr_fd: std.posix.fd_t,
     dev_null_fd: std.posix.fd_t,
-) ?std.posix.pid_t {
+) !std.posix.pid_t {
     const pid_result = std.posix.system.fork();
     switch (std.posix.errno(pid_result)) {
         .SUCCESS => {},
-        .AGAIN, .NOMEM, .NOSYS => return null,
-        else => return null,
+        .AGAIN, .NOSYS => return error.DaemonForkUnavailable,
+        .NOMEM => return error.OutOfMemory,
+        else => return error.DaemonForkFailed,
     }
 
     const pid: std.posix.pid_t = @intCast(pid_result);
@@ -10331,37 +13283,42 @@ fn spawnManifestDaemon(
     allocator: std.mem.Allocator,
     endpoint_path: []const u8,
     log_path: []const u8,
-) bool {
-    std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch {};
+) !void {
+    std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch |err| {
+        if (!isMissingPathAccessError(err)) return err;
+    };
 
-    const exe_path = std.process.executablePathAlloc(global_io, allocator) catch return false;
+    const exe_path = try std.process.executablePathAlloc(global_io, allocator);
     defer allocator.free(exe_path);
 
-    const endpoint_path_z = allocator.dupeZ(u8, endpoint_path) catch return false;
+    const endpoint_path_z = try allocator.dupeZ(u8, endpoint_path);
     defer allocator.free(endpoint_path_z);
 
-    var log_file = std.Io.Dir.cwd().createFile(global_io, log_path, .{ .truncate = false }) catch return false;
+    var log_file = try std.Io.Dir.cwd().createFile(global_io, log_path, .{ .truncate = false });
     defer log_file.close(global_io);
 
-    const dev_null_fd = std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{
+    const dev_null_fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{
         .ACCMODE = .RDWR,
         .CLOEXEC = true,
-    }, 0) catch return false;
+    }, 0);
     defer closeFd(dev_null_fd, false);
 
-    const child_pid = spawnDetachedManifestDaemon(exe_path, endpoint_path_z, log_file.handle, dev_null_fd) orelse return false;
+    const child_pid = try spawnDetachedManifestDaemon(exe_path, endpoint_path_z, log_file.handle, dev_null_fd);
 
-    const pid_path = manifestDaemonPidPathFromEndpointPath(allocator, endpoint_path) catch {
+    const pid_path = manifestDaemonPidPathFromEndpointPath(allocator, endpoint_path) catch |err| {
         std.posix.kill(child_pid, .TERM) catch {};
-        return false;
+        return err;
     };
     defer allocator.free(pid_path);
-    writeManifestDaemonPidFile(allocator, pid_path, child_pid) catch {
+    writeManifestDaemonPidFile(allocator, pid_path, child_pid) catch |err| {
         std.posix.kill(child_pid, .TERM) catch {};
-        return false;
+        return err;
     };
 
-    return waitForManifestDaemon(allocator, endpoint_path);
+    if (!try waitForManifestDaemon(allocator, endpoint_path)) {
+        std.posix.kill(child_pid, .TERM) catch {};
+        return error.DaemonStartUnavailable;
+    }
 }
 
 fn startManifestDaemon(
@@ -10369,31 +13326,88 @@ fn startManifestDaemon(
     invocation_identity: build_cache.InvocationIdentity,
     endpoint_path: []const u8,
     log_path: []const u8,
-) bool {
-    if (manifestDaemonEndpointIsLive(allocator, endpoint_path)) {
-        return true;
+) !void {
+    if (try manifestDaemonEndpointIsLive(allocator, endpoint_path)) {
+        return;
     } else {
-        cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
+        try cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
     }
 
-    std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR) catch return false;
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
 
-    const lock_path = manifestDaemonStartLockPath(allocator, invocation_identity) catch return false;
+    const lock_path = try manifestDaemonStartLockPath(allocator, invocation_identity);
     defer allocator.free(lock_path);
 
     if (std.Io.Dir.cwd().createDir(global_io, lock_path, .default_dir)) |_| {
         defer std.Io.Dir.cwd().deleteTree(global_io, lock_path) catch {};
-        return spawnManifestDaemon(allocator, endpoint_path, log_path);
-    } else |_| {
-        if (waitForManifestDaemon(allocator, endpoint_path)) return true;
-        std.Io.Dir.cwd().deleteTree(global_io, lock_path) catch {};
-        if (std.Io.Dir.cwd().createDir(global_io, lock_path, .default_dir)) |_| {
-            defer std.Io.Dir.cwd().deleteTree(global_io, lock_path) catch {};
-            return spawnManifestDaemon(allocator, endpoint_path, log_path);
-        } else |_| {
-            return waitForManifestDaemon(allocator, endpoint_path);
-        }
+        try spawnManifestDaemon(allocator, endpoint_path, log_path);
+        return;
+    } else |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => |create_lock_err| return create_lock_err,
     }
+
+    if (try waitForManifestDaemon(allocator, endpoint_path)) return;
+    std.Io.Dir.cwd().deleteTree(global_io, lock_path) catch |err| {
+        if (!isMissingPathAccessError(err)) return err;
+    };
+    if (std.Io.Dir.cwd().createDir(global_io, lock_path, .default_dir)) |_| {
+        defer std.Io.Dir.cwd().deleteTree(global_io, lock_path) catch {};
+        try spawnManifestDaemon(allocator, endpoint_path, log_path);
+        return;
+    } else |err| switch (err) {
+        error.PathAlreadyExists => {
+            if (try waitForManifestDaemon(allocator, endpoint_path)) return;
+            return error.DaemonStartUnavailable;
+        },
+        else => |create_lock_err| return create_lock_err,
+    }
+}
+
+fn manifestDaemonFallbackMessage(reason: ManifestDaemonFallbackReason) []const u8 {
+    return switch (reason) {
+        .daemon_unavailable => "daemon unavailable; rebuilding",
+        .stale_artifact => "daemon result stale; rebuilding",
+    };
+}
+
+fn manifestDaemonBuildFallbackFromWaitError(err: anyerror) ?ManifestDaemonFallbackReason {
+    return switch (err) {
+        error.DaemonRequestNotAcknowledged,
+        error.DaemonEndpointUnavailable,
+        => .daemon_unavailable,
+        else => null,
+    };
+}
+
+fn cleanupManifestDaemonBuildFallbackWithSignal(
+    allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
+    endpoint_path: []const u8,
+    wait_error: anyerror,
+    signal_process: ManifestDaemonSignalFn,
+) !void {
+    if (wait_error == error.DaemonEndpointUnavailable and !try manifestDaemonEndpointIsLive(allocator, endpoint_path)) {
+        try cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path);
+        return;
+    }
+
+    try terminateManifestDaemonEndpointWithSignal(allocator, invocation_identity, endpoint_path, signal_process);
+}
+
+fn cleanupManifestDaemonBuildFallback(
+    allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
+    endpoint_path: []const u8,
+    wait_error: anyerror,
+) !void {
+    try cleanupManifestDaemonBuildFallbackWithSignal(
+        allocator,
+        invocation_identity,
+        endpoint_path,
+        wait_error,
+        signalManifestDaemonProcess,
+    );
 }
 
 fn writeManifestDaemonRequestFile(
@@ -10483,19 +13497,46 @@ fn readManifestDaemonResponseFile(
 fn waitForManifestDaemonResponse(
     artifact_allocator: std.mem.Allocator,
     scratch_allocator: std.mem.Allocator,
+    invocation_identity: build_cache.InvocationIdentity,
     endpoint_path: []const u8,
+    request_path: []const u8,
     response_path: []const u8,
     progress_poller: ?*ManifestDaemonProgressPoller,
 ) !ManifestDaemonResponse {
-    while (true) {
-        if (progress_poller) |poller| poller.poll();
+    const ack_path = try manifestDaemonRequestAckPath(scratch_allocator, request_path);
+    defer scratch_allocator.free(ack_path);
 
-        if (cwdPathExists(response_path)) {
-            if (progress_poller) |poller| poller.poll();
+    var request_acknowledged = false;
+    var dispatch_wait_started_ms: ?i64 = null;
+
+    while (true) {
+        if (progress_poller) |poller| try poller.poll();
+
+        if (try manifestDaemonPathExists(response_path)) {
+            if (progress_poller) |poller| try poller.poll();
             return readManifestDaemonResponseFile(artifact_allocator, scratch_allocator, response_path);
         }
 
-        if (!manifestDaemonEndpointIsLive(scratch_allocator, endpoint_path)) {
+        if (!request_acknowledged) {
+            if (try manifestDaemonPathExists(ack_path)) {
+                request_acknowledged = true;
+            }
+        }
+
+        if (!request_acknowledged) {
+            const pending_warm_status = try manifestDaemonPendingRequestStatus(scratch_allocator, invocation_identity, .warm);
+            if (pending_warm_status == .acknowledged) {
+                dispatch_wait_started_ms = null;
+            } else {
+                const now_ms = manifestDaemonNowMs();
+                if (dispatch_wait_started_ms == null) dispatch_wait_started_ms = now_ms;
+                if (now_ms - dispatch_wait_started_ms.? >= MANIFEST_DAEMON_REQUEST_DISPATCH_TIMEOUT_MS) {
+                    return error.DaemonRequestNotAcknowledged;
+                }
+            }
+        }
+
+        if (!try manifestDaemonEndpointIsLive(scratch_allocator, endpoint_path)) {
             return error.DaemonEndpointUnavailable;
         }
 
@@ -10512,15 +13553,15 @@ fn warmManifestDaemon(
     build_overrides: BuildOverrides,
     collect_arc_stats: bool,
     zap_lib_dir_override: ?[]const u8,
-) void {
-    const endpoint_path = manifestDaemonEndpointPath(allocator, invocation_identity) catch return;
+) !ManifestDaemonWarmResult {
+    const endpoint_path = try manifestDaemonEndpointPath(allocator, invocation_identity);
     defer allocator.free(endpoint_path);
-    const log_path = manifestDaemonLogPath(allocator, invocation_identity) catch return;
+    const log_path = try manifestDaemonLogPath(allocator, invocation_identity);
     defer allocator.free(log_path);
 
-    if (!startManifestDaemon(allocator, invocation_identity, endpoint_path, log_path)) return;
-    if (manifestDaemonHasPendingRequest(allocator, invocation_identity, null)) return;
-    const request_path = sendManifestDaemonRequest(
+    try startManifestDaemon(allocator, invocation_identity, endpoint_path, log_path);
+    if (try manifestDaemonHasPendingRequest(allocator, invocation_identity, null)) return .pending_request;
+    const request_path = try sendManifestDaemonRequest(
         allocator,
         endpoint_path,
         .warm,
@@ -10534,8 +13575,9 @@ fn warmManifestDaemon(
         collect_arc_stats,
         false,
         zap_lib_dir_override,
-    ) catch return;
-    allocator.free(request_path);
+    );
+    defer allocator.free(request_path);
+    return .sent;
 }
 
 fn tryManifestDaemonBuild(
@@ -10549,19 +13591,19 @@ fn tryManifestDaemonBuild(
     collect_arc_stats: bool,
     zap_lib_dir_override: ?[]const u8,
     progress_node: ?zap.progress.Node,
-) ?BuildArtifact {
-    const endpoint_path = manifestDaemonEndpointPath(scratch_allocator, invocation_identity) catch return null;
+) !ManifestDaemonBuildResult {
+    const endpoint_path = try manifestDaemonEndpointPath(scratch_allocator, invocation_identity);
     defer scratch_allocator.free(endpoint_path);
-    const log_path = manifestDaemonLogPath(scratch_allocator, invocation_identity) catch return null;
+    const log_path = try manifestDaemonLogPath(scratch_allocator, invocation_identity);
     defer scratch_allocator.free(log_path);
     const request_id = nextManifestDaemonRequestId(invocation_identity);
-    const response_path = manifestDaemonResponsePath(scratch_allocator, invocation_identity, request_id) catch return null;
+    const response_path = try manifestDaemonResponsePath(scratch_allocator, invocation_identity, request_id);
     defer {
         std.Io.Dir.cwd().deleteFile(global_io, response_path) catch {};
         scratch_allocator.free(response_path);
     }
     const progress_path: ?[]const u8 = if (progress_node != null)
-        (manifestDaemonProgressPath(scratch_allocator, invocation_identity, request_id) catch return null)
+        try manifestDaemonProgressPath(scratch_allocator, invocation_identity, request_id)
     else
         null;
     defer if (progress_path) |path| {
@@ -10569,26 +13611,26 @@ fn tryManifestDaemonBuild(
         scratch_allocator.free(path);
     };
 
-    truncateManifestDaemonLog(log_path);
-    switch (manifestDaemonBuildQueuePolicy(manifestDaemonHasPendingRequest(scratch_allocator, invocation_identity, .warm))) {
+    try truncateManifestDaemonLog(log_path);
+    switch (manifestDaemonBuildQueuePolicy(try manifestDaemonHasPendingRequest(scratch_allocator, invocation_identity, .warm))) {
         .send_immediately => {},
         .queue_after_pending_warm => {
             if (progress_node) |node| node.updateCurrentItem("waiting for background warm daemon");
         },
     }
-    if (!startManifestDaemon(scratch_allocator, invocation_identity, endpoint_path, log_path)) return null;
+    try startManifestDaemon(scratch_allocator, invocation_identity, endpoint_path, log_path);
     if (progress_path) |path| {
-        truncateManifestDaemonProgress(path) catch return null;
+        try truncateManifestDaemonProgress(path);
     }
 
     var progress_poller: ?ManifestDaemonProgressPoller = if (progress_path) |path|
-        (ManifestDaemonProgressPoller.init(scratch_allocator, path, progress_node) catch null)
+        try ManifestDaemonProgressPoller.init(scratch_allocator, path, progress_node)
     else
         null;
     defer if (progress_poller) |*poller| poller.deinit();
 
     if (progress_node) |node| node.updateCurrentItem("querying incremental daemon");
-    const request_path = sendManifestDaemonRequest(
+    const request_path = try sendManifestDaemonRequest(
         scratch_allocator,
         endpoint_path,
         .build,
@@ -10602,20 +13644,34 @@ fn tryManifestDaemonBuild(
         collect_arc_stats,
         incrementalTraceEnabled(),
         zap_lib_dir_override,
-    ) catch return null;
+    );
     defer scratch_allocator.free(request_path);
 
     if (progress_node) |node| node.updateCurrentItem("waiting for daemon build");
-    const response = waitForManifestDaemonResponse(artifact_allocator, scratch_allocator, endpoint_path, response_path, if (progress_poller) |*poller| poller else null) catch return null;
+    const response = waitForManifestDaemonResponse(
+        artifact_allocator,
+        scratch_allocator,
+        invocation_identity,
+        endpoint_path,
+        request_path,
+        response_path,
+        if (progress_poller) |*poller| poller else null,
+    ) catch |err| {
+        if (manifestDaemonBuildFallbackFromWaitError(err)) |fallback_reason| {
+            try cleanupManifestDaemonBuildFallback(scratch_allocator, invocation_identity, endpoint_path, err);
+            return .{ .fallback = fallback_reason };
+        }
+        return err;
+    };
     switch (response) {
         .ok => |artifact| {
-            if (progress_poller) |*poller| poller.poll();
+            if (progress_poller) |*poller| try poller.poll();
             if (incrementalTraceEnabled()) printManifestDaemonLog(scratch_allocator, log_path);
-            return artifact;
+            return .{ .artifact = artifact };
         },
         .failed => |message| {
             if (progress_poller) |*poller| {
-                poller.poll();
+                try poller.poll();
                 poller.finishRemaining(.failed);
             }
             if (progress_node) |node| node.handoffExternalOutput(.clear);
@@ -10639,7 +13695,7 @@ fn ensureManifestDaemonState(
     }
 
     if (daemon_state.incremental_state == null) {
-        daemon_state.incremental_state = establishIncrementalWatchState(
+        daemon_state.incremental_state = try establishIncrementalWatchState(
             allocator,
             request.project_root,
             request.target_name,
@@ -10648,7 +13704,7 @@ fn ensureManifestDaemonState(
             request.collect_arc_stats,
             request.zap_lib_dir_override,
             progress_reporter,
-        ) orelse return error.InitialBuildFailed;
+        );
         const extra_watch_path = daemon_state.incremental_state.?.active_manager_source_path;
         daemon_state.watch_snapshot = WatchSnapshot.initFromSourceRoots(
             allocator,
@@ -10705,7 +13761,9 @@ fn rebuildManifestDaemonState(
             request.zap_lib_dir_override,
             progress_reporter,
         ) catch |err| switch (err) {
-            error.ContextInvalidated => {
+            error.ContextInvalidated,
+            error.BackendContextInvalidated,
+            => {
                 if (daemon_state.watch_snapshot) |*snapshot| snapshot.deinit(allocator);
                 daemon_state.watch_snapshot = null;
                 state.deinit();
@@ -10717,7 +13775,7 @@ fn rebuildManifestDaemonState(
     }
 
     if (daemon_state.watch_snapshot) |*snapshot| {
-        refreshWatchSnapshotFromSourceRoots(
+        try refreshWatchSnapshotFromSourceRoots(
             snapshot,
             allocator,
             request.project_root,
@@ -10751,6 +13809,27 @@ fn writeManifestDaemonErrorFile(
     try build_cache.writeFileAtomic(allocator, response_path, serialized.written());
 }
 
+fn reportManifestDaemonRequestError(
+    allocator: std.mem.Allocator,
+    message_allocator: std.mem.Allocator,
+    request: ManifestDaemonRequest,
+    err: anyerror,
+) !void {
+    if (request.mode == .build and request.response_path != null) {
+        const message = std.fmt.allocPrint(message_allocator, "{s}", .{@errorName(err)}) catch @errorName(err);
+        try writeManifestDaemonErrorFile(allocator, request.response_path.?, message);
+    } else {
+        std.debug.print("Error: manifest incremental daemon warm failed: {s}\n", .{@errorName(err)});
+    }
+}
+
+fn writeManifestDaemonRequestAckFile(allocator: std.mem.Allocator, request_path: []const u8) ![]const u8 {
+    const ack_path = try manifestDaemonRequestAckPath(allocator, request_path);
+    errdefer allocator.free(ack_path);
+    try build_cache.writeFileAtomic(allocator, ack_path, "ack\n");
+    return ack_path;
+}
+
 fn handleManifestDaemonRequestFile(
     allocator: std.mem.Allocator,
     request_path: []const u8,
@@ -10765,6 +13844,11 @@ fn handleManifestDaemonRequestFile(
 
     var reader: std.Io.Reader = .fixed(request_bytes);
     const request = try readManifestDaemonRequest(request_allocator, &reader);
+    const ack_path = try writeManifestDaemonRequestAckFile(allocator, request_path);
+    defer {
+        std.Io.Dir.cwd().deleteFile(global_io, ack_path) catch {};
+        allocator.free(ack_path);
+    }
     if (request.mode == .shutdown) return true;
 
     setIncrementalTraceEnabledOverride(request.trace_enabled);
@@ -10774,10 +13858,13 @@ fn handleManifestDaemonRequestFile(
         setIncrementalTraceEnabledOverride(null);
     }
 
-    var progress_writer: ?ManifestDaemonProgressWriter = if (request.progress_path) |progress_path|
-        (ManifestDaemonProgressWriter.init(allocator, progress_path) catch null)
-    else
-        null;
+    var progress_writer: ?ManifestDaemonProgressWriter = null;
+    if (request.progress_path) |progress_path| {
+        progress_writer = ManifestDaemonProgressWriter.init(allocator, progress_path) catch |err| {
+            try reportManifestDaemonRequestError(allocator, request_allocator, request, err);
+            return false;
+        };
+    }
     defer if (progress_writer) |*writer| writer.deinit();
 
     var progress_reporter: ?zap.progress.Reporter = if (progress_writer) |*writer|
@@ -10791,14 +13878,16 @@ fn handleManifestDaemonRequestFile(
         request,
         if (progress_reporter) |*reporter| reporter else null,
     ) catch |err| {
-        if (request.mode == .build and request.response_path != null) {
-            const message = std.fmt.allocPrint(request_allocator, "{s}", .{@errorName(err)}) catch @errorName(err);
-            try writeManifestDaemonErrorFile(allocator, request.response_path.?, message);
-        } else {
-            std.debug.print("Error: manifest incremental daemon warm failed: {s}\n", .{@errorName(err)});
-        }
+        try reportManifestDaemonRequestError(allocator, request_allocator, request, err);
         return false;
     };
+
+    if (progress_writer) |*writer| {
+        writer.check() catch |err| {
+            try reportManifestDaemonRequestError(allocator, request_allocator, request, err);
+            return false;
+        };
+    }
 
     if (request.mode == .build) {
         const response_path = request.response_path orelse return error.InvalidDaemonProtocol;
@@ -10871,10 +13960,8 @@ fn processManifestDaemonEndpoint(
 fn runManifestIncrementalDaemon(allocator: std.mem.Allocator, endpoint_path: []const u8) !void {
     const endpoint = try openManifestDaemonEndpointForRead(allocator, endpoint_path);
     defer endpoint.deinit();
-    defer std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch {};
     const pid_path = try manifestDaemonPidPathFromEndpointPath(allocator, endpoint_path);
     defer allocator.free(pid_path);
-    defer std.Io.Dir.cwd().deleteFile(global_io, pid_path) catch {};
 
     var daemon_state: ManifestDaemonState = .{};
     defer daemon_state.deinit(allocator);
@@ -10882,15 +13969,22 @@ fn runManifestIncrementalDaemon(allocator: std.mem.Allocator, endpoint_path: []c
     defer pending_line.deinit(allocator);
     var last_activity_ms = manifestDaemonNowMs();
 
+    var loop_error: ?anyerror = null;
     while (true) {
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = endpoint.read_fd,
             .events = std.c.POLL.IN,
             .revents = 0,
         }};
-        const ready = std.posix.poll(&poll_fds, 250) catch 0;
+        const ready = std.posix.poll(&poll_fds, 250) catch |err| {
+            loop_error = err;
+            break;
+        };
         if (ready > 0) {
-            const result = try processManifestDaemonEndpoint(allocator, endpoint, &daemon_state, &pending_line);
+            const result = processManifestDaemonEndpoint(allocator, endpoint, &daemon_state, &pending_line) catch |err| {
+                loop_error = err;
+                break;
+            };
             if (result.read_any) {
                 last_activity_ms = manifestDaemonNowMs();
             }
@@ -10902,6 +13996,10 @@ fn runManifestIncrementalDaemon(allocator: std.mem.Allocator, endpoint_path: []c
             break;
         }
     }
+
+    try deleteManifestDaemonFileIfPresent(endpoint_path);
+    try deleteManifestDaemonFileIfPresent(pid_path);
+    if (loop_error) |err| return err;
 }
 
 fn establishIncrementalWatchState(
@@ -10913,12 +14011,12 @@ fn establishIncrementalWatchState(
     collect_arc_stats: bool,
     zap_lib_dir_override: ?[]const u8,
     progress_reporter: ?*zap.progress.Reporter,
-) ?IncrementalWatchState {
-    var state = IncrementalWatchState.init(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, progress_reporter) orelse return null;
+) InteractiveWatchSetupError!IncrementalWatchState {
+    var state = try IncrementalWatchState.init(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, progress_reporter);
+    errdefer state.deinit();
     state.rebuild(allocator, project_root, target_name, build_opts, build_overrides, &.{}, zap_lib_dir_override, progress_reporter) catch |err| {
         std.debug.print("Initial incremental build failed ({s})\n", .{@errorName(err)});
-        state.deinit();
-        return null;
+        return err;
     };
     return state;
 }
@@ -10939,31 +14037,52 @@ fn watchAndRebuild(
     run_args: []const []const u8,
     collect_arc_stats: bool,
     zap_lib_dir_override: ?[]const u8,
-) void {
+) !void {
     const poll_duration = std.Io.Duration.fromMilliseconds(500);
 
     var watch_snapshot = WatchSnapshot.init(allocator, project_root, target_name, build_opts, build_overrides, zap_lib_dir_override, null) catch |err| blk: {
-        std.debug.print("Error: manifest-based watch input collection failed ({s}); watching project files until the manifest is fixed\n", .{@errorName(err)});
-        break :blk WatchSnapshot.initProjectOnly(allocator, project_root) catch return;
+        switch (classifyWatchSnapshotInitFailure(err)) {
+            .use_project_only => |reason| {
+                std.debug.print("Error: manifest-based watch input collection unavailable ({s}); watching project files until the manifest is restored\n", .{@tagName(reason)});
+                break :blk WatchSnapshot.initProjectOnly(allocator, project_root) catch |project_only_err| {
+                    try failInteractiveWatchSetupOnSevereError(project_only_err);
+                    return project_only_err;
+                };
+            },
+            .propagate_setup_error => |setup_err| {
+                try failInteractiveWatchSetupOnSevereError(setup_err);
+                return setup_err;
+            },
+        }
     };
     defer watch_snapshot.deinit(allocator);
 
-    var initial_progress = zap.progress.Reporter.init("Compiling", stderrProgressEnabled());
-    const initial_progress_reporter: ?*zap.progress.Reporter = if (initial_progress.enabled) &initial_progress else null;
-    var incr_state = establishIncrementalWatchState(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, initial_progress_reporter);
-    initial_progress.finish();
+    var incr_state: ?IncrementalWatchState = null;
+    {
+        var initial_progress = zap.progress.Reporter.init("Compiling", stderrProgressEnabled());
+        defer initial_progress.finish();
+        const initial_progress_reporter: ?*zap.progress.Reporter = if (initial_progress.enabled) &initial_progress else null;
+        incr_state = establishIncrementalWatchState(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, initial_progress_reporter) catch |err| blk: {
+            std.debug.print("Initial incremental setup failed ({s})\n", .{@errorName(err)});
+            try failInteractiveWatchSetupOnSevereError(err);
+            break :blk null;
+        };
+    }
     defer if (incr_state) |*s| s.deinit();
 
     if (incr_state) |*state| {
         runWatchArtifact(allocator, target_name, state, run_mode, run_args);
-        refreshWatchSnapshot(&watch_snapshot, allocator, project_root, target_name, build_opts, build_overrides, zap_lib_dir_override, state.active_manager_source_path);
+        try refreshWatchSnapshot(&watch_snapshot, allocator, project_root, target_name, build_opts, build_overrides, zap_lib_dir_override, state.active_manager_source_path);
     }
     std.debug.print("\n[watching for changes...]\n", .{});
 
     while (true) {
         global_io.sleep(poll_duration, .awake) catch {};
 
-        const changed_paths = watch_snapshot.changedPaths(allocator) catch continue;
+        const changed_paths = watch_snapshot.changedPaths(allocator) catch |err| {
+            std.debug.print("Error: watch change detection failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
         defer allocator.free(changed_paths);
 
         if (changed_paths.len > 0) {
@@ -10989,6 +14108,7 @@ fn watchAndRebuild(
 
             // Try incremental rebuild if state exists
             var rebuild_succeeded = false;
+            var should_establish_state = incr_state == null;
             if (incr_state) |*state| {
                 var progress = zap.progress.Reporter.init("Compiling", stderrProgressEnabled());
                 const progress_reporter: ?*zap.progress.Reporter = if (progress.enabled) &progress else null;
@@ -10996,20 +14116,20 @@ fn watchAndRebuild(
 
                 rebuild_succeeded = blk: {
                     state.rebuild(allocator, project_root, target_name, build_opts, build_overrides, changed_paths, zap_lib_dir_override, progress_reporter) catch |err| {
-                        if (err == error.ContextInvalidated) {
+                        if (err == error.ContextInvalidated or err == error.BackendContextInvalidated) {
                             std.debug.print("Incremental context invalidated; rebuilding from a fresh context\n", .{});
                         } else {
                             std.debug.print("Incremental build failed ({s})\n", .{@errorName(err)});
                         }
-                        switch (err) {
-                            error.ReadError, error.ManifestError, error.DiscoveryError, error.FrontendError, error.CacheMetadataError => {},
-                            error.ContextInvalidated => {
+                        const action = classifyInteractiveWatchRebuildFailure(err) catch |severe_err| {
+                            return severe_err;
+                        };
+                        switch (action) {
+                            .wait_for_next_change => {},
+                            .rebuild_fresh_context => {
                                 state.deinit();
                                 incr_state = null;
-                            },
-                            else => {
-                                state.deinit();
-                                incr_state = null;
+                                should_establish_state = true;
                             },
                         }
                         break :blk false;
@@ -11018,11 +14138,17 @@ fn watchAndRebuild(
                 };
             }
 
-            if (incr_state == null) {
-                var progress = zap.progress.Reporter.init("Compiling", stderrProgressEnabled());
-                const progress_reporter: ?*zap.progress.Reporter = if (progress.enabled) &progress else null;
-                incr_state = establishIncrementalWatchState(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, progress_reporter);
-                progress.finish();
+            if (incr_state == null and should_establish_state) {
+                {
+                    var progress = zap.progress.Reporter.init("Compiling", stderrProgressEnabled());
+                    defer progress.finish();
+                    const progress_reporter: ?*zap.progress.Reporter = if (progress.enabled) &progress else null;
+                    incr_state = establishIncrementalWatchState(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, progress_reporter) catch |err| blk: {
+                        std.debug.print("Incremental setup failed ({s})\n", .{@errorName(err)});
+                        try failInteractiveWatchSetupOnSevereError(err);
+                        break :blk null;
+                    };
+                }
                 rebuild_succeeded = incr_state != null;
             }
 
@@ -11033,7 +14159,7 @@ fn watchAndRebuild(
             }
             if (rebuild_succeeded or incr_state != null) {
                 const extra_watch_path = if (incr_state) |*state| state.active_manager_source_path else null;
-                refreshWatchSnapshot(&watch_snapshot, allocator, project_root, target_name, build_opts, build_overrides, zap_lib_dir_override, extra_watch_path);
+                try refreshWatchSnapshot(&watch_snapshot, allocator, project_root, target_name, build_opts, build_overrides, zap_lib_dir_override, extra_watch_path);
             }
             std.debug.print("\n[watching for changes...]\n", .{});
         }
@@ -11316,6 +14442,285 @@ fn isRecognizedBuildFlagError(args: []const []const u8, leading_end: usize) bool
 }
 
 const testing = std.testing;
+
+test "P4J2: embedded Zig lib absence remains optional for system fallback" {
+    const resolved = try resolveZigLibDirFromCandidates(.absent, .absent, .{ .found = "/system/zig/lib" });
+    try testing.expectEqualStrings("/system/zig/lib", resolved);
+}
+
+test "P4J2: trusted Zig lib failure blocks embedded and system fallback" {
+    try testing.expectError(
+        error.ZigLibDirAccessFailed,
+        resolveZigLibDirFromCandidates(
+            .{ .failed = error.ZigLibDirAccessFailed },
+            .{ .found = "/embedded/zig/lib" },
+            .{ .found = "/system/zig/lib" },
+        ),
+    );
+}
+
+test "P4J2: embedded Zig lib extraction failure blocks system fallback" {
+    try testing.expectError(
+        error.EmbeddedZigLibArchiveExtractFailed,
+        resolveZigLibDirFromCandidates(
+            .absent,
+            .{ .failed = error.EmbeddedZigLibArchiveExtractFailed },
+            .{ .found = "/system/zig/lib" },
+        ),
+    );
+}
+
+test "P4J2: system Zig lib failure propagates after prior absence" {
+    try testing.expectError(
+        error.ZigLibDirCanonicalizeFailed,
+        resolveZigLibDirFromCandidates(
+            .absent,
+            .absent,
+            .{ .failed = error.ZigLibDirCanonicalizeFailed },
+        ),
+    );
+}
+
+test "P4J2: trusted Zig lib success preserves precedence over broken lower tiers" {
+    const resolved = try resolveZigLibDirFromCandidates(
+        .{ .found = "/trusted/zig/lib" },
+        .{ .failed = error.EmbeddedZigLibArchiveExtractFailed },
+        .{ .failed = error.ZigLibDirAccessFailed },
+    );
+    try testing.expectEqualStrings("/trusted/zig/lib", resolved);
+}
+
+test "P4J2: empty embedded Zig lib archive is classified as absent" {
+    const resolved = try resolveEmbeddedZigLibDirFromArchive(testing.allocator, null, "");
+    try testing.expectEqual(@as(?[]const u8, null), resolved);
+}
+
+test "P4J2: embedded Zig lib cache root failure is required infrastructure" {
+    try testing.expectError(
+        error.EmbeddedZigLibCacheUnavailable,
+        resolveEmbeddedZigLibDirFromArchive(testing.allocator, null, "not empty"),
+    );
+}
+
+test "P4J2: embedded Zig lib decompressor init failure frees caller buffer" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cache_home = try tmp_dir.dir.realPathFileAlloc(global_io, ".", testing.allocator);
+    defer testing.allocator.free(cache_home);
+
+    try testing.expectError(
+        error.EmbeddedZigLibArchiveDecompressFailed,
+        extractEmbeddedZigLibFromArchive(testing.allocator, cache_home, "not an xz archive"),
+    );
+}
+
+test "P4J2: output/cache preparation propagates backend cache mkdir failure" {
+    var creator = FailingRequiredDirCreator{
+        .fail_on_call = 1,
+        .failure = error.AccessDenied,
+    };
+
+    try testing.expectError(
+        error.AccessDenied,
+        prepareRequiredOutputCacheDirsWithCreator(&creator, ".zap-cache", "zap-out/bin"),
+    );
+    try testing.expectEqual(@as(usize, 1), creator.calls);
+}
+
+test "P4J2: output/cache preparation propagates output mkdir failure" {
+    var creator = FailingRequiredDirCreator{
+        .fail_on_call = 2,
+        .failure = error.PathAlreadyExists,
+    };
+
+    try testing.expectError(
+        error.PathAlreadyExists,
+        prepareRequiredOutputCacheDirsWithCreator(&creator, ".zap-cache", "zap-out/bin"),
+    );
+    try testing.expectEqual(@as(usize, 2), creator.calls);
+}
+
+const FailingRequiredDirCreator = struct {
+    fail_on_call: usize,
+    failure: anyerror,
+    calls: usize = 0,
+
+    fn createDirPath(self: *FailingRequiredDirCreator, path: []const u8) anyerror!void {
+        _ = path;
+        self.calls += 1;
+        if (self.calls == self.fail_on_call) return self.failure;
+    }
+};
+
+const BufferDiscoveryDiagnosticPrinter = struct {
+    allocator: std.mem.Allocator,
+    buffer: *std.ArrayListUnmanaged(u8),
+
+    fn print(self: BufferDiscoveryDiagnosticPrinter, comptime format: []const u8, args: anytype) !void {
+        const rendered = try std.fmt.allocPrint(self.allocator, format, args);
+        defer self.allocator.free(rendered);
+        try self.buffer.appendSlice(self.allocator, rendered);
+    }
+};
+
+const NoopDiscoveryDiagnosticPrinter = struct {
+    fn print(_: NoopDiscoveryDiagnosticPrinter, comptime format: []const u8, args: anytype) !void {
+        _ = format;
+        _ = args;
+    }
+};
+
+test "discovery missing-struct diagnostic renders expected path and frees allocation" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(testing.allocator);
+
+    try printStructNotFoundDiscoveryDiagnostic(
+        testing.allocator,
+        BufferDiscoveryDiagnosticPrinter{
+            .allocator = testing.allocator,
+            .buffer = &captured,
+        },
+        "App.HttpServer",
+    );
+
+    try testing.expectEqualStrings(
+        "Error: Struct `App.HttpServer` not found — expected app/http_server.zap in one of the source roots\n",
+        captured.items,
+    );
+}
+
+test "discovery missing-struct diagnostic propagates expected-path OOM" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    try testing.expectError(
+        error.OutOfMemory,
+        printStructNotFoundDiscoveryDiagnostic(
+            failing_allocator.allocator(),
+            NoopDiscoveryDiagnosticPrinter{},
+            "App",
+        ),
+    );
+}
+
+test "discoverManifestSources preserves discovery OutOfMemory" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const config = zap.builder.BuildConfig{
+        .name = "app",
+        .version = "0.1.0",
+        .kind = .bin,
+        .root = "App.main/0",
+    };
+
+    try testing.expectError(
+        error.OutOfMemory,
+        discoverManifestSources(
+            failing_allocator.allocator(),
+            ".",
+            config,
+            &.{},
+            null,
+        ),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "discoverManifestSources owns graph-derived paths and metadata" {
+    const allocator = testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "lib");
+    try tmp_dir.dir.writeFile(global_io, .{
+        .sub_path = "lib/app.zap",
+        .data =
+        \\pub struct App {
+        \\  pub fn main() {
+        \\  }
+        \\}
+        \\
+        ,
+    });
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(project_root);
+    const lib_dir = try std.fs.path.join(allocator, &.{ project_root, "lib" });
+    defer allocator.free(lib_dir);
+    const expected_app_path = try std.fs.path.join(allocator, &.{ lib_dir, "app.zap" });
+    defer allocator.free(expected_app_path);
+
+    const paths = [_][]const u8{"lib/**/*.zap"};
+    const config = zap.builder.BuildConfig{
+        .name = "app",
+        .version = "0.1.0",
+        .kind = .bin,
+        .root = "App.main/0",
+        .paths = &paths,
+    };
+    const source_roots = [_]zap.discovery.SourceRoot{
+        .{ .name = "project", .path = lib_dir },
+    };
+
+    var manifest_sources = try discoverManifestSources(
+        allocator,
+        project_root,
+        config,
+        &source_roots,
+        null,
+    );
+    defer manifest_sources.deinit();
+
+    var churn: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (churn.items) |allocation| allocator.free(allocation);
+        churn.deinit(allocator);
+    }
+    for (0..128) |_| {
+        const allocation = try allocator.alloc(u8, expected_app_path.len);
+        @memset(allocation, 'x');
+        try churn.append(allocator, allocation);
+    }
+
+    try testing.expectEqual(@as(usize, 1), manifest_sources.source_units.len);
+    try testing.expectEqualStrings(expected_app_path, manifest_sources.source_units[0].file_path);
+    try testing.expectEqualStrings("App", manifest_sources.source_units[0].primary_struct_name.?);
+    try testing.expectEqualStrings("App", manifest_sources.source_file_to_struct.get(expected_app_path).?);
+    const structs = manifest_sources.source_file_to_structs.get(expected_app_path).?;
+    try testing.expectEqual(@as(usize, 1), structs.len);
+    try testing.expectEqualStrings("App", structs[0]);
+
+    const canonical = try canonicalPathAlloc(allocator, manifest_sources.source_units[0].file_path);
+    defer allocator.free(canonical);
+    try testing.expectEqualStrings(expected_app_path, canonical);
+}
+
+test "canonical path propagation preserves OutOfMemory" {
+    var temporary_directory = std.testing.tmpDir(.{});
+    defer temporary_directory.cleanup();
+
+    try temporary_directory.dir.writeFile(global_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {}",
+    });
+
+    const file_path = try temporary_directory.dir.realPathFileAlloc(global_io, "app.zap", testing.allocator);
+    defer testing.allocator.free(file_path);
+
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    try testing.expectError(
+        error.OutOfMemory,
+        canonicalPathAlloc(failing_allocator.allocator(), file_path),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: canonical path propagation reports canonicalization failures" {
+    try testing.expectError(
+        error.FileNotFound,
+        canonicalPathAlloc(testing.allocator, "missing/p4j2/main-canonical-input.zap"),
+    );
+}
 
 test "incremental module hashes own module-name keys" {
     var hashes: ComputedIncrementalHashes = .{
@@ -11643,6 +15048,565 @@ test "manifest daemon build requests queue behind pending warm baselines" {
     try testing.expectEqual(ManifestDaemonBuildQueuePolicy.queue_after_pending_warm, manifestDaemonBuildQueuePolicy(true));
 }
 
+test "manifest daemon pending request status reflects dispatch acknowledgements" {
+    const allocator = testing.allocator;
+
+    var invocation_identity: build_cache.InvocationIdentity = undefined;
+    @memset(&invocation_identity, 0x9a);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0x1234);
+    defer allocator.free(request_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+
+    const build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    try writeManifestDaemonRequestFile(
+        allocator,
+        request_path,
+        .warm,
+        invocation_identity,
+        null,
+        null,
+        ".",
+        "",
+        build_opts,
+        .{},
+        false,
+        false,
+        null,
+    );
+
+    try testing.expectEqual(
+        ManifestDaemonPendingRequestStatus.unacknowledged,
+        try manifestDaemonPendingRequestStatus(allocator, invocation_identity, .warm),
+    );
+
+    const ack_path = try writeManifestDaemonRequestAckFile(allocator, request_path);
+    defer allocator.free(ack_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, ack_path) catch {};
+
+    try testing.expectEqual(
+        ManifestDaemonPendingRequestStatus.acknowledged,
+        try manifestDaemonPendingRequestStatus(allocator, invocation_identity, .warm),
+    );
+}
+
+test "P4J2: manifest daemon absence remains a typed benign fallback" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xd1);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+    try deleteManifestDaemonPendingRequests(allocator, invocation_identity);
+
+    try testing.expectEqual(
+        ManifestDaemonPendingRequestStatus.none,
+        try manifestDaemonPendingRequestStatus(allocator, invocation_identity, .warm),
+    );
+    try testing.expect(!(try manifestDaemonHasPendingRequest(allocator, invocation_identity, .warm)));
+    try testing.expectEqual(
+        @as(?ManifestDaemonFallbackReason, ManifestDaemonFallbackReason.daemon_unavailable),
+        manifestDaemonBuildFallbackFromWaitError(error.DaemonEndpointUnavailable),
+    );
+    try testing.expectEqual(
+        @as(?ManifestDaemonFallbackReason, ManifestDaemonFallbackReason.daemon_unavailable),
+        manifestDaemonBuildFallbackFromWaitError(error.DaemonRequestNotAcknowledged),
+    );
+    try testing.expectEqual(
+        @as(?ManifestDaemonFallbackReason, null),
+        manifestDaemonBuildFallbackFromWaitError(error.InvalidDaemonProtocol),
+    );
+}
+
+test "P4J2: manifest daemon pending request cleanup ignores missing daemon dir" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xd5);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const missing_daemon_dir = try std.fs.path.join(allocator, &.{ tmp_path, "missing-daemon-dir" });
+    defer allocator.free(missing_daemon_dir);
+
+    try deleteManifestDaemonPendingRequestsInDir(allocator, missing_daemon_dir, invocation_identity);
+}
+
+test "P4J2: manifest daemon pending request cleanup propagates open failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xd6);
+
+    const too_long_prefix = try allocator.alloc(u8, std.fs.max_path_bytes + 1);
+    defer allocator.free(too_long_prefix);
+    @memset(too_long_prefix, 'a');
+
+    try testing.expectError(
+        error.NameTooLong,
+        deleteManifestDaemonPendingRequestsInDir(allocator, too_long_prefix, invocation_identity),
+    );
+}
+
+const FailingManifestDaemonPendingRequestIterator = struct {
+    fn next(self: *@This(), io: Io) !?Io.Dir.Entry {
+        _ = self;
+        _ = io;
+        return error.NameTooLong;
+    }
+};
+
+test "P4J2: manifest daemon pending request cleanup propagates iteration failure" {
+    var iterator: FailingManifestDaemonPendingRequestIterator = .{};
+    try testing.expectError(
+        error.NameTooLong,
+        deleteManifestDaemonPendingRequestsFromIterator(testing.allocator, MANIFEST_DAEMON_DIR, testBuildCacheDigest(0xd7), &iterator),
+    );
+}
+
+test "P4J2: manifest daemon pending request cleanup propagates allocation failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xd8);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0xd800);
+    defer allocator.free(request_path);
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = std.fs.path.basename(request_path), .data = "pending\n" });
+
+    var fixed_buffer: [0]u8 = .{};
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+    try testing.expectError(
+        error.OutOfMemory,
+        deleteManifestDaemonPendingRequestsInDir(fixed_allocator.allocator(), tmp_path, invocation_identity),
+    );
+}
+
+test "P4J2: manifest daemon pending request cleanup propagates delete failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xd9);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0xd900);
+    defer allocator.free(request_path);
+    try tmp_dir.dir.createDir(global_io, std.fs.path.basename(request_path), .default_dir);
+
+    try testing.expectError(
+        error.IsDir,
+        deleteManifestDaemonPendingRequestsInDir(allocator, tmp_path, invocation_identity),
+    );
+}
+
+test "P4J2: manifest daemon pending request cleanup deletes matching request and ack files" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xda);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0xda00);
+    defer allocator.free(request_path);
+    const ack_path = try manifestDaemonRequestAckPath(allocator, request_path);
+    defer allocator.free(ack_path);
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = std.fs.path.basename(request_path), .data = "pending\n" });
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = std.fs.path.basename(ack_path), .data = "ack\n" });
+
+    const tmp_request_path = try std.fs.path.join(allocator, &.{ tmp_path, std.fs.path.basename(request_path) });
+    defer allocator.free(tmp_request_path);
+    const tmp_ack_path = try std.fs.path.join(allocator, &.{ tmp_path, std.fs.path.basename(ack_path) });
+    defer allocator.free(tmp_ack_path);
+
+    try deleteManifestDaemonPendingRequestsInDir(allocator, tmp_path, invocation_identity);
+
+    try testing.expect(!(try manifestDaemonPathExists(tmp_request_path)));
+    try testing.expect(!(try manifestDaemonPathExists(tmp_ack_path)));
+}
+
+test "P4J2: manifest daemon endpoint cleanup propagates path allocation failure" {
+    const allocator = testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const endpoint_path = try std.fs.path.join(allocator, &.{ tmp_path, "missing-endpoint.fifo" });
+    defer allocator.free(endpoint_path);
+
+    var fixed_buffer: [0]u8 = .{};
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+
+    try testing.expectError(
+        error.OutOfMemory,
+        cleanupManifestDaemonEndpointFiles(fixed_allocator.allocator(), testBuildCacheDigest(0xdb), endpoint_path),
+    );
+}
+
+test "P4J2: manifest daemon endpoint cleanup propagates endpoint delete failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xdc);
+
+    const too_long_prefix = try allocator.alloc(u8, std.fs.max_path_bytes + 1);
+    defer allocator.free(too_long_prefix);
+    @memset(too_long_prefix, 'a');
+    const endpoint_path = try std.fmt.allocPrint(allocator, "{s}/daemon.fifo", .{too_long_prefix});
+    defer allocator.free(endpoint_path);
+
+    try testing.expectError(
+        error.NameTooLong,
+        cleanupManifestDaemonEndpointFiles(allocator, invocation_identity, endpoint_path),
+    );
+}
+
+test "P4J2: manifest daemon termination cleans stale endpoint when pid metadata is missing" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xdd);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+    const endpoint_path = try manifestDaemonEndpointPath(allocator, invocation_identity);
+    defer allocator.free(endpoint_path);
+    const pid_path = try manifestDaemonPidPath(allocator, invocation_identity);
+    defer allocator.free(pid_path);
+    defer deleteManifestDaemonFileIfPresent(endpoint_path) catch {};
+    defer deleteManifestDaemonFileIfPresent(pid_path) catch {};
+    try deleteManifestDaemonFileIfPresent(endpoint_path);
+    try deleteManifestDaemonFileIfPresent(pid_path);
+
+    try writeFile(endpoint_path, "stale endpoint\n");
+
+    try terminateManifestDaemonEndpoint(allocator, invocation_identity, endpoint_path);
+
+    try testing.expect(!(try manifestDaemonPathExists(endpoint_path)));
+    try testing.expect(!(try manifestDaemonPathExists(pid_path)));
+}
+
+fn denyManifestDaemonSignalForTest(pid: std.posix.pid_t, signal: std.posix.SIG) anyerror!void {
+    _ = pid;
+    _ = signal;
+    return error.PermissionDenied;
+}
+
+var manifest_daemon_signal_called_for_test = false;
+
+fn failIfManifestDaemonSignalCalledForTest(pid: std.posix.pid_t, signal: std.posix.SIG) anyerror!void {
+    _ = pid;
+    _ = signal;
+    manifest_daemon_signal_called_for_test = true;
+    return error.UnexpectedSignal;
+}
+
+test "P4J2: manifest daemon termination preserves endpoint metadata on kill failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xde);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+    const endpoint_path = try manifestDaemonEndpointPath(allocator, invocation_identity);
+    defer allocator.free(endpoint_path);
+    const pid_path = try manifestDaemonPidPath(allocator, invocation_identity);
+    defer allocator.free(pid_path);
+    defer deleteManifestDaemonFileIfPresent(endpoint_path) catch {};
+    defer deleteManifestDaemonFileIfPresent(pid_path) catch {};
+    try deleteManifestDaemonFileIfPresent(endpoint_path);
+    try deleteManifestDaemonFileIfPresent(pid_path);
+
+    try writeFile(endpoint_path, "live endpoint\n");
+    try writeManifestDaemonPidFile(allocator, pid_path, std.posix.system.getpid());
+
+    try testing.expectError(
+        error.PermissionDenied,
+        terminateManifestDaemonEndpointWithSignal(allocator, invocation_identity, endpoint_path, denyManifestDaemonSignalForTest),
+    );
+    try testing.expect(try manifestDaemonPathExists(endpoint_path));
+    try testing.expect(try manifestDaemonPathExists(pid_path));
+}
+
+test "P4J2: manifest daemon fallback cleanup treats unavailable endpoint as stale metadata" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xdf);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+    const endpoint_path = try manifestDaemonEndpointPath(allocator, invocation_identity);
+    defer allocator.free(endpoint_path);
+    const pid_path = try manifestDaemonPidPath(allocator, invocation_identity);
+    defer allocator.free(pid_path);
+    defer deleteManifestDaemonFileIfPresent(endpoint_path) catch {};
+    defer deleteManifestDaemonFileIfPresent(pid_path) catch {};
+    try deleteManifestDaemonFileIfPresent(endpoint_path);
+    try deleteManifestDaemonFileIfPresent(pid_path);
+
+    try writeManifestDaemonPidFile(allocator, pid_path, std.posix.system.getpid());
+
+    manifest_daemon_signal_called_for_test = false;
+    try cleanupManifestDaemonBuildFallbackWithSignal(
+        allocator,
+        invocation_identity,
+        endpoint_path,
+        error.DaemonEndpointUnavailable,
+        failIfManifestDaemonSignalCalledForTest,
+    );
+
+    try testing.expect(!manifest_daemon_signal_called_for_test);
+    try testing.expect(!(try manifestDaemonPathExists(endpoint_path)));
+    try testing.expect(!(try manifestDaemonPathExists(pid_path)));
+}
+
+test "P4J2: manifest daemon fallback cleanup propagates live endpoint termination failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xe0);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+    const endpoint_path = try manifestDaemonEndpointPath(allocator, invocation_identity);
+    defer allocator.free(endpoint_path);
+    const pid_path = try manifestDaemonPidPath(allocator, invocation_identity);
+    defer allocator.free(pid_path);
+    defer deleteManifestDaemonFileIfPresent(endpoint_path) catch {};
+    defer deleteManifestDaemonFileIfPresent(pid_path) catch {};
+    try deleteManifestDaemonFileIfPresent(endpoint_path);
+    try deleteManifestDaemonFileIfPresent(pid_path);
+
+    try writeFile(endpoint_path, "live endpoint\n");
+    try writeManifestDaemonPidFile(allocator, pid_path, std.posix.system.getpid());
+
+    try testing.expectError(
+        error.PermissionDenied,
+        cleanupManifestDaemonBuildFallbackWithSignal(
+            allocator,
+            invocation_identity,
+            endpoint_path,
+            error.DaemonEndpointUnavailable,
+            denyManifestDaemonSignalForTest,
+        ),
+    );
+    try testing.expect(try manifestDaemonPathExists(endpoint_path));
+    try testing.expect(try manifestDaemonPathExists(pid_path));
+}
+
+fn reapedChildPidForManifestDaemonTest() !std.posix.pid_t {
+    const pid_result = std.posix.system.fork();
+    switch (std.posix.errno(pid_result)) {
+        .SUCCESS => {},
+        .AGAIN, .NOMEM => return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+
+    const pid: std.posix.pid_t = @intCast(pid_result);
+    if (pid == 0) {
+        std.c._exit(0);
+    }
+
+    var status: c_int = 0;
+    while (true) {
+        const wait_result = std.c.waitpid(pid, &status, 0);
+        switch (std.posix.errno(wait_result)) {
+            .SUCCESS => return pid,
+            .INTR => continue,
+            else => return error.SkipZigTest,
+        }
+    }
+}
+
+test "P4J2: manifest daemon signal treats ESRCH as an exited-process race" {
+    const pid = try reapedChildPidForManifestDaemonTest();
+
+    try signalManifestDaemonProcess(pid, .TERM);
+    try testing.expect(!(try manifestDaemonProcessIsAlive(pid)));
+}
+
+test "P4J2: manifest daemon endpoint removal wait treats true absence as removed" {
+    const allocator = testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const endpoint_path = try std.fs.path.join(allocator, &.{ tmp_path, "missing-daemon.fifo" });
+    defer allocator.free(endpoint_path);
+
+    try testing.expect(try waitForManifestDaemonEndpointRemoval(endpoint_path));
+}
+
+test "P4J2: manifest daemon endpoint removal wait propagates access failures" {
+    const allocator = testing.allocator;
+
+    const too_long_prefix = try allocator.alloc(u8, std.fs.max_path_bytes + 1);
+    defer allocator.free(too_long_prefix);
+    @memset(too_long_prefix, 'a');
+    const endpoint_path = try std.fmt.allocPrint(allocator, "{s}/daemon.fifo", .{too_long_prefix});
+    defer allocator.free(endpoint_path);
+
+    try testing.expectError(error.NameTooLong, waitForManifestDaemonEndpointRemoval(endpoint_path));
+}
+
+test "P4J2: manifest daemon orphan cleanup deletes request after confirmed endpoint absence" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xe1);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+
+    const endpoint_path = try manifestDaemonEndpointPath(allocator, invocation_identity);
+    defer allocator.free(endpoint_path);
+    std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => |delete_err| return delete_err,
+    };
+
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0xe100);
+    defer allocator.free(request_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+    std.Io.Dir.cwd().deleteFile(global_io, request_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => |delete_err| return delete_err,
+    };
+    try writeFile(request_path, "orphan\n");
+
+    try cleanupManifestDaemonOrphanRequestArtifact(allocator, std.fs.path.basename(request_path));
+
+    try testing.expect(!(try manifestDaemonPathExists(request_path)));
+}
+
+test "P4J2: manifest daemon orphan cleanup preserves request when endpoint exists" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xe2);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+
+    const endpoint_path = try manifestDaemonEndpointPath(allocator, invocation_identity);
+    defer allocator.free(endpoint_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch {};
+    std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => |delete_err| return delete_err,
+    };
+    try writeFile(endpoint_path, "");
+
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0xe200);
+    defer allocator.free(request_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+    std.Io.Dir.cwd().deleteFile(global_io, request_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => |delete_err| return delete_err,
+    };
+    try writeFile(request_path, "pending\n");
+
+    try cleanupManifestDaemonOrphanRequestArtifact(allocator, std.fs.path.basename(request_path));
+
+    try testing.expect(try manifestDaemonPathExists(request_path));
+}
+
+test "P4J2: manifest daemon orphan cleanup preserves request on endpoint access failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xe3);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+
+    const endpoint_path = try manifestDaemonEndpointPath(allocator, invocation_identity);
+    defer allocator.free(endpoint_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch {};
+    std.Io.Dir.cwd().deleteFile(global_io, endpoint_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => |delete_err| return delete_err,
+    };
+    try std.Io.Dir.cwd().symLink(global_io, std.fs.path.basename(endpoint_path), endpoint_path, .{});
+
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0xe300);
+    defer allocator.free(request_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+    std.Io.Dir.cwd().deleteFile(global_io, request_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => {},
+        else => |delete_err| return delete_err,
+    };
+    try writeFile(request_path, "pending\n");
+
+    try testing.expectError(
+        error.SymLinkLoop,
+        cleanupManifestDaemonOrphanRequestArtifact(allocator, std.fs.path.basename(request_path)),
+    );
+    try testing.expect(try manifestDaemonPathExists(request_path));
+}
+
+test "P4J2: manifest daemon pending request scan propagates allocation failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xd2);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0x1235);
+    defer allocator.free(request_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+
+    const build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+    try writeManifestDaemonRequestFile(
+        allocator,
+        request_path,
+        .warm,
+        invocation_identity,
+        null,
+        null,
+        ".",
+        "",
+        build_opts,
+        .{},
+        false,
+        false,
+        null,
+    );
+
+    var fixed_buffer: [0]u8 = .{};
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+    try testing.expectError(
+        error.OutOfMemory,
+        manifestDaemonPendingRequestStatus(fixed_allocator.allocator(), invocation_identity, null),
+    );
+}
+
+test "P4J2: manifest daemon pending request scan propagates protocol failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xd3);
+
+    try std.Io.Dir.cwd().createDirPath(global_io, MANIFEST_DAEMON_DIR);
+    const request_path = try manifestDaemonRequestPath(allocator, invocation_identity, 0x1236);
+    defer allocator.free(request_path);
+    defer std.Io.Dir.cwd().deleteFile(global_io, request_path) catch {};
+    try writeFile(request_path, "not a daemon request");
+
+    try testing.expectError(
+        error.InvalidDaemonProtocol,
+        manifestDaemonPendingRequestStatus(allocator, invocation_identity, .warm),
+    );
+}
+
+test "P4J2: manifest daemon build propagates path allocation failure" {
+    const allocator = testing.allocator;
+    const invocation_identity = testBuildCacheDigest(0xd4);
+    const build_opts: std.StringHashMapUnmanaged([]const u8) = .empty;
+
+    var fixed_buffer: [0]u8 = .{};
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+    try testing.expectError(
+        error.OutOfMemory,
+        tryManifestDaemonBuild(
+            allocator,
+            fixed_allocator.allocator(),
+            invocation_identity,
+            ".",
+            "default",
+            build_opts,
+            .{},
+            false,
+            null,
+            null,
+        ),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4: unified Zig-style `-D<key>=<value>` build-flag pipeline
 //
@@ -11889,6 +15853,64 @@ test "validateScriptMemoryManager still gates script-mode -Dmemory to stdlib onl
     try testing.expect(!validateScriptMemoryManager("MyApp.CustomArena"));
 }
 
+test "propagateLeakReportEnv: no requested env propagation is a no-op" {
+    var env_map = std.process.Environ.Map.init(testing.allocator);
+    defer env_map.deinit();
+
+    const previous_global_env_map = global_env_map;
+    global_env_map = &env_map;
+    defer global_env_map = previous_global_env_map;
+
+    try propagateLeakReportEnv(.{});
+    try propagateLeakReportEnv(.{ .error_format = .text });
+
+    try testing.expectEqual(@as(std.process.Environ.Map.Size, 0), env_map.count());
+}
+
+test "propagateLeakReportEnv: writes requested leak-report env vars" {
+    var env_map = std.process.Environ.Map.init(testing.allocator);
+    defer env_map.deinit();
+
+    const previous_global_env_map = global_env_map;
+    global_env_map = &env_map;
+    defer global_env_map = previous_global_env_map;
+
+    try propagateLeakReportEnv(.{
+        .error_format = .json,
+        .leaks_fatal = true,
+    });
+
+    try testing.expectEqualStrings("json", env_map.get("ZAP_ERROR_FORMAT").?);
+    try testing.expectEqualStrings("1", env_map.get("ZAP_LEAKS_FATAL").?);
+}
+
+test "propagateLeakReportEnv: requested propagation requires an env map" {
+    const previous_global_env_map = global_env_map;
+    global_env_map = null;
+    defer global_env_map = previous_global_env_map;
+
+    try testing.expectError(
+        error.LeakReportEnvUnavailable,
+        propagateLeakReportEnv(.{ .error_format = .json }),
+    );
+}
+
+test "propagateLeakReportEnv: returns env-map mutation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var env_map = std.process.Environ.Map.init(failing_allocator.allocator());
+    defer env_map.deinit();
+
+    const previous_global_env_map = global_env_map;
+    global_env_map = &env_map;
+    defer global_env_map = previous_global_env_map;
+
+    try testing.expectError(
+        error.OutOfMemory,
+        propagateLeakReportEnv(.{ .leaks_fatal = true }),
+    );
+    try testing.expectEqual(@as(std.process.Environ.Map.Size, 0), env_map.count());
+}
+
 test "appendTestRunArgs forwards seed before explicit test args" {
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args.deinit(testing.allocator);
@@ -12050,6 +16072,79 @@ test "computeBuildCacheKey includes manifest result hash" {
     const second = try computeBuildCacheKey(testing.allocator, build_source, &units, target_name, .{ .manifest_result_hash = 222 });
 
     try testing.expect(!std.mem.eql(u8, first[0..], second[0..]));
+}
+
+test "P4J2: manifest cache key records active manager source hash failures" {
+    const allocator = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const missing_manager_source_path = try std.fs.path.join(allocator, &.{ tmp_path, "missing_manager.zap" });
+    defer allocator.free(missing_manager_source_path);
+
+    const config: zap.builder.BuildConfig = .{
+        .name = "app",
+        .version = "0.0.0",
+        .kind = .bin,
+    };
+    const inputs: CompileAndLinkInputs = .{
+        .config = config,
+        .source_roots = &.{},
+        .source_units = &.{},
+        .struct_order = null,
+        .level_boundaries = null,
+        .manifest_result_hash = 0,
+        .cache_source = "",
+        .target_name = "default",
+        .build_opts = .empty,
+        .zap_lib_dir = null,
+        .zig_lib_dir = "",
+        .compiler_identity_digest = zeroBuildCacheDigest(),
+        .zig_lib_identity_digest = zeroBuildCacheDigest(),
+        .project_root = tmp_path,
+        .collect_arc_stats = false,
+        .layout = .manifest,
+    };
+
+    var failure: ManifestCacheKeyFailure = .{};
+    try testing.expectError(
+        error.FileNotFound,
+        computeManifestCacheKeyHex(
+            allocator,
+            inputs,
+            config,
+            missing_manager_source_path,
+            &failure,
+        ),
+    );
+    try testing.expectEqual(ManifestCacheKeyFailureStage.active_manager_source_hash, failure.stage);
+    try testing.expectEqualStrings(missing_manager_source_path, failure.active_manager_source_path.?);
+}
+
+test "P4J2: manifest cache key failure diagnostics name the failing stage" {
+    var captured: std.ArrayListUnmanaged(u8) = .empty;
+    defer captured.deinit(testing.allocator);
+    const previous_capture = zap.diagnostics.installStderrCapture(.{
+        .list = &captured,
+        .allocator = testing.allocator,
+    });
+    defer _ = zap.diagnostics.installStderrCapture(previous_capture);
+
+    emitManifestCacheKeyFailureDiagnostic(.{
+        .stage = .active_manager_source_hash,
+        .active_manager_source_path = "lib/memory/arc.zap",
+    }, error.FileNotFound);
+    emitManifestCacheKeyFailureDiagnostic(.{ .stage = .build_input_hash }, error.OutOfMemory);
+    emitManifestCacheKeyFailureDiagnostic(.{ .stage = .hex_encoding }, error.OutOfMemory);
+
+    try testing.expectEqualStrings(
+        "Error: could not hash active memory manager source for manifest cache key (lib/memory/arc.zap): FileNotFound\n" ++
+            "Error: could not hash manifest cache key inputs: OutOfMemory\n" ++
+            "Error: could not encode manifest cache key digest: OutOfMemory\n",
+        captured.items,
+    );
 }
 
 test "computeBuildCacheKey includes source contents" {
@@ -12487,6 +16582,52 @@ test "Phase5 stdlib identity: content AND path sensitive, deterministic (no fals
     try testing.expect(!std.mem.eql(u8, h_a[0..], h_c[0..]));
 }
 
+test "P4J2: stdlib identity propagates resolve OutOfMemory" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    tmp.dir.createDirPath(global_io, "stdlib") catch return error.Unexpected;
+    const stdlib_path = tmp.dir.realPathFileAlloc(global_io, "stdlib", a) catch return error.Unexpected;
+    defer a.free(stdlib_path);
+
+    var failing_allocator = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        hashStdlibIdentity(failing_allocator.allocator(), stdlib_path),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+fn expectTinyStdlibIdentityHash(allocator: std.mem.Allocator, stdlib_path: []const u8) !void {
+    _ = try hashStdlibIdentity(allocator, stdlib_path);
+}
+
+test "P4J2: stdlib identity preserves OutOfMemory during walk and reads" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    tmp.dir.createDirPath(global_io, "stdlib/nested") catch return error.Unexpected;
+    tmp.dir.writeFile(global_io, .{
+        .sub_path = "stdlib/kernel.zap",
+        .data = "pub struct Kernel { fn root() {} }",
+    }) catch return error.Unexpected;
+    tmp.dir.writeFile(global_io, .{
+        .sub_path = "stdlib/nested/extra.zap",
+        .data = "pub struct Extra { fn nested() {} }",
+    }) catch return error.Unexpected;
+
+    const stdlib_path = tmp.dir.realPathFileAlloc(global_io, "stdlib", a) catch return error.Unexpected;
+    defer a.free(stdlib_path);
+
+    try testing.checkAllAllocationFailures(
+        a,
+        expectTinyStdlibIdentityHash,
+        .{stdlib_path},
+    );
+}
+
 test "Zig lib identity: content AND path sensitive, deterministic" {
     const a = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -12789,6 +16930,295 @@ test "manifest source roots include project lib test tools and immediate subdire
     try expectSourceRoot(roots.items, "project", project_root);
 }
 
+test "manifest source roots skip absent optional project roots with typed reason" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    const missing_lib = try std.fs.path.join(allocator, &.{ project_root, "lib" });
+
+    try testing.expectEqual(OptionalSourceRootSkipReason.missing, try optionalDirectorySkipReason(missing_lib));
+
+    var roots: std.ArrayListUnmanaged(zap.discovery.SourceRoot) = .empty;
+    try appendProjectSourceRoots(allocator, &roots, project_root);
+
+    try testing.expectEqual(@as(usize, 1), roots.items.len);
+    try testing.expectEqualStrings("project", roots.items[0].name);
+    try testing.expectEqualStrings(project_root, roots.items[0].path);
+}
+
+test "manifest source roots classify optional file root as not_directory" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(global_io, .{
+        .sub_path = "lib",
+        .data = "not a directory",
+    });
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    const lib_path = try std.fs.path.join(allocator, &.{ project_root, "lib" });
+
+    try testing.expectEqual(OptionalSourceRootSkipReason.not_directory, try optionalDirectorySkipReason(lib_path));
+}
+
+test "required project source scans propagate missing root" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    const missing_root = try std.fs.path.join(allocator, &.{ project_root, "missing" });
+
+    var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var discovered = std.StringHashMap(void).init(allocator);
+    try testing.expectError(
+        error.FileNotFound,
+        appendImmediateProjectZapFiles(allocator, missing_root, &source_files, &discovered),
+    );
+
+    try testing.expectError(
+        error.FileNotFound,
+        scanZapFilesRecursive(allocator, missing_root, &source_files, &discovered),
+    );
+}
+
+test "required project source scans free duplicate owned paths" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(global_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {}",
+    });
+
+    const allocator = testing.allocator;
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(project_root);
+    const app_path = try std.fs.path.join(allocator, &.{ project_root, "app.zap" });
+    defer allocator.free(app_path);
+
+    var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitOwnedPathList(allocator, &source_files);
+
+    var discovered = std.StringHashMap(void).init(allocator);
+    defer deinitOwnedPathSet(allocator, &discovered);
+    const key = try std.fs.path.resolve(allocator, &.{app_path});
+    var key_owned = true;
+    defer if (key_owned) allocator.free(key);
+    try discovered.put(key, {});
+    key_owned = false;
+
+    try appendImmediateProjectZapFiles(allocator, project_root, &source_files, &discovered);
+    try scanZapFilesRecursive(allocator, project_root, &source_files, &discovered);
+    try testing.expectEqual(@as(usize, 0), source_files.items.len);
+}
+
+fn exerciseAppendImmediateProjectZapFilesAllocationFailures(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+) !void {
+    var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitOwnedPathList(allocator, &source_files);
+    var discovered = std.StringHashMap(void).init(allocator);
+    defer deinitOwnedPathSet(allocator, &discovered);
+    try appendImmediateProjectZapFiles(allocator, project_root, &source_files, &discovered);
+}
+
+test "appendImmediateProjectZapFiles cleans owned paths on allocation failures" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(global_io, .{
+        .sub_path = "app.zap",
+        .data = "pub struct App {}",
+    });
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", testing.allocator);
+    defer testing.allocator.free(project_root);
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseAppendImmediateProjectZapFilesAllocationFailures,
+        .{project_root},
+    );
+}
+
+fn exerciseScanZapFilesRecursiveAllocationFailures(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+) !void {
+    var source_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitOwnedPathList(allocator, &source_files);
+    var discovered = std.StringHashMap(void).init(allocator);
+    defer deinitOwnedPathSet(allocator, &discovered);
+    try scanZapFilesRecursive(allocator, project_root, &source_files, &discovered);
+}
+
+test "scanZapFilesRecursive cleans owned paths on allocation failures" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.createDirPath(global_io, "lib/nested");
+    try tmp_dir.dir.writeFile(global_io, .{
+        .sub_path = "lib/app.zap",
+        .data = "pub struct App {}",
+    });
+    try tmp_dir.dir.writeFile(global_io, .{
+        .sub_path = "lib/nested/dep.zap",
+        .data = "pub struct Dep {}",
+    });
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, "lib", testing.allocator);
+    defer testing.allocator.free(project_root);
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseScanZapFilesRecursiveAllocationFailures,
+        .{project_root},
+    );
+}
+
+fn exerciseAppendFileFingerprintAllocationFailures(allocator: std.mem.Allocator) !void {
+    var files: std.ArrayListUnmanaged(build_cache.FileFingerprint) = .empty;
+    defer {
+        for (files.items) |fingerprint| allocator.free(fingerprint.path);
+        files.deinit(allocator);
+    }
+    try appendFileFingerprint(allocator, &files, "missing-p4j2-file.zap");
+}
+
+fn exerciseAppendAbsentFileFingerprintAllocationFailures(allocator: std.mem.Allocator) !void {
+    var files: std.ArrayListUnmanaged(build_cache.FileFingerprint) = .empty;
+    defer {
+        for (files.items) |fingerprint| allocator.free(fingerprint.path);
+        files.deinit(allocator);
+    }
+    try appendAbsentFileFingerprint(allocator, &files, "missing-p4j2-absent.zap");
+}
+
+fn exerciseAppendDirectoryFingerprintAllocationFailures(allocator: std.mem.Allocator) !void {
+    var directories: std.ArrayListUnmanaged(build_cache.DirectoryFingerprint) = .empty;
+    defer {
+        for (directories.items) |fingerprint| allocator.free(fingerprint.path);
+        directories.deinit(allocator);
+    }
+    try appendDirectoryFingerprint(allocator, &directories, "missing-p4j2-dir", false);
+}
+
+fn exerciseAppendManifestEnvFingerprintAllocationFailures(allocator: std.mem.Allocator) !void {
+    var env_vars: std.ArrayListUnmanaged(build_cache.EnvFingerprint) = .empty;
+    defer {
+        for (env_vars.items) |fingerprint| allocator.free(fingerprint.name);
+        env_vars.deinit(allocator);
+    }
+
+    try appendManifestEnvFingerprint(allocator, &env_vars, "P4J2_ENV", true, 0x1234);
+
+    try testing.expectEqual(@as(usize, 1), env_vars.items.len);
+    try testing.expectEqualStrings("P4J2_ENV", env_vars.items[0].name);
+    try testing.expect(env_vars.items[0].present);
+    try testing.expectEqual(@as(u64, 0x1234), env_vars.items[0].value_hash);
+}
+
+fn exerciseAppendManifestGlobFingerprintAllocationFailures(allocator: std.mem.Allocator) !void {
+    var globs: std.ArrayListUnmanaged(build_cache.GlobFingerprint) = .empty;
+    defer {
+        for (globs.items) |fingerprint| allocator.free(fingerprint.pattern);
+        globs.deinit(allocator);
+    }
+
+    try appendManifestGlobFingerprint(allocator, &globs, "lib/**/*.zap", 0x5678);
+
+    try testing.expectEqual(@as(usize, 1), globs.items.len);
+    try testing.expectEqualStrings("lib/**/*.zap", globs.items[0].pattern);
+    try testing.expectEqual(@as(u64, 0x5678), globs.items[0].result_hash);
+}
+
+test "manifest fingerprint append helpers clean owned paths on allocation failures" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseAppendFileFingerprintAllocationFailures,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseAppendAbsentFileFingerprintAllocationFailures,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseAppendDirectoryFingerprintAllocationFailures,
+        .{},
+    );
+}
+
+test "P4J2: manifest dependency append helpers clean env and glob payloads on allocation failures" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseAppendManifestEnvFingerprintAllocationFailures,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseAppendManifestGlobFingerprintAllocationFailures,
+        .{},
+    );
+}
+
+fn exerciseCollectMemoryAdapterSourceUnitsAllocationFailures(
+    allocator: std.mem.Allocator,
+    source_root_path: []const u8,
+) !void {
+    const source_roots = [_]zap.discovery.SourceRoot{
+        .{ .name = "zap_stdlib", .path = source_root_path },
+    };
+    const units = try collectMemoryAdapterSourceUnits(allocator, &source_roots);
+    defer {
+        for (units) |unit| {
+            allocator.free(unit.file_path);
+            allocator.free(unit.source);
+        }
+        allocator.free(units);
+    }
+}
+
+test "collectMemoryAdapterSourceUnits cleans owned sources on allocation failures" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(global_io, .{
+        .sub_path = "adapter.zap",
+        .data = "pub struct Adapter {}",
+    });
+
+    const source_root_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", testing.allocator);
+    defer testing.allocator.free(source_root_path);
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseCollectMemoryAdapterSourceUnitsAllocationFailures,
+        .{source_root_path},
+    );
+}
+
+test "manifest path glob expansion propagates missing base directory" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    var results: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    try testing.expectError(
+        error.FileNotFound,
+        globCollectFiles(allocator, project_root, "missing/**/*.zap", &results),
+    );
+}
+
 test "manifest source roots include path deps, local overrides, and stdlib roots" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -12840,6 +17270,132 @@ test "manifest source roots include path deps, local overrides, and stdlib roots
     try expectSourceRoot(roots, "dep:logging", logging_src);
     try expectSourceRoot(roots, "zap_stdlib", zap_lib_dir);
     try expectSourceRoot(roots, "zap_stdlib", zap_subdir);
+}
+
+const FailingSourceRootLockfileWriter = struct {
+    fn writeLockfile(
+        _: FailingSourceRootLockfileWriter,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: []const zap.lockfile.LockEntry,
+    ) !void {
+        return error.TestLockfileWriteFailed;
+    }
+};
+
+test "manifest source roots propagate required lockfile write failure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "deps/math/lib");
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(project_root);
+
+    const deps = [_]zap.builder.BuildConfig.Dep{
+        .{ .name = "math", .source = .{ .path = "deps/math" } },
+    };
+    const config = zap.builder.BuildConfig{
+        .name = "app",
+        .version = "0.1.0",
+        .kind = .bin,
+        .root = "App.main/0",
+        .deps = &deps,
+    };
+
+    try testing.expectError(
+        error.TestLockfileWriteFailed,
+        resolveManifestSourceRootsWithLockfileWriter(
+            allocator,
+            project_root,
+            config,
+            null,
+            .{
+                .write_lockfile = true,
+                .print_local_overrides = false,
+            },
+            FailingSourceRootLockfileWriter{},
+        ),
+    );
+}
+
+test "manifest source roots propagate malformed lockfile reads" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(global_io, .{
+        .sub_path = "zap.lock",
+        .data = "invalid lockfile line\n",
+    });
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(project_root);
+
+    const config = zap.builder.BuildConfig{
+        .name = "app",
+        .version = "0.1.0",
+        .kind = .bin,
+        .root = "App.main/0",
+    };
+
+    try testing.expectError(
+        error.InvalidLockfile,
+        resolveManifestSourceRoots(allocator, project_root, config, null, .{
+            .write_lockfile = false,
+            .print_local_overrides = false,
+        }),
+    );
+}
+
+test "lockfile entry changed detection compares source and integrity fields" {
+    const original = zap.lockfile.LockEntry{
+        .name = "dep",
+        .source_type = "git",
+        .url = "https://example.invalid/old.git",
+        .resolved_ref = "v1.0.0",
+        .commit = "1234567890abcdef",
+        .integrity = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+
+    try testing.expect(!lockEntryChanged(original, original));
+    try testing.expect(lockEntryChanged(original, .{
+        .name = "dep",
+        .source_type = "path",
+        .url = "deps/dep",
+        .resolved_ref = "-",
+        .commit = "1234567890abcdef",
+        .integrity = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }));
+    try testing.expect(lockEntryChanged(original, .{
+        .name = "dep",
+        .source_type = "git",
+        .url = "https://example.invalid/new.git",
+        .resolved_ref = "v1.0.0",
+        .commit = "1234567890abcdef",
+        .integrity = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }));
+    try testing.expect(lockEntryChanged(original, .{
+        .name = "dep",
+        .source_type = "git",
+        .url = "https://example.invalid/old.git",
+        .resolved_ref = "v2.0.0",
+        .commit = "1234567890abcdef",
+        .integrity = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }));
+    try testing.expect(lockEntryChanged(original, .{
+        .name = "dep",
+        .source_type = "git",
+        .url = "https://example.invalid/old.git",
+        .resolved_ref = "v1.0.0",
+        .commit = "1234567890abcdef",
+        .integrity = "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }));
 }
 
 test "manifest source-root recursive scan policy covers protocol and impl roots" {
@@ -13002,11 +17558,74 @@ test "firstPositionalIndex: post-positional tokens never re-trigger flag skippin
     );
 }
 
+test "P4J2: classifyRunPositional treats true absence as manifest" {
+    const kind = try classifyRunPositional(testing.allocator, &.{"missing/p4j2/run-target"});
+    switch (kind) {
+        .manifest => {},
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "P4J2: classifyRunPositional propagates canonicalization OutOfMemory" {
+    var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    try testing.expectError(
+        error.OutOfMemory,
+        classifyRunPositional(failing_allocator.allocator(), &.{"src/main.zig"}),
+    );
+    try testing.expect(failing_allocator.has_induced_failure);
+}
+
+test "P4J2: classifyRunPositional propagates canonicalization filesystem errors" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.symLink(global_io, "loop.zap", "loop.zap", .{});
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const loop_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "loop.zap" });
+    defer testing.allocator.free(loop_path);
+
+    try testing.expectError(
+        error.SymLinkLoop,
+        classifyRunPositional(testing.allocator, &.{loop_path}),
+    );
+}
+
 test "leadingFlagPresent scans only the pre-script region" {
     const args = &.{ "--trace-incremental", "s.zap", "--trace-incremental" };
 
     try testing.expect(leadingFlagPresent(args, 1, "--trace-incremental"));
     try testing.expect(!leadingFlagPresent(args, 0, "--trace-incremental"));
+}
+
+test "makeSingleFileTestRunnerSource calls selected Zest case structs" {
+    const runner = try makeSingleFileTestRunnerSource(
+        testing.allocator,
+        &.{ "Tmp.FirstCase", "Tmp.SecondCase" },
+    );
+    defer testing.allocator.free(runner);
+
+    try testing.expect(std.mem.indexOf(
+        u8,
+        runner,
+        "Zest.Runner.configure()",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        runner,
+        "Tmp.FirstCase.run()",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        runner,
+        "Tmp.SecondCase.run()",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        runner,
+        "Zest.Runner.run()",
+    ) != null);
 }
 
 test "targetIsHostRunnable: null target (native, incl. bare -Dcpu) is always runnable" {
@@ -13121,6 +17740,49 @@ test "resolveZapLibDir: invalid explicit flag dir without kernel.zap is a hard e
     try testing.expectError(
         error.InvalidZapLibDir,
         resolveZapLibDir(testing.allocator, tmp_path, null),
+    );
+}
+
+test "P4J2: resolveZapLibDir preserves OutOfMemory while validating explicit dir" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    tmp_dir.dir.writeFile(global_io, .{ .sub_path = "kernel.zap", .data = "" }) catch
+        return error.SkipZigTest;
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    var fixed_buffer: [0]u8 = .{};
+    var fixed_allocator = std.heap.FixedBufferAllocator.init(&fixed_buffer);
+    try testing.expectError(
+        error.OutOfMemory,
+        resolveZapLibDir(fixed_allocator.allocator(), tmp_path, null),
+    );
+}
+
+test "P4J2: resolveZapLibDir reports access failure while validating explicit dir" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    tmp_dir.dir.symLink(global_io, "kernel.zap", "kernel.zap", .{}) catch
+        return error.SkipZigTest;
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    try testing.expectError(
+        error.ZapLibDirAccessFailed,
+        resolveZapLibDir(testing.allocator, tmp_path, null),
+    );
+}
+
+fn exerciseResolveExeRelativeZapLibDirAllocationFailures(allocator: std.mem.Allocator) !void {
+    const resolved = try resolveExeRelativeZapLibDir(allocator);
+    defer if (resolved) |dir| allocator.free(dir);
+}
+
+test "P4J2: resolveExeRelativeZapLibDir preserves allocation failures" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        exerciseResolveExeRelativeZapLibDirAllocationFailures,
+        .{},
     );
 }
 
@@ -13239,15 +17901,30 @@ test "parseTargetArgs: absence of --zap-lib-dir is identical to the baseline par
 // Build file discovery
 // ---------------------------------------------------------------------------
 
+const BuildFileAccessStatus = enum {
+    present,
+    missing,
+};
+
+fn buildFileAccessStatus(path: []const u8) !BuildFileAccessStatus {
+    std.Io.Dir.cwd().access(global_io, path, .{}) catch |err| {
+        if (isMissingPathAccessError(err)) return .missing;
+        return err;
+    };
+    return .present;
+}
+
 /// Find build.zap and return the project root directory.
 fn discoverBuildFile(allocator: std.mem.Allocator, override: ?[]const u8) ![]const u8 {
     if (override) |path| {
-        // Verify the override file exists
-        std.Io.Dir.cwd().access(global_io, path, .{}) catch {
-            // stderr writer removed in 0.16
-            std.debug.print("Error: build file not found: {s}\n", .{path});
-            std.process.exit(1);
-        };
+        switch (try buildFileAccessStatus(path)) {
+            .present => {},
+            .missing => {
+                // stderr writer removed in 0.16
+                std.debug.print("Error: build file not found: {s}\n", .{path});
+                std.process.exit(1);
+            },
+        }
         // Project root is the directory containing the build file
         if (std.fs.path.dirname(path)) |dir| {
             return try allocator.dupe(u8, dir);
@@ -13256,13 +17933,60 @@ fn discoverBuildFile(allocator: std.mem.Allocator, override: ?[]const u8) ![]con
     }
 
     // Default: look for build.zap in cwd
-    std.Io.Dir.cwd().access(global_io, "build.zap", .{}) catch {
-        // stderr writer removed in 0.16
-        std.debug.print("Error: no build.zap found in current directory\n", .{});
-        std.process.exit(1);
-    };
+    switch (try buildFileAccessStatus("build.zap")) {
+        .present => {},
+        .missing => {
+            // stderr writer removed in 0.16
+            std.debug.print("Error: no build.zap found in current directory\n", .{});
+            std.process.exit(1);
+        },
+    }
 
     return try allocator.dupe(u8, ".");
+}
+
+test "build file access treats absent and not-directory paths as missing" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "parent", .data = "not a directory" });
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const absent_path = try std.fs.path.join(allocator, &.{ tmp_path, "missing-build.zap" });
+    defer allocator.free(absent_path);
+    const not_directory_path = try std.fs.path.join(allocator, &.{ tmp_path, "parent/build.zap" });
+    defer allocator.free(not_directory_path);
+
+    try std.testing.expectEqual(BuildFileAccessStatus.missing, try buildFileAccessStatus(absent_path));
+    try std.testing.expectEqual(BuildFileAccessStatus.missing, try buildFileAccessStatus(not_directory_path));
+}
+
+test "build file access propagates non-missing path failures" {
+    const allocator = std.testing.allocator;
+    const too_long_prefix = try allocator.alloc(u8, std.fs.max_path_bytes + 1);
+    defer allocator.free(too_long_prefix);
+    @memset(too_long_prefix, 'a');
+    const build_file_path = try std.fmt.allocPrint(allocator, "{s}/build.zap", .{too_long_prefix});
+    defer allocator.free(build_file_path);
+
+    try std.testing.expectError(error.NameTooLong, buildFileAccessStatus(build_file_path));
+}
+
+test "build file access propagates symlink-loop failures" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.symLink(global_io, "build.zap", "build.zap", .{});
+
+    const tmp_path = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const build_file_path = try std.fs.path.join(allocator, &.{ tmp_path, "build.zap" });
+    defer allocator.free(build_file_path);
+
+    try std.testing.expectError(error.SymLinkLoop, buildFileAccessStatus(build_file_path));
 }
 
 // ---------------------------------------------------------------------------
@@ -13298,6 +18022,7 @@ fn globCollectFiles(
         try alloc.dupe(u8, project_root)
     else
         try std.fs.path.join(alloc, &.{ project_root, base_rel });
+    defer alloc.free(base_dir);
 
     try walkAndMatch(alloc, base_dir, base_dir, sub_pattern, project_root, has_double_star, results);
 }
@@ -13311,12 +18036,14 @@ fn walkAndMatch(
     recurse: bool,
     results: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    var dir = std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true }) catch return;
+    var dir = try std.Io.Dir.cwd().openDir(global_io, dir_path, .{ .iterate = true });
     defer dir.close(global_io);
     var iter = dir.iterate();
 
-    while (iter.next(global_io) catch null) |entry| {
+    while (try iter.next(global_io)) |entry| {
         const full_path = try std.fs.path.join(alloc, &.{ dir_path, entry.name });
+        var full_path_owned = true;
+        defer if (full_path_owned) alloc.free(full_path);
 
         if (entry.kind == .directory and recurse) {
             try walkAndMatch(alloc, full_path, base_dir, pattern, project_root, recurse, results);
@@ -13330,6 +18057,7 @@ fn walkAndMatch(
             try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path[base_dir.len + 1 ..], entry.name })
         else
             try alloc.dupe(u8, entry.name);
+        defer alloc.free(match_path);
 
         // Strip leading "./" from pattern for matching
         const clean_pattern = if (std.mem.startsWith(u8, pattern, "./"))
@@ -13355,6 +18083,7 @@ fn walkAndMatch(
         }
         if (!dup) {
             try results.append(alloc, full_path);
+            full_path_owned = false;
         }
     }
 }
@@ -13382,6 +18111,60 @@ test "globMatch basics" {
     // Specific file
     try std.testing.expect(globMatch("./hello.zap", "hello.zap"));
     try std.testing.expect(!globMatch("./hello.zap", "other.zap"));
+}
+
+test "globCollectFiles frees skipped paths during recursive collection" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "lib/nested");
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "build.zap", .data = "pub struct Build {}" });
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "lib/nested/target.zap", .data = "pub struct Target {}" });
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "lib/nested/other.zap", .data = "pub struct Other {}" });
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "lib/readme.txt", .data = "not zap" });
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", allocator);
+    defer allocator.free(project_root);
+
+    var results: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitOwnedPathList(allocator, &results);
+
+    try globCollectFiles(allocator, project_root, "lib/**/target.zap", &results);
+    try globCollectFiles(allocator, project_root, "lib/**/target.zap", &results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, results.items[0], "lib/nested/target.zap"));
+}
+
+fn exerciseGlobCollectFilesAllocationFailures(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+) !void {
+    var results: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitOwnedPathList(allocator, &results);
+
+    try globCollectFiles(allocator, project_root, "**/*.zap", &results);
+}
+
+test "globCollectFiles cleans owned paths on allocation failures" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(global_io, "lib/nested");
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "build.zap", .data = "pub struct Build {}" });
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "app.zap", .data = "pub struct App {}" });
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "lib/nested/dep.zap", .data = "pub struct Dep {}" });
+    try tmp_dir.dir.writeFile(global_io, .{ .sub_path = "lib/nested/skip.txt", .data = "not zap" });
+
+    const project_root = try tmp_dir.dir.realPathFileAlloc(global_io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(project_root);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseGlobCollectFilesAllocationFailures,
+        .{project_root},
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -13418,10 +18201,106 @@ fn toPascalCase(allocator: std.mem.Allocator, snake: []const u8) ![]const u8 {
     return try result.toOwnedSlice(allocator);
 }
 
-fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
-    const home = env.getenv("HOME") orelse return error.FileNotFound;
+const EmbeddedZigLibError = error{
+    EmbeddedZigLibArchiveUnavailable,
+    EmbeddedZigLibCacheUnavailable,
+    EmbeddedZigLibCacheAccessFailed,
+    EmbeddedZigLibCacheDeleteFailed,
+    EmbeddedZigLibCacheCreateFailed,
+    EmbeddedZigLibCacheOpenFailed,
+    EmbeddedZigLibArchiveDecompressFailed,
+    EmbeddedZigLibArchiveExtractFailed,
+    EmbeddedZigLibDigestWriteFailed,
+    OutOfMemory,
+};
 
-    const lib_dir = try std.fs.path.join(allocator, &.{ home, ".cache", "zap", "zig-lib" });
+const ZigLibDirResolutionError = EmbeddedZigLibError || zir_backend.ZigLibDirProbeError || error{
+    ZigLibDirNotFound,
+};
+
+const ZigLibProbe = union(enum) {
+    absent,
+    found: []const u8,
+    failed: zir_backend.ZigLibDirProbeError,
+};
+
+const EmbeddedZigLibProbe = union(enum) {
+    absent,
+    found: []const u8,
+    failed: EmbeddedZigLibError,
+};
+
+fn isMissingEmbeddedZigLibCachePathError(err: anyerror) bool {
+    return switch (err) {
+        error.FileNotFound, error.NotDir => true,
+        else => false,
+    };
+}
+
+fn embeddedZigLibErrorOrStatus(err: anyerror, status: EmbeddedZigLibError) EmbeddedZigLibError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => status,
+    };
+}
+
+fn resolveZigLibDirFromCandidates(
+    trusted_zig_lib: ZigLibProbe,
+    embedded_zig_lib: EmbeddedZigLibProbe,
+    system_zig_lib: ZigLibProbe,
+) ZigLibDirResolutionError![]const u8 {
+    switch (trusted_zig_lib) {
+        .absent => {},
+        .found => |zig_lib_dir| return zig_lib_dir,
+        .failed => |err| return err,
+    }
+    switch (embedded_zig_lib) {
+        .absent => {},
+        .found => |zig_lib_dir| return zig_lib_dir,
+        .failed => |err| return err,
+    }
+    switch (system_zig_lib) {
+        .absent => {},
+        .found => |zig_lib_dir| return zig_lib_dir,
+        .failed => |err| return err,
+    }
+    return error.ZigLibDirNotFound;
+}
+
+fn resolveZigLibDir(allocator: std.mem.Allocator) ZigLibDirResolutionError![]const u8 {
+    if (try zir_backend.detectZigLibDir(allocator)) |zig_lib_dir| return zig_lib_dir;
+    if (try resolveEmbeddedZigLibDir(allocator)) |zig_lib_dir| return zig_lib_dir;
+    if (try zir_backend.detectZigLibDirSystemFallback(allocator)) |zig_lib_dir| return zig_lib_dir;
+    return error.ZigLibDirNotFound;
+}
+
+fn resolveEmbeddedZigLibDir(allocator: std.mem.Allocator) EmbeddedZigLibError!?[]const u8 {
+    return resolveEmbeddedZigLibDirFromArchive(allocator, env.getenv("HOME"), zig_lib_archive.data);
+}
+
+fn resolveEmbeddedZigLibDirFromArchive(
+    allocator: std.mem.Allocator,
+    home: ?[]const u8,
+    archive_data: []const u8,
+) EmbeddedZigLibError!?[]const u8 {
+    if (archive_data.len == 0) return null;
+    return try extractEmbeddedZigLibFromArchive(allocator, home, archive_data);
+}
+
+fn extractEmbeddedZigLib(allocator: std.mem.Allocator) EmbeddedZigLibError![]const u8 {
+    return extractEmbeddedZigLibFromArchive(allocator, env.getenv("HOME"), zig_lib_archive.data);
+}
+
+fn extractEmbeddedZigLibFromArchive(
+    allocator: std.mem.Allocator,
+    home: ?[]const u8,
+    archive_data: []const u8,
+) EmbeddedZigLibError![]const u8 {
+    if (archive_data.len == 0) return error.EmbeddedZigLibArchiveUnavailable;
+    const cache_home = home orelse return error.EmbeddedZigLibCacheUnavailable;
+
+    const lib_dir = try std.fs.path.join(allocator, &.{ cache_home, ".cache", "zap", "zig-lib" });
+    errdefer allocator.free(lib_dir);
 
     // Content-addressed staleness: the cache is valid only when it was
     // extracted from THIS compiler binary's embedded archive. Keying the
@@ -13433,7 +18312,7 @@ fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
     // effect. Instead store a digest of the embedded archive in a marker
     // file and re-extract whenever it is absent or does not match.
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(zig_lib_archive.data, &digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(archive_data, &digest, .{});
     var digest_hex: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
     _ = std.fmt.bufPrint(&digest_hex, "{x}", .{&digest}) catch unreachable;
 
@@ -13450,16 +18329,32 @@ fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
             if (std.mem.eql(u8, std.mem.trim(u8, existing, " \n\r\t"), &digest_hex)) {
                 return lib_dir;
             }
-        } else |_| {}
-    } else |_| {}
+        } else |err| {
+            if (!isMissingEmbeddedZigLibCachePathError(err)) {
+                return embeddedZigLibErrorOrStatus(err, error.EmbeddedZigLibCacheAccessFailed);
+            }
+        }
+    } else |err| {
+        if (!isMissingEmbeddedZigLibCachePathError(err)) {
+            return embeddedZigLibErrorOrStatus(err, error.EmbeddedZigLibCacheAccessFailed);
+        }
+    }
 
     // Stale or absent: wipe any prior extraction so files removed from the
     // archive do not linger, then extract this binary's archive fresh. The
     // cache is fully regenerable, so deleting it is safe.
-    std.Io.Dir.cwd().deleteTree(global_io, lib_dir) catch {};
-    std.Io.Dir.cwd().createDirPath(global_io, lib_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(global_io, lib_dir) catch |err| {
+        if (!isMissingEmbeddedZigLibCachePathError(err)) {
+            return embeddedZigLibErrorOrStatus(err, error.EmbeddedZigLibCacheDeleteFailed);
+        }
+    };
+    std.Io.Dir.cwd().createDirPath(global_io, lib_dir) catch |err| {
+        return embeddedZigLibErrorOrStatus(err, error.EmbeddedZigLibCacheCreateFailed);
+    };
 
-    var dir = std.Io.Dir.cwd().openDir(global_io, lib_dir, .{}) catch return error.FileNotFound;
+    var dir = std.Io.Dir.cwd().openDir(global_io, lib_dir, .{}) catch |err| {
+        return embeddedZigLibErrorOrStatus(err, error.EmbeddedZigLibCacheOpenFailed);
+    };
     defer dir.close(global_io);
 
     // The embedded archive (`zig_lib_archive.data`) is XZ-compressed at build
@@ -13471,23 +18366,31 @@ fn extractEmbeddedZigLib(allocator: std.mem.Allocator) ![]const u8 {
     //
     //   fixed(compressed bytes) -> xz.Decompress -> tar.extract
     //
-    // `xz.Decompress.init` takes ownership of `decompress_buffer` and grows it
-    // with `allocator` as LZMA2 dictionaries require (XZ blocks declare their
-    // own dictionary size); `decompress.deinit()` frees it. The decompressed
-    // `std.Io.Reader` is exposed as `decompress.reader`. NB: `xz.Decompress`
-    // resolves its parent via `@fieldParentPtr("reader", ...)`, so the
-    // `decompress` value must not be moved after `init` — keep it in this
-    // stable local and pass `&decompress.reader` to the extractor.
-    var compressed_reader = std.Io.Reader.fixed(zig_lib_archive.data);
+    // After successful init, `xz.Decompress` owns `decompress_buffer` and grows
+    // it with `allocator` as LZMA2 dictionaries require (XZ blocks declare
+    // their own dictionary size); `decompress.deinit()` frees it. On init
+    // failure, ownership remains here and the catch path frees it. The
+    // decompressed `std.Io.Reader` is exposed as `decompress.reader`. NB:
+    // `xz.Decompress` resolves its parent via `@fieldParentPtr("reader", ...)`,
+    // so the `decompress` value must not be moved after `init` — keep it in
+    // this stable local and pass `&decompress.reader` to the extractor.
+    var compressed_reader = std.Io.Reader.fixed(archive_data);
     const decompress_buffer = allocator.alloc(u8, 64 * 1024) catch return error.OutOfMemory;
-    var decompress = std.compress.xz.Decompress.init(&compressed_reader, allocator, decompress_buffer) catch return error.FileNotFound;
+    var decompress = std.compress.xz.Decompress.init(&compressed_reader, allocator, decompress_buffer) catch |err| {
+        allocator.free(decompress_buffer);
+        return embeddedZigLibErrorOrStatus(err, error.EmbeddedZigLibArchiveDecompressFailed);
+    };
     defer decompress.deinit();
-    std.tar.extract(global_io, dir, &decompress.reader, .{}) catch return error.FileNotFound;
+    std.tar.extract(global_io, dir, &decompress.reader, .{}) catch |err| {
+        return embeddedZigLibErrorOrStatus(err, error.EmbeddedZigLibArchiveExtractFailed);
+    };
 
     // Stamp the digest marker last so a crash mid-extract leaves an
     // unmarked (therefore stale-on-next-run) tree rather than a marked
     // partial one.
-    writeFile(digest_marker, &digest_hex) catch {};
+    writeFile(digest_marker, &digest_hex) catch |err| {
+        return embeddedZigLibErrorOrStatus(err, error.EmbeddedZigLibDigestWriteFailed);
+    };
 
     return lib_dir;
 }

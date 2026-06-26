@@ -357,7 +357,7 @@ fn detectKey(line: []const u8) ?KeyValue {
 const Parser = @import("parser.zig").Parser;
 
 fn parseSource(alloc: std.mem.Allocator, source: []const u8, out_interner: **ast.StringInterner) !ast.Program {
-    var parser = Parser.init(alloc, source);
+    var parser = try Parser.init(alloc, source);
     const program = try parser.parseProgram();
     out_interner.* = parser.interner;
     return program;
