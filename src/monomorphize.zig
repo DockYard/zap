@@ -1259,6 +1259,21 @@ const MonomorphContext = struct {
         return self.runtimeTypePredicate(type_id, .monomorphization_ready);
     }
 
+    /// True when the function body currently being scanned is itself generic
+    /// — at least one of its parameters still carries a free type variable.
+    /// The empty-literal `i64` fallback in `resolveCallArgumentType` keys off
+    /// this: that guess is only sound once the surrounding body is concrete
+    /// (the transitive pass), never during the single generic pass over the
+    /// original body. `current_scan_params` is null outside a scan, in which
+    /// case there is no generic context to worry about.
+    fn currentScanIsGeneric(self: *const MonomorphContext) TypeWalkError!bool {
+        const params = self.current_scan_params orelse return false;
+        for (params) |param| {
+            if (try containsTypeVar(self.store, param.type_id, self.allocator)) return true;
+        }
+        return false;
+    }
+
     fn resolveCallArgumentType(
         self: *const MonomorphContext,
         arg: hir.CallArg,
@@ -1350,6 +1365,22 @@ const MonomorphContext = struct {
         // let the unifier handle it.
         if (!(try self.isConcreteRuntimeType(arg_type))) {
             if (param_type) |pt| {
+                // The bare-`[]` / bare-`%{}` `i64` fallback is only a sound
+                // default in a fully CONCRETE scan context. Inside a generic
+                // body (a parameter still carries a free type variable) the
+                // monomorphizer is making a single throwaway pass whose only
+                // job is to find specializations fully pinned by concrete
+                // arguments; the concrete instantiation of this very body is
+                // re-scanned later with substituted params. Guessing `[i64]`
+                // for an empty literal whose element is actually a shared,
+                // not-yet-known type variable (e.g. `collect_next(collection,
+                // [])` where `collection :: Enumerable(element)` and
+                // `accumulator :: [element]`) binds that shared `element` to
+                // `i64` and bakes a bogus `<i64>` specialization that then
+                // poisons every downstream call's element type. Suppress the
+                // fallback here and let the concrete transitive pass infer the
+                // element from the real argument.
+                const allow_empty_default = allow_default_empty_protocol_list and !(try self.currentScanIsGeneric());
                 const effective_param_type = if (subs) |active_subs| try active_subs.applyToType(self.store, pt) else pt;
                 const param_typ = self.store.getType(effective_param_type);
                 switch (param_typ) {
@@ -1358,7 +1389,7 @@ const MonomorphContext = struct {
                             arg_type = effective_param_type;
                         } else if (arg.expr.kind == .list_init and
                             arg.expr.kind.list_init.len == 0 and
-                            allow_default_empty_protocol_list)
+                            allow_empty_default)
                         {
                             const inferred = try self.defaultUnboundTypeVars(effective_param_type, types_mod.TypeStore.I64);
                             if (try self.isConcreteRuntimeType(inferred)) arg_type = inferred;
@@ -1372,7 +1403,7 @@ const MonomorphContext = struct {
                             arg_type = effective_param_type;
                         } else if (arg.expr.kind == .map_init and
                             arg.expr.kind.map_init.len == 0 and
-                            allow_default_empty_protocol_list)
+                            allow_empty_default)
                         {
                             const inferred = try self.defaultUnboundTypeVars(effective_param_type, types_mod.TypeStore.I64);
                             if (try self.isConcreteRuntimeType(inferred)) arg_type = inferred;
@@ -1383,7 +1414,7 @@ const MonomorphContext = struct {
                             const inferred = try self.inferEmptyListProtocolReceiverType(
                                 protocol_constraint,
                                 subs,
-                                allow_default_empty_protocol_list,
+                                allow_empty_default,
                             );
                             if (inferred != types_mod.TypeStore.UNKNOWN) arg_type = inferred;
                         }

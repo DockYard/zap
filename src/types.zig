@@ -2943,6 +2943,43 @@ pub const TypeChecker = struct {
         }
     }
 
+    fn trueOptionalPayloadTypeId(self: *const TypeChecker, optional_type_id: TypeId) ?TypeId {
+        if (optional_type_id >= self.store.types.items.len) return null;
+        const optional_type = self.store.getType(optional_type_id);
+        if (optional_type != .union_type) return null;
+
+        var nil_count: usize = 0;
+        var payload_count: usize = 0;
+        var payload_type_id: TypeId = TypeStore.UNKNOWN;
+        for (optional_type.union_type.members) |member_type_id| {
+            if (member_type_id == TypeStore.NIL) {
+                nil_count += 1;
+            } else {
+                payload_count += 1;
+                payload_type_id = member_type_id;
+            }
+        }
+
+        if (nil_count == 1 and payload_count == 1) return payload_type_id;
+        return null;
+    }
+
+    fn casePatternIsTopLevelBind(pattern: *const ast.Pattern) bool {
+        return switch (pattern.*) {
+            .bind => true,
+            .paren => |inner| casePatternIsTopLevelBind(inner.inner),
+            else => false,
+        };
+    }
+
+    fn casePatternIsNilLiteral(pattern: *const ast.Pattern) bool {
+        return switch (pattern.*) {
+            .literal => |literal| literal == .nil,
+            .paren => |inner| casePatternIsNilLiteral(inner.inner),
+            else => false,
+        };
+    }
+
     /// Type-check a single case clause: switch into the clause's scope
     /// (registered by the collector) so pattern-bound names resolve to
     /// the case-clause's bindings, flow the scrutinee type into the
@@ -2952,6 +2989,7 @@ pub const TypeChecker = struct {
         self: *TypeChecker,
         clause: ast.CaseClause,
         scrutinee_type: TypeId,
+        binding_scrutinee_type: TypeId,
         scrutinee_ownership: Ownership,
     ) !TypeId {
         const prev_scope = self.current_scope;
@@ -2960,7 +2998,16 @@ pub const TypeChecker = struct {
             self.current_scope = clause_scope;
         }
 
-        try self.recordCasePatternBindingTypesWithOwnership(clause.pattern, scrutinee_type, scrutinee_ownership, clause.meta.span);
+        const binding_ownership = if (binding_scrutinee_type == scrutinee_type)
+            scrutinee_ownership
+        else
+            self.defaultOwnershipForType(binding_scrutinee_type);
+        try self.recordCasePatternBindingTypesWithOwnership(
+            clause.pattern,
+            binding_scrutinee_type,
+            binding_ownership,
+            clause.meta.span,
+        );
 
         var clause_type: TypeId = TypeStore.NIL;
         for (clause.body) |stmt| {
@@ -8721,7 +8768,7 @@ pub const TypeChecker = struct {
                         // access or Bool comparison); only the DEAD clause
                         // bodies are skipped.
                         _ = try self.inferExpr(ce.scrutinee);
-                        return try self.checkCaseClause(ce.clauses[live_idx], TypeStore.UNKNOWN, .shared);
+                        return try self.checkCaseClause(ce.clauses[live_idx], TypeStore.UNKNOWN, TypeStore.UNKNOWN, .shared);
                     }
                 }
                 const scrutinee_type = try self.inferExpr(ce.scrutinee);
@@ -8735,6 +8782,8 @@ pub const TypeChecker = struct {
                 }
                 var result_type: TypeId = TypeStore.UNKNOWN;
                 var has_wildcard = false;
+                const optional_payload_type = self.trueOptionalPayloadTypeId(scrutinee_type);
+                var nil_excluded = false;
                 for (ce.clauses) |clause| {
                     try self.restoreOwnershipBindings(&ownership_before_clauses);
                     // Check for wildcard/catch-all pattern
@@ -8742,10 +8791,17 @@ pub const TypeChecker = struct {
                         has_wildcard = true;
                     }
 
-                    const clause_type = try self.checkCaseClause(clause, scrutinee_type, scrutinee_ownership);
+                    const binding_scrutinee_type = if (nil_excluded and optional_payload_type != null and casePatternIsTopLevelBind(clause.pattern))
+                        optional_payload_type.?
+                    else
+                        scrutinee_type;
+                    const clause_type = try self.checkCaseClause(clause, scrutinee_type, binding_scrutinee_type, scrutinee_ownership);
                     try clause_ownerships.append(self.allocator, try self.cloneOwnershipBindings());
                     if (result_type == TypeStore.UNKNOWN) {
                         result_type = clause_type;
+                    }
+                    if (clause.guard == null and casePatternIsNilLiteral(clause.pattern)) {
+                        nil_excluded = true;
                     }
                 }
                 try self.restoreOwnershipBindings(&ownership_before_clauses);

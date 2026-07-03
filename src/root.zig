@@ -199,11 +199,11 @@ test {
     // pipeline using synthesised objects; these imports drive the managers'
     // actual runtime behaviour.
     //
-    // All three managers declare `zap_memory_section`, but each gates that
+    // All four managers declare `zap_memory_section`, but each gates that
     // export behind `!builtin.is_test` (see the `comptime { @export(...) }`
     // block in each manager). `runtime.zig`'s `externalMemorySection`
     // early-returns null under `builtin.is_test`, so the symbol is dead in
-    // the test binary — gating it out lets ALL THREE managers be aggregated
+    // the test binary — gating it out lets ALL FOUR managers be aggregated
     // here without a duplicate `zap_memory_section` symbol, while the
     // test-only ARC fallback continues to drive every test allocation.
     //
@@ -211,7 +211,15 @@ test {
     // stack-base capture (the `stack_bottom` upper bound must cover the
     // caller's entry frame, so an entry-frame-only heap root is scanned and
     // never prematurely swept) and an end-to-end mark-sweep survival witness.
+    //
+    // The Arena manager carries tests for its single-owner bump-allocation
+    // fast path: alignment correctness, chunk-boundary refills, geometric
+    // chunk growth capping, dedicated oversize chunks, and full-teardown
+    // leak-freedom (its tests run every chunk through
+    // `std.testing.allocator`, so any chunk `arenaDeinit` fails to return
+    // fails the test run as a leak).
     _ = @import("memory/tracking/manager.zig");
     _ = @import("memory/arc/manager.zig");
     _ = @import("memory/gc/manager.zig");
+    _ = @import("memory/arena/manager.zig");
 }

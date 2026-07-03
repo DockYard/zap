@@ -104,6 +104,117 @@ pub fn classifyAndNormalize(
     return classifyAndNormalizeWithProgram(allocator, function, ownership, type_store, null);
 }
 
+/// Side tables for the borrow-through-self-tail-arg classification
+/// (see `shouldBorrowThroughSelfTailArg`).
+///
+///   * `borrowed_param_locals` — locals produced by a `param_get` of a
+///     parameter slot whose convention is `.borrowed`. These are the
+///     only sources whose underlying object is guaranteed to outlive
+///     the function's entire self-tail-recursion chain: the current
+///     frame never owned the value, so its owner is a NON-tail
+///     ancestor frame that persists across every tail jump.
+///   * `self_tail_borrowed_args` — locals used as a `tail_call`
+///     argument to THIS function in a slot whose param convention is
+///     `.borrowed`. The callee borrows the slot (it never releases
+///     it), and a tail_call terminator has no post-call position, so
+///     any retained temporary handed to such a slot is structurally
+///     unbalanceable — one leaked reference per tail-recursion
+///     back-edge (the fannkuch-redux `copy_prefix` `src` residual
+///     leak, and the same shape under every tail-recursive stdlib
+///     helper that threads a borrowed callback/source through its
+///     recursion).
+const SelfTailBorrowThroughInfo = struct {
+    borrowed_param_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
+    self_tail_borrowed_args: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty,
+
+    fn deinit(self: *SelfTailBorrowThroughInfo, allocator: std.mem.Allocator) void {
+        self.borrowed_param_locals.deinit(allocator);
+        self.self_tail_borrowed_args.deinit(allocator);
+    }
+};
+
+const SelfTailBorrowThroughCollector = struct {
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    info: *SelfTailBorrowThroughInfo,
+    oom: bool = false,
+
+    fn visit(self: *SelfTailBorrowThroughCollector, instr: *const ir.Instruction) void {
+        switch (instr.*) {
+            .param_get => |pg| {
+                if (pg.index < self.function.param_conventions.len and
+                    self.function.param_conventions[pg.index] == .borrowed)
+                {
+                    self.info.borrowed_param_locals.put(self.allocator, pg.dest, {}) catch {
+                        self.oom = true;
+                    };
+                }
+            },
+            .tail_call => |tc| {
+                if (!std.mem.eql(u8, tc.name, self.function.name)) return;
+                for (tc.args, 0..) |arg, slot| {
+                    if (slot < self.function.param_conventions.len and
+                        self.function.param_conventions[slot] == .borrowed)
+                    {
+                        self.info.self_tail_borrowed_args.put(self.allocator, arg, {}) catch {
+                            self.oom = true;
+                        };
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+};
+
+fn collectSelfTailBorrowThroughInfo(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    info: *SelfTailBorrowThroughInfo,
+) !void {
+    var collector = SelfTailBorrowThroughCollector{
+        .allocator = allocator,
+        .function = function,
+        .info = info,
+    };
+    try ir.forEachInstruction(allocator, function, &collector, SelfTailBorrowThroughCollector.visit);
+    if (collector.oom) return error.OutOfMemory;
+}
+
+/// Borrow-through classification for a self-tail-call argument.
+///
+/// True when `dest`'s ONLY use is a `tail_call` argument to the
+/// function itself in a `.borrowed` parameter slot, and `source` is a
+/// `.borrowed` parameter local of the current function. The correct
+/// lowering is a plain `borrow_value` — no retain:
+///
+///   * The callee (this same function) treats the slot as borrowed and
+///     never releases it, and a `tail_call` is a terminator, so a
+///     retained temporary (`copy_value` + persistent retain, the
+///     fallback lowering) has NO possible balancing release site. It
+///     leaks one reference per recursion step.
+///   * The borrow is sound: the source is a borrowed PARAMETER, so the
+///     current frame never owned the object — its owning reference is
+///     held by a non-tail ancestor frame (or by a previously
+///     manufactured independent owner) that outlives the entire tail
+///     chain. Frame-internal borrows (locals refined to `.borrowed` by
+///     `shouldBorrow`) are deliberately excluded: their owner's
+///     scope-exit drop fires before the terminator, so borrowing them
+///     through the jump would dangle.
+fn shouldBorrowThroughSelfTailArg(
+    summary: *const UseSummary,
+    info: *const SelfTailBorrowThroughInfo,
+    dest: ir.LocalId,
+    source: ir.LocalId,
+) bool {
+    if (!info.self_tail_borrowed_args.contains(dest)) return false;
+    if (!info.borrowed_param_locals.contains(source)) return false;
+    const dest_counts = summary.get(dest);
+    if (dest_counts.total_use_count != 1) return false;
+    if (dest_counts.tail_call_arg_use_count != 1) return false;
+    return true;
+}
+
 /// Variant of `classifyAndNormalize` that accepts an optional
 /// program reference so the use-summary pass can consult callee
 /// `param_conventions` and refine `share_value.source` borrow-
@@ -166,11 +277,16 @@ pub fn classifyAndNormalizeWithProgram(
     // synthetic unit-test tables whose `record_count` is null).
     arc_liveness.assertConsumerWalkMatches(ownership, try arc_liveness.countInstructionRecords(allocator, function));
 
+    var self_tail_info: SelfTailBorrowThroughInfo = .{};
+    defer self_tail_info.deinit(allocator);
+    try collectSelfTailBorrowThroughInfo(allocator, function, &self_tail_info);
+
     var rewriter = StreamRewriter{
         .allocator = allocator,
         .function = function,
         .use_summary = &use_summary,
         .ownership = ownership,
+        .self_tail_info = &self_tail_info,
     };
 
     for (function.body, 0..) |_, block_index| {
@@ -2086,6 +2202,10 @@ const StreamRewriter = struct {
     /// arm of an `if_expr`), forcing the conservative `.copy_value`
     /// path and defeating uniqueness at every owned-consume site downstream.
     ownership: *const arc_liveness.ArcOwnership,
+    /// Side tables for `shouldBorrowThroughSelfTailArg` — locals that
+    /// are borrowed parameters, and locals consumed as self-tail-call
+    /// arguments into `.borrowed` slots. See the struct doc.
+    self_tail_info: *const SelfTailBorrowThroughInfo,
     /// Running InstructionId mirrored from `arc_liveness`'s depth-
     /// first traversal. Tracked so per-`local_get` queries against
     /// `ownership.last_use_sites` use the same id space the analyzer
@@ -2219,6 +2339,24 @@ const StreamRewriter = struct {
                         try new_instrs.append(self.allocator, .{
                             .move_value = .{ .dest = lg.dest, .source = lg.source },
                         });
+                    } else if (shouldBorrowThroughSelfTailArg(self.use_summary, self.self_tail_info, lg.dest, lg.source)) {
+                        // Borrow-through: a `.borrowed` parameter passed
+                        // to the function's own tail call in a
+                        // `.borrowed` slot. The fallback `copy_value` +
+                        // persistent retain has no balancing release
+                        // (terminator; callee never drops borrowed
+                        // params) and leaks one reference per
+                        // tail-recursion back-edge. The borrow is safe:
+                        // the object's owner lives in a non-tail
+                        // ancestor frame that spans the whole chain.
+                        try new_instrs.append(self.allocator, .{
+                            .borrow_value = .{ .dest = lg.dest, .source = lg.source },
+                        });
+                        if (lg.dest < self.function.local_ownership.len and
+                            self.function.local_ownership[lg.dest] == .owned)
+                        {
+                            self.function.local_ownership[lg.dest] = .borrowed;
+                        }
                     } else {
                         try new_instrs.append(self.allocator, .{
                             .copy_value = .{ .dest = lg.dest, .source = lg.source },
@@ -2255,7 +2393,9 @@ const StreamRewriter = struct {
                     }
                 },
                 .borrow_value => |bv| {
-                    if (shouldBorrow(self.function, self.use_summary, bv.dest)) {
+                    if (shouldBorrow(self.function, self.use_summary, bv.dest) or
+                        shouldBorrowThroughSelfTailArg(self.use_summary, self.self_tail_info, bv.dest, bv.source))
+                    {
                         try new_instrs.append(self.allocator, effective);
                     } else {
                         // A merged-program re-run can discover stricter

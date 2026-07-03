@@ -2910,6 +2910,10 @@ pub const CaptureGet = struct {
 pub const OptionalUnwrap = struct {
     dest: LocalId,
     source: LocalId,
+    /// When true, lower as a user-visible force unwrap and emit the nil
+    /// safety check. Case-pattern narrowing sets this to false only after the
+    /// decision tree has already proven the optional is non-nil.
+    safety_check: bool = true,
 };
 
 pub const BinLenCheck = struct {
@@ -5066,6 +5070,30 @@ pub fn fingerprintInstruction(instr: *const Instruction) InstructionIdentity {
 // IR Builder — lowers HIR to IR
 // ============================================================
 
+const CaseOptionalNarrowingContext = struct {
+    non_nil_scrutinees: std.AutoHashMap(u32, void),
+
+    fn init(allocator: std.mem.Allocator) CaseOptionalNarrowingContext {
+        return .{ .non_nil_scrutinees = std.AutoHashMap(u32, void).init(allocator) };
+    }
+
+    fn deinit(self: *CaseOptionalNarrowingContext) void {
+        self.non_nil_scrutinees.deinit();
+    }
+
+    fn isNonNil(self: *const CaseOptionalNarrowingContext, scrutinee_id: u32) bool {
+        return self.non_nil_scrutinees.contains(scrutinee_id);
+    }
+
+    fn markNonNil(self: *CaseOptionalNarrowingContext, scrutinee_id: u32) !void {
+        try self.non_nil_scrutinees.put(scrutinee_id, {});
+    }
+
+    fn unmarkNonNil(self: *CaseOptionalNarrowingContext, scrutinee_id: u32) void {
+        _ = self.non_nil_scrutinees.remove(scrutinee_id);
+    }
+};
+
 pub const IrBuilder = struct {
     pub const Error = struct {
         message: []const u8,
@@ -5944,6 +5972,75 @@ pub const IrBuilder = struct {
         const resolved = try typeIdToZigTypeWithStore(type_id, self.type_store);
         if (resolved == .any) return null;
         return type_id;
+    }
+
+    fn trueOptionalPayloadTypeId(self: *const IrBuilder, optional_type_id: types_mod.TypeId) ?types_mod.TypeId {
+        const store = self.type_store orelse return null;
+        if (optional_type_id >= store.types.items.len) return null;
+        const optional_type = store.types.items[optional_type_id];
+        if (optional_type != .union_type) return null;
+
+        var nil_count: usize = 0;
+        var payload_count: usize = 0;
+        var payload_type_id: types_mod.TypeId = types_mod.TypeStore.UNKNOWN;
+        for (optional_type.union_type.members) |member_type_id| {
+            if (member_type_id == types_mod.TypeStore.NIL) {
+                nil_count += 1;
+            } else {
+                payload_count += 1;
+                payload_type_id = member_type_id;
+            }
+        }
+
+        if (nil_count == 1 and payload_count == 1) return payload_type_id;
+        return null;
+    }
+
+    fn trueOptionalPayloadTypeIdForLocal(self: *const IrBuilder, local: LocalId) ?types_mod.TypeId {
+        const local_type_id = self.local_hir_types.get(local) orelse return null;
+        return self.trueOptionalPayloadTypeId(local_type_id);
+    }
+
+    fn decisionScrutineeId(expr: *const hir_mod.Expr) ?u32 {
+        return switch (expr.kind) {
+            .param_get => |index| index,
+            else => null,
+        };
+    }
+
+    fn literalCasesContainNil(cases: []const hir_mod.LiteralCase) bool {
+        for (cases) |case| {
+            if (case.value == .nil) return true;
+        }
+        return false;
+    }
+
+    fn emitCaseBindingLocalGet(
+        self: *IrBuilder,
+        binding_local: LocalId,
+        source_scrutinee_id: u32,
+        source_local: LocalId,
+        narrowing_context: *const CaseOptionalNarrowingContext,
+    ) !void {
+        if (narrowing_context.isNonNil(source_scrutinee_id)) {
+            if (self.trueOptionalPayloadTypeIdForLocal(source_local)) |payload_type_id| {
+                try self.current_instrs.append(self.allocator, .{
+                    .optional_unwrap = .{
+                        .dest = binding_local,
+                        .source = source_local,
+                        .safety_check = false,
+                    },
+                });
+                try self.local_hir_types.put(binding_local, payload_type_id);
+                const payload_zig_type = try typeIdToZigTypeWithStore(payload_type_id, self.type_store);
+                if (payload_zig_type != .any and payload_zig_type != .void) {
+                    try self.known_local_types.put(binding_local, payload_zig_type);
+                }
+                return;
+            }
+        }
+
+        try self.emitLocalGet(binding_local, source_local);
     }
 
     /// When `current_expected_type` names a concrete integer type, return
@@ -8488,6 +8585,34 @@ pub const IrBuilder = struct {
         if (call_index == 0) return .{ .instrs = body, .rewritten = false };
         const call_instr = body[call_index - 1];
 
+        // Phase E.7b: NESTED structural tail position. When the arm's
+        // last instruction is itself an `if_expr` / `switch_literal`
+        // whose `dest` is this arm's result, the recursion may sit one
+        // (or more) branch levels deeper — `arm body -> inner arm ->
+        // recursive call -> inner dest -> outer arm result -> outer
+        // dest -> ret` is still a genuine tail position on every CFG
+        // path. Recurse through `tryRewriteTailThroughBranch` (mutual
+        // recursion with this function handles arbitrary nesting
+        // depth). Without this, a tail self-call nested two branch
+        // levels deep (e.g. fannkuch's `rotate_loop`: `if i == last {
+        // .. } else { if count != 0 { .. } else { ..recurse.. } }`)
+        // stays a plain `call_named` — no terminator exists for
+        // `arc_drop_insertion.dropsForTerminator` to drain owned-dead
+        // locals in that arm, so every owned reference whose last use
+        // feeds a borrowing wrapper leaks one +1 per arm execution.
+        // The strict `call_index == body.len` gate mirrors the outer
+        // structural rewrite: no tail-mappable instructions may sit
+        // between the nested branch and the arm's end, so the branch
+        // value provably IS the arm result, untouched.
+        if (call_index == body.len and (call_instr == .if_expr or call_instr == .switch_literal)) {
+            if (try self.tryRewriteTailThroughBranch(call_instr, return_value.?, func_name, enclosing_function_id)) |rewritten_branch| {
+                var nested_body: std.ArrayList(Instruction) = .empty;
+                try nested_body.appendSlice(self.allocator, body[0 .. body.len - 1]);
+                try nested_body.append(self.allocator, rewritten_branch);
+                return .{ .instrs = try nested_body.toOwnedSlice(self.allocator), .rewritten = true };
+            }
+        }
+
         const trailing = body[call_index..];
 
         const TailCallShape = struct {
@@ -8618,7 +8743,12 @@ pub const IrBuilder = struct {
         dest_local: LocalId,
         func_name: []const u8,
         enclosing_function_id: FunctionId,
-    ) !?Instruction {
+        // Explicit error set: this function and `rewriteTailCallsInBody`
+        // are mutually recursive (Phase E.7b nested structural tail
+        // position), so at least one of the pair must not use an
+        // inferred error set. Every failure path here is allocator-
+        // rooted.
+    ) error{OutOfMemory}!?Instruction {
         switch (branch_instr) {
             .if_expr => |ie| {
                 if (ie.dest != dest_local) return null;
@@ -11266,6 +11396,20 @@ pub const IrBuilder = struct {
         dest: LocalId,
         span: ast.SourceSpan,
     ) anyerror!void {
+        var narrowing_context = CaseOptionalNarrowingContext.init(self.allocator);
+        defer narrowing_context.deinit();
+        try self.lowerDecisionTreeForCaseNode(decision, case_arms, scrutinee_map, dest, span, &narrowing_context);
+    }
+
+    fn lowerDecisionTreeForCaseNode(
+        self: *IrBuilder,
+        decision: *const hir_mod.Decision,
+        case_arms: []const hir_mod.CaseArm,
+        scrutinee_map: *std.AutoHashMap(u32, LocalId),
+        dest: LocalId,
+        span: ast.SourceSpan,
+        narrowing_context: *CaseOptionalNarrowingContext,
+    ) anyerror!void {
         const budget_root = self.beginDecisionTreeLoweringBudget(span);
         defer self.endDecisionTreeLoweringBudget(budget_root);
         try self.enterDecisionTreeLowering();
@@ -11280,8 +11424,8 @@ pub const IrBuilder = struct {
                 // correct decomposed locals.
                 for (arm.bindings) |binding| {
                     if (binding.kind == .scrutinee) {
-                        const scr_local = scrutinee_map.get(0) orelse 0;
-                        try self.emitLocalGet(binding.local_index, scr_local);
+                        const scr_local = scrutinee_map.get(0) orelse return error.UnresolvedScrutinee;
+                        try self.emitCaseBindingLocalGet(binding.local_index, 0, scr_local, narrowing_context);
                     }
                 }
                 const body_result = try self.lowerBlock(arm.body);
@@ -11300,26 +11444,40 @@ pub const IrBuilder = struct {
                 try self.current_instrs.append(self.allocator, .{ .set_safety = true });
                 var frame = self.pushInstructionBuffer();
                 errdefer frame.discardAndRestore();
-                try self.lowerDecisionTreeForCase(guard_node.success, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(guard_node.success, case_arms, scrutinee_map, dest, span, narrowing_context);
                 const guard_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = guard_local, .body = guard_body },
                 });
-                try self.lowerDecisionTreeForCase(guard_node.failure, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(guard_node.failure, case_arms, scrutinee_map, dest, span, narrowing_context);
             },
             .switch_literal => |sw| {
                 const scrutinee_local = try self.resolveScrutinee(sw.scrutinee, scrutinee_map);
+                const scrutinee_id = decisionScrutineeId(sw.scrutinee);
                 for (sw.cases) |case| {
                     const check_local = try self.emitSubPatternCheck(scrutinee_local, case.value);
                     var frame = self.pushInstructionBuffer();
                     errdefer frame.discardAndRestore();
-                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, dest);
+                    try self.lowerDecisionTreeForCaseNode(case.next, case_arms, scrutinee_map, dest, span, narrowing_context);
                     const case_body = try frame.takeOwnedSliceAndRestore();
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = check_local, .body = case_body },
                     });
                 }
-                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, dest);
+                if (scrutinee_id) |sid| {
+                    const default_excludes_nil =
+                        literalCasesContainNil(sw.cases) and
+                        self.trueOptionalPayloadTypeIdForLocal(scrutinee_local) != null;
+                    if (default_excludes_nil and !narrowing_context.isNonNil(sid)) {
+                        try narrowing_context.markNonNil(sid);
+                        defer narrowing_context.unmarkNonNil(sid);
+                        try self.lowerDecisionTreeForCaseNode(sw.default, case_arms, scrutinee_map, dest, span, narrowing_context);
+                    } else {
+                        try self.lowerDecisionTreeForCaseNode(sw.default, case_arms, scrutinee_map, dest, span, narrowing_context);
+                    }
+                } else {
+                    try self.lowerDecisionTreeForCaseNode(sw.default, case_arms, scrutinee_map, dest, span, narrowing_context);
+                }
             },
             .switch_tag => |sw| {
                 const scrutinee_local = try self.resolveScrutinee(sw.scrutinee, scrutinee_map);
@@ -11332,13 +11490,13 @@ pub const IrBuilder = struct {
                     });
                     var frame = self.pushInstructionBuffer();
                     errdefer frame.discardAndRestore();
-                    try self.lowerDecisionTreeForCase(case.next, case_arms, scrutinee_map, dest);
+                    try self.lowerDecisionTreeForCaseNode(case.next, case_arms, scrutinee_map, dest, span, narrowing_context);
                     const case_body = try frame.takeOwnedSliceAndRestore();
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = match_local, .body = case_body },
                     });
                 }
-                try self.lowerDecisionTreeForCase(sw.default, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(sw.default, case_arms, scrutinee_map, dest, span, narrowing_context);
             },
             .switch_variant => |sw| {
                 // Comptime-safe tagged-union matching. Emit ONE `union_switch`
@@ -11423,7 +11581,7 @@ pub const IrBuilder = struct {
                 }
                 // Lower success subtree at the same level — inner guards become
                 // flat guard_blocks that emitFlatCaseBlock can process
-                try self.lowerDecisionTreeForCase(ct.success, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(ct.success, case_arms, scrutinee_map, dest, span, narrowing_context);
             },
             .check_list => |cl| {
                 const scrutinee_local = try self.resolveScrutinee(cl.scrutinee, scrutinee_map);
@@ -11468,12 +11626,12 @@ pub const IrBuilder = struct {
                     if (i >= cl.element_scrutinee_ids.len) return error.MalformedDecisionTree;
                     try scrutinee_map.put(cl.element_scrutinee_ids[i], elem_local);
                 }
-                try self.lowerDecisionTreeForCase(cl.success, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(cl.success, case_arms, scrutinee_map, dest, span, narrowing_context);
                 const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
-                try self.lowerDecisionTreeForCase(cl.failure, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(cl.failure, case_arms, scrutinee_map, dest, span, narrowing_context);
             },
             .check_list_cons => |clc| {
                 const scrutinee_local = try self.resolveScrutinee(clc.scrutinee, scrutinee_map);
@@ -11524,12 +11682,12 @@ pub const IrBuilder = struct {
                 try self.known_local_types.put(tail_local, scrutinee_list_type);
                 try self.recordListChildHirType(scrutinee_local, tail_local, .list);
                 try scrutinee_map.put(clc.tail_scrutinee_id, tail_local);
-                try self.lowerDecisionTreeForCase(clc.success, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(clc.success, case_arms, scrutinee_map, dest, span, narrowing_context);
                 const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = len_check_local, .body = success_body },
                 });
-                try self.lowerDecisionTreeForCase(clc.failure, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(clc.failure, case_arms, scrutinee_map, dest, span, narrowing_context);
             },
             .check_binary => |cb| {
                 const scrutinee_local = try self.resolveScrutinee(cb.scrutinee, scrutinee_map);
@@ -11557,26 +11715,32 @@ pub const IrBuilder = struct {
                 // instruction to extract the value into the binding's local.
                 try self.emitBinarySegmentExtractions(cb.segments, scrutinee_local, case_arms);
 
-                try self.lowerDecisionTreeForCase(cb.success, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(cb.success, case_arms, scrutinee_map, dest, span, narrowing_context);
                 const success_body = try frame.takeOwnedSliceAndRestore();
                 try self.current_instrs.append(self.allocator, .{
                     .guard_block = .{ .condition = condition_local, .body = success_body },
                 });
-                try self.lowerDecisionTreeForCase(cb.failure, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(cb.failure, case_arms, scrutinee_map, dest, span, narrowing_context);
             },
             .bind => |bind_node| {
                 // Emit binding: resolve scrutinee and assign to binding local
                 const scrutinee_local = try self.resolveScrutinee(bind_node.source, scrutinee_map);
+                const source_scrutinee_id = decisionScrutineeId(bind_node.source) orelse return error.UnresolvedScrutinee;
                 // Find matching CaseBinding by name to get the local_index
                 for (case_arms) |arm| {
                     for (arm.bindings) |binding| {
                         if (binding.name == bind_node.name) {
-                            try self.emitLocalGet(binding.local_index, scrutinee_local);
+                            try self.emitCaseBindingLocalGet(
+                                binding.local_index,
+                                source_scrutinee_id,
+                                scrutinee_local,
+                                narrowing_context,
+                            );
                             break;
                         }
                     }
                 }
-                try self.lowerDecisionTreeForCase(bind_node.next, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(bind_node.next, case_arms, scrutinee_map, dest, span, narrowing_context);
             },
             .extract_struct => |es| {
                 const scrutinee_local = try self.resolveScrutinee(es.scrutinee, scrutinee_map);
@@ -11628,7 +11792,7 @@ pub const IrBuilder = struct {
                     }
                     try scrutinee_map.put(fe.scrutinee_id, field_local);
                 }
-                try self.lowerDecisionTreeForCase(es.success, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(es.success, case_arms, scrutinee_map, dest, span, narrowing_context);
             },
             .extract_map => |em| {
                 const scrutinee_local = try self.resolveScrutinee(em.scrutinee, scrutinee_map);
@@ -11706,14 +11870,14 @@ pub const IrBuilder = struct {
                     try self.known_local_types.put(value_local, value_type);
                     try scrutinee_map.put(ke.scrutinee_id, value_local);
                 }
-                try self.lowerDecisionTreeForCase(em.success, case_arms, scrutinee_map, dest);
+                try self.lowerDecisionTreeForCaseNode(em.success, case_arms, scrutinee_map, dest, span, narrowing_context);
                 const success_body = try frame.takeOwnedSliceAndRestore();
 
                 if (presence_condition) |condition| {
                     try self.current_instrs.append(self.allocator, .{
                         .guard_block = .{ .condition = condition, .body = success_body },
                     });
-                    try self.lowerDecisionTreeForCase(em.failure, case_arms, scrutinee_map, dest);
+                    try self.lowerDecisionTreeForCaseNode(em.failure, case_arms, scrutinee_map, dest, span, narrowing_context);
                 } else {
                     // No keys to check (an empty `%{}` pattern matches any
                     // map): the extraction body is unconditional.

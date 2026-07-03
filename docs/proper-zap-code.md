@@ -288,6 +288,26 @@ pub fn describe(result_value :: {Atom, String}) -> String {
 
 Use `case` when the branching is about value shape or tag.
 
+### Optional Return Values
+
+Functions that may not produce a value should return `T | nil`. Do not force
+unwrap optional values in Zap code. Pattern match the return value and handle
+each expected case explicitly.
+
+Write:
+
+```zap
+pub fn parse_count(input :: String) -> String {
+  case Integer.parse(input) {
+    nil -> "missing"
+    count -> Integer.to_string(count)
+  }
+}
+```
+
+Use the same pattern for other optional-return APIs such as `Float.parse/1`,
+`String.to_integer/1`, and `String.to_float/1`.
+
 ## Control Flow Macros
 
 The repo uses macro-backed control flow from `Kernel`.

@@ -65,11 +65,19 @@ Integer.sign(5)              # => 1
 ```zap
 Integer.to_string(42)        # => "42"
 Integer.parse("42")          # => 42
+Integer.parse("hello")       # => nil
 Integer.to_float(42)         # => 42.0
 ```
 
-`parse/1` raises on invalid input. If you can't trust the source, validate
-the shape first or wrap the call in a recovery branch.
+`parse/1` returns `i64 | nil`. Handle the result with `case` instead of
+force-unwrapping it:
+
+```zap
+case Integer.parse(input) {
+  nil -> "missing"
+  value -> Integer.to_string(value)
+}
+```
 
 ## Bit operations
 

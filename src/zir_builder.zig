@@ -9504,6 +9504,13 @@ pub const ZirDriver = struct {
             .optional_unwrap => |ou| {
                 const source_ref = try self.refForLocal(ou.source);
 
+                if (!ou.safety_check) {
+                    const payload = zir_builder_emit_optional_payload_unsafe(self.handle, source_ref);
+                    if (payload == error_ref) return error.EmitFailed;
+                    try self.setLocal(ou.dest, payload);
+                    return;
+                }
+
                 // Check if source is non-null
                 const is_nonnull = zir_builder_emit_is_non_null(self.handle, source_ref);
                 if (is_nonnull == error_ref) return error.EmitFailed;

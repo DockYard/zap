@@ -893,6 +893,56 @@ fn runConventionInferenceFixpoint(
     var escaping = try ir.collectValueEscapingFunctions(allocator, program);
     defer escaping.deinit(allocator);
 
+    // Phase L1 — caller-independent promotion of owned-mutating
+    // wrapper receivers whose runtime honors the consume contract.
+    //
+    // The main fixpoint below promotes a slot only when EVERY caller
+    // passes the argument at last use (plus a consume-side anchor).
+    // That caller gate is the right conservatism for general callees,
+    // but it systematically pins the monomorphized `lib/list.zap` and
+    // `lib/map.zap` wrappers (`List.set` / `push` / `pop` / `append`,
+    // `Map.put` / `delete` / `merge`): they are non-recursive leaves,
+    // so the self-recursion promotion never fires, and a single
+    // caller that re-reads its receiver in a later argument
+    // (fannkuch-redux's `shift_left`:
+    // `p = List.set(p, index, List.get(p, index + 1))` reads `p`
+    // again while evaluating the third argument) keeps the wrapper
+    // `.borrowed` for the WHOLE program. A `.borrowed` receiver
+    // forces the classifier to manufacture a `copy_value` +
+    // persistent-`retain` owner to feed the owned-consuming builtin,
+    // so the runtime sees refcount >= 2, `mutationMayMoveInPlace()`
+    // reports false, and EVERY hot-loop mutation clones — the
+    // fannkuch-redux 30x-slower-than-C regression (and its Map twin,
+    // the k-nucleotide always-clone dictionary loop).
+    //
+    // For these wrappers the caller gate is unnecessary; see
+    // `paramConsumedOnlyByOwnedMutatingReceiver` for the promotion
+    // conditions and the caller-independence soundness argument, and
+    // `consumeHonoringOwnedMutatingBuiltinSlot` for why the rule is
+    // scoped to builtins whose runtime consumes the moved-in receiver
+    // reference on every path.
+    //
+    // The value-escaping veto applies here exactly as in the main
+    // fixpoint: an indirect caller (closure value, dispatch, entry
+    // point) keeps the borrow ABI on the caller side, which an
+    // `.owned` callee would over-release (audit finding
+    // arc-param--02).
+    //
+    // This runs BEFORE the main fixpoint so the promoted wrapper
+    // slots serve as already-`.owned` anchors
+    // (`streamHasOwnedZapCalleeConsumingAlias`'s Phase 2.3 check) for
+    // the chain-consistency machinery in the same inference run.
+    for (program.functions, 0..) |_, func_index| {
+        const function: *ir.Function = @constCast(&program.functions[func_index]);
+        if (escaping.contains(function.id)) continue;
+        const conventions: MutableConventions = @constCast(function.param_conventions);
+        for (conventions, 0..) |conv, slot_index| {
+            if (conv != .borrowed) continue;
+            if (!try paramConsumedOnlyByOwnedMutatingReceiver(allocator, function, slot_index)) continue;
+            conventions[slot_index] = .owned;
+        }
+    }
+
     // Fixpoint iteration: a callee's slot can be promoted only when every
     // caller's source local satisfies the consume gates, including the
     // borrowed-source veto (the chain root must NOT be a `param_get` of
@@ -4438,6 +4488,325 @@ fn streamHasOwnedBuiltinConsumingAlias(
     return false;
 }
 
+// ============================================================
+// Phase L1 — caller-independent promotion for owned-mutating
+// wrapper receivers whose runtime honors the receiver-consume
+// contract (List four: fannkuch-redux List.set rc-1 restoration;
+// Map put/delete/merge: Phase 2 of the mutation campaign).
+// ============================================================
+
+/// Receiver slot of an owned-mutating builtin whose RUNTIME honors
+/// the receiver-consume contract on EVERY execution path (`List*.set`
+/// / `List*.push` / `List*.pop` / `List*.append` and `Map*.put` /
+/// `Map*.delete` / `Map*.merge`, including their `_owned_unchecked`
+/// peers), or `null` when `name` is not one.
+///
+/// By construction a non-null result here always equals
+/// `arc_liveness.ownedMutatingBuiltinSlot(name)` — the predicate only
+/// re-checks the accepted method set, never re-derives the slot. The
+/// method list is kept EXPLICIT (rather than delegating wholesale to
+/// the liveness predicate) so a builtin later added to the liveness
+/// set does not silently join the caller-independent promotion rule
+/// before its runtime is verified to consume.
+///
+/// "Honors the receiver-consume contract" means the runtime consumes
+/// the moved-in receiver reference on every path: the rc-1 in-place
+/// paths flow the consumed reference through to the result, the rc-1
+/// grow paths free the old buffer shallowly, and the shared-clone
+/// paths explicitly release the consumed receiver via
+/// `releaseConsumedMutationReceiver` (`src/runtime.zig`; the List
+/// four since Phase 1, `Map.put`/`Map.delete` since Phase 2a).
+/// `Map.merge` additionally consumes BOTH operands — the slot-1
+/// operand is folded and released via `releaseConsumedMergeOperand` —
+/// matching the callsite protocol verified against the
+/// post-drop-insertion IR of the monomorphized `lib/map.zap` merge
+/// wrapper (a manufactured `copy_value` + `retain .persistent` +
+/// `move_value` into each slot with no post-call release), and its
+/// receiver paths mirror `putInner`'s rc-1 reuse / shared
+/// own-clone-and-release discipline (Phase 2b); the runtime unit
+/// tests "Map(i64,i64) merge …" in `src/runtime.zig` prove the
+/// release balance on each path. Promoting a wrapper whose sink does
+/// NOT consume would orphan the manufactured +1 owner that a
+/// keeps-its-source caller hands in, leaking one receiver per call.
+fn consumeHonoringOwnedMutatingBuiltinSlot(name: []const u8) ?usize {
+    const receiver_slot = arc_liveness.ownedMutatingBuiltinSlot(name) orelse return null;
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    var method = name[dot_index + 1 ..];
+    const unchecked_suffix = "_owned_unchecked";
+    if (std.mem.endsWith(u8, method, unchecked_suffix)) {
+        method = method[0 .. method.len - unchecked_suffix.len];
+    }
+    const runtime_honors_receiver_consume =
+        std.mem.eql(u8, method, "set") or
+        std.mem.eql(u8, method, "push") or
+        std.mem.eql(u8, method, "pop") or
+        std.mem.eql(u8, method, "append") or
+        std.mem.eql(u8, method, "put") or
+        std.mem.eql(u8, method, "delete") or
+        std.mem.eql(u8, method, "merge");
+    if (!runtime_honors_receiver_consume) return null;
+    return receiver_slot;
+}
+
+/// Grow the trivial-alias closure `alias_buf[0..alias_len.*]` to a
+/// fixpoint over `function`'s body: every `move_value` / `local_get`
+/// / `borrow_value` / `share_value` whose source is already in the
+/// closure adds its dest. When `seed_param_index` is non-null, every
+/// `param_get` of that parameter slot seeds the closure; pass `null`
+/// to grow from pre-seeded entries only (the result-flow closure).
+///
+/// The closure is capped at `alias_buf.len`. Callers MUST treat a
+/// full buffer (`alias_len.* == alias_buf.len`) as "possibly
+/// incomplete" and bail conservatively — an incomplete closure would
+/// let `ExclusiveMutatingReceiverAudit` miss a use of an untracked
+/// alias.
+fn growTrivialAliasClosure(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    seed_param_index: ?u32,
+    alias_buf: []ir.LocalId,
+    alias_len: *usize,
+) std.mem.Allocator.Error!void {
+    const Grower = struct {
+        seed_param_index: ?u32,
+        alias_buf: []ir.LocalId,
+        alias_len: *usize,
+        changed: bool = false,
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            switch (instr.*) {
+                .param_get => |pg| if (self.seed_param_index) |seed_index| {
+                    if (pg.index == seed_index) {
+                        if (markAlias(pg.dest, self.alias_buf, self.alias_len, self.alias_buf.len)) {
+                            self.changed = true;
+                        }
+                    }
+                },
+                .move_value => |mv| self.followAliasLink(mv.source, mv.dest),
+                .local_get => |lg| self.followAliasLink(lg.source, lg.dest),
+                .borrow_value => |bv| self.followAliasLink(bv.source, bv.dest),
+                .share_value => |sv| self.followAliasLink(sv.source, sv.dest),
+                else => {},
+            }
+        }
+
+        fn followAliasLink(self: *@This(), source: ir.LocalId, dest: ir.LocalId) void {
+            if (!containsAlias(self.alias_buf[0..self.alias_len.*], source)) return;
+            if (markAlias(dest, self.alias_buf, self.alias_len, self.alias_buf.len)) {
+                self.changed = true;
+            }
+        }
+    };
+
+    // Iterate to a fixpoint: each pass either grows the closure by at
+    // least one local or terminates the loop, so the iteration count
+    // is bounded by `alias_buf.len`.
+    while (true) {
+        var grower = Grower{
+            .seed_param_index = seed_param_index,
+            .alias_buf = alias_buf,
+            .alias_len = alias_len,
+        };
+        try ir.forEachInstruction(allocator, function, &grower, Grower.visit);
+        if (!grower.changed) return;
+    }
+}
+
+/// Instruction visitor for `paramConsumedOnlyByOwnedMutatingReceiver`:
+/// audits EVERY use of the parameter's trivial-alias closure and
+/// requires each one to be either a closure-internal alias link or
+/// the receiver slot of a consume-honoring owned-mutating builtin
+/// (`consumeHonoringOwnedMutatingBuiltinSlot`). Any other use —
+/// another builtin slot, a Zap call argument, a `ret`, a store, a
+/// debug binding — sets `violation` and the promotion rule does not
+/// fire.
+const ExclusiveMutatingReceiverAudit = struct {
+    allocator: std.mem.Allocator,
+    alias_set: []const ir.LocalId,
+    /// Dests of the qualifying consuming `call_builtin`s. These seed
+    /// the result-flow closure that the return probe checks.
+    result_buf: []ir.LocalId,
+    result_len: *usize,
+    violation: bool = false,
+    found_receiver_consume: bool = false,
+    err: ?std.mem.Allocator.Error = null,
+
+    fn visit(self: *@This(), instr: *const ir.Instruction) void {
+        if (self.violation or self.err != null) return;
+        switch (instr.*) {
+            // Trivial alias links are the closure's own edges, not
+            // escaping uses: each link's dest is itself in
+            // `alias_set` (the closure ran to a fixpoint before this
+            // audit), so the dest's uses are audited independently.
+            .move_value => |mv| if (containsAlias(self.alias_set, mv.source)) return,
+            .local_get => |lg| if (containsAlias(self.alias_set, lg.source)) return,
+            .borrow_value => |bv| if (containsAlias(self.alias_set, bv.source)) return,
+            .share_value => |sv| if (containsAlias(self.alias_set, sv.source)) return,
+            // Pre-classifier borrow-ABI plumbing. This pass runs
+            // BEFORE `arc_ownership.classifyAndNormalize`, so the
+            // only `retain` (`.normal`) / `release` (`.release`)
+            // instructions on the parameter's alias chain are the IR
+            // builder's share/retain/release call plumbing — the
+            // classifier discards them and re-derives ownership
+            // plumbing from the FINAL `param_conventions` (a
+            // promoted receiver lowers to a plain move; a borrowed
+            // one gets a fresh manufactured owner). They carry no
+            // independent ownership semantics for the parameter, so
+            // they must not veto the receiver-only audit. Any other
+            // retain/release kind at this stage (e.g. `.persistent`,
+            // `.free` — today only produced by LATER passes) is
+            // outside this contract and conservatively vetoes via
+            // the generic use scan below.
+            .retain => |r| if (r.kind == .normal and containsAlias(self.alias_set, r.value)) return,
+            .release => |r| if (r.kind == .release and containsAlias(self.alias_set, r.value)) return,
+            .call_builtin => |cb| {
+                const receiver_slot = consumeHonoringOwnedMutatingBuiltinSlot(cb.name);
+                for (cb.args, 0..) |arg, arg_slot| {
+                    if (!containsAlias(self.alias_set, arg)) continue;
+                    const is_consuming_receiver =
+                        receiver_slot != null and receiver_slot.? == arg_slot;
+                    if (!is_consuming_receiver) {
+                        self.violation = true;
+                        return;
+                    }
+                    self.found_receiver_consume = true;
+                    if (!markAlias(cb.dest, self.result_buf, self.result_len, self.result_buf.len) and
+                        !containsAlias(self.result_buf[0..self.result_len.*], cb.dest))
+                    {
+                        // The result buffer saturated: the return
+                        // probe could not see this call's result, so
+                        // the rule cannot certify the shape.
+                        self.violation = true;
+                        return;
+                    }
+                }
+                return;
+            },
+            else => {},
+        }
+        // Generic use scan for every other opcode (including `ret`,
+        // `local_set`, Zap calls, and `dbg_var` — a debug binding
+        // counts as a use here to stay aligned with
+        // `arc_liveness.collectUses`, which anchors last-use analysis
+        // on it).
+        var uses = arc_liveness.UseList{};
+        defer uses.deinit(self.allocator);
+        arc_liveness.collectUses(self.allocator, instr.*, &uses) catch |collect_err| {
+            self.err = collect_err;
+            return;
+        };
+        for (uses.slice()) |use_local| {
+            if (containsAlias(self.alias_set, use_local)) {
+                self.violation = true;
+                return;
+            }
+        }
+    }
+};
+
+/// Instruction visitor that reports whether any return carrier
+/// (`ret`, `cond_return`, `switch_return` / `union_switch_return`
+/// arm returns) yields a local in `result_set` — the "the consuming
+/// call's result is what the function returns" condition of the
+/// owned-mutating wrapper promotion rule.
+const ReturnedLocalProbe = struct {
+    result_set: []const ir.LocalId,
+    found: bool = false,
+
+    fn visit(self: *@This(), instr: *const ir.Instruction) void {
+        if (self.found) return;
+        switch (instr.*) {
+            .ret => |r| self.checkReturnedLocal(r.value),
+            .cond_return => |cr| self.checkReturnedLocal(cr.value),
+            .switch_return => |sr| {
+                for (sr.cases) |case| self.checkReturnedLocal(case.return_value);
+                self.checkReturnedLocal(sr.default_result);
+            },
+            .union_switch_return => |usr| {
+                for (usr.cases) |case| self.checkReturnedLocal(case.return_value);
+            },
+            else => {},
+        }
+    }
+
+    fn checkReturnedLocal(self: *@This(), value: ?ir.LocalId) void {
+        if (value) |returned_local| {
+            if (containsAlias(self.result_set, returned_local)) self.found = true;
+        }
+    }
+};
+
+/// Phase L1 — does `function` consume parameter `param_index`
+/// EXCLUSIVELY as the receiver of consume-honoring owned-mutating
+/// builtins whose result the function returns?
+///
+/// The three conditions, all required:
+///
+///   1. Every use of the parameter's local — followed through the
+///      trivial alias chains this pass already models (`move_value`,
+///      `local_get`, `borrow_value`, `share_value`) — feeds the
+///      receiver slot of a `call_builtin` accepted by
+///      `consumeHonoringOwnedMutatingBuiltinSlot`.
+///   2. At least one such consuming use exists.
+///   3. A consuming call's result is what the function returns,
+///      directly or through the same trivial alias chains.
+///
+/// A slot that satisfies this predicate is promoted to `.owned`
+/// WITHOUT the main fixpoint's "every caller passes at last use"
+/// gate. Caller-independence is sound because:
+///
+///   * Callee side: the wrapper hands its receiver to a builtin
+///     whose runtime consumes the reference on every path (see
+///     `consumeHonoringOwnedMutatingBuiltinSlot`), so the moved-in
+///     owner is consumed exactly once.
+///   * Caller side: `arc_ownership`'s owned-consume rewriter
+///     (`rewriteOwnedConsumeSites` / `shouldMoveIntoOwnedConsume`)
+///     moves the argument at last use, or manufactures an
+///     independently retained owner when the caller keeps its
+///     source, and drops the post-call release either way — the
+///     callee always receives exactly one owner it may consume.
+///   * The V7 verifier (`arc_verifier.zig`) still enforces
+///     caller/callee convention agreement at every call site.
+fn paramConsumedOnlyByOwnedMutatingReceiver(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    param_index: usize,
+) std.mem.Allocator.Error!bool {
+    const max_aliases: usize = 256;
+
+    // Condition setup: trivial-alias closure of the parameter.
+    var alias_buf: [max_aliases]ir.LocalId = undefined;
+    var alias_len: usize = 0;
+    try growTrivialAliasClosure(allocator, function, @intCast(param_index), alias_buf[0..], &alias_len);
+    if (alias_len == 0) return false;
+    // A full buffer means the closure may be incomplete, and an
+    // incomplete closure could hide a non-receiver use from the
+    // audit. Bail conservatively.
+    if (alias_len == max_aliases) return false;
+
+    // Conditions 1 + 2: every alias use is a consume-honoring
+    // owned-mutating receiver.
+    var result_buf: [max_aliases]ir.LocalId = undefined;
+    var result_len: usize = 0;
+    var audit = ExclusiveMutatingReceiverAudit{
+        .allocator = allocator,
+        .alias_set = alias_buf[0..alias_len],
+        .result_buf = result_buf[0..],
+        .result_len = &result_len,
+    };
+    try ir.forEachInstruction(allocator, function, &audit, ExclusiveMutatingReceiverAudit.visit);
+    if (audit.err) |audit_err| return audit_err;
+    if (audit.violation or !audit.found_receiver_consume) return false;
+
+    // Condition 3: a consuming call's result reaches a return.
+    try growTrivialAliasClosure(allocator, function, null, result_buf[0..], &result_len);
+    if (result_len == max_aliases) return false;
+
+    var probe = ReturnedLocalProbe{ .result_set = result_buf[0..result_len] };
+    try ir.forEachInstruction(allocator, function, &probe, ReturnedLocalProbe.visit);
+    return probe.found;
+}
+
 /// Does this call site pass `args[slot_index]` in a "consume"
 /// position — i.e. is the source dead at the call?
 fn siteConsumesSlot(
@@ -5598,6 +5967,389 @@ test "arc_param_convention: side-channel stash forwarding promotes wrapper slot 
     try runConventionInferenceFixpoint(std.testing.allocator, &program, &ownerships);
 
     try std.testing.expectEqual(ir.ParamConvention.owned, conventions[0]);
+}
+
+// ============================================================
+// Phase L1 — caller-independent owned-mutating wrapper promotion
+// tests (List four + Map put/delete/merge)
+// ============================================================
+
+/// Build the canonical monomorphized-wrapper test function
+/// `wrapper(receiver, operands…) -> <builtin>(receiver, operands…)`
+/// used by the Phase L1 promotion tests, for builtins of two or three
+/// arguments (`List.set(list, index, value)` / `Map.put(map, key,
+/// value)` are three; `List.pop`-style receivers aside, `Map.delete
+/// (map, key)` / `Map.merge(map_a, map_b)` are two). The body mirrors
+/// the REAL pre-classifier IR the builder emits for `lib/list.zap` /
+/// `lib/map.zap`'s thin wrappers (verified against
+/// `FannkuchRedux__List_set__i64__3` at inference time), including
+/// the borrow-ABI plumbing the classifier later rebuilds: `local_get`
+/// alias + `retain .normal` + retained `share_value` feeding the
+/// builtin's receiver slot + post-call `release`. Returns the
+/// function's conventions slice so tests can assert on the (in-place
+/// mutated) slot.
+fn buildMutatingWrapperTestProgram(
+    arena: std.mem.Allocator,
+    builtin_name: []const u8,
+    builtin_arg_count: usize,
+) !struct { program: ir.Program, conventions: []ir.ParamConvention } {
+    std.debug.assert(builtin_arg_count >= 2 and builtin_arg_count <= 3);
+    const param_count = builtin_arg_count;
+    const result_local: ir.LocalId = @intCast(param_count);
+    const receiver_alias_local: ir.LocalId = result_local + 1;
+    const receiver_share_local: ir.LocalId = result_local + 2;
+    const first_operand_local: ir.LocalId = result_local + 3;
+
+    const args = try arena.alloc(ir.LocalId, builtin_arg_count);
+    const arg_modes = try arena.alloc(ir.ValueMode, builtin_arg_count);
+    args[0] = receiver_share_local;
+    arg_modes[0] = .move;
+    for (1..builtin_arg_count) |operand_slot| {
+        args[operand_slot] = first_operand_local + @as(ir.LocalId, @intCast(operand_slot - 1));
+        arg_modes[operand_slot] = .borrow;
+    }
+
+    var instruction_buffer: [12]ir.Instruction = undefined;
+    var instruction_count: usize = 0;
+    for (0..param_count) |param_index| {
+        instruction_buffer[instruction_count] = .{ .param_get = .{
+            .dest = @intCast(param_index),
+            .index = @intCast(param_index),
+        } };
+        instruction_count += 1;
+    }
+    instruction_buffer[instruction_count] = .{ .local_get = .{ .dest = receiver_alias_local, .source = 0 } };
+    instruction_count += 1;
+    instruction_buffer[instruction_count] = .{ .retain = .{ .value = receiver_alias_local, .kind = .normal } };
+    instruction_count += 1;
+    instruction_buffer[instruction_count] = .{ .share_value = .{
+        .dest = receiver_share_local,
+        .source = receiver_alias_local,
+        .mode = .retain,
+    } };
+    instruction_count += 1;
+    instruction_buffer[instruction_count] = .{ .retain = .{ .value = receiver_share_local, .kind = .normal } };
+    instruction_count += 1;
+    for (1..builtin_arg_count) |operand_slot| {
+        instruction_buffer[instruction_count] = .{ .local_get = .{
+            .dest = args[operand_slot],
+            .source = @intCast(operand_slot),
+        } };
+        instruction_count += 1;
+    }
+    instruction_buffer[instruction_count] = .{ .call_builtin = .{
+        .dest = result_local,
+        .name = builtin_name,
+        .args = args,
+        .arg_modes = arg_modes,
+    } };
+    instruction_count += 1;
+    instruction_buffer[instruction_count] = .{ .release = .{ .value = receiver_share_local, .kind = .release } };
+    instruction_count += 1;
+    instruction_buffer[instruction_count] = .{ .ret = .{ .value = result_local } };
+    instruction_count += 1;
+
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{
+        .label = 0,
+        .instructions = try arena.dupe(ir.Instruction, instruction_buffer[0..instruction_count]),
+    };
+
+    const local_count: u32 = @intCast(first_operand_local + (builtin_arg_count - 1));
+    const local_ownership = try arena.alloc(ir.OwnershipClass, local_count);
+    for (local_ownership) |*ownership_class| ownership_class.* = .owned;
+
+    const conventions = try arena.alloc(ir.ParamConvention, param_count);
+    conventions[0] = .borrowed;
+    for (conventions[1..]) |*operand_convention| operand_convention.* = .trivial;
+
+    const params = try arena.alloc(ir.Param, param_count);
+    params[0] = .{ .name = "receiver", .type_expr = .void };
+    for (params[1..], 0..) |*operand_param, operand_index| {
+        operand_param.* = .{
+            .name = if (operand_index == 0) "operand_one" else "operand_two",
+            .type_expr = .void,
+        };
+    }
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = .{
+        .id = 0,
+        .name = "mutating_wrapper",
+        .scope_id = 0,
+        .arity = @intCast(param_count),
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = local_count,
+        .param_conventions = conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+    return .{
+        .program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null },
+        .conventions = conventions,
+    };
+}
+
+test "arc_param_convention: List mutating wrapper receiver promotes to owned without caller consume gating" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // No callers at all: the wrapper must be promoted purely from its
+    // own body shape (receiver consumed into List.set, result
+    // returned). The main fixpoint cannot do this — it requires call
+    // sites — so this exercises the Phase L1 rule in isolation.
+    var built = try buildMutatingWrapperTestProgram(arena, "List:i64.set", 3);
+
+    var ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
+    defer ownerships.deinit();
+    try runConventionInferenceFixpoint(std.testing.allocator, &built.program, &ownerships);
+
+    try std.testing.expectEqual(ir.ParamConvention.owned, built.conventions[0]);
+}
+
+test "arc_param_convention: Map put wrapper receiver promotes to owned without caller consume gating" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Phase 2a made the Map runtime consume its receiver reference on
+    // every `put` path (rc-1 flow-through / in-place resize, and
+    // `releaseConsumedMutationReceiver` on the shared clone), so the
+    // caller-independent rule now fires for the Map wrappers exactly
+    // as it does for the List four.
+    var built = try buildMutatingWrapperTestProgram(arena, "Map:i64:i64.put", 3);
+
+    var ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
+    defer ownerships.deinit();
+    try runConventionInferenceFixpoint(std.testing.allocator, &built.program, &ownerships);
+
+    try std.testing.expectEqual(ir.ParamConvention.owned, built.conventions[0]);
+}
+
+test "arc_param_convention: Map delete wrapper receiver promotes to owned without caller consume gating" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // The two-argument peer of the `put` wrapper test: `delete`'s
+    // shared clone path also releases the consumed receiver
+    // (`releaseConsumedMutationReceiver`), so its wrapper promotes.
+    var built = try buildMutatingWrapperTestProgram(arena, "Map:i64:i64.delete", 2);
+
+    var ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
+    defer ownerships.deinit();
+    try runConventionInferenceFixpoint(std.testing.allocator, &built.program, &ownerships);
+
+    try std.testing.expectEqual(ir.ParamConvention.owned, built.conventions[0]);
+}
+
+test "arc_param_convention: Map merge wrapper receiver promotes to owned without caller consume gating" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // Phase 2b verdict: the compiler's merge callsite protocol moves a
+    // manufactured owner into BOTH slots with no post-call release
+    // (verified by IR dump of the monomorphized `lib/map.zap` merge
+    // wrapper), and the runtime now consumes both operands on every
+    // path (rc-1 in-place fold, shared own-clone + receiver release,
+    // `releaseConsumedMergeOperand` for the folded right operand) —
+    // proven by the "Map(i64,i64) merge …" release-balance unit tests
+    // in `src/runtime.zig`. The merge wrapper's receiver therefore
+    // qualifies for the caller-independent promotion.
+    var built = try buildMutatingWrapperTestProgram(arena, "Map:i64:i64.merge", 2);
+
+    var ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
+    defer ownerships.deinit();
+    try runConventionInferenceFixpoint(std.testing.allocator, &built.program, &ownerships);
+
+    try std.testing.expectEqual(ir.ParamConvention.owned, built.conventions[0]);
+}
+
+test "arc_param_convention: List wrapper with a non-sink receiver use is NOT promoted" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // `wrapper(list, index, value) { _peek = List.get(list, index);
+    // List.set(list, index, value) }` — the receiver has a read use
+    // besides the consuming receiver slot, so the every-use audit
+    // must reject the slot.
+    const get_args = try arena.alloc(ir.LocalId, 2);
+    get_args[0] = 0;
+    get_args[1] = 1;
+    const get_arg_modes = try arena.alloc(ir.ValueMode, 2);
+    get_arg_modes[0] = .borrow;
+    get_arg_modes[1] = .borrow;
+    const set_args = try arena.alloc(ir.LocalId, 3);
+    set_args[0] = 3;
+    set_args[1] = 1;
+    set_args[2] = 2;
+    const set_arg_modes = try arena.alloc(ir.ValueMode, 3);
+    set_arg_modes[0] = .move;
+    set_arg_modes[1] = .borrow;
+    set_arg_modes[2] = .borrow;
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .param_get = .{ .dest = 2, .index = 2 } },
+        .{ .call_builtin = .{
+            .dest = 5,
+            .name = "List:i64.get",
+            .args = get_args,
+            .arg_modes = get_arg_modes,
+        } },
+        .{ .share_value = .{ .dest = 3, .source = 0, .mode = .retain } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "List:i64.set",
+            .args = set_args,
+            .arg_modes = set_arg_modes,
+        } },
+        .{ .ret = .{ .value = 4 } },
+    };
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = try arena.dupe(ir.Instruction, &instrs) };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 6);
+    for (local_ownership) |*ownership_class| ownership_class.* = .owned;
+
+    const conventions = try arena.alloc(ir.ParamConvention, 3);
+    conventions[0] = .borrowed;
+    conventions[1] = .trivial;
+    conventions[2] = .trivial;
+
+    const params = try arena.alloc(ir.Param, 3);
+    params[0] = .{ .name = "list", .type_expr = .void };
+    params[1] = .{ .name = "index", .type_expr = .void };
+    params[2] = .{ .name = "value", .type_expr = .void };
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = .{
+        .id = 0,
+        .name = "List_peek_then_set_wrapper",
+        .scope_id = 0,
+        .arity = 3,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 6,
+        .param_conventions = conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
+    defer ownerships.deinit();
+    try runConventionInferenceFixpoint(std.testing.allocator, &program, &ownerships);
+
+    try std.testing.expectEqual(ir.ParamConvention.borrowed, conventions[0]);
+}
+
+test "arc_param_convention: List wrapper whose builtin result is not returned is NOT promoted" {
+    var arena_obj = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_obj.deinit();
+    const arena = arena_obj.allocator();
+
+    // The consuming call's result is discarded and a constant is
+    // returned instead — condition 3 (result reaches a return) must
+    // reject the slot.
+    const set_args = try arena.alloc(ir.LocalId, 3);
+    set_args[0] = 3;
+    set_args[1] = 1;
+    set_args[2] = 2;
+    const set_arg_modes = try arena.alloc(ir.ValueMode, 3);
+    set_arg_modes[0] = .move;
+    set_arg_modes[1] = .borrow;
+    set_arg_modes[2] = .borrow;
+
+    const instrs = [_]ir.Instruction{
+        .{ .param_get = .{ .dest = 0, .index = 0 } },
+        .{ .param_get = .{ .dest = 1, .index = 1 } },
+        .{ .param_get = .{ .dest = 2, .index = 2 } },
+        .{ .share_value = .{ .dest = 3, .source = 0, .mode = .retain } },
+        .{ .call_builtin = .{
+            .dest = 4,
+            .name = "List:i64.set",
+            .args = set_args,
+            .arg_modes = set_arg_modes,
+        } },
+        .{ .const_int = .{ .dest = 5, .value = 0 } },
+        .{ .ret = .{ .value = 5 } },
+    };
+    const blocks = try arena.alloc(ir.Block, 1);
+    blocks[0] = .{ .label = 0, .instructions = try arena.dupe(ir.Instruction, &instrs) };
+
+    const local_ownership = try arena.alloc(ir.OwnershipClass, 6);
+    for (local_ownership) |*ownership_class| ownership_class.* = .owned;
+
+    const conventions = try arena.alloc(ir.ParamConvention, 3);
+    conventions[0] = .borrowed;
+    conventions[1] = .trivial;
+    conventions[2] = .trivial;
+
+    const params = try arena.alloc(ir.Param, 3);
+    params[0] = .{ .name = "list", .type_expr = .void };
+    params[1] = .{ .name = "index", .type_expr = .void };
+    params[2] = .{ .name = "value", .type_expr = .void };
+
+    const functions = try arena.alloc(ir.Function, 1);
+    functions[0] = .{
+        .id = 0,
+        .name = "List_set_discard_wrapper",
+        .scope_id = 0,
+        .arity = 3,
+        .params = params,
+        .return_type = .void,
+        .body = blocks,
+        .is_closure = false,
+        .captures = &.{},
+        .local_count = 6,
+        .param_conventions = conventions,
+        .local_ownership = local_ownership,
+        .result_convention = .owned,
+    };
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+
+    var ownerships = arc_liveness.ProgramArcOwnership.init(std.testing.allocator);
+    defer ownerships.deinit();
+    try runConventionInferenceFixpoint(std.testing.allocator, &program, &ownerships);
+
+    try std.testing.expectEqual(ir.ParamConvention.borrowed, conventions[0]);
+}
+
+test "arc_param_convention: consumeHonoringOwnedMutatingBuiltinSlot matches the List four and the Map three" {
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("List.set"));
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("List:i64.set"));
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("List:i64.push"));
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("ListNested:i64.pop"));
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("List.append"));
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("List.set_owned_unchecked"));
+
+    // Phase 2: the Map runtime consumes its receiver on every
+    // put/delete/merge path, so every Map prefix the liveness
+    // predicate accepts now qualifies.
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("Map.put"));
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("Map:i64:i64.delete"));
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("MapNested:str:list.merge"));
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("Map.put_owned_unchecked"));
+    try std.testing.expectEqual(@as(?usize, 0), consumeHonoringOwnedMutatingBuiltinSlot("Map.merge"));
+
+    try std.testing.expectEqual(@as(?usize, null), consumeHonoringOwnedMutatingBuiltinSlot("List.get"));
+    try std.testing.expectEqual(@as(?usize, null), consumeHonoringOwnedMutatingBuiltinSlot("List.cons"));
+    try std.testing.expectEqual(@as(?usize, null), consumeHonoringOwnedMutatingBuiltinSlot("Map.get"));
+    try std.testing.expectEqual(@as(?usize, null), consumeHonoringOwnedMutatingBuiltinSlot("Map.keys"));
+    try std.testing.expectEqual(@as(?usize, null), consumeHonoringOwnedMutatingBuiltinSlot("Foo.set"));
+    try std.testing.expectEqual(@as(?usize, null), consumeHonoringOwnedMutatingBuiltinSlot("MapAlt.put"));
 }
 
 // ============================================================

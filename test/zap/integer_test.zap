@@ -64,6 +64,15 @@ pub struct Zap.IntegerTest {
       assert(parsed == 42)
     }
 
+    test("parse positive can be handled with case pattern matching") {
+      result = case Integer.parse("42") {
+        nil -> -1
+        int -> int + 1
+      }
+
+      assert(result == 43)
+    }
+
     test("parse negative") {
       parsed = Integer.parse("-7")
       assert(parsed != nil)
@@ -74,8 +83,26 @@ pub struct Zap.IntegerTest {
       assert(Integer.parse("hello") == nil)
     }
 
+    test("parse invalid can be handled with nil case pattern") {
+      result = case Integer.parse("hello") {
+        nil -> 99
+        int -> int
+      }
+
+      assert(result == 99)
+    }
+
     test("parse out-of-range returns nil") {
       assert(Integer.parse("9223372036854775808") == nil)
+    }
+
+    test("parse out-of-range can be handled with nil case pattern") {
+      result = case Integer.parse("9223372036854775808") {
+        nil -> 123
+        int -> int
+      }
+
+      assert(result == 123)
     }
 
     test("parse zero") {

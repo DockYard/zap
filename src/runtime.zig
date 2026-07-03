@@ -848,13 +848,27 @@ pub fn resetAllocator() void {
 // `./map-instrumentation.json`).
 //
 // Resolution order:
-//   1. The build-system root (the compiler binary built by `zig build`)
+//   1. Host test builds (`zig build test`) read the `-Dinstrument-map`
+//      build option through the `build_options` module. `@import("root")`
+//      is NOT usable here: Zig 0.16's test runner makes it resolve to the
+//      test runner's own root (the same fragility the `collect_arc_stats`
+//      block below documents), so a root-decl override is invisible to
+//      test builds — the S/W/V instrumentation differential tests would
+//      silently compile to their trivial `!instrument_map` early-return
+//      under `-Dinstrument-map=true`. `runtime.zig` is only ever analyzed
+//      inside the `zap` module (`src/root.zig` is its sole importer), and
+//      `build.zig` always attaches the option to that module, so the
+//      import resolves in every host compilation. Embedded user-binary
+//      runtimes are never Zig test builds (`zap test` runners are plain
+//      executables), so this branch stays comptime-dead — and the
+//      `build_options` module reference unanalyzed — outside the host
+//      build.
+//   2. The build-system root (the compiler binary built by `zig build`)
 //      can override the flag by declaring
 //      `pub const zap_runtime_instrument_map_override: bool = ...;`.
 //      `src/root.zig` re-exports the `-Dinstrument-map` build option
-//      under that name, so a `zig build -Dinstrument-map=true` flips
-//      the flag on for the host test suite.
-//   2. The embedded-runtime root (a Zap user binary) does not declare
+//      under that name.
+//   3. The embedded-runtime root (a Zap user binary) does not declare
 //      that override, so the flag falls back to the source-level
 //      `INSTRUMENT_MAP_DEFAULT` constant. `compiler.zig` rewrites that
 //      default at source-registration time when the host compiler was
@@ -865,6 +879,9 @@ pub fn resetAllocator() void {
 const INSTRUMENT_MAP_DEFAULT: bool = false;
 
 pub const instrument_map: bool = blk: {
+    if (builtin.is_test) {
+        break :blk @as(bool, @import("build_options").instrument_map);
+    }
     const root = @import("root");
     if (@hasDecl(root, "zap_runtime_instrument_map_override")) {
         break :blk @as(bool, root.zap_runtime_instrument_map_override);
@@ -7524,11 +7541,83 @@ pub fn List(comptime T: type) type {
             ArcRuntime.headerRelease(&mut.header, listDeepWalk);
         }
 
+        /// Consume an iter-cell (cursor-backed) receiver of a checked
+        /// owned-mutating builtin (`set`/`push`/`pop`/`append`) after its
+        /// view has been materialized into an independent buffer.
+        ///
+        /// The compiler transfers ownership of the receiver INTO these
+        /// builtins uniformly (`arc_liveness` clears the argument's owns
+        /// bit at the `call_builtin`;
+        /// `arc_param_convention.consumeHonoringOwnedMutatingBuiltinSlot`
+        /// names the receiver slot) — cursor-ness is a RUNTIME property
+        /// (`isIterCell`) the ownership passes cannot see, so an iter-cell
+        /// receiver arrives with the same moved-in +1 as a buffer
+        /// receiver. The iter branches materialize a fresh result buffer
+        /// from the cursor's view and abandon the cursor, so this helper
+        /// must reclaim the consumed cursor reference; omitting it orphans
+        /// one iter cell AND the cursor's +1 on its source buffer per
+        /// call (the Phase-2 cursor analog of the fannkuch-redux
+        /// unbounded-leak regression — an `Enumerable.next` state fed to
+        /// `List.set` in a loop leaked the whole source list every
+        /// iteration).
+        ///
+        /// Reclamation is model-aware, mirroring `release`'s iter-cell
+        /// dispatch (`ListIter(T).releaseFromListPtr`):
+        ///   * `INDIVIDUAL_NO_REFCOUNT` (Tracking): the cursor cell is
+        ///     freed eagerly and its owned source clone released — the
+        ///     pre-existing behavior.
+        ///   * REFCOUNTED: `headerRelease` + `iterDeepWalk` decrement the
+        ///     cursor's count and, on the zero-transition, free the cell
+        ///     and release its retained source. Releasing here can never
+        ///     invalidate another observer: exactly one incoming reference
+        ///     is consumed, surviving cursor aliases hold their own +1s,
+        ///     and the materialized result deep-owns its elements so it
+        ///     does not depend on the source buffer staying alive.
+        ///   * BULK_OR_NEVER / TRACED: no per-drop reclamation exists —
+        ///     comptime no-op.
+        ///
+        /// Must be called AFTER materialization: the view reads through
+        /// the cursor's source, which this release may tear down.
         inline fn releaseConsumedCursorOperand(operand: ?*const Self) void {
-            if (comptime eager_individual_free) {
+            if (comptime eager_individual_free or reclamation_model == .refcounted) {
                 if (operand) |list_ptr| {
                     if (list_ptr.isIterCell()) release(operand);
                 }
+            }
+        }
+
+        /// Consume the receiver of a checked owned-mutating builtin
+        /// (`set`/`push`/`pop`/`append`) on its shared deep-retain-clone
+        /// path, under the refcounted model only.
+        ///
+        /// The compiler transfers ownership of the receiver INTO these
+        /// builtins: `arc_liveness` clears the argument's owns bit at the
+        /// `call_builtin` ("consuming call_builtin arguments transfer
+        /// their owner into the runtime primitive") and
+        /// `arc_ownership.rewriteOwnedConsumeBuiltinSites` rewrites the
+        /// receiver slot to a last-use move or an independent COW owner
+        /// and drops the post-call release. The rc==1 fast paths honor
+        /// that transfer by returning the same buffer (the reference
+        /// flows through), and the rc==1 grow paths honor it by freeing
+        /// the old buffer shallowly. The shared clone path must honor it
+        /// symmetrically by releasing the consumed reference — omitting
+        /// this orphaned one reference per shared mutation, so every
+        /// superseded buffer leaked (the fannkuch-redux unbounded-leak
+        /// regression). Releasing here can never free a buffer another
+        /// observer holds: this path only runs at rc >= 2, and exactly
+        /// one incoming reference is being consumed.
+        ///
+        /// Comptime-gated to `.refcounted`: under Tracking the receiver
+        /// protocol is alias-or-persistent-clone and buffers are
+        /// reclaimed at teardown (see `release`'s model notes); under
+        /// bulk/traced models per-drop reclamation does not exist. Both
+        /// keep their existing behavior byte-for-byte. Iter-cell
+        /// receivers never reach the shared clone paths (they are
+        /// materialized and handled by `releaseConsumedCursorOperand`
+        /// earlier in each builtin).
+        inline fn releaseConsumedMutationReceiver(operand: ?*const Self) void {
+            if (comptime reclamation_model == .refcounted) {
+                release(operand);
             }
         }
 
@@ -7837,10 +7926,14 @@ pub fn List(comptime T: type) type {
             return ownElement(value);
         }
 
-        /// Bounds-checked element write. Refcount-aware: on rc==1 the
+        /// Bounds-checked element write. Consumes the receiver reference
+        /// and returns the new owner. Refcount-aware: on rc==1 the
         /// existing buffer is mutated in place and the same pointer is
-        /// returned; on rc>1 the buffer is deep-retain cloned first so
-        /// the original observer stays valid.
+        /// returned (the reference flows through); on rc>1 the buffer is
+        /// deep-retain cloned so any OTHER observer stays valid, and the
+        /// consumed incoming reference is released (see
+        /// `releaseConsumedMutationReceiver`). A caller that needs to
+        /// keep its own reference must `retain` before calling.
         pub fn set(vec: ?*const Self, index: i64, value: T) ?*const Self {
             const v = vec orelse @panic("List.set: null list");
             const view = View.fromListPtr(v);
@@ -7871,6 +7964,7 @@ pub fn List(comptime T: type) type {
             const clone_existing = clone.slotAt(slot).*;
             releaseElement(clone_existing, std.heap.c_allocator);
             clone.slotAt(slot).* = value;
+            releaseConsumedMutationReceiver(vec);
             return clone;
         }
 
@@ -7935,6 +8029,7 @@ pub fn List(comptime T: type) type {
             const clone = cloneBufferRetainingChildren(v, new_cap) orelse return null;
             clone.slotAtPtr(clone.len).* = value;
             clone.len += 1;
+            releaseConsumedMutationReceiver(vec);
             return clone;
         }
 
@@ -7970,6 +8065,7 @@ pub fn List(comptime T: type) type {
             const removed_value = clone.slotAtPtr(clone.len - 1).*;
             releaseElement(removed_value, std.heap.c_allocator);
             clone.len -= 1;
+            releaseConsumedMutationReceiver(vec);
             return clone;
         }
 
@@ -8040,6 +8136,7 @@ pub fn List(comptime T: type) type {
             copyViewRetainingChildren(fresh_data, 0, av_view);
             copyViewRetainingChildren(fresh_data, av_view.len, bv_view);
             releaseConsumedCursorOperand(a);
+            if (!av.isIterCell()) releaseConsumedMutationReceiver(a);
             return fresh;
         }
 
@@ -15660,25 +15757,110 @@ pub fn Map(comptime K: type, comptime V: type) type {
         }
 
         /// Reclaim a `Map.merge` / `merge_owned_unchecked` operand that the
-        /// codegen MOVED into the call (consumed) but does NOT itself drop under
-        /// the `INDIVIDUAL_NO_REFCOUNT` reclamation model. `Map.merge` consumes
-        /// both operands; under REFCOUNTED the codegen emits the matching
-        /// `release` for the moved slot-1 operand (and decrements the slot-0
-        /// receiver's transferred reference), so the runtime must NOT release it
-        /// again — doing so underflows the refcount (an `arcRelease`
-        /// unreachable). Under `INDIVIDUAL_NO_REFCOUNT` there is no refcount and
-        /// the no-refcount drop pass leaves a moved-into-builtin operand
-        /// un-dropped, so the runtime reclaims it here: `release` deep-frees its
-        /// eagerly-freed inners and poisons its slots (the merge already
-        /// clone-on-shared every entry into the result, so those copies are
-        /// independent). Comptime-gated, so it is a no-op under REFCOUNTED /
-        /// BULK_OR_NEVER / TRACED.
+        /// codegen MOVED into the call (consumed) but does not itself drop.
+        /// `Map.merge` consumes BOTH operands on every path: the callsite
+        /// protocol (`arc_liveness.ownedMutatingBuiltinSlot` slot 0,
+        /// `alwaysConsumingBuiltinArg` slot 1) moves a last-use owner — or a
+        /// manufactured independent owner when the caller keeps its source —
+        /// into each slot and emits NO post-call release for either
+        /// (verified against the post-drop-insertion IR of the monomorphized
+        /// `lib/map.zap` merge wrapper: `copy_value` + `retain .persistent`
+        /// + `move_value` into the builtin, no `release`).
+        ///
+        /// Under REFCOUNTED the fold has already given the result its own
+        /// +1 on every copied child, so releasing the consumed operand here
+        /// balances the moved-in reference; omitting it orphaned one
+        /// reference per operand per merge (the buffer never reached its
+        /// zero-transition — one leaked map per call). Releasing can never
+        /// free a live observer's buffer: a keeps-its-source caller holds
+        /// its OWN reference on top of the consumed one, so the count stays
+        /// >= 1 after this release. Under `INDIVIDUAL_NO_REFCOUNT` there is
+        /// no refcount and the no-refcount drop pass leaves a
+        /// moved-into-builtin operand un-dropped, so the runtime reclaims it
+        /// here: `release` deep-frees its eagerly-freed inners and poisons
+        /// its slots (the merge already clone-on-shared every entry into the
+        /// result, so those copies are independent). Comptime-gated to a
+        /// no-op under BULK_OR_NEVER / TRACED, where per-drop reclamation
+        /// does not exist.
         inline fn releaseConsumedMergeOperand(operand: ?*const Self) void {
-            if (comptime eager_individual_free) release(operand);
+            if (comptime eager_individual_free or reclamation_model == .refcounted) {
+                release(operand);
+            }
         }
 
+        /// Consume the receiver of a checked owned-mutating builtin
+        /// (`put`/`delete`) on its shared deep-retain-clone path, under the
+        /// refcounted model only — the exact `List.releaseConsumedMutationReceiver`
+        /// analog.
+        ///
+        /// The compiler transfers ownership of the receiver INTO these
+        /// builtins: `arc_liveness` clears the argument's owns bit at the
+        /// `call_builtin` ("consuming call_builtin arguments transfer their
+        /// owner into the runtime primitive") and
+        /// `arc_ownership.rewriteOwnedConsumeBuiltinSites` rewrites the
+        /// receiver slot to a last-use move or an independent COW owner and
+        /// drops the post-call release. The rc==1 fast paths honor that
+        /// transfer by returning the same buffer (the reference flows
+        /// through), and the in-place resize paths honor it by freeing the
+        /// old buffer shallowly. The shared clone path must honor it
+        /// symmetrically by releasing the consumed reference — omitting this
+        /// orphaned one reference per shared mutation, so every superseded
+        /// buffer leaked (the Map peer of the fannkuch-redux List
+        /// unbounded-leak regression). Releasing here can never free a
+        /// buffer another observer holds: this path only runs at rc >= 2,
+        /// and exactly one incoming reference is being consumed.
+        ///
+        /// Comptime-gated to `.refcounted`: under Tracking the receiver
+        /// protocol is alias-or-persistent-clone and buffers are reclaimed
+        /// at teardown (see `release`'s model notes); under bulk/traced
+        /// models per-drop reclamation does not exist. Both keep their
+        /// existing behavior byte-for-byte. Iter-cell receivers never reach
+        /// the shared clone paths (they are materialized and handled by
+        /// `releaseConsumedCursorOperand` earlier in each builtin).
+        inline fn releaseConsumedMutationReceiver(operand: ?*const Self) void {
+            if (comptime reclamation_model == .refcounted) {
+                release(operand);
+            }
+        }
+
+        /// Consume an iter-cell (cursor-backed) receiver of a checked
+        /// owned-mutating builtin (`put`/`delete`/`merge` receiver slot)
+        /// after its view has been materialized into an independent
+        /// buffer — the exact `List.releaseConsumedCursorOperand` analog.
+        ///
+        /// The compiler transfers ownership of the receiver INTO these
+        /// builtins uniformly (`arc_liveness` clears the argument's owns
+        /// bit at the `call_builtin`;
+        /// `arc_param_convention.consumeHonoringOwnedMutatingBuiltinSlot`
+        /// names the receiver slot) — cursor-ness is a RUNTIME property
+        /// (`isIterCell`) the ownership passes cannot see, so an iter-cell
+        /// receiver arrives with the same moved-in +1 as a buffer
+        /// receiver. The iter branches materialize a fresh result buffer
+        /// from the cursor's view and abandon the cursor, so this helper
+        /// must reclaim the consumed cursor reference; omitting it orphans
+        /// one iter cell AND the cursor's +1 on its source buffer per
+        /// call (an `Enumerable.next` state fed to `Map.put` in a loop
+        /// leaked the whole source map every iteration).
+        ///
+        /// Reclamation is model-aware, mirroring `release`'s iter-cell
+        /// dispatch (`MapIter(K, V).releaseFromMapPtr`):
+        ///   * `INDIVIDUAL_NO_REFCOUNT` (Tracking): the cursor cell is
+        ///     freed eagerly and its owned source clone released — the
+        ///     pre-existing behavior.
+        ///   * REFCOUNTED: `headerRelease` + the iter deep-walk decrement
+        ///     the cursor's count and, on the zero-transition, free the
+        ///     cell and release its retained source. Releasing here can
+        ///     never invalidate another observer: exactly one incoming
+        ///     reference is consumed, surviving cursor aliases hold their
+        ///     own +1s, and the materialized result deep-owns its entries
+        ///     so it does not depend on the source buffer staying alive.
+        ///   * BULK_OR_NEVER / TRACED: no per-drop reclamation exists —
+        ///     comptime no-op.
+        ///
+        /// Must be called AFTER materialization: the view reads through
+        /// the cursor's source, which this release may tear down.
         inline fn releaseConsumedCursorOperand(operand: ?*const Self) void {
-            if (comptime eager_individual_free) {
+            if (comptime eager_individual_free or reclamation_model == .refcounted) {
                 if (operand) |map_ptr| {
                     if (map_ptr.isIterCell()) release(operand);
                 }
@@ -15776,13 +15958,17 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 // abandoned receiver's inners into a leak AND hand the clone a
                 // second, separately-tracked inner. A bare retain
                 // (`retainEntryKey`/`retainEntryValue`) is exactly that move:
-                // a refcount bump under REFCOUNTED (the +1 the consumed
-                // receiver would have dropped transfers to the clone) and a
-                // no-op under Tracking (the inner pointer is simply rehomed
+                // a no-op under Tracking (the inner pointer is simply rehomed
                 // into the clone's slot, freed exactly once when the clone
-                // drops). This is NOT a value-semantic SHARE — that is
-                // `cloneForShare`, where BOTH source and clone survive and so
-                // must `ownEntry*`-clone.
+                // drops). Under REFCOUNTED this path only runs at rc >= 2 —
+                // the surviving observers keep the source buffer and its
+                // child references alive until their own zero-transition
+                // deep-walk — so the bare retain is the clone's own
+                // independent +1 per child, and the consumed receiver
+                // reference itself is balanced by the caller's
+                // `releaseConsumedMutationReceiver`. This is NOT a
+                // value-semantic SHARE — that is `cloneForShare`, where BOTH
+                // source and clone survive and so must `ownEntry*`-clone.
                 retainEntryKey(new_entries[i].key);
                 retainEntryValue(new_entries[i].value);
             }
@@ -16020,6 +16206,15 @@ pub fn Map(comptime K: type, comptime V: type) type {
         // Insert
         // -------------------------------------------------------------------
 
+        /// Insert or overwrite `key`. Consumes the receiver reference and
+        /// returns the new owner; the key/value slots are BORROWED (the map
+        /// takes its own independent owner of each). Refcount-aware: on
+        /// rc==1 the existing buffer is mutated in place and the same
+        /// pointer is returned (the reference flows through); on rc>1 the
+        /// buffer is deep-retain cloned so any OTHER observer stays valid,
+        /// and the consumed incoming reference is released (see
+        /// `releaseConsumedMutationReceiver`). A caller that needs to keep
+        /// its own reference must `retain` before calling.
         pub fn put(map: ?*const Self, key: K, value: V) ?*const Self {
             const callsite = @returnAddress();
             if (comptime instrument_map) {
@@ -16085,7 +16280,9 @@ pub fn Map(comptime K: type, comptime V: type) type {
 
             const target_cap = pickCapacity(self.capacity, self.len + 1);
             const clone = cloneBufferRetainingChildren(self, target_cap, callsite) orelse return null;
-            return putInPlace(clone, key, value, callsite);
+            const result = putInPlace(clone, key, value, callsite);
+            releaseConsumedMutationReceiver(map);
+            return result;
         }
 
         fn putInPlace(target: *Self, key: K, value: V, callsite: u64) ?*const Self {
@@ -16229,6 +16426,14 @@ pub fn Map(comptime K: type, comptime V: type) type {
         // Delete (swap-remove + Robin Hood backshift)
         // -------------------------------------------------------------------
 
+        /// Remove `key` (a no-op when absent). Consumes the receiver
+        /// reference and returns the new owner. Refcount-aware: on rc==1
+        /// the existing buffer is mutated in place and the same pointer is
+        /// returned (the reference flows through); on rc>1 the buffer is
+        /// deep-retain cloned so any OTHER observer stays valid, and the
+        /// consumed incoming reference is released (see
+        /// `releaseConsumedMutationReceiver`). A caller that needs to keep
+        /// its own reference must `retain` before calling.
         pub fn delete(map: ?*const Self, key: K) ?*const Self {
             const callsite = @returnAddress();
             if (comptime instrument_map) {
@@ -16284,6 +16489,7 @@ pub fn Map(comptime K: type, comptime V: type) type {
             if (findEntry(clone, key)) |found_entry_idx| {
                 deleteFoundInPlace(clone, found_entry_idx);
             }
+            releaseConsumedMutationReceiver(map);
             return clone;
         }
 
@@ -16347,26 +16553,36 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 }
             }
 
-            // `Map.merge` CONSUMES BOTH operands: the codegen transfers
-            // ownership of `map_a` (slot 0, the `arc_liveness.ownedMutatingBuiltinSlot`
-            // receiver) AND `map_b` (slot 1, lowered with a `.move` arg-mode at
-            // last use) into the call and emits NO scope-exit drop for either,
-            // so `merge` itself must reclaim both. `map_a`'s ownership flows into
-            // the result (reused in place / moved when uniquely owned); `map_b`'s
-            // entries are folded in and then `map_b` is released. Each folded
-            // `map_b` entry is CLONE-ON-SHARED (`ownEntry*`) so the subsequent
-            // `release(map_b)` deep-frees `map_b`'s own inners without touching
-            // the result's copies — under `INDIVIDUAL_NO_REFCOUNT` +
-            // `CLONE_ON_SHARE` (`Memory.Tracking`) a bare retain would instead
-            // alias `map_b`'s boxed inner and the `release(map_b)` would free it
-            // out from under the result (`invalid free` / SEGFAULT — FU-31).
-            // Under REFCOUNTED the clone folds to a refcount bump and
-            // `release(map_b)` to the matching decrement.
+            // `Map.merge` CONSUMES BOTH operands on every path: the codegen
+            // transfers ownership of `map_a` (slot 0, the
+            // `arc_liveness.ownedMutatingBuiltinSlot` receiver) AND `map_b`
+            // (slot 1, `arc_liveness.alwaysConsumingBuiltinArg`) into the
+            // call — a last-use move or a manufactured independent owner
+            // when the caller keeps its source — and emits NO post-call
+            // release for either (verified against the post-drop-insertion
+            // IR of the monomorphized `lib/map.zap` merge wrapper), so
+            // `merge` itself must reclaim both. `map_a`'s ownership flows
+            // into the result (reused in place when uniquely owned;
+            // own-cloned and released when shared); `map_b`'s entries are
+            // folded in and then `map_b` is released
+            // (`releaseConsumedMergeOperand`). Each folded `map_b` entry is
+            // CLONE-ON-SHARED (`ownEntry*`) so the subsequent
+            // `release(map_b)` deep-frees `map_b`'s own inners without
+            // touching the result's copies — under `INDIVIDUAL_NO_REFCOUNT`
+            // + `CLONE_ON_SHARE` (`Memory.Tracking`) a bare retain would
+            // instead alias `map_b`'s boxed inner and the `release(map_b)`
+            // would free it out from under the result (`invalid free` /
+            // SEGFAULT — FU-31). Under REFCOUNTED the clone folds to a
+            // refcount bump and `release(map_b)` to the matching decrement.
             //
             // The prior implementation (`retain(map_a)` + a `put`-fold +
             // intermediate `release`) move-cloned the receiver then deep-freed
             // the just-cloned-from buffer, and bare-retained `map_b`'s values —
-            // both double-free classes under Tracking.
+            // both double-free classes under Tracking. A later revision
+            // borrowed both operands under REFCOUNTED (own-clone, no
+            // release) against the callsite's consume protocol, which
+            // orphaned one reference per operand per call — both operand
+            // buffers leaked on every merge.
             if (map_a == null and map_b == null) return null;
             // Single-operand arms. The result must UNIQUELY OWN the lone
             // operand's entries. Under `INDIVIDUAL_NO_REFCOUNT` the codegen
@@ -16375,8 +16591,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
             // reclaimed by `releaseConsumedMergeOperand` only after a clone,
             // since we cannot reuse `map_b`'s buffer (the loop below would have
             // grown it); for `map_a == null` we own-clone `map_b`. Under
-            // REFCOUNTED both operands are BORROWED (the caller releases them),
-            // so we always own-clone — never alias an operand the caller frees.
+            // REFCOUNTED the consumed `map_a` reference flows straight
+            // through as the result (any surviving observers are protected
+            // by COW at their next mutation); the consumed `map_b` is
+            // own-cloned into an independent result and then released.
             if (map_b == null) {
                 if (map_a.?.isIterCell()) {
                     const view = View.fromMapPtr(map_a.?);
@@ -16384,10 +16602,20 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     releaseConsumedCursorOperand(map_a);
                     return result;
                 }
-                if (comptime eager_individual_free) return map_a;
+                if (comptime eager_individual_free or reclamation_model == .refcounted) return map_a;
                 return cloneBufferOwningChildren(map_a.?, map_a.?.capacity, @returnAddress());
             }
             if (map_a == null) {
+                // Under REFCOUNTED the consumed `map_b` reference flows
+                // straight through as the result — the exact mirror of the
+                // `map_b == null` arm above (no mutation happens, so
+                // surviving observers are protected by COW at their next
+                // mutation). Under `INDIVIDUAL_NO_REFCOUNT` we own-clone and
+                // reclaim instead: `release(map_b)` poisons its eager
+                // inners, so the buffer cannot be handed onward.
+                if (comptime reclamation_model == .refcounted) {
+                    if (!map_b.?.isIterCell()) return map_b;
+                }
                 const only = if (map_b.?.isIterCell()) blk: {
                     const view = View.fromMapPtr(map_b.?);
                     break :blk materializeViewForTargetLen(view, view.len, @returnAddress());
@@ -16410,20 +16638,25 @@ pub fn Map(comptime K: type, comptime V: type) type {
             const target_len = combinedTargetLen(a_view.len, b_view.len);
             const target_cap = pickCapacity(if (a.isIterCell()) 0 else a.capacity, target_len);
 
-            // Establish the owned accumulator from `map_a`. The two reclamation
-            // models hand `map_a` to `merge` differently:
-            //   * `INDIVIDUAL_NO_REFCOUNT` (Tracking): the codegen MOVES `map_a`
-            //     into the call and does not drop it, so `merge` CONSUMES it —
-            //     reuse its buffer in place at capacity, else MOVE its entries
-            //     into the grown buffer (uniquely owned, no per-entry clone) and
-            //     free the old shallowly. (A shared map was already split into
-            //     per-owner buffers at its `cloneForShare` site, so a consumed
-            //     handle is sole-owner.)
-            //   * REFCOUNTED / BULK_OR_NEVER / TRACED: `map_a` is BORROWED (the
-            //     caller releases it), so `merge` must NOT reuse or free it —
-            //     OWN-clone its entries into an independent result (a refcount
-            //     bump per entry under REFCOUNTED; the caller's release balances
-            //     `map_a`'s own reference).
+            // Establish the owned accumulator from the CONSUMED `map_a`:
+            //   * `INDIVIDUAL_NO_REFCOUNT` (Tracking): a consumed handle is
+            //     sole-owner by construction (a shared map was already split
+            //     into per-owner buffers at its `cloneForShare` site), so
+            //     reuse its buffer in place at capacity, else MOVE its
+            //     entries into the grown buffer (uniquely owned, no
+            //     per-entry clone) and free the old shallowly.
+            //   * REFCOUNTED: refcount-aware, mirroring `putInner`. On
+            //     rc==1 the consumed reference is the sole owner — reuse the
+            //     buffer in place (or grow it, moving children verbatim and
+            //     freeing the old buffer shallowly; the +1 transfers to the
+            //     grown buffer). On rc>1 OWN-clone the entries (a refcount
+            //     bump per entry) into an independent accumulator and
+            //     release the consumed receiver reference
+            //     (`releaseConsumedMutationReceiver`) — the surviving
+            //     observers keep the source buffer alive, exactly the
+            //     `put`/`delete` shared-clone discipline.
+            //   * BULK_OR_NEVER / TRACED: no per-drop reclamation — OWN-clone
+            //     into an independent result and leave the operand alone.
             const result = blk: {
                 if (a.isIterCell()) {
                     const materialized = materializeViewOwningEntries(a_view, target_cap, @returnAddress()) orelse return null;
@@ -16437,16 +16670,28 @@ pub fn Map(comptime K: type, comptime V: type) type {
                     @constCast(a).bufferFreeShallow();
                     break :blk grown;
                 }
+                if (comptime reclamation_model == .refcounted) {
+                    if (a.header.count() == 1) {
+                        if (target_cap == a.capacity) break :blk @constCast(a);
+                        const grown = cloneBufferMovingChildren(a, target_cap, @returnAddress()) orelse return null;
+                        if (comptime instrument_map) mapInstrumentationOnRelease(@intFromPtr(a), a.len);
+                        @constCast(a).bufferFreeShallow();
+                        break :blk grown;
+                    }
+                    const owned = cloneBufferOwningChildren(a, target_cap, @returnAddress()) orelse return null;
+                    releaseConsumedMutationReceiver(map_a);
+                    break :blk owned;
+                }
                 break :blk cloneBufferOwningChildren(a, target_cap, @returnAddress()) orelse return null;
             };
 
             // Fold each `map_b` entry: clone-on-share its key/value into the
             // result (last-writer-wins on overlapping keys, deep-releasing the
-            // displaced value once). Then, under the no-refcount model only,
-            // reclaim the CONSUMED `map_b` (its inners are freed once; the
-            // folded copies are independent). Under REFCOUNTED `map_b` is
-            // borrowed and the caller releases it — `releaseConsumedMergeOperand`
-            // is a comptime no-op there.
+            // displaced value once). Then reclaim the CONSUMED `map_b`
+            // (`releaseConsumedMergeOperand`): under `INDIVIDUAL_NO_REFCOUNT`
+            // its inners are freed once (the folded copies are independent);
+            // under REFCOUNTED the moved-in reference is decremented, which
+            // the fold's per-entry `ownEntry*` bumps balance.
             foldBorrowedViewEntries(result, b_view);
             releaseConsumedMergeOperand(map_b);
             return result;
@@ -16559,9 +16804,17 @@ pub fn Map(comptime K: type, comptime V: type) type {
                 return map_a;
             }
             if (map_a == null) {
-                // No A to mutate; own an independent clone-on-share copy of the
-                // consumed B (rc=1), then reclaim the consumed `map_b` (no-refcount
-                // model only — see `releaseConsumedMergeOperand`).
+                // No A to mutate. Under REFCOUNTED the consumed `map_b`
+                // reference flows straight through as the result (no
+                // mutation happens; the checked `merge` arm is identical).
+                // Under `INDIVIDUAL_NO_REFCOUNT` own an independent
+                // clone-on-share copy of the consumed B (rc=1), then
+                // reclaim the consumed `map_b` (`releaseConsumedMergeOperand`
+                // poisons its eager inners, so the buffer cannot be handed
+                // onward there).
+                if (comptime reclamation_model == .refcounted) {
+                    if (!map_b.?.isIterCell()) return map_b;
+                }
                 const callsite = @returnAddress();
                 const only = if (map_b.?.isIterCell()) blk: {
                     const view = View.fromMapPtr(map_b.?);
@@ -16605,8 +16858,10 @@ pub fn Map(comptime K: type, comptime V: type) type {
             }
 
             // Fold each entry of the CONSUMED `map_b` (clone-on-share into the
-            // result), then reclaim `map_b` (no-refcount model only — see
-            // `releaseConsumedMergeOperand`) so its own inners are freed once.
+            // result), then reclaim `map_b` (`releaseConsumedMergeOperand`):
+            // under `INDIVIDUAL_NO_REFCOUNT` its own inners are freed once;
+            // under REFCOUNTED the moved-in reference is decremented, which
+            // the fold's per-entry `ownEntry*` bumps balance.
             foldBorrowedViewEntries(result, b_view);
             releaseConsumedMergeOperand(map_b);
             return result;
@@ -21549,50 +21804,58 @@ test "instrumentation: S — never shared" {
     if (!comptime instrument_map) return;
     const MapI64 = Map(i64, i64);
     const before_id = mapInstrumentationLastInstanceId();
-    const m_initial = MapI64.put(null, 1, 100) orelse {
+    // Never-shared chain under the consume protocol: `put` consumes its
+    // receiver reference (see `releaseConsumedMutationReceiver`) and on
+    // rc==1 mutates the buffer in place, flowing the same reference
+    // through as the result — so the chain simply rebinds `m` with NO
+    // intermediate release (the borrow-era `release(m)` after each put
+    // would now over-release the moved-in reference and free the live
+    // cell). Only the final owner releases.
+    var m: ?*const MapI64 = MapI64.put(null, 1, 100) orelse {
         try std.testing.expect(false);
         return;
     };
-    var m: ?*const MapI64 = m_initial;
     var k: i64 = 2;
     while (k <= 5) : (k += 1) {
-        const next_m = MapI64.put(m, k, k * 100) orelse {
+        m = MapI64.put(m, k, k * 100) orelse {
             try std.testing.expect(false);
             return;
         };
-        MapI64.release(m);
-        m = next_m;
     }
-    // First derived id is `before_id + 1`. We re-resolve via a probe:
-    // the initial allocation registered exactly one instance with the
-    // first-allocated cell pointer, which became the parent for the
-    // four follow-up `put` calls. Releasing m releases the chain head.
     MapI64.release(m);
 
-    // Walk the finalised list looking for the chain we just produced
-    // (lineage_id was assigned to the first allocation; every put
-    // inherited it via the parent context). We expect 5 records (one
-    // per allocation), all class S with peak_strong_count = 1.
+    // The rc==1 in-place fast path keeps the chain on ONE cell: the
+    // initial allocation (capacity `DENSE_MAP_INITIAL_CAPACITY` = 8 at
+    // load factor 7/8 holds all five entries) absorbs every follow-up
+    // put with no resize and no derived allocation. We therefore expect
+    // exactly one finalised record: never shared (class S,
+    // peak_strong_count = 1), four receiver `put` bumps (the null-
+    // receiver initial put has no receiver to bump), no reads, no
+    // parent, five entries at release.
+    var records_seen: u32 = 0;
     var saw_first: bool = false;
-    var seen_class_S: u32 = 0;
     var puts_on_first: u32 = 0;
     var gets_on_first: u32 = 0;
+    var size_at_release_on_first: u32 = 0;
     for (instrumentation_state.finalised.items) |rec| {
         if (rec.instance_id <= before_id) continue;
+        records_seen += 1;
         try std.testing.expectEqual(@as(u32, 1), rec.peak_strong_count);
-        if (rec.class == 'S') seen_class_S += 1;
+        try std.testing.expectEqual(@as(u8, 'S'), rec.class);
+        try std.testing.expect(!rec.had_share_event);
+        try std.testing.expect(!rec.had_post_share_mutation);
         if (!saw_first and rec.parent_instance_id == 0) {
             saw_first = true;
             puts_on_first = rec.puts;
             gets_on_first = rec.gets;
+            size_at_release_on_first = rec.size_at_release;
         }
     }
-    try std.testing.expect(seen_class_S >= 5);
+    try std.testing.expectEqual(@as(u32, 1), records_seen);
     try std.testing.expect(saw_first);
-    // The first map had four `put` calls applied to it (the chain
-    // wraps it four times before the final release).
-    try std.testing.expectEqual(@as(u32, 1), puts_on_first);
+    try std.testing.expectEqual(@as(u32, 4), puts_on_first);
     try std.testing.expectEqual(@as(u32, 0), gets_on_first);
+    try std.testing.expectEqual(@as(u32, 5), size_at_release_on_first);
 }
 
 test "instrumentation: W — shared but never post-share-mutated" {
@@ -21637,8 +21900,11 @@ test "instrumentation: V — shared and post-share-mutated" {
     // Share — refcount goes 1 → 2 — `had_share_event` flips on.
     _ = MapI64.retain(original);
 
-    // Mutate while still shared. `put` allocates a fresh derived map.
-    const derived = MapI64.put(original, 2, 200) orelse {
+    // Mutate while still shared. `put` allocates a fresh derived map and
+    // consumes its receiver reference (see
+    // `releaseConsumedMutationReceiver`), so hand it an independent owner
+    // — the test's own two `original` releases below stay balanced.
+    const derived = MapI64.put(MapI64.retain(original), 2, 200) orelse {
         try std.testing.expect(false);
         return;
     };
@@ -21737,7 +22003,11 @@ test "List(i64) set on rc>1 buffer clones; original stays unchanged" {
     const shared = ListI64.retain(original);
     defer ListI64.release(shared);
 
-    const updated = ListI64.set(original, 1, 99) orelse {
+    // `set` consumes its receiver reference (see
+    // `releaseConsumedMutationReceiver`); hand it an independent owner so
+    // the test's own `original` reference (released by the defer above)
+    // stays valid for the preservation assertions below.
+    const updated = ListI64.set(ListI64.retain(original), 1, 99) orelse {
         try std.testing.expect(false);
         return;
     };
@@ -22310,23 +22580,29 @@ test "ListIter: cursor-backed state supports List transforms and materializing m
     try std.testing.expectEqual(@as(i64, 20), ListI64.get(flattened, 1));
     try std.testing.expectEqual(@as(i64, 40), ListI64.get(flattened, 5));
 
-    const set_result = ListI64.set(cursor, 1, 99) orelse return error.TestUnexpectedResult;
+    // The checked mutating builtins consume their receiver reference —
+    // for a cursor-backed receiver the iter branch materializes the view
+    // and releases the consumed cursor reference (see
+    // `releaseConsumedCursorOperand`). The test keeps its own `cursor`
+    // handle for the defer above and later calls, so hand each builtin
+    // an independent owner.
+    const set_result = ListI64.set(ListI64.retain(cursor), 1, 99) orelse return error.TestUnexpectedResult;
     defer ListI64.release(set_result);
     try std.testing.expectEqual(@as(i64, 2), ListI64.get(set_result, 0));
     try std.testing.expectEqual(@as(i64, 99), ListI64.get(set_result, 1));
     try std.testing.expectEqual(@as(i64, 3), ListI64.get(cursor, 1));
 
-    const pushed = ListI64.push(cursor, 8) orelse return error.TestUnexpectedResult;
+    const pushed = ListI64.push(ListI64.retain(cursor), 8) orelse return error.TestUnexpectedResult;
     defer ListI64.release(pushed);
     try std.testing.expectEqual(@as(i64, 4), ListI64.length(pushed));
     try std.testing.expectEqual(@as(i64, 8), ListI64.last(pushed));
 
-    const popped = ListI64.pop(cursor) orelse return error.TestUnexpectedResult;
+    const popped = ListI64.pop(ListI64.retain(cursor)) orelse return error.TestUnexpectedResult;
     defer ListI64.release(popped);
     try std.testing.expectEqual(@as(i64, 2), ListI64.length(popped));
     try std.testing.expectEqual(@as(i64, 3), ListI64.last(popped));
 
-    const appended = ListI64.append(cursor, filtered) orelse return error.TestUnexpectedResult;
+    const appended = ListI64.append(ListI64.retain(cursor), filtered) orelse return error.TestUnexpectedResult;
     defer ListI64.release(appended);
     try std.testing.expectEqual(@as(i64, 5), ListI64.length(appended));
     try std.testing.expectEqual(@as(i64, 2), ListI64.get(appended, 3));
@@ -22351,6 +22627,79 @@ test "ListIter: cursor-backed state supports List transforms and materializing m
     try std.testing.expectEqual(@as(i64, 2), ListI64.length(owned_slice));
     try std.testing.expectEqual(@as(i64, 3), ListI64.get(owned_slice, 0));
     try std.testing.expectEqual(@as(i64, 4), ListI64.get(owned_slice, 1));
+}
+
+test "ListIter: checked mutating builtins consume the cursor reference" {
+    // Pins the consume contract for cursor-backed receivers of the
+    // checked owned-mutating builtins (`set`/`push`/`pop`/`append`)
+    // under the refcounted model: each call moves the cursor's only
+    // reference into the builtin, which must free the iter cell
+    // (`list_iter_free_total`) and drop the cursor's +1 on the source
+    // list (see `releaseConsumedCursorOperand`). Before that helper
+    // fired under REFCOUNTED, every such call orphaned the iter cell
+    // and pinned the source buffer forever — an `Enumerable.next`
+    // state fed to `List.set` in a loop leaked the whole source list
+    // per iteration.
+    const ListI64 = List(i64);
+    var values: ?*const ListI64 = ListI64.new_empty(4) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 1) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 2) orelse return error.OutOfMemory;
+    values = ListI64.push(values, 3) orelse return error.OutOfMemory;
+    defer ListI64.release(values);
+
+    const refcount_before = values.?.header.count();
+    const iter_allocs_before = list_iter_alloc_total;
+    const iter_frees_before = list_iter_free_total;
+
+    {
+        const first = ListI64.next(ListI64.retain(values));
+        try std.testing.expectEqual(ATOM_CONT, first.@"0");
+        const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(refcount_before + 1, values.?.header.count());
+        const set_result = ListI64.set(cursor, 0, 99) orelse return error.TestUnexpectedResult;
+        defer ListI64.release(set_result);
+        try std.testing.expectEqual(refcount_before, values.?.header.count());
+        try std.testing.expectEqual(@as(i64, 99), ListI64.get(set_result, 0));
+        try std.testing.expectEqual(@as(i64, 3), ListI64.get(set_result, 1));
+    }
+
+    {
+        const first = ListI64.next(ListI64.retain(values));
+        try std.testing.expectEqual(ATOM_CONT, first.@"0");
+        const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+        const push_result = ListI64.push(cursor, 8) orelse return error.TestUnexpectedResult;
+        defer ListI64.release(push_result);
+        try std.testing.expectEqual(refcount_before, values.?.header.count());
+        try std.testing.expectEqual(@as(i64, 3), ListI64.length(push_result));
+        try std.testing.expectEqual(@as(i64, 8), ListI64.last(push_result));
+    }
+
+    {
+        const first = ListI64.next(ListI64.retain(values));
+        try std.testing.expectEqual(ATOM_CONT, first.@"0");
+        const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+        const pop_result = ListI64.pop(cursor) orelse return error.TestUnexpectedResult;
+        defer ListI64.release(pop_result);
+        try std.testing.expectEqual(refcount_before, values.?.header.count());
+        try std.testing.expectEqual(@as(i64, 1), ListI64.length(pop_result));
+        try std.testing.expectEqual(@as(i64, 2), ListI64.get(pop_result, 0));
+    }
+
+    {
+        const first = ListI64.next(ListI64.retain(values));
+        try std.testing.expectEqual(ATOM_CONT, first.@"0");
+        const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+        // `append` borrows its second operand; only the cursor receiver
+        // is consumed.
+        const append_result = ListI64.append(cursor, values) orelse return error.TestUnexpectedResult;
+        defer ListI64.release(append_result);
+        try std.testing.expectEqual(refcount_before, values.?.header.count());
+        try std.testing.expectEqual(@as(i64, 5), ListI64.length(append_result));
+        try std.testing.expectEqual(@as(i64, 1), ListI64.get(append_result, 2));
+    }
+
+    try std.testing.expectEqual(@as(u64, 4), list_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 4), list_iter_free_total - iter_frees_before);
 }
 
 test "listSum bridge dispatches to concrete List(i64) sum" {
@@ -22590,7 +22939,12 @@ test "List(?*const Map) set on shared buffer preserves original ARC elements" {
     var shared: ?*const Helpers.ListMap = Helpers.ListMap.retain(original);
     defer if (shared) |list| Helpers.ListMap.release(list);
 
-    var updated: ?*const Helpers.ListMap = Helpers.ListMap.set(original, 0, replacement) orelse @panic("test list set failed");
+    // `set` consumes its receiver reference (see
+    // `releaseConsumedMutationReceiver`); hand it an independent owner —
+    // the same "independent COW owner" protocol the compiler emits via
+    // `arc_ownership.rewriteOwnedConsumeBuiltinSites` — so `original`
+    // keeps its own reference for the preservation assertions below.
+    var updated: ?*const Helpers.ListMap = Helpers.ListMap.set(Helpers.ListMap.retain(original), 0, replacement) orelse @panic("test list set failed");
     defer if (updated) |list| Helpers.ListMap.release(list);
 
     try std.testing.expect(@intFromPtr(updated.?) != @intFromPtr(original.?));
@@ -22606,7 +22960,9 @@ test "List(?*const Map) set on shared buffer preserves original ARC elements" {
     Helpers.ListMap.release(updated);
     updated = null;
 
-    try std.testing.expectEqual(before_releases + 12, arc_releases_total);
+    // +13: the original 12 releases plus `set`'s internal release of the
+    // consumed receiver reference on the shared-clone path.
+    try std.testing.expectEqual(before_releases + 13, arc_releases_total);
 }
 
 test "List higher-order helpers pass owned ARC elements to callbacks" {
@@ -23506,9 +23862,10 @@ test "Map(i64,i64) merge_owned_unchecked folds B into A in place" {
         try std.testing.expect(false);
         return;
     };
-    // `merge_owned_unchecked` consumes `map_a` (mutated in place) but BORROWS
-    // `map_b` under the host REFCOUNTED manager (the caller releases `b`).
-    defer MapI64.release(b);
+    // `merge_owned_unchecked` consumes BOTH operands: `map_a` is mutated
+    // in place (its reference flows through to the result) and the folded
+    // `map_b` reference is released by the runtime itself (see
+    // `releaseConsumedMergeOperand`) — the test must not release `b`.
 
     const a_ptr = @intFromPtr(a);
     const after = MapI64.merge_owned_unchecked(a, b).?;
@@ -23530,20 +23887,18 @@ test "Map(i64,i64) merge_owned_unchecked semantics match checked merge on rc=1 i
     const keys_b = [_]i64{ 2, 3 };
     const vals_b = [_]i64{ 99, 30 };
 
-    // Under the host REFCOUNTED manager, checked `merge` BORROWS both operands
-    // (caller releases both `a_checked` and `b_checked`); `merge_owned_unchecked`
-    // consumes `a_unchecked` (mutated in place — not released by the caller) but
-    // BORROWS `b_unchecked` (caller releases it).
+    // Both variants CONSUME both operands (the compiler's merge callsite
+    // protocol — see `arc_liveness.alwaysConsumingBuiltinArg`): on rc==1
+    // inputs the receiver's reference flows through to the result and the
+    // right operand is folded and released by the runtime. The caller
+    // releases only the merged result.
     const a_checked = MapI64.fromPairs(&keys_a, &vals_a, 2).?;
     const b_checked = MapI64.fromPairs(&keys_b, &vals_b, 2).?;
-    defer MapI64.release(b_checked);
     const merged_checked = MapI64.merge(a_checked, b_checked).?;
     defer MapI64.release(merged_checked);
-    MapI64.release(a_checked);
 
     const a_unchecked = MapI64.fromPairs(&keys_a, &vals_a, 2).?;
     const b_unchecked = MapI64.fromPairs(&keys_b, &vals_b, 2).?;
-    defer MapI64.release(b_unchecked);
     const merged_unchecked = MapI64.merge_owned_unchecked(a_unchecked, b_unchecked).?;
     defer MapI64.release(merged_unchecked);
 
@@ -23563,6 +23918,256 @@ test "Map(i64,i64) put_owned_unchecked on null receiver allocates a fresh map" {
     try std.testing.expectEqual(@as(i64, 1), MapI64.size(m));
     try std.testing.expectEqual(@as(i64, 100), MapI64.get(m, 42, 0));
     try std.testing.expectEqual(@as(u32, 1), m.header.count());
+}
+
+test "Map(i64,i64) put on shared buffer preserves original entries" {
+    const MapI64 = Map(i64, i64);
+    const keys = [_]i64{ 1, 2 };
+    const vals = [_]i64{ 10, 20 };
+    const original = MapI64.fromPairs(&keys, &vals, 2) orelse @panic("test map allocation failed");
+    defer MapI64.release(original);
+
+    // Bump refcount; now `put` must COW instead of mutating in place.
+    const shared = MapI64.retain(original);
+    defer MapI64.release(shared);
+
+    // `put` consumes its receiver reference (see
+    // `releaseConsumedMutationReceiver`); hand it an independent owner —
+    // the same "independent COW owner" protocol the compiler emits via
+    // `arc_ownership.rewriteOwnedConsumeBuiltinSites` — so the test's own
+    // `original` reference (released by the defer above) stays valid for
+    // the preservation assertions below.
+    const updated = MapI64.put(MapI64.retain(original), 3, 30) orelse @panic("test map put failed");
+    defer MapI64.release(updated);
+
+    try std.testing.expect(@intFromPtr(updated) != @intFromPtr(original));
+    // Original unchanged: still two entries, key 3 absent.
+    try std.testing.expectEqual(@as(i64, 2), MapI64.size(original));
+    try std.testing.expectEqual(@as(i64, -1), MapI64.get(original, 3, -1));
+    try std.testing.expectEqual(@as(i64, 10), MapI64.get(original, 1, 0));
+    // Updated carries the original entries plus the inserted one.
+    try std.testing.expectEqual(@as(i64, 3), MapI64.size(updated));
+    try std.testing.expectEqual(@as(i64, 30), MapI64.get(updated, 3, 0));
+    try std.testing.expectEqual(@as(i64, 20), MapI64.get(updated, 2, 0));
+}
+
+test "Map(i64,i64) delete on shared buffer preserves original entries" {
+    const MapI64 = Map(i64, i64);
+    const keys = [_]i64{ 1, 2, 3 };
+    const vals = [_]i64{ 10, 20, 30 };
+    const original = MapI64.fromPairs(&keys, &vals, 3) orelse @panic("test map allocation failed");
+    defer MapI64.release(original);
+
+    const shared = MapI64.retain(original);
+    defer MapI64.release(shared);
+
+    // `delete` consumes its receiver reference on the shared-clone path
+    // (see `releaseConsumedMutationReceiver`); hand it an independent
+    // owner so `original` keeps its own reference.
+    const updated = MapI64.delete(MapI64.retain(original), 2) orelse @panic("test map delete failed");
+    defer MapI64.release(updated);
+
+    try std.testing.expect(@intFromPtr(updated) != @intFromPtr(original));
+    // Original unchanged: key 2 still present.
+    try std.testing.expectEqual(@as(i64, 3), MapI64.size(original));
+    try std.testing.expectEqual(@as(i64, 20), MapI64.get(original, 2, 0));
+    // Updated dropped key 2, kept the rest.
+    try std.testing.expectEqual(@as(i64, 2), MapI64.size(updated));
+    try std.testing.expectEqual(@as(i64, -1), MapI64.get(updated, 2, -1));
+    try std.testing.expectEqual(@as(i64, 30), MapI64.get(updated, 3, 0));
+}
+
+test "Map(i64,i64) shared-clone put releases exactly one consumed receiver reference" {
+    const MapI64 = Map(i64, i64);
+    const before_releases = arc_releases_total;
+
+    const keys = [_]i64{ 1, 2 };
+    const vals = [_]i64{ 10, 20 };
+    var original: ?*const MapI64 = MapI64.fromPairs(&keys, &vals, 2) orelse @panic("test map allocation failed");
+    var shared: ?*const MapI64 = MapI64.retain(original);
+    var updated: ?*const MapI64 = MapI64.put(MapI64.retain(original), 3, 30) orelse @panic("test map put failed");
+
+    MapI64.release(updated);
+    updated = null;
+    MapI64.release(shared);
+    shared = null;
+    MapI64.release(original);
+    original = null;
+
+    // +4: the test's own three releases plus `put`'s internal release of
+    // the consumed receiver reference on the shared-clone path. Without
+    // the internal release the consumed +1 is orphaned and the original
+    // buffer never reaches its zero-transition (one leaked map per
+    // shared-receiver mutation).
+    try std.testing.expectEqual(before_releases + 4, arc_releases_total);
+}
+
+test "Map(u32,?*const Map) put on shared buffer preserves original nested values" {
+    const Helpers = struct {
+        const InnerMap = Map(u32, i64);
+        const OuterMap = Map(u32, ?*const InnerMap);
+
+        fn newInner(seed: u32) ?*const InnerMap {
+            const keys = [_]u32{seed};
+            const values = [_]i64{@as(i64, seed) * 10};
+            return InnerMap.fromPairs(&keys, &values, 1);
+        }
+
+        fn expectValue(outer: ?*const OuterMap, key: u32, expected: *const InnerMap) !void {
+            const actual = OuterMap.get(outer, key, null) orelse @panic("expected nested map value");
+            defer InnerMap.release(actual);
+            try std.testing.expectEqual(@intFromPtr(expected), @intFromPtr(actual));
+        }
+    };
+
+    const inner_one = Helpers.newInner(1) orelse @panic("test map allocation failed");
+    const inner_two = Helpers.newInner(2) orelse @panic("test map allocation failed");
+    const replacement = Helpers.newInner(9) orelse @panic("test map allocation failed");
+
+    var original: ?*const Helpers.OuterMap = Helpers.OuterMap.put(null, 1, inner_one) orelse @panic("test map put failed");
+    defer if (original) |map_ptr| Helpers.OuterMap.release(map_ptr);
+    original = Helpers.OuterMap.put(original, 2, inner_two) orelse @panic("test map put failed");
+    Helpers.InnerMap.release(inner_one);
+    Helpers.InnerMap.release(inner_two);
+
+    const shared = Helpers.OuterMap.retain(original);
+    defer Helpers.OuterMap.release(shared);
+
+    // Consume protocol: hand `put` an independent receiver owner.
+    const updated = Helpers.OuterMap.put(Helpers.OuterMap.retain(original), 1, replacement) orelse @panic("test map put failed");
+    defer Helpers.OuterMap.release(updated);
+    Helpers.InnerMap.release(replacement);
+
+    try std.testing.expect(@intFromPtr(updated) != @intFromPtr(original.?));
+    try Helpers.expectValue(original, 1, inner_one);
+    try Helpers.expectValue(original, 2, inner_two);
+    try Helpers.expectValue(updated, 1, replacement);
+    try Helpers.expectValue(updated, 2, inner_two);
+}
+
+test "Map(i64,i64) merge on shared operands releases exactly one reference per operand" {
+    const MapI64 = Map(i64, i64);
+    const before_releases = arc_releases_total;
+
+    const keys_a = [_]i64{ 1, 2 };
+    const vals_a = [_]i64{ 10, 20 };
+    const keys_b = [_]i64{ 3, 4 };
+    const vals_b = [_]i64{ 30, 40 };
+    var a: ?*const MapI64 = MapI64.fromPairs(&keys_a, &vals_a, 2) orelse @panic("test map allocation failed");
+    var b: ?*const MapI64 = MapI64.fromPairs(&keys_b, &vals_b, 2) orelse @panic("test map allocation failed");
+
+    // `merge` consumes BOTH operand references (the compiler moves a
+    // manufactured independent owner into each slot and emits no
+    // post-call release — see `arc_ownership.rewriteOwnedConsumeBuiltinSites`
+    // and `arc_liveness.alwaysConsumingBuiltinArg`). The test keeps its
+    // own handles, so it hands `merge` independent owners.
+    var merged: ?*const MapI64 = MapI64.merge(MapI64.retain(a), MapI64.retain(b)) orelse @panic("test map merge failed");
+
+    // Both source maps stay intact for their surviving owners.
+    try std.testing.expectEqual(@as(i64, 2), MapI64.size(a));
+    try std.testing.expectEqual(@as(i64, 2), MapI64.size(b));
+    try std.testing.expectEqual(@as(i64, 4), MapI64.size(merged));
+    try std.testing.expectEqual(@as(i64, 10), MapI64.get(merged, 1, 0));
+    try std.testing.expectEqual(@as(i64, 40), MapI64.get(merged, 4, 0));
+
+    MapI64.release(merged);
+    merged = null;
+    MapI64.release(a);
+    a = null;
+    MapI64.release(b);
+    b = null;
+
+    // +5: the test's own three releases plus `merge`'s internal release
+    // of each consumed operand reference (one for the shared receiver on
+    // the own-clone path, one for the folded right operand). Without them
+    // both operand buffers leak on every merge of kept-alive sources.
+    try std.testing.expectEqual(before_releases + 5, arc_releases_total);
+}
+
+test "Map(i64,i64) merge with uniquely-owned receiver folds in place and consumes the right operand" {
+    const MapI64 = Map(i64, i64);
+    const before_releases = arc_releases_total;
+
+    const keys_a = [_]i64{ 1, 2 };
+    const vals_a = [_]i64{ 10, 20 };
+    const keys_b = [_]i64{ 2, 3 };
+    const vals_b = [_]i64{ 99, 30 };
+    const a = MapI64.fromPairs(&keys_a, &vals_a, 2) orelse @panic("test map allocation failed");
+    const b = MapI64.fromPairs(&keys_b, &vals_b, 2) orelse @panic("test map allocation failed");
+    const a_ptr = @intFromPtr(a);
+
+    // Both operands are passed at last use (moved in, rc == 1): the
+    // receiver's buffer is reused in place and the right operand is
+    // folded and reclaimed by `merge` itself.
+    var merged: ?*const MapI64 = MapI64.merge(a, b) orelse @panic("test map merge failed");
+
+    // rc==1 fast path: A had capacity for the fold, so the result IS A's
+    // buffer — no allocation, the consumed reference flowed through.
+    try std.testing.expectEqual(a_ptr, @intFromPtr(merged.?));
+    try std.testing.expectEqual(@as(i64, 3), MapI64.size(merged));
+    // B overrides A on the overlapping key.
+    try std.testing.expectEqual(@as(i64, 99), MapI64.get(merged, 2, 0));
+    try std.testing.expectEqual(@as(i64, 30), MapI64.get(merged, 3, 0));
+
+    MapI64.release(merged);
+    merged = null;
+
+    // +2: the test's release of the merged result plus `merge`'s internal
+    // release of the consumed right operand (which hits its
+    // zero-transition and frees B's buffer).
+    try std.testing.expectEqual(before_releases + 2, arc_releases_total);
+}
+
+test "Map(i64,i64) merge with null right operand flows the consumed receiver through" {
+    const MapI64 = Map(i64, i64);
+    const before_releases = arc_releases_total;
+
+    const keys = [_]i64{ 1, 2 };
+    const vals = [_]i64{ 10, 20 };
+    const a = MapI64.fromPairs(&keys, &vals, 2) orelse @panic("test map allocation failed");
+    const a_ptr = @intFromPtr(a);
+
+    // `merge(a, %{})` with the receiver at last use: the consumed
+    // reference IS the result — no clone, no internal release.
+    var merged: ?*const MapI64 = MapI64.merge(a, null) orelse @panic("test map merge failed");
+    try std.testing.expectEqual(a_ptr, @intFromPtr(merged.?));
+    try std.testing.expectEqual(@as(i64, 2), MapI64.size(merged));
+
+    MapI64.release(merged);
+    merged = null;
+
+    // +1: only the test's own release — the flow-through path performs
+    // no internal retain/release.
+    try std.testing.expectEqual(before_releases + 1, arc_releases_total);
+}
+
+test "Map(i64,i64) merge with null receiver flows the consumed right operand through" {
+    const MapI64 = Map(i64, i64);
+    const before_releases = arc_releases_total;
+
+    const keys = [_]i64{ 3, 4 };
+    const vals = [_]i64{ 30, 40 };
+    var b: ?*const MapI64 = MapI64.fromPairs(&keys, &vals, 2) orelse @panic("test map allocation failed");
+
+    // The caller keeps `b`, so it hands `merge` an independent owner;
+    // `merge(%{}, b)` performs no mutation, so the consumed reference IS
+    // the result (the exact mirror of the null-right-operand arm) — the
+    // surviving `b` owner is protected by COW at its next mutation.
+    var merged: ?*const MapI64 = MapI64.merge(null, MapI64.retain(b)) orelse @panic("test map merge failed");
+
+    try std.testing.expectEqual(@intFromPtr(b.?), @intFromPtr(merged.?));
+    try std.testing.expectEqual(@as(i64, 2), MapI64.size(merged));
+    try std.testing.expectEqual(@as(i64, 40), MapI64.get(merged, 4, 0));
+
+    MapI64.release(merged);
+    merged = null;
+    MapI64.release(b);
+    b = null;
+
+    // +2: only the test's own two releases — the flow-through path
+    // performs no internal retain/release, and the second release hits
+    // the zero-transition that frees the shared buffer exactly once.
+    try std.testing.expectEqual(before_releases + 2, arc_releases_total);
 }
 
 // ============================================================
@@ -24246,7 +24851,13 @@ test "MapIter: cursor-backed state supports checked materializing mutations" {
     defer M.release(cursor);
     try std.testing.expectEqual(refcount_before + 1, src.header.count());
 
-    const inserted = M.put(cursor, 5, 50) orelse return error.TestUnexpectedResult;
+    // The checked mutating builtins consume their receiver reference —
+    // for a cursor-backed receiver the iter branch materializes the view
+    // and releases the consumed cursor reference (see
+    // `releaseConsumedCursorOperand`). The test keeps its own `cursor`
+    // handle for the defer above and later calls, so hand each builtin
+    // an independent owner.
+    const inserted = M.put(M.retain(cursor), 5, 50) orelse return error.TestUnexpectedResult;
     defer M.release(inserted);
     try std.testing.expectEqual(@as(i64, 4), M.size(inserted));
     try std.testing.expect(!M.hasKey(inserted, 1));
@@ -24254,13 +24865,13 @@ test "MapIter: cursor-backed state supports checked materializing mutations" {
     try std.testing.expect(M.hasKey(inserted, 5));
     try std.testing.expectEqual(@as(i64, 50), M.get(inserted, 5, -1));
 
-    const overwritten = M.put(cursor, 2, 200) orelse return error.TestUnexpectedResult;
+    const overwritten = M.put(M.retain(cursor), 2, 200) orelse return error.TestUnexpectedResult;
     defer M.release(overwritten);
     try std.testing.expectEqual(@as(i64, 3), M.size(overwritten));
     try std.testing.expectEqual(@as(i64, 200), M.get(overwritten, 2, -1));
     try std.testing.expectEqual(@as(i64, 20), M.get(cursor, 2, -1));
 
-    const deleted = M.delete(cursor, 3) orelse return error.TestUnexpectedResult;
+    const deleted = M.delete(M.retain(cursor), 3) orelse return error.TestUnexpectedResult;
     defer M.release(deleted);
     try std.testing.expectEqual(@as(i64, 2), M.size(deleted));
     try std.testing.expect(M.hasKey(deleted, 2));
@@ -24272,7 +24883,12 @@ test "MapIter: cursor-backed state supports checked materializing mutations" {
     const other = M.fromPairs(&other_keys, &other_values, 2) orelse @panic("map alloc");
     defer M.release(other);
 
-    const merged = M.merge(cursor, other) orelse return error.TestUnexpectedResult;
+    // `merge` consumes BOTH operands (see `releaseConsumedCursorOperand`
+    // for the cursor-backed receiver and `releaseConsumedMergeOperand`
+    // for the right operand); the test keeps its own `cursor` and
+    // `other` handles for the defers above, so hand merge independent
+    // owners of each.
+    const merged = M.merge(M.retain(cursor), M.retain(other)) orelse return error.TestUnexpectedResult;
     defer M.release(merged);
     try std.testing.expectEqual(@as(i64, 4), M.size(merged));
     try std.testing.expect(!M.hasKey(merged, 1));
@@ -24283,6 +24899,83 @@ test "MapIter: cursor-backed state supports checked materializing mutations" {
 
     try std.testing.expect(M.hasKey(src, 1));
     try std.testing.expect(!M.hasKey(src, 5));
+}
+
+test "MapIter: checked mutating builtins consume the cursor reference" {
+    // Pins the consume contract for cursor-backed receivers of the
+    // checked owned-mutating builtins (`put`/`delete`/`merge`) under
+    // the refcounted model: each call moves the cursor's only
+    // reference into the builtin, which must free the iter cell
+    // (`dense_map_iter_free_total`) and drop the cursor's +1 on the
+    // source map (see `releaseConsumedCursorOperand`). Before that
+    // helper fired under REFCOUNTED, every such call orphaned the iter
+    // cell and pinned the source buffer forever — an `Enumerable.next`
+    // state fed to `Map.put` in a loop leaked the whole source map per
+    // iteration.
+    const M = Map(i64, i64);
+    const keys = [_]i64{ 1, 2, 3 };
+    const values = [_]i64{ 10, 20, 30 };
+    const src = M.fromPairs(&keys, &values, 3) orelse @panic("map alloc");
+    defer M.release(src);
+
+    const refcount_before = src.header.count();
+    const iter_allocs_before = dense_map_iter_alloc_total;
+    const iter_frees_before = dense_map_iter_free_total;
+
+    {
+        const first = M.next(M.retain(src));
+        try std.testing.expectEqual(ATOM_CONT, first.@"0");
+        const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(refcount_before + 1, src.header.count());
+        const put_result = M.put(cursor, 9, 90) orelse return error.TestUnexpectedResult;
+        defer M.release(put_result);
+        try std.testing.expectEqual(refcount_before, src.header.count());
+        try std.testing.expectEqual(@as(i64, 3), M.size(put_result));
+        try std.testing.expectEqual(@as(i64, 90), M.get(put_result, 9, -1));
+    }
+
+    {
+        const first = M.next(M.retain(src));
+        try std.testing.expectEqual(ATOM_CONT, first.@"0");
+        const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+        // The first-yielded entry is seed-dependent, so only assert the
+        // deleted key is absent (a no-op delete when the cursor already
+        // consumed it still exercises the consume path).
+        const delete_result = M.delete(cursor, 2) orelse return error.TestUnexpectedResult;
+        defer M.release(delete_result);
+        try std.testing.expectEqual(refcount_before, src.header.count());
+        try std.testing.expect(!M.hasKey(delete_result, 2));
+    }
+
+    {
+        const first = M.next(M.retain(src));
+        try std.testing.expectEqual(ATOM_CONT, first.@"0");
+        const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+        // Main merge path: the cursor receiver AND the right operand are
+        // both consumed; `other` is handed over without keeping a handle.
+        const other_keys = [_]i64{ 7, 8 };
+        const other_values = [_]i64{ 70, 80 };
+        const other = M.fromPairs(&other_keys, &other_values, 2) orelse @panic("map alloc");
+        const merge_result = M.merge(cursor, other) orelse return error.TestUnexpectedResult;
+        defer M.release(merge_result);
+        try std.testing.expectEqual(refcount_before, src.header.count());
+        try std.testing.expectEqual(@as(i64, 4), M.size(merge_result));
+        try std.testing.expectEqual(@as(i64, 70), M.get(merge_result, 7, -1));
+    }
+
+    {
+        const first = M.next(M.retain(src));
+        try std.testing.expectEqual(ATOM_CONT, first.@"0");
+        const cursor = first.@"2" orelse return error.TestUnexpectedResult;
+        // The `map_b == null` arm has its own cursor-consume site.
+        const merge_null_result = M.merge(cursor, null) orelse return error.TestUnexpectedResult;
+        defer M.release(merge_null_result);
+        try std.testing.expectEqual(refcount_before, src.header.count());
+        try std.testing.expectEqual(@as(i64, 2), M.size(merge_null_result));
+    }
+
+    try std.testing.expectEqual(@as(u64, 4), dense_map_iter_alloc_total - iter_allocs_before);
+    try std.testing.expectEqual(@as(u64, 4), dense_map_iter_free_total - iter_frees_before);
 }
 
 test "MapIter: owned unchecked cursor mutations release iterator source" {
@@ -24325,7 +25018,10 @@ test "MapIter: owned unchecked cursor mutations release iterator source" {
     const other_values = [_]i64{ 300, 50 };
     const other = M.fromPairs(&other_keys, &other_values, 2) orelse @panic("map alloc");
     defer M.release(other);
-    const merge_result = M.merge_owned_unchecked(merge_cursor, other) orelse return error.TestUnexpectedResult;
+    // `merge_owned_unchecked` consumes its right operand (see
+    // `releaseConsumedMergeOperand`); the test keeps its own `other`
+    // handle for the defer above, so hand merge an independent owner.
+    const merge_result = M.merge_owned_unchecked(merge_cursor, M.retain(other)) orelse return error.TestUnexpectedResult;
     defer M.release(merge_result);
     try std.testing.expectEqual(refcount_before, src.header.count());
     try std.testing.expectEqual(@as(i64, 3), M.size(merge_result));

@@ -195,8 +195,26 @@ pub struct Zap.StringTest {
       assert(parsed == 42)
     }
 
+    test("to_integer valid can be handled with case pattern matching") {
+      result = case String.to_integer("42") {
+        nil -> "missing"
+        int -> Integer.to_string(int)
+      }
+
+      assert(result == "42")
+    }
+
     test("to_integer invalid returns nil") {
       assert(String.to_integer("hello") == nil)
+    }
+
+    test("to_integer invalid can be handled with nil case pattern") {
+      result = case String.to_integer("hello") {
+        nil -> "missing"
+        int -> Integer.to_string(int)
+      }
+
+      assert(result == "missing")
     }
 
     test("to_float valid") {
@@ -205,8 +223,26 @@ pub struct Zap.StringTest {
       assert(parsed == 3.14)
     }
 
+    test("to_float valid can be handled with case pattern matching") {
+      result = case String.to_float("3.14") {
+        nil -> 0.0
+        float -> Float.round(float)
+      }
+
+      assert(result == 3.0)
+    }
+
     test("to_float invalid returns nil") {
       assert(String.to_float("hello") == nil)
+    }
+
+    test("to_float invalid can be handled with nil case pattern") {
+      result = case String.to_float("hello") {
+        nil -> "missing"
+        float -> Float.to_string(float)
+      }
+
+      assert(result == "missing")
     }
 
     # capitalize

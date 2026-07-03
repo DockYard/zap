@@ -11082,6 +11082,7 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
         std.debug.print("{s}[{d}] {s}", .{ spaces[0..used], idx, @tagName(instr) });
         switch (instr) {
             .unwrap_error_union => |ueu| std.debug.print(" dest={d} source={d} mode={s}", .{ ueu.dest, ueu.source, @tagName(ueu.mode) }),
+            .optional_unwrap => |ou| std.debug.print(" dest={d} source={d} safety_check={}", .{ ou.dest, ou.source, ou.safety_check }),
             .protocol_dispatch => |pd| std.debug.print(" dest={d} receiver={d} method={s}", .{ pd.dest, pd.receiver, pd.method_name }),
             .local_get => |lg| std.debug.print(" dest={d} source={d}", .{ lg.dest, lg.source }),
             .share_value => |sv| std.debug.print(" dest={d} source={d} mode={s}", .{ sv.dest, sv.source, @tagName(sv.mode) }),

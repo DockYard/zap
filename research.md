@@ -1,256 +1,276 @@
-# Research: Function Type Propagation Through Zap's Compilation Pipeline
+# Designing a BEAM-Class Concurrency Model for Zap: A State-of-the-Art Research Survey
 
-## Problem Statement
+## TL;DR
+- **A BEAM-style actor model is achievable in AOT-native Zap without a VM**, but fairness/preemption must be re-engineered: adopt compiler-inserted cooperative yield checks at loop back-edges and function prologues (Go's pre-1.14 model; naive loop preemption cost Go a **7.8% geomean slowdown**, per Austin Clements' proposal 24543) as the MVP, gated behind a comptime flag so non-spawning programs stay literally zero-cost, and stage signal-based async preemption (Go 1.14 SIGURG) only if measured latency bounds demand it.
+- **Keep per-process isolation and non-atomic refcounts, but relax the "pure copy, never share" rejection for exactly one tier: an atomically-refcounted immutable byte-buffer type (mirroring Erlang's >64-byte refc binaries and persistent_term), because pure deep-copy provably dominates cost past a few KB and every production BEAM system relies on this escape hatch. Zap's immutability doesn't remove the need for this tier: immutability makes sharing race-safe but not lifetime-safe, and it doesn't make values unique — Elixir-style bindings alias freely, so move is only legal when the sender provably holds the sole reference, which is why copy must stay the default (send never invalidates the sender's bindings). move also delivers to exactly one receiver, whereas this tier exists for fanning large data out to many processes; and until region transfer ships, even a moved heap value's bytes live in the sender's arena, so raw pointer handoff would couple lifetimes and break isolation. A pointer-free, immutable buffer allocated off every process heap is the one shape whose lifetime can safely outlive its sender. Region-transfer for move (Verona/Pony iso/Swift SE-0414) is the right long-term zero-copy story but should ship after copy semantics.
+- **Zig 0.16's `Io.Evented` is the correct substrate but is explicitly experimental and Linux-first**; Zap should target it while being prepared to vendor/fork a stackful-coroutine scheduler (the `zio` library proves this is viable today), fix per-process stack sizing via guard-paged fixed reservations, and stage Windows (IOCP) and WASI as documented gaps.
 
-Zap is a functional programming language that compiles to native code via Zig's compiler backend. Functions are first-class values — they can be passed as arguments, returned from functions, and stored in data structures. This works at the language level but breaks during code generation: **function-typed values become `void` when crossing struct boundaries in the generated ZIR**, causing 21 compilation errors in the test suite.
+## Key Findings
 
-## Architecture Overview
+1. **Preemption without reduction counting is a solved-but-costly problem.** BEAM counts reductions in its interpreter; AOT code cannot. The three real options are cooperative yield-point insertion (Go ≤1.13, Tokio coop budget), signal-based async preemption (Go ≥1.14 SIGURG), and hybrids. Per Go's "Non-cooperative goroutine preemption" proposal (design doc 24543), fault-based loop preemption produced *"a geomean slow-down on a large suite of benchmarks [of] 7.8%, with a handful of significantly worse outliers"* — which is why Go moved to signals. Zap controls its own ZIR codegen, so it can insert cheap safepoints where it chooses — but the evidence says loop back-edge polls hurt tight numeric loops (exactly Zap's CLBG wins like nbody/spectral-norm), so they must be comptime-gated.
 
-Zap's compilation pipeline:
+2. **Zig 0.16 `Io.Evented` gives Zap green threads, `Future`, `Group`, `Queue`, `Select`, and `io.cancel()` — but it is experimental.** Andrew Kelley's 0.16 release notes label the io_uring and GCD backends experimental with known gaps (error handling, logging, minimal task stack allocation), plus an unresolved io_uring performance regression. kqueue is proof-of-concept only, Windows IOCP is absent from `std.Io.Evented`, and the green-thread backend cannot target WASM/WASI (stack switching is unavailable there). The third-party `zio` library already implements a complete `std.Io` with io_uring/epoll/kqueue/IOCP and work-stealing M:N scheduling, proving the design is deliverable and forkable.
 
-```
-.zap source → Parse → Collect → Macro Expand → Desugar → Type Check → HIR → IR → ZIR → Zig Sema → LLVM → Native
-```
+3. **Erlang's own architecture validates most of Zap's plan but contradicts "never share."** Every message is copied into the receiver's heap — *"Messages are always copied before being inserted into the queue. As wasteful as this may sound it greatly reduces garbage collection (GC) latency as the GC never has to look beyond a single process"* (erlang.org message-passing blog) — **except** refc binaries >64 bytes, literals, and `persistent_term`, which are globally shared. This is the single most important tension for Zap to resolve.
 
-The critical handoff is **IR → ZIR**. The IR (intermediate representation) is Zap's low-level SSA-like format. ZIR is Zig's internal representation that feeds into Zig's semantic analysis (Sema) and then LLVM codegen.
+4. **Per-process footprint targets are realistic.** BEAM spawns a process in **327 words (2616 bytes) on 64-bit OTP 27**, and per the Efficiency Guide *"the size includes 233 words for the heap area (which includes the stack)"*; Pony actors need only **256 bytes** (*"one actor needs only 256 bytes on 64bit systems"* — Pony Tutorial); Go goroutines start at a **2 KB** growable stack. For a native stackful coroutine + arena + mailbox, the stack reservation dominates, so Zap's footprint hinges on its stack strategy, not its bookkeeping.
 
-Zap uses a **forked Zig compiler** (`~/projects/zig`) that exposes ZIR construction via a C-ABI surface (`zir_api.zig`). The Zap compiler builds ZIR by calling C functions like `zir_builder_emit_call`, `zir_builder_emit_param`, `zir_builder_emit_decl_ref`, etc.
+5. **Ordering, links, monitors, and supervision have precise, copyable semantics.** Erlang guarantees only **pairwise (point-to-point) FIFO**: signals from A to B preserve order, but there is no global order across senders. Links are bidirectional and one-per-pair; monitors are unidirectional, stackable `'DOWN'` messages. `exit(Pid, kill)` is untrappable and rewrites the reason to `killed`; `trap_exit` converts trappable exit signals to `{'EXIT', From, Reason}` messages. Supervisor defaults are **intensity 1 / period 5 s**, strategy `one_for_one`, restart `permanent`, with `brutal_kill` / integer-timeout / `infinity` shutdown protocols. All of this is implementable in pure Zap stdlib over a minimal signal intrinsic (Gleam OTP demonstrates exactly this: a small Erlang core with supervisors/actors written in the surface language).
 
-### Per-Struct Compilation
+## Details
 
-Each Zap struct (one per `.zap` file) is compiled independently through the pipeline, producing its own ZIR struct. Cross-struct references use `@import("StructName").function_name`. The Zig compiler links all structs together.
+### 6.1 Scheduling and Preemption for Native Code
 
-Example: `Enum.map([1,2,3], doubler)` in a test struct becomes:
-```zig
-// In Test_MyTest.zig (ZIR)
-@import("Enum").map__2(list_ref, doubler_ref)
-```
+**The core problem.** BEAM achieves soft-realtime fairness by counting *reductions* (roughly function calls) in its bytecode interpreter and preempting at ~4000 reductions. AOT-native Zap has no interpreter loop to instrument, so fairness must come from either compiler-inserted checks or OS signals.
 
-And inside the Enum struct:
-```zig
-// In Enum.zig (ZIR)
-pub fn map__2(list: ListType, callback: anytype) ListType {
-    return @import("zap_runtime").ListCell.mapFn(list, callback);
-}
-```
+**Option A — Cooperative yield points (recommended MVP).** Go before 1.14 inserted preemption checks in function prologues, tied to the stack-growth check (`morestack`). Tokio's cooperative budget is the modern refinement: each task gets a budget — per the Tokio "Reducing tail latencies" blog, *"When the task is scheduled, it is assigned a budget of 128 operations per 'tick'. The number 128 was picked mostly because it felt good and seemed to work well with the cases we were testing against (Noria and HTTP)"* — each resource poll decrements it, and when exhausted all resources return `Pending` to force a yield. Tokio added `consume_budget` for CPU-heavy loops that touch no resources — directly analogous to what Zap must insert into pure compute loops. Tokio's own post-mortem is explicit this is a workaround for not being able to preempt: *"Runtimes that have full control over execution (Go, Erlang, etc.) will also use preemption... accomplished by injecting yield points... at compile-time."* The starvation pitfall: budget-only schemes cannot preempt a genuinely tight loop, so Tokio still warns users to avoid CPU-bound work / use `spawn_blocking`.
 
-And in the runtime:
-```zig
-// In zap_runtime.zig
-pub fn mapFn(list: ?*const ListCell, callback: anytype) ?*const ListCell {
-    while (current) |cell| {
-        result = cons(callback(cell.head), result);  // <-- ERROR: callback is void
-    }
-}
-```
+**Option B — Signal-based async preemption (stage later).** Go 1.14 registers a `SIGURG` handler; a `sysmon` thread detects any goroutine running >10 ms and sends `SIGURG` to its thread; the handler injects a call to `asyncPreempt`, which reaches a safepoint and reschedules. The critical constraint: this requires **precise pointer maps / async-safe-point metadata** (Go's `PCDATA_UnsafePoint` tables) so the runtime knows the goroutine is at a preemptible point. Zap likely cannot cheaply produce full register/stack pointer maps at arbitrary PCs (it uses ARC, not tracing GC, so it has no such infrastructure), which makes true async preemption expensive to bolt on. Signals also interact badly with FFI and syscalls (Go special-cases Darwin exec, etc.).
 
-## The Bug
+**Safepoint overhead evidence.** Go's proposal 24543 reports that emitting stack/register maps for safe-points (the Go 1.11 compiler change enabling non-cooperative preemption) *increased binary sizes by about 5%*, and that cooperative loop-preemption prototypes *"led to unacceptable slow-downs in tight loops."* JVM safepoint experience (psy-lob-saw) shows counted→uncounted loop transitions (adding a safepoint poll) disable loop unrolling, fill-pattern replacement, and superword/SIMD optimizations — a serious warning for Zap's numeric benchmarks. Academic timestamp-based execution control measured **~13.7 ns per increment** in a worst-case empty loop, acceptable only when events are spaced >0.5 ms apart.
 
-When `doubler` (a function reference) is passed from `Test_MyTest` → `Enum.map__2` → `ListCell.mapFn`, Zig's Sema sees the `callback` argument as `void` by the time it reaches `mapFn`. The error: `type 'void' not a function`.
+**Recommendation for 6.1:**
+- **MVP:** cooperative yield checks inserted by ZIR codegen at (a) function prologues that already carry a stack check and (b) loop back-edges, but **only in functions reachable from a spawned process and only when concurrency is comptime-enabled**. A per-process budget counter (Tokio-style) decremented at these points; yield when exhausted. This gives bounded fairness for well-behaved code at near-zero cost for straight-line code.
+- **Zero-cost guarantee:** a program that never spawns compiles the checks out entirely (comptime `runtime_concurrency = false`), preserving nbody/spectral-norm wins (Constraint 4).
+- **Stage 2 (only if latency bounds require):** signal-based preemption as a *watchdog* — a monitor thread signals a process that has exceeded a wall-clock budget without yielding, with the handler setting a flag checked at the next safepoint (not injecting arbitrary calls), sidestepping the pointer-map requirement. This is a "poisoned budget" design closer to Go's synchronous-preemption stack-guard poisoning than full async preemption.
 
-### Why It Happens
+**M:N scheduler architecture.** Adopt the now-standard design proven by Go (GMP), Tokio, and `zio`: one scheduler thread per core, per-core run queues with a global overflow queue, work-stealing between cores, and a LIFO slot for the just-woken task (improves message-passing locality — the ping-pong partner runs immediately). BEAM runs one scheduler per core and historically busy-waits before sleeping; Go integrates a **netpoller** so idle Ps park and are woken by I/O readiness. Zap should integrate wakeups through `Io.Evented`'s event loop (io_uring/kqueue) rather than busy-waiting, matching Go's power efficiency.
 
-The ZIR builder (`src/zir_builder.zig`) uses a `local_refs` hash map to track the ZIR instruction ref for each IR local variable. When emitting a function call's arguments, it looks up each argument's local ID:
+**Stack strategy (a hard native-code problem).** Zap processes hold raw pointers into their own stacks, and Zap has no precise pointer maps, so **Go-style copying/growable stacks are ruled out** (they require rewriting every interior pointer on move — Go relies on the GC's precise pointer maps to do this). Segmented stacks (Go ≤1.2) suffer the "hot-split" problem — a loop straddling a segment boundary thrashes allocation (Go measured a 1.26 s → 5.37 s regression on a recursive benchmark). BEAM sidesteps this by putting the process stack *inside the movable process heap* scanned by its copying GC — also unavailable to Zap. **Recommendation:** fixed virtual reservation with lazy commit and a guard page (the classic approach; `zio` and Boost.Fiber do this). Reserve a large virtual range (e.g., 256 KB–1 MB) per process, commit pages lazily on fault, and rely on overcommit so RSS tracks actual depth. The Zig team is building a **compile-time maximum-stack-size computation** — Zap should consume it once available. Flag the limitation: on systems with overcommit disabled, fixed reservations inflate committed memory (the exact caveat the Zig async docs raise).
 
-```zig
-// src/zir_builder.zig line 2181 (call_builtin handler)
-for (cb.args) |arg| {
-    const ref = self.refForValueLocal(arg) catch @intFromEnum(Zir.Inst.Ref.void_value);
-    try args.append(self.allocator, ref);
-}
-```
+**Blocking operations and FFI.** Zap code can call native primitives that block. The three canonical answers: BEAM **dirty schedulers** (a separate thread pool for NIFs expected to run >1 ms; introduced in OTP 17, the process is evacuated to a dirty run queue), Go's **syscall handoff** (an M blocking in a syscall detaches its P so another M can run it), and Tokio's **`spawn_blocking`** (a dedicated blocking thread pool). **Recommendation:** provide a `Zap.blocking` intrinsic that moves the calling green thread onto a dedicated OS-thread pool (dirty-scheduler equivalent) so it cannot stall a core scheduler; document that un-annotated blocking FFI can stall a scheduler exactly as an over-long NIF stalls a BEAM scheduler. This belongs in the runtime, not stdlib.
 
-If `refForValueLocal(arg)` fails (the local has no ZIR ref), it **silently falls back to `void_value`**. This pattern appears in ~20 places across the ZIR builder.
+### 6.2 Mailbox Design
 
-The lookup fails because function-typed values flow through the IR as opaque locals without type information. The IR's `LocalId` is just a `u32` — it carries no type. When the ZIR builder processes instructions like `make_closure` and `call_closure`, it tries to reconstruct the function reference, but this reconstruction fails in several scenarios.
+**Queue algorithm.** The mailbox is MPSC (many senders, one owning process). The canonical choice is the **Vyukov intrusive MPSC queue** — used by Akka, Netty, RxJava, Boost.Fiber's scheduler — which costs **one atomic exchange (XCHG) on push** and is wait-free for producers, with a single-consumer pop. The intrusive node lives in the message envelope. Note the widely-documented subtlety: the naive Vyukov pop is "blocking" in that a producer suspended between its XCHG and its `next`-store leaves a transient gap; the consumer must handle the `null`-next-but-nonempty case.
 
-### Scenarios Where It Fails
+**Crucially for Zap's non-atomic-refcount invariant:** the queue links *envelopes*; the atomic operation is only on the envelope's `next` pointer and the queue head — **not** on the refcounted payload. The payload is copied into the receiver's heap (or transferred by region) so no refcount is ever touched by two threads. This is the key to preserving Zap's non-atomic ARC (see 6.6).
 
-**1. Cross-struct function references in Enum callbacks:**
-```zap
-# test/for_comprehension_test.zap
-doubled = for x <- [1, 2, 3] { x * 2 }
-```
-Desugars to a call to `Enum.map` with an anonymous callback. The callback is a `make_closure` with 0 captures. The ZIR builder emits `decl_ref("__for_0")` for the anonymous function. But when this ref crosses into the Enum struct via `@import`, Zig can't resolve it because `__for_0` is private to the test struct.
+**Wakeup design.** Options: `eventfd` (one per scheduler, classic), io_uring `MSG_RING` (kernel-side ring-to-ring wakeup, lowest overhead on Linux), or userspace parking (futex/atomic flag when the target is on a running scheduler). **Recommendation:** userspace atomic-flag parking when the target scheduler is awake (no syscall), falling back to the `Io.Evented` event-loop wakeup (eventfd/`MSG_RING` on Linux, kqueue user events on BSD/macOS) when parked. Prototype both and measure (risk R7).
 
-**2. Function references passed as callback parameters:**
-```zap
-# test/closure_test.zap
-fn apply(value :: i64, callback :: (i64 -> i64)) -> i64 {
-    callback(value)
-}
-assert(apply(41, add_one) == 42)
-```
-`add_one` is passed to `apply`. In the IR, this is `make_closure(dest=L5, function=add_one_id, captures=[])`. The ZIR builder emits `decl_ref("add_one__1")` and stores it in `local_refs[L5]`. Then `apply`'s body has `call_closure(callee=L1, args=[L0])` where L1 is the `callback` parameter. The parameter IS registered via `setLocal(1, param_ref)`, so L1 resolves. But the actual function pointer type is lost — Zig sees it as `anytype` and needs the callsite to provide the concrete type. When the concrete type comes from a cross-struct `@import`, the indirection loses the function-ness.
+**Selective receive.** Erlang's `receive` scans the mailbox in order for the first matching message — an **O(N) scan**, with pathological O(N²) pileup when a process cannot match the head repeatedly. The OTP compiler's ref-trick optimization (`recv_opt_info`): when a `receive` only matches messages containing a freshly-created unique reference (the request-response idiom via `monitor/2`), the compiler marks a **receive start position** so the scan skips all messages older than the reference — making the common gen_server call O(1). Limitations: only one active position at a time; nested calls defeat it. **Recommendation for Zap:** support selective receive (core to Elixir ergonomics), but (a) implement the ref-trick receive-mark from day one, and (b) expose mailbox-length telemetry so pileups are observable. Consider a restricted default where `receive` on a typed union with a distinguished correlation token gets the O(1) path automatically.
 
-**3. Imported function identifiers:**
-```zap
-# test/import_test.zap
-import Test.MultiStructHelper
-assert(double(3) == 6)
-```
-`double` is used as a bare identifier. The ZIR builder emits `decl_ref("double")` but `double` isn't declared in `Test_ImportTest.zig` — it's in `Test_MultiStructHelper.zig`. The ZIR builder should emit `@import("Test_MultiStructHelper").double__1` instead.
+**After-timeouts / timer wheels.** `receive ... after T` needs an efficient timer. The state of the art is **hierarchical timing wheels** (Varghese & Lauck 1987), used by BEAM (per-scheduler wheels), Netty's `HashedWheelTimer`, and Kafka's purgatory. Kafka's design layers wheels of increasing granularity (tickMs × wheelSize per level) with **O(1) insert/delete** and advances the clock via a `DelayQueue` of buckets. **Recommendation:** per-scheduler hierarchical timing wheel, integrated with `Select` so the after-branch is just another wakeable source. `after 0` is a non-blocking poll.
 
-## Current Type Representation
+**Ordering.** Erlang guarantees pairwise FIFO only. Pony guarantees **causal** ordering (messages arrive before messages they caused, at a common destination) — required by ORCA's GC correctness, and strictly more expensive. **Recommendation:** promise **pairwise FIFO** (Erlang's guarantee), which the Vyukov queue delivers for free per sender, and explicitly do *not* promise causal or global ordering. This matches Elixir semantics.
 
-### IR Types (`src/ir.zig`)
+**Priority messages.** OTP 28 shipped **EEP 76 priority messages**: a process opts in via a priority alias; priority messages are inserted before a Priority-Message-Queue-End marker so `receive` matches them first, without violating pairwise ordering (RabbitMQ is experimenting with it for `rabbit_reader` flow control). **Recommendation:** do **not** adopt priority messages on day one — they complicate the mailbox/ordering story, and EEP 76 itself notes most code assumes reception order. Design the envelope with a spare flag bit so a priority tier can be added later without ABI churn.
 
-The IR has a `ZigType` union that represents Zig types:
-```zig
-pub const ZigType = union(enum) {
-    void,
-    bool_type,
-    i8, i16, i32, i64,
-    u8, u16, u32, u64,
-    usize, isize,
-    f16, f32, f64,
-    string,       // []const u8
-    atom,         // u32
-    list,         // ?*const ListCell
-    map,          // MapType
-    tuple: []const ZigType,
-    struct_ref: []const u8,
-    optional: *const ZigType,
-    error_union: *const ZigType,
-    // NO function type variant exists
-};
-```
+### 6.3 Backpressure and Overload
 
-**There is no `function` variant.** The IR cannot represent `*const fn(i64) i64` as a type. Function parameters with type annotation `(i64 -> i64)` get their Zap-level type checked, but this type is lost during IR lowering.
+The fundamental fork: **unbounded mailboxes** (Erlang — `send` is fire-and-forget and never blocks, modulo distributed busy limits) plus a `max_heap_size` kill-switch, versus **bounded mailboxes** (Akka) with an overflow strategy. Akka's bounded mailbox blocks the producer (violating "never block in an actor") or drops to dead-letters; the Akka community's consistent advice is to abandon bounded mailboxes for **Akka Streams / credit-based flow control** (Reactive Streams demand signaling) or the work-pulling pattern. Erlang's unbounded default risks unbounded memory growth, mitigated by `message_queue_data=off_heap` (messages in heap fragments, not GC-scanned until matched) and per-process `max_heap_size` that kills a bloated process. Pony uses **sender-muting backpressure**: a sender to an overloaded actor is itself descheduled until the receiver catches up.
 
-### IR Instructions
+**Recommendation for 6.3 (Open Decision #2):** **unbounded mailbox by default + observability + optional per-spawn bound.** Rationale: (1) preserves Elixir/Erlang fire-and-forget (Constraint 5); (2) blocking `send` reintroduces the deadlock and lifetime-coupling problems Zap's isolation model exists to avoid; (3) the failure mode (memory growth) is made *safe and diagnosable* by a per-process heap/mailbox limit that triggers `let-it-crash` teardown (the BEAM `max_heap_size` model). Offer `spawn(f, .{ .max_mailbox = N, .overflow = .crash | .drop_newest | .block })` for the minority who want bounded semantics, defaulting to unbounded + a high crash threshold. Credit-based flow control (sbroker, RabbitMQ credit_flow, Ranch) belongs in **stdlib**, not the runtime — it is expressible in pure Zap over send/receive.
 
-Function values flow through these IR instructions:
-- `make_closure { dest: LocalId, function: FunctionId, captures: []LocalId }` — creates a function reference
-- `call_closure { dest: LocalId, callee: LocalId, args: []LocalId }` — calls a function value
-- `call { dest: LocalId, target: FunctionId, args: []LocalId }` — direct named call
-- `call_builtin { dest: LocalId, name: []const u8, args: []LocalId }` — runtime function call (`:zig.Struct.function`)
-- `local_set { dest: LocalId, source: LocalId }` — copy a local
-- `local_get { dest: LocalId, source: LocalId }` — read a local
+### 6.4 Message Copy vs Transfer — The Memory-Transfer Problem
 
-None of these carry type information on the locals. A `LocalId` is just a number.
+This is the deepest question. Three regimes:
 
-### IR Parameters
+**(1) Deep-copy path (MVP, must-have).** BEAM's copier is a two-pass `size_object` + `copy_struct`: walk the term graph to compute size, allocate contiguous space in the receiver, then copy word-by-word fixing pointers. Shared subterms are (by default) flattened (an optimization to preserve sharing exists but is off by default because "most applications do not send messages with shared subterms"). For Zap: an arbitrary graph (List/Map/struct/boxed existential/closure) is deep-cloned into the receiver's manager. **Closures** are the subtle case: the **native code pointer is shared** (all processes are in one OS process image — code is immutable and global, exactly like BEAM sharing literal/code areas), while the **captured environment is deep-copied**. This is safe and is the natural analogue of BEAM's fun-copying.
 
-```zig
-pub const Param = struct {
-    name: []const u8,
-    type_expr: ZigType,    // <-- has the type, but no function variant
-    default_value: ?*const DefaultValue = null,
-};
-```
+**When copy dominates.** Copy cost is O(graph size). Erlang chose **64 bytes** as the refc-binary sharing threshold precisely because below it, copying is cheaper than refcount coordination, and above it, copying dominates. Strong evidence: **pure copy is viable and even optimal below ~64 bytes–few KB; above that it is a real cost.**
 
-When `callback :: (i64 -> i64)` is lowered to IR, `type_expr` becomes `ZigType.void` because there's no function variant. The type checker knows it's a function type, but this knowledge doesn't survive into the IR.
+**(2) The restricted immutable-share tier (recommended — relax the rejection).** Zap's design doc rejects all sharing. The state of the art says this is too absolutist for large immutable payloads:
+- Erlang shares all refc binaries >64 B globally with atomic refcounts (well-known "binary leak" pathology: a tiny sub-binary pinning a huge binary).
+- Pony shares *all* deeply-immutable `val` data via ORCA's deferred distributed weighted reference counting, with **no stop-the-world and no shared-memory synchronization beyond messages**.
+- BEAM shares literal areas and `persistent_term` (copied out only on module unload).
 
-### ZIR Builder Type Mapping
+**Recommendation:** introduce **exactly one** shared tier — an **atomically-refcounted immutable byte buffer** (`Zap.Blob`), deeply immutable, opaque, with an atomic header, shared by pointer across processes. This does *not* betray isolation the way general sharing would: (a) it is immutable, so no cross-process mutation and no data race; (b) it carries its own atomic refcount, isolated from the non-atomic ARC of ordinary heap cells — the atomicity is confined to this one type, preserving Constraint 3 for everything else; (c) a crashed process merely drops its atomic reference (decrement), never corrupting another heap. This is the pragmatic, principled escape hatch every production actor system converged on. Bound the leak pathology by *not* supporting sub-blob aliasing in v1. Keep it opt-in and single-typed so "independent reasoning" holds for all normal data.
 
-```zig
-// src/zir_builder.zig line 329
-fn mapParamType(zig_type: ir.ZigType) u32 {
-    return switch (zig_type) {
-        .i64 => @intFromEnum(Zir.Inst.Ref.i64_type),
-        .string => @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
-        // ... other concrete types ...
-        else => @intFromEnum(Zir.Inst.Ref.none), // anytype for unknown types
-    };
-}
-```
+**(3) Region transfer for true zero-copy move (stage after copy).** Zap already has a uniqueness prover. The literature on transferring whole object graphs:
+- **Verona regions / `cown`s:** ownership of an entire object graph transfers linearly between concurrent owners; the source region must be *closed* (no external references) for soundness, propagating ownership linearly without runtime overhead.
+- **Pony `iso` + `recover`:** an `iso` reference names a sendable, isolated subgraph with no incoming/outgoing aliases; `recover` blocks build one and hand it off.
+- **Swift SE-0414 Region Based Isolation** (shipped in Swift 6): the compiler proves via *isolation regions* that a non-`Sendable` value and everything reachable from it can be transferred across an isolation boundary because *"transferring a non-Sendable value over an isolation boundary cannot result in races because the value (and any... value that might alias it) is never used again."* SE-0430 adds the `sending` keyword. This is *directly* the analysis Zap needs.
+- **Vale regions + generational references:** regions as allocation arenas; Vale's memory-safety approach has (per verdagon.dev, BenchmarkRL terrain generator) *"only 10.84% overhead, less than half the cost of reference counting"* — evidence that generational/region techniques are cheap enough to be practical.
 
-Unknown types (including function types) map to `none` (Zig's `anytype`). This is actually correct for parameters — `anytype` accepts function pointers. The problem isn't the parameter declaration; it's that the **argument value** at the call site becomes void.
+**Concrete Zap design:** a value proven unique by the uniqueness prover, and proven **region-closed** (no pointer escapes the subgraph, no pointer into it from outside — exactly SE-0414's region analysis or Pony's `iso` invariant), can be allocated in its **own sub-arena / dedicated slab set**. `send(pid, move(x))` then **re-parents that region to the receiver's manager in O(1)** — the receiver's manager adopts the slab set; no bytes move. This is precisely BEAM's **heap-fragment** pattern inverted: BEAM allocates the copied message in a fragment attached to the receiver until the next GC integrates it; Zap allocates the *outgoing* message in a detachable region the receiver adopts.
 
-## The Type Store
+**Who performs the copy/transfer, on whose allocator, with what synchronization?** For the copy path: the **sender** performs the copy, but **into a fresh detachable heap fragment/region it allocates from a shared page pool** (not the receiver's non-atomic manager — that would touch the receiver's manager from two threads, violating Constraint 2). The envelope carries the fragment; on `receive`, the *receiver* adopts the fragment into its own manager (single-owner operation). This mirrors BEAM's `off_heap` strategy exactly (*the sender writes directly to a heap fragment when it cannot get the receiver's main lock*) and means **no synchronization on either manager's internal structures** — the only atomic operation is the MPSC queue link and, if the shared page pool is used, its allocation. The in-flight envelope is owned by *neither* process's manager; it belongs to the message system until adopted.
 
-The type checker (`src/types.zig`) has a rich type representation that DOES include function types:
+### 6.5 Per-Process Heap Management and Long-Lived Processes
 
-```zig
-pub const Type = union(enum) {
-    int: struct { signed: bool, bits: u8 },
-    float: struct { bits: u8 },
-    bool_type,
-    string,
-    atom,
-    nil,
-    tuple: []const TypeId,
-    list: TypeId,
-    map: struct { key: TypeId, value: TypeId },
-    function: struct {
-        params: []const TypeId,
-        return_type: TypeId,
-    },
-    // ...
-};
-```
+BEAM uses a **per-process generational copying (Cheney) semi-space GC** with a global large-object/binary space, a **233-word** initial heap, growth on demand, `fullsweep_after` to force full collection, and `hibernate` to shrink a waiting process to its minimum footprint.
 
-The `TypeStore` resolves and unifies types during type checking. After type checking, the HIR (High-level IR) carries resolved `TypeId` on every expression. But during HIR → IR lowering, function types are lost because `ir.ZigType` has no function variant.
+**Does a Zap process ever NEED tracing GC?** Zap has deterministic ARC + move semantics + arenas. For **acyclic** data this is sufficient — ARC drops reclaim promptly. Two gaps: (a) **cycles** — ARC leaks cycles; but per-process isolation bounds the damage (a leaked cycle dies with the process), and Zap's ownership discipline discourages cycles. (b) **long-lived-process arena growth** — a `bump` arena never frees individual objects, so a server loop that allocates per iteration grows unboundedly.
 
-## What the Fix Requires
+**The auto-reset insight (recommended).** The region-per-request literature (Verona, Vale, and BEAM's `hibernate`) suggests: if the compiler can prove a server-loop iteration's heap closure — that no heap object allocated in iteration *i* is reachable after iteration *i* returns to the receive point (which Zap's ownership/liveness analysis is positioned to prove) — it can **auto-reset the per-iteration arena** at the top of the loop, giving O(1) bulk reclamation with zero GC. This is the arena analogue of BEAM hibernation and is the single most promising Zap-specific optimization. Where the proof fails (state accumulates across iterations), fall back to ARC-per-process (slab pools), which handles retained state fine.
 
-### 1. Add Function Type to IR
+**Recommendation (Open Decision #6):** **No per-process tracing GC in v1.** Ship ARC + per-process slab pools as the default reclamation model (handles retained/aliased state and acyclic graphs), with an **arena strategy** available per-spawn for processes whose loop-closure the compiler can prove (bump-allocation + auto-reset). Provide a `Memory.Tracking`/leak-detection build to catch cyclic leaks in test. Revisit a per-process cycle collector (a Bacon–Rajan trial-deletion collector confined to one process's heap) only if real workloads leak — the isolation guarantee makes this low-risk to defer. Note: Elixir "cannot leak memory the way manual-memory languages do" precisely because process and ETS memory is freed wholesale on termination — Zap's bulk arena/slab free on crash gives the same guarantee.
 
-```zig
-// In ir.ZigType, add:
-function: struct {
-    param_types: []const ZigType,
-    return_type: *const ZigType,
-},
-```
+**Process footprint target.** BEAM: 327 words (2616 bytes) incl. 233-word heap+stack (OTP 27, 64-bit). Pony: 256 bytes/actor. Go: 2 KB growable stack. For Zap, the stack reservation dominates: with lazy-commit fixed reservation, the *committed* footprint can approach Go's (a few KB) even with a large *reserved* range. Target: **single-digit KB committed** per idle process. Spawn cost ~1–3 µs is achievable if spawn is (a) grab a pid slot, (b) init a manager context, (c) reserve stack (lazy), (d) enqueue on a run queue — all pool operations, no syscalls on the hot path.
 
-### 2. Preserve Function Types During IR Lowering
+**Crash teardown.** On exit (normal or crash), the runtime frees the process's arena/slab set wholesale — cheaper than GC and guaranteed leak-free for process-local heap. **External resources** (fds, sockets, FFI handles) are the hazard: BEAM uses **port/NIF resource destructors** and monitors; structured-concurrency systems (Trio, Kotlin, Zig `Group`/`defer`/`errdefer`) use scope-exit cleanup. **Recommendation:** processes register owned external resources with the runtime (a small drop-list); on teardown the runtime runs their destructors (close fd, `io.cancel()`), analogous to BEAM resource destructors. `error.Canceled` from `Io.Evented` is the native cancellation signal to wire kill/shutdown into.
 
-In `src/ir.zig`'s `IrBuilder`, when lowering a HIR expression with a function type, map it to the new `ZigType.function` variant instead of `void`.
+### 6.6 Manager/ABI Integration (Zap-Particular)
 
-### 3. Emit Function Pointer Types in ZIR
+**One manager context per process.** Zap's manager ABI is already context-based (init → context pointer, allocate, deallocate, deinit), so **multiple independent manager instances in one binary is already ABI-supported** — the natural per-process-heap implementation. Each process's green thread owns one manager context.
 
-In `src/zir_builder.zig`, when encountering a `ZigType.function`:
-- For parameters: emit `*const fn(param_types...) return_type` instead of `anytype`
-- For `make_closure` with 0 captures: emit a typed `decl_ref` 
-- For cross-struct calls: ensure the function ref type survives the `@import` boundary
+**Where the context pointer lives.** Options: (a) green-thread-local storage (a slot in the coroutine control block), (b) a reserved register (fast but scarce/portability-hostile), (c) threaded parameter (explicit but pervasive). **Recommendation:** store the manager context pointer in the **green-thread control block** and load it into a scheduler-maintained thread-local at context-switch time. Runtime primitives that today reference a process-global manager become `manager = current_process().manager` — one TLS load. This avoids threading the manager through every signature (which would break zero-cost for non-concurrent code) while keeping the hot allocation path to a single indirect load. For the **non-concurrent single-process path, the manager is a global/static** exactly as today (comptime-selected), so zero regression holds (Constraint 4).
 
-### 4. Fix Cross-Struct Import Resolution
+**Can different processes use different allocation strategies?** The reclamation-model axis (refcounted / bulk_or_never / individual_no_refcount / traced) is **comptime-global** today. Three options: (a) one model binary-wide, strategy (bump/arena/GPA) varying within it; (b) compile the runtime multi-model and dispatch dynamically; (c) restrict per-process choice to parameters (initial size, reset policy). **Recommendation: (a).** Keep the reclamation model comptime-global (ARC default), but allow the **allocation strategy** to vary per-process (a process can request a `bump` arena via spawn options while the binary's reclamation model stays ARC). Option (b) imposes dynamic dispatch on every allocation — a direct regression to Zap's few-instruction alloc path, unacceptable. Option (c) is the conservative fallback. ABI consequence of (a): the manager vtable is monomorphized per comptime model; per-process instances differ only in allocation-strategy parameters and internal state, so one vtable serves all processes — no dispatch cliff.
 
-When a local's value comes from another struct (via `import` or cross-struct function call), the ZIR builder should emit `@import("SourceStruct").function_name` instead of `decl_ref("function_name")`.
+**Non-atomic refcount safety across a send.** The invariant to preserve: **every refcounted cell is strictly scheduler-local at all times.** The copy/move discipline guarantees this: (1) **copy** — the sender allocates a fresh fragment from a shared page pool and deep-copies; the *copied* cells have fresh refcounts touched only by the sender until adoption, then only by the receiver. The *original* cells stay in the sender's heap, refcounts untouched by anyone else. (2) **move** — the region is proven unique (refcount 1, no aliases) before transfer, re-parented atomically-with-respect-to-the-queue, but the refcounts inside are never concurrently accessed because uniqueness means only one process ever had references. **The in-flight envelope is owned by the message system, not either manager.** The only state needing atomic handoff is the **envelope pointer itself** (the Vyukov queue link) — never a payload refcount. This confirms Constraint 3 holds. Forbid at compile time: sending via `move` a value whose refcount is currently >1 (the uniqueness prover already rejects this). Erlang's OTP 25 parallel-signal optimization (a fixed 64-slot per-sender buffer array that improved receive throughput *"520 times better"* at 16 senders, active only with `off_heap`) validates the per-sender-slotted MPSC approach Zap should use.
 
-The `import` resolution logic exists for function CALLS (see `emitCrossStructCall` in zir_builder.zig) but not for function VALUES passed as arguments.
+### 6.7 Process Identity, Links, Monitors, Supervision
 
-## Key Files
+**Pid representation.** BEAM uses node + number (15-bit) + serial (3-bit) + creation, with number historically indexing the process table (identifiers are now 28-bit integers) and serial distinguishing dead/reused slots. The modern robust native idiom is **generational indices**: a pid is `{ slot: u32, generation: u32 }`, where the slot indexes a process array and the generation is bumped on slot reuse. A send validates `table[slot].generation == pid.generation`; a stale pid (process exited, slot reused) fails the check → the message is dropped (or a `noproc`-style monitor down fires). This prevents **ABA/use-after-exit** exactly as Vale's generational references prevent use-after-free via a per-allocation generation counter. **Recommendation:** generational-index pids, plain sendable copyable values (pids are `trivial` non-heap values). Reserve bits for a node id (0 = local) so distribution (6.10) is cheap later.
 
-| File | Role |
-|------|------|
-| `src/types.zig` | Type checker with full function type support (TypeStore, Type union) |
-| `src/hir.zig` | HIR with TypeId annotations on every expression |
-| `src/ir.zig` | IR with ZigType (missing function variant), IrBuilder |
-| `src/zir_builder.zig` | ZIR emission, local_refs tracking, cross-struct routing |
-| `src/compiler.zig` | Pipeline orchestration, per-struct compilation |
-| `src/runtime.zig` | Runtime with ListCell.mapFn etc. (where the errors manifest) |
-| `lib/enum.zap` | Enum.map etc. — intermediate struct between caller and runtime |
-| `test/closure_test.zap` | Tests for function-as-value patterns |
-| `test/for_comprehension_test.zap` | Tests for desugared for loops with callbacks |
-| `test/import_test.zap` | Tests for cross-struct bare identifier imports |
+**Links vs monitors.** Directly copy Erlang's precise semantics (subagent-confirmed against erlang.org v29 ref manual): **links bidirectional, one-per-pair, propagate exit signals**; **monitors unidirectional, stackable, deliver `{'DOWN', Ref, process, Pid, Reason}`**; monitor of a dead process fires `noproc` immediately. `trap_exit` converts a trappable exit signal into an `{'EXIT', From, Reason}` message. Exit reasons: **`normal`** (silently dropped unless trapping), **`kill`** (via `exit(Pid,kill)` — untrappable, terminates target with reason `killed` so it doesn't cascade as `kill`), and **other** (propagates as-is; kills non-trapping linked processes).
 
-## Current Error Manifest
+**Exit-signal ordering and Select integration.** Because everything is a signal with pairwise FIFO, exit signals and messages from the same sender are ordered. In Zap, `receive` desugars to `Select` over the mailbox; **exit/down signals are a distinct wakeable source in that `Select`**, and `error.Canceled` from `io.cancel()` is the kill mechanism. A trapping process sees exits as ordinary messages in its mailbox (merged at the point they arrive, preserving per-sender order); a non-trapping process's `Select` has an implicit "exit signal → die" arm.
 
-21 errors when running `zap test`:
+**Supervisor design.** Restart strategies `one_for_one` / `rest_for_one` / `one_for_all` (+ `simple_one_for_one` for homogeneous dynamic children); **defaults intensity 1, period 5 s, strategy `one_for_one`, restart `permanent`**; shutdown protocol `brutal_kill` (immediate `exit(kill)`) / integer timeout (`exit(shutdown)` then kill after T) / `infinity` (for supervisor children). Children start left→right, terminate right→left. **All of this is implementable in pure Zap stdlib** (Constraint: everything expressible in Zap lives in `lib/*.zap`) over minimal intrinsics: `spawn`, `link`, `monitor`, `exit_signal`, `trap_exit`, `receive`. This mirrors Gleam OTP's architecture — a *small* Erlang core (just the channel-receiver half) with supervisors/actors written in Gleam itself — validating that supervision need not be a runtime primitive.
 
-| Count | Struct | Error | Root Cause |
-|-------|--------|-------|------------|
-| 2 | Test_ClosureTest | `type 'void' not a function` | Function ref passed to `apply()` becomes void |
-| 8 | Test_ForComprehensionTest | `expected ListCell, found void` | For loop callback becomes void |
-| 9 | zap_runtime | `type 'void' not a function` | mapFn/filterFn/reduceFn etc. receive void callbacks |
-| 2 | Test_ImportTest | `undeclared identifier` | Bare imported names not resolved to @import |
+**Structured-concurrency framing.** Supervisors *are* nurseries with restart policies. Trio nurseries and Kotlin `coroutineScope` guarantee no child outlives its scope; OTP supervisors add restart. Zap should build supervisors on Zig's `Group` (which already provides scoped concurrent-task lifetime and cancellation) — a supervisor is a `Group` plus a restart-intensity window plus child specs. A genuinely modern synthesis of the two traditions.
 
-## Relevant Zig Concepts
+**Registry.** Local name registration (atom/string → pid) with the classic register-then-crash race. Provide a runtime-level local registry with atomic register/lookup; defer Elixir-style pluggable `via`-registries to stdlib later.
 
-- **ZIR (Zig IR)**: Zig's intermediate representation before semantic analysis. Instruction-based, SSA-like. Each struct produces its own ZIR.
-- **Sema**: Zig's semantic analyzer that type-checks ZIR and produces AIR (Analysis IR). This is where the `void not a function` errors occur.
-- **`anytype`**: Zig's comptime-polymorphic parameter type. Functions with `anytype` params are monomorphized at each call site. The runtime's `mapFn(list, callback: anytype)` relies on this.
-- **`@import`**: Zig's struct system. Each Zap struct becomes a Zig struct. Cross-struct references use `@import("StructName").symbol`.
-- **`decl_ref`**: ZIR instruction that references a declaration by name within the current struct's namespace.
-- **Function pointers**: In Zig, `*const fn(i64) i64` is a concrete type. Function values in Zap should compile to this.
+### 6.8 Language-Surface Lowering
 
-## Constraints
+**`receive` desugaring.** `receive P1 -> E1; ... after T -> Et end` lowers to a `Select` over (mailbox message source with pattern-match filter, timer source for `after`). Because stackful coroutines can suspend at arbitrary depth, **`receive` works at any call depth** (BEAM allows this; the green-thread stack simply parks). `after 0` polls once. Selective receive interacts with mailbox structure via the receive-mark optimization (6.2).
 
-- The Zig fork's C-ABI surface (`zir_api.zig`) already supports emitting function types via `zir_builder_emit_param` with type refs, `zir_builder_emit_decl_ref` for function references, and `zir_builder_emit_call_ref` for indirect calls.
-- The fix must work for both same-struct and cross-struct function references.
-- Anonymous functions (lambdas) with 0 captures should work the same as named function references.
-- Closures with captures use a different mechanism (environment struct) and are partially working — the 0-capture case is the broken one.
-- All changes must be in the Zap compiler (`~/projects/zap/src/`), not in the Zig fork.
+**Typed messages (a real design opportunity).** The spectrum: dynamic tuples-and-atoms (Erlang) vs typed actors (Akka Typed, Pony behaviours, **Gleam's `Subject(message)`** — full compile-time type safety of the message type per process). Zap has unions, atoms, and monomorphization. **Recommendation:** infer a **per-process message union type** from the `receive` patterns (and/or an explicit `process Foo receives MsgUnion` annotation), type-check `send` against it, and require `receive` to be **exhaustive over that union** (a new verifier pass — 6.11). This gives Gleam-like safety while keeping Elixir ergonomics (patterns look identical). On receipt of a non-matching message: for a *typed* Zap process the union is closed, so non-matching is a compile-time impossibility for local sends; for dynamic/distributed sources, provide a catch-all arm or a runtime `unexpected_message` telemetry event + drop (never crash on unknown message — that would break rolling-deploy patterns).
+
+**`spawn` variants.** `spawn` / `spawn_link` / `spawn_monitor` (Elixir-aligned), plus a **`Task.async`-style typed spawn returning `Future(T)`** mapped directly to Zig's `Future(T)` — `spawn+await` for request/response. Both the untyped-fire-and-forget and typed-await idioms.
+
+### 6.9 Observability and Tooling
+
+BEAM's operability is its underrated superpower: per-process introspection (mailbox depth, heap size, current function, reductions), `observer`, crash reports with stacktraces, message tracing (`dbg`, `trace:system/3`), scheduler utilization, and OTP 28's **scalable process iteration** (`processes_iterator/0` + `process_next/1`) so listing millions of processes doesn't lock the table. Native runtimes deliver analogues: Go's **pprof + execution tracer**, Tokio's **`tokio-console` + `tracing`**.
+
+**Recommendation — build from day one (a known must-have):**
+- Per-process introspection: mailbox depth, heap/arena bytes, current function (from the green-thread's saved PC + symbol table), state (running/waiting/blocked).
+- A scalable process-listing iterator (adopt OTP 28's generational-safe iteration model to avoid locking the process table).
+- Crash reports with native stacktraces (Zap controls codegen, so it can emit frame metadata for unwinding).
+- Message tracing hooks (compile-time-optional trace points on send/receive).
+- Scheduler utilization + run-queue depth counters.
+- Deadlock/starvation detection: because the scheduler owns all run queues and mailboxes, it can detect "all processes waiting, none runnable" (system deadlock) and "process starved N ticks."
+
+These hooks double as the testing hooks (6.11) — design them once.
+
+### 6.10 Distribution (Design-For, Build-Later)
+
+Early decisions that make distribution cheap later: (1) **pid structure** already carries a node id (6.7) — remote pids just have nonzero node; (2) **message format** — the copy path already serializes graphs, so a wire format is a natural extension; (3) **registry API** — keep it abstract so a distributed registry can back it; (4) **serialization hooks** — derive from Zap's static type info.
+
+**Lessons from Erlang dist:** the classic pain is **head-of-line blocking** — one big message on the single TCP connection between two nodes blocks all others; OTP 22 added **message fragmentation** (`DFLAG_FRAGMENTS`) to interleave. ETF (External Term Format) is dynamically typed and carries an atom cache. Newer takes: **Partisan** (multiple connections, avoids HOL blocking, pluggable overlays) and **Cloud Haskell** (typed channels).
+
+**Serialization format for a statically-typed language.** ETF is a poor fit (dynamic, atom-table-oriented). **Recommendation:** a **custom compact format derived from Zap's monomorphized type info** — because both ends know the static type of a typed channel, the wire format needs no per-field tags (like Cap'n Proto / a schema-driven encoding), only the payload, making it far denser than ETF. Fall back to a self-describing tagged format only for dynamic/`any` messages. Design for **multiple connections per node pair from day one** (Partisan's lesson) to avoid Erlang's HOL blocking. Security: Erlang dist is famously insecure by default (cleartext ETF, cookie auth with no MITM protection) — mandate TLS and per-node auth in the design.
+
+### 6.11 Testing and Verification
+
+**Deterministic scheduler testing.** The gold standard is **seeded/deterministic scheduling** with systematic interleaving exploration: **Loom** and **Shuttle** (Rust, randomized + DPOR-style), **Coyote/P** (C#/.NET; Coyote uses source/binary rewriting to replace concurrency primitives and systematically explore interleavings), and **FoundationDB-style deterministic simulation** (single-threaded simulated concurrency + injected faults; FDB ran >250M simulations ≈ 1870 years, 3.5M CPU-hours). Madsim (RisingWave) and Antithesis generalize this.
+
+**Recommendation — expose these hooks from day one:**
+- A **seedable scheduler**: the M:N scheduler takes a PRNG seed; in test mode it runs single-threaded and makes all scheduling/timer/message-delivery decisions from the seed → **fully reproducible** interleavings (FoundationDB's core trick). This requires the runtime to funnel *all* nondeterminism (scheduling, timers, message order across senders, `io` results) through injectable seams — Zap's `runtime_os` seam and `Io` injection already provide exactly this architecture.
+- **Fault injection**: process crashes, message drops (allowed by pairwise-FIFO's "may be lost" clause), delays — as pre-programmed simulator events (FDB's `BUGGIFY`).
+- **Concurrent Zest**: `Zest` tests spawn processes under the seeded scheduler; a failing test prints the seed for exact replay. DPOR-style bounded exploration for small process counts.
+
+**Verifier passes for concurrency lowering** (analogous to the existing ARC verifier — Constraint 8):
+- **"No borrowed value reaches a send"** — a `.borrowed`-convention value flowing into `send` is a compile error (borrowed values are caller-retained; sending them would alias across processes).
+- **"No shared value crosses a process boundary"** — except the sanctioned `Zap.Blob` immutable tier (6.4).
+- **"Moved region is closed"** — the SE-0414/Pony-`iso`-style region-closure analysis: a `move`d graph has no external in-pointers, no escaping out-pointers, and refcount == 1 (uniqueness prover).
+- **"Use-after-move across send"** — the existing move checker extended to the send boundary.
+- **"Receive patterns exhaustive over the process message union"** (6.8).
+
+## Recommendations (Staged Implementation Plan)
+
+Consistent with the stated roadmap (sync Zig fork → send/receive → spawn → reject shared/borrowed at send → deep-copy → move) and the eight constraints:
+
+**Stage 0 — Substrate (sync the Zig fork).** Pull Zig 0.16 `Io.Evented` + `Future`/`Group`/`Queue`/`Select`/`io.cancel`. Because `Io.Evented` is experimental and Linux-only, **vendor a known-good stackful-coroutine scheduler** (the `zio` design is the reference: io_uring/epoll/kqueue/IOCP + work-stealing M:N) behind Zap's `runtime_os` seam. Deliverable: green threads run on Linux; kqueue/IOCP/WASI staged and documented.
+
+**Stage 1 — MVP runtime (single scheduler, copy-only).**
+- Green-thread = process; per-process manager context (6.6) in the thread control block; global/static manager preserved for non-concurrent binaries (zero-cost).
+- Vyukov MPSC mailbox; userspace + event-loop wakeup.
+- `spawn` / `send` / `receive`/`after` lowered to `Select`; generational-index pids.
+- **Deep-copy send path** (sender allocates detachable fragment, receiver adopts) — the discipline that keeps refcounts scheduler-local.
+- Cooperative yield points (comptime-gated) at loop back-edges + prologues; per-process budget.
+- Compile-time **rejection of borrowed/shared at send** + use-after-move across send.
+- Wholesale arena/slab free on crash; external-resource drop-list.
+- Observability skeleton (mailbox depth, process list, crash stacktraces) — non-negotiable from day one.
+- Seedable single-threaded scheduler mode for deterministic Zest.
+
+**Stage 2 — Multicore + supervision.**
+- M:N work-stealing scheduler (scheduler count = cores), per-core run queues + global queue, LIFO slot, netpoller-style parking via `Io.Evented`.
+- Links, monitors, `trap_exit`, exit signals, generational pids with node-id bits; local registry.
+- Supervisors + restart strategies **in pure Zap stdlib** over minimal intrinsics (built on `Group`); defaults intensity 1 / period 5 s.
+- `spawn_link` / `spawn_monitor` / `Task.async → Future(T)`.
+- Hierarchical timing wheel per scheduler.
+- Dirty-scheduler-equivalent blocking pool for blocking FFI.
+
+**Stage 3 — Performance + expressiveness.**
+- **Move path via region re-parenting** (O(1) transfer of proven-unique, region-closed graphs); the region-closure verifier pass (SE-0414/`iso`-style).
+- **`Zap.Blob`** atomically-refcounted immutable shared byte buffer (the one sanctioned share tier).
+- Arena auto-reset for compiler-proven loop-closed server loops.
+- Typed per-process message unions + exhaustiveness verifier.
+- Ref-trick selective-receive optimization.
+- Full observability (tracing, scheduler utilization, deadlock detection).
+
+**Stage 4 — Distribution (design-for now, build later).** Custom type-derived wire format; multi-connection-per-node transport (avoid Erlang HOL blocking); TLS + auth mandatory; distributed registry.
+
+**Benchmarks/thresholds that change these recommendations:**
+- If cooperative yield points cost >2–3% on CLBG numeric benchmarks even when gated → move safepoints to loop back-edges only, or adopt the signal-watchdog design earlier.
+- If same-machine ping-pong latency is not competitive with Pony/Akka → prioritize the LIFO slot + userspace wakeup + move path.
+- If real workloads leak cyclic garbage per-process → add a per-process trial-deletion cycle collector.
+- If pure-copy p99 latency spikes on multi-KB messages → accelerate `Zap.Blob` and the region-move path.
+
+## Six Open Decisions — Resolved
+
+1. **Mailbox ordering: FIFO or priority-aware?** → **Pairwise (per-sender) FIFO**, no global order, no priority tier in v1. Rationale: exactly Erlang's guarantee, free from the Vyukov queue, matches Elixir expectations, avoids the ordering-assumption breakage EEP 76 itself warns about. Reserve an envelope flag bit for a future priority tier.
+
+2. **Mailbox overflow: unbounded vs bounded?** → **Unbounded by default + per-process heap/mailbox limit that triggers let-it-crash + observability**, with an optional per-spawn bound (`crash`/`drop_newest`/`block`). Rationale: preserves fire-and-forget and isolation; makes the failure mode safe and diagnosable rather than reintroducing producer-blocking deadlocks. Credit-flow lives in stdlib.
+
+3. **Message format: any Zap value or restricted union?** → **Any Zap value is copyable/sendable**, but **encourage a typed per-process message union** (inferred/annotated) that the verifier checks for exhaustiveness. Rationale: keeps Elixir ergonomics while offering Gleam-grade safety; the copier already handles arbitrary graphs. Closures: share code pointer, deep-copy environment.
+
+4. **Process heap sizing: fixed-with-growth or configurable?** → **Configurable per spawn, with a small default.** Default to a small initial slab (BEAM's 233-word philosophy) that grows; allow `spawn(f, .{ .initial_heap, .strategy = .arena | .arc, .max_heap })`. Rationale: Zap's manager ABI already supports per-instance parameters (6.6 option (a)); costs nothing and serves both millions-of-tiny-processes and few-big-processes workloads.
+
+5. **Move across arenas: does moved heap data physically move?** → **No physical move in v1 (copy-on-move for heap data); O(1) region re-parenting in Stage 3 for proven-unique, region-closed graphs.** Rationale: a raw pointer into the sender's arena breaks isolation when the sender dies, so v1 `move` of heap data is implemented as copy (zero-copy only for register/stack/trivial values), which is correct and simple. The principled zero-copy path is region transfer (Verona/`iso`/SE-0414), requiring the region-closure verifier — staged, with copy as the documented fallback when closure can't be proven.
+
+6. **GC per process: does ownership eliminate it?** → **Yes for v1 — no tracing GC.** ARC + per-process slab pools (default) handle acyclic and retained state; arena + auto-reset handles proven-loop-closed servers. Rationale: per-process isolation bounds any cyclic leak to a single (crashable) process, making a cycle collector safe to defer. Add a per-process trial-deletion cycle collector only if measured workloads leak.
+
+## Ranked Risk List (each with a falsifiable early experiment)
+
+**R1 (Critical) — Safepoint/yield-point overhead regresses Zap's numeric benchmark wins.** Zap wins nbody/spectral-norm; loop back-edge polls historically cost ~7.8% (Go) and disable SIMD/unrolling (JVM). *Experiment:* insert loop-back-edge budget decrements behind a comptime flag and re-run the existing CLBG suite; measure delta on nbody/spectral-norm. **Kill criterion:** >2–3% regression → restrict to prologues + watchdog signal, or emit polls only in functions that also contain a `receive`/`send`.
+
+**R2 (Critical) — Zig 0.16 `Io.Evented` immaturity blocks the substrate.** Experimental, Linux-only, unresolved io_uring perf regression; kqueue/IOCP/WASI incomplete. *Experiment:* build the ping-pong MVP on both `std.Io.Evented` and vendored `zio`; measure spawn cost and ping-pong latency; decide which to fork. **Kill criterion:** if neither hits ~1–3 µs spawn / competitive ping-pong, escalate to a bespoke scheduler.
+
+**R3 (Critical) — Non-atomic refcount safety violated by the in-flight envelope.** If any copied/moved cell's refcount is touched by two schedulers, the non-atomic-ARC edifice (Constraint 3) collapses. *Experiment:* prototype the sender-copies-into-detachable-fragment + receiver-adopts path under ThreadSanitizer/Shuttle-style race detection with adversarial concurrent send/receive; assert zero refcount races. **Kill criterion:** any cross-scheduler refcount access that isn't the sanctioned `Zap.Blob` atomic header.
+
+**R4 (High) — Region re-parenting (O(1) move) doesn't compose with the slab allocator.** The uniqueness prover may prove uniqueness but the slab pool may not support cheap detach/adopt of a slab subset. *Experiment:* prototype region re-parenting in the slab allocator — allocate a message subgraph in a dedicated slab set, detach from sender manager, adopt into receiver manager; measure it is truly O(1) and leak-free. **Kill criterion:** if detach/adopt is O(graph) anyway, keep copy-on-move and drop the O(1) claim (documented fallback per Open Decision #5).
+
+**R5 (High) — Pure copy p99 latency spikes on large messages.** If workloads pass multi-KB structures, copy cost dominates (Erlang's 64-byte threshold is evidence). *Experiment:* measure ping-pong latency vs message size (64 B → 1 MB) on the copy path; find the crossover. **Trigger:** crossover below realistic message sizes → prioritize `Zap.Blob` + region move.
+
+**R6 (Medium) — Fixed stack reservation inflates RSS where overcommit is disabled.** *Experiment:* spawn 1M idle processes on Linux (overcommit on) and a no-overcommit config; measure committed vs reserved memory. **Mitigation:** consume Zig's compile-time max-stack-size analysis to right-size reservations.
+
+**R7 (Medium) — MPSC wakeup latency dominates ping-pong.** *Experiment:* micro-benchmark wakeup latency: userspace atomic-flag vs eventfd vs io_uring `MSG_RING`. Pick per-platform.
+
+**R8 (Medium) — Selective-receive O(N²) pileups in long-mailbox server processes.** *Experiment:* implement the ref-trick receive-mark; benchmark a gen_server-style loop with a 10⁶-deep mailbox; confirm O(1) matching for correlated replies.
+
+**R9 (Low/Medium) — Cyclic leaks in long-lived processes.** *Experiment:* run long-lived server workloads under `Memory.Tracking`; measure retained cycles. **Trigger:** measurable leak → per-process trial-deletion collector.
+
+## Missing Capabilities the State of the Art Says an Actor Runtime Must Have
+
+Beyond observability (already flagged), modern experience reveals these gaps in the current plan:
+
+1. **A blocking/dirty-scheduler pool.** Any real system calls blocking FFI (crypto, DB drivers, `getaddrinfo`). Without a dirty-scheduler equivalent, one blocking call stalls a whole core scheduler (BEAM learned this → dirty schedulers in OTP 17; `Io.Evented` already uses a thread pool for DNS `getaddrinfo`). **Must-have in Stage 2.**
+
+2. **A `persistent_term` / shared-immutable-table equivalent.** Read-mostly global config/lookup tables that every process needs. Copying them into every process heap is wasteful; this is precisely what `Zap.Blob` + a global immutable registry provides. Without it, users will abuse message-passing to fake it.
+
+3. **An ETS-like shared mutable table — deliberately deferred but must be acknowledged.** BEAM's ETS is the pressure-relief valve for shared state that violates pure isolation (caches, registries, large shared datasets). Zap's isolation model forbids it by construction. *Recommendation:* explicitly document that the sanctioned substitute is (a) `Zap.Blob` for immutable shared data and (b) an owner-process holding the table and serving reads via messages. If profiling shows this bottlenecks, a concurrency-safe shared-table primitive would require its own atomic-refcount tier (a larger isolation compromise) — flag as an open research question.
+
+4. **Process hibernation.** Long-lived idle processes (connection handlers waiting on rare events) should shrink to minimal footprint. BEAM's `hibernate` does this; Zap's arena auto-reset (6.5) is the mechanism, but an explicit `hibernate` intrinsic that resets the arena and shrinks the committed stack should be a first-class API.
+
+5. **`spawn_request`/async spawn + `Task`-style typed await.** Already in the plan via `Future(T)`, but ensure the *typed reply* correlation (Gleam's `Subject`, Erlang's ref-trick) is ergonomic — the single most common real pattern (synchronous call).
+
+6. **Rolling-upgrade / hot-code-loading posture.** Zap is AOT-native, so BEAM-style hot code loading is out of scope — but the runtime **must not crash on receipt of an unknown message** (6.8), because rolling deploys transiently mix message versions. Document the message-versioning story (a version tag in the envelope / union) as a first-class concern even without hot-loading.
+
+7. **FFI/NIF safety model.** BEAM NIFs can crash the whole VM; this is a known footgun. Zap shares one OS process image, so a bad FFI call crashes everything. **Recommendation:** document the FFI safety contract (like BEAM's), provide the blocking-pool isolation, and consider (later) out-of-process ports for untrusted native code (BEAM's `Port` model) as the safe alternative.
+
+8. **Cancellation cleanup guarantees.** Structured concurrency (Trio/Kotlin/Zig `Group`) guarantees children are cleaned up on scope exit; Zap must guarantee a killed process's external resources (fds/sockets/io ops) are cancelled (`io.cancel()` → `error.Canceled`) and destructors run — the 6.5 drop-list. Without this, crashes leak OS resources even though heap is bulk-freed.
+
+## Caveats
+
+- **Go binary-size figure corrected:** emitting stack/register maps for safe-points (the Go 1.11 compiler change enabling non-cooperative preemption) increased binary sizes by **~5%**, not ~10% (Go proposal 24543, conservative inner-frame scanning doc). The ~10% figure applies to an earlier, less-optimized "safe-points everywhere" prototype. Either way, the takeaway stands: full async-preemption metadata is not free, reinforcing Zap's comptime-gated cooperative approach.
+- **Version attribution:** Erlang's *parallel signal sending optimization* (the 64-slot per-sender buffer array yielding up to 520× throughput at 16 senders, active only with `message_queue_data=off_heap`) is documented as landing in **OTP 25**, not OTP 26. The task brief's "OTP 26 parallel signal delivery" should be verified against this; the mechanism (per-sender-slotted MPSC) is what matters for Zap. OTP 28 (not 26) added `processes_iterator/0`/`process_next/1` and EEP 76 priority messages.
+- **Process footprint figure:** the authoritative current number is **327 words / 2616 bytes (OTP 27, 64-bit) including a 233-word heap+stack**; older docs cite 309 words. The "338 words" figure in the task brief could not be confirmed in official sources — treat as version/build-dependent. The 233-word initial heap is exact and current.
+- **Zig `Io.Evented` is a moving target.** All Zig 0.16 async claims are as of the 0.16 release/dev cycle (early–mid 2026) and are explicitly labeled experimental by the Zig team; backend completeness (kqueue, IOCP, minimal stack allocation, the io_uring perf regression) will change. Zap must track upstream and be prepared to fork (routine per the brief).
+- **Vale regions and Verona are research-stage.** Vale's region borrowing and hybrid-generational memory are described by its author as upcoming/not-yet-shipped; Verona is explicitly early-stage research. The *ideas* (region transfer, generational references) are sound and shipping elsewhere (Swift SE-0414 is production), so Zap should lean on the Swift/Pony proven implementations for the region-closure analysis rather than the research prototypes.
+- **Quantitative targets** (spawn ~1–3 µs, single-digit-KB footprint, competitive ping-pong) are drawn from comparable systems (Pony 256 B/actor, Go 2 KB stacks, BEAM 2616 B/process) and are *plausible* for Zap's design but **must be validated by the Stage-1 prototype** (R2) — they are targets, not measured Zap results.

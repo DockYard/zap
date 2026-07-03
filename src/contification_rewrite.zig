@@ -181,7 +181,11 @@ fn cloneInstruction(
         .call_direct => |cd| .{ .call_direct = .{ .dest = try remapDest(cd.dest, local_map, next_local), .function = cd.function, .clause_index = cd.clause_index, .args = try remapLocalSlice(allocator, cd.args, local_map), .arg_modes = try allocator.dupe(ir.ValueMode, cd.arg_modes) } },
         .call_named => |cn| .{ .call_named = .{ .dest = try remapDest(cn.dest, local_map, next_local), .name = try allocator.dupe(u8, cn.name), .args = try remapLocalSlice(allocator, cn.args, local_map), .arg_modes = try allocator.dupe(ir.ValueMode, cn.arg_modes) } },
         .call_builtin => |cb| .{ .call_builtin = .{ .dest = try remapDest(cb.dest, local_map, next_local), .name = try allocator.dupe(u8, cb.name), .args = try remapLocalSlice(allocator, cb.args, local_map), .arg_modes = try allocator.dupe(ir.ValueMode, cb.arg_modes), .result_type = cb.result_type } },
-        .optional_unwrap => |ou| .{ .optional_unwrap = .{ .dest = try remapDest(ou.dest, local_map, next_local), .source = remapLocal(ou.source, local_map) } },
+        .optional_unwrap => |ou| .{ .optional_unwrap = .{
+            .dest = try remapDest(ou.dest, local_map, next_local),
+            .source = remapLocal(ou.source, local_map),
+            .safety_check = ou.safety_check,
+        } },
         .if_expr => |ie| .{ .if_expr = .{
             .dest = try remapDest(ie.dest, local_map, next_local),
             .condition = remapLocal(ie.condition, local_map),

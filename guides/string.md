@@ -76,14 +76,23 @@ String.pad_trailing("zap", 6, ".")         # => "zap..."
 
 ```zap
 String.to_integer("42")    # => 42
+String.to_integer("nope")  # => nil
 String.to_float("3.14")    # => 3.14
+String.to_float("nope")    # => nil
 
 Integer.to_string(42)      # => "42"
 Float.to_string(3.14)      # => "3.14"
 ```
 
-These functions raise on a malformed input. If you can't trust the source,
-validate before converting.
+Numeric conversions return `T | nil`. Handle them with `case` instead of
+force-unwrapping:
+
+```zap
+case String.to_integer(input) {
+  nil -> "missing"
+  value -> Integer.to_string(value)
+}
+```
 
 ## Strings as enumerables
 

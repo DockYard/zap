@@ -44,6 +44,15 @@ pub struct Zap.FloatTest {
       assert(parsed == 3.14)
     }
 
+    test("parse valid can be handled with case pattern matching") {
+      result = case Float.parse("3.0") {
+        nil -> 0.0
+        float -> float + 1.0
+      }
+
+      assert(result == 4.0)
+    }
+
     test("parse negative") {
       parsed = Float.parse("-0.5")
       assert(parsed != nil)
@@ -52,6 +61,15 @@ pub struct Zap.FloatTest {
 
     test("parse invalid returns nil") {
       assert(Float.parse("hello") == nil)
+    }
+
+    test("parse invalid can be handled with nil case pattern") {
+      result = case Float.parse("hello") {
+        nil -> -1.5
+        float -> float
+      }
+
+      assert(result == -1.5)
     }
 
     test("round down") {

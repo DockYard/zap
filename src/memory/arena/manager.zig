@@ -22,28 +22,96 @@
 //!
 //! ## Architecture
 //!
-//! `Memory.Arena` wraps Zig 0.16's `std.heap.ArenaAllocator` backed
-//! by `std.heap.page_allocator`. Every `core.allocate` request is
-//! served from the wrapped arena; every `core.deallocate` is a no-op
-//! because the arena reclaims its backing storage in a single bulk
-//! free at process exit (see `core.deinit`). The whole-program-lifetime
-//! semantics match the Erlang/BEAM-style "process heap" model the Arena
-//! manager is intended to approximate at the binary level.
+//! `Memory.Arena` is a single-owner bump allocator over
+//! geometrically-growing chunks obtained directly from
+//! `std.heap.page_allocator`. Every `core.allocate` request is served
+//! by aligning the bump cursor, bounds-checking against the current
+//! chunk's end, and advancing the cursor — no atomics, no locks, no
+//! per-allocation buffer-list traversal. Every `core.deallocate` is a
+//! no-op because the manager reclaims its backing chunks in a single
+//! bulk teardown at process exit (see `core.deinit`). The
+//! whole-program-lifetime semantics match the Erlang/BEAM-style
+//! "process heap" model the Arena manager is intended to approximate
+//! at the binary level.
 //!
-//! ### Thread safety
+//! ### Why not `std.heap.ArenaAllocator` (historical note)
 //!
-//! Zig 0.16 made `std.heap.ArenaAllocator` lock-free via atomic
-//! linked-list operations on its `used_list` / `free_list` chains and
-//! per-node `end_index` bumps (see `lib/std/heap/ArenaAllocator.zig` in
-//! the pinned fork — `loadFirstNode`, `tryPushNode`, `stealFreeList`,
-//! `pushFreeList`, and the `@atomicRmw(.Add, .acquire)` on `end_index`
-//! in the alloc hot path). The manager therefore needs no external
-//! mutex: `core.allocate` and `core.deallocate` are safe under any
-//! degree of multi-threaded contention. Spec section 4.7 carried a
-//! historical note that `Memory.Arena` would wrap `ArenaAllocator`
-//! "with a mutex when called from the multi-threaded allocator path";
-//! that footnote pre-dates the 0.16 lock-free rewrite and is no longer
-//! applicable to this implementation.
+//! Through the Phase 5 rollout this manager wrapped Zig 0.16's
+//! `std.heap.ArenaAllocator` (backed by `page_allocator`). The 0.16
+//! stdlib arena is lock-free via atomic linked-list operations on its
+//! `used_list` / `free_list` chains and per-node `end_index` bumps
+//! (see `lib/std/heap/ArenaAllocator.zig` in the pinned fork —
+//! `loadFirstNode`, `tryPushNode`, `stealFreeList`, `pushFreeList`,
+//! and the `@atomicRmw(.Add, .acquire)` on `end_index` in the alloc
+//! hot path). Profiling the binarytrees benchmark (N=21, ReleaseFast)
+//! under that wrapper showed ~44% of all samples inside
+//! `ArenaAllocator.alloc` — an atomic RMW plus generic
+//! alignment/retry logic on every 16-byte node allocation, costing
+//! more than the benchmark's own make+check work combined. Zap's
+//! concurrency architecture makes those atomics pure waste: managers
+//! are per-process by design (BEAM-style — each process owns its
+//! manager and heap exclusively; see "Thread safety" below), so the
+//! cross-thread safety the stdlib arena pays for on every allocation
+//! can never be exercised. The wrapper was replaced with the
+//! manager-owned bump path below; chunks now come straight from
+//! `page_allocator` (option (a) of the redesign: managing chunks
+//! directly, rather than keeping the stdlib arena as a chunk source,
+//! avoids carrying two bookkeeping structures for the same memory and
+//! keeps teardown a trivial list walk).
+//!
+//! ### Chunk policy
+//!
+//! Chunks grow geometrically: the first chunk is
+//! `ARENA_FIRST_CHUNK_SIZE` (64 KiB) and each refill doubles the next
+//! chunk size up to `ARENA_MAX_CHUNK_SIZE` (8 MiB), so small scripts
+//! reserve little and huge workloads pay a bounded, amortized-O(1)
+//! refill frequency. A request too large for the standard schedule
+//! gets a dedicated, exactly-sized chunk while the current bump chunk
+//! keeps filling — an interleaved stream of large and small
+//! allocations does not churn the bump chunk. The schedule still
+//! advances on dedicated refills so a pure stream of
+//! just-over-schedule requests converges onto the bump path after at
+//! most `log2(ARENA_MAX_CHUNK_SIZE / ARENA_FIRST_CHUNK_SIZE)`
+//! dedicated chunks. Abandoned chunk tails are never written, so they
+//! cost virtual address space but no resident pages; peak RSS tracks
+//! bytes actually allocated plus one chunk header per chunk.
+//!
+//! ### Resize / remap contract
+//!
+//! The core v1.0 ABI exposes exactly two allocation slots —
+//! `core.allocate` and `core.deallocate` (spec section 4.2). There is
+//! no resize or remap slot, and the runtime never resizes
+//! manager-owned memory: the `Allocator.resize` fast paths in
+//! `src/runtime.zig` (`tryArenaExtend`, used by `String.concat`)
+//! operate on the runtime's own `runtime_arena`, and `List(T)` grow
+//! paths reallocate through their own buffer allocator. The previous
+//! `std.heap.ArenaAllocator` wrapper likewise never received resize
+//! calls — the vtable had no slot to route them through — so dropping
+//! the stdlib arena's last-allocation-resize support changes no
+//! observable behavior.
+//!
+//! ### Thread safety — single-owner invariant
+//!
+//! **This manager is single-owner by architecture.** Zap's planned
+//! concurrency model is BEAM-style per-process memory managers: each
+//! process owns its manager and heap exclusively, and no arena is
+//! ever shared across threads. Today the runtime spawns no threads at
+//! all — `core.init` is called once from `ensureMemoryStartup` on the
+//! main thread, every `core.allocate` / `core.deallocate` dispatch
+//! happens on that same thread, and `core.deinit` runs once on the
+//! normal-exit path (spec section 4.4). The bump path below is
+//! therefore deliberately non-atomic, including the refill path: there
+//! is no current call path that can reach one arena context from two
+//! threads, and the future concurrency model keeps it that way by
+//! construction (new process => new manager context). If a future
+//! runtime change ever shared one arena context across threads it
+//! would have to revisit this manager first — the module-level
+//! invariant is: ONE OWNING THREAD PER `ArenaContext`, ALWAYS.
+//! Spec section 4.7 carried a historical note that `Memory.Arena`
+//! would wrap `ArenaAllocator` "with a mutex when called from the
+//! multi-threaded allocator path"; that footnote pre-dates both the
+//! 0.16 lock-free stdlib rewrite and this single-owner bump redesign,
+//! and is not applicable to this implementation.
 //!
 //! ### No REFCOUNT_V1 capability — Phase 6 codegen elision
 //!
@@ -83,12 +151,13 @@
 //! ### Manager context lifetime
 //!
 //! The Arena manager allocates a small `ArenaContext` struct on
-//! `std.heap.page_allocator` during `core.init` to hold the
-//! `std.heap.ArenaAllocator` state. The context survives for the
-//! lifetime of the process; `core.deinit` (called on the normal-exit
-//! path — see spec section 4.4) destroys the arena's backing chunks
-//! via `arena.deinit()` and then returns the context struct itself to
-//! `page_allocator`. On abnormal-exit paths (`abort`, `panic`,
+//! `std.heap.page_allocator` during `core.init` to hold the bump
+//! cursor, the current chunk bound, the chunk teardown list, and the
+//! geometric growth schedule. The context survives for the lifetime
+//! of the process; `core.deinit` (called on the normal-exit path —
+//! see spec section 4.4) walks the chunk list, returns every chunk to
+//! the backing allocator, and then returns the context struct itself
+//! to `page_allocator`. On abnormal-exit paths (`abort`, `panic`,
 //! `std.process.exit`) the OS reclaims everything; the Arena manager
 //! has no resources that require explicit cleanup beyond the chunks
 //! the OS would already reclaim.
@@ -224,31 +293,182 @@ const SECTION_NAME = switch (builtin.target.ofmt) {
 };
 
 // ---------------------------------------------------------------------------
-// Manager context.
+// Bump-allocation chunk machinery.
 //
-// The Arena manager holds a live `std.heap.ArenaAllocator` for the
-// lifetime of the process. The context struct is page-allocator-owned
-// because the fork primitive's `link_libc = false` configuration
-// forbids `c_allocator`; see the architecture note above for the full
-// rationale.
+// The Arena manager owns its chunks directly (see the "Why not
+// `std.heap.ArenaAllocator`" architecture note above). The context
+// struct is page-allocator-owned because the fork primitive's
+// `link_libc = false` configuration forbids `c_allocator`; see the
+// architecture note above for the full rationale.
 // ---------------------------------------------------------------------------
 
-const ArenaContext = struct {
-    /// The wrapped lock-free arena. Backed by `std.heap.page_allocator`
-    /// so each underlying chunk is its own `mmap` region, matching the
-    /// "BEAM process heap" lifetime semantics — the chunks are reclaimed
-    /// wholesale by `arena.deinit()` on `core.deinit`, or by the OS on
-    /// abnormal exit.
-    arena: std.heap.ArenaAllocator,
+/// Size of the first backing chunk. Small scripts that make only a
+/// handful of `core.allocate` calls reserve a single 64 KiB chunk.
+const ARENA_FIRST_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Ceiling of the geometric chunk-growth schedule. Refill frequency
+/// for allocation-heavy workloads is amortized to one backing-
+/// allocator call per 8 MiB of demand; untouched chunk tails cost no
+/// resident pages, so a larger cap would buy nothing except virtual
+/// address-space slack per chunk.
+const ARENA_MAX_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+comptime {
+    if (!std.math.isPowerOfTwo(ARENA_FIRST_CHUNK_SIZE)) @compileError(
+        "arena: ARENA_FIRST_CHUNK_SIZE must be a power of two so doubling lands exactly on the cap",
+    );
+    if (!std.math.isPowerOfTwo(ARENA_MAX_CHUNK_SIZE)) @compileError(
+        "arena: ARENA_MAX_CHUNK_SIZE must be a power of two so doubling lands exactly on the cap",
+    );
+    if (ARENA_FIRST_CHUNK_SIZE > ARENA_MAX_CHUNK_SIZE) @compileError(
+        "arena: chunk growth schedule requires ARENA_FIRST_CHUNK_SIZE <= ARENA_MAX_CHUNK_SIZE",
+    );
+    if (ARENA_FIRST_CHUNK_SIZE <= @sizeOf(ChunkHeader)) @compileError(
+        "arena: the first chunk must have room for payload beyond its header",
+    );
+}
+
+/// Intrusive header at the base of every backing chunk. Links the
+/// chunk into the context's teardown list and records the exact byte
+/// length handed out by the backing allocator so `core.deinit` can
+/// return it verbatim (`rawFree` requires the original length and
+/// alignment).
+const ChunkHeader = struct {
+    /// Next chunk in the teardown list (most-recently-allocated first).
+    next: ?*ChunkHeader,
+    /// Total chunk length in bytes, including this header.
+    size: usize,
 };
+
+/// Per-process manager state. Field order keeps the two hot-path
+/// fields (`bump_cursor`, `chunk_end`) at the front of the struct so
+/// the fast path touches a single cache line.
+///
+/// SINGLE-OWNER INVARIANT: exactly one thread may ever use an
+/// `ArenaContext` — see the "Thread safety" module note. No field
+/// here is atomic, deliberately.
+const ArenaContext = struct {
+    /// Address of the next unallocated byte in the current chunk.
+    /// Always `<= chunk_end`. Starts at 0 (no chunk yet) — together
+    /// with `chunk_end == 0` that makes the very first allocation
+    /// take the refill path, so a process that never allocates maps
+    /// no chunk at all.
+    bump_cursor: usize,
+    /// One-past-the-end address of the current chunk (0 before the
+    /// first refill). Relies on the platform never mapping the final
+    /// page of the address space, so one-past-end cannot wrap to 0 —
+    /// the same assumption `std.heap.ArenaAllocator`'s node-end
+    /// arithmetic makes.
+    chunk_end: usize,
+    /// Teardown list of every chunk this context ever allocated,
+    /// including dedicated oversize chunks. Walked exactly once, by
+    /// `arenaDeinit`.
+    chunk_list: ?*ChunkHeader,
+    /// Next standard chunk size in the geometric schedule
+    /// (`ARENA_FIRST_CHUNK_SIZE` doubling to `ARENA_MAX_CHUNK_SIZE`).
+    next_chunk_size: usize,
+    /// Backing allocator chunks are carved from. `page_allocator` in
+    /// production (`arenaInit`); injectable so the in-file unit tests
+    /// can run the identical code paths against
+    /// `std.testing.allocator` and inherit its leak detection. Read
+    /// only on the refill, init, and teardown paths — never on the
+    /// bump fast path.
+    backing: std.mem.Allocator,
+};
+
+/// Create a fresh context on `backing`. Shared by the production
+/// `arenaInit` (which passes `page_allocator`) and the in-file tests
+/// (which pass `std.testing.allocator`); both therefore exercise the
+/// exact same initialization, refill, and teardown code.
+fn arenaContextCreate(backing: std.mem.Allocator) ?*ArenaContext {
+    const arena_ctx = backing.create(ArenaContext) catch return null;
+    arena_ctx.* = .{
+        .bump_cursor = 0,
+        .chunk_end = 0,
+        .chunk_list = null,
+        .next_chunk_size = ARENA_FIRST_CHUNK_SIZE,
+        .backing = backing,
+    };
+    return arena_ctx;
+}
+
+/// Allocate one backing chunk of exactly `chunk_size` bytes and push
+/// it onto the teardown list. The chunk is requested at
+/// `ChunkHeader`'s natural alignment only; callers guarantee payload
+/// alignment by reserving `alignment - 1` slack bytes in `chunk_size`
+/// (see `arenaAllocateFromNewChunk`), so no backing allocator needs to
+/// support over-aligned mappings.
+fn arenaChunkAllocate(arena_ctx: *ArenaContext, chunk_size: usize) ?*ChunkHeader {
+    const raw = arena_ctx.backing.rawAlloc(
+        chunk_size,
+        comptime std.mem.Alignment.of(ChunkHeader),
+        @returnAddress(),
+    ) orelse return null;
+    const chunk: *ChunkHeader = @ptrCast(@alignCast(raw));
+    chunk.* = .{
+        .next = arena_ctx.chunk_list,
+        .size = chunk_size,
+    };
+    arena_ctx.chunk_list = chunk;
+    return chunk;
+}
+
+/// Refill path — the cold side of `arenaAllocate`, taken only when
+/// the current chunk cannot satisfy the request. `noinline` keeps the
+/// hot bump path free of the refill machinery's register pressure.
+///
+/// Two cases:
+///
+///   * Standard refill: the request fits a schedule-sized chunk. The
+///     new chunk becomes the current bump chunk (abandoning the old
+///     chunk's untouched tail — no resident-page cost) and the
+///     schedule doubles toward `ARENA_MAX_CHUNK_SIZE`.
+///   * Dedicated chunk: the request is larger than the next scheduled
+///     chunk. It gets an exactly-sized chunk of its own and the
+///     current bump chunk is left in place, so interleaved small
+///     allocations keep packing densely. The schedule still advances
+///     so a stream of just-over-schedule requests converges onto the
+///     standard path (see the "Chunk policy" module note).
+///
+/// Returns null on backing-allocator OOM or arithmetic overflow of
+/// the request bounds — the spec's documented OOM signal (§4.3.1).
+noinline fn arenaAllocateFromNewChunk(
+    arena_ctx: *ArenaContext,
+    size: usize,
+    alignment: u32,
+) ?[*]u8 {
+    // Worst-case bytes a fresh chunk must hold: the header, the
+    // padding to reach `alignment` from any header end, and the
+    // payload itself. Checked arithmetic — a pathological `size` near
+    // `maxInt(usize)` must surface as OOM (null), not wrap into a
+    // too-small chunk.
+    const alignment_slack = @as(usize, alignment) - 1;
+    const payload_worst_case = std.math.add(usize, size, alignment_slack) catch return null;
+    const needed = std.math.add(usize, payload_worst_case, @sizeOf(ChunkHeader)) catch return null;
+
+    const is_standard_refill = needed <= arena_ctx.next_chunk_size;
+    const chunk_size = if (is_standard_refill) arena_ctx.next_chunk_size else needed;
+    const chunk = arenaChunkAllocate(arena_ctx, chunk_size) orelse return null;
+    arena_ctx.next_chunk_size = @min(arena_ctx.next_chunk_size * 2, ARENA_MAX_CHUNK_SIZE);
+
+    const payload_base = @intFromPtr(chunk) + @sizeOf(ChunkHeader);
+    const result_address = std.mem.alignForward(usize, payload_base, alignment);
+    std.debug.assert(result_address + size <= @intFromPtr(chunk) + chunk_size);
+    if (is_standard_refill) {
+        arena_ctx.bump_cursor = result_address + size;
+        arena_ctx.chunk_end = @intFromPtr(chunk) + chunk_size;
+    }
+    return @ptrFromInt(result_address);
+}
 
 // ---------------------------------------------------------------------------
 // Vtable functions
 // ---------------------------------------------------------------------------
 
 /// Initialise the manager. Allocates an `ArenaContext` on
-/// `page_allocator`, embeds a fresh `ArenaAllocator(page_allocator)`,
-/// and returns the pointer as the manager context per spec §4.2.
+/// `page_allocator` with an empty chunk list and returns the pointer
+/// as the manager context per spec §4.2. No chunk is mapped until the
+/// first allocation.
 ///
 /// Spec §4.2 prohibits the manager from calling its own `allocate`
 /// during init in a way that would trigger compiler-emitted allocation
@@ -258,49 +478,53 @@ const ArenaContext = struct {
 /// emitted allocation surface is reached strictly post-init.
 fn arenaInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
     _ = options;
-    const ctx = std.heap.page_allocator.create(ArenaContext) catch return null;
-    ctx.* = .{
-        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-    };
-    return @ptrCast(ctx);
+    const arena_ctx = arenaContextCreate(std.heap.page_allocator) orelse return null;
+    return @ptrCast(arena_ctx);
 }
 
-/// Deinitialise the manager. Frees every chunk the wrapped arena
-/// allocated, then returns the context struct itself to
-/// `page_allocator`. Spec §4.4 declares `deinit` best-effort — it
-/// runs only on the normal-main-return path — so the manager must not
+/// Deinitialise the manager. Walks the chunk teardown list, returns
+/// every chunk to the backing allocator, then returns the context
+/// struct itself. Spec §4.4 declares `deinit` best-effort — it runs
+/// only on the normal-main-return path — so the manager must not
 /// depend on this path executing for correctness. The Arena manager
 /// trivially satisfies that constraint: on abnormal exit the OS
 /// reclaims every `mmap`'d chunk, so the only resource that would
 /// "leak" is bookkeeping data the OS would have reclaimed anyway.
 ///
-/// ### Thread-safety of `arena.deinit()`
+/// ### Thread-safety of teardown
 ///
-/// Zig 0.16's `std.heap.ArenaAllocator.deinit` is documented as "not
-/// threadsafe" — it walks `used_list`/`free_list` without atomic
-/// fences because the deinit path assumes exclusive access. This is
-/// nonetheless safe to call here because spec §4.4 makes `deinit` a
-/// **single-threaded normal-exit-only** call: the runtime invokes
-/// `core.deinit` exactly once, from the main thread, after all
-/// program-spawned threads have either joined or been terminated by
-/// the normal-shutdown path. No concurrent `arenaAllocate` or
-/// `arenaDeallocate` can be in flight when this function runs, so the
-/// "not threadsafe" caveat does not apply. On abnormal-exit paths
-/// (`abort`, `panic`, `std.process.exit`) this function is never
-/// invoked at all — the OS reclaims the `mmap`'d chunks directly.
+/// The chunk-list walk takes no lock, consistent with the manager's
+/// single-owner invariant (see the module "Thread safety" note). Spec
+/// §4.4 additionally makes `deinit` a **single-threaded
+/// normal-exit-only** call: the runtime invokes `core.deinit` exactly
+/// once, from the main thread, after all program work has finished —
+/// no concurrent `arenaAllocate` or `arenaDeallocate` can be in
+/// flight when this function runs. On abnormal-exit paths (`abort`,
+/// `panic`, `std.process.exit`) this function is never invoked at all
+/// — the OS reclaims the `mmap`'d chunks directly.
 fn arenaDeinit(ctx: *anyopaque) callconv(.c) void {
     const arena_ctx: *ArenaContext = @ptrCast(@alignCast(ctx));
-    arena_ctx.arena.deinit();
-    std.heap.page_allocator.destroy(arena_ctx);
+    const backing = arena_ctx.backing;
+    var chunk_iter = arena_ctx.chunk_list;
+    while (chunk_iter) |chunk| {
+        const next = chunk.next;
+        const chunk_bytes: [*]u8 = @ptrCast(chunk);
+        backing.rawFree(
+            chunk_bytes[0..chunk.size],
+            comptime std.mem.Alignment.of(ChunkHeader),
+            @returnAddress(),
+        );
+        chunk_iter = next;
+    }
+    backing.destroy(arena_ctx);
 }
 
-/// Raw allocation slot — `core.allocate` (spec §4.2). Serves every
-/// request from the wrapped lock-free arena. The runtime supplies
-/// `alignment` as a power-of-two byte count (typically `@alignOf(usize)`
-/// or larger); we translate that into a `std.mem.Alignment` and call
-/// `rawAlloc` on the arena's allocator so we use the standard
-/// `Allocator.VTable` plumbing and inherit every fix that has ever
-/// landed there.
+/// Raw allocation slot — `core.allocate` (spec §4.2). The single-owner
+/// bump fast path: align the cursor, bounds-check against the current
+/// chunk end, advance the cursor, return. No atomics, no locks — see
+/// the module "Thread safety" note for why that is sound. The cold
+/// refill path (`arenaAllocateFromNewChunk`) is the only place backing
+/// memory is requested.
 ///
 /// Returning `null` on OOM matches the spec's documented signal
 /// (§4.3.1) — the runtime then aborts with the OOM diagnostic. The
@@ -309,19 +533,32 @@ fn arenaDeinit(ctx: *anyopaque) callconv(.c) void {
 fn arenaAllocate(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8 {
     const arena_ctx: *ArenaContext = @ptrCast(@alignCast(ctx));
     // Spec §4.2 contract: `alignment` is "always a power of two and at
-    // least `@alignOf(usize)`". The runtime is responsible for enforcing
-    // that — papering over a contract violation here would silently
-    // round invalid alignments up to 1 and hide the bug. Assert the
-    // contract directly so a regression surfaces immediately in
-    // `Debug` / `ReleaseSafe` builds (the only modes the fork primitive
-    // compiles managers under; see spec §10.3.1). Zero-size allocations
-    // are forwarded as-is — the arena's `alloc` asserts `n > 0`,
-    // matching the spec contract that `size > 0` is the runtime's
-    // responsibility.
+    // least `@alignOf(usize)`", and `size > 0`. The runtime is
+    // responsible for enforcing both — papering over a contract
+    // violation here would hide the bug. Assert the contract directly
+    // so a regression surfaces immediately in `Debug` / `ReleaseSafe`
+    // builds; both asserts compile to nothing under `ReleaseFast`, so
+    // the production fast path pays for neither.
     std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
-    const arena_alignment: std.mem.Alignment = .fromByteUnits(alignment);
-    const allocator = arena_ctx.arena.allocator();
-    return allocator.rawAlloc(size, arena_alignment, @returnAddress());
+    std.debug.assert(size > 0);
+    // Padding to the next `alignment` boundary, as pure bit math:
+    // `(-cursor) mod alignment`. Wrapping negation is well-defined and
+    // cannot overflow, unlike `alignForward`'s `cursor + (alignment-1)`
+    // form.
+    const padding = (0 -% arena_ctx.bump_cursor) & (@as(usize, alignment) - 1);
+    // Context invariant `bump_cursor <= chunk_end` makes this
+    // subtraction safe; the saturating add keeps a pathological `size`
+    // near `maxInt(usize)` from wrapping past the bound check (the
+    // refill path re-validates it with checked arithmetic and reports
+    // OOM).
+    const available = arena_ctx.chunk_end - arena_ctx.bump_cursor;
+    if (padding +| size > available) {
+        @branchHint(.unlikely);
+        return arenaAllocateFromNewChunk(arena_ctx, size, alignment);
+    }
+    const result_address = arena_ctx.bump_cursor + padding;
+    arena_ctx.bump_cursor = result_address + size;
+    return @ptrFromInt(result_address);
 }
 
 /// Raw deallocation slot — `core.deallocate` (spec §4.2). No-op
@@ -370,7 +607,11 @@ const ZapMemorySection = extern struct {
     core: ZapMemoryManagerCoreV1,
 };
 
-/// The section payload. Exported so the linker does not dead-strip it.
+/// The section payload. Kept `pub` so the Phase-4 source-registered
+/// dispatch path (`runtime.zig`'s `bindSourceActiveManager`) can read it
+/// directly as `active_manager.zap_memory_section`, and `@export`ed
+/// (below) in non-test builds so the linker symbol the weak-extern /
+/// driver path discovers is present and not dead-stripped.
 ///
 /// **`zap_memory_section` is a MANDATORY exported symbol name for every
 /// memory manager** — first-party and third-party alike. The runtime's
@@ -385,7 +626,7 @@ const ZapMemorySection = extern struct {
 /// `src/memory/driver.zig`'s post-link symbol check (`assertExportsManagerSymbol`).
 /// Spec section 3.2 + section 10.5 codify the requirement; this comment
 /// pins the implementation-side invariant in source.
-pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) = .{
+pub const zap_memory_section: ZapMemorySection = .{
     .meta = .{
         .magic = ZMEM_MAGIC,
         .abi_major = 1,
@@ -409,6 +650,39 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .get_capability_desc = arenaGetCapabilityDesc,
     },
 };
+
+// Emit the mandatory `zap_memory_section` LINKER SYMBOL only in non-test
+// builds. (The `pub const` above always stays visible as a Zig decl — see
+// below — so this gates ONLY the exported symbol, not the value.)
+//
+// `zap_memory_section` is a MANDATORY exported symbol (spec §3.2): the
+// runtime's `externalMemorySection` discovers it via a weak `@extern`, and
+// the driver's post-link check (`assertExportsManagerSymbol`) enforces its
+// presence in every standalone-compiled manager object. Production manager
+// objects are built by `zap_fork_compile_zig_to_object`, which is never a
+// test build, so the symbol is always present where the contract requires it.
+//
+// The value must ALSO remain a `pub const` decl unconditionally: the Phase-4
+// source-registered dispatch path (`runtime.zig`'s `bindSourceActiveManager`)
+// reads it directly as `active_manager.zap_memory_section` via `@hasDecl` —
+// a Zig-decl access, NOT the linker symbol — so a user binary that registers
+// this manager as its active source needs the decl regardless of `export`.
+//
+// Under `builtin.is_test` the SYMBOL is dead: `runtime.zig`'s
+// `externalMemorySection` early-returns null in test mode (see its
+// `if (builtin.is_test) return null;` guard), so no test ever reads the
+// section through the linker. Gating EMISSION on `!builtin.is_test` lets the
+// Arena manager be imported into the same `zig build test` binary as the
+// other first-party managers (`src/root.zig`'s aggregation) without
+// colliding on the single, strongly-linked `zap_memory_section` symbol —
+// multiple unconditional `export`s of the same name in one binary is a
+// duplicate-symbol link error. The `.section` reproduces the prior
+// `linksection(SECTION_NAME)` byte-for-byte.
+comptime {
+    if (!builtin.is_test) {
+        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // REFCOUNT_V1 panic stubs (Phase 4)
@@ -608,4 +882,177 @@ comptime {
     _ = @as(*const RetainSizedClassFn, retainSizedClass);
     _ = @as(*const ReleaseSizedClassFn, releaseSizedClass);
     _ = @as(*const RefcountSizedClassFn, refcountSizedClass);
+}
+
+// ---------------------------------------------------------------------------
+// In-file behavioural tests — bump-allocation logic.
+//
+// Aggregated into `zig build test` via `src/root.zig`'s first-party
+// manager import block (mirroring the Tracking / ARC / GC managers).
+// Every test drives the real vtable functions (`arenaAllocate`,
+// `arenaDeallocate`, `arenaDeinit`) against a context whose backing
+// allocator is `std.testing.allocator`, so the production init /
+// refill / teardown code paths run verbatim and the testing
+// allocator's leak detection proves `arenaDeinit` returns every chunk
+// AND the context struct — a leaked chunk fails the test run.
+// ---------------------------------------------------------------------------
+
+/// Count the chunks currently linked into the context's teardown list.
+fn testCountChunks(arena_ctx: *const ArenaContext) usize {
+    var count: usize = 0;
+    var chunk_iter = arena_ctx.chunk_list;
+    while (chunk_iter) |chunk| : (chunk_iter = chunk.next) count += 1;
+    return count;
+}
+
+test "arenaAllocate returns pointers honoring every supported alignment" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    const alignments = [_]u32{ 8, 16, 32, 64, 128, 256, 512, 1024, 4096 };
+    const sizes = [_]usize{ 1, 3, 8, 17, 64 };
+    for (alignments) |alignment| {
+        for (sizes) |size| {
+            const ptr = arenaAllocate(ctx, size, alignment) orelse return error.OutOfMemory;
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                @intFromPtr(ptr) % @as(usize, alignment),
+            );
+            // The returned block must be writable end to end.
+            @memset(ptr[0..size], 0xAB);
+        }
+    }
+}
+
+test "arenaAllocate serves non-overlapping writable blocks across chunk refills" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    // Allocate far more than the first chunk holds so several refills
+    // occur, filling each block with a distinct byte pattern.
+    const block_size: usize = 4096;
+    const block_count: usize = (ARENA_FIRST_CHUNK_SIZE * 8) / block_size;
+    var blocks: [block_count][*]u8 = undefined;
+    for (0..block_count) |block_index| {
+        const ptr = arenaAllocate(ctx, block_size, 8) orelse return error.OutOfMemory;
+        @memset(ptr[0..block_size], @truncate(block_index));
+        blocks[block_index] = ptr;
+    }
+    try std.testing.expect(testCountChunks(arena_ctx) > 1);
+    // Every earlier block's pattern must have survived every later
+    // allocation — any bump-cursor overlap corrupts a predecessor.
+    for (blocks, 0..) |ptr, block_index| {
+        const expected_byte: u8 = @truncate(block_index);
+        for (ptr[0..block_size]) |actual_byte| {
+            try std.testing.expectEqual(expected_byte, actual_byte);
+        }
+    }
+}
+
+test "arena chunk sizes grow geometrically and cap at ARENA_MAX_CHUNK_SIZE" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    // Doubling from 64 KiB reaches the 8 MiB cap after 7 refills;
+    // drive enough standard refills to observe the cap twice.
+    const doubling_steps = comptime std.math.log2(ARENA_MAX_CHUNK_SIZE / ARENA_FIRST_CHUNK_SIZE);
+    const target_chunk_count = comptime doubling_steps + 3;
+    const block_size: usize = 32 * 1024;
+    var iterations: usize = 0;
+    while (testCountChunks(arena_ctx) < target_chunk_count) : (iterations += 1) {
+        try std.testing.expect(iterations < 4096);
+        _ = arenaAllocate(ctx, block_size, 8) orelse return error.OutOfMemory;
+    }
+
+    // The teardown list is newest-first; collect and reverse to get
+    // allocation order.
+    var chunk_sizes: [target_chunk_count]usize = undefined;
+    var chunk_iter = arena_ctx.chunk_list;
+    var reverse_index: usize = target_chunk_count;
+    while (chunk_iter) |chunk| : (chunk_iter = chunk.next) {
+        reverse_index -= 1;
+        chunk_sizes[reverse_index] = chunk.size;
+    }
+    try std.testing.expectEqual(@as(usize, 0), reverse_index);
+
+    var expected_size: usize = ARENA_FIRST_CHUNK_SIZE;
+    for (chunk_sizes) |chunk_size| {
+        try std.testing.expectEqual(expected_size, chunk_size);
+        try std.testing.expect(chunk_size <= ARENA_MAX_CHUNK_SIZE);
+        expected_size = @min(expected_size * 2, ARENA_MAX_CHUNK_SIZE);
+    }
+}
+
+test "oversized requests get dedicated chunks and preserve the bump chunk" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    const first_small = arenaAllocate(ctx, 16, 8) orelse return error.OutOfMemory;
+    const schedule_after_first = arena_ctx.next_chunk_size;
+    const chunks_after_first = testCountChunks(arena_ctx);
+
+    // Larger than the next scheduled chunk => dedicated, exactly-sized
+    // chunk; the bump cursor must not move to it.
+    const oversized_request = schedule_after_first * 2;
+    const cursor_before_oversized = arena_ctx.bump_cursor;
+    const oversized_ptr = arenaAllocate(ctx, oversized_request, 8) orelse return error.OutOfMemory;
+    @memset(oversized_ptr[0..oversized_request], 0xCD);
+    try std.testing.expectEqual(cursor_before_oversized, arena_ctx.bump_cursor);
+    try std.testing.expectEqual(chunks_after_first + 1, testCountChunks(arena_ctx));
+    // The dedicated chunk (newest in the teardown list) is sized for
+    // exactly this request: header + alignment slack + payload.
+    const dedicated_chunk = arena_ctx.chunk_list.?;
+    try std.testing.expectEqual(
+        @sizeOf(ChunkHeader) + @as(usize, 7) + oversized_request,
+        dedicated_chunk.size,
+    );
+
+    // A subsequent small allocation continues bump-packing immediately
+    // after the first one, inside the original chunk.
+    const second_small = arenaAllocate(ctx, 16, 8) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@intFromPtr(first_small) + 16, @intFromPtr(second_small));
+}
+
+test "arenaDeallocate is a no-op and never invalidates prior allocations" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    const ptr = arenaAllocate(ctx, 64, 8) orelse return error.OutOfMemory;
+    @memset(ptr[0..64], 0x5A);
+    arenaDeallocate(ctx, ptr, 64, 8);
+    // BULK_OR_NEVER: the block stays live and untouched after the
+    // (accounting-only) deallocate call, and later allocations must
+    // not reuse it before deinit.
+    const later = arenaAllocate(ctx, 64, 8) orelse return error.OutOfMemory;
+    try std.testing.expect(@intFromPtr(later) != @intFromPtr(ptr));
+    for (ptr[0..64]) |byte| try std.testing.expectEqual(@as(u8, 0x5A), byte);
+}
+
+test "arenaAllocate reports OOM as null when the backing allocator fails" {
+    // fail_index = 1: the context struct itself allocates fine, the
+    // first chunk request fails — the spec's null OOM signal must
+    // surface instead of a panic.
+    var failing_backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const arena_ctx = arenaContextCreate(failing_backing.allocator()) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+    try std.testing.expectEqual(@as(?[*]u8, null), arenaAllocate(ctx, 16, 8));
+}
+
+test "arenaAllocate reports pathological size overflow as null" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+    // `size + alignment slack + header` overflows usize; the checked
+    // refill arithmetic must classify that as OOM (null), never wrap
+    // into a too-small chunk.
+    try std.testing.expectEqual(
+        @as(?[*]u8, null),
+        arenaAllocate(ctx, std.math.maxInt(usize) - 4, 8),
+    );
 }

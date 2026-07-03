@@ -2243,6 +2243,7 @@ fn hashInstruction(hasher: *std.hash.Wyhash, instr: ir.Instruction) void {
         .optional_unwrap => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
             hasher.update(std.mem.asBytes(&v.source));
+            hasher.update(std.mem.asBytes(&v.safety_check));
         },
         .bin_len_check => |v| {
             hasher.update(std.mem.asBytes(&v.dest));
