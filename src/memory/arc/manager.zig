@@ -460,8 +460,8 @@ const SlabHeader = extern struct {
     /// Number of currently-live slots in this slab. Decremented by
     /// `release_sized` on the zero-transition; when this drops to zero
     /// and the slab is NOT the class's `current`, the slab is either
-    /// cached as the class's lone `cached_empty` (for hot reuse) or
-    /// returned to `page_allocator`.
+    /// retained on the class's bounded empty-slab cache (for hot
+    /// reuse) or returned to `page_allocator`.
     live_count: u32,
 
     /// Free-list head (slot index). `NULL_SLOT` when the free list is
@@ -480,8 +480,10 @@ const SlabHeader = extern struct {
     capacity: u32,
 
     /// Intrusive prev/next pointers for the class's partial-slab list.
-    /// Null on both ends when the slab is not on the list (i.e., when
-    /// it is `current`, full, or in `cached_empty`).
+    /// Null on both ends when the slab is not on any list (i.e., when
+    /// it is `current` or full). The class's empty-slab cache reuses
+    /// `next` alone as its singly-linked stack link (`prev` stays null
+    /// while a slab is cached).
     prev: ?*SlabHeader,
     next: ?*SlabHeader,
 
@@ -498,32 +500,127 @@ const SlabHeader = extern struct {
     owner: *anyopaque,
 };
 
+/// Fraction divisor and absolute bounds for the per-class empty-slab
+/// cache cap (see `emptyCacheCap`). The cap is
+///
+///   clamp(live_slab_peak / EMPTY_CACHE_PEAK_DIVISOR,
+///         EMPTY_CACHE_RETAIN_FLOOR, EMPTY_CACHE_RETAIN_CEILING)
+///
+/// * `EMPTY_CACHE_PEAK_DIVISOR = 2` — retain at most half the class's
+///   historical live-slab peak. Idle retention is therefore bounded by
+///   half of what the workload itself demonstrably demanded, while an
+///   oscillation whose amplitude is any fraction up to half of peak is
+///   absorbed entirely (binarytrees N=21: peak ≈ 2560 class-0 slabs
+///   during the stretch tree, per-band teardown amplitude ≤ ~650 slabs
+///   — comfortably inside peak/2 ≈ 1280).
+/// * `EMPTY_CACHE_RETAIN_FLOOR = 2` — small working sets whose peak/2
+///   rounds to 0 or 1 may still retain two empties (128 KiB per class),
+///   covering the tiniest oscillations. The floor can never push mapped
+///   memory past the peak: the cache only ever receives slabs that were
+///   just live, so `live + cached <= peak` holds regardless (see the
+///   invariant note on `emptyCacheCap`).
+/// * `EMPTY_CACHE_RETAIN_CEILING = 1024` — bounds worst-case idle
+///   retention at 64 MiB per class (1024 × 64 KiB) for programs whose
+///   live peak was enormous in an early phase but that later shrink
+///   permanently. Large enough that benchmark-scale oscillations
+///   (tens of MiB per class) are still fully absorbed.
+const EMPTY_CACHE_PEAK_DIVISOR: u32 = 2;
+const EMPTY_CACHE_RETAIN_FLOOR: u32 = 2;
+const EMPTY_CACHE_RETAIN_CEILING: u32 = 1024;
+
 /// Per-size-class state. Each class owns its own bank of slabs; the
 /// `current` slab is the most-recently-used allocation target (slot
 /// bumps come from here first), the `partials` list holds slabs with
 /// both live cells AND free slots (a freed slot in a previously-full
-/// slab pushes it to the front), and `cached_empty` holds at most one
-/// fully-empty slab to absorb mmap thrash from hot/cold oscillation.
+/// slab pushes it to the front), and the `empty_head` stack retains a
+/// bounded number of fully-empty slabs to absorb mmap/munmap thrash
+/// from hot/cold oscillation.
+///
+/// ## Empty-slab cache policy (history and rationale)
+///
+/// The cache began life as a single `cached_empty` slot: workloads that
+/// oscillated around exactly one slab's working set avoided syscall
+/// thrash, but larger oscillations (binarytrees N=21 tears down and
+/// rebuilds hundreds of slabs per band) still paid an mmap + munmap +
+/// page-fault-zeroing round trip per slab per cycle — ~18% of profile
+/// samples. The slot was therefore generalized into a bounded LIFO
+/// stack whose cap derives from the class's live-slab high-watermark
+/// (`live_slab_peak`, see `emptyCacheCap`).
+///
+/// The watermark is tracked PER CLASS, not globally, because the pool
+/// itself is keyed per class: slabs are class-typed (slot geometry and
+/// capacity are functions of `class_index`) and never migrate between
+/// classes, so a global watermark would let one class's peak justify
+/// retaining empties in a class that never demonstrated that demand.
+/// The per-class bound `live + cached <= peak` sums to the same bound
+/// globally, which keeps the no-RSS-regression argument structural.
 const SizeClass = extern struct {
     /// The active slab — allocations pop from this slab's free list
     /// first, then bump-allocate. Switched out only when full (rotated
-    /// to the partial list) or when zero-live in `release_sized` (held
-    /// in `cached_empty`).
+    /// to the partial list) or when zero-live in `release_sized` (moved
+    /// to the empty-slab cache).
     current: ?*SlabHeader,
 
     /// Head of an intrusive doubly-linked list of slabs with both live
     /// cells AND free slots. Slabs migrate full→partial on `release_sized`
     /// and partial→current on `acquireSlab` (no allocator call). Empty
-    /// slabs leave the partial list (either to `cached_empty` or back
-    /// to the OS via `unmapSlab`).
+    /// slabs leave the partial list (either to the empty-slab cache or
+    /// back to the OS via `unmapSlab`).
     partials: ?*SlabHeader,
 
-    /// At most one fully-empty slab is held for fast reuse. Workloads
-    /// that oscillate around exactly one slab's working set avoid
-    /// mmap/munmap thrash entirely; larger working sets that exceed
-    /// this cache pay the syscall cost.
-    cached_empty: ?*SlabHeader,
+    /// LIFO stack of fully-empty slabs retained for reuse, singly
+    /// linked through `SlabHeader.next` (`prev` stays null). LIFO order
+    /// keeps the hottest — most recently touched, most likely still
+    /// resident — slab on top. Bounded by `emptyCacheCap`; excess
+    /// empties unmap immediately, exactly as every empty slab did
+    /// under the single-slot design.
+    empty_head: ?*SlabHeader,
+
+    /// Number of slabs on the `empty_head` stack. Compared against
+    /// `emptyCacheCap` on every slab-empty transition.
+    empty_count: u32,
+
+    /// Number of mapped slabs currently in service (current + partial
+    /// + full floaters) — i.e., every slab owned by this class that is
+    /// NOT on the empty stack. Incremented when a slab enters service
+    /// (fresh mmap or reuse from the empty stack), decremented when a
+    /// slab empties out of service.
+    live_slab_count: u32,
+
+    /// High-watermark of `live_slab_count` — the most slabs this class
+    /// ever had simultaneously in service. The empty-cache cap derives
+    /// from this so cached empties can only exist strictly below a
+    /// live-slab level the process already reached while the slabs
+    /// held payload: peak RSS is set by live demand, never by caching.
+    live_slab_peak: u32,
 };
+
+/// Maximum number of empty slabs `class` may retain, derived from its
+/// live-slab high-watermark (see the constant block above for the
+/// clamp rationale).
+///
+/// Structural invariant — mapped slabs never exceed the live peak:
+/// `acquireSlab` reuses a cached empty before it ever maps a fresh
+/// slab, so a fresh mmap only happens while `empty_count == 0` (mapped
+/// total == live count <= peak after the watermark update), and an
+/// empty transition merely moves a slab from live to cached (mapped
+/// total unchanged) or unmaps it (mapped total shrinks). Therefore
+/// `live_slab_count + empty_count <= live_slab_peak` at all times, no
+/// matter what this function returns — the cap only tunes how much of
+/// that already-reached headroom is retained versus returned to the OS.
+inline fn emptyCacheCap(class: *const SizeClass) u32 {
+    const peak_fraction = class.live_slab_peak / EMPTY_CACHE_PEAK_DIVISOR;
+    return @min(@max(peak_fraction, EMPTY_CACHE_RETAIN_FLOOR), EMPTY_CACHE_RETAIN_CEILING);
+}
+
+/// Record that a slab entered service (fresh mmap or reuse from the
+/// empty stack): bump the live count and advance the high-watermark.
+inline fn noteSlabEnteredService(class: *SizeClass) void {
+    class.live_slab_count += 1;
+    if (class.live_slab_count > class.live_slab_peak) {
+        class.live_slab_peak = class.live_slab_count;
+    }
+}
 
 /// Compute the byte offset to the slot array's first slot inside a
 /// slab. Derived from the header size + the side-table refcount array
@@ -569,7 +666,10 @@ inline fn slabPoolInit() SlabPool {
         pool.classes[class_index] = .{
             .current = null,
             .partials = null,
-            .cached_empty = null,
+            .empty_head = null,
+            .empty_count = 0,
+            .live_slab_count = 0,
+            .live_slab_peak = 0,
         };
     }
     return pool;
@@ -589,6 +689,15 @@ inline fn slabPoolInit() SlabPool {
 /// raw `std.posix.mmap`, which does not exist on Windows). The returned
 /// pointer doubles as the allocation base recorded in
 /// `SlabHeader.allocation_base`; `unmapSlab` frees exactly this region.
+/// Test-only slab map/unmap accounting. The in-file empty-slab-cache
+/// tests use these totals for an accounting-based leak check (every
+/// mapped slab — cached empties included — must be unmapped by
+/// `deinit`) and to prove cache reuse maps no fresh slab. The
+/// increments below compile away entirely outside `zig build test`
+/// (`builtin.is_test` is comptime-false in production manager objects).
+var test_slab_mmap_total: usize = 0;
+var test_slab_unmap_total: usize = 0;
+
 fn mmapAlignedSlab() ?[*]align(std.heap.page_size_min) u8 {
     const page_size = std.heap.page_size_min;
     // SLAB_SIZE must be a multiple of the OS page size so the
@@ -607,6 +716,7 @@ fn mmapAlignedSlab() ?[*]align(std.heap.page_size_min) u8 {
         @returnAddress(),
     ) orelse return null;
 
+    if (builtin.is_test) test_slab_mmap_total += 1;
     return @alignCast(base);
 }
 
@@ -617,6 +727,7 @@ fn unmapSlab(base: [*]align(std.heap.page_size_min) u8) void {
     const page_size = std.heap.page_size_min;
     const slab_alignment: std.mem.Alignment =
         .fromByteUnits(@max(SLAB_ALIGN, @as(usize, page_size)));
+    if (builtin.is_test) test_slab_unmap_total += 1;
     std.heap.page_allocator.rawFree(base[0..SLAB_SIZE], slab_alignment, @returnAddress());
 }
 
@@ -710,29 +821,62 @@ inline fn slabOnPartialList(class: *SizeClass, slab: *SlabHeader) bool {
     return slab.prev != null or class.partials == slab;
 }
 
-/// Acquire a slab for `class` to make active. Pulls from the cached-
-/// empty slot if present, then the partial list, then mmaps fresh.
+/// Debug-only invariant check: an empty slab's side-table refcount
+/// array is all-zero. `slabFreeSlot` zeroes each entry as the slot is
+/// freed and `slabInit` zeroed every entry past the bump cursor, so a
+/// slab whose `live_count` reached zero holds no non-zero entry — the
+/// load-bearing fact that lets `acquireSlab` reuse a cached empty slab
+/// without re-memsetting the side table.
+fn verifyEmptySlabSideTableZeroed(slab: *SlabHeader) void {
+    var slot_index: u32 = 0;
+    while (slot_index < slab.capacity) : (slot_index += 1) {
+        std.debug.assert(slabRefcountPtr(slab, slot_index).* == 0);
+    }
+}
+
+/// Acquire a slab for `class` to make active. Pulls from the empty-
+/// slab cache if non-empty, then the partial list, then mmaps fresh —
+/// strictly in that order, which is what makes the mapped-slabs-
+/// never-exceed-live-peak invariant structural (see `emptyCacheCap`).
 /// Returns null on OOM.
+///
+/// ## Reuse re-initializes metadata only
+///
+/// A slab reused from the empty cache does NOT get the fresh-mmap
+/// zero-page guarantee back, and deliberately does not emulate it:
+///
+/// * Header allocation state (`live_count`, `free_list_head`,
+///   `bump_index`, list links) is re-initialized explicitly below.
+///   The identity fields (`magic`, `class_index`, `capacity`,
+///   `allocation_base`, `owner`) survive from the original `slabInit`
+///   unchanged — a cached slab never changes class.
+/// * The side-table refcount array is already all-zero: `slabFreeSlot`
+///   zeroes each entry on free, and entries past the bump cursor were
+///   zeroed by `slabInit` and never handed out, so an empty slab holds
+///   no stale count (verified in safety-checked builds below). This is
+///   exactly the state `slabInit`'s memset establishes on a fresh
+///   mapping.
+/// * Slot payload bytes are left dirty. The allocation contract never
+///   promised zeroed payload — free-list recycling inside a live slab
+///   already returns dirty slots — so no caller may depend on it.
+///
+/// Skipping the wholesale re-zero is where the old oscillation cost
+/// went: a fresh mmap pays the kernel zero-page fault for all 64 KiB
+/// on first touch, while reuse touches only the header.
 fn acquireSlab(pool: *SlabPool, class_index: u32) ?*SlabHeader {
     const class = &pool.classes[class_index];
 
-    if (class.cached_empty) |cached| {
-        class.cached_empty = null;
-        // Reset bump cursor — the cached slab's live_count was 0 when
-        // it was cached; re-bump from zero on reuse so the side-table
-        // contents (which were zeroed at init and may have been
-        // mutated since) are written fresh by `allocate_refcounted`.
+    if (class.empty_head) |cached| {
+        class.empty_head = cached.next;
+        std.debug.assert(class.empty_count > 0);
+        class.empty_count -= 1;
+        noteSlabEnteredService(class);
         cached.live_count = 0;
         cached.free_list_head = NULL_SLOT;
         cached.bump_index = 0;
         cached.prev = null;
         cached.next = null;
-        // Re-zero the side-table — a previously-used slab has dirty
-        // refcount entries from prior allocations.
-        const ref_ptr_byte: [*]u8 = @ptrCast(cached);
-        const refcount_bytes_ptr = ref_ptr_byte + @sizeOf(SlabHeader);
-        const refcount_bytes_count: usize = @as(usize, cached.capacity) * @sizeOf(u32);
-        @memset(refcount_bytes_ptr[0..refcount_bytes_count], 0);
+        if (std.debug.runtime_safety) verifyEmptySlabSideTableZeroed(cached);
         return cached;
     }
 
@@ -744,6 +888,7 @@ fn acquireSlab(pool: *SlabPool, class_index: u32) ?*SlabHeader {
     const aligned_base = mmapAlignedSlab() orelse return null;
     const slab: *SlabHeader = @ptrCast(@alignCast(aligned_base));
     slabInit(slab, class_index, @ptrCast(class), aligned_base);
+    noteSlabEnteredService(class);
     return slab;
 }
 
@@ -798,22 +943,32 @@ fn slabFreeSlot(pool: *SlabPool, slab: *SlabHeader, slot_index: u32) void {
     slab.free_list_head = slot_index;
     std.debug.assert(slab.live_count > 0);
     slab.live_count -= 1;
-    // Reset the side-table refcount so the slot's next allocation
-    // begins from a known-zero baseline (the allocator overwrites it
-    // anyway, but a zeroed entry is friendlier for any future
-    // diagnostic that walks the side table for debugging).
+    // Reset the side-table refcount. This zeroing is LOAD-BEARING for
+    // the empty-slab cache: because every freed slot's entry returns
+    // to zero here (and entries past the bump cursor were zeroed by
+    // `slabInit`), a slab that empties out carries an all-zero side
+    // table, which is what lets `acquireSlab` reuse a cached empty
+    // slab with a metadata-only re-init instead of a side-table memset.
     slabRefcountPtr(slab, slot_index).* = 0;
 
     if (slab == class.current) return;
 
     if (slab.live_count == 0) {
-        // Drain the slab from the partial list if it was on it; then
-        // either cache it or unmap.
+        // Drain the slab from the partial list if it was on it; the
+        // slab is leaving service either way.
         if (slabOnPartialList(class, slab)) {
             unlinkPartial(class, slab);
         }
-        if (class.cached_empty == null) {
-            class.cached_empty = slab;
+        std.debug.assert(class.live_slab_count > 0);
+        class.live_slab_count -= 1;
+        // Retain the empty slab for reuse while the cache is below its
+        // watermark-derived cap; past the cap, excess empties unmap
+        // immediately — the exact pre-cache behaviour.
+        if (class.empty_count < emptyCacheCap(class)) {
+            slab.prev = null;
+            slab.next = class.empty_head;
+            class.empty_head = slab;
+            class.empty_count += 1;
         } else {
             unmapSlab(slab.allocation_base);
         }
@@ -968,10 +1123,10 @@ fn arcInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
 /// Deinitialise the manager. Walks every class's slab list and
 /// returns each slab to the OS. Frees the context struct last.
 ///
-/// Spec §4.4 makes `deinit` best-effort. The slab pool's eager
-/// unmap-on-zero-live policy keeps the deinit-time slab count small
+/// Spec §4.4 makes `deinit` best-effort. The slab pool's bounded
+/// unmap-on-zero-live policy keeps the deinit-time slab count modest
 /// in well-behaved programs; the loop below handles the residual
-/// (cached-empty + current + partial slabs of every class).
+/// (current + partial + every cached empty slab of every class).
 fn arcDeinit(ctx: *anyopaque) callconv(.c) void {
     const arc_ctx: *ArcContext = @ptrCast(@alignCast(ctx));
     var class_index: u32 = 0;
@@ -985,10 +1140,11 @@ fn arcDeinit(ctx: *anyopaque) callconv(.c) void {
             class.partials = slab.next;
             unmapSlab(slab.allocation_base);
         }
-        if (class.cached_empty) |slab| {
+        while (class.empty_head) |slab| {
+            class.empty_head = slab.next;
             unmapSlab(slab.allocation_base);
-            class.cached_empty = null;
         }
+        class.empty_count = 0;
     }
     std.heap.page_allocator.destroy(arc_ctx);
 }
@@ -1476,4 +1632,180 @@ test "ARC class-specialized helpers interoperate with generic sized refcount slo
     try std.testing.expectEqual(@as(u32, 1), refcountSizedClass(ctx, slot_ptr, class_index));
 
     releaseSized(ctx, slot_ptr, @sizeOf(Payload), @alignOf(Payload), null);
+}
+
+// ---------------------------------------------------------------------------
+// Empty-slab cache tests
+//
+// These tests exercise the bounded empty-slab cache through the public
+// allocate/deallocate surface and verify its internal accounting through
+// the in-file `ArcContext` view. They use the largest slab class
+// (4096-byte slots) so a slab fills after only a handful of allocations
+// and multi-slab scenarios stay small and fast.
+// ---------------------------------------------------------------------------
+
+/// Slab class used by the empty-slab cache tests: the 4096-byte class
+/// has the smallest per-slab capacity, keeping multi-slab workloads to
+/// a few dozen allocations.
+const test_empty_cache_class_index: u32 = lookupClass(4096, 8).?;
+const test_empty_cache_slab_capacity: u32 = capacityForClass(test_empty_cache_class_index);
+
+fn testEmptyCacheClass(ctx: *anyopaque) *SizeClass {
+    const arc_ctx: *ArcContext = @ptrCast(@alignCast(ctx));
+    return &arc_ctx.slab_pool.classes[test_empty_cache_class_index];
+}
+
+fn testAllocEmptyCacheSlot(ctx: *anyopaque) ![*]u8 {
+    return allocate(ctx, 4096, 8) orelse error.OutOfMemory;
+}
+
+fn testFreeEmptyCacheSlot(ctx: *anyopaque, slot: [*]u8) void {
+    deallocate(ctx, slot, 4096, 8);
+}
+
+test "ARC empty-slab cache: live-slab watermark rises on growth and falls on teardown" {
+    const ctx = init(null) orelse return error.OutOfMemory;
+    defer deinit(ctx);
+    const class = testEmptyCacheClass(ctx);
+
+    const slab_capacity = test_empty_cache_slab_capacity;
+    var slots: [2 * test_empty_cache_slab_capacity][*]u8 = undefined;
+
+    // Fill one slab plus one slot of a second slab: two live slabs.
+    for (&slots) |*slot| slot.* = try testAllocEmptyCacheSlot(ctx);
+    try std.testing.expectEqual(@as(u32, 2), class.live_slab_count);
+    try std.testing.expectEqual(@as(u32, 2), class.live_slab_peak);
+    try std.testing.expectEqual(@as(u32, 0), class.empty_count);
+
+    // Free the first slab's slots: it empties and moves live -> cached,
+    // so the live count falls while the watermark holds.
+    for (slots[0..slab_capacity]) |slot| testFreeEmptyCacheSlot(ctx, slot);
+    try std.testing.expectEqual(@as(u32, 1), class.live_slab_count);
+    try std.testing.expectEqual(@as(u32, 2), class.live_slab_peak);
+    try std.testing.expectEqual(@as(u32, 1), class.empty_count);
+
+    // Rebuild the working set: the cached slab returns to service, so
+    // the live count rises WITHOUT raising the watermark (reuse is not
+    // new peak demand).
+    for (slots[0..slab_capacity]) |*slot| slot.* = try testAllocEmptyCacheSlot(ctx);
+    try std.testing.expectEqual(@as(u32, 2), class.live_slab_count);
+    try std.testing.expectEqual(@as(u32, 2), class.live_slab_peak);
+    try std.testing.expectEqual(@as(u32, 0), class.empty_count);
+
+    for (&slots) |slot| testFreeEmptyCacheSlot(ctx, slot);
+}
+
+test "ARC empty-slab cache: cache is bounded by the watermark cap and excess slabs unmap" {
+    const ctx = init(null) orelse return error.OutOfMemory;
+    defer deinit(ctx);
+    const class = testEmptyCacheClass(ctx);
+
+    const slab_count = 8;
+    var slots: [slab_count * test_empty_cache_slab_capacity][*]u8 = undefined;
+    for (&slots) |*slot| slot.* = try testAllocEmptyCacheSlot(ctx);
+    try std.testing.expectEqual(@as(u32, slab_count), class.live_slab_count);
+    try std.testing.expectEqual(@as(u32, slab_count), class.live_slab_peak);
+
+    // Free everything. Seven non-current slabs empty out; the cap
+    // (peak/2 = 4) retains four of them and the excess three unmap.
+    // The eighth slab stays `current` and is never cached.
+    for (&slots) |slot| testFreeEmptyCacheSlot(ctx, slot);
+    try std.testing.expectEqual(@as(u32, slab_count / 2), class.empty_count);
+    try std.testing.expectEqual(@as(u32, 1), class.live_slab_count);
+    try std.testing.expectEqual(@as(u32, slab_count), class.live_slab_peak);
+
+    // Structural RSS bound: mapped slabs (live + cached) never exceed
+    // the class's historical live peak.
+    try std.testing.expect(class.live_slab_count + class.empty_count <= class.live_slab_peak);
+}
+
+test "ARC empty-slab cache: reused slabs are metadata-reinitialized and serve valid slots" {
+    const ctx = init(null) orelse return error.OutOfMemory;
+    defer deinit(ctx);
+    const class = testEmptyCacheClass(ctx);
+
+    const slab_capacity = test_empty_cache_slab_capacity;
+    var slots: [2 * test_empty_cache_slab_capacity][*]u8 = undefined;
+    for (&slots) |*slot| slot.* = try testAllocEmptyCacheSlot(ctx);
+
+    // Empty the first slab so it lands on the empty cache; remember its
+    // base so reuse can be proven by address identity.
+    const first_slab = slabFromSlotPtr(slots[0]);
+    for (slots[0..slab_capacity]) |slot| testFreeEmptyCacheSlot(ctx, slot);
+    try std.testing.expectEqual(@as(u32, 1), class.empty_count);
+
+    const mmap_before_reuse = test_slab_mmap_total;
+
+    // The current (second) slab is full, so the next allocation must
+    // rotate to a fresh slab — which must come from the empty cache,
+    // not a new mapping.
+    var reused_slots: [test_empty_cache_slab_capacity][*]u8 = undefined;
+    for (&reused_slots) |*slot| {
+        const slot_bytes = allocateRefcounted(ctx, 4096, 8) orelse return error.OutOfMemory;
+        slot.* = slot_bytes;
+        try std.testing.expectEqual(first_slab, slabFromSlotPtr(slot_bytes));
+        try std.testing.expectEqual(@as(u32, 1), refcountSized(ctx, slot_bytes, 4096, 8));
+    }
+    try std.testing.expectEqual(mmap_before_reuse, test_slab_mmap_total);
+    try std.testing.expectEqual(@as(u32, 0), class.empty_count);
+
+    // Header invariants after reuse: magic and geometry intact, the
+    // bump cursor consumed the whole slab, every slot live.
+    try std.testing.expectEqual(SLAB_MAGIC, first_slab.magic);
+    try std.testing.expectEqual(test_empty_cache_class_index, first_slab.class_index);
+    try std.testing.expectEqual(slab_capacity, first_slab.capacity);
+    try std.testing.expectEqual(slab_capacity, first_slab.live_count);
+    try std.testing.expectEqual(slab_capacity, first_slab.bump_index);
+    try std.testing.expectEqual(NULL_SLOT, first_slab.free_list_head);
+
+    // Retain/release cycles on reused slots behave normally.
+    retainSized(ctx, reused_slots[0], 4096, 8);
+    try std.testing.expectEqual(@as(u32, 2), refcountSized(ctx, reused_slots[0], 4096, 8));
+    releaseSized(ctx, reused_slots[0], 4096, 8, null);
+    try std.testing.expectEqual(@as(u32, 1), refcountSized(ctx, reused_slots[0], 4096, 8));
+
+    for (&reused_slots) |slot| releaseSized(ctx, slot, 4096, 8, null);
+    for (slots[slab_capacity..]) |slot| testFreeEmptyCacheSlot(ctx, slot);
+}
+
+test "ARC empty-slab cache: deinit returns every cached slab to the OS" {
+    const mmap_baseline = test_slab_mmap_total;
+    const unmap_baseline = test_slab_unmap_total;
+
+    {
+        const ctx = init(null) orelse return error.OutOfMemory;
+        defer deinit(ctx);
+        const class = testEmptyCacheClass(ctx);
+
+        // Oscillate: build four slabs, tear them down, leaving cached
+        // empties plus the current slab for deinit to reclaim.
+        var slots: [4 * test_empty_cache_slab_capacity][*]u8 = undefined;
+        for (&slots) |*slot| slot.* = try testAllocEmptyCacheSlot(ctx);
+        for (&slots) |slot| testFreeEmptyCacheSlot(ctx, slot);
+        try std.testing.expect(class.empty_count > 0);
+    }
+
+    // Accounting-based leak check: every slab mapped during the block
+    // (including all cached empties) was unmapped by teardown.
+    try std.testing.expectEqual(
+        test_slab_mmap_total - mmap_baseline,
+        test_slab_unmap_total - unmap_baseline,
+    );
+}
+
+test "ARC empty-slab cache: a workload that never oscillates caches no empties" {
+    const ctx = init(null) orelse return error.OutOfMemory;
+    defer deinit(ctx);
+    const class = testEmptyCacheClass(ctx);
+
+    const slab_count = 5;
+    var slots: [slab_count * test_empty_cache_slab_capacity][*]u8 = undefined;
+    for (&slots) |*slot| {
+        slot.* = try testAllocEmptyCacheSlot(ctx);
+        // Growth-only allocation never produces an empty slab, so the
+        // cache stays empty for the entire run.
+        try std.testing.expectEqual(@as(u32, 0), class.empty_count);
+    }
+    try std.testing.expectEqual(@as(u32, slab_count), class.live_slab_count);
+    try std.testing.expectEqual(@as(u32, slab_count), class.live_slab_peak);
 }
