@@ -442,6 +442,37 @@ spawn). `libzap_compiler.a` was rebuilt with the fix. The E1 `Io.Evented`
 *performance* verdict and the `deinit` compile error (crash 3) are
 unaffected.
 
+**Erratum (round 2, 2026-07-04, fork `6a425dbaeb`):** the round-1 "full
+audit" above used the wrong resolution criterion (it compared against
+LLVM's register *names* generally, not against what
+`TargetLowering::getRegForInlineAsmConstraint` actually resolves: the
+TableGen *def* name of registers that are members of register classes with
+target-legal value types, case-insensitive, plus per-target overrides).
+Re-auditing against LLVM 21 sources with the correct criterion found:
+(1) x86 `cc` and `rflags` were still silently dropped — the flags state
+*is* modeled (EFLAGS ∈ CCR; the spelling `flags` resolves via X86's
+override), so round 1's "unmodeled/harmless" classification was false;
+both now translate to `flags`, and `std.Io.fiber.contextSwitch`'s
+`.rflags` clobber verifiably reaches LLVM as `~{flags}` on x86_64. In
+practice the drop was masked by the Clang-compat `~{dirflag},~{fpsr},
+~{flags}` trailer Zig appends to every x86 asm (round 1's claim that "Zig
+appends nothing" was also wrong), so no x86_64 fiber miscompile was live —
+but correctness no longer depends on that trailer. (2) Round 1's aarch64
+SME tile maps (`za{N}{s} → za{s}{N}`), riscv `vcsr → vxrm+vxsat`, and
+sparc `ccr/xcc → icc` were all *no-ops* (targets of the translations
+resolve nowhere: untyped register classes / no class membership); tiles
+now widen to the resolvable `~{za}` (sound over-approximation), and the
+dead riscv/sparc translations were removed with corrected rationale
+(sparc condition codes are modeled but unreachable by any clobber
+spelling — a Clang-shared upstream limitation, not "unmodeled"). (3) New:
+lanai `sw → sr` (status word is modeled; round 1 called it unmodeled).
+aarch64 x29/x30 → fp/lr and the arm/avr/msp430/ve/mips maps re-verified
+effective under the correct criterion. New `test-llvm-ir` end-to-end cases
+pin the emitted constraint strings (x86_64 `rflags`/`cc` → `~{flags}`,
+fiber `contextSwitch` on x86_64, aarch64 `~{fp},~{lr}`, tile → `~{za}`).
+Compiler + `libzap_compiler.a` rebuilt; aarch64 unaffected — E9
+`fiber_switch` floors reproduce (2.98–3.32 ns one-way, spawn min 8.46 ns).
+
 ### Fiber-switch floor (ReleaseFast, median / min per-op ns, 5 reps)
 
 | Metric | Median | Min | Load (1-min) |
