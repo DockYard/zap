@@ -159,11 +159,113 @@ build). These are **not** the E2 reference numbers; the table above is.
 
 (Medians in seconds; bold marks where Zap leads or ties the field.)
 
-## E1 — spawn/ping-pong
+## E1 — spawn/ping-pong (S0.2, 2026-07-04)
 
-*Reserved — filled by the Phase 0 S0.2 spike (re-measured in Phases 1 and 4).
-Targets: sub-µs–3 µs spawn; same-scheduler RTT within 2–3× BEAM/Go. Report
-per-manager — spawn cost is manager-dependent.*
+Fork `std.Io` backend micro-benchmarks: `Io.Evented` (resolves to the
+Dispatch/GCD backend on macOS) vs `Io.Threaded`. Re-measured in Phases 1
+and 4; spawn cost is manager-dependent, so later phases report per-manager.
+
+### Methodology
+
+- **Date:** 2026-07-04. Same machine as the S0.1 baseline above (Apple M4,
+  10 cores, 32 GB, macOS 26.2).
+- **Benchmark:** `spike/concurrency-e1/bench.zig` (throwaway spike; see its
+  README), compiled with the asdf Zig 0.16.0 binary against the fork's std
+  (`~/projects/zig` working tree of this date):
+
+  ```sh
+  zig build-exe --zig-lib-dir $HOME/projects/zig/lib -OReleaseFast bench.zig
+  ```
+
+- **Protocol:** one measurement at a time, foreground; unrecorded warmup pass
+  (workload/10, min 1000 ops) then 5 timed repetitions; median + min of
+  per-op ns reported. Timing via `CLOCK_UPTIME_RAW` directly, never through
+  the `Io` vtable under test. `uptime` recorded immediately before every
+  timed run; other agent sessions were active — 1-minute load average ranged
+  **3.8–5.2** across the timed runs, so minima are the load-robust floor
+  (same caveat as S0.1).
+- **Workloads:** spawn benches = 100,000 trivial tasks (`spawn` = `Io.async`
+  with ≤64 futures in flight; `spawn-serial` = spawn then await immediately;
+  `spawn-group` = `Io.Group.async` batch, awaited once). `pingpong` =
+  100,000 round trips of a `u64` token through two capacity-1
+  `Io.Queue(u64)`s between two `Io.concurrent` actors. `queue` = 1,000,000
+  non-blocking putOne/getOne pairs on one task (floor reference).
+- The ≤64-future window exists because each Dispatch fiber reserves ~60 MB
+  of lazily-committed address space (`Io/Dispatch.zig` `Fiber.min_stack_size`
+  = 60 MiB); 100k in-flight fibers is not addressable. This is itself an E1
+  finding: Dispatch fibers are far too heavy for BEAM-style process counts.
+- `Io.Threaded` defaults: worker pool = cpu_count − 1 = 9 threads;
+  `Io.async` runs tasks **inline** when the pool is saturated (the `eager`
+  fraction below), so its spawn number mixes queued and inline completions.
+
+### Results (ReleaseFast, median / min per-op ns, 5 reps each)
+
+| Metric | `Io.Evented` (Dispatch) | `Io.Threaded` | Load (1-min) |
+|---|---:|---:|---|
+| spawn, windowed ≤64 (`Io.async`+await, ns/task) | 30,149 / 26,744 | 2,219 / 1,441 | 3.8 / 4.7 |
+| spawn, serial (spawn→await round trip, ns/task) | 7,896 / 4,126 | 4,316 / 2,660 | 5.0 / 4.7 |
+| spawn, `Io.Group.async` batch (ns/task) | **SIGSEGV** (crash 1 below) | 451 / 63 | — / 4.4 |
+| ping-pong RTT (ns/round-trip) | **SIGSEGV** (crash 2 below) | 3,430 / 2,879 | — / 4.2 |
+| queue floor (ns per put+get pair, non-blocking) | 13.1 / 13.1 | 16.4 / 16.3 | 4.3 / 4.1 |
+
+`Io.Threaded` spawn eager-inline fraction ranged 3.6–23% across windowed
+reps (0% for serial/pingpong). Threaded ping-pong is a genuine cross-thread
+wakeup: each `Io.concurrent` actor gets a dedicated pool thread.
+
+Debug-build characterization (because Evented crashes at ReleaseFast):
+Evented ping-pong at `-ODebug` completes at **37,289 / 37,161 ns/RTT**
+(2,000 round trips, 5 reps), while Threaded ping-pong at `-ODebug` is
+2,243 / 2,201 ns/RTT — i.e. Debug overhead on this bench is negligible, so
+~37 µs/RTT is representative of Dispatch's blocking-queue suspend/wakeup
+cost even before the crash is fixed. Evented `spawn-group` at `-ODebug`
+runs but pathologically: ~32–45 **ms** per trivial task (likely interacting
+with the backend's 10 ms timer leeway).
+
+### Backend failures found (exact reproductions)
+
+All against `spike/concurrency-e1/bench.zig` compiled as above.
+
+1. **Dispatch `Group.async` segfault (ReleaseFast).**
+   `./bench evented spawn-group 2000 2 200` → SIGSEGV (exit 139), before any
+   rep completes. Works at `-ODebug` (but see pathology above).
+2. **Dispatch blocking-queue fiber suspend/resume segfault (ReleaseFast and
+   ReleaseSafe).** `./bench evented pingpong 1 1 0` — a *single* round trip —
+   dies deterministically with SIGSEGV; ReleaseSafe prints a garbage fault
+   address (e.g. `0xa907a3e0910043e8`, PAC-looking), and the crash handler
+   cannot unwind (corrupted fiber context). Identical logic completes at
+   `-ODebug`. Non-blocking fiber paths (spawn/await, non-blocking queue ops)
+   work at ReleaseFast, so the break is specific to fibers suspending on a
+   `Io.Queue` condition and being resumed from another fiber/thread under
+   optimized codegen.
+3. **`Io.Evented.deinit` does not compile.** `Io/Dispatch.zig:584` passes
+   `ev.main_loop_stack[0..main_loop_stack_size]` — comptime-known length, so
+   type `*[8192]u8` (pointer-to-array, not a slice) — to `Allocator.free`,
+   whose comptime assert (`slice_info.size == .slice`) fails whenever
+   `deinit` is referenced. The spike skips `deinit` on the evented path.
+
+### Verdict vs plan targets and yardstick
+
+**Fail on both backends; escalate per the plan's kill criterion.** Targets
+were sub-µs–3 µs spawn and same-scheduler RTT within 2–3× BEAM/Go (BEAM:
+sub-µs spawn, sub-µs same-scheduler send). `Io.Threaded` is the better
+substrate but sits at the edge or outside the band: windowed spawn
+2.2 µs median (1.4 µs min) is inside 3 µs only via inline-execution mixing,
+serial spawn is 4.3 µs, and ping-pong RTT of 3.4 µs median / 2.9 µs min is
+**>3× BEAM's sub-µs send** and well above Tokio's low-ns mpsc.
+`Io.Evented` (Dispatch) fails outright: ~30 µs per windowed spawn (60 MB
+address-space reservation + mmap/munmap + GCD enqueue per fiber), ~37 µs/RTT
+even in the Debug-only configuration that survives, two distinct optimized-
+build segfaults on exactly the paths a message-passing runtime hammers
+(blocking queue suspend/resume, group spawn), and a deinit that does not
+compile — it is not a viable scheduler substrate in its current state. The
+13–16 ns non-blocking queue floor shows the queue data structure itself is
+fine; the cost lives in task/fiber suspension and wakeup. Per the E1 kill
+criterion (≥1–3 µs spawn or RTT >3× BEAM/Go), the S0.5 memo should
+**escalate to the bespoke run-queue scheduler on `fiber.zig`** rather than
+driving processes through `Io.async`/`Io.Queue` as-is; the Dispatch fiber
+fixes (crashes, 60 MB stacks, deinit) are needed regardless for the fork's
+I/O story, but even a fixed Dispatch backend's cost structure (GCD enqueue
+µs-scale, per the yardstick table) cannot reach BEAM-class spawn/send.
 
 ## E9 — Dispatch vs Kqueue (Darwin)
 
