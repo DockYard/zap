@@ -273,6 +273,75 @@ fixes (crashes, 60 MB stacks, deinit) are needed regardless for the fork's
 I/O story, but even a fixed Dispatch backend's cost structure (GCD enqueue
 µs-scale, per the yardstick table) cannot reach BEAM-class spawn/send.
 
+### Post-clobber-fix re-measurement (S0.5, 2026-07-04)
+
+The table above was measured with the aarch64 clobber-emission bug present
+(E9's FORK BUG finding: `~{x29}`/`~{x30}` silently dropped, so **every
+optimized build of fiber code was miscompiled**, including all Evented rows).
+After the fork fix (`74c0b87fe5`), the Evented cases were re-run to complete
+the E1 record. **The post-fix rows below supersede the pre-fix Evented rows
+as the E1 record**; the pre-fix Evented numbers were produced under
+miscompilation and are kept only as history.
+
+- **Build:** same `bench.zig` (unchanged, sha as committed), compiled with
+  the **fixed fork compiler binary itself** —
+  `~/projects/zig/zig-out/bin/zig build-exe --zig-lib-dir ~/projects/zig/lib
+  -OReleaseFast bench.zig` (fork @ `74c0b87fe5`, clean tree) — not the asdf
+  0.16.0 binary used pre-fix. Two Threaded rows were re-run with the same
+  compiler as an apples-to-apples cross-check.
+- **Protocol:** unchanged (one measurement at a time, foreground, warmup then
+  5 timed reps, `CLOCK_UPTIME_RAW`, `uptime` before every run). 1-minute
+  load average ranged **1.5–2.2** across all runs — the quietest E1 session
+  (pre-fix was 3.8–5.2), so part of any improvement is load, not the fix.
+- **Crash-repro confirmation:** both former deterministic segfaults are gone
+  on this exact binary — `./bench evented pingpong 1 1 0` completes
+  (228 µs first-op, includes actor startup) and
+  `./bench evented spawn-group 2000 2 200` completes (24,962/24,521
+  ns/task). E9's root-cause is confirmed on the E1 workload itself.
+
+| Metric (median / min per-op ns, 5 reps) | Evented pre-fix | Evented **post-fix** | Threaded post-fix (cross-check) |
+|---|---:|---:|---:|
+| spawn, windowed ≤64 (ns/task) | 30,149 / 26,744 | 19,117 / 16,600 | 1,382 / 1,372 (eager 0.6–1.2%) |
+| spawn, serial (ns/task) | 7,896 / 4,126 | 19,840 / 19,625 † | — |
+| spawn, `Group.async` batch (ns/task) | SIGSEGV | 24,671 / 24,417 | — |
+| ping-pong RTT (ns/round-trip) | SIGSEGV (~37,289 at `-ODebug`) | **1,012 / 947** | 1,792 / 1,770 |
+| queue floor (ns per put+get pair) | 13.1 / 13.1 | 8.7 / 8.4 | — |
+
+† **New residual Dispatch bug (intermittent, race-like).** `evented
+spawn-serial` at the default workload (100k ops × 5 reps) SIGSEGV'd mid-run
+in **3 of 5** attempts (twice after rep 1, once after rep 3); it also
+crashed once at `2000 3 200` (2 of 3 attempts at that invocation passed).
+Single-rep probes at 100/500/1,000/1,500/2,000/4,000/10,000 ops (multiple
+attempts each) all passed. The signature is distinct from the fixed clobber
+crashes, which were deterministic on the *first* op; this one needs volume
+and is probabilistic — consistent with upstream's "explicitly experimental"
+label on these backends. The † medians are from the 2 completed full runs
+(19,840.3/19,624.7 and 19,851.7/19,727.2 — <0.1% apart). The
+`Io.Evented.deinit` compile error (crash 3) is unchanged.
+
+**Does this change the E1 verdict?** One sub-verdict changes materially;
+the overall verdict does not.
+
+- **RTT sub-verdict corrected.** Post-fix Dispatch ping-pong is
+  **1.01 µs median / 0.95 µs min per RTT** — inside the 2–3×-BEAM target
+  band and *better than Threaded* (1.79 µs) on the same session. The
+  pre-fix characterization (~37 µs from the Debug-only run) reflected the
+  Debug pathology, not the optimized fiber handoff; the earlier claim that
+  "even a fixed Dispatch backend's cost structure cannot reach BEAM-class
+  send" is **withdrawn for send/RTT**.
+- **Spawn verdict stands, and it is architectural.** All three spawn shapes
+  sit at **17–25 µs/task** post-fix — 6–25× outside the sub-µs–3 µs target
+  — because the costs are structural, not bugs: ~60 MiB address-space
+  reservation per fiber (`Io/Dispatch.zig` `Fiber.min_stack_size`), a fresh
+  stack mmap per spawn (E9 measured that alone at 1.65 µs), and a GCD
+  enqueue per task (µs-scale per the yardstick table). None of that is
+  touched by the clobber fix.
+- **Overall: fail on spawn → the escalation to a bespoke run-queue
+  scheduler on `fiber.zig` stands**, now resting on spawn architecture,
+  scheduling control (budgets/LIFO slot/determinism — see the S0.5 memo,
+  implementation-plan Appendix A), and the residual intermittent crash —
+  not on Dispatch's send path, which the fix vindicated.
+
 ## E9 — fiber-switch floor + Darwin wakeup mechanism (S0.3, 2026-07-04)
 
 Reframed after E1: both fork `std.Io` backends failed the E1 targets, so the
@@ -365,7 +434,9 @@ compiler: the x30 repro now emits `~{fp},~{lr}` (was `~{x29},~{x30}`),
 segfaults are gone** — `bench evented pingpong 1 1 0` completes at
 ReleaseFast *and* ReleaseSafe, `bench evented spawn-group 2000 2 200`
 completes at ReleaseFast (plus a 2000-op × 3-rep evented ping-pong stress at
-~784 ns/op, no crash; no second bug surfaced). This spike's `fiber_switch`
+~784 ns/op, no crash; at that time no second bug had surfaced — the fuller
+E1 re-measurement above later found an *intermittent* `spawn-serial`
+SIGSEGV at higher volumes). This spike's `fiber_switch`
 still passes with matching floor numbers (3.30 ns median one-way, 8.46 ns
 spawn). `libzap_compiler.a` was rebuilt with the fix. The E1 `Io.Evented`
 *performance* verdict and the `deinit` compile error (crash 3) are

@@ -177,8 +177,10 @@ same convention as `spike/manager_v1`) before any production code.
   `concurrent`/`Select` as-is vs own run-queue scheduler on `fiber.zig` implementing the `Io`
   vtable. E1/E9 numbers decide; the plan assumes the latter (full control over budgets, LIFO
   slot, stealing, determinism) unless the spike shows Evented-as-is suffices for Phase 1–2.
+  **Decided — see Appendix A** (bespoke run-queue scheduler on `fiber.zig`).
 
-Exit gate: E1/E9/E10 numbers recorded in the plan doc; scheduler decision made.
+Exit gate: E1/E9/E10 numbers recorded in the plan doc; scheduler decision made. **Met
+2026-07-04** — ledger sections E1 (incl. post-fix re-measurement), E9, E10; Appendix A.
 
 ### Phase 1 — Runtime kernel, single scheduler, single model (L)
 
@@ -357,3 +359,146 @@ spawn site's manager binding is comptime-resolvable — the language rule everyt
 stands on); the scheduler-owns-`Io`-vtable architecture (pending only S0.5's confirmation); the
 Windows-Threaded and wasm-capability-error v1 postures; and the division of labor in §4.
 Anything the experiment gates overturn comes back as a plan amendment, not a silent change.
+
+---
+
+## Appendix A — S0.5 scheduler architecture decision (Phase 0 exit)
+
+**Decided 2026-07-04.** Evidence basis: E1 (including the post-clobber-fix re-measurement),
+E9, and E10, all recorded in `docs/concurrency-bench-results.md`. This memo is the Phase 0
+exit artifact; Phase 1 implements it. It confirms the architecture §8 held pending S0.5.
+
+### A.1 The decision
+
+**Zap's scheduler is a bespoke M:N run-queue scheduler built directly on the fork's
+`lib/std/Io/fiber.zig` context-switch primitive, and it implements the `std.Io` vtable
+itself** (operate-centric, per §3). Neither fork `std.Io` backend is used as the scheduling
+substrate. The rejected alternative — driving processes through `Io.Evented`/`Io.Threaded`
+as-is via `Io.async`/`concurrent`/`Select` — is rejected on three grounds, each quantified:
+
+1. **Spawn architecture.** The target is sub-µs spawn (ARC default; 1–3 µs acceptable for
+   heavy-init managers). Post-fix, `Io.Evented` (Dispatch) spawn sits at **19.1 µs windowed /
+   19.8 µs serial / 24.7 µs group** per task — 6–25× outside the band — and the cost is
+   structural, not a bug: ~60 MiB address-space reservation per fiber
+   (`Io/Dispatch.zig` `Fiber.min_stack_size`), a fresh stack mmap per spawn (E9 prices that
+   alone at **1.65 µs**), and a µs-scale GCD enqueue per task. Fixing the miscompilation did
+   not move it (windowed spawn went 30 µs → 19 µs on a much quieter session; the shape is
+   unchanged). Fixing the *architecture* means rewriting the backend's fiber/stack/admission
+   layer — i.e. building the bespoke scheduler anyway, inside GCD's constraints. E9 shows the
+   substrate floor we build on instead: **3.20 ns** one-way switch, **8.99 ns** spawn on a
+   pooled stack — roughly two orders of magnitude of headroom under sub-µs for pid-slot,
+   manager-init, run-queue, and safepoint bookkeeping.
+2. **Scheduling control.** The plan requires preemption budgets (reduction accounting fed by
+   the three-layer safepoint design), a LIFO slot for message-driven wakeup locality, work
+   stealing, a per-scheduler timing wheel, a flag-only watchdog, a per-process manager
+   context resolved at spawn, and — non-negotiably (§2 decision 11, Phase 1.5) — a **seeded
+   deterministic mode**. Dispatch delegates scheduling to opaque GCD queues: no run-queue we
+   own, no admission control, no determinism, no budget hook. `Io.Threaded` posts fine
+   micro-numbers post-fix (1.38 µs windowed spawn, 1.79 µs RTT) but is 1:1 — every
+   receive-suspended process holds an OS thread, so BEAM-scale process counts (10⁵–10⁶) are
+   architecturally unreachable. No amount of backend fixing yields these properties; owning
+   the run queue does, and E9's mechanism data (below) prices every piece we must build.
+3. **Reliability posture.** Post-fix, Dispatch still exhibits an **intermittent, race-like
+   `spawn-serial` SIGSEGV** (3 of 5 full-workload runs) plus the `deinit` compile error, and
+   upstream labels these backends explicitly experimental. Not load-bearing for the decision
+   — grounds 1–2 suffice — but it confirms the runtime cannot be hostage to backend
+   scheduling internals we do not control.
+
+**The decision survives the clobber-fix reinterpretation of E1 — stated explicitly for the
+record.** The E9 fork fix (`74c0b87fe5`) eliminated both deterministic E1 segfaults, and the
+re-measured Dispatch ping-pong RTT is **1.01 µs median / 0.95 µs min** — *inside* the
+2–3×-BEAM target band and better than Threaded's 1.79 µs. E1's original claim that a fixed
+Dispatch "cannot reach BEAM-class spawn/send" is therefore **corrected to spawn only**: the
+send path is vindicated, and the rejection rests on the spawn architecture, on scheduling
+control, and on the residual instability — none of which the fix touched. The escalation
+called by E1's kill criterion stands on the post-fix numbers.
+
+**Why still implement the `std.Io` vtable:** any Zap-runtime or FFI code doing I/O through
+`Io` must suspend the calling *process*, not block the scheduler thread (§3). The
+implementation is `operate`-centric (upstream is folding per-function entries into the
+`Operation` union — measured drift since 0.16.0 is one function folded plus renames), and
+task admission uses the newly-legalized lazy-start semantics of `async`/`groupAsync`
+(upstream `56265d6f99`): defer fiber assignment until first suspension/await — the
+BEAM-style admission shape.
+
+### A.2 Binding design consequences for Phase 1
+
+Each is a design commitment, not a suggestion; each cites its evidence.
+
+1. **Pooled, fixed-reservation, guard-paged, lazy-commit stacks — pooling is mandatory.**
+   E9: fresh stack (mmap + guard mprotect + first-page fault + munmap) costs **1,646 ns**
+   vs **8.99 ns** spawn on a pooled stack — a 183× penalty that alone consumes the entire
+   sub-µs spawn budget. The spawn hot path never calls mmap; stacks come from a
+   per-scheduler pool with a high-watermark bound, and fresh mapping happens only on pool
+   growth.
+2. **Darwin park/wake = the OS futex; EVFILT_USER only for the I/O poller.** E9: all four
+   kernel mechanisms land within ~20% (792–958 ns median), so semantics decide —
+   `os_sync_wait_on_address`/`os_sync_wake_by_address_any` (with `__ulock_wait2`/`__ulock_wake`
+   as the pre-14.4 fallback, gated exactly as the fork's `Io.Threaded` does) atomically
+   couples parking with a run-queue state word, needs no per-thread kernel object, and wakes
+   as a no-op when nobody is parked. The kqueue `EVFILT_USER` path is reserved for the one
+   thread parked inside the kqueue I/O poller, where the unified wait point is worth its
+   +40 ns.
+3. **Spin-then-park, threshold 1–2 µs.** E9: a spinning thread observes a handoff in ~83 ns;
+   a parked wake costs ~900 ns median end-to-end. Crossover ≈ one park cost → spin a few
+   hundred `spinLoopHint` iterations (1–2 µs on M4) before parking. This keeps
+   same-scheduler RTT in the tens of ns (6.4 ns switch pair + 8.7–16 ns queue floor, E1/E9)
+   and bounds cross-scheduler RTT by two parked wakes ≈ 1.8 µs — inside the ≤2–3 µs band.
+4. **`current_process` is resolved once per scheduling quantum** and carried in a register or
+   parameter across the runtime hot path — never re-resolved per dispatch site. E10: on
+   Darwin the threadlocal read is a call through the TLV thunk, and LLVM's hoisting is
+   unreliable (per-alloc in the pure shape, per-list in the mix shape). The scheduler writes
+   the process pointer at quantum entry; runtime kernel code receives it, not the TLS slot.
+5. **Alloc hot path is monomorphized *and inlined*; the PCB manager vtable serves cold paths
+   only.** E10: vtable dispatch costs **+13.8%** on the pure-alloc shape (≈5× the E2 kill
+   criterion) and even a direct non-inlined call costs +6.2%, so the hot-path rule is
+   inlined specialization, not "direct call per model". The cold-path arm is empirically
+   sound: +4.7% relative on the realistic mix, +0.09–0.22 ns absolute.
+6. **Role of the remaining fork backends.** `Io.Threaded` is the Windows (and
+   wasm-with-host-threads) capability-matrix fallback (§1 item 5, Phase 7) — real 1:1
+   threads, documented semantics differences; it is not a performance tier. The Evented
+   backends are retained as *event-source references*: their kqueue/io_uring/GCD-source
+   integration informs our poller (Phase 4), but their fiber scheduling, stack policy, and
+   admission are not used. Remaining Dispatch defects (residual `spawn-serial` race, `deinit`
+   compile error, 60 MiB `min_stack_size`) stay on the fork-hygiene track, off the
+   campaign's critical path.
+
+### A.3 Phase-1 kernel work-item deltas
+
+- **1.1 (PCB)** — "fiber + stack reservation" is now concrete: fork `fiber.zig` `Context` +
+  a **per-scheduler stack pool** (fixed reservation, guard page, lazy commit,
+  high-watermark-bounded free list). The stack pool is a named deliverable of 1.1, with the
+  E9 9 ns pooled-spawn floor as its pool-hit reference.
+- **1.4 (spawn/exit)** — "pool-only hot path" now has a budget: spawn ≤ 1 µs = 9 ns
+  floor + pid slot + manager init + enqueue; the path provably performs no mmap/munmap.
+  Phase 1's E1 re-run gates against the **post-fix** E1 ledger rows.
+- **1.4/1.5 (new sub-item: idle park/wake)** — the single scheduler parks on the decided
+  futex primitive when the run queue is empty and is woken by timer/cross-thread test
+  senders. This pulls the *mechanism* half of Phase 4.1 forward; **4.1's open question
+  ("parking via Evented wakeups … measure, R7") is closed for Darwin** — run-queue parking
+  = OS futex, poller = EVFILT_USER. R7 narrows to the Linux poller counterpart
+  (eventfd vs io_uring `MSG_RING`), measured in Phase 4.
+- **1.5 (deterministic mode)** — unchanged in scope, but S0.5 is its precondition: it exists
+  *because* we own the run queue; Evented-as-is could never have provided it.
+- **1.6 (observability) / PCB ABI** — the per-quantum `current_process` discipline (A.2.4)
+  is part of the scheduler↔kernel ABI from day one; every kernel entry point that can
+  allocate takes the process pointer, and only quantum entry touches the TLS slot.
+- **3.2 (monomorphization hybrid)** — unchanged, with E10 sharpening the acceptance bar: a
+  "specialized" hot path whose alloc fast path is not inlined has already paid half the
+  vtable penalty (+6.2%); the verifier red-flag for ICF-unfoldable specializations gains a
+  companion check that hot-path specializations actually inline the alloc fast path.
+
+### A.4 Open questions deliberately deferred
+
+1. **Register vs parameter for the current-process pointer on aarch64.** x18 is reserved by
+   the Darwin platform ABI, so a globally reserved register is likely unavailable there;
+   Phase 1 decides between parameter-threading and a per-quantum TLS write with measured
+   numbers (E10 gives the per-site cost either choice must beat).
+2. **Linux poller wakeup primitive** — eventfd vs io_uring `MSG_RING` (E9 was Darwin-only);
+   measured when the Phase 4 poller lands.
+3. **Stack-pool sizing/watermark policy and its interaction with Darwin teardown** — decided
+   empirically by Phase 1.7's spawn/die-cycle test.
+4. **Root cause of the residual Dispatch `spawn-serial` race** — fork-hygiene track;
+   irrelevant to the bespoke scheduler but wanted for the fork's own I/O story.
+5. **Windows budget/watchdog semantics on the 1:1 Threaded fallback** — documented capability
+   difference, scoped in Phase 7.2.
