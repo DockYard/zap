@@ -439,10 +439,109 @@ contingent on fixing the dropped-x30-clobber fork bug above, which currently
 breaks *any* optimized build of fiber-based code, including the E1 Dispatch
 backend.
 
-## E10 — vtable vs monomorphized alloc
+## E10 — vtable vs monomorphized alloc (S0.4, 2026-07-04)
 
-*Reserved — filled by the Phase 0 S0.4 spike. Confirms the manager
-monomorphization hybrid's hot/cold split empirically.*
+Hot-path cost of allocation *dispatch*, validating the manager-
+monomorphization hybrid (`zap-concurrency-research.md` §2.3): the same
+few-instruction bump allocation function (limit check + bump over a
+pre-reserved 1 MiB buffer, reset on exhaustion, never grown during timing)
+reached through three call mechanisms — **inlined** (comptime-known
+allocator, today's-Zap monomorphized shape), **direct** (same function
+`noinline`, direct call), **vtable** (threadlocal `current_process` →
+`Process.manager_vtable` → fn pointer → indirect call, the §2.3 cold-path
+dispatch shape).
+
+### Methodology
+
+- **Date:** 2026-07-04. Same machine as S0.1/E1/E9 (MacBook Air `Mac16,13`,
+  Apple M4, 10 cores, 32 GB, macOS 26.2 build 25C56).
+- **Benchmark:** `spike/concurrency-e10/dispatch.zig` (throwaway spike; see
+  its README), compiled with the **fixed fork compiler** from S0.3
+  (`~/projects/zig` @ `74c0b87fe5f2191cef674be63222d90689881648`, the
+  clobber-translation fix, clean tree):
+
+  ```sh
+  ~/projects/zig/zig-out/bin/zig build-exe --zig-lib-dir ~/projects/zig/lib \
+      -OReleaseFast -femit-asm=dispatch.s dispatch.zig
+  ```
+
+- **Protocol:** one measurement at a time, foreground; unrecorded warmup
+  pass (ops/10) then 5 timed reps of 100,000,000 allocations each;
+  median + min per-alloc ns. Timing via `CLOCK_UPTIME_RAW` (E1/E9
+  convention). `uptime` recorded immediately before each run; 1-minute load
+  average was **2.31** for the Shape A runs and **2.03–2.04** for Shape B —
+  the quietest session of the Phase 0 series, and rep-to-rep spread was
+  <2% on every row.
+- **Shapes:** **A `pure`** = tight loop of 16-byte allocations, each
+  returned pointer sunk through an empty register-constraint asm (worst
+  case, maximally dispatch-sensitive). **B `mix`** = allocate 32-byte
+  nodes, write 3 fields each, build 8-node lists, traverse into a checksum
+  (sunk via `doNotOptimizeAway`), discard (dispatch diluted by real work).
+  1 MiB buffer keeps the working set L2-resident so the measurement is
+  about dispatch, not memory bandwidth; each rep asserts (outside the timed
+  region) that the buffer wrapped — ~1,526 (A) / ~3,052 (B) resets per rep,
+  so reset cost is amortized to noise and allocations provably executed.
+- **Anti-elision/devirtualization:** a decoy second manager behind a second
+  vtable, selectable only at runtime via argv (never selected in recorded
+  runs; `decoy_allocs=0` printed as proof), keeps the vtable and fn-pointer
+  loads non-constant.
+- **Asm verification (evidence in the spike README):** each shape × variant
+  loop sits under its own `noinline` symbol in `dispatch.s`. Confirmed: the
+  inlined loops contain **no call instructions** (≈10-instruction body);
+  the direct loops contain the direct `bl _dispatch.bumpAllocOutlined`
+  (8× unrolled in Shape B); the vtable loops perform the full double
+  indirection **per allocation** — load `Process` pointer from the TLS
+  slot, `ldp` context+vtable, load fn pointer, `blr` — and are not
+  devirtualized. Darwin wrinkle: the `current_process` threadlocal read is
+  a call through the TLV thunk; in Shape A that thunk call executes per
+  allocation (two `blr`s per alloc), in Shape B LLVM hoisted it to once per
+  8-alloc list while still reloading process/vtable/fn-pointer per alloc.
+
+### Results (ReleaseFast, per-alloc ns, 100 M allocs × 5 reps)
+
+| Shape | Variant | Median | Min | vs inlined (median) | vs inlined (min) |
+|---|---|---:|---:|---:|---:|
+| A pure-alloc | inlined | 1.604 | 1.600 | — | — |
+| A pure-alloc | direct (noinline) | 1.704 | 1.690 | **+6.2%** | +5.6% |
+| A pure-alloc | vtable-indirect | 1.826 | 1.808 | **+13.8%** | +13.0% |
+| B node-mix | inlined | 1.892 | 1.873 | — | — |
+| B node-mix | direct (noinline) | 1.943 | 1.918 | **+2.7%** | +2.4% |
+| B node-mix | vtable-indirect | 1.980 | 1.977 | **+4.7%** | +5.6% |
+
+Absolute vtable-vs-inlined delta: **+0.22 ns/alloc** (A), **+0.09 ns/alloc**
+(B) — the M4's out-of-order core overlaps most of the dispatch chain with
+surrounding work, and its indirect-branch predictor is perfect here because
+the call target is monomorphic at runtime (a real multi-manager binary's
+cold paths would add occasional indirect-branch mispredicts on top).
+
+### DECISION — hybrid split confirmed
+
+**The data confirms the §2.3 hybrid: monomorphize hot allocating paths;
+vtable-dispatch is tolerable for cold ones.** On the pure-alloc worst case,
+vtable dispatch costs **+13.8% median (+13.0% min)** over the monomorphized
+shape — nearly 5× the E2 kill criterion (2–3% CLBG regression) and
+~1.8× Go's 7.8%-geomean yardstick for a single extra back-edge instruction,
+on top of an allocator that is *already* memory-bound on its own state.
+No dispatch of any kind belongs on the alloc hot path. The direct-call
+variant sharpens the point: merely losing inlining costs **+6.2%** in the
+pure shape — roughly half the total vtable penalty — so the hot-path rule
+must be *monomorphized and inlined*, not "direct call into a per-model
+function"; per-model specialization only pays if the alloc fast path is
+inlined into the hot loop, which is exactly what the plan's
+monomorphization arm does. For cold paths the verdict flips: the absolute
+cost is +0.09–0.22 ns per allocation, and with even the minimal real work
+of Shape B (three field writes + an 8-node traversal per node) the relative
+overhead collapses to **+4.7%** of an already tiny per-alloc figure; any
+genuinely cold, rarely-allocating function amortizes that to nothing (a
+single L2 miss costs two orders of magnitude more). "Resolve once at spawn,
+then indirect-call through the PCB's manager vtable" is therefore
+empirically sound as the cold-path arm, matching the plan's reasoning.
+One design note for Phase 1: on Darwin the `current_process()` threadlocal
+lookup is itself a call (TLV thunk) and is part of the measured cost —
+scheduler code should load the process pointer once per scheduling quantum
+(or keep it in a reserved register) rather than re-resolving the
+threadlocal at every dispatch site, since LLVM cannot always hoist it (it
+did per-list in Shape B, per-alloc in Shape A).
 
 ## E2 — safepoint overhead
 
