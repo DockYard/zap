@@ -34,11 +34,15 @@ What the 2026 devlog changes about our plan:
    experimental** (error handling, perf diagnostics, coverage gaps). Consequence: our fork has
    the right substrate but we must expect churn; upstream fixes (notably the known io_uring perf
    regression) are cherry-picked continuously rather than waiting for releases.
-2. **Upstream is now 0.17.0-dev.** `std.Io` will keep evolving there. Consequence: the Zap
-   runtime touches `std.Io` only through **one seam file** (`runtime_io.zig`, §4) so upstream
-   API churn lands in one place. A **full fork rebase onto 0.17** is scheduled once, at the
-   Phase 2→3 boundary (before the per-spawn-manager work multiplies the diff surface), not
-   continuously.
+2. **Upstream is now 0.17.0-dev — and our fork is already based on it.** The fork's merge-base
+   with upstream master is a commit from ~2026-03-18 (66 Zap commits on top; local upstream ref
+   stale since March). Consequence: the campaign **starts with a catch-up rebase onto a pinned
+   current master snapshot (Phase −1)** — done while our diff is 66 commits, not after Phases
+   0–2 grow it, and so that every experiment measures the substrate we will actually build on
+   (including post-February `Io` fixes such as the io_uring perf-regression work). After Phase
+   −1: `std.Io` contact stays behind **one seam file** (`runtime_io.zig`, §4); upstream `Io`
+   fixes are cherry-picked deliberately; the only later realignment is a small hop when 0.17.0
+   tags. No mid-campaign full rebase.
 3. **Jan 31, 2026 — zig libc**: libc functions becoming Zig wrappers, with the stated goal of
    letting `read`/`write` participate in an io_uring event loop. Consequence: long-term, even
    libc-using FFI can suspend cooperatively instead of blocking a scheduler. Near-term the
@@ -140,6 +144,27 @@ tests written first (Zest under `test/` for language/stdlib semantics; `zir-test
 for harness concerns — flags, cache layout, cross-target, compile-fail diagnostics); full suite
 green before the phase closes; frequent commits.
 
+### Phase −1 — Fork realignment to upstream master (M, infrastructure)
+
+Goal: rebase our 66 fork commits onto a **pinned** current upstream master snapshot and bring
+Zap green against it, so all concurrency work builds on the freshest `std.Io` — the fastest-
+moving API in std and the one the scheduler will *implement*, not merely consume.
+
+- **P-1.1** Fetch upstream; pin a snapshot commit (never track master continuously); rebase the
+  Zap commit stack (zir_api C-ABI layer + targeted std/os fixes) onto it.
+- **P-1.2** Bootstrap check: if master has moved past LLVM 21, rebuild the zig-bootstrap +
+  supplemental z/zstd prefix (documented gotchas apply — the local build READMEs are
+  incomplete; budget real time here).
+- **P-1.3** Fork test suite green (re-run the known verification gotchas from the previous
+  fork-green campaign).
+- **P-1.4** Zap alignment: rebuild `libzap_compiler.a`, refresh `zap-deps` archives, fix std
+  churn in `src/runtime.zig` and every manager source, full Zap test suite green.
+- **P-1.5** Re-snapshot CLBG baselines on the new base so E2's before/after comparison is
+  apples-to-apples.
+
+Exit gate: fork `zig build test` green + Zap full suite green + CLBG baselines re-recorded +
+pinned upstream SHA documented in this plan.
+
 ### Phase 0 — Substrate spikes + experiment harness (M)
 
 Goal: retire the highest-uncertainty questions with throwaway-marked spikes (`spike/` dirs,
@@ -211,7 +236,7 @@ Goal: `spawn`/`send`/`receive`/`after` work in Zap programs; single model; safep
 
 Exit gates: **E2** (CLBG with concurrency ON: alloc-piggyback ≈ 0 on allocating loops;
 back-edge poll ≤2–3% on nbody/spectral-norm, else loop-unroll mitigation before proceeding);
-**E6** first crossover measurement. **Fork rebase onto 0.17 happens at this boundary.**
+**E6** first crossover measurement.
 
 ### Phase 3 — Per-spawn managers (XL; the centerpiece)
 
@@ -318,13 +343,15 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
    caps; red-flag verifier catches semantic leaks.
 3. Safepoint cost on CLBG wins (E2) — highest-visibility perf risk; unrolling mitigation
    staged before concurrency-on ships.
-4. Upstream 0.17 `std.Io` churn — contained by the `runtime_io.zig` seam + one scheduled
-   rebase at the 2→3 boundary.
+4. Upstream 0.17 `std.Io` churn — contained by the Phase −1 catch-up rebase (pinned snapshot),
+   the `runtime_io.zig` seam, deliberate cherry-picks, and one small hop when 0.17.0 tags.
+   Secondary risk inside Phase −1 itself: an LLVM version bump forcing a bootstrap rebuild.
 5. Darwin teardown ordering — dedicated Phase-1 test, not discovered in production.
 
 ## 8. What approval covers
 
-Approving this plan locks in: the phase ordering and exit gates above; **Decision Gate 0** (a
+Approving this plan locks in: the **rebase-first sequencing** (Phase −1 before any concurrency
+code); the phase ordering and exit gates above; **Decision Gate 0** (a
 spawn site's manager binding is comptime-resolvable — the language rule everything in Phase 3
 stands on); the scheduler-owns-`Io`-vtable architecture (pending only S0.5's confirmation); the
 Windows-Threaded and wasm-capability-error v1 postures; and the division of labor in §4.
