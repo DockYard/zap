@@ -348,6 +348,29 @@ Building the spike surfaced a miscompilation that makes the fork's
   below include that instruction; the properly fixed fork primitive would be
   marginally cheaper.
 
+**FIXED in the fork (2026-07-04, `74c0b87fe5`):** upstream `codeberg/master`
+has no fix (only its pre-existing MIPS clobber-override map), so the fork now
+translates Zig clobber names to LLVM's per-target register names in
+`appendConstraints` (`src/codegen/llvm/FuncGen.zig`), extending upstream's
+MIPS mechanism. A full audit of every `std.builtin.assembly.Clobbers` arch
+family against the LLVM 21 register defs found the same silent-drop bug
+beyond aarch64 `x29/x30 → fp/lr`: arm `r13/r14 → sp/lr`, aarch64 SME tiles
+`za{N}{q,d,s,h,b} → za{q,d,s,h,b}{N}`, avr `flags → sreg`, msp430
+`r0/r1/r2 → pc/sp/sr`, riscv `vcsr → vxrm+vxsat`, sparc `ccr/xcc → icc`, ve
+`s0–s63 → sx0–sx63`, `vixr → vix` — all now mapped (unmodeled-in-LLVM names
+are left verbatim and are harmless; named register *constraints* fail loudly
+in LLVM, so only clobbers had a silent path). Re-validation with the fixed
+compiler: the x30 repro now emits `~{fp},~{lr}` (was `~{x29},~{x30}`),
+`fiber.contextSwitch` IR carries `~{lr}`, and **both deterministic E1
+segfaults are gone** — `bench evented pingpong 1 1 0` completes at
+ReleaseFast *and* ReleaseSafe, `bench evented spawn-group 2000 2 200`
+completes at ReleaseFast (plus a 2000-op × 3-rep evented ping-pong stress at
+~784 ns/op, no crash; no second bug surfaced). This spike's `fiber_switch`
+still passes with matching floor numbers (3.30 ns median one-way, 8.46 ns
+spawn). `libzap_compiler.a` was rebuilt with the fix. The E1 `Io.Evented`
+*performance* verdict and the `deinit` compile error (crash 3) are
+unaffected.
+
 ### Fiber-switch floor (ReleaseFast, median / min per-op ns, 5 reps)
 
 | Metric | Median | Min | Load (1-min) |
