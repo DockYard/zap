@@ -34,15 +34,20 @@ What the 2026 devlog changes about our plan:
    experimental** (error handling, perf diagnostics, coverage gaps). Consequence: our fork has
    the right substrate but we must expect churn; upstream fixes (notably the known io_uring perf
    regression) are cherry-picked continuously rather than waiting for releases.
-2. **Upstream is now 0.17.0-dev — and our fork is already based on it.** The fork's merge-base
-   with upstream master is a commit from ~2026-03-18 (66 Zap commits on top; local upstream ref
-   stale since March). Consequence: the campaign **starts with a catch-up rebase onto a pinned
-   current master snapshot (Phase −1)** — done while our diff is 66 commits, not after Phases
-   0–2 grow it, and so that every experiment measures the substrate we will actually build on
-   (including post-February `Io` fixes such as the io_uring perf-regression work). After Phase
-   −1: `std.Io` contact stays behind **one seam file** (`runtime_io.zig`, §4); upstream `Io`
-   fixes are cherry-picked deliberately; the only later realignment is a small hop when 0.17.0
-   tags. No mid-campaign full rebase.
+2. **Upstream is 0.17.0-dev; our fork sits on exactly the 0.16.0 release commit** (merge-base
+   `24fdd5b7` = "Release 0.16.0", 2026-04-13, our 66 commits on top; upstream has added 1,262
+   commits since, including an **LLVM 21→22 toolchain bump**). A measured July-2026 diff shows
+   the surfaces this plan builds on are **nearly frozen** upstream: `Io/fiber.zig` byte-
+   identical, the `Evented` backend switch unchanged (still no Windows/IOCP, no wasm fibers),
+   `Future`/`Select`/`Queue`/`Cancelable`/`async`/`concurrent` unchanged; the vtable delta is
+   one function (`netRead`) folded into the `Operation` union plus two option-type renames.
+   Consequence: **build on the 0.16.0-based fork now; do not rebase first.** `std.Io` contact
+   stays behind one seam file (`runtime_io.zig`, §4) and the vtable implementation is
+   `operate`-centric (§3), so the small upstream drift is absorbed cheaply. The **full rebase
+   is a decoupled campaign** — sized Large for reasons unrelated to concurrency (LLVM-22
+   bootstrap rebuild; codegen/linker/ZIR-internal churn) — targeting the 0.17.0 release
+   (~Q4 2026 on current cadence) at whatever phase boundary is nearest when it ships; it never
+   blocks concurrency work.
 3. **Jan 31, 2026 — zig libc**: libc functions becoming Zig wrappers, with the stated goal of
    letting `read`/`write` participate in an io_uring event loop. Consequence: long-term, even
    libc-using FFI can suspend cooperatively instead of blocking a scheduler. Near-term the
@@ -95,7 +100,13 @@ global overflow queue + work stealing, parking/wakeup integrated with the `Io.Ev
 loop, a per-scheduler hierarchical timing wheel, a per-scheduler flag-only watchdog timer, and
 a seedable single-threaded deterministic mode. The Zap scheduler **implements the `std.Io`
 vtable**, so any Zap-runtime or FFI code doing I/O through `Io` suspends the calling process
-correctly instead of blocking the scheduler thread.
+correctly instead of blocking the scheduler thread. Two upstream-informed design rules: the
+implementation is **`operate`-centric** (route I/O dispatch through one `operate` switch over
+the `Operation` union — upstream is migrating per-function vtable entries into it, so this
+absorbs future drift for free), and task admission exploits the **newly-legalized lazy-start
+semantics** of `async`/`groupAsync` (upstream `56265d6f99` deleted the "concurrency assigned
+before return" guarantee — a run-queue scheduler may defer fiber assignment until
+`await`/`cancel`, which is exactly the BEAM-style admission shape).
 
 **A send is:** copy into a detachable fragment from the shared envelope page pool (owned by the
 message system; abandon/reclaim on sender death) → one atomic exchange onto the receiver's
@@ -144,32 +155,14 @@ tests written first (Zest under `test/` for language/stdlib semantics; `zir-test
 for harness concerns — flags, cache layout, cross-target, compile-fail diagnostics); full suite
 green before the phase closes; frequent commits.
 
-### Phase −1 — Fork realignment to upstream master (M, infrastructure)
-
-Goal: rebase our 66 fork commits onto a **pinned** current upstream master snapshot and bring
-Zap green against it, so all concurrency work builds on the freshest `std.Io` — the fastest-
-moving API in std and the one the scheduler will *implement*, not merely consume.
-
-- **P-1.1** Fetch upstream; pin a snapshot commit (never track master continuously); rebase the
-  Zap commit stack (zir_api C-ABI layer + targeted std/os fixes) onto it.
-- **P-1.2** Bootstrap check: if master has moved past LLVM 21, rebuild the zig-bootstrap +
-  supplemental z/zstd prefix (documented gotchas apply — the local build READMEs are
-  incomplete; budget real time here).
-- **P-1.3** Fork test suite green (re-run the known verification gotchas from the previous
-  fork-green campaign).
-- **P-1.4** Zap alignment: rebuild `libzap_compiler.a`, refresh `zap-deps` archives, fix std
-  churn in `src/runtime.zig` and every manager source, full Zap test suite green.
-- **P-1.5** Re-snapshot CLBG baselines on the new base so E2's before/after comparison is
-  apples-to-apples.
-
-Exit gate: fork `zig build test` green + Zap full suite green + CLBG baselines re-recorded +
-pinned upstream SHA documented in this plan.
-
 ### Phase 0 — Substrate spikes + experiment harness (M)
 
 Goal: retire the highest-uncertainty questions with throwaway-marked spikes (`spike/` dirs,
 same convention as `spike/manager_v1`) before any production code.
 
+- **S0.0** Fork hygiene: purge the accidentally-committed build artifacts from the fork tree
+  (`libzir_builder.a`, `zir_api.o`, `zir_builder.o`, `zir_ref_dump`) so the eventual rebase
+  campaign starts from a clean commit stack.
 - **S0.1** Benchmark harness: spawn cost, ping-pong RTT (same/cross scheduler), copy p99 vs
   size; CLBG baseline snapshot for E2 comparison. Baselines table from
   `research-round-2.md` Q10.
@@ -267,7 +260,10 @@ conservative scan cost + false retention → mark-sweep ships or slips per rev 2
 - **4.1** M:N work-stealing scheduler (schedulers = cores), per-core queues + LIFO slot +
   global overflow; parking via Evented wakeups (userspace flag when awake; eventfd/`MSG_RING`/
   kqueue-user/GCD source when parked — measure, R7).
-- **4.2** Hierarchical timing wheel per scheduler, feeding the `after` Select arm.
+- **4.2** Hierarchical timing wheel per scheduler, feeding the `after` Select arm. Include
+  `Condition.waitTimeout`/`Semaphore.waitTimeout` in the primitive set: implement on 0.16's
+  existing `futexWaitTimeout` vtable entry, or cherry-pick the three small std-only upstream
+  commits (`d821446cf9`, `a43973b336`, `c0763b5e25`).
 - **4.3** Blocking pool (dirty-scheduler equivalent): `Process.blocking` intrinsic; documented
   FFI contract; zig-libc devlog path noted as the long-term shrink.
 - **4.4** Deterministic mode extended: seeded multi-scheduler interleaving sweeps
@@ -343,15 +339,20 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
    caps; red-flag verifier catches semantic leaks.
 3. Safepoint cost on CLBG wins (E2) — highest-visibility perf risk; unrolling mitigation
    staged before concurrency-on ships.
-4. Upstream 0.17 `std.Io` churn — contained by the Phase −1 catch-up rebase (pinned snapshot),
-   the `runtime_io.zig` seam, deliberate cherry-picks, and one small hop when 0.17.0 tags.
-   Secondary risk inside Phase −1 itself: an LLVM version bump forcing a bootstrap rebuild.
+4. Upstream 0.17 churn — **measured (2026-07) to be minimal on every surface we implement**;
+   contained by the `runtime_io.zig` seam, the `operate`-centric vtable, and deliberate
+   cherry-picks. The real cost sits in the **decoupled rebase campaign (sized L)**: LLVM-22
+   bootstrap rebuild; a severe both-sides rewrite of `src/codegen/x86_64/CodeGen.zig`; the
+   upstream `Coff.zig` rewrite vs our fix; and ZIR-internal drift (`@cImport` removed,
+   `errdefer`-capture removed, `std.builtin`→`std.lang`, `@typeInfo`/`@bitCast` changes)
+   requiring revalidation of our 13.5k-line `zir_api.zig`/`zir_builder.zig`.
 5. Darwin teardown ordering — dedicated Phase-1 test, not discovered in production.
 
 ## 8. What approval covers
 
-Approving this plan locks in: the **rebase-first sequencing** (Phase −1 before any concurrency
-code); the phase ordering and exit gates above; **Decision Gate 0** (a
+Approving this plan locks in: the **stay-on-0.16 sequencing** (no rebase before concurrency
+work; the full 0.17 rebase is a decoupled campaign timed to the 0.17.0 release); the phase
+ordering and exit gates above; **Decision Gate 0** (a
 spawn site's manager binding is comptime-resolvable — the language rule everything in Phase 3
 stands on); the scheduler-owns-`Io`-vtable architecture (pending only S0.5's confirmation); the
 Windows-Threaded and wasm-capability-error v1 postures; and the division of labor in §4.
