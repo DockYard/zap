@@ -243,6 +243,12 @@ All against `spike/concurrency-e1/bench.zig` compiled as above.
    whose comptime assert (`slice_info.size == .slice`) fails whenever
    `deinit` is referenced. The spike skips `deinit` on the evented path.
 
+*Update (E9, 2026-07-04):* the S0.3 spike found the likely root cause of
+crashes 1–2: the aarch64 `~{x30}` clobber on `fiber.contextSwitch` is
+silently dropped in Zig→LLVM constraint emission, so optimized builds keep
+live pointers in x30 across fiber switches. See the E9 section's FORK BUG
+finding below.
+
 ### Verdict vs plan targets and yardstick
 
 **Fail on both backends; escalate per the plan's kill criterion.** Targets
@@ -267,10 +273,148 @@ fixes (crashes, 60 MB stacks, deinit) are needed regardless for the fork's
 I/O story, but even a fixed Dispatch backend's cost structure (GCD enqueue
 µs-scale, per the yardstick table) cannot reach BEAM-class spawn/send.
 
-## E9 — Dispatch vs Kqueue (Darwin)
+## E9 — fiber-switch floor + Darwin wakeup mechanism (S0.3, 2026-07-04)
 
-*Reserved — filled by the Phase 0 S0.3 spike. Fiber-switch + wakeup latency on
-each backend; picks the tier-1 Darwin default.*
+Reframed after E1: both fork `std.Io` backends failed the E1 targets, so the
+campaign builds a bespoke scheduler on raw `fiber.zig` context switching.
+E9 measures the substrate floor (raw fiber switch/spawn/stack costs) and
+compares the Darwin mechanisms our scheduler could use to wake a parked
+scheduler thread.
+
+### Methodology
+
+- **Date:** 2026-07-04. Same machine as S0.1/E1 (MacBook Air `Mac16,13`,
+  Apple M4, 10 cores, 32 GB, macOS 26.2 build 25C56).
+- **Benchmarks:** `spike/concurrency-e9/{fiber_switch,wakeup}.zig`
+  (throwaway spike; see its README), compiled with the asdf Zig 0.16.0
+  binary against the fork's std (`~/projects/zig` @
+  `b8fc76ac3f7cc11580a6801d3ccaa2d520f0af06`, clean tree):
+
+  ```sh
+  zig build-exe --zig-lib-dir $HOME/projects/zig/lib -OReleaseFast fiber_switch.zig
+  zig build-exe --zig-lib-dir $HOME/projects/zig/lib -OReleaseFast wakeup.zig
+  ```
+
+- **Protocol:** one measurement at a time, foreground; unrecorded warmup
+  (workload/10) then 5 timed repetitions; timing via `CLOCK_UPTIME_RAW`
+  (~41.7 ns granularity on Apple Silicon — sub-100 ns numbers quantize to
+  ~42 ns ticks). `uptime` recorded immediately before every run; other
+  agent sessions were active — 1-minute load average ranged **3.4–3.8**
+  across all runs (lighter and steadier than E1's 3.8–5.2).
+- **Fiber workloads:** `pingpong` = 1,000,000 round trips of control between
+  two fibers on one thread (per-op = one one-way switch; timed region holds
+  exactly `2·N + 2` switches); `spawn` = 1,000,000 × (init context on a
+  pooled stack → switch in → body immediately switches back); `stack` =
+  100,000 × (mmap 256 KiB stack + PROT_NONE guard page + fault in top page +
+  munmap). Fiber layout mirrors `Io/Dispatch.zig` (argument block at stack
+  top, naked entry trampoline, fp = 0); a `wake_count` counter asserts all
+  switches really executed.
+- **Wakeup workloads:** 100,000 timed wakeups/rep. Main records t0, signals
+  the worker's channel, parks on its own; the parked worker wakes, records
+  t1, echoes back. Only main→worker is timed (t1 − t0, same clock). Main
+  busy-waits 20 µs between iterations so the worker is reliably parked
+  before each timed wake. All blocking waits carry 5 s panic timeouts.
+  Default QoS, no pinning (macOS has no affinity API on Apple Silicon).
+
+### FORK BUG (blocking finding): aarch64 `~{x30}` asm clobber silently dropped
+
+Building the spike surfaced a miscompilation that makes the fork's
+`std.Io.fiber.contextSwitch` **unusable in optimized builds as-is**:
+
+- `contextSwitch` declares `.x30 = true` in its clobber set, but the Zig
+  LLVM backend (`src/codegen/llvm/FuncGen.zig` clobber emission) writes the
+  Zig field name into the constraint string — `~{x30}` — while LLVM's
+  AArch64 link register is named `lr`. Clang translates user clobber
+  `"x30"` → `"lr"`; Zig does not, and LLVM silently ignores unknown clobber
+  names. Net effect: **LLVM believes x30 survives the switch** and at
+  ReleaseFast allocates live pointers into it across the asm.
+- Symptom in this spike (before the workaround): `fiberMain` kept its args
+  pointer in x30; a resumed fiber saw the *other* fiber's x30. A 10 M-round-
+  trip ping-pong "finished" in 0.01 s real with `total_ns=0`. Minimal repro:
+  `-femit-llvm-ir` shows `~{x30}` in the IR while the disassembly carries a
+  live pointer in x30 across the switch (`mov x30, x1` before, `ldr x8,
+  [x30]` after).
+- Debug builds are unaffected — matching E1's "works at `-ODebug`, dies at
+  ReleaseFast/ReleaseSafe" Dispatch signature. This is the most plausible
+  root cause of **E1 crashes 1–2** (Dispatch `Group.async` and blocking-
+  queue suspend/resume segfaults; the PAC-looking ReleaseSafe fault address
+  is consistent with control state derived from stale x30). The fork fix
+  (map `x30` → `lr` in LLVM constraint emission, then re-run the E1 crash
+  repros) is queued for the scheduler work; this measurement job makes no
+  fork changes.
+- To measure anyway, the spike uses a local copy of the primitive whose only
+  change is a fourth `Context` word saving/restoring x30 per-context
+  (+1 instruction — correct under either compiler behavior). The numbers
+  below include that instruction; the properly fixed fork primitive would be
+  marginally cheaper.
+
+### Fiber-switch floor (ReleaseFast, median / min per-op ns, 5 reps)
+
+| Metric | Median | Min | Load (1-min) |
+|---|---:|---:|---|
+| one-way context switch (ns) | 3.20 | 3.19 | 3.45 |
+| control round trip, 2 switches (ns) | 6.39 | 6.38 | 3.45 |
+| spawn floor, pooled stack (init + switch in + switch out, ns) | 8.99 | 8.99 | 3.45 |
+| fresh stack (mmap + guard mprotect + first-page fault + munmap, ns) | 1,646 | 1,629 | 3.45 |
+
+Rep-to-rep spread was <0.5% on the switch/spawn rows — these are stable
+numbers despite background load (single-threaded, cache-resident).
+
+### Cross-thread wakeup latency, parked thread (Darwin, ns, 100k wakeups × 5 reps)
+
+Median = median of rep medians; min = min across all reps; p99 range = the
+per-rep p99 spread. Load (1-min) at run start in parentheses.
+
+| Mechanism | Median | Min | p99 range | Notes |
+|---|---:|---:|---|---|
+| spin (atomic flag, no syscall) | 83 | 0 | 84–209 | floor for an *awake* scheduler; ~2 clock ticks |
+| `gcd-sem` (dispatch_semaphore) (3.43) | 792 | 708 | 5,333–7,333 | cheapest GCD wake |
+| `ulock` (`__ulock_wait2`/`wake`, what fork `Io.Threaded` futex uses) (3.74) | 917 | 250 | 3,292–11,167 | fork has **no** `std.Thread.Futex`; this is its internal pair |
+| `os-sync` (`os_sync_wait_on_address` public API, macOS 14.4+) (3.78) | 917 | 250 | 5,292–7,084 | identical cost to `ulock` (thin wrapper) |
+| `kqueue` (EVFILT_USER trigger → kevent return) (3.53) | 958 | 833 | 6,208–10,166 | same wait point as I/O readiness |
+
+Per-rep maxima ranged 68 µs–5.3 ms on all mechanisms (scheduler
+preemption tails under load) — parked-wakeup p99s of 3–11 µs are the
+number to design against, not the maxima.
+
+### DECISION — Darwin wake mechanism and spin-then-park threshold
+
+**Use the Darwin futex (`os_sync_wait_on_address` / `os_sync_wake_by_
+address_any`, with `__ulock_wait2`/`__ulock_wake` as the pre-14.4 fallback
+exactly as the fork's `Io.Threaded` already gates it) as the bespoke
+scheduler's park/wake primitive for run-queue parking, and EVFILT_USER only
+for threads parked inside the kqueue I/O poller.** Rationale: all four
+kernel mechanisms land within ~20% (792–958 ns median), so semantics —
+not latency — decide. The futex compare-and-wait is the only primitive that
+atomically couples "park" with a run-queue generation/state word, giving
+race-free sleep with no per-thread kernel object and a cheap no-op wake
+(`ENOENT`) when nobody is parked; it is also the substrate the fork std
+already uses, and the public `os_sync` API is stable ABI. GCD semaphores'
+~120 ns median edge does not offset dragging libdispatch into a bespoke
+runtime and decoupling the wake from scheduler state; kqueue's unified
+wait point matters only for the poller thread, where its +40 ns (~1 clock
+tick) premium over futex is irrelevant.
+
+**Spin-then-park:** a parked wake costs ~900 ns (median) end-to-end while a
+spinning thread observes a handoff in ~83 ns, so the crossover sits near
+one park cost: spin ~1–2 µs (a few hundred `spinLoopHint` iterations on M4)
+before parking. Piggybacking on the E1 finding that same-thread queue ops
+floor at 13–16 ns, a scheduler that spins briefly before parking keeps
+same-scheduler message RTT in the tens of ns and pays ~0.9 µs only on a
+genuinely idle wake.
+
+**Targets check (feeds S0.5):** the substrate comfortably supports the
+campaign targets. Spawn floor is 9 ns with pooled stacks (sub-µs spawn has
+~two orders of magnitude of headroom for allocator + run-queue + safepoint
+bookkeeping); a same-scheduler RTT built on 6.4 ns switch pairs plus
+13–16 ns queue ops sits far under BEAM's sub-µs send; cross-scheduler RTT
+bounded by two parked wakes ≈ 1.8 µs median (within the ≤2–3 µs band), and
+spin-then-park pulls the busy case toward ~166 ns. The 1.65 µs fresh-stack
+cost rules out per-spawn mmap — **stack pooling (or segmented/virtual-memory
+tricks) is mandatory** for BEAM-class spawn rates. Caveat: all of this is
+contingent on fixing the dropped-x30-clobber fork bug above, which currently
+breaks *any* optimized build of fiber-based code, including the E1 Dispatch
+backend.
 
 ## E10 — vtable vs monomorphized alloc
 
