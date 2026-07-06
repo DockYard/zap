@@ -110,6 +110,13 @@
 //! canary test in `fiber_context.zig` fails loudly under such a compiler;
 //! `zig build test-kernel` runs it at ReleaseFast on purpose.
 //!
+//! Portability tracking (Phase 4 Linux CI leg): the kernel test/stress env
+//! knobs (`adversarial_stress.zig`, `teardown_stress.zig`, `panic_guards.zig`)
+//! read their configuration via libc `std.c.getenv`, so the Linux leg must
+//! either link libc for kernel tests or migrate the knobs to
+//! `std.posix.getenv`. Failure mode today is a loud link error, not silent
+//! misbehavior.
+//!
 //! ## Why this is not under `src/runtime.zig`
 //!
 //! The kernel compiles as a self-contained source tree with no dependency

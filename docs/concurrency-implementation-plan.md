@@ -550,7 +550,11 @@ Each is a design commitment, not a suggestion; each cites its evidence.
 2. **Linux poller wakeup primitive** — eventfd vs io_uring `MSG_RING` (E9 was Darwin-only);
    measured when the Phase 4 poller lands.
 3. **Stack-pool sizing/watermark policy and its interaction with Darwin teardown** — decided
-   empirically by Phase 1.7's spawn/die-cycle test.
+   empirically by Phase 1.7's spawn/die-cycle test. *[Update (Phase 1 close): 1.7 landed as the
+   measuring instrument (the teardown-stress harness + soak knob); the sizing decision itself —
+   including whether cached stacks get `madvise(MADV_FREE)`-style RSS decay — re-points to when
+   real managers land (Phase 2 item 2.4 / Phase 3 items 3.x), measured with that harness. The
+   Phase 1 constants remain the documented ARC-slab-mirror initial policy.]*
 4. **Root cause of the residual Dispatch `spawn-serial` race** — fork-hygiene track.
    **Triaged (job G2, 2026-07-05): classified Dispatch-specific**, evidence in
    `spike/concurrency-e1/triage/` (6 lldb crash captures) and the E1 †-note in
