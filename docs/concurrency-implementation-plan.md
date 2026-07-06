@@ -81,6 +81,7 @@ From `zap-concurrency-research.md` rev 2 §6 — restated as one line each:
    append, opt-in aliasing view.
 9. Wasm/feasibility: comptime capability matrix + runtime spawn error; no Asyncify.
 10. Fork posture: extend `Io.Evented` in `~/projects/zig`; no vendored scheduler.
+    *[Superseded by Appendix A (S0.5): the kernel is a bespoke run-queue scheduler on `fiber.zig`; the Evented backends are demoted to event-source references (A.2.6).]*
 11. Testing: seeded deterministic scheduler; verona-rt-style seed sweeps; failing test prints
     its seed.
 
@@ -98,7 +99,8 @@ node bits}`.
 **The scheduler is:** per-core scheduler threads (M:N), per-core run queues with LIFO slot +
 global overflow queue + work stealing, parking/wakeup integrated with the `Io.Evented` event
 loop, a per-scheduler hierarchical timing wheel, a per-scheduler flag-only watchdog timer, and
-a seedable single-threaded deterministic mode. The Zap scheduler **implements the `std.Io`
+a seedable single-threaded deterministic mode. *[Superseded by Appendix A (S0.5): parking is
+the OS futex on our own run queues per A.2.2/A.3, not Evented event-loop integration.]* The Zap scheduler **implements the `std.Io`
 vtable**, so any Zap-runtime or FFI code doing I/O through `Io` suspends the calling process
 correctly instead of blocking the scheduler thread. Two upstream-informed design rules: the
 implementation is **`operate`-centric** (route I/O dispatch through one `operate` switch over
@@ -166,11 +168,18 @@ same convention as `spike/manager_v1`) before any production code.
 - **S0.1** Benchmark harness: spawn cost, ping-pong RTT (same/cross scheduler), copy p99 vs
   size; CLBG baseline snapshot for E2 comparison. Baselines table from
   `research-round-2.md` Q10.
+  *[Plan amendment (Phase 0 review): two S0.1 deliverables moved rather than delivered here.
+  The "copy p99 vs size" harness construction moved to Phase 2 (item 2.8) — the deep-copy
+  walker E6 must measure is built in Phase 2 item 2.4, so a Phase-0 harness could only have
+  measured raw memcpy. The "same/cross scheduler" RTT decomposition moved to Phase 4 —
+  cross-scheduler RTT requires the M:N scheduler; Phase 0's E9 wake-cost measurements bound
+  it analytically (two parked wakes ≈ 1.8 µs).]*
 - **S0.2 (E1)** Fiber spawn + ping-pong on the fork's `Io.Evented` (Dispatch on this machine)
   vs `Io.Threaded`. Targets: sub-µs–3 µs spawn, RTT within 2–3× BEAM/Go.
 - **S0.3 (E9)** Dispatch vs Kqueue on Darwin: fiber-switch + wakeup latency → picks the
   tier-1 default backend (note: upstream's Evented switch picks Dispatch for macOS; validate
   or override in-fork).
+  *[Superseded by Appendix A (S0.5): E9 was reframed to fiber-floor + wake-mechanism measurement and chose the os_sync futex for run-queue parking with EVFILT_USER reserved for the I/O-poller split.]*
 - **S0.4 (E10)** Vtable-dispatch vs monomorphized alloc call microbenchmark → confirms the
   hybrid's hot/cold split empirically.
 - **S0.5** Scheduler architecture decision memo: drive processes through `Io.async`/
@@ -228,6 +237,13 @@ Goal: `spawn`/`send`/`receive`/`after` work in Zap programs; single model; safep
   supports compile-fail.
 - **2.7** Zap stdlib: `lib/process.zap` minimal surface; Zest concurrent tests (seeded) —
   ping-pong, ordering (pairwise FIFO), crash-teardown, timeout semantics.
+- **2.8** Copy-p99-vs-size harness (moved from S0.1): message-copy latency over 64 B–1 MB
+  payloads, built on the 2.4 deep-copy walker (the component whose absence moved this out of
+  Phase 0); feeds the E6 crossover measurement below.
+- **2.9** E2 gate execution precondition: quiet-machine interleaved re-baseline — paired
+  baseline-vs-safepoint runs of the same binaries in the same session, compared on paired
+  medians/minima per the S0.1 ledger's gating protocol (the archival S0.1 table is drift
+  context, not the gate).
 
 Exit gates: **E2** (CLBG with concurrency ON: alloc-piggyback ≈ 0 on allocating loops;
 back-edge poll ≤2–3% on nbody/spectral-norm, else loop-unroll mitigation before proceeding);
@@ -262,6 +278,7 @@ conservative scan cost + false retention → mark-sweep ships or slips per rev 2
 - **4.1** M:N work-stealing scheduler (schedulers = cores), per-core queues + LIFO slot +
   global overflow; parking via Evented wakeups (userspace flag when awake; eventfd/`MSG_RING`/
   kqueue-user/GCD source when parked — measure, R7).
+  *[Superseded by Appendix A (S0.5): closed by A.3 — Darwin run-queue parking = OS futex, poller = EVFILT_USER; R7 narrows to the Linux poller primitive (eventfd vs `MSG_RING`).]*
 - **4.2** Hierarchical timing wheel per scheduler, feeding the `after` Select arm. Include
   `Condition.waitTimeout`/`Semaphore.waitTimeout` in the primitive set: implement on 0.16's
   existing `futexWaitTimeout` vtable entry, or cherry-pick the three small std-only upstream
@@ -273,7 +290,9 @@ conservative scan cost + false retention → mark-sweep ships or slips per rev 2
 
 Exit gates: **E7** (fiber blocking inside a manager call — GC pause in `allocate`, lazy-commit
 fault — co-scheduled fibers not delayed beyond watchdog tick, else mandatory handoff for
-blockable manager calls); E1 cross-scheduler numbers.
+blockable manager calls); E1 cross-scheduler numbers, including the same-vs-cross-scheduler
+ping-pong RTT decomposition moved here from S0.1 (measurable only once the M:N scheduler
+exists; until then bounded analytically by E9's parked-wake cost — two wakes ≈ 1.8 µs).
 
 ### Phase 5 — Signals, supervision, typed calls (L)
 

@@ -2,9 +2,11 @@
 
 **THROWAWAY SPIKE CODE.** Job S0.2 (experiment E1) of the concurrency campaign
 (`docs/concurrency-implementation-plan.md`, Phase 0). This directory is not
-product code, is not wired into any build, and will be deleted once the S0.5
-scheduler-architecture decision is made. Results are recorded in the E1
-section of `docs/concurrency-bench-results.md`.
+product code and is not wired into any build. It is retained until the
+Phase 1 E1 re-run gate completes (the re-run gates against this spike's
+post-fix ledger rows, and the `triage/` crash captures here are referenced by
+the ledger's E1 section); it is deleted after that gate. Results are recorded
+in the E1 section of `docs/concurrency-bench-results.md`.
 
 ## What it measures
 

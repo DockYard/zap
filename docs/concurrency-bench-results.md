@@ -5,9 +5,14 @@ Results ledger for the concurrency implementation campaign
 CLBG performance baseline below on pre-concurrency `main` so that every later
 phase — especially the **E2** safepoint-overhead gate — has an apples-to-apples
 reference. Zap's CLBG standing (n-body, spectral-norm wins) is a hard
-requirement of the campaign; any run that regresses these numbers by more than
-the E2 kill criterion (>2–3% on n-body/spectral-norm) triggers the unrolling
-mitigation before concurrency-on ships.
+requirement of the campaign. The E2 kill criterion is >2–3% regression on
+n-body/spectral-norm → the unrolling mitigation before concurrency-on ships;
+the gate itself is decided by the **paired protocol** — interleaved,
+same-session, quiet-machine re-runs of the baseline binaries against the
+safepoint binaries, compared on paired medians/minima, as prescribed in the
+S0.1 methodology section below. The S0.1 table is the archival snapshot and
+drift context, not the gate: no run is gated by absolute comparison against
+its numbers.
 
 ## CLBG baseline (S0.1) — pre-concurrency `main`
 
@@ -44,6 +49,13 @@ mitigation before concurrency-on ships.
   | `spectral-norm/spectral_norm.zap` | `3697f9434abb` |
   | `k-nucleotide/k_nucleotide.zap` | `763abe1414e3` |
   | `k-nucleotide/input.fasta` | `d4a2d94374f2` |
+
+  *Reproducibility update (2026-07-05):* the working-tree `Integer.parse`
+  wrappers described above were committed to `lang-benches` as
+  `49287c676a0e3c1d649b7446e7f0e07780134f28` (`fix: wrap Integer.parse for
+  optional-returning API (zap main)`), so the measured bench sources are now
+  pinned by that commit; the sha256 prefixes above remain the byte-level
+  ground truth.
 
 - **Binary acquisition** (the suite's established `zap run` script-mode
   protocol, `lang-benches/scripts/zap-script-bin.sh`):
@@ -176,6 +188,13 @@ and 4; spawn cost is manager-dependent, so later phases report per-manager.
   ```sh
   zig build-exe --zig-lib-dir $HOME/projects/zig/lib -OReleaseFast bench.zig
   ```
+
+  *Fork pin (recorded post hoc):* best-known state is
+  `b8fc76ac3f7cc11580a6801d3ccaa2d520f0af06` (the SHA the same-day S0.1 and
+  E9 jobs recorded for a clean fork tree). Honesty note: the exact fork tree
+  state for these pre-fix rows was **not recorded at measurement time**; the
+  rows are superseded-as-history by the post-clobber-fix re-measurement below
+  (fork @ `74c0b87fe5`), which is fully pinned.
 
 - **Protocol:** one measurement at a time, foreground; unrecorded warmup pass
   (workload/10, min 1000 ops) then 5 timed repetitions; median + min of

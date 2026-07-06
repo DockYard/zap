@@ -1,3 +1,15 @@
 *.o
 zig-out/
 .zig-cache/
+
+# Concurrency-spike build outputs: the spike READMEs' `zig build-exe`
+# commands produce extensionless binaries (and e10's -femit-asm produces
+# a .s listing). Ignore the exact documented names per directory rather
+# than broad patterns, so any new artifact still shows up in git status
+# and gets a deliberate decision (same rationale as the fork's S0.0
+# exact-path entries).
+concurrency-e1/bench
+concurrency-e9/fiber_switch
+concurrency-e9/wakeup
+concurrency-e10/dispatch
+*.s

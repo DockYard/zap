@@ -2,8 +2,10 @@
 
 **THROWAWAY SPIKE CODE.** Job S0.3 (experiment E9, reframed after E1) of the
 concurrency campaign (`docs/concurrency-implementation-plan.md`, Phase 0).
-This directory is not product code, is not wired into any build, and will be
-deleted once the S0.5 scheduler-architecture decision is made. Results are
+This directory is not product code and is not wired into any build. It is
+retained as a substrate-floor reference workload until the Phase 1 kernel
+implementation lands (its fiber-switch/spawn/wake floors are the reference
+numbers Phase 1 builds against); it is deleted after that. Results are
 recorded in the E9 section of `docs/concurrency-bench-results.md`.
 
 ## What it measures
