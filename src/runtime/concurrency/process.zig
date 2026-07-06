@@ -129,6 +129,14 @@ pub const ManagerVTable = struct {
     /// "wholesale arena/slab free on exit") — releases every live
     /// allocation of this process in one call.
     teardown: *const fn (manager_state: ?*anyopaque) void,
+    /// Bytes currently live in this process's heap (plan Phase 1 item
+    /// 1.6, the per-process "heap bytes" observability surface). The
+    /// value is payload bytes — allocated minus deallocated request
+    /// sizes — with manager-defined exactness: the Phase 1 test managers
+    /// count requested bytes exactly; a real manager may report its
+    /// internal accounting granularity instead. Advisory, never
+    /// load-bearing; `teardown` returns it to zero.
+    heapByteCount: *const fn (manager_state: ?*anyopaque) usize,
 };
 
 /// A process's manager binding: opaque per-process manager state plus the
@@ -154,6 +162,13 @@ pub const ManagerContext = struct {
     /// Wholesale exit teardown through the vtable.
     pub fn teardown(manager: ManagerContext) void {
         manager.vtable.teardown(manager.manager_state);
+    }
+
+    /// Bytes currently live in the process heap, through the vtable
+    /// (observability, plan item 1.6 — see `ManagerVTable.heapByteCount`
+    /// for the exactness contract).
+    pub fn heapByteCount(manager: ManagerContext) usize {
+        return manager.vtable.heapByteCount(manager.manager_state);
     }
 };
 
@@ -332,6 +347,7 @@ test "PCB: state-transition legality matrix" {
 const TestManager = struct {
     arena: std.heap.ArenaAllocator,
     allocation_count: usize = 0,
+    live_heap_bytes: usize = 0,
     teardown_count: usize = 0,
 
     fn init(backing_allocator: std.mem.Allocator) TestManager {
@@ -346,12 +362,14 @@ const TestManager = struct {
         .allocate = allocateThunk,
         .deallocate = deallocateThunk,
         .teardown = teardownThunk,
+        .heapByteCount = heapByteCountThunk,
     };
 
     fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
         const manager: *TestManager = @ptrCast(@alignCast(manager_state.?));
         const memory = manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress()) orelse return null;
         manager.allocation_count += 1;
+        manager.live_heap_bytes += byte_length;
         return memory;
     }
 
@@ -359,6 +377,7 @@ const TestManager = struct {
         const manager: *TestManager = @ptrCast(@alignCast(manager_state.?));
         manager.arena.allocator().rawFree(memory[0..byte_length], alignment, @returnAddress());
         manager.allocation_count -= 1;
+        manager.live_heap_bytes -= byte_length;
     }
 
     fn teardownThunk(manager_state: ?*anyopaque) void {
@@ -370,6 +389,12 @@ const TestManager = struct {
         manager.arena.deinit();
         manager.arena = std.heap.ArenaAllocator.init(backing_allocator);
         manager.allocation_count = 0;
+        manager.live_heap_bytes = 0;
+    }
+
+    fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
+        const manager: *TestManager = @ptrCast(@alignCast(manager_state.?));
+        return manager.live_heap_bytes;
     }
 };
 
@@ -395,6 +420,24 @@ test "PCB: manager vtable allocate/deallocate/teardown round-trip" {
 fn noopEntry(execution: *fiber_context.FiberExecution, argument: ?*anyopaque) void {
     _ = execution;
     _ = argument;
+}
+
+test "PCB: manager vtable heap-byte accounting tracks live bytes and resets on teardown" {
+    var test_manager = TestManager.init(testing.allocator);
+    defer test_manager.arena.deinit();
+    const manager = test_manager.managerContext();
+
+    try testing.expectEqual(@as(usize, 0), manager.heapByteCount());
+    const first = manager.allocate(64, .of(u64)) orelse return error.TestUnexpectedResult;
+    _ = manager.allocate(100, .of(u8)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 164), manager.heapByteCount());
+
+    manager.deallocate(first, 64, .of(u64));
+    try testing.expectEqual(@as(usize, 100), manager.heapByteCount());
+
+    // Wholesale exit teardown zeroes the live-byte accounting.
+    manager.teardown();
+    try testing.expectEqual(@as(usize, 0), manager.heapByteCount());
 }
 
 test "PCB: init defaults — embryo state, empty mailbox and drop-list, full budget" {

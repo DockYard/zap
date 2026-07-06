@@ -286,6 +286,56 @@ pub fn reclaimWithoutResume(kernel_fiber: *KernelFiber) void {
     kernel_fiber.lifecycle_state = .reclaimed;
 }
 
+/// The architecture-neutral view of a suspended fiber's saved cpu state
+/// (plan Phase 1 item 1.6): the last-suspend program counter, frame
+/// pointer, and stack pointer as captured by the fiber's final context
+/// switch away. This module owns the arch-specific `Context` field names;
+/// consumers (introspection snapshots, the crash reporter's saved-frame
+/// walk) work with this view only.
+pub const SavedRegisters = struct {
+    /// Address of the instruction the fiber resumes at — the suspend
+    /// point inside its last yield's context switch.
+    program_counter: usize,
+    /// The fiber's frame pointer at the suspend point. Walking the frame
+    /// records from here reaches the fiber root's {fp: 0, ra: 0}
+    /// terminator (the unwind-safe-root design, module doc).
+    frame_pointer: usize,
+    /// The fiber's stack pointer at the suspend point.
+    stack_pointer: usize,
+};
+
+/// The last-suspend registers of `kernel_fiber`, or null when the fiber
+/// has no walkable suspend point:
+///
+/// * `.ready` — no code has ever run on the stack (the saved context is
+///   the synthetic entry context, not a suspend point);
+/// * `.running` — the saved context is stale (it was consumed by the
+///   switch-in that started the current quantum);
+/// * `.finished`/`.reclaimed` — the fiber ran to completion; its stack
+///   has been (or is about to be) released, so the saved state must not
+///   be walked.
+///
+/// Only `.suspended` fibers — parked mid-yield with their stack intact —
+/// return a value. Scheduler-thread discipline: read while the fiber's
+/// owning scheduler is not resuming it.
+pub fn savedRegisters(kernel_fiber: *const KernelFiber) ?SavedRegisters {
+    if (kernel_fiber.lifecycle_state != .suspended) return null;
+    const saved_context = &kernel_fiber.switch_context;
+    return switch (builtin.cpu.arch) {
+        .aarch64 => .{
+            .program_counter = saved_context.pc,
+            .frame_pointer = saved_context.fp,
+            .stack_pointer = saved_context.sp,
+        },
+        .x86_64 => .{
+            .program_counter = saved_context.rip,
+            .frame_pointer = saved_context.rbp,
+            .stack_pointer = saved_context.rsp,
+        },
+        else => |arch| @compileError("savedRegisters not implemented for " ++ @tagName(arch)),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Stack layout, entry trampoline, and context-switch plumbing.
 // ---------------------------------------------------------------------------
@@ -689,6 +739,38 @@ test "FiberContext: native stack unwinding terminates at the fiber root" {
         try testing.expect(probe.frames_captured > 0);
         try testing.expect(probe.frames_captured <= 32);
     }
+}
+
+test "FiberContext: savedRegisters exposes the last-suspend pc/fp of a suspended fiber only" {
+    var pool = StackPool.init(.{ .usable_size = 64 * 1024 });
+    defer pool.deinit();
+
+    var probe = CounterProbe{ .yield_budget = 1 };
+    var kernel_fiber = try init(&pool, countingEntry, &probe);
+
+    // `.ready`: no code has run — there is no suspend point yet.
+    try testing.expectEqual(@as(?SavedRegisters, null), savedRegisters(&kernel_fiber));
+
+    var scheduler = SchedulerContext{};
+    try testing.expectEqual(ResumeOutcome.yielded, resumeFiber(&scheduler, &kernel_fiber));
+    try testing.expectEqual(LifecycleState.suspended, kernel_fiber.lifecycle_state);
+
+    // `.suspended`: the yield's context switch saved the suspend point.
+    const saved = savedRegisters(&kernel_fiber) orelse return error.TestUnexpectedResult;
+    try testing.expect(saved.program_counter != 0);
+    const usable_bytes = kernel_fiber.stack.usable();
+    const usable_start = @intFromPtr(usable_bytes.ptr);
+    const usable_end = usable_start + usable_bytes.len;
+    try testing.expect(saved.frame_pointer >= usable_start);
+    try testing.expect(saved.frame_pointer < usable_end);
+    try testing.expect(saved.stack_pointer >= usable_start);
+    try testing.expect(saved.stack_pointer < usable_end);
+    try testing.expect(saved.stack_pointer <= saved.frame_pointer);
+
+    // Run to completion: a reclaimed fiber has no walkable suspend point
+    // (its stack has already returned to the pool).
+    try testing.expectEqual(ResumeOutcome.finished, resumeFiber(&scheduler, &kernel_fiber));
+    try testing.expectEqual(@as(?SavedRegisters, null), savedRegisters(&kernel_fiber));
 }
 
 test "FiberContext: reclaimWithoutResume releases a never-run fiber's stack" {

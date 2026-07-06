@@ -239,6 +239,7 @@ const pid_table_module = @import("pid_table.zig");
 const mailbox_module = @import("mailbox.zig");
 const envelope_pool_module = @import("envelope_pool.zig");
 const process_module = @import("process.zig");
+const crash_report_module = @import("crash_report.zig");
 
 const Pid = pid_table_module.Pid;
 const PidTable = pid_table_module.PidTable;
@@ -655,6 +656,9 @@ pub const Scheduler = struct {
     normal_exit_total: u64,
     /// Kill teardowns (scheduler-thread only).
     kill_total: u64,
+    /// Quanta executed (process switch-ins; scheduler-thread only —
+    /// plan item 1.6 "quanta executed").
+    quantum_total: u64,
 
     /// Construction options.
     pub const Options = struct {
@@ -675,6 +679,14 @@ pub const Scheduler = struct {
         trace_hook: ?TraceHook = null,
         /// Opaque context for `trace_hook`.
         trace_context: ?*anyopaque = null,
+        /// Crash-report seam (plan 1.6; `crash_report.zig`): invoked
+        /// synchronously on the scheduler thread at the START of every
+        /// teardown — before the pid is unregistered or any resource is
+        /// torn down — with a borrowed report. Null = one branch per
+        /// teardown, nothing captured.
+        crash_report_hook: ?crash_report_module.ReportHook = null,
+        /// Opaque context for `crash_report_hook`.
+        crash_report_context: ?*anyopaque = null,
         /// Usable bytes per fiber stack (forwarded to this scheduler's
         /// stack pool).
         stack_usable_size: usize = stack_pool_module.default_usable_size,
@@ -712,6 +724,8 @@ pub const Scheduler = struct {
         normal_exit_total: u64,
         /// Kill teardowns.
         kill_total: u64,
+        /// Quanta executed (process switch-ins).
+        quantum_total: u64,
         /// Futex parks entered.
         park_count: u64,
         /// `wake()` invocations.
@@ -752,6 +766,7 @@ pub const Scheduler = struct {
             .spawn_total = 0,
             .normal_exit_total = 0,
             .kill_total = 0,
+            .quantum_total = 0,
         };
     }
 
@@ -964,6 +979,7 @@ pub const Scheduler = struct {
             .spawn_total = scheduler.spawn_total,
             .normal_exit_total = scheduler.normal_exit_total,
             .kill_total = scheduler.kill_total,
+            .quantum_total = scheduler.quantum_total,
             .park_count = scheduler.park_count.load(.monotonic),
             .wake_signal_count = scheduler.wake_signal_count.load(.monotonic),
         };
@@ -988,6 +1004,7 @@ pub const Scheduler = struct {
             scheduler.options.preemption_budget,
         );
         scheduler.emitTrace(.schedule, pcb.pid);
+        scheduler.quantum_total += 1;
         scheduler.current_process = pcb;
         const outcome = fiber_context.resumeFiber(&scheduler.fiber_scheduler_context, &pcb.fiber);
         scheduler.current_process = null;
@@ -1031,6 +1048,16 @@ pub const Scheduler = struct {
     fn teardownProcess(scheduler: *Scheduler, record: *ProcessRecord, reason: ExitReason) void {
         const pcb = &record.pcb;
         const exit_pid = pcb.pid; // captured: unregister resets it
+
+        // (1) Crash report FIRST (plan 1.6, `crash_report.zig`): the
+        // report snapshots the pid, state, mailbox depth, and — for a
+        // suspended fiber — the stack trace from the last suspend point,
+        // all of which the steps below destroy.
+        if (scheduler.options.crash_report_hook) |report_hook| {
+            const report = crash_report_module.captureForTeardown(pcb, reason);
+            report_hook(scheduler.options.crash_report_context, &report);
+        }
+
         pcb.transitionTo(.exiting);
 
         // (2) Pid first: every outstanding copy dead-letters from here on.
@@ -1458,6 +1485,7 @@ const testing = std.testing;
 /// exactly one teardown per spawn.
 const TestProcessManager = struct {
     arena: std.heap.ArenaAllocator,
+    live_heap_bytes: usize = 0,
     teardown_count: usize = 0,
 
     fn init(backing_allocator: std.mem.Allocator) TestProcessManager {
@@ -1476,16 +1504,20 @@ const TestProcessManager = struct {
         .allocate = allocateThunk,
         .deallocate = deallocateThunk,
         .teardown = teardownThunk,
+        .heapByteCount = heapByteCountThunk,
     };
 
     fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
         const manager: *TestProcessManager = @ptrCast(@alignCast(manager_state.?));
-        return manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress());
+        const memory = manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress()) orelse return null;
+        manager.live_heap_bytes += byte_length;
+        return memory;
     }
 
     fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
         const manager: *TestProcessManager = @ptrCast(@alignCast(manager_state.?));
         manager.arena.allocator().rawFree(memory[0..byte_length], alignment, @returnAddress());
+        manager.live_heap_bytes -= byte_length;
     }
 
     fn teardownThunk(manager_state: ?*anyopaque) void {
@@ -1494,6 +1526,12 @@ const TestProcessManager = struct {
         const backing_allocator = manager.arena.child_allocator;
         manager.arena.deinit();
         manager.arena = std.heap.ArenaAllocator.init(backing_allocator);
+        manager.live_heap_bytes = 0;
+    }
+
+    fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
+        const manager: *TestProcessManager = @ptrCast(@alignCast(manager_state.?));
+        return manager.live_heap_bytes;
     }
 };
 
@@ -1741,6 +1779,29 @@ test "Scheduler: budget exhaustion forces yield — quantum and yield counts are
     try testing.expectEqual(@as(usize, 4), trace_log.countKind(.schedule));
     try testing.expectEqual(@as(usize, 3), trace_log.countKind(.yield));
     try testing.expectEqual(@as(usize, 1), trace_log.countKind(.exit));
+    try kernel.expectExactAccounting();
+}
+
+test "Scheduler: quantum counter counts every executed quantum exactly" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{ .stack_usable_size = 64 * 1024, .preemption_budget = 3 });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    try testing.expectEqual(@as(u64, 0), kernel.scheduler.statistics().quantum_total);
+
+    var log = WorkLog{};
+    var probe = WorkLogProbe{ .log = &log, .identity = 'q', .total_steps = 10 };
+    _ = try kernel.scheduler.spawn(.{
+        .entry = workLoggingEntry,
+        .argument = &probe,
+        .manager = manager.managerContext(),
+    });
+    try kernel.scheduler.runUntilQuiescent();
+
+    // 10 steps at budget 3: yields after steps 3, 6, 9 → exactly 4 quanta.
+    try testing.expectEqual(@as(u64, 4), kernel.scheduler.statistics().quantum_total);
     try kernel.expectExactAccounting();
 }
 

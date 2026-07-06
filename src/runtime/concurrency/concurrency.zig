@@ -32,8 +32,9 @@
 //!
 //! Phase 1, jobs P1-J1 (kernel skeleton, plan item 1.1), P1-J2
 //! (generational pid table, plan item 1.2), P1-J3 (mailbox +
-//! envelope pool, plan item 1.3), and P1-J4 (scheduler core, plan items
-//! 1.4 + 1.5):
+//! envelope pool, plan item 1.3), P1-J4 (scheduler core, plan items
+//! 1.4 + 1.5), and P1-J5 (observability + crash reports + teardown
+//! stress, plan items 1.6 + 1.7):
 //!
 //! * `stack_pool.zig` — pooled fixed-reservation guard-paged lazy-commit
 //!   fiber stacks with a live-peak-bounded free list (plan A.2.1).
@@ -66,9 +67,24 @@
 //! * `deterministic.zig` — the seeded deterministic mode: seeded
 //!   `Decisions`, append-only trace recording with equality comparison,
 //!   scenario harness + seed sweeps, failing-seed printing.
+//! * `introspection.zig` — the plan-1.6 observability skeleton:
+//!   per-process snapshots (state, approximate mailbox depth, manager
+//!   heap bytes, last-suspend pc/fp), process listing over the pid
+//!   table's lock-free iterator, and the scheduler counter roster
+//!   (run-queue depth, quanta, parks/wakes, dead letters, spawn/exit
+//!   totals). Per research.md §6.9, these double as the testing hooks.
+//! * `crash_report.zig` — plan-1.6 crash reports: on every teardown
+//!   (normal exit, kill/simulated crash) an optional sink receives the
+//!   pid, reason, state and mailbox depth at death, and a native stack
+//!   trace walked from the fiber's last suspend point (a bounded,
+//!   stack-bounds-validated frame-pointer walk that avoids the fork-std
+//!   MachO compact-unwind defect — adjudication note in the module doc).
+//! * `teardown_stress.zig` — the plan-1.7 Darwin teardown campaign
+//!   (mimalloc-#164 class): thousands of mixed-shape spawn/die cycles
+//!   with exact per-wave resource accounting;
+//!   `ZAP_TEARDOWN_STRESS_CYCLES` scales it to a soak.
 //!
-//! NOT here yet: observability beyond the statistics skeleton (1.6),
-//! the Darwin spawn/die teardown campaign (1.7), timers, links/monitors,
+//! NOT here yet: timers, links/monitors,
 //! and the `std.Io` vtable. This tree is NOT wired
 //! into Zap compilation — it is exercised by `zig build test-kernel`
 //! (both the selected optimize mode and a ReleaseFast run for the
@@ -103,6 +119,8 @@ pub const mailbox = @import("mailbox.zig");
 pub const envelope_pool = @import("envelope_pool.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const deterministic = @import("deterministic.zig");
+pub const introspection = @import("introspection.zig");
+pub const crash_report = @import("crash_report.zig");
 
 pub const StackPool = stack_pool.StackPool;
 pub const Stack = stack_pool.Stack;
@@ -135,6 +153,11 @@ pub const SendOutcome = scheduler.SendOutcome;
 pub const SeededDecisions = deterministic.SeededDecisions;
 pub const TraceRecorder = deterministic.TraceRecorder;
 pub const DeterministicHarness = deterministic.Harness;
+pub const ProcessSnapshot = introspection.ProcessSnapshot;
+pub const ProcessListIterator = introspection.ProcessListIterator;
+pub const KernelCounters = introspection.KernelCounters;
+pub const CrashReport = crash_report.CrashReport;
+pub const ReportHook = crash_report.ReportHook;
 
 test {
     _ = stack_pool;
@@ -145,4 +168,7 @@ test {
     _ = envelope_pool;
     _ = scheduler;
     _ = deterministic;
+    _ = introspection;
+    _ = crash_report;
+    _ = @import("teardown_stress.zig");
 }

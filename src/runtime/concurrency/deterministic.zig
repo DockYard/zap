@@ -320,6 +320,7 @@ pub const Harness = struct {
 /// teardown is verifiable.
 const HarnessProcessManager = struct {
     arena: std.heap.ArenaAllocator,
+    live_heap_bytes: usize = 0,
     teardown_count: usize = 0,
 
     fn managerContext(manager: *HarnessProcessManager) process_module.ManagerContext {
@@ -330,16 +331,20 @@ const HarnessProcessManager = struct {
         .allocate = allocateThunk,
         .deallocate = deallocateThunk,
         .teardown = teardownThunk,
+        .heapByteCount = heapByteCountThunk,
     };
 
     fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
         const manager: *HarnessProcessManager = @ptrCast(@alignCast(manager_state.?));
-        return manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress());
+        const memory = manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress()) orelse return null;
+        manager.live_heap_bytes += byte_length;
+        return memory;
     }
 
     fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
         const manager: *HarnessProcessManager = @ptrCast(@alignCast(manager_state.?));
         manager.arena.allocator().rawFree(memory[0..byte_length], alignment, @returnAddress());
+        manager.live_heap_bytes -= byte_length;
     }
 
     fn teardownThunk(manager_state: ?*anyopaque) void {
@@ -349,6 +354,12 @@ const HarnessProcessManager = struct {
         // Leave the arena in a deinit-safe state (destroy() only asserts
         // and frees the struct; a double teardown is caught by the count).
         manager.arena = std.heap.ArenaAllocator.init(manager.arena.child_allocator);
+        manager.live_heap_bytes = 0;
+    }
+
+    fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
+        const manager: *HarnessProcessManager = @ptrCast(@alignCast(manager_state.?));
+        return manager.live_heap_bytes;
     }
 };
 
