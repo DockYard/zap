@@ -10,7 +10,8 @@
 //!
 //! ## Phase status
 //!
-//! Phase 1, job P1-J1 — the kernel skeleton (plan item 1.1):
+//! Phase 1, jobs P1-J1 (kernel skeleton, plan item 1.1) and P1-J2
+//! (generational pid table, plan item 1.2):
 //!
 //! * `stack_pool.zig` — pooled fixed-reservation guard-paged lazy-commit
 //!   fiber stacks with a live-peak-bounded free list (plan A.2.1).
@@ -19,11 +20,15 @@
 //!   stack-lifetime invariant from the G2 triage (a finished fiber's stack
 //!   is released only by the scheduler, after the final switch away).
 //! * `process.zig` — the process control block: fiber + manager context +
-//!   mailbox/pid placeholders + preemption budget + drop-list head +
-//!   state machine.
+//!   mailbox placeholder + preemption budget + drop-list head + state
+//!   machine + pid identity (register/unregister seams for 1.4).
+//! * `pid_table.zig` — generational pid table: packed `{slot, generation,
+//!   model, node}` pids (§2.4 invariant: generation+model validated as
+//!   one atomic unit, dead-letter on mismatch), lock-free tagged free
+//!   list, and OTP-28-style snapshot-free live-process iteration.
 //!
-//! NOT here yet: run-queue scheduler and pid table (P1-J2), Vyukov MPSC
-//! mailbox and envelope pool (P1-J3), spawn/exit orchestration (1.4),
+//! NOT here yet: run-queue scheduler, Vyukov MPSC mailbox and envelope
+//! pool (P1-J3), spawn/exit orchestration (1.4),
 //! deterministic mode (1.5), observability (1.6). This tree is NOT wired
 //! into Zap compilation — it is exercised by `zig build test-kernel`
 //! (both the selected optimize mode and a ReleaseFast run for the
@@ -53,6 +58,7 @@
 pub const stack_pool = @import("stack_pool.zig");
 pub const fiber_context = @import("fiber_context.zig");
 pub const process = @import("process.zig");
+pub const pid_table = @import("pid_table.zig");
 
 pub const StackPool = stack_pool.StackPool;
 pub const Stack = stack_pool.Stack;
@@ -61,10 +67,14 @@ pub const FiberExecution = fiber_context.FiberExecution;
 pub const SchedulerContext = fiber_context.SchedulerContext;
 pub const ProcessControlBlock = process.ProcessControlBlock;
 pub const ProcessState = process.ProcessState;
-pub const Pid = process.Pid;
+pub const Pid = pid_table.Pid;
+pub const PidTable = pid_table.PidTable;
+pub const ReclamationModel = pid_table.ReclamationModel;
+pub const LiveProcessIterator = pid_table.LiveProcessIterator;
 
 test {
     _ = stack_pool;
     _ = fiber_context;
     _ = process;
+    _ = pid_table;
 }

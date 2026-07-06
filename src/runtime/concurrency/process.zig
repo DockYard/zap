@@ -6,8 +6,18 @@
 //! context (vtable + state pointer in the process control block) + a
 //! mailbox + a preemption budget + a drop-list of external resources + a
 //! pid table slot.* This module defines the control block and its state
-//! machine; spawn/exit/teardown orchestration is Phase 1 item 1.4, the pid
-//! table is P1-J2, and the mailbox is P1-J3.
+//! machine; spawn/exit/teardown orchestration is Phase 1 item 1.4 and the
+//! mailbox is P1-J3.
+//!
+//! ## Pid identity (P1-J2 wiring)
+//!
+//! Identity lives in the generational pid table (`pid_table.zig`). A PCB
+//! is born with `Pid.invalid`; the spawn path registers it (`register`)
+//! to obtain its pid at creation, and the exit path unregisters it
+//! (`unregister`) in the `.exiting` state — BEFORE manager teardown, so
+//! every subsequent lookup dead-letters instead of observing a heap that
+//! is being torn down. Those two calls are the creation/finish seams the
+//! 1.4 spawn/exit orchestration will drive.
 //!
 //! ## Manager binding (placeholder discipline)
 //!
@@ -29,19 +39,13 @@
 
 const std = @import("std");
 const fiber_context = @import("fiber_context.zig");
+const pid_table = @import("pid_table.zig");
 
-/// Process identifier — PLACEHOLDER.
-///
-/// TODO(P1-J2): replace with the real generational pid: model bits a
-/// function of {slot, generation} plus reserved node bits, backed by the
-/// pid table with scalable iteration (plan Phase 1 item 1.2, locked design
-/// decision 4). Until then this is an opaque 64-bit handle so PCB layout
-/// and tests do not churn when the real type lands.
-pub const Pid = enum(u64) {
-    /// Sentinel for "no process" while the real pid table does not exist.
-    invalid = 0,
-    _,
-};
+/// Process identifier — the generational pid of `pid_table.zig` (plan
+/// Phase 1 item 1.2, locked design decision 4): `{slot, generation,
+/// model bits, node bits}` packed into 64 bits. Re-exported here because
+/// the PCB carries it; the table module owns the definition.
+pub const Pid = pid_table.Pid;
 
 /// Scheduling/lifecycle state of a process (plan §3). The legal
 /// transitions are encoded in `isLegalTransition`; `transitionTo` enforces
@@ -146,7 +150,8 @@ pub const DropListNode = struct {
 /// kernel. Field order groups the scheduler-hot fields (state, budget,
 /// fiber) ahead of exit-path fields.
 pub const ProcessControlBlock = struct {
-    /// Process identity. Placeholder type — see `Pid`.
+    /// Process identity. `Pid.invalid` from `init` until `register`
+    /// acquires a pid-table slot; `Pid.invalid` again after `unregister`.
     pid: Pid,
     /// Lifecycle/scheduling state; mutate only via `transitionTo`.
     state: ProcessState,
@@ -165,17 +170,18 @@ pub const ProcessControlBlock = struct {
     /// Head of the external-resource drop-list (see `DropListNode`).
     drop_list_head: ?*DropListNode,
 
-    /// Assemble a PCB in the `.embryo` state with an empty mailbox slot,
-    /// an empty drop-list, and a full default preemption budget. The
-    /// caller provides the created fiber (see `fiber_context.init`) and
-    /// the manager binding; spawn orchestration on top is Phase 1.4.
+    /// Assemble a PCB in the `.embryo` state with no identity
+    /// (`Pid.invalid` — identity is acquired by `register`, which needs
+    /// the PCB's final address), an empty mailbox slot, an empty
+    /// drop-list, and a full default preemption budget. The caller
+    /// provides the created fiber (see `fiber_context.init`) and the
+    /// manager binding; spawn orchestration on top is Phase 1.4.
     pub fn init(
-        pid: Pid,
         kernel_fiber: fiber_context.KernelFiber,
         manager: ManagerContext,
     ) ProcessControlBlock {
         return .{
-            .pid = pid,
+            .pid = .invalid,
             .state = .embryo,
             .preemption_budget = default_preemption_budget,
             .fiber = kernel_fiber,
@@ -183,6 +189,53 @@ pub const ProcessControlBlock = struct {
             .mailbox = null,
             .drop_list_head = null,
         };
+    }
+
+    /// Creation seam (Phase 1.4 spawn path): acquire a pid-table slot
+    /// for this process under `model` and record the pid in the PCB. The
+    /// PCB must be at its final address (the table stores the pointer),
+    /// in the `.embryo` state, and not already registered — violations
+    /// are kernel bugs and panic in every build mode, matching
+    /// `transitionTo`'s discipline. On `error.ProcessTableExhausted` the
+    /// PCB is untouched and the spawn path surfaces the failure.
+    pub fn register(
+        process: *ProcessControlBlock,
+        table: *pid_table.PidTable,
+        model: pid_table.ReclamationModel,
+    ) pid_table.PidTable.AcquireError!Pid {
+        if (process.pid.toBits() != Pid.invalid.toBits()) {
+            @branchHint(.cold);
+            @panic("ProcessControlBlock.register: process already registered — kernel bug");
+        }
+        if (process.state != .embryo) {
+            @branchHint(.cold);
+            @panic("ProcessControlBlock.register: identity must be acquired in the embryo state — kernel bug");
+        }
+        const pid = try table.acquire(process, model);
+        process.pid = pid;
+        return pid;
+    }
+
+    /// Finish seam (Phase 1.4 exit path): release this process's pid —
+    /// instantly dead-lettering every outstanding copy of it — and reset
+    /// the PCB's pid to `Pid.invalid`. Must run in the `.exiting` state
+    /// and BEFORE `manager.teardown()`, so no lookup can resolve to a
+    /// process whose heap is being torn down. Calling it unregistered or
+    /// outside `.exiting` is a kernel bug and panics in every build mode.
+    pub fn unregister(
+        process: *ProcessControlBlock,
+        table: *pid_table.PidTable,
+    ) void {
+        if (process.pid.toBits() == Pid.invalid.toBits()) {
+            @branchHint(.cold);
+            @panic("ProcessControlBlock.unregister: process is not registered — kernel bug");
+        }
+        if (process.state != .exiting) {
+            @branchHint(.cold);
+            @panic("ProcessControlBlock.unregister: identity must be released in the exiting state — kernel bug");
+        }
+        table.release(process.pid);
+        process.pid = .invalid;
     }
 
     /// Move the process to `new_state`, enforcing `isLegalTransition`.
@@ -310,9 +363,9 @@ test "PCB: init defaults — embryo state, empty mailbox and drop-list, full bud
     defer test_manager.arena.deinit();
 
     const kernel_fiber = try fiber_context.init(&pool, noopEntry, null);
-    var process = ProcessControlBlock.init(.invalid, kernel_fiber, test_manager.managerContext());
+    var process = ProcessControlBlock.init(kernel_fiber, test_manager.managerContext());
 
-    try testing.expectEqual(Pid.invalid, process.pid);
+    try testing.expectEqual(Pid.invalid.toBits(), process.pid.toBits());
     try testing.expectEqual(ProcessState.embryo, process.state);
     try testing.expectEqual(default_preemption_budget, process.preemption_budget);
     try testing.expectEqual(@as(?*anyopaque, null), process.mailbox);
@@ -335,7 +388,7 @@ test "PCB: transitionTo walks a full legal lifecycle" {
     defer test_manager.arena.deinit();
 
     const kernel_fiber = try fiber_context.init(&pool, noopEntry, null);
-    var process = ProcessControlBlock.init(.invalid, kernel_fiber, test_manager.managerContext());
+    var process = ProcessControlBlock.init(kernel_fiber, test_manager.managerContext());
 
     const lifecycle = [_]ProcessState{ .runnable, .running, .waiting, .runnable, .running, .exiting };
     for (lifecycle) |next_state| {
@@ -376,7 +429,7 @@ test "PCB: process body runs on its fiber, allocates from its manager, and exits
 
     var probe = ProcessBodyProbe{};
     const kernel_fiber = try fiber_context.init(&pool, allocatingProcessBody, &probe);
-    var process = ProcessControlBlock.init(.invalid, kernel_fiber, test_manager.managerContext());
+    var process = ProcessControlBlock.init(kernel_fiber, test_manager.managerContext());
     probe.process = &process;
 
     var scheduler = fiber_context.SchedulerContext{};
@@ -399,4 +452,42 @@ test "PCB: process body runs on its fiber, allocates from its manager, and exits
     process.manager.teardown();
     try testing.expectEqual(@as(usize, 1), test_manager.teardown_count);
     try testing.expectEqual(@as(u32, 0), pool.statistics().live_stack_count);
+}
+
+test "PCB: register/unregister wire pid identity through the table across the process lifecycle" {
+    var pool = stack_pool.StackPool.init(.{ .usable_size = 64 * 1024 });
+    defer pool.deinit();
+    var test_manager = TestManager.init(testing.allocator);
+    defer test_manager.arena.deinit();
+    var table = try pid_table.PidTable.init(testing.allocator, .{ .capacity = 4 });
+    defer table.deinit();
+
+    const kernel_fiber = try fiber_context.init(&pool, noopEntry, null);
+    var process = ProcessControlBlock.init(kernel_fiber, test_manager.managerContext());
+
+    // Creation seam: the embryo gains its identity from the table.
+    const pid = try process.register(&table, .refcounted);
+    try testing.expectEqual(pid.toBits(), process.pid.toBits());
+    try testing.expect(pid.isLocal());
+    try testing.expectEqual(pid_table.ReclamationModel.refcounted, pid.model);
+    try testing.expectEqual(@as(?*ProcessControlBlock, &process), table.lookup(pid));
+    try testing.expectEqual(@as(u32, 1), table.statistics().live_process_count);
+
+    // Run the process to completion through a legal lifecycle.
+    var scheduler = fiber_context.SchedulerContext{};
+    process.transitionTo(.runnable);
+    process.transitionTo(.running);
+    try testing.expectEqual(fiber_context.ResumeOutcome.finished, fiber_context.resumeFiber(&scheduler, &process.fiber));
+    process.transitionTo(.exiting);
+
+    // Finish seam: unregister BEFORE manager teardown; the pid dies with
+    // the registration and every outstanding copy dead-letters.
+    process.unregister(&table);
+    try testing.expectEqual(Pid.invalid.toBits(), process.pid.toBits());
+    try testing.expectEqual(@as(?*ProcessControlBlock, null), table.lookup(pid));
+    try testing.expectEqual(@as(u32, 0), table.statistics().live_process_count);
+    try testing.expectEqual(@as(u64, 1), table.statistics().dead_letter_count);
+
+    process.manager.teardown();
+    try testing.expectEqual(@as(usize, 1), test_manager.teardown_count);
 }
