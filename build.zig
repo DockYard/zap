@@ -296,6 +296,57 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&run_target_capability_audit.step);
 
     // -----------------------------------------------------------------------
+    // Concurrency runtime kernel (P1-J1 — docs/concurrency-implementation-plan.md
+    // Phase 1 item 1.1). The kernel is a self-contained Zig tree
+    // (`src/runtime/concurrency/`) with NO dependency on libzap_compiler.a,
+    // so its tests run standalone via `zig build test-kernel` even when the
+    // compiler archive is absent (this section sits ABOVE the archive check
+    // on purpose). Two compiles exist:
+    //   * the user-selected optimize mode (default Debug) — the full suite,
+    //     including the Debug-only stack poisoning and the stack-lifetime-
+    //     invariant ordering proof. Wired into BOTH `zig build test-kernel`
+    //     and the plain `zig build test` gate (cheap, no native deps, and
+    //     Debug fiber codegen is correct under stock Zig 0.16.0 too).
+    //   * ReleaseFast — the miscompilation canary MUST run optimized: it
+    //     fails loudly when the building compiler silently drops the aarch64
+    //     x30/lr asm clobber of `std.Io.fiber.contextSwitch` (fork fix
+    //     74c0b87fe5/6a425dbaeb; stock Zig 0.16.0 is affected), which
+    //     miscompiles every optimized build of fiber-based code. This run is
+    //     DELIBERATELY only in `zig build test-kernel`: optimized kernel
+    //     builds are only supported under the fork compiler, and wiring a
+    //     fork-toolchain-requiring artifact into the generic `zig build
+    //     test` gate would make the standard workflow fail by design (or
+    //     pass by register-allocation luck) under stock Zig. Run
+    //     `~/projects/zig/zig-out/bin/zig build test-kernel` for the full
+    //     kernel gate.
+    const concurrency_kernel_root = "src/runtime/concurrency/concurrency.zig";
+    const kernel_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(concurrency_kernel_root),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = if (test_filter) |f| &.{f} else &.{},
+    });
+    const run_kernel_tests = b.addRunArtifact(kernel_tests);
+    const kernel_tests_release_fast = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(concurrency_kernel_root),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+        .filters = if (test_filter) |f| &.{f} else &.{},
+    });
+    const run_kernel_tests_release_fast = b.addRunArtifact(kernel_tests_release_fast);
+    const test_kernel_step = b.step(
+        "test-kernel",
+        "Run the concurrency runtime-kernel tests standalone (selected optimize mode + ReleaseFast miscompilation canary; fork compiler required for the ReleaseFast half)",
+    );
+    test_kernel_step.dependOn(&run_kernel_tests.step);
+    test_kernel_step.dependOn(&run_kernel_tests_release_fast.step);
+    test_step.dependOn(&run_kernel_tests.step);
+
+    // -----------------------------------------------------------------------
     // Dependency paths
     // -----------------------------------------------------------------------
     const user_lib = b.option([]const u8, "zap-compiler-lib", "Path to libzap_compiler.a");

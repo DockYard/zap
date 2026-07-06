@@ -113,6 +113,15 @@ test {
     //     `src/target_capability_audit.zig` — built as dedicated
     //     `build.zig` test targets (the audit needs the generated
     //     `stdlib_sources` import the `zap` module does not provide).
+    //   * `src/runtime/concurrency/concurrency.zig`,
+    //     `src/runtime/concurrency/stack_pool.zig`,
+    //     `src/runtime/concurrency/fiber_context.zig`,
+    //     `src/runtime/concurrency/process.zig` — the concurrency runtime
+    //     kernel (P1-J1), a self-contained tree with its own dedicated
+    //     `zig build test-kernel` target (also wired into `zig build
+    //     test`): it must run WITHOUT the compiler link and additionally
+    //     at ReleaseFast for the fiber miscompilation canary, neither of
+    //     which the `zap` module test binary provides.
     // ----------------------------------------------------------------
     _ = @import("target_triple.zig");
     _ = @import("target_caps.zig");
