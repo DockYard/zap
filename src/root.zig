@@ -113,26 +113,17 @@ test {
     //     `src/target_capability_audit.zig` — built as dedicated
     //     `build.zig` test targets (the audit needs the generated
     //     `stdlib_sources` import the `zap` module does not provide).
-    //   * `src/runtime/concurrency/concurrency.zig`,
-    //     `src/runtime/concurrency/stack_pool.zig`,
-    //     `src/runtime/concurrency/fiber_context.zig`,
-    //     `src/runtime/concurrency/process.zig`,
-    //     `src/runtime/concurrency/pid_table.zig`,
-    //     `src/runtime/concurrency/mailbox.zig`,
-    //     `src/runtime/concurrency/envelope_pool.zig`,
-    //     `src/runtime/concurrency/scheduler.zig`,
-    //     `src/runtime/concurrency/deterministic.zig`,
-    //     `src/runtime/concurrency/introspection.zig`,
-    //     `src/runtime/concurrency/crash_report.zig`,
-    //     `src/runtime/concurrency/teardown_stress.zig`,
-    //     `src/runtime/concurrency/adversarial_stress.zig`,
-    //     `src/runtime/concurrency/panic_guards.zig` — the
-    //     concurrency runtime kernel (P1-J1…J6), a self-contained tree
-    //     with its own dedicated `zig build test-kernel` target (also
-    //     wired into `zig build test`): it must run WITHOUT the compiler
-    //     link and additionally at ReleaseFast for the fiber
+    //   * `src/runtime/concurrency/concurrency.zig` — AGGREGATOR for
+    //     `src/runtime/concurrency/`: the root of the concurrency runtime
+    //     kernel (P1-J1…J6), a self-contained tree with its own dedicated
+    //     `zig build test-kernel` target (whose selected-optimize half is
+    //     also wired into `zig build test`): it must run WITHOUT the
+    //     compiler link and additionally at ReleaseFast for the fiber
     //     miscompilation canary, neither of which the `zap` module test
-    //     binary provides.
+    //     binary provides. Kernel modules are NEVER hand-listed here —
+    //     the meta-test parses concurrency.zig's own `test {}` block and
+    //     FAILS if any test-bearing module under the subtree is missing
+    //     from it.
     // ----------------------------------------------------------------
     _ = @import("target_triple.zig");
     _ = @import("target_caps.zig");
