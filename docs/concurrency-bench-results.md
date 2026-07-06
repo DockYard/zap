@@ -156,9 +156,10 @@ load average peaked at 12 during this pass:
 
 ### Cross-language context (prior full-suite run)
 
-For scale only — from the committed `lang-benches` full-suite run of
-2026-07-03 (`run-all.sh`, 5 runs, same machine, previous day's compiler
-build). These are **not** the E2 reference numbers; the table above is.
+For scale only — from the `lang-benches` full-suite run of 2026-07-03,
+committed in that repo as `b4b9a77` (`run-all.sh`, 5 runs, same machine,
+previous day's compiler build). These are **not** the E2 reference
+numbers; the table above is.
 
 | Benchmark | C | Rust | Zig | Go | OCaml | Zap (ARC) | Zap (Arena) |
 |---|---:|---:|---:|---:|---:|---:|---:|

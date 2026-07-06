@@ -1,6 +1,7 @@
 # Zap Concurrency Implementation Plan
 
-**Status: DRAFT — awaiting approval.**
+**Status: APPROVED — in execution.** (Ratified by the 2026-07-04 implementation directive;
+Phase 0 completed 2026-07-05 — see Appendix A and the gap-analysis record in the ledger.)
 
 **Lineage:** `research.md` (round-1 survey) → `research-round-2.md` (round-2 evidence) →
 `zap-concurrency-research.md` rev 2 (design positions, all resolved). This document turns those
@@ -65,7 +66,7 @@ What the 2026 devlog changes about our plan:
 From `zap-concurrency-research.md` rev 2 §6 — restated as one line each:
 
 1. Manager comptime-resolved at the spawn site (language rule) — **Decision Gate 0, needs
-   explicit sign-off with plan approval**.
+   explicit sign-off with plan approval**. *[Ratified with plan approval, 2026-07-04.]*
 2. Monomorphization hybrid: hot allocating paths specialized per reclamation model (≤4); cold
    closure/existential paths dispatch via the process's manager vtable; post-ICF kill criterion.
 3. Cross-model traffic: same-model O(1) move ▸ Blob/immutable ▸ lazy per-reachable-pair copy
@@ -344,7 +345,7 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
 | Gate | Phase | Kill criterion / decision |
 |---|---|---|
 | E1 spawn/ping-pong | 0, re-run 1, 4 | ≥1–3 µs spawn or RTT >3× BEAM/Go → escalate scheduler design |
-| E9 Dispatch vs Kqueue | 0 | picks Darwin default backend |
+| E9 Dispatch vs Kqueue | 0 | picks Darwin default backend *[Superseded: E9 was reframed to fiber-floor + wake-mechanism measurement; outcome — os_sync futex parking + EVFILT_USER poller split, per Appendix A.]* |
 | E10 dispatch vs mono alloc | 0 | confirms hybrid hot/cold split |
 | E2 CLBG safepoints | 2 | >2–3% on nbody/spectral-norm → unrolling mitigation first |
 | E6 copy crossover | 2, re-run 6 | early crossover → pull Blob/move forward |
@@ -378,6 +379,9 @@ spawn site's manager binding is comptime-resolvable — the language rule everyt
 stands on); the scheduler-owns-`Io`-vtable architecture (pending only S0.5's confirmation); the
 Windows-Threaded and wasm-capability-error v1 postures; and the division of labor in §4.
 Anything the experiment gates overturn comes back as a plan amendment, not a silent change.
+
+Approval occurred via the implementation directive of 2026-07-04, which directed full
+phase-by-phase execution of this plan.
 
 ---
 
