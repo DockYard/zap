@@ -263,6 +263,21 @@ pub const ProcessControlBlock = struct {
         process.pid = .invalid;
     }
 
+    /// Register an external (non-heap) resource for destruction at process
+    /// exit: push `node` onto the drop-list head. LIFO by design —
+    /// exit-time teardown (P1-J4) walks the list head-first, so
+    /// destructors run newest-first, mirroring scope-exit `defer`
+    /// ordering (research.md §6.5: the drop-list is the kernel analogue
+    /// of BEAM resource destructors). The node is owned by the resource
+    /// it destroys; the kernel never allocates or frees it. Owner-only:
+    /// call from the owning process's own execution (or the scheduler
+    /// thread while the process is not running) — the list is not
+    /// thread-safe by the same owner-only posture as every PCB field.
+    pub fn registerDropResource(process: *ProcessControlBlock, node: *DropListNode) void {
+        node.next = process.drop_list_head;
+        process.drop_list_head = node;
+    }
+
     /// Move the process to `new_state`, enforcing `isLegalTransition`.
     /// Illegal transitions are kernel bugs and panic in every build mode —
     /// state-machine corruption must never propagate silently.
@@ -521,6 +536,61 @@ test "PCB: register/unregister wire pid identity through the table across the pr
 
     process.manager.teardown();
     try testing.expectEqual(@as(usize, 1), test_manager.teardown_count);
+}
+
+const DropOrderProbe = struct {
+    node: DropListNode,
+    log: *[4]u8,
+    log_cursor: *usize,
+    identity: u8,
+
+    fn destructor(node: *DropListNode) void {
+        const probe: *DropOrderProbe = @fieldParentPtr("node", node);
+        probe.log[probe.log_cursor.*] = probe.identity;
+        probe.log_cursor.* += 1;
+    }
+};
+
+test "PCB: registerDropResource pushes LIFO so exit-time destructors run newest-first" {
+    var pool = stack_pool.StackPool.init(.{ .usable_size = 64 * 1024 });
+    defer pool.deinit();
+    var test_manager = TestManager.init(testing.allocator);
+    defer test_manager.arena.deinit();
+
+    const kernel_fiber = try fiber_context.init(&pool, noopEntry, null);
+    var process: ProcessControlBlock = undefined;
+    ProcessControlBlock.init(&process, kernel_fiber, test_manager.managerContext());
+
+    var destruction_log: [4]u8 = @splat(0);
+    var log_cursor: usize = 0;
+    var probes: [3]DropOrderProbe = undefined;
+    for (&probes, 0..) |*probe, index| {
+        probe.* = .{
+            .node = .{ .destructor = DropOrderProbe.destructor },
+            .log = &destruction_log,
+            .log_cursor = &log_cursor,
+            .identity = @intCast('a' + index),
+        };
+        process.registerDropResource(&probe.node);
+    }
+
+    // LIFO: the most recently registered resource is the list head.
+    try testing.expectEqual(@as(?*DropListNode, &probes[2].node), process.drop_list_head);
+    try testing.expectEqual(@as(?*DropListNode, &probes[1].node), probes[2].node.next);
+    try testing.expectEqual(@as(?*DropListNode, &probes[0].node), probes[1].node.next);
+    try testing.expectEqual(@as(?*DropListNode, null), probes[0].node.next);
+
+    // Walking the list head-first (what teardown does) runs newest-first.
+    while (process.drop_list_head) |node| {
+        process.drop_list_head = node.next;
+        node.destructor(node);
+    }
+    try testing.expectEqual(@as(usize, 3), log_cursor);
+    try testing.expectEqualSlices(u8, "cba", destruction_log[0..3]);
+
+    // Drain the never-run fiber's stack through the pool directly (the
+    // scheduler-side teardown path owns this once a scheduler exists).
+    pool.release(process.fiber.stack);
 }
 
 const MailboxDeliveryProbe = struct {

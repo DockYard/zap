@@ -8,11 +8,32 @@
 //! semantics) is Zap code in `lib/*.zap` layered on intrinsics in later
 //! phases.
 //!
+//! ## The scheduler model (P1-J4)
+//!
+//! Phase 1 runs ONE bespoke run-queue scheduler built directly on the
+//! fork's `std.Io.fiber` context switch (the Appendix A / S0.5 decision):
+//! processes are COOPERATIVE — a quantum runs until the process yields,
+//! suspends on its mailbox, exhausts its preemption budget at a
+//! `yieldCheck` safepoint, observes the flag-only watchdog, or exits —
+//! and the scheduler parks on an OS futex when nothing is runnable
+//! (Darwin: `os_sync_wait_on_address`/`__ulock` per E9; spin ~1–2 µs
+//! first). Every structure is INSTANCE-based (no module-level mutable
+//! state): Phase 4 multiplies scheduler instances over the shared,
+//! already-M:N-safe pid table and envelope pool for the per-core
+//! queues + LIFO slot + work-stealing design of research.md §6.1.
+//!
+//! A seeded DETERMINISTIC mode (plan 1.5, decision 11) funnels all
+//! scheduler nondeterminism — next-runnable choice, per-quantum budget —
+//! through the `Decisions` seam: same seed ⇒ byte-identical event trace,
+//! single-threaded, parking forbidden; a failing seeded scenario prints
+//! its seed for exact replay (`deterministic.zig`).
+//!
 //! ## Phase status
 //!
 //! Phase 1, jobs P1-J1 (kernel skeleton, plan item 1.1), P1-J2
-//! (generational pid table, plan item 1.2), and P1-J3 (mailbox +
-//! envelope pool, plan item 1.3):
+//! (generational pid table, plan item 1.2), P1-J3 (mailbox +
+//! envelope pool, plan item 1.3), and P1-J4 (scheduler core, plan items
+//! 1.4 + 1.5):
 //!
 //! * `stack_pool.zig` — pooled fixed-reservation guard-paged lazy-commit
 //!   fiber stacks with a live-peak-bounded free list (plan A.2.1).
@@ -35,9 +56,20 @@
 //!   allocation domain: in-flight envelopes owned by neither manager)
 //!   with mimalloc-style abandon/reclaim for sender death and a
 //!   high-watermark-bounded empty-page cache.
+//! * `scheduler.zig` — spawn (pool-only hot path, eager pooled stack +
+//!   lazy entry frame), the run loop (intrusive-FIFO ready queue +
+//!   `Decisions` seam), preemption budgets + `yieldCheck`, the flag-only
+//!   watchdog seam, exit/kill teardown (drop-list LIFO → mailbox drain →
+//!   handle abandon → invariant stack release → pid generation bump →
+//!   wholesale manager free; EXACT accounting), and futex idle parking
+//!   with cross-thread mailbox-push wakes.
+//! * `deterministic.zig` — the seeded deterministic mode: seeded
+//!   `Decisions`, append-only trace recording with equality comparison,
+//!   scenario harness + seed sweeps, failing-seed printing.
 //!
-//! NOT here yet: run-queue scheduler, spawn/exit orchestration (1.4),
-//! deterministic mode (1.5), observability (1.6). This tree is NOT wired
+//! NOT here yet: observability beyond the statistics skeleton (1.6),
+//! the Darwin spawn/die teardown campaign (1.7), timers, links/monitors,
+//! and the `std.Io` vtable. This tree is NOT wired
 //! into Zap compilation — it is exercised by `zig build test-kernel`
 //! (both the selected optimize mode and a ReleaseFast run for the
 //! miscompilation canary; fork compiler required for the latter). The
@@ -69,6 +101,8 @@ pub const process = @import("process.zig");
 pub const pid_table = @import("pid_table.zig");
 pub const mailbox = @import("mailbox.zig");
 pub const envelope_pool = @import("envelope_pool.zig");
+pub const scheduler = @import("scheduler.zig");
+pub const deterministic = @import("deterministic.zig");
 
 pub const StackPool = stack_pool.StackPool;
 pub const Stack = stack_pool.Stack;
@@ -88,6 +122,19 @@ pub const PopOutcome = mailbox.PopOutcome;
 pub const WakeCallback = mailbox.WakeCallback;
 pub const EnvelopePool = envelope_pool.EnvelopePool;
 pub const EnvelopePage = envelope_pool.EnvelopePage;
+pub const Scheduler = scheduler.Scheduler;
+pub const ProcessContext = scheduler.ProcessContext;
+pub const ProcessEntry = scheduler.ProcessEntry;
+pub const Decisions = scheduler.Decisions;
+pub const TraceEvent = scheduler.TraceEvent;
+pub const TraceHook = scheduler.TraceHook;
+pub const IdleStrategy = scheduler.IdleStrategy;
+pub const ExitReason = scheduler.ExitReason;
+pub const KillOutcome = scheduler.KillOutcome;
+pub const SendOutcome = scheduler.SendOutcome;
+pub const SeededDecisions = deterministic.SeededDecisions;
+pub const TraceRecorder = deterministic.TraceRecorder;
+pub const DeterministicHarness = deterministic.Harness;
 
 test {
     _ = stack_pool;
@@ -96,4 +143,6 @@ test {
     _ = pid_table;
     _ = mailbox;
     _ = envelope_pool;
+    _ = scheduler;
+    _ = deterministic;
 }

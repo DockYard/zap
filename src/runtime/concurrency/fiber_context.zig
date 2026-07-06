@@ -29,11 +29,17 @@
 //!   from fiber-side code (`FiberExecution` exposes only `yield`), and
 //!   `StackPool.release` independently panics if called from a frame that
 //!   lives inside the stack being released.
-//! * The stack is released to its pool ONLY inside `resumeFiber`, on the
-//!   scheduler's stack, strictly AFTER the finishing fiber's final context
-//!   switch has returned control to the scheduler — i.e. after the
-//!   finishing fiber has provably left the stack (its cpu state was saved
-//!   by that final switch and will never be restored).
+//! * The stack is released to its pool ONLY by scheduler-side code, and
+//!   only once the fiber has provably left it. There are exactly two
+//!   release sites: `resumeFiber`'s post-switch path (the FINISH path —
+//!   strictly AFTER the finishing fiber's final context switch has
+//!   returned control to the scheduler, i.e. after the finishing fiber
+//!   has provably left the stack: its cpu state was saved by that final
+//!   switch and will never be restored) and `reclaimWithoutResume` (the
+//!   KILL path, P1-J4 — legal only for `.ready` fibers, whose stack no
+//!   code has ever touched, and `.suspended` fibers, whose cpu state was
+//!   saved by their last yield switch and, by that call's contract, is
+//!   never restored).
 //!
 //! Phase 1 runs a single scheduler; the same discipline extends to Phase 4
 //! multicore because a fiber is owned by exactly one scheduler at a time,
@@ -242,6 +248,42 @@ pub fn resumeFiber(scheduler: *SchedulerContext, kernel_fiber: *KernelFiber) Res
         // `.reclaimed` is only ever set on this side of the switch.
         .running, .ready, .reclaimed => unreachable,
     }
+}
+
+/// Reclaim a fiber that will NEVER be resumed — the kill path (P1-J4,
+/// plan item 1.4: exit/crash teardown of a process that is not currently
+/// running). Releases the fiber's stack back to its pool and marks the
+/// fiber `.reclaimed` (terminal).
+///
+/// Legal ONLY for:
+///
+/// * `.ready` fibers — no code has ever executed on the stack (the entry
+///   frame is not even written until the first resume), so nothing can
+///   still be "on" it; and
+/// * `.suspended` fibers — the fiber's cpu state was saved by its last
+///   yield's context switch, and because this call's contract is that the
+///   fiber is never resumed, that state is never restored: the fiber has
+///   provably left the stack, which is exactly the stack-lifetime
+///   invariant's release condition (module doc). The abandoned frames on
+///   the stack are NOT unwound — kernel teardown reclaims process-owned
+///   resources through the drop-list and the manager's wholesale free
+///   (plan §5.3), never through stack unwinding.
+///
+/// `.running` is forbidden (the caller would be releasing a stack that is
+/// executing — precisely the Dispatch-backend bug the invariant exists to
+/// prevent; `StackPool.release` independently panics on it), `.finished`
+/// is forbidden (the finish path's release belongs to `resumeFiber`, which
+/// always runs it before returning), and `.reclaimed` is a double release.
+/// All are kernel bugs and panic in every build mode.
+pub fn reclaimWithoutResume(kernel_fiber: *KernelFiber) void {
+    switch (kernel_fiber.lifecycle_state) {
+        .ready, .suspended => {},
+        .running, .finished, .reclaimed => @panic(
+            "reclaimWithoutResume: fiber is not reclaimable without resume (running, finished, or reclaimed)",
+        ),
+    }
+    kernel_fiber.origin_stack_pool.release(kernel_fiber.stack);
+    kernel_fiber.lifecycle_state = .reclaimed;
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +689,53 @@ test "FiberContext: native stack unwinding terminates at the fiber root" {
         try testing.expect(probe.frames_captured > 0);
         try testing.expect(probe.frames_captured <= 32);
     }
+}
+
+test "FiberContext: reclaimWithoutResume releases a never-run fiber's stack" {
+    var pool = StackPool.init(.{ .usable_size = 64 * 1024 });
+    defer pool.deinit();
+
+    var probe = CounterProbe{ .yield_budget = 0 };
+    var kernel_fiber = try init(&pool, countingEntry, &probe);
+    try testing.expectEqual(LifecycleState.ready, kernel_fiber.lifecycle_state);
+    try testing.expectEqual(@as(u32, 1), pool.statistics().live_stack_count);
+
+    // Kill path (P1-J4): the fiber never runs — no code ever touched its
+    // stack — so the scheduler may reclaim it directly.
+    reclaimWithoutResume(&kernel_fiber);
+    try testing.expectEqual(LifecycleState.reclaimed, kernel_fiber.lifecycle_state);
+    try testing.expect(!probe.entered);
+
+    const stats = pool.statistics();
+    try testing.expectEqual(@as(u32, 0), stats.live_stack_count);
+    try testing.expectEqual(@as(u32, 1), stats.cached_stack_count);
+}
+
+test "FiberContext: reclaimWithoutResume releases a suspended fiber's stack after its last switch away" {
+    var pool = StackPool.init(.{ .usable_size = 64 * 1024 });
+    defer pool.deinit();
+
+    const yield_budget = 3;
+    var probe = CounterProbe{ .yield_budget = yield_budget };
+    var kernel_fiber = try init(&pool, countingEntry, &probe);
+    var scheduler = SchedulerContext{};
+
+    // Run the fiber into its first suspension: its stack now holds live
+    // frames, and its cpu state was saved by the yield's context switch.
+    try testing.expectEqual(ResumeOutcome.yielded, resumeFiber(&scheduler, &kernel_fiber));
+    try testing.expectEqual(LifecycleState.suspended, kernel_fiber.lifecycle_state);
+    try testing.expect(probe.entered);
+
+    // Kill path (P1-J4): the suspended fiber will never be resumed, so it
+    // has provably left its stack — the invariant's suspension analogue.
+    reclaimWithoutResume(&kernel_fiber);
+    try testing.expectEqual(LifecycleState.reclaimed, kernel_fiber.lifecycle_state);
+    // The entry function never completed (it was abandoned mid-yield).
+    try testing.expect(probe.iterations_completed < yield_budget);
+
+    const stats = pool.statistics();
+    try testing.expectEqual(@as(u32, 0), stats.live_stack_count);
+    try testing.expectEqual(@as(u32, 1), stats.cached_stack_count);
 }
 
 // ---------------------------------------------------------------------------

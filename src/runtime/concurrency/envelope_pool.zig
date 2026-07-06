@@ -145,6 +145,28 @@ const mailbox_module = @import("mailbox.zig");
 
 pub const Envelope = mailbox_module.Envelope;
 
+/// Whether the deterministic-interleaving test instrumentation is
+/// compiled in. Test builds only — the hook, its field, and its call
+/// site all vanish from non-test builds (same pattern as
+/// `mailbox.PushInstrumentation`).
+pub const enable_test_instrumentation = builtin.is_test;
+
+/// Test-only free-path instrumentation (compiled out of non-test
+/// builds): `between_slot_push_and_count_decrement` runs on the freeing
+/// thread AFTER its recycled-slot push and BEFORE its count decrement —
+/// exactly the window in which the owner can already re-allocate the
+/// pushed slot while the count still includes the not-yet-decremented
+/// free (see `noteEnvelopeAllocated` for why that transient over-count
+/// is legal). Lets a test park a freeing thread there and exercise the
+/// interleaving DETERMINISTICALLY.
+pub const FreeInstrumentation = if (enable_test_instrumentation) struct {
+    /// Hook invoked in the push→decrement window; null (default)
+    /// disables.
+    between_slot_push_and_count_decrement: ?*const fn (instrumentation_context: ?*anyopaque, envelope: *Envelope) void = null,
+    /// Opaque context handed to the hook.
+    instrumentation_context: ?*anyopaque = null,
+} else struct {};
+
 /// Default number of envelope slots carved from one page. At the current
 /// envelope size this keeps a page in the low single-digit KiB — small
 /// enough that short-lived senders don't strand memory, large enough
@@ -184,7 +206,10 @@ const PageOwnership = enum(u2) {
 /// together so every reclaim decision is a single atomic read (module
 /// doc, "Which transitions are atomic"). `fetchAdd(1)`/`fetchSub(1)` on
 /// the packed u64 act on the count field alone: the count occupies the
-/// low 32 bits and is bounded by `capacity` (≤ 2^32 − 1), so a carry can
+/// low 32 bits and is bounded by `capacity` plus one per thread
+/// concurrently inside `free`'s push→decrement window (the legal
+/// transient over-count documented at `noteEnvelopeAllocated`) — still
+/// astronomically below 2^32 for any real thread count, so a carry can
 /// never reach the ownership bits, and underflow is a kernel bug caught
 /// by assertion.
 const PageStatus = packed struct(u64) {
@@ -286,6 +311,8 @@ pub const EnvelopePool = struct {
     /// doc: the lock is what keeps this counter from transiently
     /// underflowing when a last-free races the abandon CAS).
     abandoned_page_count: u32,
+    /// Test-only free-path instrumentation (zero-sized outside tests).
+    free_instrumentation: FreeInstrumentation,
 
     /// Construction options.
     pub const Options = struct {
@@ -312,6 +339,7 @@ pub const EnvelopePool = struct {
             .live_page_count = 0,
             .live_page_peak = 0,
             .abandoned_page_count = 0,
+            .free_instrumentation = .{},
         };
     }
 
@@ -481,10 +509,25 @@ pub const EnvelopePool = struct {
     /// publication to the receiver rides the mailbox release/acquire
     /// edge, and the owner's own abandon CAS (`.acq_rel`) orders all its
     /// increments for the reclaim path.
+    ///
+    /// The count is deliberately NOT asserted against `capacity` here:
+    /// `free` pushes a slot onto `recycled_slots` BEFORE decrementing the
+    /// count (the order the reclaim proof rests on), so the owner can
+    /// legally pop and re-allocate that slot while the freeing thread is
+    /// still between its push and its decrement — at that instant the
+    /// count TRANSIENTLY exceeds the number of distinct live slots by
+    /// one per mid-window free (each such free double-counts its slot:
+    /// the re-allocation's increment lands before the free's decrement).
+    /// The over-count is self-correcting (every pending decrement lands),
+    /// bounded by the number of threads concurrently inside `free`'s
+    /// two-step window, and never observed by the reclaim decision
+    /// (`count == 0` still proves quiescence — a mid-window free keeps
+    /// the count positive). Asserting `< capacity` was exactly the P1-J4
+    /// ReleaseFast stress-crash bug; the deterministic regression test
+    /// below pins the legal interleaving.
     fn noteEnvelopeAllocated(page: *EnvelopePage) void {
         const prior: PageStatus = @bitCast(page.status.fetchAdd(1, .monotonic));
         std.debug.assert(prior.ownership == .handle_owned);
-        std.debug.assert(prior.live_envelope_count < page.capacity);
     }
 
     /// Return one envelope to its origin page — callable from ANY thread
@@ -511,12 +554,22 @@ pub const EnvelopePool = struct {
             ) orelse break;
         }
 
+        runBetweenSlotPushAndCountDecrementInstrumentation(page, envelope);
+
         // 2) Decrement the live count; the returned word is the whole
         //    reclaim decision (module doc, reclaim proof point 2).
         const prior: PageStatus = @bitCast(page.status.fetchSub(1, .acq_rel));
         std.debug.assert(prior.live_envelope_count > 0);
         if (prior.live_envelope_count == 1 and prior.ownership == .abandoned) {
             page.pool.reclaimAbandonedPage(page);
+        }
+    }
+
+    inline fn runBetweenSlotPushAndCountDecrementInstrumentation(page: *EnvelopePage, envelope: *Envelope) void {
+        if (comptime enable_test_instrumentation) {
+            if (page.pool.free_instrumentation.between_slot_push_and_count_decrement) |instrument| {
+                instrument(page.pool.free_instrumentation.instrumentation_context, envelope);
+            }
         }
     }
 
@@ -917,6 +970,90 @@ test "EnvelopePool: freeing into an owned page never reclaims it out from under 
     EnvelopePool.free(again);
     handle.abandon();
     try testing.expectEqual(@as(u32, 0), pool.statistics().live_page_count);
+}
+
+// -- deterministic transient over-count regression -----------------------------
+
+/// Drives one `free` on a separate thread and parks it INSIDE the
+/// push→decrement window via the test-only free instrumentation, so the
+/// owner can re-allocate the pushed slot while the page's live count
+/// still includes the not-yet-decremented free.
+const ParkedFreer = struct {
+    envelope_to_free: *Envelope,
+    reached_window: std.atomic.Value(bool) = .init(false),
+    release_from_window: std.atomic.Value(bool) = .init(false),
+
+    fn instrumentation(instrumentation_context: ?*anyopaque, envelope: *Envelope) void {
+        const freer: *ParkedFreer = @ptrCast(@alignCast(instrumentation_context.?));
+        if (envelope != freer.envelope_to_free) return;
+        freer.reached_window.store(true, .release);
+        const deadline = mailbox_module.TestDeadline.init(30 * std.time.ns_per_s);
+        while (!freer.release_from_window.load(.acquire)) {
+            if (deadline.expired()) @panic("ParkedFreer: never released from the window");
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn run(freer: *ParkedFreer) void {
+        EnvelopePool.free(freer.envelope_to_free);
+    }
+};
+
+test "EnvelopePool: owner re-allocation during a free's push→decrement window is legal (transient over-count)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var pool = EnvelopePool.init(testing.allocator, .{ .envelopes_per_page = 4 });
+    defer pool.deinit();
+    var handle = EnvelopePool.Handle.init(&pool);
+
+    // Fill the page completely: live count == capacity, bump exhausted.
+    var envelopes: [4]*Envelope = undefined;
+    for (&envelopes) |*slot| slot.* = try handle.allocate();
+    const page = envelopes[0].origin_page.?;
+    try testing.expectEqual(@as(u32, 4), page.liveEnvelopeCount());
+
+    // A "receiver" frees one envelope but is parked between its
+    // recycled-slot push and its count decrement.
+    var freer = ParkedFreer{ .envelope_to_free = envelopes[2] };
+    pool.free_instrumentation = .{
+        .between_slot_push_and_count_decrement = ParkedFreer.instrumentation,
+        .instrumentation_context = &freer,
+    };
+    const freer_thread = try std.Thread.spawn(.{}, ParkedFreer.run, .{&freer});
+    {
+        const deadline = mailbox_module.TestDeadline.init(30 * std.time.ns_per_s);
+        while (!freer.reached_window.load(.acquire)) {
+            if (deadline.expired()) return error.TestTimeout;
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    // The slot is already on the recycled list but the count still says
+    // 4 (== capacity): the owner's re-allocation MUST succeed — the
+    // transient over-count to 5 is the documented legal state, not
+    // corruption.
+    const reallocated = try handle.allocate();
+    try testing.expectEqual(envelopes[2], reallocated);
+    try testing.expectEqual(@as(u32, 5), page.liveEnvelopeCount());
+
+    // Release the parked free; its decrement lands and the count returns
+    // to the true live number.
+    freer.release_from_window.store(true, .release);
+    freer_thread.join();
+    try testing.expectEqual(@as(u32, 4), page.liveEnvelopeCount());
+
+    // Exact accounting from here on: everything frees, the page empties,
+    // abandon returns it.
+    pool.free_instrumentation = .{};
+    EnvelopePool.free(envelopes[0]);
+    EnvelopePool.free(envelopes[1]);
+    EnvelopePool.free(reallocated);
+    EnvelopePool.free(envelopes[3]);
+    try testing.expectEqual(@as(u32, 0), page.liveEnvelopeCount());
+    handle.abandon();
+    const stats = pool.statistics();
+    try testing.expectEqual(@as(u32, 0), stats.live_page_count);
+    try testing.expectEqual(@as(u32, 0), stats.abandoned_page_count);
 }
 
 // -- multi-threaded integration stress ---------------------------------------
