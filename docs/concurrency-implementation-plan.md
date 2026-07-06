@@ -238,6 +238,27 @@ margin; test-manager caveat noted, Phase 3 re-measures per manager).
 
 Goal: `spawn`/`send`/`receive`/`after` work in Zap programs; single model; safepoints in.
 
+*[Phase 2 opened — P2-J1 (runtime packaging + intrinsic ABI bridge) landed `8ac3cb3`,
+2026-07-06. The kernel is linkable into user binaries behind the comptime
+`runtime_concurrency` gate (default OFF = byte-for-byte today's world: no kernel object, no
+`zap_proc_*` symbol — verified by `nm` + an nbody spot-check at the S0.1 baseline;
+`Zap.Manifest.runtime_concurrency` / `-Druntime-concurrency=on|off`, folded into every
+artifact/snapshot/script cache key). Gate ON compiles the kernel unit per target through
+`zap_fork_compile_zig_to_object` rooted at `src/runtime/concurrency/abi.zig` — the primitive
+already supports multi-file roots (its root `Package.Module` is the source file's directory),
+so NO fork extension was needed — content-addresses the object
+(`src/concurrency_driver.zig`), and splices it into the link via
+`zir_compilation_add_link_object_file`. The minimal C-ABI intrinsic surface
+(`zap_proc_runtime_init/deinit`, `zap_proc_run_until_quiescent`, `zap_proc_spawn`,
+`zap_proc_self`, `zap_proc_send` — opaque payload bytes until the 2.4/P2-J5 deep-copy
+walker —, `zap_proc_receive_park`, `zap_proc_envelope_free`, `zap_proc_exit`,
+`zap_proc_yield_check`) is defined in `abi.zig` with a signature-mirrored extern set in
+`src/runtime.zig`; gated-on binaries initialize the runtime before user main and deinit via
+LIFO atexit (kernel teardown precedes manager shutdown). Until 2.3/2.7 land the Zap surface,
+E2E validation is the kernel-suite round-trip test plus the documented
+`ZAP_CONCURRENCY_SMOKE=1` runtime hook, which drives
+init → spawn → send → receive → exit through the real link seam in a gated-on binary.]*
+
 - **2.1** Typed pids: `Pid(M)` as the primary handle (Gleam-`Subject` analogue); `send`
   type-checks against `M`; untyped `Pid` exists for registry/dynamic use behind a
   `catch_all`-required receive.
