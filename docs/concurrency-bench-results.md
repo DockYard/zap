@@ -454,6 +454,21 @@ through the real Vyukov mailboxes, and the futex wake path.
 | ping-pong RTT, same-scheduler (ns/round-trip) | **44.4 / 44.2** | 3.33 |
 | parked wake → receive returns (ns) | **5,042 median / 1,458 min**, p99 8,500–10,125 across reps | 3.21 |
 
+**RTT run-to-run variance (P1-R3 adjudication, 2026-07-06).** An informal
+rebuild during R1 observed ~150–170 ns/RTT under session load, so the
+44.4 ns figure was re-adjudicated by measurement: two fresh back-to-back
+ReleaseFast rebuild+runs of `pingpong` on the same kernel (foreground,
+`uptime` recorded; 1-min load 2.55 and 3.66) gave medians **90.0 and
+49.8 ns** with minima **68.4 and 45.0 ns**, reps improving monotonically
+within every run. The minimum reproduces the recorded floor (45.0 vs
+44.2, within 2%); the median is load- and warmth-sensitive — ~50–90 ns
+across fresh runs, individual cold reps to 136 ns, ~150–170 ns in the R1
+informal observation. Read the table's 44.4/44.2 row as the quiet-run
+converged best case; under session load expect same-scheduler RTT
+medians of ~50–90 ns — still ≥20× inside the 2–3 µs band, verdict
+unaffected. This confirms the standing "minima are the load-robust
+floor" caveat for RTT specifically.
+
 #### Comparison vs targets, floors, and the Phase 0 backends
 
 | Metric | Kernel (median) | Plan target | E9 substrate floor | `Io.Threaded` | `Io.Evented` post-fix |

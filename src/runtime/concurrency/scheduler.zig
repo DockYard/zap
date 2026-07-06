@@ -149,7 +149,9 @@
 //! Phase 1 SIMULATES crashes via this explicit kill API; wiring
 //! trap/panic entry into the same path is Phase 2+ (plan 2.x), and
 //! `io.cancel()`-based cancellation of in-flight I/O joins the drop-list
-//! run when the `std.Io` vtable lands (plan §3).
+//! run when the `std.Io` vtable lands (plan §3; re-scoped out of Phase 1
+//! item 1.4 — see that item's annotation in
+//! `docs/concurrency-implementation-plan.md`, which cites this doc back).
 //!
 //! ## Idle parking (E9 / plan A.2.2–A.2.3, Appendix A.3)
 //!

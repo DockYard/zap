@@ -205,12 +205,25 @@ from Zig tests and a minimal intrinsic set.
   page pool with abandon/reclaim (mimalloc-style) for sender-death.
 - **1.4** Spawn/exit/teardown: pool-only hot path (pid slot + manager init + lazy stack +
   enqueue); wholesale arena/slab free on exit; drop-list destructor run; `io.cancel()` wiring.
+  *[`io.cancel()` wiring re-scoped out of Phase 1: it lands with the phase where the kernel
+  implements the `std.Io` vtable (§3 architecture; `receive`-on-`Io.Select` is Phase 2 item
+  2.3) — until then external-resource cancellation rides the landed drop-list seam (scheduler
+  teardown runs drop-list destructors on every exit path). Two-way citation:
+  `src/runtime/concurrency/scheduler.zig`'s crash-teardown module doc records the same
+  deferral and points back here.]*
 - **1.5** Deterministic mode: single-threaded seeded scheduler; all nondeterminism (scheduling,
   timers, sender interleaving) funneled through the seam; seed printed on failure.
 - **1.6** Observability skeleton (non-negotiable): process list iterator, mailbox depth, heap
   bytes, state, crash reports with native stack traces.
 - **1.7** Darwin teardown test (mimalloc-#164 class): thousands of spawn/die cycles under
   Tracking/Leak managers, clean teardown asserted.
+  *[As landed: "Tracking/Leak managers" was substituted with `std.testing.allocator`-backed
+  leak checking plus byte-accounting per-process test managers — functionally equivalent for
+  the kernel-owned resources this test guards (stacks, envelopes, pid slots, PCB records:
+  every pool balances exactly to pre-spawn counts and the testing allocator fails on any
+  leaked byte), since Phase 1 payloads are opaque and no real manager exists yet to track.
+  The real manifest-manager binding that Tracking/Leak would exercise lands in Phase 2 item
+  2.4.]*
 
 Exit gate: E3's same-model half (ARC→ARC copy under TSan, adversarial send/receive, zero
 refcount races); E1 re-measured on the real kernel. **Met 2026-07-06 (P1-J6)** — ledger
@@ -235,7 +248,10 @@ Goal: `spawn`/`send`/`receive`/`after` work in Zap programs; single model; safep
   exit-signal arm); `after 0` = poll; suspension at arbitrary call depth (stackful fibers).
 - **2.4** Deep-copy send: sender copies into detachable fragment (closures: share code pointer,
   deep-copy environment); receiver adopts (rc=1 init). ZIR-emitted copy walker written for
-  reuse as a serializer later.
+  reuse as a serializer later. This item includes binding the real manifest (ARC) manager ABI
+  for receiver-side adoption — replacing the Phase 1 kernel test-manager vtable (not layering
+  over it) per the no-fallbacks rule; `src/runtime/concurrency/process.zig`'s "Manager
+  binding" module doc cites this item back.
 - **2.5** Safepoints, all three layers, comptime-gated (`runtime_concurrency` off → zero
   emission): alloc piggyback; bare back-edge polls only in alloc-free/call-free loops;
   per-scheduler flag-only watchdog.
@@ -300,6 +316,11 @@ fault — co-scheduled fibers not delayed beyond watchdog tick, else mandatory h
 blockable manager calls); E1 cross-scheduler numbers, including the same-vs-cross-scheduler
 ping-pong RTT decomposition moved here from S0.1 (measurable only once the M:N scheduler
 exists; until then bounded analytically by E9's parked-wake cost — two wakes ≈ 1.8 µs).
+The parked-wake re-measurement in that re-run must be re-baselined under the quiet-machine
+paired-run discipline (mirroring item 2.9: paired runs in the same session, compared on
+paired medians/minima, load recorded per run), because the Phase 1 wake numbers carry
+session load; acceptance is wake median under recorded load ≤ ~2× min, or the
+cross-scheduler budget explicitly re-derived from the loaded numbers.
 
 ### Phase 5 — Signals, supervision, typed calls (L)
 
@@ -521,8 +542,11 @@ Each is a design commitment, not a suggestion; each cites its evidence.
 
 1. **Register vs parameter for the current-process pointer on aarch64.** x18 is reserved by
    the Darwin platform ABI, so a globally reserved register is likely unavailable there;
-   Phase 1 decides between parameter-threading and a per-quantum TLS write with measured
-   numbers (E10 gives the per-site cost either choice must beat).
+   Phase 2 decides between parameter-threading and a per-quantum TLS write with measured
+   numbers (E10 gives the per-site cost either choice must beat). *[Amended from "Phase 1
+   decides": the landed Phase 1 kernel is fully parameter-threaded internally (the mechanism
+   is in), but the choice only becomes measurable once compiled Zap code exists to exercise
+   per-site cost — the `scheduler.zig` module doc records the same Phase 2 deferral.]*
 2. **Linux poller wakeup primitive** — eventfd vs io_uring `MSG_RING` (E9 was Darwin-only);
    measured when the Phase 4 poller lands.
 3. **Stack-pool sizing/watermark policy and its interaction with Darwin teardown** — decided
