@@ -19,6 +19,28 @@
 //! is being torn down. Those two calls are the creation/finish seams the
 //! 1.4 spawn/exit orchestration will drive.
 //!
+//! ## Mailbox ownership and the teardown seam (P1-J3)
+//!
+//! The PCB owns its mailbox by value: a Vyukov intrusive MPSC queue
+//! (`mailbox.zig`) whose empty state references its own embedded stub
+//! envelope — which is why `init` constructs the PCB IN PLACE at its
+//! final address (the same pinning `register` already demanded). Senders
+//! resolve the pid (`pid_table.lookup`) and push envelopes drawn from
+//! the shared envelope page pool (`envelope_pool.zig`); only the owning
+//! process pops.
+//!
+//! Teardown seam (wired by 1.4/J4, in this order): (1) `unregister` the
+//! pid — new senders dead-letter from that instant; (2) drain the
+//! mailbox (`pop` until `.empty`, bounded-retrying `.transient_gap`) and
+//! `envelope_pool.free` every envelope — dead-lettering the payloads;
+//! (3) `abandon()` the process's envelope-pool `Handle` — its sender
+//! side — so pages with still-in-flight envelopes are reclaimed by
+//! their receivers (mimalloc-style abandon/reclaim, `envelope_pool.zig`);
+//! (4) `manager.teardown()`. The pool `Handle` is created by the 1.4
+//! spawn path and is deliberately NOT a PCB field yet: whether handles
+//! bind per-process or per-scheduler-thread is a Phase 4 decision
+//! (`envelope_pool.zig`, "Multi-producer posture").
+//!
 //! ## Manager binding (placeholder discipline)
 //!
 //! `ManagerContext` carries an opaque state pointer plus a minimal vtable —
@@ -40,6 +62,7 @@
 const std = @import("std");
 const fiber_context = @import("fiber_context.zig");
 const pid_table = @import("pid_table.zig");
+const mailbox_module = @import("mailbox.zig");
 
 /// Process identifier — the generational pid of `pid_table.zig` (plan
 /// Phase 1 item 1.2, locked design decision 4): `{slot, generation,
@@ -163,32 +186,34 @@ pub const ProcessControlBlock = struct {
     fiber: fiber_context.KernelFiber,
     /// Per-process memory-manager binding.
     manager: ManagerContext,
-    /// Mailbox — PLACEHOLDER. TODO(P1-J3): becomes the Vyukov MPSC
-    /// envelope-intrusive mailbox (plan Phase 1 item 1.3); opaque until
-    /// that type exists so the PCB layout is stable for P1-J2's pid table.
-    mailbox: ?*anyopaque,
+    /// The process's mailbox (P1-J3): Vyukov intrusive MPSC over pool
+    /// envelopes — any thread pushes, only this process pops. Owned by
+    /// value; its embedded stub makes the PCB pinned from `init` on.
+    /// See the module doc's "Mailbox ownership and the teardown seam".
+    mailbox: mailbox_module.Mailbox,
     /// Head of the external-resource drop-list (see `DropListNode`).
     drop_list_head: ?*DropListNode,
 
-    /// Assemble a PCB in the `.embryo` state with no identity
-    /// (`Pid.invalid` — identity is acquired by `register`, which needs
-    /// the PCB's final address), an empty mailbox slot, an empty
-    /// drop-list, and a full default preemption budget. The caller
-    /// provides the created fiber (see `fiber_context.init`) and the
-    /// manager binding; spawn orchestration on top is Phase 1.4.
+    /// Assemble a PCB IN PLACE — at its final address, which the mailbox
+    /// pins from this call on (its empty state references its embedded
+    /// stub envelope; `register` already required the same pinning) —
+    /// in the `.embryo` state with no identity (`Pid.invalid` — identity
+    /// is acquired by `register`), an empty mailbox, an empty drop-list,
+    /// and a full default preemption budget. The caller provides the
+    /// created fiber (see `fiber_context.init`) and the manager binding;
+    /// spawn orchestration on top is Phase 1.4.
     pub fn init(
+        process: *ProcessControlBlock,
         kernel_fiber: fiber_context.KernelFiber,
         manager: ManagerContext,
-    ) ProcessControlBlock {
-        return .{
-            .pid = .invalid,
-            .state = .embryo,
-            .preemption_budget = default_preemption_budget,
-            .fiber = kernel_fiber,
-            .manager = manager,
-            .mailbox = null,
-            .drop_list_head = null,
-        };
+    ) void {
+        process.pid = .invalid;
+        process.state = .embryo;
+        process.preemption_budget = default_preemption_budget;
+        process.fiber = kernel_fiber;
+        process.manager = manager;
+        process.mailbox.init();
+        process.drop_list_head = null;
     }
 
     /// Creation seam (Phase 1.4 spawn path): acquire a pid-table slot
@@ -256,6 +281,7 @@ pub const ProcessControlBlock = struct {
 
 const testing = std.testing;
 const stack_pool = @import("stack_pool.zig");
+const envelope_pool = @import("envelope_pool.zig");
 
 test "PCB: state-transition legality matrix" {
     const State = ProcessState;
@@ -363,12 +389,14 @@ test "PCB: init defaults — embryo state, empty mailbox and drop-list, full bud
     defer test_manager.arena.deinit();
 
     const kernel_fiber = try fiber_context.init(&pool, noopEntry, null);
-    var process = ProcessControlBlock.init(kernel_fiber, test_manager.managerContext());
+    var process: ProcessControlBlock = undefined;
+    ProcessControlBlock.init(&process, kernel_fiber, test_manager.managerContext());
 
     try testing.expectEqual(Pid.invalid.toBits(), process.pid.toBits());
     try testing.expectEqual(ProcessState.embryo, process.state);
     try testing.expectEqual(default_preemption_budget, process.preemption_budget);
-    try testing.expectEqual(@as(?*anyopaque, null), process.mailbox);
+    try testing.expectEqual(mailbox_module.PopOutcome.empty, process.mailbox.pop());
+    try testing.expectEqual(@as(usize, 0), process.mailbox.depth());
     try testing.expectEqual(@as(?*DropListNode, null), process.drop_list_head);
     try testing.expectEqual(fiber_context.LifecycleState.ready, process.fiber.lifecycle_state);
 
@@ -388,7 +416,8 @@ test "PCB: transitionTo walks a full legal lifecycle" {
     defer test_manager.arena.deinit();
 
     const kernel_fiber = try fiber_context.init(&pool, noopEntry, null);
-    var process = ProcessControlBlock.init(kernel_fiber, test_manager.managerContext());
+    var process: ProcessControlBlock = undefined;
+    ProcessControlBlock.init(&process, kernel_fiber, test_manager.managerContext());
 
     const lifecycle = [_]ProcessState{ .runnable, .running, .waiting, .runnable, .running, .exiting };
     for (lifecycle) |next_state| {
@@ -429,7 +458,8 @@ test "PCB: process body runs on its fiber, allocates from its manager, and exits
 
     var probe = ProcessBodyProbe{};
     const kernel_fiber = try fiber_context.init(&pool, allocatingProcessBody, &probe);
-    var process = ProcessControlBlock.init(kernel_fiber, test_manager.managerContext());
+    var process: ProcessControlBlock = undefined;
+    ProcessControlBlock.init(&process, kernel_fiber, test_manager.managerContext());
     probe.process = &process;
 
     var scheduler = fiber_context.SchedulerContext{};
@@ -463,7 +493,8 @@ test "PCB: register/unregister wire pid identity through the table across the pr
     defer table.deinit();
 
     const kernel_fiber = try fiber_context.init(&pool, noopEntry, null);
-    var process = ProcessControlBlock.init(kernel_fiber, test_manager.managerContext());
+    var process: ProcessControlBlock = undefined;
+    ProcessControlBlock.init(&process, kernel_fiber, test_manager.managerContext());
 
     // Creation seam: the embryo gains its identity from the table.
     const pid = try process.register(&table, .refcounted);
@@ -490,4 +521,66 @@ test "PCB: register/unregister wire pid identity through the table across the pr
 
     process.manager.teardown();
     try testing.expectEqual(@as(usize, 1), test_manager.teardown_count);
+}
+
+const MailboxDeliveryProbe = struct {
+    process: *ProcessControlBlock = undefined,
+    received_payload_length: usize = 0,
+    freed_envelope: bool = false,
+};
+
+fn receivingProcessBody(execution: *fiber_context.FiberExecution, argument: ?*anyopaque) void {
+    _ = execution;
+    const probe: *MailboxDeliveryProbe = @ptrCast(@alignCast(argument.?));
+    // The owning process is the single consumer of its own mailbox.
+    switch (probe.process.mailbox.pop()) {
+        .envelope => |received| {
+            probe.received_payload_length = received.fragment.payload_byte_length;
+            envelope_pool.EnvelopePool.free(received);
+            probe.freed_envelope = true;
+        },
+        .empty, .transient_gap => {},
+    }
+}
+
+test "PCB: pool envelope pushed to the PCB mailbox is delivered to the process body and freed" {
+    var pool = stack_pool.StackPool.init(.{ .usable_size = 64 * 1024 });
+    defer pool.deinit();
+    var test_manager = TestManager.init(testing.allocator);
+    defer test_manager.arena.deinit();
+    var message_pool = envelope_pool.EnvelopePool.init(testing.allocator, .{ .envelopes_per_page = 4 });
+    defer message_pool.deinit();
+
+    var probe = MailboxDeliveryProbe{};
+    const kernel_fiber = try fiber_context.init(&pool, receivingProcessBody, &probe);
+    var process: ProcessControlBlock = undefined;
+    ProcessControlBlock.init(&process, kernel_fiber, test_manager.managerContext());
+    probe.process = &process;
+
+    // Sender side: draw an envelope from the shared pool and push it to
+    // the process's mailbox (empty→nonempty: the wake signal fires).
+    var sender_handle = envelope_pool.EnvelopePool.Handle.init(&message_pool);
+    const envelope = try sender_handle.allocate();
+    envelope.fragment.payload_byte_length = 0xC0FFEE;
+    try testing.expect(process.mailbox.push(envelope));
+
+    // Receiver side: run the process; its body pops and frees.
+    var scheduler = fiber_context.SchedulerContext{};
+    process.transitionTo(.runnable);
+    process.transitionTo(.running);
+    try testing.expectEqual(fiber_context.ResumeOutcome.finished, fiber_context.resumeFiber(&scheduler, &process.fiber));
+    process.transitionTo(.exiting);
+
+    try testing.expectEqual(@as(usize, 0xC0FFEE), probe.received_payload_length);
+    try testing.expect(probe.freed_envelope);
+    try testing.expectEqual(mailbox_module.PopOutcome.empty, process.mailbox.pop());
+    try testing.expectEqual(@as(usize, 0), process.mailbox.depth());
+
+    // Sender exit: the freed envelope left its page empty, so abandon
+    // returns it — every page accounted.
+    sender_handle.abandon();
+    try testing.expectEqual(@as(u32, 0), message_pool.statistics().live_page_count);
+    try testing.expectEqual(@as(u32, 0), message_pool.statistics().abandoned_page_count);
+
+    process.manager.teardown();
 }
