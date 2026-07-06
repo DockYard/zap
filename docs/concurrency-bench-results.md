@@ -388,6 +388,111 @@ the overall verdict does not.
   implementation-plan Appendix A), and the residual intermittent crash —
   not on Dispatch's send path, which the fix vindicated.
 
+### Phase 1 kernel re-measurement (P1-J6, 2026-07-06) — GATE: PASS
+
+The Phase 1 exit-gate re-run of E1 on the REAL landed kernel
+(`src/runtime/concurrency/`, the bespoke run-queue scheduler the Phase 0
+escalation called for), replacing the spike's `Io.async`/`Io.Queue`
+shapes with the kernel's real paths: scheduler spawn (pid acquire + PCB
+init + pooled stack + fiber init + ready enqueue), envelope send/receive
+through the real Vyukov mailboxes, and the futex wake path.
+
+#### Methodology
+
+- **Date:** 2026-07-06. Same machine as the Phase 0 series (MacBook Air
+  `Mac16,13`, Apple M4, 10 cores, 32 GB, macOS 26.2 build 25C56).
+- **Benchmark:** `bench/concurrency-kernel/bench.zig` (NOT throwaway —
+  the Phase 3 per-manager spawn re-measurement and the Phase 4
+  cross-scheduler E1 re-run extend it; see its README), compiled with
+  the fork compiler (`~/projects/zig` @ `6a425dbaeb`, clean tree) at
+  `-OReleaseFast` against the kernel tree at the P1-J6 commit:
+
+  ```sh
+  ~/projects/zig/zig-out/bin/zig build-exe -OReleaseFast --name bench \
+    --dep concurrency -Mmain=bench.zig \
+    -Mconcurrency=../../src/runtime/concurrency/concurrency.zig
+  ```
+
+- **Protocol:** unchanged from Phase 0 (one measurement at a time,
+  foreground, unrecorded warmup pass = workload/10, then 5 timed reps,
+  `CLOCK_UPTIME_RAW` never through code under test, `uptime` recorded
+  immediately before every run). Other agent sessions were active —
+  1-minute load average ranged **3.2–3.8** across the timed runs
+  (comparable to the E9 session, quieter than pre-fix E1), so minima
+  are the load-robust floor (standing caveat). Load was *decaying*
+  across the session; several spawn runs show monotonically improving
+  reps for that reason — medians are quoted, minima bound the floor.
+- **Workloads:** `spawn` = timed batches of 256 admissions (pool-hit
+  steady state — batch equals the stack pool's cache ceiling, and a
+  512-process warmup wave makes the whole ceiling available; the bench
+  asserts `pool_miss_batches == 0`), quiescence between batches
+  untimed; 102,400 spawns per rep. `spawn-serial` = spawn one trivial
+  process and run it to quiescence per op (full
+  spawn→run→exit→teardown), 102,400 ops. `spawn-lifecycle` = timed
+  (spawn 256 + run all to quiescence), amortized, 102,400 ops.
+  `pingpong` = 100,000 round trips between two kernel processes via
+  `ProcessContext.send`/`receive` (real lookup + envelope alloc +
+  mailbox push + wake seam per hop; 1,020,006 quanta executed, zero
+  parks — pure same-scheduler). `wake` = 100,000 parked-wake
+  deliveries: a producer THREAD waits for the scheduler's park counter,
+  settles 20 µs so the scheduler is inside the futex wait, then pushes;
+  latency = push-instant → `receive` returns in the woken process
+  (bounds Phase 4 cross-scheduler RTT). 510,005 parks over the run.
+- **Manager caveat (honest):** per-process managers are the Phase 1
+  TEST manager (arena + byte accounting, as in the kernel's own tests);
+  the real per-spawn manager ABI is Phase 3. Spawn rows measure the
+  kernel path with a cheap manager init/teardown, not the eventual
+  ARC-manager cost — Phase 3 re-measures per manager.
+
+#### Results (ReleaseFast, median / min per-op ns, 5 reps, 2026-07-06)
+
+| Metric | Kernel | Load (1-min) |
+|---|---:|---|
+| spawn, admission only (ns/spawn) | **11.1 / 10.4** | 3.75 |
+| spawn-serial, full lifecycle (ns/op) | **43.0 / 41.7** | 3.56 |
+| spawn-lifecycle, amortized batch (ns/op) | **35.1 / 33.4** | 3.36 |
+| ping-pong RTT, same-scheduler (ns/round-trip) | **44.4 / 44.2** | 3.33 |
+| parked wake → receive returns (ns) | **5,042 median / 1,458 min**, p99 8,500–10,125 across reps | 3.21 |
+
+#### Comparison vs targets, floors, and the Phase 0 backends
+
+| Metric | Kernel (median) | Plan target | E9 substrate floor | `Io.Threaded` | `Io.Evented` post-fix |
+|---|---:|---:|---:|---:|---:|
+| spawn (admission) | 11.1 ns | sub-µs | 8.99 ns (pooled fiber spawn) | 1,382 ns (windowed, post-fix) | 19,117 ns |
+| spawn (full lifecycle, serial) | 43.0 ns | sub-µs–3 µs | — | 4,316 ns (serial, pre-fix) | 19,840 ns |
+| ping-pong RTT | 44.4 ns | ≤2–3 µs (2–3× BEAM) | 6.4 ns (switch pair) + 8.7–16 ns (queue floor) | 1,792 ns (post-fix) | 1,012 ns |
+| parked wake → running | 5.0 µs (min 1.46 µs) | — (Phase 4 x-sched budget) | 917 ns median / 250 ns min (raw futex wake, thread awake) | — | — |
+
+- **Spawn: PASS with ~2 orders of magnitude of headroom.** Admission is
+  11.1 ns — 2.1 ns over the E9 raw pooled-fiber floor buys the pid slot,
+  PCB init, envelope-handle init, ready enqueue, and the admission wake
+  edge. Even the full serial lifecycle (43 ns) sits ~23× under the
+  1 µs low end of the target band and ~100× under Threaded's serial
+  spawn. The pool-only claim held: `pool_miss_batches=0` on every run.
+- **RTT: PASS with ~23–40× margin.** 44.4 ns/RTT against the 2–3 µs
+  band; the scheduler+mailbox budget consumed over the raw substrate
+  floor is ≈38 ns/RTT (two sends with pid lookup + envelope alloc, two
+  receives, two wake-seam drains, two switch pairs ≈ 12.8 ns of it) —
+  22.8× better than post-fix Threaded and within a factor of ~7 of the
+  bare switch-pair+queue floor. BEAM's sub-µs same-scheduler send is
+  beaten by ~20×.
+- **Wake path (informational; no Phase 1 target).** Wake-to-running
+  min 1.46 µs ≈ the E9 parked-wake floor (~0.9–1 µs) plus the
+  unpark→drain→schedule→switch-in path; the 5.0 µs median and 8.5–10 µs
+  p99 carry this session's background load (19 sessions, load ~3.2) —
+  consistent with E9's observation that parked-wake p99s of 3–11 µs are
+  the number to design against. Phase 4's cross-scheduler RTT bound of
+  two parked wakes therefore budgets ~3 µs floor, ~10 µs median under
+  load — the LIFO-slot/spin-then-park design (Appendix A) exists
+  precisely to keep the hot path off this cost.
+- **Verdict: E1 gate PASS** (kill criterion "≥1–3 µs spawn or RTT >3×
+  BEAM/Go" — spawn is 43 ns full-lifecycle, RTT is 44 ns; both are
+  orders of magnitude inside). The Phase 1 numbers validate the S0.5
+  escalation decision on its own terms: the bespoke kernel beats the
+  best `std.Io` backend rows by 20–450× per metric with the test
+  manager, and the remaining Phase 3 risk is manager cost, not kernel
+  structure.
+
 ## E9 — fiber-switch floor + Darwin wakeup mechanism (S0.3, 2026-07-04)
 
 Reframed after E1: both fork `std.Io` backends failed the E1 targets, so the
@@ -690,6 +795,123 @@ scheduler code should load the process pointer once per scheduling quantum
 (or keep it in a reserved register) rather than re-resolving the
 threadlocal at every dispatch site, since LLVM cannot always hoist it (it
 did per-list in Shape B, per-alloc in Shape A).
+
+## E3 — same-model race validation (Phase 1 half, P1-J6, 2026-07-06) — GATE: PASS
+
+The Phase 1 half of gate E3 (gate table: "E3 TSan copy matrix +
+sender-dies", phases 1 same-model / 3 full). **Scope honesty:** Phase 1
+payloads are opaque (the ARC deep-copy walker is plan item 2.4), so
+"ARC→ARC copy under TSan" cannot exist yet; the Phase 1 same-model scope
+is ZERO races in the kernel's shared machinery under adversarial
+concurrency — mailbox links, envelope page ownership/abandon/reclaim,
+pid-table slot transitions, scheduler wake/park — with the
+payload-refcount rule (no refcount ever touched cross-thread;
+`mailbox.zig`) preserved by construction and asserted where expressible
+(payloads are stamped opaque words; nothing dereferences them
+cross-thread). The reachable-pair copy matrix re-runs as E3's full half
+in Phase 3.
+
+### ThreadSanitizer availability (resolved: AVAILABLE)
+
+The fork compiler supports `-fsanitize-thread` for aarch64-macos test
+builds end-to-end (fork @ `6a425dbaeb`). Positive control: a
+deliberately racy two-thread counter program compiled at ReleaseFast
+reports `WARNING: ThreadSanitizer: data race` with correct stacks.
+Finding-fatality control: TSan's default exit code did NOT propagate
+through the test runner in this setup, so every gate run sets
+`TSAN_OPTIONS="halt_on_error=1 abort_on_error=1"` (verified: findings
+then SIGABRT, exit 134) AND the captured output is grepped for
+`ThreadSanitizer|WARNING|data race`.
+
+### Method and volumes
+
+1. **Kernel test suite under TSan** — all 98 tests
+   (`src/runtime/concurrency/concurrency.zig`), strict options:
+   * Debug: 98/98 pass, **zero findings**.
+   * ReleaseFast: 96/96 pass (+2 Debug-only skips), **zero findings**.
+2. **Dedicated adversarial stress**
+   (`src/runtime/concurrency/adversarial_stress.zig`, committed as part
+   of the kernel suite; `ZAP_ADVERSARIAL_STRESS_ROUNDS` scales it).
+   Six producer THREADS against the scheduler thread, per round: a
+   stale-pid dead-letter storm racing the current round's slot
+   acquisitions in LIFO-reused slots (every stale lookup must miss —
+   a resolve is a §2.4 generation-reuse bug; reasons tallied and only
+   `generation_mismatch`/`slot_not_occupied` permitted); mid-flight
+   sender death (ephemeral envelope handles abandoned immediately after
+   each push + the round handle abandoned while receivers still free
+   from its pages); sinks killed `.runnable` with populated mailboxes
+   while producers are still pushing to the round's consumers (teardown
+   drain + abandoned-page reclaim overlapping live cross-thread
+   pushes); victims killed at the non-cooperative `.waiting` point;
+   futex park/wake pressure (consumers block mid-round; producers spray
+   spurious `wake()`/`requestWatchdogPreemption()` and walk the
+   lock-free live iterator without PCB dereference). Every round ends
+   with a full barrier and EXACT accounting: consumer receipts with
+   per-producer pairwise-FIFO order, sink budgets, kill outcomes by
+   state, crash-report mailbox depths at death (sinks die with exactly
+   their leftovers, everyone else empty), dead-letter counter delta ==
+   producers' locally observed miss count, and zero live/abandoned
+   pages, zero live stacks, zero live processes. Contract discipline:
+   every push targets a process provably alive across the lookup→push
+   window (the out-of-contract foreign-push-vs-teardown race is the
+   documented Phase 4 PCB-lifetime caveat and is not exercisable in
+   Phase 1); stale-pid traffic is the in-contract shape of "sending to
+   exiting/dead processes".
+3. **TSan-monitored adversarial volume** (strict options, all clean):
+   2×1,000-round standalone runs (Debug 12.4 s, ReleaseFast 9.5 s) +
+   **15×1,000-round ReleaseFast chunks + 3×1,000-round Debug chunks run
+   back-to-back** (~5 minutes of sustained TSan-monitored adversarial
+   concurrency; fresh TSan state per chunk — see the limitation below)
+   ≈ **20,000 rounds ≈ 220,000 process lifecycles, ~4 M cross-thread
+   envelopes, ~4 M racing stale lookups under TSan. ZERO findings.**
+4. **Uninstrumented soak (exact accounting as the oracle):**
+   ReleaseFast at **100,000 rounds** — 1.1 M process lifecycles,
+   ~19.8 M cross-thread envelopes, ~19.8 M stale-pid probes racing slot
+   transitions, ~880 k abandoned-page reclaims, 22.7 s wall — **zero
+   invariant violations**; Debug at 10,000 rounds likewise clean.
+   Committed CI default: 120 rounds (seconds-scale), in `zig build
+   test` / `test-kernel` at Debug + ReleaseFast.
+
+### TSan-runtime limitation found (documented, not a kernel finding)
+
+Single-process adversarial runs ≥ ~4,000 rounds at ReleaseFast crash
+INSIDE ThreadSanitizer's runtime — verbatim head of the report
+(`handle_segv=0` run, full log in the P1-J6 job record):
+
+```
+==94194==ERROR: ThreadSanitizer: BUS on unknown address (pc … T31821900)
+==94194==The signal is caused by a WRITE memory access.
+    #0 __tsan::TraceSwitchPartImpl(__tsan::ThreadState*) tsan_rtl.cpp:1052
+    #1 __tsan::TraceRestartMemoryAccess(…) tsan_rtl_access.cpp:416
+    #2 __tsan_atomic64_fetch_add tsan_interface_atomic.cpp:631
+    #3 Thread.PosixThreadImpl.spawn….Instance.entryFn Thread.zig:752
+```
+
+The fault is a wild WRITE inside TSan's own trace-part allocator while
+servicing an ordinary `fetchAdd` from a producer thread — trace-capacity
+exhaustion of TSan v3's per-thread event history on Darwin/arm64 at
+extreme event volume (`history_size=2` and `flush_memory_ms=1000` do not
+avoid it; Debug+TSan additionally degrades superlinearly near the
+threshold). Kernel exoneration: the fault frames are entirely within
+`tsan_rtl`; the identical binary logic runs **clean at 25× that volume
+uninstrumented** (100 k rounds, exact accounting); and TSan itself is
+clean across 20 k+ rounds when chunked below the trace-capacity
+threshold. Mitigation for future gates: chunk long TSan soaks at ≤1,000
+rounds per process (as above). The Phase 4 Linux CI leg of E3 (full
+matrix, per the plan's gate table) should re-probe the threshold there,
+where TSan's trace allocator behaves differently.
+
+### Verdict
+
+**PASS.** Zero ThreadSanitizer findings across the full kernel suite and
+~20,000 adversarial rounds at both optimize modes; zero invariant
+violations across 111 k+ uninstrumented rounds (≈1.3 M lifecycles); no
+kernel change of any kind was needed (the one-line-ordering-fix budget
+went unused). The payload-refcount rule is untestable-by-TSan until the
+Phase 2 copy walker exists — preserved by construction (opaque stamped
+payloads; the only cross-thread atomics are the mailbox links and pool
+page words, per the `mailbox.zig`/`envelope_pool.zig` inventories) and
+scheduled for direct TSan coverage in E3's full half (Phase 3).
 
 ## E2 — safepoint overhead
 

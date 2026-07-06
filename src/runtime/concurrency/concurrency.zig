@@ -83,6 +83,13 @@
 //!   (mimalloc-#164 class): thousands of mixed-shape spawn/die cycles
 //!   with exact per-wave resource accounting;
 //!   `ZAP_TEARDOWN_STRESS_CYCLES` scales it to a soak.
+//! * `adversarial_stress.zig` — the Phase 1 half of exit gate E3
+//!   (P1-J6): producer THREADS storm the kernel's shared machinery
+//!   (stale-pid dead-letter storms racing slot transitions, mid-flight
+//!   sender death with abandon/reclaim churn, teardown of populated
+//!   mailboxes concurrent with live pushes, futex wake/park pressure)
+//!   with exact accounting per round; `ZAP_ADVERSARIAL_STRESS_ROUNDS`
+//!   scales it to a soak. Run under TSan for the E3 gate.
 //!
 //! NOT here yet: timers, links/monitors,
 //! and the `std.Io` vtable. This tree is NOT wired
@@ -171,4 +178,5 @@ test {
     _ = introspection;
     _ = crash_report;
     _ = @import("teardown_stress.zig");
+    _ = @import("adversarial_stress.zig");
 }

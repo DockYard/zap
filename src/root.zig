@@ -121,12 +121,17 @@ test {
     //     `src/runtime/concurrency/mailbox.zig`,
     //     `src/runtime/concurrency/envelope_pool.zig`,
     //     `src/runtime/concurrency/scheduler.zig`,
-    //     `src/runtime/concurrency/deterministic.zig` — the concurrency
-    //     runtime kernel (P1-J1…J4), a self-contained tree with its own
-    //     dedicated `zig build test-kernel` target (also wired into `zig
-    //     build test`): it must run WITHOUT the compiler link and
-    //     additionally at ReleaseFast for the fiber miscompilation
-    //     canary, neither of which the `zap` module test binary provides.
+    //     `src/runtime/concurrency/deterministic.zig`,
+    //     `src/runtime/concurrency/introspection.zig`,
+    //     `src/runtime/concurrency/crash_report.zig`,
+    //     `src/runtime/concurrency/teardown_stress.zig`,
+    //     `src/runtime/concurrency/adversarial_stress.zig` — the
+    //     concurrency runtime kernel (P1-J1…J6), a self-contained tree
+    //     with its own dedicated `zig build test-kernel` target (also
+    //     wired into `zig build test`): it must run WITHOUT the compiler
+    //     link and additionally at ReleaseFast for the fiber
+    //     miscompilation canary, neither of which the `zap` module test
+    //     binary provides.
     // ----------------------------------------------------------------
     _ = @import("target_triple.zig");
     _ = @import("target_caps.zig");

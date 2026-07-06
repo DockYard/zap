@@ -213,7 +213,13 @@ from Zig tests and a minimal intrinsic set.
   Tracking/Leak managers, clean teardown asserted.
 
 Exit gate: E3's same-model half (ARC→ARC copy under TSan, adversarial send/receive, zero
-refcount races); E1 re-measured on the real kernel.
+refcount races); E1 re-measured on the real kernel. **Met 2026-07-06 (P1-J6)** — ledger
+sections "E3 — same-model race validation (Phase 1 half)" (TSan available on the fork;
+zero findings across the kernel suite + ~20k adversarial rounds; scope note: Phase 1
+payloads are opaque, so the copy-walker half of the TSan matrix moves with the walker to
+E3's Phase 3 full run) and E1 "Phase 1 kernel re-measurement" (spawn 11 ns admission /
+43 ns full lifecycle, RTT 44 ns, parked wake 5.0 µs median — PASS with orders-of-magnitude
+margin; test-manager caveat noted, Phase 3 re-measures per manager).
 
 ### Phase 2 — Language surface + copy-path send/receive (XL)
 
