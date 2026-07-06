@@ -52,7 +52,12 @@
 //! Final sizing/watermark policy is deliberately deferred (plan Appendix
 //! A.4 item 3) and will be decided empirically by Phase 1.7's Darwin
 //! spawn/die-cycle teardown test; the constants below are the initial
-//! mirror of the ARC slab policy.
+//! mirror of the ARC slab policy. One consequence to keep in view for
+//! that decision: a cached stack's RESIDENT pages do not decay — the
+//! free list retains whatever pages the stack's deepest tenant faulted
+//! in — so long-idle caches hold peak-depth resident memory until
+//! `trim`; whether releases should `madvise` the usable range back to
+//! the OS is part of the same Phase 1.7 / A.4 item 3 sizing decision.
 //!
 //! ## The fiber-stack-lifetime invariant (release-side enforcement)
 //!
@@ -564,11 +569,16 @@ test "StackPool: guard page is PROT_NONE and the usable range is read+write" {
     try testing.expect(!guard_protection.readable);
     try testing.expect(!guard_protection.writable);
 
-    const usable_low = readRegionProtection(@intFromPtr(stack.usable().ptr)).?;
+    // The queries below skip like the first one: on a platform where the
+    // guard query answered, these normally answer too, but a null (e.g.
+    // a transient procfs read failure) must skip rather than panic.
+    const usable_low = readRegionProtection(@intFromPtr(stack.usable().ptr)) orelse
+        return error.SkipZigTest;
     try testing.expect(usable_low.readable);
     try testing.expect(usable_low.writable);
 
-    const usable_high = readRegionProtection(stack.top() - 16).?;
+    const usable_high = readRegionProtection(stack.top() - 16) orelse
+        return error.SkipZigTest;
     try testing.expect(usable_high.readable);
     try testing.expect(usable_high.writable);
 }

@@ -143,52 +143,10 @@ fn configuredTotalSpawnCycles() !usize {
 
 // -- per-process manager --------------------------------------------------------------
 
-/// Byte-accounting arena manager (the standard Phase 1 test-manager
-/// shape; see `scheduler.zig`). Reused across waves — teardown re-arms
-/// the arena — but never shared between concurrently-live processes.
-const StressManager = struct {
-    arena: std.heap.ArenaAllocator,
-    live_heap_bytes: usize = 0,
-    teardown_count: usize = 0,
-
-    fn managerContext(manager: *StressManager) ManagerContext {
-        return .{ .manager_state = manager, .vtable = &vtable };
-    }
-
-    const vtable = process_module.ManagerVTable{
-        .allocate = allocateThunk,
-        .deallocate = deallocateThunk,
-        .teardown = teardownThunk,
-        .heapByteCount = heapByteCountThunk,
-    };
-
-    fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
-        const manager: *StressManager = @ptrCast(@alignCast(manager_state.?));
-        const memory = manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress()) orelse return null;
-        manager.live_heap_bytes += byte_length;
-        return memory;
-    }
-
-    fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
-        const manager: *StressManager = @ptrCast(@alignCast(manager_state.?));
-        manager.arena.allocator().rawFree(memory[0..byte_length], alignment, @returnAddress());
-        manager.live_heap_bytes -= byte_length;
-    }
-
-    fn teardownThunk(manager_state: ?*anyopaque) void {
-        const manager: *StressManager = @ptrCast(@alignCast(manager_state.?));
-        manager.teardown_count += 1;
-        const backing_allocator = manager.arena.child_allocator;
-        manager.arena.deinit();
-        manager.arena = std.heap.ArenaAllocator.init(backing_allocator);
-        manager.live_heap_bytes = 0;
-    }
-
-    fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
-        const manager: *StressManager = @ptrCast(@alignCast(manager_state.?));
-        return manager.live_heap_bytes;
-    }
-};
+/// The shared Phase 1 test-manager shape (`test_support.zig`). Reused
+/// across waves — teardown re-arms the arena — but never shared between
+/// concurrently-live processes.
+const StressManager = @import("test_support.zig").CountingArenaManager;
 
 // -- process bodies -------------------------------------------------------------------
 

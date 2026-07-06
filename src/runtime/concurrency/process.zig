@@ -47,9 +47,12 @@
 //! enough for Phase 1 kernel tests, which drive it with a std-allocator-
 //! backed test manager. Binding the REAL manager ABI
 //! (`docs/memory-manager-abi.md`: `ZapManagerDescriptor`, capability
-//! vtables, `zap_active_manager` symbol families) is a later wiring job in
-//! this phase; when it lands, this vtable is replaced by (not layered over)
-//! the manager-ABI entry points, per the no-fallbacks rule.
+//! vtables, `zap_active_manager` symbol families) lands in later phases
+//! of the plan: Phase 2 item 2.4 binds the real manifest manager (ARC)
+//! with adoption semantics; Phase 3 items 3.1/3.3 add the per-spawn
+//! manager families. When each landing arrives, this vtable is replaced
+//! by (not layered over) the manager-ABI entry points, per the
+//! no-fallbacks rule.
 //!
 //! ## Per-quantum current-process discipline (plan A.2.4 / A.3)
 //!
@@ -58,6 +61,23 @@
 //! resolves the current process once per scheduling quantum and threads the
 //! pointer through — E10 measured per-site TLV reads at +13.8% on the
 //! pure-alloc shape, so re-resolution per call site is banned by design.
+//!
+//! ## Concurrency: PCB fields are owner-only
+//!
+//! Every PCB field is OWNER-ONLY: it is read and mutated only by the
+//! owning process's own execution, or by the scheduler thread while the
+//! process is not running (in Phase 1 these are the same thread; the
+//! phrasing is the Phase 4 contract). Nothing in the PCB is thread-safe
+//! by itself — the one deliberate exception is the mailbox, whose PUSH
+//! side is any-thread by design (`mailbox.zig`). Foreign threads that
+//! hold a PCB pointer from `pid_table.lookup` may push to the mailbox
+//! and nothing else; `introspection.zig`'s cross-thread snapshots read
+//! `state` on the documented best-effort basis.
+//!
+//! Phase 4 (M:N schedulers) tracking line: atomicize `ProcessState` (or
+//! fence the introspection reads) before a second scheduler thread can
+//! observe a PCB — the owner-only contract above is what makes plain
+//! (non-atomic) fields correct today.
 
 const std = @import("std");
 const fiber_context = @import("fiber_context.zig");
@@ -118,7 +138,9 @@ pub const default_preemption_budget: u32 = 4000;
 
 /// Minimal per-process memory-manager binding for Phase 1 kernel tests.
 /// See the module doc's "Manager binding" section: the real manager-ABI
-/// wiring replaces this vtable later in Phase 1.
+/// wiring replaces this vtable in Phase 2 item 2.4 (manifest ARC manager,
+/// adoption semantics) and Phase 3 items 3.1/3.3 (per-spawn manager
+/// families).
 pub const ManagerVTable = struct {
     /// Allocate `byte_length` bytes at `alignment` from the process's
     /// manager. Returns null on exhaustion.
@@ -284,10 +306,9 @@ pub const ProcessControlBlock = struct {
     /// destructors run newest-first, mirroring scope-exit `defer`
     /// ordering (research.md §6.5: the drop-list is the kernel analogue
     /// of BEAM resource destructors). The node is owned by the resource
-    /// it destroys; the kernel never allocates or frees it. Owner-only:
-    /// call from the owning process's own execution (or the scheduler
-    /// thread while the process is not running) — the list is not
-    /// thread-safe by the same owner-only posture as every PCB field.
+    /// it destroys; the kernel never allocates or frees it. The list is
+    /// owner-only like every PCB field (module doc, "Concurrency: PCB
+    /// fields are owner-only").
     pub fn registerDropResource(process: *ProcessControlBlock, node: *DropListNode) void {
         node.next = process.drop_list_head;
         process.drop_list_head = node;
@@ -312,6 +333,10 @@ pub const ProcessControlBlock = struct {
 const testing = std.testing;
 const stack_pool = @import("stack_pool.zig");
 const envelope_pool = @import("envelope_pool.zig");
+const test_support = @import("test_support.zig");
+
+/// The shared Phase 1 test-manager shape (`test_support.zig`).
+const TestManager = test_support.CountingArenaManager;
 
 test "PCB: state-transition legality matrix" {
     const State = ProcessState;
@@ -340,63 +365,6 @@ test "PCB: state-transition legality matrix" {
         }
     }
 }
-
-/// Arena-backed test manager: the Phase 1 stand-in for a real per-process
-/// manager instance. `teardown` is the wholesale free-on-exit shape the
-/// plan's item 1.4 prescribes.
-const TestManager = struct {
-    arena: std.heap.ArenaAllocator,
-    allocation_count: usize = 0,
-    live_heap_bytes: usize = 0,
-    teardown_count: usize = 0,
-
-    fn init(backing_allocator: std.mem.Allocator) TestManager {
-        return .{ .arena = std.heap.ArenaAllocator.init(backing_allocator) };
-    }
-
-    fn managerContext(manager: *TestManager) ManagerContext {
-        return .{ .manager_state = manager, .vtable = &test_manager_vtable };
-    }
-
-    const test_manager_vtable = ManagerVTable{
-        .allocate = allocateThunk,
-        .deallocate = deallocateThunk,
-        .teardown = teardownThunk,
-        .heapByteCount = heapByteCountThunk,
-    };
-
-    fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
-        const manager: *TestManager = @ptrCast(@alignCast(manager_state.?));
-        const memory = manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress()) orelse return null;
-        manager.allocation_count += 1;
-        manager.live_heap_bytes += byte_length;
-        return memory;
-    }
-
-    fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
-        const manager: *TestManager = @ptrCast(@alignCast(manager_state.?));
-        manager.arena.allocator().rawFree(memory[0..byte_length], alignment, @returnAddress());
-        manager.allocation_count -= 1;
-        manager.live_heap_bytes -= byte_length;
-    }
-
-    fn teardownThunk(manager_state: ?*anyopaque) void {
-        const manager: *TestManager = @ptrCast(@alignCast(manager_state.?));
-        manager.teardown_count += 1;
-        // Wholesale free-on-exit; re-arm the arena so the test's outer
-        // `defer arena.deinit()` stays valid after teardown.
-        const backing_allocator = manager.arena.child_allocator;
-        manager.arena.deinit();
-        manager.arena = std.heap.ArenaAllocator.init(backing_allocator);
-        manager.allocation_count = 0;
-        manager.live_heap_bytes = 0;
-    }
-
-    fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
-        const manager: *TestManager = @ptrCast(@alignCast(manager_state.?));
-        return manager.live_heap_bytes;
-    }
-};
 
 test "PCB: manager vtable allocate/deallocate/teardown round-trip" {
     var test_manager = TestManager.init(testing.allocator);

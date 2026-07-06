@@ -99,6 +99,11 @@ const Mode = enum {
 
 // -- per-process manager (the Phase 1 test-manager shape; module doc) ---------------------
 
+/// Deliberately a LOCAL copy of the kernel's test-manager shape rather
+/// than `src/runtime/concurrency/test_support.zig`'s shared decl: the
+/// bench compiles the kernel as a module (`-Mconcurrency=…`), which does
+/// not export test support, and this copy drops the teardown counter the
+/// tests need but a benchmark must not pay for.
 const BenchManager = struct {
     arena: std.heap.ArenaAllocator,
     live_heap_bytes: usize = 0,
@@ -343,6 +348,16 @@ fn runPingPongRepetition(kernel: *BenchKernel, managers: *[2]BenchManager, round
     return elapsed;
 }
 
+/// Self-verification tolerance on one ping-pong repetition's quantum
+/// count above the 2×rounds steady state. The exact expected shape is
+/// 2×rounds + 1 (one quantum per process per round trip, plus the
+/// pinger's entry quantum that sends round 0 before its first wait); the
+/// slack additionally absorbs a few boundary quanta should the
+/// scheduler's yield classification ever legitimately shift, while still
+/// failing loudly on anything structural (double scheduling, lost wakes,
+/// busy-poll receive would all blow far past it).
+const pingpong_quantum_slack: u64 = 8;
+
 fn runPingPongMode(allocator: std.mem.Allocator, rounds: usize) !void {
     var kernel: BenchKernel = undefined;
     try kernel.init(allocator, .{});
@@ -358,14 +373,37 @@ fn runPingPongMode(allocator: std.mem.Allocator, rounds: usize) !void {
 
     var per_op_ns: [repetition_count]f64 = undefined;
     for (&per_op_ns, 0..) |*result, repetition| {
+        const quanta_before = kernel.scheduler.statistics().quantum_total;
         const timed_ns = try runPingPongRepetition(&kernel, &managers, rounds);
+        // Self-verification: a round trip is one quantum per process, so
+        // the per-op number is only "one message RTT" if this repetition
+        // executed ≈ 2×rounds quanta (see `pingpong_quantum_slack`).
+        const quanta_this_repetition = kernel.scheduler.statistics().quantum_total - quanta_before;
+        if (quanta_this_repetition < 2 * rounds or
+            quanta_this_repetition > 2 * rounds + pingpong_quantum_slack)
+        {
+            std.debug.print(
+                "pingpong self-verification FAILED: rep {d} executed {d} quanta, expected [{d}, {d}]\n",
+                .{ repetition, quanta_this_repetition, 2 * rounds, 2 * rounds + pingpong_quantum_slack },
+            );
+            return error.PingPongQuantumAccountingBroken;
+        }
         result.* = @as(f64, @floatFromInt(timed_ns)) / @as(f64, @floatFromInt(rounds));
         std.debug.print("rep {d}: total_ns={d} per_rtt_ns={d:.1}\n", .{ repetition, timed_ns, result.* });
     }
     printResult("pingpong", &per_op_ns);
     const stats = kernel.scheduler.statistics();
+    // Self-verification: a same-scheduler run must never park — a parked
+    // wake (~900 ns) inside the timed region would contaminate the RTT.
+    if (stats.park_count != 0) {
+        std.debug.print(
+            "pingpong self-verification FAILED: park_count={d}, expected 0 for a same-scheduler run\n",
+            .{stats.park_count},
+        );
+        return error.PingPongParked;
+    }
     std.debug.print(
-        "quantum_total={d} park_count={d} (same-scheduler run — parks should be 0)\n",
+        "quantum_total={d} park_count={d} (self-verified: ~2 quanta per round trip, zero parks)\n",
         .{ stats.quantum_total, stats.park_count },
     );
 }

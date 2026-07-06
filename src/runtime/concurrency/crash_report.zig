@@ -53,16 +53,21 @@
 //! reports DO NOT route through that path: the walk above never invokes
 //! `SelfInfo.unwindFrame`, and rendering (`CrashReport.render`) only
 //! SYMBOLIZES addresses via debug info — symbolization never unwinds.
-//! Measured on real suspended-fiber frames (2026-07, Debug and
-//! ReleaseFast, Apple Silicon): the kernel FP walk and the fork's
-//! `SelfInfo` unwinder (exercised via
-//! `std.debug.captureCurrentStackTrace` with a reconstructed
-//! `cpu_context` over the same saved {pc, fp, sp}) produce IDENTICAL
-//! return-address chains — 8/8 frames in Debug, 7/7 in ReleaseFast, no
-//! divergence, no truncation, zero di→fp fallbacks (so the compact-unwind
-//! rules themselves were genuinely exercised, not skipped), both
-//! terminating cleanly at the fiber root and symbolizing down through
-//! `receive`/entry/`fiberMain`. The buggy `x_reg_pairs` reads corrupt
+//! The kernel-walk ⇔ fork-unwinder equivalence is REGRESSION-PINNED by
+//! the committed test "kernel FP walk matches the fork SelfInfo
+//! unwinder on a real suspended fiber" below: it reconstructs a
+//! `cpu_context` over the same saved {pc, fp, sp} of a genuinely
+//! suspended fiber, runs the fork's unwinder through
+//! `std.debug.captureCurrentStackTrace`, and fails if the two
+//! return-address chains diverge or truncate. (The original 2026-07
+//! Apple Silicon measurement that adjudicated this observed identical
+//! chains — 8/8 frames in Debug, 7/7 in ReleaseFast — with zero di→fp
+//! fallbacks, so the compact-unwind rules themselves were genuinely
+//! exercised, both walks terminating cleanly at the fiber root and
+//! symbolizing down through `receive`/entry/`fiberMain`; the fallback
+//! count is not observable through the public capture API, so the
+//! pinned test asserts chain identity and clean termination, not the
+//! fallback count.) The buggy `x_reg_pairs` reads corrupt
 //! only the restored x19..x28 *unwind register state* (never consulted
 //! by the frame-record ip/fp chain these traces follow) and over-read up
 //! to `fp + 0x38`, which stays inside the mapping thanks to J1's
@@ -339,59 +344,8 @@ const Pid = pid_table_module.Pid;
 const EnvelopePool = envelope_pool_module.EnvelopePool;
 const ManagerContext = process_module.ManagerContext;
 
-/// Byte-accounting arena manager (the standard Phase 1 test-manager
-/// shape; see `scheduler.zig`).
-const ReportTestManager = struct {
-    arena: std.heap.ArenaAllocator,
-    live_heap_bytes: usize = 0,
-    teardown_count: usize = 0,
-
-    fn init(backing_allocator: std.mem.Allocator) ReportTestManager {
-        return .{ .arena = std.heap.ArenaAllocator.init(backing_allocator) };
-    }
-
-    fn deinitBacking(manager: *ReportTestManager) void {
-        manager.arena.deinit();
-    }
-
-    fn managerContext(manager: *ReportTestManager) ManagerContext {
-        return .{ .manager_state = manager, .vtable = &vtable };
-    }
-
-    const vtable = process_module.ManagerVTable{
-        .allocate = allocateThunk,
-        .deallocate = deallocateThunk,
-        .teardown = teardownThunk,
-        .heapByteCount = heapByteCountThunk,
-    };
-
-    fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
-        const manager: *ReportTestManager = @ptrCast(@alignCast(manager_state.?));
-        const memory = manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress()) orelse return null;
-        manager.live_heap_bytes += byte_length;
-        return memory;
-    }
-
-    fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
-        const manager: *ReportTestManager = @ptrCast(@alignCast(manager_state.?));
-        manager.arena.allocator().rawFree(memory[0..byte_length], alignment, @returnAddress());
-        manager.live_heap_bytes -= byte_length;
-    }
-
-    fn teardownThunk(manager_state: ?*anyopaque) void {
-        const manager: *ReportTestManager = @ptrCast(@alignCast(manager_state.?));
-        manager.teardown_count += 1;
-        const backing_allocator = manager.arena.child_allocator;
-        manager.arena.deinit();
-        manager.arena = std.heap.ArenaAllocator.init(backing_allocator);
-        manager.live_heap_bytes = 0;
-    }
-
-    fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
-        const manager: *ReportTestManager = @ptrCast(@alignCast(manager_state.?));
-        return manager.live_heap_bytes;
-    }
-};
+/// The shared Phase 1 test-manager shape (`test_support.zig`).
+const ReportTestManager = @import("test_support.zig").CountingArenaManager;
 
 /// Test sink: copies every report (the seam contract — reports are
 /// borrowed for the hook call only).
@@ -691,6 +645,92 @@ test "CrashReport: normal exit with a populated mailbox reports the leftover dep
     try testing.expectEqual(ExitReason.normal, report.reason);
     try testing.expectEqual(@as(usize, 2), report.mailbox_depth_at_death);
     try testing.expectEqual(TraceStatus.ran_to_completion, report.trace_status);
+    try kernel.expectExactAccounting();
+}
+
+// -- unwinder equivalence (the module doc's regression pin) ---------------------------
+
+/// `std.debug.cpu_context.Native` reconstructed from a suspended fiber's
+/// saved {pc, fp, sp} — the exact shape the module doc's adjudication
+/// measured. Every register the two supported architectures' frame-chain
+/// walks consult is populated; the rest are zero.
+fn reconstructedCpuContext(saved: fiber_context.SavedRegisters) std.debug.cpu_context.Native {
+    var context = std.mem.zeroes(std.debug.cpu_context.Native);
+    switch (builtin.cpu.arch) {
+        .aarch64 => {
+            context.x[29] = saved.frame_pointer;
+            context.sp = saved.stack_pointer;
+            context.pc = saved.program_counter;
+        },
+        .x86_64 => {
+            context.gprs.set(.rbp, saved.frame_pointer);
+            context.gprs.set(.rsp, saved.stack_pointer);
+            context.gprs.set(.rip, saved.program_counter);
+        },
+        // The module-level comptime gate rejects other architectures.
+        else => comptime unreachable,
+    }
+    return context;
+}
+
+test "CrashReport: kernel FP walk matches the fork SelfInfo unwinder on a real suspended fiber" {
+    // Both sides of the comparison need stack tracing compiled in; when
+    // std compiles it out the fork unwinder legitimately returns zero
+    // frames and there is nothing to compare.
+    if (!std.options.allow_stack_tracing) return error.SkipZigTest;
+
+    var kernel: ReportTestKernel = undefined;
+    try kernel.init();
+    defer kernel.deinit();
+    var manager = ReportTestManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    // Park a real process in receive: a genuine suspended fiber whose
+    // saved {pc, fp, sp} is a real mid-`yield` suspend point.
+    const victim_pid = try kernel.scheduler.spawn(.{
+        .entry = blockForMessageEntry,
+        .manager = manager.managerContext(),
+    });
+    try testing.expectError(error.AllProcessesWaiting, kernel.scheduler.runUntilQuiescent());
+    const victim_pcb = kernel.pid_table.lookup(victim_pid).?;
+    const saved = fiber_context.savedRegisters(&victim_pcb.fiber).?;
+
+    // Side one: the kernel's bounded frame-pointer walk.
+    var report = CrashReport{
+        .pid_bits = victim_pcb.pid.toBits(),
+        .reason = .killed,
+        .state_at_death = victim_pcb.state,
+        .mailbox_depth_at_death = 0,
+        .trace_status = .captured,
+        .suspend_program_counter = saved.program_counter,
+        .suspend_frame_pointer = saved.frame_pointer,
+        .return_address_buffer = undefined,
+        .return_address_count = 0,
+        .trace_truncated = false,
+    };
+    walkSavedFrames(&report, saved, victim_pcb.fiber.stack);
+    try testing.expect(!report.trace_truncated);
+    const kernel_chain = report.trace();
+    try testing.expect(kernel_chain.len >= 2);
+
+    // Side two: the fork's SelfInfo unwinder over a cpu_context
+    // reconstructed from the SAME saved registers. Both conventions
+    // report the context pc first, +1 (`StackIterator.next`'s ctx_first
+    // arm mirrors `walkSavedFrames`' first-frame contract), so the
+    // chains must be element-wise IDENTICAL when both terminate cleanly
+    // at the fiber root's {fp: 0, ra: 0} record.
+    const reconstructed_context = reconstructedCpuContext(saved);
+    var unwinder_address_buffer: [max_trace_frames]usize = undefined;
+    const unwinder_trace = std.debug.captureCurrentStackTrace(
+        .{ .context = &reconstructed_context },
+        &unwinder_address_buffer,
+    );
+    try testing.expectEqual(std.debug.SkippedAddresses.none, unwinder_trace.skipped);
+    try testing.expectEqualSlices(usize, kernel_chain, unwinder_trace.return_addresses);
+
+    // Tear the parked victim down; every pool balances.
+    try testing.expectEqual(scheduler_module.KillOutcome.killed, kernel.scheduler.kill(victim_pid));
+    try kernel.scheduler.runUntilQuiescent();
     try kernel.expectExactAccounting();
 }
 

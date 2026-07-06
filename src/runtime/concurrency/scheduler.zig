@@ -101,7 +101,8 @@
 //! a resource failure into an asynchronous crash of an already-visible
 //! pid. Spawn stays the single synchronous failure point.
 //!
-//! ## Exit and crash teardown (plan 1.4, §5.3 wholesale-free guarantee)
+//! ## Exit and crash teardown (plan Phase 1 item 1.4 "spawn/exit/
+//! teardown" — the wholesale-free guarantee)
 //!
 //! Normal exit (entry function returns) and kill run ONE teardown path:
 //!
@@ -130,8 +131,8 @@
 //!    `.ready`/`.suspended` fiber goes through
 //!    `fiber_context.reclaimWithoutResume` (the fiber has provably left
 //!    the stack — see that function's doc);
-//! 8. wholesale-free the process heap (`manager.teardown()` — plan §5.3:
-//!    bulk arena/slab free, never per-object);
+//! 8. wholesale-free the process heap (`manager.teardown()` — plan Phase
+//!    1 item 1.4: bulk arena/slab free, never per-object);
 //! 9. recycle the record.
 //!
 //! Leak accounting balances EXACTLY after every teardown: stack pool,
@@ -876,6 +877,11 @@ pub const Scheduler = struct {
     pub fn shutdownAllProcesses(scheduler: *Scheduler) void {
         while (true) {
             scheduler.drainWakeStack();
+            // Deliberately BYPASSES the Decisions seam (fixed FIFO order,
+            // never `chooseNextReadyIndex`): shutdown is a fixed
+            // deterministic policy that runs after a scenario's compared
+            // trace ends, so exempting it keeps the seam's inventory to
+            // decisions that can diverge replayed runs.
             if (scheduler.dequeueReadyAt(0)) |record| {
                 scheduler.teardownProcess(record, .killed);
                 continue;
@@ -1095,7 +1101,8 @@ pub const Scheduler = struct {
             .running, .finished => unreachable,
         }
 
-        // (8) Wholesale heap free (plan §5.3).
+        // (8) Wholesale heap free (plan Phase 1 item 1.4: bulk arena/slab
+        // free on exit — module doc, "Exit and crash teardown").
         pcb.manager.teardown();
 
         scheduler.emitTrace(switch (reason) {
@@ -1479,61 +1486,8 @@ const parking_futex = struct {
 
 const testing = std.testing;
 
-/// Arena-backed per-process test manager (the Phase 1 stand-in for a real
-/// manager instance, mirroring `process.zig`'s TestManager): `teardown`
-/// is the wholesale free-on-exit shape and is counted so tests can assert
-/// exactly one teardown per spawn.
-const TestProcessManager = struct {
-    arena: std.heap.ArenaAllocator,
-    live_heap_bytes: usize = 0,
-    teardown_count: usize = 0,
-
-    fn init(backing_allocator: std.mem.Allocator) TestProcessManager {
-        return .{ .arena = std.heap.ArenaAllocator.init(backing_allocator) };
-    }
-
-    fn deinitBacking(manager: *TestProcessManager) void {
-        manager.arena.deinit();
-    }
-
-    fn managerContext(manager: *TestProcessManager) ManagerContext {
-        return .{ .manager_state = manager, .vtable = &vtable };
-    }
-
-    const vtable = process_module.ManagerVTable{
-        .allocate = allocateThunk,
-        .deallocate = deallocateThunk,
-        .teardown = teardownThunk,
-        .heapByteCount = heapByteCountThunk,
-    };
-
-    fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
-        const manager: *TestProcessManager = @ptrCast(@alignCast(manager_state.?));
-        const memory = manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress()) orelse return null;
-        manager.live_heap_bytes += byte_length;
-        return memory;
-    }
-
-    fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
-        const manager: *TestProcessManager = @ptrCast(@alignCast(manager_state.?));
-        manager.arena.allocator().rawFree(memory[0..byte_length], alignment, @returnAddress());
-        manager.live_heap_bytes -= byte_length;
-    }
-
-    fn teardownThunk(manager_state: ?*anyopaque) void {
-        const manager: *TestProcessManager = @ptrCast(@alignCast(manager_state.?));
-        manager.teardown_count += 1;
-        const backing_allocator = manager.arena.child_allocator;
-        manager.arena.deinit();
-        manager.arena = std.heap.ArenaAllocator.init(backing_allocator);
-        manager.live_heap_bytes = 0;
-    }
-
-    fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
-        const manager: *TestProcessManager = @ptrCast(@alignCast(manager_state.?));
-        return manager.live_heap_bytes;
-    }
-};
+/// The shared Phase 1 test-manager shape (`test_support.zig`).
+const TestProcessManager = @import("test_support.zig").CountingArenaManager;
 
 /// One scheduler + shared structures, wired for a test.
 const TestKernel = struct {

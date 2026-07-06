@@ -25,10 +25,12 @@
 //!
 //! * A fiber cannot release its own stack. The entry function returns into
 //!   `fiberMain`, whose final act is marking the fiber `.finished` and
-//!   switching AWAY to the scheduler context. No release path is reachable
-//!   from fiber-side code (`FiberExecution` exposes only `yield`), and
-//!   `StackPool.release` independently panics if called from a frame that
-//!   lives inside the stack being released.
+//!   switching AWAY to the scheduler context. No kernel API path to a
+//!   release is reachable from fiber-side code (`FiberExecution` exposes
+//!   only `yield`), and `StackPool.release` independently panics — in
+//!   every build mode — if called from a frame that lives inside the
+//!   stack being released, which also covers code that smuggles a pool
+//!   pointer onto the fiber and self-releases outside the kernel API.
 //! * The stack is released to its pool ONLY by scheduler-side code, and
 //!   only once the fiber has provably left it. There are exactly two
 //!   release sites: `resumeFiber`'s post-switch path (the FINISH path —
@@ -45,6 +47,13 @@
 //! multicore because a fiber is owned by exactly one scheduler at a time,
 //! so the resume-observes-finish edge and the release always happen on the
 //! owning scheduler's thread.
+//!
+//! Build-mode posture: at ReleaseFast the ORDERING half of the invariant
+//! (no release while code is still on the stack) is enforced by
+//! `StackPool.release`'s always-on frame-address panic; the Debug-only
+//! poison fill only adds OBSERVATION of ordering violations after the
+//! fact (use-after-release reads poison), which is a diagnostic by
+//! design, not the enforcement.
 //!
 //! ## Fiber roots are unwind-safe
 //!
@@ -267,7 +276,8 @@ pub fn resumeFiber(scheduler: *SchedulerContext, kernel_fiber: *KernelFiber) Res
 ///   invariant's release condition (module doc). The abandoned frames on
 ///   the stack are NOT unwound — kernel teardown reclaims process-owned
 ///   resources through the drop-list and the manager's wholesale free
-///   (plan §5.3), never through stack unwinding.
+///   (plan Phase 1 item 1.4; `scheduler.zig`, "Exit and crash teardown"),
+///   never through stack unwinding.
 ///
 /// `.running` is forbidden (the caller would be releasing a stack that is
 /// executing — precisely the Dispatch-backend bug the invariant exists to

@@ -205,53 +205,10 @@ const payload_stamp = struct {
 
 // -- per-process manager -------------------------------------------------------------
 
-/// Byte-accounting arena manager (the standard Phase 1 test-manager
-/// shape; see `scheduler.zig`/`teardown_stress.zig`). Reused across
-/// rounds — teardown re-arms the arena — but never shared between
+/// The shared Phase 1 test-manager shape (`test_support.zig`). Reused
+/// across rounds — teardown re-arms the arena — but never shared between
 /// concurrently-live processes.
-const StressManager = struct {
-    arena: std.heap.ArenaAllocator,
-    live_heap_bytes: usize = 0,
-    teardown_count: usize = 0,
-
-    fn managerContext(manager: *StressManager) ManagerContext {
-        return .{ .manager_state = manager, .vtable = &vtable };
-    }
-
-    const vtable = process_module.ManagerVTable{
-        .allocate = allocateThunk,
-        .deallocate = deallocateThunk,
-        .teardown = teardownThunk,
-        .heapByteCount = heapByteCountThunk,
-    };
-
-    fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
-        const manager: *StressManager = @ptrCast(@alignCast(manager_state.?));
-        const memory = manager.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress()) orelse return null;
-        manager.live_heap_bytes += byte_length;
-        return memory;
-    }
-
-    fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
-        const manager: *StressManager = @ptrCast(@alignCast(manager_state.?));
-        manager.arena.allocator().rawFree(memory[0..byte_length], alignment, @returnAddress());
-        manager.live_heap_bytes -= byte_length;
-    }
-
-    fn teardownThunk(manager_state: ?*anyopaque) void {
-        const manager: *StressManager = @ptrCast(@alignCast(manager_state.?));
-        manager.teardown_count += 1;
-        const backing_allocator = manager.arena.child_allocator;
-        manager.arena.deinit();
-        manager.arena = std.heap.ArenaAllocator.init(backing_allocator);
-        manager.live_heap_bytes = 0;
-    }
-
-    fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
-        const manager: *StressManager = @ptrCast(@alignCast(manager_state.?));
-        return manager.live_heap_bytes;
-    }
-};
+const StressManager = @import("test_support.zig").CountingArenaManager;
 
 // -- shared coordination state ----------------------------------------------------------
 
@@ -470,12 +427,16 @@ const Producer = struct {
     /// Local dead-letter observations (lookup misses this producer
     /// caused); summed across producers == the table counter delta.
     observed_lookup_miss_count: u64 = 0,
-    /// Loud-failure flag read after join.
-    failed: bool = false,
+    /// Loud-failure diagnosis read after join: the `@errorName` of the
+    /// error that aborted this producer's campaign, or null on success.
+    /// Preserving the KIND (not just a flag) keeps a gate failure
+    /// diagnosable — `error.BarrierTimeout` and `error.StalePidResolved`
+    /// demand entirely different investigations.
+    failure_error_name: ?[]const u8 = null,
 
     fn run(producer: *Producer) void {
-        producer.runOrFail() catch {
-            producer.failed = true;
+        producer.runOrFail() catch |campaign_error| {
+            producer.failure_error_name = @errorName(campaign_error);
         };
     }
 
@@ -860,7 +821,13 @@ test "AdversarialStress: cross-thread send/teardown storms hold every kernel inv
     spawned_thread_count = 0;
 
     for (&producers) |*producer| {
-        try testing.expect(!producer.failed);
+        if (producer.failure_error_name) |error_name| {
+            std.debug.print(
+                "producer {d} failed with error.{s}\n",
+                .{ producer.producer_index, error_name },
+            );
+            return error.ProducerCampaignFailed;
+        }
     }
 
     // Campaign totals.

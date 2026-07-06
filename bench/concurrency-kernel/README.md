@@ -57,12 +57,22 @@ uptime && ./bench <spawn|spawn-serial|spawn-lifecycle|pingpong|wake> [ops]
 
 Defaults: 102,400 ops for the spawn modes (400 batches of 256), 100,000
 for `pingpong` and `wake`; 5 timed repetitions after one unrecorded
-warmup pass (workload/10). Timing uses `CLOCK_UPTIME_RAW` directly, never
-through kernel code under test. Each mode prints per-rep totals and a
-`RESULT` line with median + min per-op nanoseconds (`wake` reports the
-per-rep median/min/p99/max and a `RESULT` with the median of rep medians,
-the global min, and the p99 range across reps, per the E9 wakeup
+warmup pass sized at workload/10 with a CLAMPED MINIMUM — at least 1,000
+ops for the spawn and pingpong modes and at least 100 messages for
+`wake` — so a small `[ops]` override still warms the pools/caches enough
+for the timed reps to measure the steady state instead of first-touch
+growth. Timing uses `CLOCK_UPTIME_RAW` directly, never through kernel
+code under test. Each mode prints per-rep totals and a `RESULT` line
+with median + min per-op nanoseconds (`wake` reports the per-rep
+median/min/p99/max and a `RESULT` with the median of rep medians, the
+global min, and the p99 range across reps, per the E9 wakeup
 convention).
+
+`pingpong` self-verifies instead of trusting its own label: every timed
+repetition must execute ≈ 2×rounds scheduler quanta (one per process per
+round trip, +1 entry quantum, small documented slack) and the whole mode
+must record zero futex parks — violations abort the run with a nonzero
+exit instead of printing a contaminated RTT.
 
 `wake` notes: the producer waits for the scheduler's park counter to
 advance, then settles 20 µs so the scheduler is inside (not merely

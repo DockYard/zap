@@ -167,6 +167,13 @@ pub const CrashReport = crash_report.CrashReport;
 pub const ReportHook = crash_report.ReportHook;
 
 test {
+    // FIRST on purpose: the expect-panic guard tests dispatch child
+    // processes through their own test bodies, and front-of-suite
+    // placement lets a guard child reach its scenario without re-running
+    // the rest of the kernel suite (`panic_guards.zig`, "Dispatch
+    // discipline" — placement is a speed optimization, not a correctness
+    // requirement).
+    _ = @import("panic_guards.zig");
     _ = stack_pool;
     _ = fiber_context;
     _ = process;

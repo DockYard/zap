@@ -125,7 +125,8 @@ test {
     //     `src/runtime/concurrency/introspection.zig`,
     //     `src/runtime/concurrency/crash_report.zig`,
     //     `src/runtime/concurrency/teardown_stress.zig`,
-    //     `src/runtime/concurrency/adversarial_stress.zig` — the
+    //     `src/runtime/concurrency/adversarial_stress.zig`,
+    //     `src/runtime/concurrency/panic_guards.zig` — the
     //     concurrency runtime kernel (P1-J1…J6), a self-contained tree
     //     with its own dedicated `zig build test-kernel` target (also
     //     wired into `zig build test`): it must run WITHOUT the compiler

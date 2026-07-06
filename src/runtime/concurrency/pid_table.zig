@@ -34,12 +34,13 @@
 //!
 //! Width rationale (the authoritative constants are `pid_bit_layout`):
 //!
-//! * **slot: 24 bits** — 16,777,216 concurrent processes: 64× BEAM's
-//!   default process table (`+P` 262,144) and comfortably "millions",
-//!   while keeping absolute-maximum table memory bounded (24 bytes/slot →
-//!   384 MiB at the 2^24 ceiling; 6 MiB at the BEAM-default capacity).
-//!   The slot field occupies the LOW bits so slot extraction on the send
-//!   hot path is a single mask, no shift.
+//! * **slot: 24 bits** — 16,777,215 concurrent processes (the all-ones
+//!   index is reserved as the free-list sentinel, `max_table_capacity`):
+//!   64× BEAM's default process table (`+P` 262,144) and comfortably
+//!   "millions", while keeping absolute-maximum table memory bounded
+//!   (24 bytes/slot → 384 MiB at the 2^24 ceiling; 6 MiB at the
+//!   BEAM-default capacity). The slot field occupies the LOW bits so slot
+//!   extraction on the send hot path is a single mask, no shift.
 //! * **generation: 30 bits** — 1,073,741,822 usable generations per slot
 //!   (generation 0 is reserved never-live, see `Pid.invalid`). ABA safety
 //!   does NOT rest on this width being "big enough": a slot whose
@@ -66,10 +67,12 @@
 //! takes NO global lock anywhere — not on `lookup`, not on `acquire`:
 //!
 //! * **Free list** — a Treiber stack of slot indices whose head packs
-//!   `{slot_index, aba_tag}` into one CAS-word; the tag increments on
-//!   every successful push AND pop, so the classic Treiber pop ABA
-//!   (head reused with a different next pointer) cannot commit. Safe for
-//!   concurrent acquire/release today.
+//!   `{slot_index: u24, aba_tag: u40}` into one CAS-word; the tag
+//!   increments on every successful push AND pop, so the classic Treiber
+//!   pop ABA (head reused with a different next pointer) can only commit
+//!   if the tag wraps a full 2^40 cycle inside one thread's load→CAS
+//!   window — see `FreeListHead` for the earned-guarantee arithmetic.
+//!   Safe for concurrent acquire/release today.
 //! * **Per-slot metadata** — `{generation, model, state}` packed into one
 //!   atomic u64. Publication ordering: `acquire` stores the PCB pointer
 //!   (`.release`) BEFORE publishing the occupied metadata (`.release`);
@@ -191,8 +194,17 @@ pub const pid_bit_layout = struct {
     /// Bit position of the node field (top byte).
     pub const node_shift = slot_bits + generation_bits + model_bits;
 
-    /// Maximum table capacity: slot indices must fit the slot field.
+    /// Size of the pid slot-index ADDRESS SPACE: slot indices must fit
+    /// the 24-bit slot field. Not every index is usable as a table slot —
+    /// see `max_table_capacity`.
     pub const max_slot_capacity = 1 << slot_bits;
+    /// Maximum table capacity: one index of the 24-bit slot space (the
+    /// all-ones `maxInt(u24)`) is reserved as the free-list "empty"
+    /// sentinel (`free_list_sentinel`), so it can never name a real slot.
+    /// Reserving an index keeps the free-list head packed as
+    /// `{slot_index: u24, aba_tag: u40}` — the widest ABA tag the
+    /// CAS word can carry (see `FreeListHead`).
+    pub const max_table_capacity = max_slot_capacity - 1;
     /// First generation ever issued for any slot. Generation 0 is
     /// reserved never-live so the all-zero bit pattern (`Pid.invalid`)
     /// can never name a live process.
@@ -264,7 +276,19 @@ comptime {
     std.debug.assert(pid_bit_layout.first_live_generation >= 1);
     std.debug.assert(Pid.invalid.toBits() == 0);
     std.debug.assert(@bitSizeOf(SlotMetadata) == 64);
+
+    // Free-list head layout: the slot-index field spans exactly the pid
+    // slot space (low bits), and every remaining bit of the CAS word is
+    // ABA tag — widening the tag any further would shrink the slot field.
     std.debug.assert(@bitSizeOf(FreeListHead) == 64);
+    std.debug.assert(@bitOffsetOf(FreeListHead, "slot_index") == 0);
+    std.debug.assert(@bitSizeOf(@FieldType(FreeListHead, "slot_index")) == pid_bit_layout.slot_bits);
+    std.debug.assert(@bitSizeOf(@FieldType(FreeListHead, "aba_tag")) == 64 - pid_bit_layout.slot_bits);
+    // The sentinel is the one reserved slot index: strictly above every
+    // index a table may use, still representable in the packed field.
+    std.debug.assert(free_list_sentinel == std.math.maxInt(u24));
+    std.debug.assert(free_list_sentinel == pid_bit_layout.max_table_capacity);
+    std.debug.assert(pid_bit_layout.max_table_capacity == pid_bit_layout.max_slot_capacity - 1);
 }
 
 /// Table-level lifecycle state of a slot (distinct from the PCB's
@@ -303,20 +327,42 @@ const Slot = struct {
     pcb: std.atomic.Value(?*process.ProcessControlBlock),
     /// Next slot index in the free list; meaningful only while the slot
     /// is inside the free list. Written before the push CAS (which
-    /// publishes it with `.release`).
+    /// publishes it with `.release`). Values are always in the u24 slot
+    /// space (or `free_list_sentinel`); the field is u32 only because
+    /// u24 is not an atomic operand size.
     next_free: std.atomic.Value(u32),
 };
 
 /// Free-list head: a Treiber-stack top packed with an ABA tag that
-/// increments on every successful push and pop, so a head CAS can never
-/// succeed against a stale `next_free` observation.
+/// increments on every successful push and pop.
+///
+/// The tag is the EARNED guarantee, not an absolute one: a head CAS
+/// commits against a stale `next_free` observation only if the tag wraps
+/// a full cycle — exactly 2^40 successful push/pop operations — between
+/// one thread's head load and its CAS. 2^40 = 1,099,511,627,776 ≈
+/// 1.1 × 10^12 operations; even at a pathological 10^9 free-list
+/// operations per second sustained by other threads, the stalled
+/// thread's load→CAS window would have to span ~18 minutes (2^40 / 10^9
+/// ≈ 1,100 s) for the wrap to line up, versus ~4.3 s for the u32 tag
+/// this replaced (2^32 ≈ 4.3 × 10^9). This hardening is probabilistic;
+/// the STRUCTURAL pid-identity guarantee (a `{slot, generation}` pair is
+/// never reissued) rests on generation retirement, not on this tag —
+/// see the module doc's generation-width rationale.
+///
+/// The slot-index field is u24 (the pid slot space, giving the tag every
+/// remaining bit of the CAS word), which is why one 24-bit index —
+/// `free_list_sentinel` — is reserved and `max_table_capacity` is one
+/// below the 2^24 address space.
 const FreeListHead = packed struct(u64) {
-    slot_index: u32,
-    aba_tag: u32,
+    slot_index: u24,
+    aba_tag: u40,
 };
 
-/// "Empty free list" marker for `FreeListHead.slot_index`/`next_free`.
-const free_list_sentinel: u32 = std.math.maxInt(u32);
+/// "Empty free list" marker for `FreeListHead.slot_index` and the
+/// per-slot `next_free` links (which store u24-range values widened to
+/// u32 — u24 is not an atomic operand size). Reserved: no table slot
+/// ever carries this index (`pid_bit_layout.max_table_capacity`).
+const free_list_sentinel: u24 = std.math.maxInt(u24);
 
 /// Why a pid failed to resolve. Passed to the dead-letter hook so the
 /// message system (P1-J3+) can distinguish stale senders from forged or
@@ -364,7 +410,8 @@ pub const DeadLetterHook = *const fn (
 /// program manifest when the language surface lands (Phase 2).
 pub const Config = struct {
     /// Number of slots (= maximum concurrent processes). Must be in
-    /// `[1, pid_bit_layout.max_slot_capacity]`.
+    /// `[1, pid_bit_layout.max_table_capacity]` (one 24-bit index is
+    /// reserved as the free-list sentinel — see `pid_bit_layout`).
     capacity: u32 = default_capacity,
 };
 
@@ -464,7 +511,7 @@ pub const PidTable = struct {
     /// Errors from `init`.
     pub const InitError = error{
         /// `Config.capacity` is 0 or exceeds
-        /// `pid_bit_layout.max_slot_capacity`.
+        /// `pid_bit_layout.max_table_capacity`.
         InvalidCapacity,
         /// Slot-storage allocation failed.
         OutOfMemory,
@@ -482,7 +529,7 @@ pub const PidTable = struct {
     /// threaded in ascending slot order (so single-threaded acquisition
     /// is deterministic: slot 0 first).
     pub fn init(allocator: std.mem.Allocator, config: Config) InitError!PidTable {
-        if (config.capacity == 0 or config.capacity > pid_bit_layout.max_slot_capacity) {
+        if (config.capacity == 0 or config.capacity > pid_bit_layout.max_table_capacity) {
             return error.InvalidCapacity;
         }
 
@@ -536,9 +583,16 @@ pub const PidTable = struct {
         // The free-list pop granted exclusive ownership of this slot, so
         // the metadata read cannot race a writer (`.monotonic` suffices;
         // the pop CAS's acquire ordering made the releasing store
-        // visible).
+        // visible). A popped slot that is not `.free` means the free
+        // list and the slot metadata disagree — free-list corruption —
+        // and must fail loudly in every build mode (the same posture as
+        // `release`'s validating-CAS panic) rather than resurrect a
+        // live or retired slot.
         const current: SlotMetadata = @bitCast(slot.metadata.load(.monotonic));
-        std.debug.assert(current.state == .free);
+        if (current.state != .free) {
+            @branchHint(.cold);
+            @panic("PidTable.acquire: popped slot is not free (free-list corruption) — kernel bug");
+        }
 
         // Publication order (module doc "Concurrency posture"): PCB
         // pointer first with `.release` (so a seqlock reader that
@@ -653,12 +707,13 @@ pub const PidTable = struct {
     }
 
     /// Pop a slot index off the Treiber free list, or null when empty.
-    /// Lock-free: the head CAS carries an ABA tag bumped on every
-    /// successful push/pop, so a stale `next_free` observation can never
-    /// commit (the tag would have moved). The head load and CAS-failure
-    /// reload use `.acquire` to pair with the push CAS's `.release`,
-    /// which is what publishes both the popped slot's `next_free` and
-    /// its released metadata to this thread.
+    /// Lock-free: the head CAS carries the u40 ABA tag bumped on every
+    /// successful push/pop, so a stale `next_free` observation commits
+    /// only across an exact 2^40-operation tag wrap inside this thread's
+    /// load→CAS window (`FreeListHead` states the arithmetic). The head
+    /// load and CAS-failure reload use `.acquire` to pair with the push
+    /// CAS's `.release`, which is what publishes both the popped slot's
+    /// `next_free` and its released metadata to this thread.
     fn popFreeSlot(table: *PidTable) ?u32 {
         var observed_head = table.free_list_head.load(.acquire);
         while (true) {
@@ -667,8 +722,10 @@ pub const PidTable = struct {
 
             // Safe even though this thread does not own the slot yet: if
             // another thread pops/pushes it concurrently, the head tag
-            // moves and the CAS below fails.
-            const next_index = table.slots[head.slot_index].next_free.load(.monotonic);
+            // moves and the CAS below fails. `next_free` only ever holds
+            // u24-range values (slot indices or the sentinel), so the
+            // narrowing is lossless.
+            const next_index: u24 = @intCast(table.slots[head.slot_index].next_free.load(.monotonic));
             const successor = FreeListHead{
                 .slot_index = next_index,
                 .aba_tag = head.aba_tag +% 1,
@@ -686,7 +743,7 @@ pub const PidTable = struct {
     /// CAS's `.release` publishes both the slot's `next_free` link and —
     /// via the caller's preceding metadata store — the slot's freed
     /// state to the next popper (see `popFreeSlot`).
-    fn pushFreeSlot(table: *PidTable, slot_index: u32) void {
+    fn pushFreeSlot(table: *PidTable, slot_index: u24) void {
         var observed_head = table.free_list_head.load(.monotonic);
         while (true) {
             const head: FreeListHead = @bitCast(observed_head);
@@ -822,9 +879,15 @@ test "Pid: invalid pid is the all-zero bit pattern and generation zero is never 
 
 test "PidTable: init validates capacity bounds" {
     try testing.expectError(error.InvalidCapacity, PidTable.init(testing.allocator, .{ .capacity = 0 }));
+    // The full 2^24 slot address space is NOT a legal capacity: the
+    // all-ones index is the reserved free-list sentinel.
     try testing.expectError(
         error.InvalidCapacity,
-        PidTable.init(testing.allocator, .{ .capacity = pid_bit_layout.max_slot_capacity + 1 }),
+        PidTable.init(testing.allocator, .{ .capacity = pid_bit_layout.max_slot_capacity }),
+    );
+    try testing.expectError(
+        error.InvalidCapacity,
+        PidTable.init(testing.allocator, .{ .capacity = pid_bit_layout.max_table_capacity + 1 }),
     );
 }
 
@@ -1001,6 +1064,10 @@ test "PidTable: generation exhaustion retires the slot instead of wrapping" {
     var table = try PidTable.init(testing.allocator, .{ .capacity = 1 });
     defer table.deinit();
 
+    var probe = DeadLetterProbe{};
+    table.dead_letter_hook = DeadLetterProbe.hook;
+    table.dead_letter_context = &probe;
+
     // White-box: fast-forward the (free) slot to its final generation —
     // equivalent to max_generation-1 acquire/release cycles.
     table.slots[0].metadata.store(@bitCast(SlotMetadata{
@@ -1020,8 +1087,15 @@ test "PidTable: generation exhaustion retires the slot instead of wrapping" {
     try testing.expectEqual(@as(u32, 0), table.statistics().live_process_count);
     try testing.expectError(error.ProcessTableExhausted, table.acquire(&pcb, .refcounted));
 
-    // The retired-generation pid stays dead.
+    // The retired-generation pid stays dead, and it dead-letters with
+    // the RETIRED-slot reason: the slot keeps its final generation
+    // forever, so the pid's generation still MATCHES and the miss is
+    // classified `slot_not_occupied` (the `DeadLetterReason` doc's
+    // retired-final-generation case), never `generation_mismatch`.
     try testing.expectEqual(@as(?*process.ProcessControlBlock, null), table.lookup(final_generation_pid));
+    try testing.expectEqual(@as(usize, 1), probe.call_count);
+    try testing.expectEqual(final_generation_pid.toBits(), probe.observed_pid_bits);
+    try testing.expectEqual(DeadLetterReason.slot_not_occupied, probe.observed_reason.?);
 }
 
 test "PidTable: iterator yields exactly the live set and skips released slots" {

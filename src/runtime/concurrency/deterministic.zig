@@ -317,7 +317,10 @@ pub const Harness = struct {
 
 /// Arena-backed per-process manager for harness scenarios: `teardown` is
 /// the wholesale free-on-exit shape (plan 1.4), counted so exactly-once
-/// teardown is verifiable.
+/// teardown is verifiable. Deliberately NOT `test_support.zig`'s shared
+/// `CountingArenaManager`: the harness is a pub, non-test-scoped kernel
+/// component (the Phase 2.7 Zest wrappers layer on it), and test_support
+/// must stay out of non-test namespaces by its own contract.
 const HarnessProcessManager = struct {
     arena: std.heap.ArenaAllocator,
     live_heap_bytes: usize = 0,
@@ -350,10 +353,14 @@ const HarnessProcessManager = struct {
     fn teardownThunk(manager_state: ?*anyopaque) void {
         const manager: *HarnessProcessManager = @ptrCast(@alignCast(manager_state.?));
         manager.teardown_count += 1;
+        // Capture the child allocator BEFORE deinit — reading through
+        // the arena after `deinit` is use-after-deinit (the pattern of
+        // `test_support.CountingArenaManager.teardownThunk`).
+        const backing_allocator = manager.arena.child_allocator;
         manager.arena.deinit();
         // Leave the arena in a deinit-safe state (destroy() only asserts
         // and frees the struct; a double teardown is caught by the count).
-        manager.arena = std.heap.ArenaAllocator.init(manager.arena.child_allocator);
+        manager.arena = std.heap.ArenaAllocator.init(backing_allocator);
         manager.live_heap_bytes = 0;
     }
 
@@ -657,6 +664,178 @@ test "Deterministic: 50-seed sweep of a race-prone scenario holds every invarian
     try runSeedSweep(testing.allocator, 0xBA5E, 50, sweepScenario, &state, .{
         .verify_after_run = sweepVerify,
     });
+}
+
+// -- seeded kill + crash-report capture (the J5 determinism coverage gap) -----------
+
+const crash_report_module = @import("crash_report.zig");
+
+/// Envelopes queued in the spinning victim's mailbox at its kill.
+const kill_report_leftover_count = 3;
+
+/// Copying crash-report sink for the seeded kill scenario (the seam
+/// contract — reports are borrowed for the hook call only).
+const KillReportLog = struct {
+    reports: [8]crash_report_module.CrashReport = undefined,
+    count: usize = 0,
+
+    fn hook(report_context: ?*anyopaque, report: *const crash_report_module.CrashReport) void {
+        const log: *KillReportLog = @ptrCast(@alignCast(report_context.?));
+        if (log.count == log.reports.len) @panic("KillReportLog overflow");
+        log.reports[log.count] = report.*;
+        log.count += 1;
+    }
+
+    fn byPidBits(log: *const KillReportLog, pid_bits: u64) ?*const crash_report_module.CrashReport {
+        for (log.reports[0..log.count]) |*report| {
+            if (report.pid_bits == pid_bits) return report;
+        }
+        return null;
+    }
+};
+
+const KillReportScenarioState = struct {
+    report_log: KillReportLog = .{},
+    waiting_victim_pid: Pid = Pid.invalid,
+    spinning_victim_pid: Pid = Pid.invalid,
+    /// Scheduler-thread-only run beacons: once the killer observes them
+    /// nonzero, each victim has provably completed the quantum that
+    /// parked it (waiting victim) or proved it ran (spinning victim), so
+    /// the kill outcomes and report contents below are seed-invariant.
+    waiting_victim_started: usize = 0,
+    spinning_victim_started: usize = 0,
+    waiting_kill_outcome: scheduler_module.KillOutcome = .not_found,
+    spinning_kill_outcome: scheduler_module.KillOutcome = .not_found,
+};
+
+fn killReportWaitingVictimEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const state: *KillReportScenarioState = @ptrCast(@alignCast(argument.?));
+    state.waiting_victim_started += 1;
+    _ = context.receive();
+    @panic("the waiting victim must be killed while suspended, never resumed");
+}
+
+fn killReportSpinningVictimEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const state: *KillReportScenarioState = @ptrCast(@alignCast(argument.?));
+    state.spinning_victim_started += 1;
+    // Never receives: queued envelopes stay queued for the teardown
+    // drain, and the pending kill is consumed at a scheduling point.
+    while (true) {
+        context.yieldCheck();
+        context.yieldNow();
+    }
+}
+
+fn killReportKillerEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const state: *KillReportScenarioState = @ptrCast(@alignCast(argument.?));
+    // Wait until both victims provably ran (single-threaded: an observed
+    // beacon means the victim's quantum completed, so the waiting victim
+    // is `.waiting` and the spinning victim is `.runnable`).
+    while (state.waiting_victim_started == 0 or state.spinning_victim_started == 0) {
+        context.yieldNow();
+    }
+    // Queue exactly `kill_report_leftover_count` envelopes the spinning
+    // victim will never receive — the report must count them at death.
+    var sequence: usize = 0;
+    while (sequence < kill_report_leftover_count) : (sequence += 1) {
+        const outcome = context.send(state.spinning_victim_pid, .{ .payload_byte_length = sequence }) catch
+            @panic("kill-report killer: envelope allocation failed");
+        if (outcome != .delivered) @panic("kill-report killer: send dead-lettered");
+    }
+    state.spinning_kill_outcome = context.kill(state.spinning_victim_pid);
+    state.waiting_kill_outcome = context.kill(state.waiting_victim_pid);
+}
+
+fn killReportScenario(harness: *Harness, scenario_context: ?*anyopaque) anyerror!void {
+    const state: *KillReportScenarioState = @ptrCast(@alignCast(scenario_context.?));
+    state.* = .{};
+    // Install the crash-report sink on this seed's fresh scheduler. The
+    // hook context lives in the scenario state, which outlives the run.
+    harness.scheduler.options.crash_report_hook = KillReportLog.hook;
+    harness.scheduler.options.crash_report_context = &state.report_log;
+    state.waiting_victim_pid = try harness.spawnProcess(killReportWaitingVictimEntry, state);
+    state.spinning_victim_pid = try harness.spawnProcess(killReportSpinningVictimEntry, state);
+    _ = try harness.spawnProcess(killReportKillerEntry, state);
+}
+
+fn killReportVerify(harness: *Harness, scenario_context: ?*anyopaque) anyerror!void {
+    const state: *KillReportScenarioState = @ptrCast(@alignCast(scenario_context.?));
+
+    // Kill outcomes are seed-invariant by the beacon discipline above.
+    if (state.waiting_kill_outcome != .killed) return error.WaitingKillOutcomeWrong;
+    if (state.spinning_kill_outcome != .kill_pending) return error.SpinningKillOutcomeWrong;
+
+    // Exactly three teardown reports: two kills plus the killer's exit.
+    if (state.report_log.count != 3) return error.ReportCountWrong;
+
+    // The waiting victim died suspended at its receive: killed, empty
+    // mailbox, and a real suspend-point trace.
+    const waiting_report = state.report_log.byPidBits(state.waiting_victim_pid.toBits()) orelse
+        return error.WaitingReportMissing;
+    if (waiting_report.reason != .killed) return error.WaitingReasonWrong;
+    if (waiting_report.state_at_death != .waiting) return error.WaitingStateWrong;
+    if (waiting_report.mailbox_depth_at_death != 0) return error.WaitingDepthWrong;
+    if (waiting_report.trace_status != .captured) return error.WaitingTraceStatusWrong;
+    if (waiting_report.trace_truncated) return error.WaitingTraceTruncated;
+    if (waiting_report.trace().len < 2) return error.WaitingTraceTooShallow;
+    if (waiting_report.suspend_program_counter == 0) return error.WaitingSuspendPcMissing;
+
+    // The spinning victim was killed while queued: torn down at its
+    // dequeue with exactly the leftover envelopes still counted.
+    const spinning_report = state.report_log.byPidBits(state.spinning_victim_pid.toBits()) orelse
+        return error.SpinningReportMissing;
+    if (spinning_report.reason != .killed) return error.SpinningReasonWrong;
+    if (spinning_report.state_at_death != .runnable) return error.SpinningStateWrong;
+    if (spinning_report.mailbox_depth_at_death != kill_report_leftover_count) {
+        return error.SpinningDepthWrong;
+    }
+    if (spinning_report.trace_status != .captured) return error.SpinningTraceStatusWrong;
+    if (spinning_report.trace_truncated) return error.SpinningTraceTruncated;
+
+    // The scheduler's trace saw exactly the two kills.
+    var kill_event_count: usize = 0;
+    for (harness.trace()) |event| {
+        if (event.kind == .kill) kill_event_count += 1;
+    }
+    if (kill_event_count != 2) return error.KillEventCountWrong;
+}
+
+test "Deterministic: seeded kill + crash-report capture holds across a seed sweep" {
+    var state = KillReportScenarioState{};
+    try runSeedSweep(testing.allocator, 0xC0DE, 40, killReportScenario, &state, .{
+        .verify_after_run = killReportVerify,
+    });
+}
+
+test "Deterministic: same seed twice reproduces the kill + crash-report run byte-identically" {
+    var first_state = KillReportScenarioState{};
+    const first_trace = try runScenario(testing.allocator, 0xDEAD5EED, killReportScenario, &first_state, .{
+        .verify_after_run = killReportVerify,
+    });
+    defer testing.allocator.free(first_trace);
+
+    var second_state = KillReportScenarioState{};
+    const second_trace = try runScenario(testing.allocator, 0xDEAD5EED, killReportScenario, &second_state, .{
+        .verify_after_run = killReportVerify,
+    });
+    defer testing.allocator.free(second_trace);
+
+    // Byte-identical scheduling (spawn/kill/exit order included) and
+    // identical deterministic report fields: the reports were captured
+    // deterministically, not merely captured.
+    try testing.expect(tracesIdentical(first_trace, second_trace));
+    try testing.expectEqual(first_state.report_log.count, second_state.report_log.count);
+    for (
+        first_state.report_log.reports[0..first_state.report_log.count],
+        second_state.report_log.reports[0..second_state.report_log.count],
+    ) |*first_report, *second_report| {
+        try testing.expectEqual(first_report.pid_bits, second_report.pid_bits);
+        try testing.expectEqual(first_report.reason, second_report.reason);
+        try testing.expectEqual(first_report.state_at_death, second_report.state_at_death);
+        try testing.expectEqual(first_report.mailbox_depth_at_death, second_report.mailbox_depth_at_death);
+        try testing.expectEqual(first_report.trace_status, second_report.trace_status);
+        try testing.expectEqual(first_report.return_address_count, second_report.return_address_count);
+    }
 }
 
 // -- deterministic idle = deadlock error, cleaned up by the harness -----------------
