@@ -319,6 +319,32 @@ label on these backends. The † medians are from the 2 completed full runs
 (19,840.3/19,624.7 and 19,851.7/19,727.2 — <0.1% apart). The
 `Io.Evented.deinit` compile error (crash 3) is unchanged.
 
+**Triaged 2026-07-05 (job G2) — classification: Dispatch-specific
+fiber-lifetime race in `lib/std/Io/Dispatch.zig`; not the shared
+`Io/fiber.zig` context-switch machinery; not libdispatch.** Six lldb crash
+captures out of 7 ReleaseFast attempts (fork @ `6a425dbaeb`, full raw
+captures in `spike/concurrency-e1/triage/`), all on GCD worker threads in
+fiber context switches consuming freed/recycled fiber memory: (i) read
+fault on unmapped fiber-allocation memory inside `Io.fiber.contextSwitch`;
+(ii) wild jump to `pc=0` with all callee-saved registers zeroed (resumed
+into a munmapped-then-re-mmapped, zero-filled fiber region); (iii) execute
+fault jumping to per-worker `Thread.main_context`-consistent wq-stack
+addresses. Register-level smoking gun (cap-06): the awaiter thread is
+inside `Dispatch.await` → `Fiber.destroy(fiber=0x104a84000)` → `munmap`
+at the very instant the crashing worker holds x21 = `0x104a84000`.
+Mechanism candidate: `AsyncClosure.call` publishes `Fiber.finished` and
+only *then* leaves the fiber's stack via `yield(.nothing)`, while `await`'s
+fast path destroys the 60 MB allocation immediately on seeing `finished` —
+predicting exactly the observed distribution (serial await races the
+just-finishing task every op and crashes; windowed `spawn` with await
+distance 64 and `pingpong` with zero per-op fiber churn ran crash-free as
+same-binary controls, pingpong pushing millions of switches through the
+same shared asm). ReleaseSafe: 4/4 attempts passed with no safety panic
+(perturbs the race, classifies nothing). libdispatch frames were parked/idle
+in every capture. Not a Phase 1 blocker — the bespoke scheduler owns its
+own fiber lifecycle; see implementation-plan Appendix A.4.4 and
+`spike/concurrency-e1/triage/README.md`.
+
 **Does this change the E1 verdict?** One sub-verdict changes materially;
 the overall verdict does not.
 

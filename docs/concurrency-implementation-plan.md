@@ -498,7 +498,22 @@ Each is a design commitment, not a suggestion; each cites its evidence.
    measured when the Phase 4 poller lands.
 3. **Stack-pool sizing/watermark policy and its interaction with Darwin teardown** — decided
    empirically by Phase 1.7's spawn/die-cycle test.
-4. **Root cause of the residual Dispatch `spawn-serial` race** — fork-hygiene track;
-   irrelevant to the bespoke scheduler but wanted for the fork's own I/O story.
+4. **Root cause of the residual Dispatch `spawn-serial` race** — fork-hygiene track.
+   **Triaged (job G2, 2026-07-05): classified Dispatch-specific**, evidence in
+   `spike/concurrency-e1/triage/` (6 lldb crash captures) and the E1 †-note in
+   `docs/concurrency-bench-results.md`. The fault is a fiber-lifetime race in
+   `lib/std/Io/Dispatch.zig` — `await`'s fast path `Fiber.destroy`s the fiber
+   allocation upon seeing `Fiber.finished` while the finishing task is still on
+   that fiber's stack in `yield(.nothing)` (cap-06 caught the awaiter mid-`munmap`
+   of the exact fiber address held by the crashing worker) — **not** the shared
+   `Io/fiber.zig` context-switch machinery (same-binary pingpong controls pushed
+   millions of switches through the same asm crash-free; every fault consumed
+   freed/recycled Dispatch-owned memory) and not libdispatch (its frames were
+   parked/idle in every capture). **Not a Phase 1 entry blocker.** Phase 1 must
+   carry the design invariant this bug violates: a finished fiber's stack may not
+   be freed or recycled until the finishing fiber has provably left it —
+   completion publication happens off-stack, or destruction defers through the
+   scheduler. The Dispatch-side fix itself stays on the fork-hygiene track for
+   the fork's own I/O story.
 5. **Windows budget/watchdog semantics on the 1:1 Threaded fallback** — documented capability
    difference, scoped in Phase 7.2.

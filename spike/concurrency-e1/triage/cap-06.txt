@@ -1,0 +1,117 @@
+(lldb) target create "./bench-fast"
+Current executable set to '/private/tmp/claude-501/-Users-bcardarella-projects-zap/76dc8e8d-325d-407c-9a69-5b4a278ab765/scratchpad/e1-triage/bench-fast' (arm64).
+(lldb) settings set -- target.run-args  "evented" "spawn-serial" "100000" "5" "1"
+(lldb) run
+backend=evented bench=spawn-serial ops=100000 reps=5 window=64
+Process 21154 launched: '/private/tmp/claude-501/-Users-bcardarella-projects-zap/76dc8e8d-325d-407c-9a69-5b4a278ab765/scratchpad/e1-triage/bench-fast' (arm64)
+Process 21154 stopped
+* thread #2, queue = 'org.ziglang.std.Io.Dispatch', stop reason = EXC_BAD_ACCESS (code=2, address=0x16ff13180)
+    frame #0: 0x000000016ff13180 
+->  0x16ff13180: <unknown> 
+    0x16ff13184: udf    #0x1
+    0x16ff13188: <unknown> 
+    0x16ff1318c: udf    #0x1
+Target 0: (bench-fast) stopped.
+(lldb) thread info
+thread #2: tid = 0x1dcde3c, 0x000000016ff13180, queue = 'org.ziglang.std.Io.Dispatch', stop reason = EXC_BAD_ACCESS (code=2, address=0x16ff13180)
+
+(lldb) bt all
+  thread #1, queue = 'com.apple.main-thread'
+    frame #0: 0x0000000187adebb0 libsystem_kernel.dylib`semaphore_wait_trap + 8
+    frame #1: 0x0000000187966990 libdispatch.dylib`_dispatch_sema4_wait + 28
+    frame #2: 0x0000000187966f40 libdispatch.dylib`_dispatch_semaphore_wait_slow + 132
+    frame #3: 0x0000000100001c30 bench-fast`Io.Dispatch.mainLoop(ev=0x000000016fdfb910, message=<unavailable>) at Dispatch.zig:622:34 [opt]
+* thread #2, queue = 'org.ziglang.std.Io.Dispatch', stop reason = EXC_BAD_ACCESS (code=2, address=0x16ff13180)
+  * frame #0: 0x000000016ff13180 
+  thread #3, queue = 'org.ziglang.std.Io.Dispatch'
+    frame #0: 0x0000000187ae2714 libsystem_kernel.dylib`__munmap + 8
+    frame #1: 0x0000000100051160 bench-fast`posix.munmap at posix.zig:685:32 [opt] [inlined]
+    frame #2: 0x000000010005115c bench-fast`heap.PageAllocator.unmap at PageAllocator.zig:194:21 [opt]
+    frame #3: 0x0000000100047198 bench-fast`mem.Allocator.rawFree at Allocator.zig:160:25 [opt]
+    frame #4: 0x0000000100047178 bench-fast`mem.Allocator.free__anon_10182 at Allocator.zig:449:17 [opt] [inlined]
+    frame #5: 0x0000000100047174 bench-fast`Io.Dispatch.Fiber.destroy(fiber=0x0000000104a84000, ev=<unavailable>) at Dispatch.zig:214:28 [opt] [inlined]
+    frame #6: 0x000000010004715c bench-fast`Io.Dispatch.await(userdata=<unavailable>, future=<unavailable>, result_alignment=<unavailable>) at Dispatch.zig:1114:21 [opt]
+    frame #7: 0x000000010004f4d4 bench-fast`Io.Future(f=0x000000016fdfb0a0).await at Io.zig:1201:28 [opt] [inlined]
+    frame #8: 0x000000010004f4b8 bench-fast`bench.benchSpawnSerial(spawn_count=<unavailable>) at bench.zig:93:34 [opt]
+    frame #9: 0x000000010004f430 bench-fast`bench.runBenchmark(io=<unavailable>, benchmark=<unavailable>, op_count=<unavailable>) at bench.zig:183:45 [opt]
+    frame #10: 0x0000000100047ed8 bench-fast`bench.runRepetitions(io=<unavailable>, backend=<unavailable>, benchmark=spawn-serial, op_count=<unavailable>, repetitions=<unavailable>, warmup_override=<unavailable>) at bench.zig:210:36 [opt]
+    frame #11: 0x0000000100000db8 bench-fast`bench.main(init=<unavailable>) at bench.zig:286:27 [opt]
+    frame #12: 0x0000000100000ba8 bench-fast`start.callMain at start.zig:699:88 [opt] [inlined]
+    frame #13: 0x0000000100000ba8 bench-fast`start.callMainWithArgs at start.zig:638:20 [opt]
+    frame #14: 0x0000000100000ba8 bench-fast`start.main(c_argc=<unavailable>, c_argv=<unavailable>, c_envp=<unavailable>) at start.zig:663:28 [opt]
+    frame #15: 0x0000000187759d54 dyld`start + 7184
+  thread #4
+    frame #0: 0x0000000187b1cb94 libsystem_pthread.dylib`start_wqthread
+(lldb) register read
+General Purpose Registers:
+        x0 = 0x0000000000000000
+        x1 = 0x0000000000000000
+        x2 = 0x0000000000000001
+        x3 = 0x00000000000010ff
+        x4 = 0x00000001f4a46ad0  (void *)0x0000000187972d74: _dispatch_root_queue_push
+        x5 = 0x0000000100001cb8  bench-fast`Io.Dispatch.Fiber.resume + 124 [inlined] Io.fiber.contextSwitch + 40 at fiber.zig:30:20
+  bench-fast`Io.Dispatch.Fiber.resume + 84 [inlined] Io.Dispatch.contextSwitch at Dispatch.zig:714:62
+  bench-fast`Io.Dispatch.Fiber.resume + 84 at Dispatch.zig:288:22
+        x6 = 0x0000000000000000
+        x7 = 0x0000000000000000
+        x8 = 0x00000001879776d0  libdispatch.dylib`_dispatch_worker_thread2
+        x9 = 0x0000000000000100
+       x10 = 0x0000000000000001
+       x11 = 0x00000001f4a47cb0  _dispatch_root_queues + 1648
+       x12 = 0x000000010068dec8
+       x13 = 0x0000081000000000
+       x14 = 0x0000000000000000
+       x15 = 0x0000000000000000
+       x16 = 0x0000000000000170
+       x17 = 0x00000001f6000a68
+       x18 = 0x0000000000000000
+       x19 = 0x0000000000000001
+       x20 = 0x00000001f4a47c40  _dispatch_root_queues + 1536
+       x21 = 0x0000000104a84000
+       x22 = 0x0000000000000000
+       x23 = 0x0000000000000000
+       x24 = 0x0000000000000000
+       x25 = 0x000000016fe870e0
+       x26 = 0x00000001f4a47ac0  _dispatch_root_queues + 1152
+       x27 = 0x000000016fe87180
+       x28 = 0x00000000000005ff
+        fp = 0x00000000000005ff
+        lr = 0x000000016ff13180
+        sp = 0x0000000108687b50
+        pc = 0x000000016ff13180
+      cpsr = 0x00000000
+
+(lldb) disassemble --pc --count 32
+->  0x16ff13180: <unknown> 
+    0x16ff13184: udf    #0x1
+    0x16ff13188: <unknown> 
+    0x16ff1318c: udf    #0x1
+    0x16ff13190: <unknown> 
+    0x16ff13194: udf    #0x1
+    0x16ff13198: udf    #0x0
+    0x16ff1319c: udf    #0x0
+    0x16ff131a0: udf    #0x0
+    0x16ff131a4: udf    #0x0
+    0x16ff131a8: mla    z0.b, p0/m, z0.b, z0.b
+    0x16ff131ac: udf    #0x0
+    0x16ff131b0: udf    #0x0
+    0x16ff131b4: udf    #0x0
+    0x16ff131b8: <unknown> 
+    0x16ff131bc: <unknown> 
+    0x16ff131c0: udf    #0x0
+    0x16ff131c4: udf    #0x0
+    0x16ff131c8: udf    #0x0
+    0x16ff131cc: udf    #0x0
+    0x16ff131d0: udf    #0x0
+    0x16ff131d4: udf    #0x0
+    0x16ff131d8: udf    #0x0
+    0x16ff131dc: udf    #0x0
+    0x16ff131e0: udf    #0x0
+    0x16ff131e4: udf    #0x0
+    0x16ff131e8: udf    #0x0
+    0x16ff131ec: udf    #0x0
+    0x16ff131f0: udf    #0x0
+    0x16ff131f4: udf    #0x0
+    0x16ff131f8: udf    #0x0
+    0x16ff131fc: udf    #0x0
+(lldb) image lookup --address $pc
