@@ -147,6 +147,15 @@ fn resolveDefaultForkFn() ?ForkCompileFn {
     return default_fork_fn_or_null;
 }
 
+/// Public accessor for the linked-in fork-compile primitive so sibling
+/// build drivers (`src/concurrency_driver.zig`) share the SAME single
+/// extern reference point instead of redeclaring the C-ABI symbol in a
+/// second compilation unit. Returns `null` in test builds, exactly like
+/// the private resolver.
+pub fn defaultForkCompileFn() ?ForkCompileFn {
+    return resolveDefaultForkFn();
+}
+
 // ---------------------------------------------------------------------------
 // Driver types
 // ---------------------------------------------------------------------------
@@ -1268,8 +1277,10 @@ fn makeSafeFileName(allocator: std.mem.Allocator, manager_name: []const u8) ![]c
 /// segments fails to resolve to a known `std.Target.*` enum value.
 /// Tag-validity is enforced here; whether the resulting triple is in
 /// the v1.0 supported whitelist is decided downstream by the fork
-/// primitive's `isSupportedTriple`.
-fn parseTargetTriple(triple: []const u8) ?ZapForkTarget {
+/// primitive's `isSupportedTriple`. Public so sibling build drivers
+/// (`src/concurrency_driver.zig`) resolve triples through the single
+/// canonical parser.
+pub fn parseTargetTriple(triple: []const u8) ?ZapForkTarget {
     var iter = std.mem.tokenizeAny(u8, triple, "-");
     const arch_str = iter.next() orelse return null;
     const os_str = iter.next() orelse return null;
@@ -1634,23 +1645,31 @@ pub fn assertExportsManagerSymbolForTest(
     return assertExportsManagerSymbol(manager_name, object_bytes, diag);
 }
 
-const SymbolCheckError = error{
+pub const SymbolCheckError = error{
     UnsupportedFormat,
     InvalidObject,
 };
 
-/// Walk the object's symbol table and return `true` iff
-/// `zap_memory_section` is present. Supports ELF64, Mach-O 64-bit, COFF,
-/// and WebAssembly — the same formats `section_parser.extractSection`
-/// handles.
-fn managerSymbolPresent(bytes: []const u8) SymbolCheckError!bool {
+/// Walk `bytes`' symbol table and return `true` iff `symbol_name` is
+/// present. Supports ELF64, Mach-O 64-bit, COFF, and WebAssembly — the
+/// same formats `section_parser.extractSection` handles. Public so
+/// sibling build drivers (`src/concurrency_driver.zig`, which asserts
+/// the kernel object exports its `zap_proc_*` intrinsics) reuse the one
+/// audited per-format walker set instead of growing a second parser.
+pub fn objectExportsSymbol(bytes: []const u8, symbol_name: []const u8) SymbolCheckError!bool {
     return switch (section_parser.detectFormat(bytes)) {
-        .elf => elfSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
-        .macho => machoSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
-        .coff => coffSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
-        .wasm => wasmSymbolPresent(bytes, MANAGER_SYMBOL_NAME),
+        .elf => elfSymbolPresent(bytes, symbol_name),
+        .macho => machoSymbolPresent(bytes, symbol_name),
+        .coff => coffSymbolPresent(bytes, symbol_name),
+        .wasm => wasmSymbolPresent(bytes, symbol_name),
         .unknown => SymbolCheckError.InvalidObject,
     };
+}
+
+/// Walk the object's symbol table and return `true` iff
+/// `zap_memory_section` is present.
+fn managerSymbolPresent(bytes: []const u8) SymbolCheckError!bool {
+    return objectExportsSymbol(bytes, MANAGER_SYMBOL_NAME);
 }
 
 /// Read an unsigned LEB128 integer from `bytes` at `cursor.*`, advancing

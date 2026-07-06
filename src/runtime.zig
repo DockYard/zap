@@ -3416,6 +3416,15 @@ pub fn memoryStartupForEntry() void {
     // async-signal-safe.
     installZapCrashHandlers();
     zapMemoryStartup();
+    // P2-J1: the concurrency runtime initializes AFTER the memory manager
+    // (its atexit shutdown therefore fires BEFORE the manager's — LIFO —
+    // so every process is torn down while the manager is still live).
+    // Comptime-gated: with the gate OFF (the source default) this branch
+    // is eliminated, `concurrencyStartupForEntry` is never analyzed, and
+    // no `zap_proc_*` extern is referenced anywhere in the binary.
+    if (comptime runtime_concurrency_active) {
+        concurrencyStartupForEntry();
+    }
 }
 
 /// Atexit ordering contract for memory shutdown
@@ -3473,6 +3482,180 @@ fn zapMemoryShutdown() void {
     // their last-known values. The dispatchers detect post-shutdown
     // dispatch via `active_manager_state.shutdown_complete` instead.
     active_manager_state.shutdown_complete = true;
+}
+
+// ============================================================
+// Concurrency runtime gate + bootstrap (P2-J1)
+//
+// The comptime `runtime_concurrency` gate over the concurrency kernel
+// (`src/runtime/concurrency/`). The compiler rewrite
+// (`compiler.zig`, rewrite stage 7) flips the marker to `true` only for
+// builds that resolved `runtime_concurrency` ON (manifest field or
+// `-Druntime-concurrency=on`); those builds ALSO link the per-target
+// kernel object compiled by `src/concurrency_driver.zig`, which is what
+// resolves the `zap_proc_*` externs below. With the gate OFF — the
+// source default, observed by host tests and every non-concurrent user
+// binary — nothing in this section is analyzed or referenced: no
+// bootstrap call, no extern symbol, no kernel object (the plan §3
+// zero-cost guarantee).
+// ============================================================
+
+const RUNTIME_CONCURRENCY_DEFAULT: bool = false;
+
+/// Whether this binary carries the concurrency runtime. Comptime; the
+/// single source every gated declaration in this file branches on.
+pub const runtime_concurrency_active: bool = RUNTIME_CONCURRENCY_DEFAULT;
+
+/// Extern mirror of the kernel's C-ABI intrinsic bridge. MUST stay
+/// signature-identical to the `export fn zap_proc_*` declarations in
+/// `src/runtime/concurrency/abi.zig` (the authoritative ABI contract,
+/// including result codes, ownership, and threading rules — both files
+/// carry this cross-reference). P2-J2/J3's ZIR lowering targets the
+/// same extern shapes.
+const ZapConcurrencyKernel = struct {
+    /// C-ABI process entry shape accepted by `zap_proc_spawn`
+    /// (`abi.zig`'s `ZapProcEntry`).
+    const ProcEntry = *const fn (process: *anyopaque, argument: ?*anyopaque) callconv(.c) void;
+
+    extern fn zap_proc_runtime_init() callconv(.c) i32;
+    extern fn zap_proc_runtime_deinit() callconv(.c) void;
+    extern fn zap_proc_run_until_quiescent() callconv(.c) i32;
+    extern fn zap_proc_spawn(entry: ProcEntry, argument: ?*anyopaque) callconv(.c) u64;
+    extern fn zap_proc_self(process: *anyopaque) callconv(.c) u64;
+    extern fn zap_proc_send(
+        process: *anyopaque,
+        target_pid_bits: u64,
+        payload_pointer: ?[*]const u8,
+        payload_len: usize,
+    ) callconv(.c) i32;
+    extern fn zap_proc_receive_park(
+        process: *anyopaque,
+        out_payload_pointer: *?[*]const u8,
+        out_payload_len: *usize,
+    ) callconv(.c) *anyopaque;
+    extern fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void;
+    extern fn zap_proc_exit(process: *anyopaque) callconv(.c) noreturn;
+    extern fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void;
+};
+
+/// Gated entry-prologue bootstrap: initialize the binary-wide
+/// concurrency runtime before user main and register its LIFO atexit
+/// shutdown (deliverable 4 of P2-J1; single-scheduler Phase 2 posture).
+/// Called only from `memoryStartupForEntry` under the comptime gate.
+fn concurrencyStartupForEntry() void {
+    const status = ZapConcurrencyKernel.zap_proc_runtime_init();
+    if (status != 0) {
+        @panic("zap: concurrency runtime failed to initialize");
+    }
+    // LIFO ordering: registered AFTER `zapMemoryShutdownAtexit`
+    // (registered inside `zapMemoryStartup` above), so this handler
+    // fires FIRST at exit — every process is torn down while the memory
+    // manager is still live. Atexit-ordering-contract compliance (see
+    // `zapMemoryShutdownAtexit`'s header): the kernel deinit touches
+    // only kernel-owned structures (pid table, envelope pool, scheduler
+    // records, payload ledger — all page-allocator-backed) and performs
+    // NO ARC dispatch. On targets without `atexit` (WASI) the seam
+    // returns a negative sentinel and shutdown rides the explicit exit
+    // path, matching the memory manager's own posture.
+    const atexit_rc = RuntimeOs.registerAtExit(zapConcurrencyShutdownAtexit);
+    std.debug.assert(atexit_rc <= 0);
+    maybeRunConcurrencySmoke();
+}
+
+/// Attests compliance with the atexit ordering contract documented at
+/// `zapMemoryShutdownAtexit`: no ARC dispatch — the kernel deinit frees
+/// kernel-owned pools through the page allocator only.
+fn zapConcurrencyShutdownAtexit() callconv(.c) void {
+    ZapConcurrencyKernel.zap_proc_runtime_deinit();
+}
+
+/// P2-J1 validation seam: `ZAP_CONCURRENCY_SMOKE=1` in the environment
+/// of a gated-on binary runs an init → spawn → send → receive → exit
+/// round-trip through the extern mirror (the REAL link seam) before
+/// user main, printing `zap-concurrency-smoke: ok` on success and
+/// panicking on any deviation. This is the documented Phase 2 stand-in
+/// for a Zap-surface end-to-end test until P2-J2/J3 lower
+/// `spawn`/`send`/`receive`; those jobs replace this hook with real
+/// language-surface Zest coverage.
+fn maybeRunConcurrencySmoke() void {
+    const value = RuntimeOs.getEnv("ZAP_CONCURRENCY_SMOKE") orelse return;
+    if (!(value.len == 1 and value[0] == '1')) return;
+    runConcurrencySmoke();
+}
+
+/// Shared state for the smoke round-trip, threaded as the opaque
+/// process arguments (mirrors `abi.zig`'s kernel-side E2E test).
+const ConcurrencySmokeProbe = struct {
+    receiver_pid_bits: u64 = 0,
+    receiver_observed_self: u64 = 0,
+    sender_observed_self: u64 = 0,
+    received_payload_matches: bool = false,
+    receiver_finished: bool = false,
+    sender_finished: bool = false,
+
+    const payload = "P2-J1 smoke payload";
+};
+
+fn concurrencySmokeReceiverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *ConcurrencySmokeProbe = @ptrCast(@alignCast(argument.?));
+    probe.receiver_observed_self = ZapConcurrencyKernel.zap_proc_self(process);
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = ZapConcurrencyKernel.zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    if (payload_pointer) |pointer| {
+        probe.received_payload_matches =
+            std.mem.eql(u8, pointer[0..payload_len], ConcurrencySmokeProbe.payload);
+    }
+    ZapConcurrencyKernel.zap_proc_envelope_free(envelope);
+    probe.receiver_finished = true;
+    // Returning is the normal-exit path.
+}
+
+fn concurrencySmokeSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *ConcurrencySmokeProbe = @ptrCast(@alignCast(argument.?));
+    probe.sender_observed_self = ZapConcurrencyKernel.zap_proc_self(process);
+    ZapConcurrencyKernel.zap_proc_yield_check(process);
+    const send_status = ZapConcurrencyKernel.zap_proc_send(
+        process,
+        probe.receiver_pid_bits,
+        ConcurrencySmokeProbe.payload.ptr,
+        ConcurrencySmokeProbe.payload.len,
+    );
+    if (send_status != 0) {
+        @panic("zap-concurrency-smoke: send did not deliver");
+    }
+    probe.sender_finished = true;
+    // Exit through the intrinsic (the Phase 2 kill-path exit) so the
+    // smoke covers it; the receiver covers the normal-return path.
+    ZapConcurrencyKernel.zap_proc_exit(process);
+}
+
+fn runConcurrencySmoke() void {
+    var probe = ConcurrencySmokeProbe{};
+    const receiver_pid_bits = ZapConcurrencyKernel.zap_proc_spawn(concurrencySmokeReceiverEntry, &probe);
+    if (receiver_pid_bits == 0) {
+        @panic("zap-concurrency-smoke: receiver spawn failed");
+    }
+    probe.receiver_pid_bits = receiver_pid_bits;
+    const sender_pid_bits = ZapConcurrencyKernel.zap_proc_spawn(concurrencySmokeSenderEntry, &probe);
+    if (sender_pid_bits == 0) {
+        @panic("zap-concurrency-smoke: sender spawn failed");
+    }
+    if (ZapConcurrencyKernel.zap_proc_run_until_quiescent() != 0) {
+        @panic("zap-concurrency-smoke: run_until_quiescent failed");
+    }
+    if (!probe.receiver_finished or !probe.sender_finished) {
+        @panic("zap-concurrency-smoke: a process did not finish");
+    }
+    if (probe.receiver_observed_self != receiver_pid_bits or
+        probe.sender_observed_self != sender_pid_bits)
+    {
+        @panic("zap-concurrency-smoke: self() mismatch");
+    }
+    if (!probe.received_payload_matches) {
+        @panic("zap-concurrency-smoke: payload mismatch");
+    }
+    stderrWriteFlushed("zap-concurrency-smoke: ok\n");
 }
 
 /// Idempotent first-call self-arming wrapper used by every ARC

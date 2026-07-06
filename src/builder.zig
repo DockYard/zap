@@ -54,6 +54,13 @@ pub const BuildConfig = struct {
     /// dependency sources are loaded. There is no callable backend
     /// resolver — `Memory.Manager` is a zero-method conformance marker.
     memory_manager: ?MemoryManager = null,
+    /// P2-J1 comptime concurrency gate (`Zap.Manifest.runtime_concurrency`,
+    /// overridable by `-Druntime-concurrency=on|off`). `false` — the
+    /// default — is the zero-cost posture: no kernel object is compiled
+    /// or linked and no `zap_proc_*` symbol exists in the artifact.
+    /// `true` links the per-target kernel object resolved by
+    /// `src/concurrency_driver.zig` and enables the runtime bootstrap.
+    runtime_concurrency: bool = false,
     /// Test timeout in milliseconds (0 = no timeout). Zig 0.16 supports
     /// native unit test timeouts in the build system.
     test_timeout: i64 = 0,
@@ -207,6 +214,10 @@ pub fn scriptManifest(
         // `-Dmemory=` (validated stdlib-only for script mode) when
         // present, matching the manifest path's `memory:` resolution.
         .memory_manager = SCRIPT_DEFAULT_MEMORY,
+        // Concurrency gate defaults OFF (zero-cost posture);
+        // `applyBuildOverrides` overlays `-Druntime-concurrency=` when
+        // present, matching the manifest path's field resolution.
+        .runtime_concurrency = false,
         .test_timeout = 0,
         .error_style = null,
         .multiline_errors = false,
@@ -1699,6 +1710,11 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                         },
                         else => {},
                     }
+                } else if (std.mem.eql(u8, field.name, "runtime_concurrency")) {
+                    config.runtime_concurrency = switch (field.value) {
+                        .bool_val => |gate_enabled| gate_enabled,
+                        else => false,
+                    };
                 } else if (std.mem.eql(u8, field.name, "pipeline")) {
                     config.pipeline = try constValueToPipeline(alloc, field.value);
                 }
@@ -3410,6 +3426,36 @@ test "ctfe manifest evaluates minimal valid manifest with real stdlib" {
     try testing.expectEqualStrings("lib/**/*.zap", manifest_eval.config.paths[0]);
     try testing.expect(manifest_eval.config.memory_manager != null);
     try testing.expectEqualStrings("Memory.ARC", manifest_eval.config.memory_manager.?.type_name);
+}
+
+test "constValueToBuildConfig parses the runtime_concurrency gate (P2-J1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const gate_on = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "gate_probe" } },
+            .{ .name = "version", .value = .{ .string = "0.0.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "runtime_concurrency", .value = .{ .bool_val = true } },
+        },
+    } };
+    const gate_on_config = try constValueToBuildConfig(alloc, gate_on);
+    try testing.expect(gate_on_config.runtime_concurrency);
+
+    const gate_absent = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "gate_probe" } },
+            .{ .name = "version", .value = .{ .string = "0.0.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+        },
+    } };
+    const gate_absent_config = try constValueToBuildConfig(alloc, gate_absent);
+    // Absent field ⇒ the zero-cost default.
+    try testing.expect(!gate_absent_config.runtime_concurrency);
 }
 
 test "memoryManagerSelectionFromManifest parses memory Type value" {

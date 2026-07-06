@@ -78,6 +78,7 @@ pub const memory_section_parser = @import("memory/section_parser.zig");
 pub const memory_abi = @import("memory/abi.zig");
 pub const memory_driver = @import("memory/driver.zig");
 pub const memory_elision = @import("memory/elision.zig");
+pub const concurrency_driver = @import("concurrency_driver.zig");
 pub const target_triple = @import("target_triple.zig");
 pub const target_caps = @import("target_caps.zig");
 pub const target_fold = @import("target_fold.zig");
@@ -200,6 +201,7 @@ test {
     _ = @import("memory/section_parser.zig");
     _ = @import("memory/abi.zig");
     _ = @import("memory/driver.zig");
+    _ = @import("concurrency_driver.zig");
     _ = @import("memory/elision.zig");
     // First-party memory managers — inline behavioural tests.
     //

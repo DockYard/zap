@@ -368,6 +368,16 @@ pub const CompileOptions = struct {
     /// user-binary build. The memory driver validates the same source
     /// through the `.zapmem` object pipeline before it reaches here.
     active_manager_source_path: []const u8,
+    /// P2-J1 concurrency gate: path to the per-target concurrency
+    /// kernel object resolved by `src/concurrency_driver.zig`, linked
+    /// into the binary via `zir_compilation_add_link_object_file`.
+    /// MUST be non-null exactly when the build's `runtime_concurrency`
+    /// gate is ON (the caller also passes `runtime_concurrency = true`
+    /// through `compiler.RuntimeSourceControls` so the embedded
+    /// runtime's `zap_proc_*` extern references have this object to
+    /// resolve against). Null — the default — is the zero-cost OFF
+    /// posture: nothing is linked and no intrinsic symbol exists.
+    concurrency_kernel_object_path: ?[]const u8 = null,
     /// Shared CLI progress reporter, owned by the command driver.
     progress: ?*progress_mod.Reporter = null,
     /// Phase 0 — DWARF foundation: when true (the default), the ZIR
@@ -671,6 +681,19 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
     if (zir_compilation_add_struct(ctx, "zap_active_manager", active_manager_path_z) != 0) {
         zir_compilation_destroy(ctx);
         return error.CompilationFailed;
+    }
+
+    // P2-J1 concurrency gate: splice the per-target kernel object into
+    // the link line. Present exactly when the build resolved
+    // `runtime_concurrency` ON — the rewritten runtime source then
+    // references the object's `zap_proc_*` intrinsics. The object was
+    // compiled and content-address-validated by
+    // `src/concurrency_driver.zig` before it reaches here.
+    if (options.concurrency_kernel_object_path) |kernel_object_path| {
+        addLinkObjectFile(ctx, kernel_object_path, allocator) catch |err| {
+            zir_compilation_destroy(ctx);
+            return err;
+        };
     }
 
     return ctx;

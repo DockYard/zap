@@ -11969,13 +11969,23 @@ pub fn validateOneStructPerFile(
 ///      compile away the lazy startup fallback only in that guaranteed
 ///      executable shape; library and object outputs retain the
 ///      fallback.
+///   7. The P2-J1 concurrency gate (`RUNTIME_CONCURRENCY_DEFAULT`).
+///      Rewritten to `true` only when the build resolved
+///      `runtime_concurrency` ON (manifest field or
+///      `-Druntime-concurrency=on`): the runtime's comptime-gated
+///      bootstrap then initializes the concurrency kernel before user
+///      main and references the `zap_proc_*` intrinsic externs the
+///      linked kernel object provides. OFF (the default) leaves the
+///      source-level `false`, so no gated declaration is analyzed and
+///      no `zap_proc_*` symbol is referenced — the plan §3 zero-cost
+///      guarantee.
 ///
 /// Host tests import `runtime.zig` directly and therefore observe the
 /// source-level defaults: instrumentation follows the host build
 /// option, declared caps default to ARC, active-manager source binding
 /// defaults to unavailable, the startup-prologue marker stays false so
-/// lazy startup remains available, and ARC stats default to
-/// `builtin.is_test`.
+/// lazy startup remains available, ARC stats default to
+/// `builtin.is_test`, and the concurrency gate stays OFF.
 ///
 /// The returned slice is either a borrowed view of the embedded source
 /// (no rewrites required) or a freshly-allocated owned buffer (one or
@@ -12009,6 +12019,11 @@ pub const RuntimeSourceControls = struct {
     /// Runtime `ZAP_ARC_STATS=1` still controls whether collected
     /// counters are printed.
     collect_arc_stats: bool = false,
+    /// P2-J1 concurrency gate: true only when the build resolved
+    /// `runtime_concurrency` ON, in which case the caller also links
+    /// the compiled kernel object (`src/concurrency_driver.zig`) so the
+    /// runtime's `zap_proc_*` extern references resolve.
+    runtime_concurrency: bool = false,
 };
 
 /// Variant of `getRuntimeSource` for callers whose output mode does
@@ -12041,6 +12056,7 @@ pub fn getRuntimeSourceForRuntimeControls(
         .refcount_sized_extension = refcount_sized_extension,
         .memory_startup_prologue_emitted = controls.memory_startup_prologue_emitted,
         .collect_arc_stats = controls.collect_arc_stats,
+        .runtime_concurrency = controls.runtime_concurrency,
     });
 }
 
@@ -12050,6 +12066,8 @@ const RuntimeRewrite = struct {
     refcount_sized_extension: bool,
     memory_startup_prologue_emitted: bool,
     collect_arc_stats: bool,
+    /// P2-J1 concurrency gate (see `RuntimeSourceControls`).
+    runtime_concurrency: bool = false,
 };
 
 /// Lazily-built rewritten runtime source. Keyed by the rewrite
@@ -12066,10 +12084,12 @@ var rewritten_runtime_cache: std.AutoHashMapUnmanaged(u128, []const u8) = .empty
 ///   * bit   65    — `memory_startup_prologue_emitted`.
 ///   * bit   66    — `collect_arc_stats`.
 ///   * bit   67    — `refcount_sized_extension`.
-///   * bits 68..127 — reserved for future rewrite flags.
+///   * bit   68    — `runtime_concurrency` (P2-J1 gate).
+///   * bits 69..127 — reserved for future rewrite flags.
 ///
 /// The (instrumented, declared_caps, refcount_sized_extension,
-/// startup-prologue, ARC-stats) tuple must produce a unique key — two builds that
+/// startup-prologue, ARC-stats, concurrency-gate) tuple must produce a
+/// unique key — two builds that
 /// differ in any one field MUST alias to two distinct cache entries,
 /// otherwise the second build's rewrite would silently inject the
 /// first build's source.
@@ -12079,6 +12099,7 @@ fn rewriteCacheKey(req: RuntimeRewrite) u128 {
     if (req.memory_startup_prologue_emitted) key |= (@as(u128, 1) << 65);
     if (req.collect_arc_stats) key |= (@as(u128, 1) << 66);
     if (req.refcount_sized_extension) key |= (@as(u128, 1) << 67);
+    if (req.runtime_concurrency) key |= (@as(u128, 1) << 68);
     return key;
 }
 
@@ -12278,7 +12299,30 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
         final_buf = prologue_buf;
     }
 
-    // Stage 7: runtime_os seam splice. The source-level seam in
+    // Stage 7: P2-J1 concurrency-gate marker rewrite. Only builds that
+    // resolved `runtime_concurrency` ON flip the marker: the runtime's
+    // comptime-gated concurrency bootstrap then compiles in and its
+    // `zap_proc_*` extern references resolve against the kernel object
+    // the build links (`src/concurrency_driver.zig`). The default-OFF
+    // source marker keeps every gated declaration unanalyzed — the
+    // plan §3 zero-cost guarantee for non-concurrent binaries.
+    if (req.runtime_concurrency) {
+        const gate_needle = "const RUNTIME_CONCURRENCY_DEFAULT: bool = false;";
+        const gate_replacement = "const RUNTIME_CONCURRENCY_DEFAULT: bool = true;";
+        const gate_idx = std.mem.indexOf(u8, final_buf, gate_needle) orelse {
+            @panic("runtime.zig is missing the RUNTIME_CONCURRENCY_DEFAULT marker; the P2-J1 concurrency-gate rewrite cannot proceed");
+        };
+        const gate_total_len = final_buf.len - gate_needle.len + gate_replacement.len;
+        var gate_buf = std.heap.page_allocator.alloc(u8, gate_total_len) catch
+            @panic("out of memory rewriting runtime source for the concurrency gate");
+        @memcpy(gate_buf[0..gate_idx], final_buf[0..gate_idx]);
+        @memcpy(gate_buf[gate_idx .. gate_idx + gate_replacement.len], gate_replacement);
+        @memcpy(gate_buf[gate_idx + gate_replacement.len ..], final_buf[gate_idx + gate_needle.len ..]);
+        std.heap.page_allocator.free(final_buf);
+        final_buf = gate_buf;
+    }
+
+    // Stage 8: runtime_os seam splice. The source-level seam in
     // `runtime.zig` is the POSIX backend inline (so the host test build,
     // which loads `runtime.zig` unrewritten on a POSIX host, stays the
     // native regression anchor). For EVERY user binary we replace that
@@ -16199,6 +16243,50 @@ test "Phase 2 ARC stats: runtime rewrite cache separates collection shape" {
     try std.testing.expect(elided_src.ptr != collecting_src.ptr);
     try std.testing.expect(std.mem.indexOf(u8, elided_src, "const COLLECT_ARC_STATS_DEFAULT: bool = builtin.is_test;") != null);
     try std.testing.expect(std.mem.indexOf(u8, collecting_src, "const COLLECT_ARC_STATS_DEFAULT: bool = true;") != null);
+}
+
+test "P2-J1 concurrency gate: runtime source keeps the gate OFF by default" {
+    const src = getRuntimeSourceForRuntimeControls(0x1, true, .{
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_CONCURRENCY_DEFAULT: bool = false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_CONCURRENCY_DEFAULT: bool = true;") == null);
+}
+
+test "P2-J1 concurrency gate: runtime source rewrites the gate marker when ON" {
+    const src = getRuntimeSourceForRuntimeControls(0x1, true, .{
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+        .runtime_concurrency = true,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_CONCURRENCY_DEFAULT: bool = true;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "const RUNTIME_CONCURRENCY_DEFAULT: bool = false;") == null);
+}
+
+test "P2-J1 concurrency gate: runtime rewrite cache separates gate shape" {
+    const gate_off_src = rewriteRuntimeSource(.{
+        .instrumented = false,
+        .declared_caps = 0x1,
+        .refcount_sized_extension = true,
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+        .runtime_concurrency = false,
+    });
+    const gate_on_src = rewriteRuntimeSource(.{
+        .instrumented = false,
+        .declared_caps = 0x1,
+        .refcount_sized_extension = true,
+        .memory_startup_prologue_emitted = true,
+        .collect_arc_stats = false,
+        .runtime_concurrency = true,
+    });
+
+    try std.testing.expect(gate_off_src.ptr != gate_on_src.ptr);
+    try std.testing.expect(std.mem.indexOf(u8, gate_off_src, "const RUNTIME_CONCURRENCY_DEFAULT: bool = false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gate_on_src, "const RUNTIME_CONCURRENCY_DEFAULT: bool = true;") != null);
 }
 
 test "Phase 2 memory adapters: runtime rewrite cache separates refcount sized extension shape" {

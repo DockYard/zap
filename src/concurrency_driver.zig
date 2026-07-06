@@ -1,0 +1,849 @@
+//! Concurrency kernel build driver (P2-J1 —
+//! `docs/concurrency-implementation-plan.md` §4 / Phase 2 packaging).
+//!
+//! When a build's `runtime_concurrency` gate is ON, this driver turns
+//! the self-contained kernel source unit (`src/runtime/concurrency/`,
+//! rooted at `abi.zig`) into a per-target object file through the SAME
+//! Zig-fork primitive the memory-manager driver uses
+//! (`zap_fork_compile_zig_to_object` — plan §4: "compiled per target …
+//! exactly like manager sources — never text codegen"). The resulting
+//! object is spliced into the user binary's link line by
+//! `src/zir_backend.zig` via `zir_compilation_add_link_object_file`,
+//! alongside the ZIR-generated code and the `zap_active_manager`
+//! source module.
+//!
+//! Multi-file-root note (the P2-J1 packaging finding): the fork
+//! primitive already supports multi-file roots — `compileToObjectImpl`
+//! creates the root `Package.Module` with `root = dirname(source_path)`
+//! and `root_src_path = basename(source_path)`, so the root file's
+//! relative `@import`s of its siblings resolve through Zig's ordinary
+//! module machinery. No fork extension was required; `abi.zig`
+//! `@import`s the whole kernel tree and the primitive compiles it as
+//! one unit.
+//!
+//! When the gate is OFF this driver is never invoked: no kernel source
+//! is read, no object is produced or linked, and no `zap_proc_*` symbol
+//! exists in the binary (plan §3 zero-cost guarantee, job constraint 4).
+//!
+//! ## Caching
+//!
+//! The object is content-addressed, mirroring the manager validation
+//! cache (`src/memory/driver.zig` §10.3 semantics): the cache key
+//! digests every `.zig` file of the kernel unit (sorted path + content,
+//! length-prefixed), the root basename, the toolchain identity digests,
+//! the optimize mode, the target identity (triple, or host arch/os/abi
+//! for native), and the CPU string. A keyed object already on disk is
+//! reused without invoking the fork; a fresh compile lands via
+//! write-to-temporary + atomic rename so a crashed build can never
+//! leave a truncated object that later cache-hits. The key's hex form
+//! is also folded into the build's artifact cache key by `src/main.zig`
+//! so editing a kernel source invalidates cached user binaries.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const memory_driver = @import("memory/driver.zig");
+const progress_mod = @import("progress.zig");
+
+/// Schema tag folded into the cache key so a future change to what the
+/// key covers self-invalidates every older entry.
+const KERNEL_CACHE_SCHEMA = "zap.concurrency.kernel.object.cache.v1";
+
+/// Path of the kernel source unit relative to the Zap source tree root
+/// (the parent of the resolved stdlib `lib/` directory — the same root
+/// the memory driver resolves stdlib manager backends under).
+pub const KERNEL_UNIT_RELATIVE_DIR = "src/runtime/concurrency";
+
+/// Root file of the kernel compilation unit: the C-ABI intrinsic
+/// bridge, which `@import`s the rest of the kernel tree.
+pub const KERNEL_ROOT_BASENAME = "abi.zig";
+
+/// The intrinsic export the compiled object is asserted to carry. One
+/// symbol suffices as the build-time link-surface tripwire: all
+/// `zap_proc_*` exports live in the same root file, so a root-file
+/// mismatch (wrong file compiled, exports renamed) fails here with a
+/// precise diagnostic instead of at the user binary's final link.
+pub const KERNEL_SENTINEL_SYMBOL = "zap_proc_runtime_init";
+
+/// Driver-level errors, mirroring the memory driver's error/diagnostic
+/// discipline (each variant is paired with a populated diagnostic).
+pub const KernelResolveError = error{
+    /// The kernel source directory or its root file could not be read.
+    KernelSourceNotFound,
+    /// The fork primitive rejected the compile; the diagnostic carries
+    /// the forwarded compiler errors.
+    KernelCompileFailed,
+    /// The compiled object could not be read back for validation.
+    ObjectReadFailed,
+    /// The compiled object does not export the sentinel intrinsic.
+    ValidationFailed,
+    /// Internal driver error (filesystem, allocator misuse) not
+    /// described above.
+    InternalError,
+    OutOfMemory,
+};
+
+/// Inputs for kernel-object resolution. Mirrors the shape of
+/// `memory_driver.ResolveOptions` for the fields both drivers share.
+pub const KernelResolveOptions = struct {
+    /// Absolute or cwd-relative path to the kernel source unit
+    /// directory (production: `<zap_source_root>/src/runtime/concurrency`).
+    kernel_source_dir: []const u8,
+    /// Root file basename within `kernel_source_dir`.
+    kernel_root_basename: []const u8 = KERNEL_ROOT_BASENAME,
+    /// Directory the compiled kernel object is cached in. Created if
+    /// absent.
+    cache_dir: []const u8,
+    /// Optional Zig stdlib directory forwarded to the fork primitive.
+    zig_lib_dir: ?[]const u8 = null,
+    /// Identity digest of the running Zap compiler / Zig fork toolchain
+    /// (required in production; test-only default mirrors the memory
+    /// driver's discipline).
+    compiler_identity_digest: ?[32]u8 = null,
+    /// Identity digest of the Zig stdlib directory (same discipline).
+    zig_lib_identity_digest: ?[32]u8 = null,
+    /// Optimize mode forwarded to the fork primitive — the same value
+    /// the build passes for the manager object so every object in the
+    /// final link agrees.
+    optimize: memory_driver.ZapForkOptimize = .ReleaseSafe,
+    /// Cross-compile target triple (null = native), identical semantics
+    /// to the memory driver.
+    target: ?[]const u8 = null,
+    /// CPU model/feature set (null/"" = the triple's default CPU).
+    cpu: ?[]const u8 = null,
+    /// Test seam: overrides the linked-in fork primitive.
+    fork_compile_fn: ?memory_driver.ForkCompileFn = null,
+    /// Optional CLI progress reporter owned by the build command.
+    progress: ?*progress_mod.Reporter = null,
+};
+
+/// A resolved (content-addressed, validated) kernel object.
+pub const ResolvedKernel = struct {
+    /// Absolute-or-cwd-relative path of the compiled kernel object,
+    /// owned by the caller's allocator.
+    object_path: []const u8,
+    /// Hex form of the content-address key. Value type — callers fold
+    /// it into the build artifact cache key.
+    cache_key_hex: [64]u8,
+};
+
+/// Free the owned memory inside a `ResolvedKernel`. Safe to call once.
+pub fn freeResolvedKernel(allocator: std.mem.Allocator, resolved: *ResolvedKernel) void {
+    allocator.free(resolved.object_path);
+    resolved.object_path = "";
+}
+
+/// Compute the kernel unit's content-address key WITHOUT compiling
+/// (cheap; safe to run before an artifact-cache check, mirroring
+/// `memory_driver.resolveManagerSource`'s role). Digests every `.zig`
+/// file under `kernel_source_dir` (recursively, sorted) plus the build
+/// controls listed in the module doc.
+pub fn kernelCacheKeyHex(
+    allocator: std.mem.Allocator,
+    options: KernelResolveOptions,
+    diag: *memory_driver.DriverDiagnostic,
+) KernelResolveError![64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashLenPrefixed(&hasher, KERNEL_CACHE_SCHEMA);
+    hashLenPrefixed(&hasher, options.kernel_root_basename);
+
+    try hashKernelSources(allocator, &hasher, options, diag);
+
+    const compiler_identity = try requiredIdentity(options.compiler_identity_digest, "compiler", diag);
+    const zig_lib_identity = try requiredIdentity(options.zig_lib_identity_digest, "Zig lib", diag);
+    hasher.update(&compiler_identity);
+    hasher.update(&zig_lib_identity);
+
+    const optimize_tag: u8 = @intCast(@intFromEnum(options.optimize));
+    hasher.update(std.mem.asBytes(&optimize_tag));
+
+    if (options.target) |triple| {
+        hashLenPrefixed(&hasher, triple);
+    } else {
+        // Native identity: the host triple, so a cache directory shared
+        // across hosts (e.g. a copied workspace) can never false-hit.
+        hashLenPrefixed(&hasher, "native");
+        hashLenPrefixed(&hasher, @tagName(builtin.cpu.arch));
+        hashLenPrefixed(&hasher, @tagName(builtin.os.tag));
+        hashLenPrefixed(&hasher, @tagName(builtin.abi));
+    }
+    hashLenPrefixed(&hasher, options.cpu orelse "");
+    hashLenPrefixed(&hasher, options.zig_lib_dir orelse "");
+
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digestHex(digest);
+}
+
+/// Resolve the compiled kernel object for this build: compute the
+/// content-address key, reuse the keyed object when present, otherwise
+/// compile the kernel unit through the fork primitive (temporary path +
+/// atomic rename) and assert the sentinel intrinsic export. The
+/// returned `object_path` is owned by `allocator`.
+pub fn resolveKernelObject(
+    allocator: std.mem.Allocator,
+    options: KernelResolveOptions,
+    diag: *memory_driver.DriverDiagnostic,
+) KernelResolveError!ResolvedKernel {
+    const cache_key_hex = try kernelCacheKeyHex(allocator, options, diag);
+
+    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, options.cache_dir) catch {};
+
+    const object_basename = std.fmt.allocPrint(
+        allocator,
+        "zap_concurrency_kernel-{s}.o",
+        .{cache_key_hex},
+    ) catch return KernelResolveError.OutOfMemory;
+    defer allocator.free(object_basename);
+    const object_path = std.fs.path.join(allocator, &.{ options.cache_dir, object_basename }) catch
+        return KernelResolveError.OutOfMemory;
+    errdefer allocator.free(object_path);
+
+    // Content-addressed reuse: the key covers every input that affects
+    // the object, and completed objects are published atomically below,
+    // so existence at the keyed path IS validity.
+    if (pathIsReadable(object_path)) {
+        return .{ .object_path = object_path, .cache_key_hex = cache_key_hex };
+    }
+
+    if (options.progress) |progress| {
+        progress.stage("Concurrency: compiling kernel object", .{});
+        progress.commitLine();
+    }
+
+    const root_source_path = std.fs.path.join(
+        allocator,
+        &.{ options.kernel_source_dir, options.kernel_root_basename },
+    ) catch return KernelResolveError.OutOfMemory;
+    defer allocator.free(root_source_path);
+
+    // Compile to a process-unique temporary sibling, then rename into
+    // the keyed path. A crash mid-compile leaves only a stale `.tmp-*`
+    // file that can never satisfy the reuse check above.
+    const temporary_object_path = std.fmt.allocPrint(
+        allocator,
+        "{s}.tmp-{d}",
+        .{ object_path, interimPathDiscriminator() },
+    ) catch return KernelResolveError.OutOfMemory;
+    defer allocator.free(temporary_object_path);
+
+    try compileKernelUnit(allocator, root_source_path, temporary_object_path, options, diag);
+    errdefer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, temporary_object_path) catch {};
+
+    try assertKernelObjectExports(allocator, temporary_object_path, diag);
+
+    std.Io.Dir.cwd().rename(
+        temporary_object_path,
+        std.Io.Dir.cwd(),
+        object_path,
+        std.Options.debug_io,
+    ) catch {
+        diag.write(
+            "concurrency kernel: could not publish compiled object to '{s}'",
+            .{object_path},
+        );
+        return KernelResolveError.InternalError;
+    };
+
+    return .{ .object_path = object_path, .cache_key_hex = cache_key_hex };
+}
+
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
+
+fn requiredIdentity(
+    digest: ?[32]u8,
+    comptime which: []const u8,
+    diag: *memory_driver.DriverDiagnostic,
+) KernelResolveError![32]u8 {
+    return digest orelse {
+        if (builtin.is_test) return [_]u8{0} ** 32;
+        diag.write(
+            "concurrency kernel driver: production resolve omitted the " ++ which ++ " identity digest",
+            .{},
+        );
+        return KernelResolveError.InternalError;
+    };
+}
+
+/// Digest every `.zig` file under the kernel unit directory
+/// (recursively), in sorted relative-path order, folding path and
+/// content length-prefixed. An empty unit (no `.zig` files) is a
+/// configuration error, not an empty digest.
+fn hashKernelSources(
+    allocator: std.mem.Allocator,
+    hasher: *std.crypto.hash.sha2.Sha256,
+    options: KernelResolveOptions,
+    diag: *memory_driver.DriverDiagnostic,
+) KernelResolveError!void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var relative_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, options.kernel_source_dir, .{ .iterate = true }) catch {
+        diag.write(
+            "concurrency kernel source unit not found at '{s}'",
+            .{options.kernel_source_dir},
+        );
+        return KernelResolveError.KernelSourceNotFound;
+    };
+    defer dir.close(std.Options.debug_io);
+
+    var walker = dir.walk(arena) catch return KernelResolveError.OutOfMemory;
+    defer walker.deinit();
+    while (walker.next(std.Options.debug_io) catch {
+        diag.write(
+            "concurrency kernel source unit at '{s}' could not be walked",
+            .{options.kernel_source_dir},
+        );
+        return KernelResolveError.KernelSourceNotFound;
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        const owned = arena.dupe(u8, entry.path) catch return KernelResolveError.OutOfMemory;
+        relative_paths.append(arena, owned) catch return KernelResolveError.OutOfMemory;
+    }
+
+    if (relative_paths.items.len == 0) {
+        diag.write(
+            "concurrency kernel source unit at '{s}' contains no .zig sources",
+            .{options.kernel_source_dir},
+        );
+        return KernelResolveError.KernelSourceNotFound;
+    }
+
+    std.mem.sort([]const u8, relative_paths.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+
+    var found_root = false;
+    for (relative_paths.items) |relative_path| {
+        if (std.mem.eql(u8, relative_path, options.kernel_root_basename)) found_root = true;
+        const contents = dir.readFileAlloc(
+            std.Options.debug_io,
+            relative_path,
+            arena,
+            .limited(64 * 1024 * 1024),
+        ) catch {
+            diag.write(
+                "concurrency kernel source '{s}/{s}' could not be read",
+                .{ options.kernel_source_dir, relative_path },
+            );
+            return KernelResolveError.KernelSourceNotFound;
+        };
+        hashLenPrefixed(hasher, relative_path);
+        hashLenPrefixed(hasher, contents);
+    }
+
+    if (!found_root) {
+        diag.write(
+            "concurrency kernel root '{s}' not found under '{s}'",
+            .{ options.kernel_root_basename, options.kernel_source_dir },
+        );
+        return KernelResolveError.KernelSourceNotFound;
+    }
+}
+
+fn compileKernelUnit(
+    allocator: std.mem.Allocator,
+    root_source_path: []const u8,
+    object_path: []const u8,
+    options: KernelResolveOptions,
+    diag: *memory_driver.DriverDiagnostic,
+) KernelResolveError!void {
+    const source_z = allocator.dupeZ(u8, root_source_path) catch return KernelResolveError.OutOfMemory;
+    defer allocator.free(source_z);
+    const object_z = allocator.dupeZ(u8, object_path) catch return KernelResolveError.OutOfMemory;
+    defer allocator.free(object_z);
+    const cache_dir_z = allocator.dupeZ(u8, options.cache_dir) catch return KernelResolveError.OutOfMemory;
+    defer allocator.free(cache_dir_z);
+    const zig_lib_z: ?[:0]const u8 = if (options.zig_lib_dir) |p|
+        (allocator.dupeZ(u8, p) catch return KernelResolveError.OutOfMemory)
+    else
+        null;
+    defer if (zig_lib_z) |p| allocator.free(p);
+    const cpu_z: ?[:0]const u8 = if (options.cpu) |c|
+        (if (c.len == 0) null else (allocator.dupeZ(u8, c) catch return KernelResolveError.OutOfMemory))
+    else
+        null;
+    defer if (cpu_z) |p| allocator.free(p);
+
+    const target: memory_driver.ZapForkTarget = if (options.target) |triple|
+        memory_driver.parseTargetTriple(triple) orelse {
+            diag.write(
+                "concurrency kernel could not build for cross-compile target '{s}': unrecognised triple (expected arch-os-abi)",
+                .{triple},
+            );
+            return KernelResolveError.KernelCompileFailed;
+        }
+    else
+        .{
+            .arch_tag = memory_driver.ZAP_FORK_ARCH_NATIVE,
+            .os_tag = 0,
+            .abi_tag = 0,
+            ._reserved = 0,
+        };
+
+    const fork_fn: memory_driver.ForkCompileFn = options.fork_compile_fn orelse
+        (memory_driver.defaultForkCompileFn() orelse {
+            diag.write(
+                "concurrency kernel driver: no fork compile function available (test build without explicit override?)",
+                .{},
+            );
+            return KernelResolveError.InternalError;
+        });
+
+    var fork_diag_buf: [4096]u8 = undefined;
+    fork_diag_buf[0] = 0;
+
+    const result = fork_fn(
+        source_z.ptr,
+        &target,
+        options.optimize,
+        object_z.ptr,
+        &fork_diag_buf,
+        fork_diag_buf.len,
+        if (zig_lib_z) |p| p.ptr else null,
+        cache_dir_z.ptr,
+        cache_dir_z.ptr,
+        if (cpu_z) |p| p.ptr else null,
+    );
+
+    switch (result) {
+        .Ok => return,
+        .SourceNotFound => {
+            diag.write(
+                "concurrency kernel root source not found at '{s}'",
+                .{root_source_path},
+            );
+            return KernelResolveError.KernelSourceNotFound;
+        },
+        .CompilationFailed => {
+            const fork_text = std.mem.sliceTo(&fork_diag_buf, 0);
+            diag.write(
+                "compilation of the concurrency kernel failed:\n{s}",
+                .{fork_text},
+            );
+            return KernelResolveError.KernelCompileFailed;
+        },
+        .TargetUnsupported => {
+            const fork_text = std.mem.sliceTo(&fork_diag_buf, 0);
+            diag.write(
+                "concurrency kernel target unsupported: {s}",
+                .{fork_text},
+            );
+            return KernelResolveError.KernelCompileFailed;
+        },
+        .InternalError => {
+            const fork_text = std.mem.sliceTo(&fork_diag_buf, 0);
+            diag.write(
+                "internal error compiling the concurrency kernel: {s}",
+                .{fork_text},
+            );
+            return KernelResolveError.InternalError;
+        },
+    }
+}
+
+/// Assert the freshly-compiled object exports the sentinel intrinsic
+/// (`KERNEL_SENTINEL_SYMBOL`), reusing the memory driver's per-format
+/// symbol-table walkers. Catching a link-surface mismatch here gives a
+/// build-time diagnostic naming the kernel instead of an undefined
+/// `zap_proc_*` reference at the user binary's final link.
+fn assertKernelObjectExports(
+    allocator: std.mem.Allocator,
+    object_path: []const u8,
+    diag: *memory_driver.DriverDiagnostic,
+) KernelResolveError!void {
+    const object_bytes = std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        object_path,
+        allocator,
+        .limited(256 * 1024 * 1024),
+    ) catch {
+        diag.write("could not read compiled concurrency kernel object at '{s}'", .{object_path});
+        return KernelResolveError.ObjectReadFailed;
+    };
+    defer allocator.free(object_bytes);
+
+    const found = memory_driver.objectExportsSymbol(object_bytes, KERNEL_SENTINEL_SYMBOL) catch |err| {
+        switch (err) {
+            error.UnsupportedFormat => diag.write(
+                "concurrency kernel object at '{s}' uses an unsupported format for symbol-table inspection",
+                .{object_path},
+            ),
+            error.InvalidObject => diag.write(
+                "concurrency kernel object at '{s}' has a malformed object header",
+                .{object_path},
+            ),
+        }
+        return KernelResolveError.ValidationFailed;
+    };
+    if (!found) {
+        diag.write(
+            "concurrency kernel object does not export the required intrinsic '{s}'; the compiled root must be the C-ABI bridge (src/runtime/concurrency/abi.zig)",
+            .{KERNEL_SENTINEL_SYMBOL},
+        );
+        return KernelResolveError.ValidationFailed;
+    }
+}
+
+fn pathIsReadable(path: []const u8) bool {
+    std.Io.Dir.cwd().access(std.Options.debug_io, path, .{}) catch return false;
+    return true;
+}
+
+/// Discriminator for the temporary object path: pid + a monotonic
+/// counter, unique enough that two concurrent builds in one cache
+/// directory never collide on the temporary name (each publishes via
+/// rename, so the final path is race-free either way).
+var interim_counter = std.atomic.Value(u64).init(0);
+
+fn interimPathDiscriminator() u64 {
+    const counter = interim_counter.fetchAdd(1, .monotonic);
+    const pid: u64 = switch (builtin.os.tag) {
+        .windows => @intCast(std.os.windows.GetCurrentProcessId()),
+        .wasi => 0,
+        else => @intCast(std.c.getpid()),
+    };
+    return pid *% 0x1_0000 +% counter;
+}
+
+fn hashLenPrefixed(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
+    const len: u64 = bytes.len;
+    hasher.update(std.mem.asBytes(&len));
+    hasher.update(bytes);
+}
+
+fn digestHex(digest: [32]u8) [64]u8 {
+    const alphabet = "0123456789abcdef";
+    var out: [64]u8 = undefined;
+    for (digest, 0..) |byte, index| {
+        out[index * 2] = alphabet[byte >> 4];
+        out[index * 2 + 1] = alphabet[byte & 0x0f];
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Test fixture: a fake kernel unit in a tmp dir plus a mock fork
+/// primitive that writes a minimal ELF64 object exporting the sentinel
+/// intrinsic (modeled on `memory/driver.zig`'s `synthesizeElfWithCaps`,
+/// minus the `.zapmem` machinery the kernel does not carry).
+const TestUnit = struct {
+    tmp: testing.TmpDir,
+    // Sentinel-terminated on purpose: `realPathFileAlloc` returns a
+    // `dupeZ` allocation, and `allocator.free` must see the sentinel in
+    // the slice type to release the full buffer.
+    dir_path: [:0]const u8,
+    cache_path: [:0]const u8,
+
+    fn init(allocator: std.mem.Allocator) !TestUnit {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.createDirPath(std.Options.debug_io, "kernel");
+        try tmp.dir.createDirPath(std.Options.debug_io, "cache");
+        try tmp.dir.writeFile(std.Options.debug_io, .{
+            .sub_path = "kernel/abi.zig",
+            .data = "// fake kernel root\n",
+        });
+        try tmp.dir.writeFile(std.Options.debug_io, .{
+            .sub_path = "kernel/scheduler.zig",
+            .data = "// fake sibling\n",
+        });
+        const dir_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "kernel", allocator);
+        errdefer allocator.free(dir_path);
+        const cache_path = try tmp.dir.realPathFileAlloc(std.Options.debug_io, "cache", allocator);
+        return .{ .tmp = tmp, .dir_path = dir_path, .cache_path = cache_path };
+    }
+
+    fn deinit(unit: *TestUnit, allocator: std.mem.Allocator) void {
+        allocator.free(unit.dir_path);
+        allocator.free(unit.cache_path);
+        unit.tmp.cleanup();
+    }
+
+    fn options(unit: *const TestUnit, fork_fn: memory_driver.ForkCompileFn) KernelResolveOptions {
+        return .{
+            .kernel_source_dir = unit.dir_path,
+            .cache_dir = unit.cache_path,
+            .fork_compile_fn = fork_fn,
+        };
+    }
+};
+
+var mock_kernel_compile_count: usize = 0;
+
+fn mockForkCompileKernel(
+    source_path: [*:0]const u8,
+    target: *const memory_driver.ZapForkTarget,
+    optimize: memory_driver.ZapForkOptimize,
+    out_object_path: [*:0]const u8,
+    out_diagnostic_buffer: ?[*]u8,
+    out_diagnostic_capacity: usize,
+    zig_lib_dir_opt: ?[*:0]const u8,
+    local_cache_dir_opt: ?[*:0]const u8,
+    global_cache_dir_opt: ?[*:0]const u8,
+    cpu_features_opt: ?[*:0]const u8,
+) callconv(.c) memory_driver.ZapForkResult {
+    _ = source_path;
+    _ = target;
+    _ = optimize;
+    _ = out_diagnostic_buffer;
+    _ = out_diagnostic_capacity;
+    _ = zig_lib_dir_opt;
+    _ = local_cache_dir_opt;
+    _ = global_cache_dir_opt;
+    _ = cpu_features_opt;
+    mock_kernel_compile_count += 1;
+    var buffer: [4096]u8 = undefined;
+    const written = synthesizeKernelElf(&buffer);
+    const object_path = std.mem.sliceTo(out_object_path, 0);
+    std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{
+        .sub_path = object_path,
+        .data = buffer[0..written],
+    }) catch return .InternalError;
+    return .Ok;
+}
+
+fn mockForkCompileGarbage(
+    source_path: [*:0]const u8,
+    target: *const memory_driver.ZapForkTarget,
+    optimize: memory_driver.ZapForkOptimize,
+    out_object_path: [*:0]const u8,
+    out_diagnostic_buffer: ?[*]u8,
+    out_diagnostic_capacity: usize,
+    zig_lib_dir_opt: ?[*:0]const u8,
+    local_cache_dir_opt: ?[*:0]const u8,
+    global_cache_dir_opt: ?[*:0]const u8,
+    cpu_features_opt: ?[*:0]const u8,
+) callconv(.c) memory_driver.ZapForkResult {
+    _ = source_path;
+    _ = target;
+    _ = optimize;
+    _ = out_diagnostic_buffer;
+    _ = out_diagnostic_capacity;
+    _ = zig_lib_dir_opt;
+    _ = local_cache_dir_opt;
+    _ = global_cache_dir_opt;
+    _ = cpu_features_opt;
+    const object_path = std.mem.sliceTo(out_object_path, 0);
+    std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{
+        .sub_path = object_path,
+        .data = "not an object file",
+    }) catch return .InternalError;
+    return .Ok;
+}
+
+/// Minimal ELF64 relocatable whose symtab carries exactly the sentinel
+/// intrinsic. Layout mirrors the memory driver's ELF synthesizer.
+fn synthesizeKernelElf(buffer: []u8) usize {
+    const shstrtab = "\x00.shstrtab\x00.symtab\x00.strtab\x00";
+    const symstrtab = "\x00" ++ KERNEL_SENTINEL_SYMBOL ++ "\x00";
+
+    const ehdr_size: u64 = @sizeOf(std.elf.Elf64_Ehdr);
+    const shdr_size: u64 = @sizeOf(std.elf.Elf64_Shdr);
+    const sym_size: u64 = @sizeOf(std.elf.Elf64_Sym);
+    const shdr_count: u16 = 4; // null, shstrtab, symtab, strtab
+
+    const shdr_table_offset = ehdr_size;
+    const shstrtab_offset = shdr_table_offset + shdr_size * @as(u64, shdr_count);
+    const symtab_offset = shstrtab_offset + shstrtab.len;
+    const sym_count: u64 = 2; // STN_UNDEF + the sentinel
+    const symstrtab_offset = symtab_offset + sym_size * sym_count;
+    const total = symstrtab_offset + symstrtab.len;
+
+    var ehdr: std.elf.Elf64_Ehdr = .{
+        .e_ident = [_]u8{0} ** 16,
+        .e_type = .REL,
+        .e_machine = .X86_64,
+        .e_version = 1,
+        .e_entry = 0,
+        .e_phoff = 0,
+        .e_shoff = shdr_table_offset,
+        .e_flags = 0,
+        .e_ehsize = @intCast(ehdr_size),
+        .e_phentsize = 0,
+        .e_phnum = 0,
+        .e_shentsize = @intCast(shdr_size),
+        .e_shnum = shdr_count,
+        .e_shstrndx = 1,
+    };
+    ehdr.e_ident[0] = 0x7F;
+    ehdr.e_ident[1] = 'E';
+    ehdr.e_ident[2] = 'L';
+    ehdr.e_ident[3] = 'F';
+    ehdr.e_ident[std.elf.EI.CLASS] = std.elf.ELFCLASS64;
+    ehdr.e_ident[std.elf.EI.DATA] = std.elf.ELFDATA2LSB;
+    ehdr.e_ident[std.elf.EI.VERSION] = 1;
+    @memcpy(buffer[0..@sizeOf(std.elf.Elf64_Ehdr)], std.mem.asBytes(&ehdr));
+
+    var sh_null: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    @memcpy(buffer[shdr_table_offset..][0..@sizeOf(std.elf.Elf64_Shdr)], std.mem.asBytes(&sh_null));
+
+    var sh_shstrtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_shstrtab.sh_name = 1; // ".shstrtab"
+    sh_shstrtab.sh_type = @intFromEnum(std.elf.SHT.STRTAB);
+    sh_shstrtab.sh_offset = shstrtab_offset;
+    sh_shstrtab.sh_size = shstrtab.len;
+    @memcpy(
+        buffer[shdr_table_offset + shdr_size ..][0..@sizeOf(std.elf.Elf64_Shdr)],
+        std.mem.asBytes(&sh_shstrtab),
+    );
+
+    var sh_symtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_symtab.sh_name = 11; // ".symtab"
+    sh_symtab.sh_type = @intFromEnum(std.elf.SHT.SYMTAB);
+    sh_symtab.sh_offset = symtab_offset;
+    sh_symtab.sh_size = sym_size * sym_count;
+    sh_symtab.sh_link = 3; // ".strtab" index
+    sh_symtab.sh_info = 1;
+    sh_symtab.sh_addralign = 8;
+    sh_symtab.sh_entsize = sym_size;
+    @memcpy(
+        buffer[shdr_table_offset + shdr_size * 2 ..][0..@sizeOf(std.elf.Elf64_Shdr)],
+        std.mem.asBytes(&sh_symtab),
+    );
+
+    var sh_strtab: std.elf.Elf64_Shdr = std.mem.zeroes(std.elf.Elf64_Shdr);
+    sh_strtab.sh_name = 19; // ".strtab"
+    sh_strtab.sh_type = @intFromEnum(std.elf.SHT.STRTAB);
+    sh_strtab.sh_offset = symstrtab_offset;
+    sh_strtab.sh_size = symstrtab.len;
+    @memcpy(
+        buffer[shdr_table_offset + shdr_size * 3 ..][0..@sizeOf(std.elf.Elf64_Shdr)],
+        std.mem.asBytes(&sh_strtab),
+    );
+
+    @memcpy(buffer[shstrtab_offset..][0..shstrtab.len], shstrtab);
+
+    var sym_null: std.elf.Elf64_Sym = std.mem.zeroes(std.elf.Elf64_Sym);
+    @memcpy(buffer[symtab_offset..][0..@sizeOf(std.elf.Elf64_Sym)], std.mem.asBytes(&sym_null));
+
+    var sym_sentinel: std.elf.Elf64_Sym = std.mem.zeroes(std.elf.Elf64_Sym);
+    sym_sentinel.st_name = 1; // offset of the sentinel in strtab
+    // STT_FUNC(2) | STB_GLOBAL(1) << 4 = 0x12
+    sym_sentinel.st_info = (1 << 4) | 2;
+    sym_sentinel.st_shndx = 1;
+    @memcpy(
+        buffer[symtab_offset + sym_size ..][0..@sizeOf(std.elf.Elf64_Sym)],
+        std.mem.asBytes(&sym_sentinel),
+    );
+
+    @memcpy(buffer[symstrtab_offset..][0..symstrtab.len], symstrtab);
+
+    return @intCast(total);
+}
+
+test "concurrency driver: resolve compiles once and content-addressed reuse skips the fork" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    mock_kernel_compile_count = 0;
+    var first = try resolveKernelObject(allocator, unit.options(mockForkCompileKernel), &diag);
+    defer freeResolvedKernel(allocator, &first);
+    try testing.expectEqual(@as(usize, 1), mock_kernel_compile_count);
+
+    var second = try resolveKernelObject(allocator, unit.options(mockForkCompileKernel), &diag);
+    defer freeResolvedKernel(allocator, &second);
+    // Cache hit: the fork primitive is NOT re-invoked and the paths agree.
+    try testing.expectEqual(@as(usize, 1), mock_kernel_compile_count);
+    try testing.expectEqualStrings(first.object_path, second.object_path);
+    try testing.expectEqualSlices(u8, &first.cache_key_hex, &second.cache_key_hex);
+}
+
+test "concurrency driver: editing any kernel source changes the cache key and recompiles" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    mock_kernel_compile_count = 0;
+    var first = try resolveKernelObject(allocator, unit.options(mockForkCompileKernel), &diag);
+    defer freeResolvedKernel(allocator, &first);
+
+    // Edit a NON-ROOT sibling: the whole unit participates in the key.
+    try unit.tmp.dir.writeFile(std.Options.debug_io, .{
+        .sub_path = "kernel/scheduler.zig",
+        .data = "// fake sibling, edited\n",
+    });
+
+    var second = try resolveKernelObject(allocator, unit.options(mockForkCompileKernel), &diag);
+    defer freeResolvedKernel(allocator, &second);
+    try testing.expectEqual(@as(usize, 2), mock_kernel_compile_count);
+    try testing.expect(!std.mem.eql(u8, &first.cache_key_hex, &second.cache_key_hex));
+    try testing.expect(!std.mem.eql(u8, first.object_path, second.object_path));
+}
+
+test "concurrency driver: cache key separates optimize, target, and cpu" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var base_options = unit.options(mockForkCompileKernel);
+    const base_key = try kernelCacheKeyHex(allocator, base_options, &diag);
+
+    base_options.optimize = .ReleaseFast;
+    const optimize_key = try kernelCacheKeyHex(allocator, base_options, &diag);
+    try testing.expect(!std.mem.eql(u8, &base_key, &optimize_key));
+
+    base_options.optimize = .ReleaseSafe;
+    base_options.target = "aarch64-linux-gnu";
+    const target_key = try kernelCacheKeyHex(allocator, base_options, &diag);
+    try testing.expect(!std.mem.eql(u8, &base_key, &target_key));
+
+    base_options.target = null;
+    base_options.cpu = "baseline";
+    const cpu_key = try kernelCacheKeyHex(allocator, base_options, &diag);
+    try testing.expect(!std.mem.eql(u8, &base_key, &cpu_key));
+}
+
+test "concurrency driver: object missing the sentinel intrinsic fails validation" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    try testing.expectError(
+        KernelResolveError.ValidationFailed,
+        resolveKernelObject(allocator, unit.options(mockForkCompileGarbage), &diag),
+    );
+    try testing.expect(diag.text().len > 0);
+}
+
+test "concurrency driver: missing kernel unit fails with a named diagnostic" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var options = unit.options(mockForkCompileKernel);
+    options.kernel_source_dir = "/nonexistent/zap/kernel/unit";
+    try testing.expectError(
+        KernelResolveError.KernelSourceNotFound,
+        resolveKernelObject(allocator, options, &diag),
+    );
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "/nonexistent/zap/kernel/unit") != null);
+}

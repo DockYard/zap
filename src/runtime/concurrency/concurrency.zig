@@ -90,10 +90,22 @@
 //!   mailboxes concurrent with live pushes, futex wake/park pressure)
 //!   with exact accounting per round; `ZAP_ADVERSARIAL_STRESS_ROUNDS`
 //!   scales it to a soak. Run under TSan for the E3 gate.
+//! * `abi.zig` — Phase 2 (P2-J1): the C-ABI `zap_proc_*` intrinsic
+//!   bridge and the ROOT of the per-target kernel object that
+//!   `src/concurrency_driver.zig` compiles through
+//!   `zap_fork_compile_zig_to_object` and links into gated-on user
+//!   binaries. Deliberately NOT re-exported here: `abi.zig` imports
+//!   this file (it is the object root above the kernel), and only its
+//!   test block participates in the kernel test suite below.
 //!
 //! NOT here yet: timers, links/monitors,
-//! and the `std.Io` vtable. This tree is NOT wired
-//! into Zap compilation — it is exercised by `zig build test-kernel`
+//! and the `std.Io` vtable. Since P2-J1 this tree IS wired into Zap
+//! compilation behind the comptime `runtime_concurrency` gate (default
+//! OFF): when the gate is ON, `src/concurrency_driver.zig` compiles
+//! `abi.zig` (the object root above this file) per target through
+//! `zap_fork_compile_zig_to_object` and the object is linked into the
+//! user binary; when OFF, no kernel code or symbol reaches the binary.
+//! The kernel test suite remains `zig build test-kernel`
 //! (both the selected optimize mode and a ReleaseFast run for the
 //! miscompilation canary; fork compiler required for the latter). The
 //! selected-optimize run is also part of plain `zig build test`.
@@ -193,4 +205,5 @@ test {
     _ = crash_report;
     _ = @import("teardown_stress.zig");
     _ = @import("adversarial_stress.zig");
+    _ = @import("abi.zig");
 }

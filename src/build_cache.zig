@@ -44,6 +44,11 @@ pub const OverrideIdentity = struct {
     memory: ?[]const u8 = null,
     target: ?[]const u8 = null,
     cpu: ?[]const u8 = null,
+    /// P2-J1: `-Druntime-concurrency=` tri-state (null = manifest
+    /// decides). A gate flip changes the emitted runtime and the link
+    /// line, so the manifest-snapshot fast path must MISS on it rather
+    /// than reinstalling an artifact built under the other gate value.
+    runtime_concurrency: ?bool = null,
 };
 
 pub const Pipeline = struct {
@@ -468,7 +473,9 @@ pub fn compilerIdentityDigestForPath(
 pub fn hashInvocationIdentity(allocator: std.mem.Allocator, inputs: InvocationInputs) !InvocationIdentity {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     const identity_magic: u32 = 0x5a_49_44_32; // "ZID2"
-    const identity_version: u16 = 2;
+    // v3 (P2-J1): the identity folds the `-Druntime-concurrency=`
+    // override tri-state; the bump retires every pre-gate snapshot.
+    const identity_version: u16 = 3;
     hashBytes(&hasher, std.mem.asBytes(&identity_magic));
     hashBytes(&hasher, std.mem.asBytes(&identity_version));
     hashBytes(&hasher, inputs.build_source);
@@ -495,6 +502,11 @@ pub fn hashInvocationIdentity(allocator: std.mem.Allocator, inputs: InvocationIn
     hashOptionalString(&hasher, inputs.overrides.memory);
     hashOptionalString(&hasher, inputs.overrides.target);
     hashOptionalString(&hasher, inputs.overrides.cpu);
+    // P2-J1: tri-state gate override (0 = unset, 1 = off, 2 = on).
+    hashOptionalByte(&hasher, if (inputs.overrides.runtime_concurrency) |gate|
+        @as(u8, if (gate) 2 else 1)
+    else
+        null);
     hashBool(&hasher, inputs.collect_arc_stats);
     hashOptionalString(&hasher, inputs.zap_lib_dir);
     hashBytes(&hasher, inputs.zig_lib_dir);

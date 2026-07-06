@@ -36,6 +36,21 @@
   default), the target's default CPU is used. The CLI `-Dcpu=<cpu>`
   flag overrides this per-field.
 
+  ## `runtime_concurrency:` field
+
+  Comptime gate over the concurrency runtime kernel. When `false`
+  (the default), the binary compiles exactly as before the kernel
+  existed: no scheduler code is compiled or linked, no `zap_proc_*`
+  intrinsic symbol exists in the artifact, and no startup cost is
+  paid. When `true`, the per-target kernel object is linked into the
+  binary and the runtime initializes the scheduler before `main` and
+  shuts it down after. The CLI `-Druntime-concurrency=on|off` flag
+  overrides this per-field.
+
+  Phase 2 posture: the gate exposes the kernel's C-ABI intrinsic
+  bridge only; the `spawn`/`send`/`receive` language surface lands in
+  later Phase 2 jobs of `docs/concurrency-implementation-plan.md`.
+
   ## `pipeline:` field
 
   Overrides the command pipeline for this manifest. When omitted, Zap
@@ -55,6 +70,7 @@ pub struct Zap.Manifest {
   paths :: [String] = []
   deps :: [Zap.Dep] = []
   memory :: Type = Memory.ARC
+  runtime_concurrency :: Bool = false
   build_opts :: [{String, String}] = []
   test_timeout :: i64 = 0
   error_style :: String = ""

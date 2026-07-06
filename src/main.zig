@@ -228,6 +228,10 @@ fn printUsage() void {
         \\                    script mode: stdlib managers only)
         \\  -Dtarget=<triple> Cross-compile target (e.g. x86_64-linux-gnu)
         \\  -Dcpu=<cpu>       Target CPU model/features (e.g. baseline, apple_m1)
+        \\  -Druntime-concurrency=<on|off>
+        \\                    Comptime concurrency-runtime gate (default off:
+        \\                    zero cost — no kernel linked, no zap_proc_*
+        \\                    symbols; overrides Zap.Manifest.runtime_concurrency)
         \\  -D<key>=<value>   Custom build option (read via System.get_build_opt)
         \\
         \\Options:
@@ -791,6 +795,12 @@ const BuildOverrides = struct {
     /// run path sets in the child environment. No effect under
     /// non-tracking managers (they do not detect leaks). Default off.
     leaks_fatal: bool = false,
+    /// P2-J1 — `-Druntime-concurrency=on|off`: per-build override of the
+    /// manifest's `runtime_concurrency` comptime gate. `on` links the
+    /// per-target concurrency kernel object and enables the runtime
+    /// bootstrap; `off` forces the zero-cost posture. Null defers to the
+    /// manifest field (default `false`).
+    runtime_concurrency: ?bool = null,
 };
 
 /// Phase 0 — DWARF foundation: parsed `-Ddebug-info` flag value.
@@ -1000,6 +1010,7 @@ const BUILD_FLAG_KEYS = [_][]const u8{
     "frame-pointers",
     "error-format",
     "leaks-fatal",
+    "runtime-concurrency",
 };
 
 /// Format the supported-keys list for diagnostics straight from
@@ -1168,6 +1179,19 @@ fn parseBuildOverrides(
                     "unknown -Dleaks-fatal value '{s}' (valid: on, off)",
                     .{value},
                 ) };
+        } else if (std.mem.eql(u8, key, "runtime-concurrency")) {
+            // P2-J1: per-build override of the manifest's comptime
+            // concurrency gate.
+            overrides.runtime_concurrency = if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true"))
+                true
+            else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false"))
+                false
+            else
+                return .{ .err = try std.fmt.allocPrint(
+                    alloc,
+                    "unknown -Druntime-concurrency value '{s}' (valid: on, off)",
+                    .{value},
+                ) };
         } else {
             return .{ .err = try std.fmt.allocPrint(
                 alloc,
@@ -1213,6 +1237,9 @@ fn applyBuildOverrides(config: *zap.builder.BuildConfig, overrides: BuildOverrid
         };
     }
     if (overrides.frame_pointers) |fp| config.frame_pointers = fp;
+    // P2-J1: `-Druntime-concurrency=` overrides the manifest's comptime
+    // concurrency gate per-field, exactly like every other `-D` flag.
+    if (overrides.runtime_concurrency) |gate| config.runtime_concurrency = gate;
 
     // Phase 4.a — unified diagnostics: install the process-wide
     // diagnostic-output policy as a single source of truth read by the
@@ -1546,6 +1573,16 @@ fn cmdRunScript(
         .cpu = config.cpu orelse "",
         .debug_info_tag = debugInfoCacheTagFor(config.debug_info),
         .frame_pointers_tag = framePointersCacheTagFor(config.frame_pointers),
+        .runtime_concurrency = config.runtime_concurrency,
+        .concurrency_kernel_key = scriptConcurrencyKernelKey(
+            alloc,
+            config,
+            zap_lib,
+            zig_lib_dir,
+            compiler_identity_digest,
+            zig_lib_identity_digest,
+            script_optimize_policy.memory_driver_optimize,
+        ),
     }) catch {
         std.debug.print("Error: out of memory computing the script content key\n", .{});
         std.process.exit(1);
@@ -1998,6 +2035,16 @@ fn cmdTestScript(
         .cpu = config.cpu orelse "",
         .debug_info_tag = debugInfoCacheTagFor(config.debug_info),
         .frame_pointers_tag = framePointersCacheTagFor(config.frame_pointers),
+        .runtime_concurrency = config.runtime_concurrency,
+        .concurrency_kernel_key = scriptConcurrencyKernelKey(
+            alloc,
+            config,
+            zap_lib,
+            zig_lib_dir,
+            compiler_identity_digest,
+            zig_lib_identity_digest,
+            test_optimize_policy.memory_driver_optimize,
+        ),
     }) catch {
         std.debug.print("Error: out of memory computing the test content key\n", .{});
         std.process.exit(1);
@@ -4390,6 +4437,7 @@ fn buildOverrideIdentity(overrides: BuildOverrides) build_cache.OverrideIdentity
         .memory = overrides.memory,
         .target = overrides.target,
         .cpu = overrides.cpu,
+        .runtime_concurrency = overrides.runtime_concurrency,
     };
 }
 
@@ -7422,6 +7470,10 @@ fn computeManifestCacheKeyHex(
     inputs: CompileAndLinkInputs,
     config: zap.builder.BuildConfig,
     active_manager_source_path: []const u8,
+    /// P2-J1: content-address key of the concurrency kernel object
+    /// (`concurrency_driver.kernelCacheKeyHex`) when
+    /// `config.runtime_concurrency` is ON; "" when OFF.
+    concurrency_kernel_key: []const u8,
     failure: ?*ManifestCacheKeyFailure,
 ) ![]const u8 {
     if (failure) |failure_info| failure_info.* = .{
@@ -7444,6 +7496,8 @@ fn computeManifestCacheKeyHex(
         .cpu = config.cpu orelse "",
         .debug_info_tag = debugInfoCacheTagFor(config.debug_info),
         .frame_pointers_tag = framePointersCacheTagFor(config.frame_pointers),
+        .runtime_concurrency = config.runtime_concurrency,
+        .concurrency_kernel_key = concurrency_kernel_key,
     });
     if (failure) |failure_info| failure_info.* = .{ .stage = .hex_encoding };
     return digestHexAlloc(alloc, cache_digest);
@@ -7725,12 +7779,58 @@ fn compileAndLink(
     manager_source_node.updateCurrentItem(source_selection.active_manager_source_path, "Memory: locating manager backend", .{});
     manager_source_node.succeed();
 
+    // ------------------------------------------------------------------
+    // P2-J1 — concurrency gate. When `runtime_concurrency` resolved ON,
+    // the concurrency kernel unit (`src/runtime/concurrency/`, rooted at
+    // `abi.zig`) is compiled per target through the same fork primitive
+    // as manager sources and its object is linked into the binary. The
+    // kernel's content-address key is computed HERE (cheap: a source
+    // digest, no compile) so it participates in the artifact cache key;
+    // the object compile itself happens after an artifact-cache miss,
+    // mirroring the manager's source-selection/object split.
+    // ------------------------------------------------------------------
+    const runtime_concurrency_enabled = config.runtime_concurrency;
+    const concurrency_kernel_source_dir = try std.fs.path.join(
+        alloc,
+        &.{ zap_source_tree_root, zap.concurrency_driver.KERNEL_UNIT_RELATIVE_DIR },
+    );
+    const concurrency_cache_dir = try std.fs.path.join(alloc, &.{ backend_cache_dir, "concurrency" });
+    const concurrency_kernel_options: zap.concurrency_driver.KernelResolveOptions = .{
+        .kernel_source_dir = concurrency_kernel_source_dir,
+        .cache_dir = concurrency_cache_dir,
+        .zig_lib_dir = zig_lib_dir,
+        .compiler_identity_digest = inputs.compiler_identity_digest,
+        .zig_lib_identity_digest = inputs.zig_lib_identity_digest,
+        .optimize = driver_optimize,
+        .target = compile_target,
+        .cpu = compile_cpu,
+        .progress = progress,
+    };
+    var concurrency_kernel_key_storage: [64]u8 = undefined;
+    const concurrency_kernel_key: []const u8 = if (runtime_concurrency_enabled) blk: {
+        var kernel_diag_buf: [4096]u8 = undefined;
+        var kernel_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &kernel_diag_buf };
+        concurrency_kernel_key_storage = zap.concurrency_driver.kernelCacheKeyHex(
+            alloc,
+            concurrency_kernel_options,
+            &kernel_diag,
+        ) catch |err| {
+            std.debug.print("Error: concurrency kernel resolution failed: {s}\n", .{@errorName(err)});
+            if (kernel_diag.text().len > 0) {
+                std.debug.print("  {s}\n", .{kernel_diag.text()});
+            }
+            std.process.exit(1);
+        };
+        break :blk &concurrency_kernel_key_storage;
+    } else "";
+
     // Compilation caching: hash the cache source (build.zap or the
     // script source) + all Zap sources + target name, the selected
     // backend source, the running compiler identity, and EVERY build
     // control that changes the emitted artifact — including the
     // (post-override) optimize mode, frontend policy, memory manager,
-    // cross target, and cpu. Folding these controls means flipping any
+    // cross target, cpu, and the P2-J1 concurrency gate + kernel key.
+    // Folding these controls means flipping any
     // `-D` flag invalidates the cache (and is the exact key Phase 5's
     // content-addressed script skip-recompile attaches to: see
     // `cacheKeyControls`).
@@ -7744,6 +7844,7 @@ fn compileAndLink(
         cache_inputs,
         config,
         source_selection.active_manager_source_path,
+        concurrency_kernel_key,
         &cache_key_failure,
     ) catch |err| {
         emitManifestCacheKeyFailureDiagnostic(cache_key_failure, err);
@@ -7837,6 +7938,37 @@ fn compileAndLink(
     defer zap.memory_driver.freeResolved(alloc, &resolved_manager);
     manager_object_node.updateCurrentItem(resolved_manager.active_manager_source_path, "Memory: building manager object", .{});
     manager_object_node.succeed();
+
+    // P2-J1: with the gate ON, produce (or content-address-reuse) the
+    // per-target concurrency kernel object now that the artifact cache
+    // missed — the same fork primitive and cache discipline as the
+    // manager object above.
+    var resolved_concurrency_kernel: ?zap.concurrency_driver.ResolvedKernel = null;
+    defer if (resolved_concurrency_kernel) |*resolved_kernel|
+        zap.concurrency_driver.freeResolvedKernel(alloc, resolved_kernel);
+    if (runtime_concurrency_enabled) {
+        var kernel_object_node = ScopedProgressNode.start(progress, compile_parent_node, "Concurrency kernel object");
+        defer kernel_object_node.deinit();
+        var kernel_diag_buf: [4096]u8 = undefined;
+        var kernel_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &kernel_diag_buf };
+        resolved_concurrency_kernel = zap.concurrency_driver.resolveKernelObject(
+            alloc,
+            concurrency_kernel_options,
+            &kernel_diag,
+        ) catch |err| {
+            std.debug.print("Error: concurrency kernel compilation failed: {s}\n", .{@errorName(err)});
+            if (kernel_diag.text().len > 0) {
+                std.debug.print("  {s}\n", .{kernel_diag.text()});
+            }
+            std.process.exit(1);
+        };
+        kernel_object_node.updateCurrentItem(
+            resolved_concurrency_kernel.?.object_path,
+            "Concurrency: building kernel object",
+            .{},
+        );
+        kernel_object_node.succeed();
+    }
 
     // Compile through frontend
     // Use per-file pipeline for import-driven discovery, legacy pipeline for glob
@@ -7953,6 +8085,10 @@ fn compileAndLink(
             .{
                 .memory_startup_prologue_emitted = has_generated_executable_startup_prologue,
                 .collect_arc_stats = collect_arc_stats,
+                // P2-J1: flips the runtime's comptime concurrency gate;
+                // the kernel object below resolves the resulting
+                // `zap_proc_*` extern references.
+                .runtime_concurrency = runtime_concurrency_enabled,
             },
         ),
         .output_mode = output_mode_val,
@@ -7971,6 +8107,13 @@ fn compileAndLink(
         // wire intact end-to-end.
         .declared_caps = resolved_manager.declared_caps,
         .active_manager_source_path = resolved_manager.active_manager_source_path,
+        // P2-J1: the content-addressed kernel object spliced into the
+        // link line when the concurrency gate is ON; null keeps the
+        // zero-cost OFF posture.
+        .concurrency_kernel_object_path = if (resolved_concurrency_kernel) |resolved_kernel|
+            resolved_kernel.object_path
+        else
+            null,
         .progress = progress,
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
@@ -8090,6 +8233,22 @@ fn refreshManifestSnapshot(
         try appendFileFingerprint(alloc, &files, source_unit.file_path);
     }
     try appendFileFingerprint(alloc, &files, active_manager_source_path);
+    // P2-J1: a gated-on artifact links the concurrency kernel object, so
+    // the snapshot fast path must MISS when any kernel source changes —
+    // fingerprint every `.zig` file of the kernel unit, exactly as the
+    // manager backend source is fingerprinted above. Gate OFF adds
+    // nothing (the artifact contains no kernel code).
+    if (config.runtime_concurrency) {
+        const zap_source_tree_root: []const u8 = if (inputs.zap_lib_dir) |lib_dir|
+            (std.fs.path.dirname(lib_dir) orelse inputs.project_root)
+        else
+            inputs.project_root;
+        const kernel_source_dir = try std.fs.path.join(
+            alloc,
+            &.{ zap_source_tree_root, zap.concurrency_driver.KERNEL_UNIT_RELATIVE_DIR },
+        );
+        try appendKernelSourceFingerprints(alloc, &files, kernel_source_dir);
+    }
 
     try appendDirectoryFingerprint(alloc, &directories, inputs.project_root, false);
     for ([_][]const u8{ "lib", "test", "tools" }) |relative_root| {
@@ -8170,6 +8329,37 @@ fn appendFileFingerprint(
     const fingerprint = try build_cache.fileFingerprint(alloc, path);
     errdefer alloc.free(fingerprint.path);
     try files.append(alloc, fingerprint);
+}
+
+/// P2-J1: fingerprint every `.zig` source of the concurrency kernel
+/// unit (recursively, deterministic order) into a gated-on manifest
+/// snapshot. A missing/unreadable kernel unit is a hard error here —
+/// the build that just linked its object proved the unit readable, so
+/// failure means the tree mutated mid-build.
+fn appendKernelSourceFingerprints(
+    alloc: std.mem.Allocator,
+    files: *std.ArrayListUnmanaged(build_cache.FileFingerprint),
+    kernel_source_dir: []const u8,
+) !void {
+    var relative_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    var dir = try std.Io.Dir.cwd().openDir(global_io, kernel_source_dir, .{ .iterate = true });
+    defer dir.close(global_io);
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+    while (try walker.next(global_io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        try relative_paths.append(alloc, try alloc.dupe(u8, entry.path));
+    }
+    std.mem.sort([]const u8, relative_paths.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    for (relative_paths.items) |relative_path| {
+        const full_path = try std.fs.path.join(alloc, &.{ kernel_source_dir, relative_path });
+        try appendFileFingerprint(alloc, files, full_path);
+    }
 }
 
 fn appendAbsentFileFingerprint(
@@ -8356,6 +8546,17 @@ const BuildCacheOptions = struct {
     /// produce a different artifact, not a stale cache hit on a
     /// binary whose prologue does not match the request.
     frame_pointers_tag: u8 = 0,
+    /// P2-J1: the resolved `runtime_concurrency` gate. Flipping the
+    /// gate changes the emitted runtime (marker rewrite) and the link
+    /// line (kernel object present/absent), so it must produce a
+    /// different artifact, never a stale cache hit.
+    runtime_concurrency: bool = false,
+    /// P2-J1: content-address key of the concurrency kernel object
+    /// (`concurrency_driver.kernelCacheKeyHex`) when the gate is ON,
+    /// "" when OFF. Folding it means editing any kernel source under
+    /// `src/runtime/concurrency/` invalidates cached gated-on binaries
+    /// even when the compiler binary itself is unchanged.
+    concurrency_kernel_key: []const u8 = "",
 
     const Section = extern struct {
         magic: u32,
@@ -8381,8 +8582,10 @@ const BuildCacheOptions = struct {
     /// present vs. absent) changes — so a version bump invalidates
     /// every pre-Gap-E ReleaseFast / Small artifact that would
     /// otherwise satisfy a cache hit with a fresh request that now
-    /// expects the new shape.
-    const CONTROL_VERSION: u16 = 7;
+    /// expects the new shape. Version 8 (P2-J1) folds the
+    /// `runtime_concurrency` gate and the concurrency kernel object
+    /// key into artifact identity.
+    const CONTROL_VERSION: u16 = 8;
 
     fn runtimeFlags(self: BuildCacheOptions) u16 {
         var flags: u16 = 0;
@@ -8421,6 +8624,13 @@ const BuildCacheOptions = struct {
         // policy does not match the request.
         hasher.update(std.mem.asBytes(&self.debug_info_tag));
         hasher.update(std.mem.asBytes(&self.frame_pointers_tag));
+        // P2-J1: fold the concurrency gate and the kernel-object key
+        // (length-prefixed, "" when the gate is OFF).
+        const concurrency_gate_byte: u8 = if (self.runtime_concurrency) 1 else 0;
+        hasher.update(std.mem.asBytes(&concurrency_gate_byte));
+        const kernel_key_len: u64 = self.concurrency_kernel_key.len;
+        hasher.update(std.mem.asBytes(&kernel_key_len));
+        hasher.update(self.concurrency_kernel_key);
 
         const runtime_flags = self.runtimeFlags();
         if (runtime_flags == 0) return;
@@ -8510,7 +8720,11 @@ const SCRIPT_CONTENT_KEY_MAGIC: u32 = 0x5a_53_43_31; // "ZSC1"
 /// flag flip on the same source invalidates the cached artifact.
 /// Earlier v2 keys were policy-blind and would silently cache-hit
 /// the wrong prologue or DWARF policy.
-const SCRIPT_CONTENT_KEY_VERSION: u16 = 3;
+/// Bumped to v4 with P2-J1: the key now folds the
+/// `runtime_concurrency` gate and the concurrency kernel object key so
+/// a `-Druntime-concurrency=` flip (or a kernel-source edit under a
+/// gated-on script) invalidates the cached artifact.
+const SCRIPT_CONTENT_KEY_VERSION: u16 = 4;
 
 fn hashUpdateLenPrefixed(hasher: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {
     const len: u64 = bytes.len;
@@ -8639,7 +8853,70 @@ const ScriptContentKeyControls = struct {
     /// override (0 = unset / mode default, 1 = on, 2 = off). Mirror
     /// of `BuildCacheOptions.frame_pointers_tag`.
     frame_pointers_tag: u8 = 0,
+    /// P2-J1: the resolved `runtime_concurrency` gate. Mirror of
+    /// `BuildCacheOptions.runtime_concurrency` — flipping
+    /// `-Druntime-concurrency=` on the same script must produce a
+    /// distinct artifact (different runtime rewrite + link line).
+    runtime_concurrency: bool = false,
+    /// P2-J1: content-address key of the concurrency kernel object
+    /// when the gate is ON, "" when OFF. Mirror of
+    /// `BuildCacheOptions.concurrency_kernel_key` — editing a kernel
+    /// source under `src/runtime/concurrency/` must invalidate cached
+    /// gated-on script artifacts (the stdlib identity hash covers only
+    /// `.zap` files, and the compiler identity covers only the
+    /// executable's own bytes).
+    concurrency_kernel_key: []const u8 = "",
 };
+
+/// P2-J1: resolve the concurrency-kernel content key for a script-mode
+/// content key: "" when the gate is OFF; otherwise the same
+/// `kernelCacheKeyHex` the compile tail folds into the manifest cache
+/// key, computed over `<dirname(zap_lib)>/src/runtime/concurrency`.
+/// Exits with a diagnostic on failure (a gated-on script whose kernel
+/// unit cannot be read cannot build either). Allocated in `alloc`.
+fn scriptConcurrencyKernelKey(
+    alloc: std.mem.Allocator,
+    config: zap.builder.BuildConfig,
+    zap_lib: []const u8,
+    zig_lib_dir: []const u8,
+    compiler_identity_digest: BuildCacheDigest,
+    zig_lib_identity_digest: BuildCacheDigest,
+    driver_optimize: zap.memory_driver.ZapForkOptimize,
+) []const u8 {
+    if (!config.runtime_concurrency) return "";
+    const zap_source_root = std.fs.path.dirname(zap_lib) orelse ".";
+    const kernel_source_dir = std.fs.path.join(
+        alloc,
+        &.{ zap_source_root, zap.concurrency_driver.KERNEL_UNIT_RELATIVE_DIR },
+    ) catch {
+        std.debug.print("Error: out of memory resolving the concurrency kernel source directory\n", .{});
+        std.process.exit(1);
+    };
+    var kernel_diag_buf: [4096]u8 = undefined;
+    var kernel_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &kernel_diag_buf };
+    const key = zap.concurrency_driver.kernelCacheKeyHex(alloc, .{
+        .kernel_source_dir = kernel_source_dir,
+        // Key computation reads sources only; the object cache dir is
+        // resolved later by the shared compile tail.
+        .cache_dir = "",
+        .zig_lib_dir = zig_lib_dir,
+        .compiler_identity_digest = compiler_identity_digest,
+        .zig_lib_identity_digest = zig_lib_identity_digest,
+        .optimize = driver_optimize,
+        .target = config.target,
+        .cpu = config.cpu,
+    }, &kernel_diag) catch |err| {
+        std.debug.print("Error: concurrency kernel resolution failed: {s}\n", .{@errorName(err)});
+        if (kernel_diag.text().len > 0) {
+            std.debug.print("  {s}\n", .{kernel_diag.text()});
+        }
+        std.process.exit(1);
+    };
+    return alloc.dupe(u8, &key) catch {
+        std.debug.print("Error: out of memory computing the concurrency kernel key\n", .{});
+        std.process.exit(1);
+    };
+}
 
 /// Compute the hex content key for a script. Same full-SHA-256
 /// construction as `computeBuildCacheKey` so the script and manifest
@@ -8675,6 +8952,11 @@ fn computeScriptContentKey(
     // distinct cache key.
     hasher.update(std.mem.asBytes(&controls.debug_info_tag));
     hasher.update(std.mem.asBytes(&controls.frame_pointers_tag));
+    // P2-J1: fold the concurrency gate + kernel-object key (mirror of
+    // `BuildCacheOptions.updateHasher`).
+    const concurrency_gate_byte: u8 = if (controls.runtime_concurrency) 1 else 0;
+    hasher.update(std.mem.asBytes(&concurrency_gate_byte));
+    hashUpdateLenPrefixed(&hasher, controls.concurrency_kernel_key);
 
     return digestHexAlloc(alloc, hasher.finalResult());
 }
@@ -9162,6 +9444,7 @@ fn cloneBuildConfig(
             .type_name = try allocator.dupe(u8, manager.type_name),
             .adapter_source_path = try cloneOptionalString(allocator, manager.adapter_source_path),
         } else null,
+        .runtime_concurrency = config.runtime_concurrency,
         .test_timeout = config.test_timeout,
         .error_style = try cloneOptionalString(allocator, config.error_style),
         .multiline_errors = config.multiline_errors,
@@ -9630,6 +9913,17 @@ const IncrementalWatchState = struct {
     /// The manager object and generated runtime are pinned to this source; a
     /// later content change requires rebuilding the persistent Zig context.
     active_manager_source_digest: BuildCacheDigest,
+    /// P2-J1: the resolved `runtime_concurrency` gate, pinned for the
+    /// watch session exactly like the memory manager (the kernel object
+    /// and rewritten runtime were baked into the persistent Zig context
+    /// at `init`; a manifest gate flip tears the session down through
+    /// the same build.zap-change flow).
+    runtime_concurrency: bool,
+    /// P2-J1: content-address key of the pinned kernel object ("" when
+    /// the gate is OFF). Owned by `allocator`; freed in `deinit`. Folded
+    /// into the rebuild metadata cache key so gated-on watch artifacts
+    /// are keyed to the exact kernel sources they linked.
+    concurrency_kernel_key: []const u8,
 
     fn deinit(self: *IncrementalWatchState) void {
         zir_backend.destroyContext(self.zir_ctx);
@@ -9641,6 +9935,7 @@ const IncrementalWatchState = struct {
         self.allocator.free(self.output_name);
         if (self.target) |target| self.allocator.free(target);
         self.allocator.free(self.active_manager_source_path);
+        self.allocator.free(self.concurrency_kernel_key);
         self.manifest_arena.deinit();
     }
 
@@ -9792,6 +10087,52 @@ const IncrementalWatchState = struct {
         const active_manager_source_path_owned = allocator.dupe(u8, resolved_manager.active_manager_source_path) catch return error.OutOfMemory;
         errdefer allocator.free(active_manager_source_path_owned);
 
+        // P2-J1: resolve the concurrency kernel object when the gate is
+        // ON — mirroring `buildTarget`'s flow — and pin its identity for
+        // the watch session (the object path is baked into the
+        // persistent Zig context's link inputs below).
+        const runtime_concurrency_enabled = config.runtime_concurrency;
+        var resolved_concurrency_kernel: ?zap.concurrency_driver.ResolvedKernel = null;
+        defer if (resolved_concurrency_kernel) |*resolved_kernel|
+            zap.concurrency_driver.freeResolvedKernel(alloc, resolved_kernel);
+        if (runtime_concurrency_enabled) {
+            const concurrency_kernel_source_dir = std.fs.path.join(
+                alloc,
+                &.{ zap_source_tree_root, zap.concurrency_driver.KERNEL_UNIT_RELATIVE_DIR },
+            ) catch return error.OutOfMemory;
+            var kernel_diag_buf: [4096]u8 = undefined;
+            var kernel_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &kernel_diag_buf };
+            resolved_concurrency_kernel = zap.concurrency_driver.resolveKernelObject(
+                alloc,
+                .{
+                    .kernel_source_dir = concurrency_kernel_source_dir,
+                    .cache_dir = ".zap-cache/concurrency",
+                    .zig_lib_dir = zig_lib_dir,
+                    .compiler_identity_digest = compiler_identity_digest,
+                    .zig_lib_identity_digest = zig_lib_identity_digest,
+                    .optimize = driver_optimize,
+                    .target = compile_target,
+                    .cpu = compile_cpu,
+                    .progress = progress,
+                },
+                &kernel_diag,
+            ) catch |err| {
+                std.debug.print(
+                    "Error: watch-mode concurrency kernel resolution failed: {s}\n",
+                    .{@errorName(err)},
+                );
+                if (kernel_diag.text().len > 0) {
+                    std.debug.print("  {s}\n", .{kernel_diag.text()});
+                }
+                return incrementalInitErrorOrStatus(err, error.BackendError);
+            };
+        }
+        const concurrency_kernel_key_owned: []const u8 = if (resolved_concurrency_kernel) |resolved_kernel|
+            (allocator.dupe(u8, &resolved_kernel.cache_key_hex) catch return error.OutOfMemory)
+        else
+            (allocator.dupe(u8, "") catch return error.OutOfMemory);
+        errdefer allocator.free(concurrency_kernel_key_owned);
+
         const output_name_raw = if (config.asset_name) |an| (if (an.len > 0) an else config.name) else config.name;
         const out_dir: []const u8 = switch (config.kind) {
             .bin => "zap-out/bin",
@@ -9857,6 +10198,7 @@ const IncrementalWatchState = struct {
                 .{
                     .memory_startup_prologue_emitted = has_generated_executable_startup_prologue,
                     .collect_arc_stats = collect_arc_stats,
+                    .runtime_concurrency = runtime_concurrency_enabled,
                 },
             ),
             .output_mode = output_mode_val,
@@ -9867,6 +10209,10 @@ const IncrementalWatchState = struct {
             .incremental = true,
             .declared_caps = declared_caps,
             .active_manager_source_path = active_manager_source_path_owned,
+            .concurrency_kernel_object_path = if (resolved_concurrency_kernel) |resolved_kernel|
+                resolved_kernel.object_path
+            else
+                null,
             .debug_info_policy = watch_dbg_resolution.in_binary,
             .frame_pointer_policy = zir_backend.FramePointerPolicy.fromOptional(watch_dbg_resolution.frame_pointers),
         }) catch |err| return incrementalInitErrorOrStatus(err, error.BackendError);
@@ -9913,6 +10259,8 @@ const IncrementalWatchState = struct {
             .refcount_sized_extension = refcount_sized_extension,
             .active_manager_source_path = active_manager_source_path_owned,
             .active_manager_source_digest = active_manager_source_digest,
+            .runtime_concurrency = runtime_concurrency_enabled,
+            .concurrency_kernel_key = concurrency_kernel_key_owned,
         };
     }
 
@@ -9983,6 +10331,7 @@ const IncrementalWatchState = struct {
                 .{
                     .memory_startup_prologue_emitted = self.has_generated_executable_startup_prologue,
                     .collect_arc_stats = self.collect_arc_stats,
+                    .runtime_concurrency = self.runtime_concurrency,
                 },
             ),
             .output_mode = self.output_mode,
@@ -9993,6 +10342,10 @@ const IncrementalWatchState = struct {
             .arc_ownership = if (result.arc_ownership) |*ownership| ownership else null,
             .declared_caps = self.declared_caps,
             .active_manager_source_path = self.active_manager_source_path,
+            // P2-J1: rebuilds reuse the persistent context created at
+            // `init`, whose link inputs already carry the kernel object;
+            // `backendOptions` feeds `injectAndUpdate` (never a fresh
+            // `createContext`), so no object path is re-registered here.
             .progress = progress,
             .debug_info_policy = dbg_resolution.in_binary,
             .frame_pointer_policy = zir_backend.FramePointerPolicy.fromOptional(dbg_resolution.frame_pointers),
@@ -10301,7 +10654,7 @@ const IncrementalWatchState = struct {
                 .dependencies = self.manifest_dependencies,
             },
         };
-        const cache_key_hex = computeManifestCacheKeyHex(alloc, metadata_inputs, config, self.active_manager_source_path, null) catch |err|
+        const cache_key_hex = computeManifestCacheKeyHex(alloc, metadata_inputs, config, self.active_manager_source_path, self.concurrency_kernel_key, null) catch |err|
             return incrementalErrorOrStatus(err, error.CacheMetadataError);
         const output_filename = buildArtifactFilename(alloc, config) catch |err|
             return incrementalErrorOrStatus(err, error.CacheMetadataError);
@@ -15680,6 +16033,57 @@ test "parseBuildOverrides: captures memory/target/cpu values verbatim" {
     }
 }
 
+test "parseBuildOverrides: -Druntime-concurrency parses on/off/true/false and rejects junk (P2-J1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Unset ⇒ null (the manifest field decides).
+    switch (try parseBuildOverrides(a, &.{}, 0)) {
+        .ok => |ov| try testing.expect(ov.runtime_concurrency == null),
+        .err => return error.UnexpectedError,
+    }
+
+    const truthy_spellings = [_][]const u8{ "-Druntime-concurrency=on", "-Druntime-concurrency=true" };
+    for (truthy_spellings) |flag| {
+        switch (try parseBuildOverrides(a, &.{flag}, 1)) {
+            .ok => |ov| try testing.expectEqual(@as(?bool, true), ov.runtime_concurrency),
+            .err => return error.UnexpectedError,
+        }
+    }
+    const falsy_spellings = [_][]const u8{ "-Druntime-concurrency=off", "-Druntime-concurrency=false" };
+    for (falsy_spellings) |flag| {
+        switch (try parseBuildOverrides(a, &.{flag}, 1)) {
+            .ok => |ov| try testing.expectEqual(@as(?bool, false), ov.runtime_concurrency),
+            .err => return error.UnexpectedError,
+        }
+    }
+
+    switch (try parseBuildOverrides(a, &.{"-Druntime-concurrency=maybe"}, 1)) {
+        .ok => return error.UnexpectedSuccess,
+        .err => |msg| try testing.expect(std.mem.indexOf(u8, msg, "runtime-concurrency") != null),
+    }
+}
+
+test "applyBuildOverrides: -Druntime-concurrency overrides the manifest gate (P2-J1)" {
+    var config: zap.builder.BuildConfig = .{
+        .name = "app",
+        .version = "0.0.0",
+        .kind = .bin,
+    };
+    try testing.expect(!config.runtime_concurrency);
+
+    applyBuildOverrides(&config, .{ .runtime_concurrency = true });
+    try testing.expect(config.runtime_concurrency);
+
+    // Null override leaves the (now-true) manifest value untouched.
+    applyBuildOverrides(&config, .{});
+    try testing.expect(config.runtime_concurrency);
+
+    applyBuildOverrides(&config, .{ .runtime_concurrency = false });
+    try testing.expect(!config.runtime_concurrency);
+}
+
 test "parseBuildOverrides: only scans the leading region (leading_end)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -16116,6 +16520,7 @@ test "P4J2: manifest cache key records active manager source hash failures" {
             inputs,
             config,
             missing_manager_source_path,
+            "",
             &failure,
         ),
     );
