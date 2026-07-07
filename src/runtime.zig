@@ -3521,7 +3521,7 @@ const ZapConcurrencyKernel = struct {
     const ProcEntry = *const fn (process: *anyopaque, argument: ?*anyopaque) callconv(.c) void;
 
     extern fn zap_proc_runtime_init() callconv(.c) i32;
-    extern fn zap_proc_bind_manager(core_vtable: *const anyopaque, context: *anyopaque) callconv(.c) i32;
+    extern fn zap_proc_bind_manager(core_vtable: *const anyopaque) callconv(.c) i32;
     extern fn zap_proc_runtime_deinit() callconv(.c) void;
     extern fn zap_proc_run_until_quiescent() callconv(.c) i32;
     extern fn zap_proc_run_until_exit(target_pid_bits: u64) callconv(.c) i32;
@@ -3558,6 +3558,15 @@ const ZapConcurrencyKernel = struct {
     extern var zap_proc_reductions_budget: u32;
     extern var zap_proc_reductions_remaining: u32;
     extern fn zap_proc_safepoint_slow() callconv(.c) void;
+
+    // P3-J1 per-process manager routing (plan item 3.1 / A.4 OQ1). The
+    // scheduler publishes the running process's PRIVATE ARC context here at
+    // quantum entry (`process.zig`); the runtime allocation hot path reads it
+    // (via `currentManagerContext`) so each process's cells — and every
+    // message it adopts — land in its own private heap, wholesale-freed with
+    // it at teardown. Seeded by `concurrencyStartupForEntry` with the
+    // bootstrap context for out-of-quantum (startup/atexit) allocations.
+    extern var zap_proc_active_arc_context: ?*anyopaque;
 };
 
 /// Gated entry-prologue bootstrap: initialize the binary-wide
@@ -3570,25 +3579,33 @@ fn concurrencyStartupForEntry() void {
         @panic("zap: concurrency runtime failed to initialize");
     }
 
-    // P2-J5: bind the REAL manifest memory manager (Phase 2 = the ARC
-    // default) as every spawned process's manager context, replacing the
-    // kernel's Phase-1 std-allocator bootstrap arena (the no-fallbacks
-    // rule). `zapMemoryStartup` (run earlier in `memoryStartupForEntry`)
-    // has already created the manager context, so `core`/`context` are
-    // live here; the kernel adapts this v1.x core vtable through
-    // `ManifestManagerBinding` (`abi.zig`). Without this bind, every
-    // `zap_proc_spawn` — including the root process — would fail by design.
+    // P3-J1: bind the REAL manifest memory manager FACTORY (Phase 3 = the
+    // ARC default) — its core vtable — so every `zap_proc_spawn` MINTS ITS
+    // OWN private per-process context from it (plan item 3.1, the BEAM
+    // per-process-heap model). This replaces the Phase-2 shared-context
+    // binding (the no-fallbacks rule — the shared instance is gone, not
+    // layered over). `zapMemoryStartup` (run earlier in
+    // `memoryStartupForEntry`) has already created the runtime's BOOTSTRAP
+    // context and bound `core`, so both are live here. Without this bind,
+    // every `zap_proc_spawn` — including the root process — would fail by
+    // design.
     const manager_core = active_manager_state.core orelse
         @panic("zap: concurrency runtime bootstrap ran before the memory manager was bound");
-    const manager_context = active_manager_state.context orelse
+    const bootstrap_context = active_manager_state.context orelse
         @panic("zap: concurrency runtime bootstrap ran before the memory manager context was created");
-    const bind_status = ZapConcurrencyKernel.zap_proc_bind_manager(
-        @ptrCast(manager_core),
-        manager_context,
-    );
+    const bind_status = ZapConcurrencyKernel.zap_proc_bind_manager(@ptrCast(manager_core));
     if (bind_status != 0) {
         @panic("zap: concurrency runtime failed to bind the manifest memory manager");
     }
+
+    // Seed the scheduler-published current-process ARC context (A.4 OQ1) with
+    // the runtime's BOOTSTRAP context so allocations OUTSIDE any process
+    // quantum — during the remainder of startup, and in atexit handlers after
+    // the root process has exited — resolve a valid private heap. Once the
+    // root process is scheduled, `runQuantum` overwrites this per quantum with
+    // the running process's own context and restores this bootstrap value
+    // between quanta (`process.zig`, `zap_proc_active_arc_context`).
+    ZapConcurrencyKernel.zap_proc_active_arc_context = bootstrap_context;
 
     // LIFO ordering: registered AFTER `zapMemoryShutdownAtexit`
     // (registered inside `zapMemoryStartup` above), so this handler
@@ -5869,6 +5886,90 @@ pub fn mapInstrumentationLastInstanceId() u64 {
 // ============================================================
 
 pub const ArcRuntime = struct {
+    /// The manager context every hot-path allocation / free / release
+    /// dispatches against (plan item 3.1 / A.4 OQ1, P3-J1).
+    ///
+    /// With the concurrency gate ON this is the CURRENT PROCESS'S PRIVATE
+    /// context, published per scheduling quantum by the scheduler and read
+    /// from a stable memory location (`process.zig`,
+    /// `zap_proc_active_arc_context`) — so every `List`/`Map`/`String`/box a
+    /// process builds, and every message it adopts through the deep-copy
+    /// walker, lands in that process's own heap and is wholesale-freed with it
+    /// at teardown. This PUBLISHED-per-quantum read is the A.4 OQ1 decision:
+    /// it costs a single load from a hot global, beating the Phase-2 ambient
+    /// `zap_proc_current()` per-allocation lookup (a cross-object call plus a
+    /// field deref) — quantified in `docs/concurrency-bench-results.md` § OQ1
+    /// against the E10 yardstick; full register/parameter threading is the J2
+    /// monomorphization ceiling, deferred.
+    ///
+    /// With the gate OFF this folds to the binary-wide singleton
+    /// (`active_manager_state.context`) exactly as before — the comptime
+    /// branch drops the extern-global reference entirely, preserving the plan
+    /// §3 zero-cost guarantee. Returns null only on genuine misuse (dispatch
+    /// before startup or after shutdown); callers keep their `orelse` handling.
+    inline fn currentManagerContext() ?*anyopaque {
+        if (comptime runtime_concurrency_active) {
+            // The published per-quantum process context, falling back to the
+            // runtime bootstrap context when no process is current (the tiny
+            // pre-seed startup window, and the driver thread between quanta) so
+            // out-of-quantum allocations always resolve a valid private heap.
+            return ZapConcurrencyKernel.zap_proc_active_arc_context orelse active_manager_state.context;
+        }
+        return active_manager_state.context;
+    }
+
+    /// Raw (header-less) allocation of `byte_length` bytes at `alignment`
+    /// from the manifest manager — the CONTAINER-BUFFER allocator for
+    /// `List`/`Map` cells under the concurrency gate (P3-J1).
+    ///
+    /// A `List(T)`/`Map(K,V)` cell is a single contiguous buffer (inline
+    /// `ArcHeader` + payload; plan §2.4). Phase 2 allocated it straight from
+    /// `c_allocator`, so it lived OUTSIDE any per-process heap and a killed
+    /// process leaked it. Routing it through the manager's `allocate` on the
+    /// CURRENT PROCESS'S private context (`currentManagerContext`) puts the
+    /// buffer in that process's own heap, so it is wholesale-freed with the
+    /// process at teardown (crash-safe, leak-exact). Only ever called under
+    /// the gate — the gate-OFF path keeps container buffers on `c_allocator`
+    /// exactly as today (the zero-cost guarantee; E6/host baselines unchanged).
+    /// Returns null on OOM.
+    pub inline fn containerBufferAlloc(byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
+        if (active_manager_state.shutdown_complete) {
+            @panic("zap runtime: container-buffer alloc after shutdown");
+        }
+        ensureMemoryStartup();
+        const ctx = currentManagerContext() orelse
+            @panic("zap runtime: container-buffer alloc with null manager context");
+        const alignment_bytes: u32 = @intCast(alignment.toByteUnits());
+        if (comptime !active_manager_source_available) {
+            const core = active_manager_state.core orelse
+                @panic("zap runtime: container-buffer alloc with no active memory manager");
+            return core.allocate(ctx, byte_length, alignment_bytes);
+        }
+        return active_manager.allocate(ctx, byte_length, alignment_bytes);
+    }
+
+    /// Free a container buffer previously returned by `containerBufferAlloc`,
+    /// back to the CURRENT PROCESS'S private context. `byte_length`/`alignment`
+    /// MUST match the original request (the manager keys its slab free-list on
+    /// them — the alloc used `bufferSize(cap)`/`bufferAlign()`, so does every
+    /// free). Runs during the owner process's own ARC release, so
+    /// `currentManagerContext` resolves the SAME context the alloc used (the
+    /// scheduler-local-refcount invariant: a process only releases its own
+    /// cells during its own quantum). Only ever called under the gate.
+    pub inline fn containerBufferFree(memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
+        // After shutdown the manager context is deinit'd (and its heap already
+        // wholesale-freed); an individual free would double-free — skip it.
+        if (active_manager_state.shutdown_complete) return;
+        const ctx = currentManagerContext() orelse return;
+        const alignment_bytes: u32 = @intCast(alignment.toByteUnits());
+        if (comptime !active_manager_source_available) {
+            const core = active_manager_state.core orelse return;
+            core.deallocate(ctx, memory, byte_length, alignment_bytes);
+            return;
+        }
+        active_manager.deallocate(ctx, memory, byte_length, alignment_bytes);
+    }
+
     /// Increment the runtime `arc_consumes_total` counter. Emitted as a
     /// ZIR call from each `share_value(.consume)` lowering so the
     /// observable counter reflects every consume site that fired during
@@ -6055,7 +6156,7 @@ pub const ArcRuntime = struct {
                     @panic("zap runtime: allocAny dispatched with no active memory manager");
                 }
             }
-            const ctx = active_manager_state.context orelse
+            const ctx = currentManagerContext() orelse
                 @panic("zap runtime: allocAny dispatched with null manager context");
             // Header-less cell: clamp zero-size types to one byte (see
             // `nonRefcountedCellSize`). `core.allocate` asserts `size > 0`.
@@ -6131,7 +6232,7 @@ pub const ArcRuntime = struct {
         else
             comptime refcount_sized_extension_active;
         if (has_sized_extension) {
-            const ctx = active_manager_state.context orelse
+            const ctx = currentManagerContext() orelse
                 @panic("zap runtime: allocAny dispatched with null manager context");
             const size = @sizeOf(T);
             const alignment_bytes = @alignOf(T);
@@ -6183,7 +6284,7 @@ pub const ArcRuntime = struct {
                 @panic("zap runtime: allocAny dispatched with no active memory manager");
             }
         }
-        const ctx = active_manager_state.context orelse
+        const ctx = currentManagerContext() orelse
             @panic("zap runtime: allocAny dispatched with null manager context");
         const layout = LegacyArcInnerLayout(T);
         const raw = blk: {
@@ -6301,7 +6402,7 @@ pub const ArcRuntime = struct {
                 @panic("zap runtime: allocInlineHeaderCell dispatched with no active memory manager");
             }
         }
-        const ctx = active_manager_state.context orelse
+        const ctx = currentManagerContext() orelse
             @panic("zap runtime: allocInlineHeaderCell dispatched with null manager context");
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
@@ -6340,7 +6441,7 @@ pub const ArcRuntime = struct {
                 @panic("zap runtime: freeInlineHeaderCell dispatched with no active memory manager");
             }
         }
-        const ctx = active_manager_state.context orelse
+        const ctx = currentManagerContext() orelse
             @panic("zap runtime: freeInlineHeaderCell dispatched with null manager context");
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
@@ -6880,7 +6981,7 @@ pub const ArcRuntime = struct {
                 @panic("zap runtime: freeAny dispatched with no active memory manager");
             }
         }
-        const ctx = active_manager_state.context orelse
+        const ctx = currentManagerContext() orelse
             @panic("zap runtime: freeAny dispatched with null manager context");
         // Header-less cell: pass the SAME clamped size the matching `allocAny`
         // requested (see `nonRefcountedCellSize`) so a tracking manager pairs
@@ -6930,7 +7031,7 @@ pub const ArcRuntime = struct {
         // manager observes the refcount decrement and on the zero-
         // transition returns the slot to the slab pool. Public entry
         // already validated globals.
-        const ctx = active_manager_state.context orelse unreachable;
+        const ctx = currentManagerContext() orelse unreachable;
         // Phase 7b: comptime-fold the sized-extension branch for
         // source-registered builds; runtime-load for fallback object-linked builds.
         const has_sized_extension = if (comptime !active_manager_source_available)
@@ -6977,7 +7078,7 @@ pub const ArcRuntime = struct {
                         @panic("zap runtime: v1.0 legacy freeAny: no active manager core");
                     }
                 }
-                const ctx = active_manager_state.context orelse @panic(
+                const ctx = currentManagerContext() orelse @panic(
                     "zap runtime: v1.0 legacy freeAny: null manager context",
                 );
                 const raw: [*]u8 = @ptrCast(@alignCast(header_obj));
@@ -7442,7 +7543,7 @@ pub const ArcRuntime = struct {
         // releases children) and then frees the slot. The outer
         // `releaseAny` already validated globals before reaching this
         // type-specific dispatcher.
-        const ctx = active_manager_state.context orelse unreachable;
+        const ctx = currentManagerContext() orelse unreachable;
         // Phase 7b: comptime-fold the sized-extension branch for
         // source-registered builds; runtime-load for fallback object-linked builds.
         const has_sized_extension = if (comptime !active_manager_source_available)
@@ -7531,7 +7632,7 @@ pub const ArcRuntime = struct {
                         @panic("zap runtime: v1.0 legacy release: no active manager core");
                     }
                 }
-                const ctx = active_manager_state.context orelse @panic(
+                const ctx = currentManagerContext() orelse @panic(
                     "zap runtime: v1.0 legacy release: null manager context",
                 );
                 if (comptime !active_manager_source_available) {
@@ -7915,7 +8016,7 @@ pub const ArcRuntime = struct {
         // Arc(T) side-table path. The public entry has already validated
         // both globals; the orelse unreachable lets release builds
         // elide the second null check.
-        const ctx = active_manager_state.context orelse unreachable;
+        const ctx = currentManagerContext() orelse unreachable;
         // Phase 7b: comptime-fold the sized-extension branch for
         // source-registered builds; runtime-load for fallback object-linked builds.
         const has_sized_extension = if (comptime !active_manager_source_available)
@@ -8123,7 +8224,7 @@ pub const ArcRuntime = struct {
             return;
         }
         // Arc(T) side-table path. Public entry already validated globals.
-        const ctx = active_manager_state.context orelse unreachable;
+        const ctx = currentManagerContext() orelse unreachable;
         // Phase 7b: comptime-fold the sized-extension branch for
         // source-registered builds; runtime-load for fallback object-linked builds.
         const has_sized_extension = if (comptime !active_manager_source_available)
@@ -8248,7 +8349,7 @@ pub const ArcRuntime = struct {
                 @panic("zap runtime: headerRetain dispatched with no active memory manager");
             }
         }
-        const ctx = active_manager_state.context orelse {
+        const ctx = currentManagerContext() orelse {
             @panic("zap runtime: headerRetain dispatched with null manager context");
         };
         if (comptime !active_manager_source_available) {
@@ -8316,7 +8417,7 @@ pub const ArcRuntime = struct {
                 @panic("zap runtime: headerRelease dispatched with no active memory manager");
             }
         }
-        const ctx = active_manager_state.context orelse {
+        const ctx = currentManagerContext() orelse {
             @panic("zap runtime: headerRelease dispatched with null manager context");
         };
         if (comptime !active_manager_source_available) {
@@ -8360,7 +8461,7 @@ pub const ArcRuntime = struct {
         if (comptime !(active_manager_source_available and refcount_v1_active)) {
             if (active_manager_state.refcount_capability == null) return 0;
         }
-        const ctx = active_manager_state.context orelse return 0;
+        const ctx = currentManagerContext() orelse return 0;
         // Phase 7b: comptime-fold the sized-extension branch for
         // source-registered builds; runtime-load for fallback object-linked builds.
         const has_sized_extension = if (comptime !active_manager_source_available)
@@ -8572,7 +8673,7 @@ pub const ArcRuntime = struct {
                 @panic("zap runtime: reuse-decline free dispatched with no active memory manager");
             }
         }
-        const ctx = active_manager_state.context orelse
+        const ctx = currentManagerContext() orelse
             @panic("zap runtime: reuse-decline free dispatched with null manager context");
         if (comptime !active_manager_source_available) {
             const core = active_manager_state.core orelse
@@ -8794,11 +8895,21 @@ pub fn List(comptime T: type) type {
             // Comptime-elided with the concurrency gate OFF (zero cost).
             Kernel.procReductionTick();
             std.debug.assert(len_arg <= capacity_arg);
-            const allocator = std.heap.c_allocator;
             const align_v = comptime bufferAlign();
             const total = bufferSize(capacity_arg);
-            const raw = allocator.alignedAlloc(u8, align_v, total) catch return null;
-            const self_ptr: *Self = @ptrCast(@alignCast(raw.ptr));
+            // P3-J1: under the concurrency gate the cell buffer comes from the
+            // CURRENT PROCESS'S private manager heap so it is wholesale-freed
+            // with the process at teardown (leak-exact, crash-safe). Gate OFF:
+            // `c_allocator` exactly as today (the plan §2.4 architecture and
+            // the zero-cost guarantee — E6/host baselines unchanged).
+            const raw_ptr: [*]u8 = if (comptime runtime_concurrency_active)
+                (ArcRuntime.containerBufferAlloc(total, align_v) orelse return null)
+            else raw: {
+                const allocator = std.heap.c_allocator;
+                const raw = allocator.alignedAlloc(u8, align_v, total) catch return null;
+                break :raw raw.ptr;
+            };
+            const self_ptr: *Self = @ptrCast(@alignCast(raw_ptr));
             self_ptr.* = .{
                 .header = ArcHeader.init(),
                 .len = len_arg,
@@ -8811,12 +8922,19 @@ pub fn List(comptime T: type) type {
         /// the unique-owner resize path where children have been moved
         /// to the resized buffer.
         fn bufferFreeShallow(self: *Self) void {
-            const allocator = std.heap.c_allocator;
             const total = bufferSize(self.cap);
             const align_v = comptime bufferAlign();
             const raw_ptr: [*]u8 = @ptrCast(self);
-            const raw_slice = @as([*]align(align_v.toByteUnits()) u8, @alignCast(raw_ptr))[0..total];
-            allocator.free(raw_slice);
+            // P3-J1: mirror `bufferAlloc` — under the gate return the buffer to
+            // the current process's private heap (wholesale-freed at teardown);
+            // gate OFF free to `c_allocator` exactly as today.
+            if (comptime runtime_concurrency_active) {
+                ArcRuntime.containerBufferFree(raw_ptr, total, align_v);
+            } else {
+                const allocator = std.heap.c_allocator;
+                const raw_slice = @as([*]align(align_v.toByteUnits()) u8, @alignCast(raw_ptr))[0..total];
+                allocator.free(raw_slice);
+            }
         }
 
         /// Free the buffer after deep-releasing every populated element.

@@ -237,44 +237,56 @@ const Ledger = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Real manifest-manager binding (plan item 2.4 / P2-J5)
+// Real manifest-manager binding (plan item 3.1 / P3-J1 — per-process instances)
 // ---------------------------------------------------------------------------
 //
-// This REPLACES (not layers over — the no-fallbacks rule) the Phase-1
-// std-allocator bootstrap arena that previously stood in for each
-// process's manager context. The gated-on runtime bootstrap
-// (`src/runtime.zig`, `concurrencyStartupForEntry`) hands the kernel the
-// manifest memory manager's v1.x core vtable + live context via
-// `zap_proc_bind_manager` immediately after `zap_proc_runtime_init`; every
-// process spawned thereafter binds its PCB manager context to that manager
-// through the adapter below. In Phase 2 the binary's manifest model is ARC
-// (single model), so this is the real `Memory.ARC` manager — the seam the
-// `process.zig` "Manager binding" module doc reserves for this item.
+// The gated-on runtime bootstrap (`src/runtime.zig`,
+// `concurrencyStartupForEntry`) hands the kernel the manifest memory
+// manager's v1.x core VTABLE via `zap_proc_bind_manager` immediately after
+// `zap_proc_runtime_init`. The binary's manifest model is ARC (single model
+// in Phase 3), so this is the real `Memory.ARC` manager's core vtable — the
+// seam the `process.zig` "Manager binding" module doc reserves for this item.
 //
-// Phase-2 shared-instance discipline (single scheduler, single model): all
-// processes share ONE manager context (the binary-wide manifest instance),
-// so the adapter's `teardown` is a no-op — a per-process wholesale free
-// would tear down the shared heap. This is sound under ARC: a cleanly
-// exiting process has already released its cells through the compiler's
-// end-of-scope (Perceus) releases, and a killed process's still-live cells
-// are reclaimed when the shared context is deinit'd at program exit
-// (`zapMemoryShutdown`, after the LIFO concurrency-runtime shutdown). The
-// DOCUMENTED Phase-3 seam (plan item 3.1, per-spawn managers) is to give
-// each process its OWN manager instance whose `teardown` performs a real
-// per-process wholesale free; the adapter's shape does not change, only the
-// context handed to each process. Adopting cross-process message payloads
-// into a receiver's manager (plan item 2.4, the deep-copy walker) uses the
-// runtime's ARC allocation path directly (`src/runtime.zig`), not this
-// kernel-side context, because materializing typed Zap cells needs the
+// Phase-3 per-process-instance discipline (plan item 3.1 — the BEAM model,
+// project memory `project_beam_process_memory_model.md`): each process owns
+// its OWN manager instance (a private heap), minted at spawn by calling the
+// core vtable's `init` (`ManifestManagerBinding.createProcessContext`) and
+// stored as the PCB manager context. The adapter's `teardown` performs a
+// REAL per-process wholesale free by calling the core vtable's `deinit` on
+// that private context — the process's entire heap released in one call
+// (cheaper than per-cell release; crash-safe, since a killed process's
+// still-live cells are bulk-freed regardless of refcount state). This
+// REPLACES the Phase-2 shared-singleton binding whose `teardown` was a
+// documented no-op (the no-fallbacks rule — the no-op is gone, not layered
+// over): a per-process wholesale free is now correct precisely because each
+// process's context is private, so freeing it tears down only that
+// process's heap.
+//
+// The kernel is deliberately manager-agnostic: it calls the ABI's own
+// `init`/`deinit`/`allocate`/`deallocate` entry points and never reads the
+// manager's identity (it does not know the context is an ARC slab pool).
+// The core vtable is one per runtime (Phase-3 single model), so the adapter
+// thunks read it from the pinned `runtime_state.manager_binding` rather than
+// storing a `{core, ctx}` pair per process; the multi-manager symbol
+// families are plan item 3.1's J3 follow-on. Adopting cross-process message
+// payloads into a receiver's manager (plan item 2.4, the deep-copy walker)
+// uses the runtime's ARC allocation path directly (`src/runtime.zig`), which
+// in Phase 3 routes to the receiver process's OWN private context through the
+// scheduler-published `zap_proc_active_arc_context` (`process.zig`) — not
+// this kernel-side adapter, because materializing typed Zap cells needs the
 // runtime value representation the kernel is deliberately free of.
 
 /// Locally-redeclared v1.0 prefix of the memory-manager core vtable
 /// (`docs/memory-manager-abi.md` §4; canonical Zig definition in
 /// `src/memory/abi.zig`, self-contained ARC copy in
-/// `src/memory/arc/manager.zig`). The kernel adapter calls only
-/// `allocate`/`deallocate`; `init`/`deinit`/`get_capability_desc` are
-/// typed opaque because the kernel never invokes them (the runtime creates
-/// and owns the context). Redeclared per the self-contained-manager
+/// `src/memory/arc/manager.zig`). The kernel adapter calls
+/// `init`/`deinit`/`allocate`/`deallocate` — `init`/`deinit` are the
+/// Phase-3 per-process-instance factory (`ManifestManagerBinding` calls
+/// `init` once per spawn to mint a fresh private heap and `deinit` once at
+/// teardown for the real wholesale free), so they are now real typed
+/// pointers rather than the Phase-2 opaque placeholders. `get_capability_desc`
+/// stays opaque because the kernel never invokes it (the runtime discovers
+/// the refcount capability). Redeclared per the self-contained-manager
 /// convention (spec §11.1.1); the `comptime` layout asserts below catch
 /// drift from the canonical definition. A newer-minor manager advertises a
 /// larger `size` and appends trailing fields (spec §2.3); the kernel reads
@@ -284,8 +296,8 @@ const ZapMemoryManagerCoreV1 = extern struct {
     abi_minor: u16,
     size: u32,
     declared_caps: u64,
-    init: *const anyopaque,
-    deinit: *const anyopaque,
+    init: *const fn (options: ?*const anyopaque) callconv(.c) ?*anyopaque,
+    deinit: *const fn (context: *anyopaque) callconv(.c) void,
     allocate: *const fn (context: *anyopaque, byte_length: usize, alignment: u32) callconv(.c) ?[*]u8,
     deallocate: *const fn (context: *anyopaque, memory: [*]u8, byte_length: usize, alignment: u32) callconv(.c) void,
     get_capability_desc: *const anyopaque,
@@ -303,13 +315,13 @@ comptime {
         @compileError("abi: ZapMemoryManagerCoreV1.deallocate offset drift");
 }
 
-/// The process-wide binding of the manifest manager: its core vtable plus
-/// the live context the runtime created. One per runtime (Phase-2
-/// shared-instance discipline — see the section doc); every spawned
-/// process's PCB manager context adapts through it.
+/// The runtime binding of the manifest manager: its core vtable. One per
+/// runtime (Phase-3 single model — see the section doc). The per-process
+/// STATE is the private context each spawn mints from this vtable via
+/// `createProcessContext`, not a field here. Pinned as a field of the pinned
+/// `RuntimeState`.
 const ManifestManagerBinding = struct {
     core: *const ZapMemoryManagerCoreV1,
-    context: *anyopaque,
 
     const vtable = process_module.ManagerVTable{
         .allocate = allocateThunk,
@@ -318,37 +330,46 @@ const ManifestManagerBinding = struct {
         .heapByteCount = heapByteCountThunk,
     };
 
-    /// The `ManagerContext` handed to `scheduler.spawn`. `binding` must be
-    /// pinned for the life of every process that holds the context — it is
-    /// a field of the pinned `RuntimeState`, satisfied by construction.
-    fn managerContext(binding: *ManifestManagerBinding) process_module.ManagerContext {
-        return .{ .manager_state = binding, .vtable = &vtable };
+    /// Mint a FRESH private per-process manager context by calling the core
+    /// vtable's `init`, wrapped as the `ManagerContext` handed to
+    /// `scheduler.spawn`. Returns null if the manager's `init` fails (out of
+    /// memory) — the caller surfaces it as spawn failure. The returned
+    /// context's `manager_state` is the opaque private-context pointer; its
+    /// `teardown` wholesale-frees it via the core vtable's `deinit`.
+    fn createProcessContext(binding: *ManifestManagerBinding) ?process_module.ManagerContext {
+        const context = binding.core.init(null) orelse return null;
+        return .{ .manager_state = context, .vtable = &vtable };
+    }
+
+    /// The shared core vtable every per-process thunk dispatches through
+    /// (Phase-3 single model — see the section doc). Read from the pinned
+    /// runtime binding rather than stored per process; the `manager_bound`
+    /// spawn gate guarantees it is live whenever a process holds a context.
+    inline fn sharedCore() *const ZapMemoryManagerCoreV1 {
+        return runtime_state.manager_binding.core;
     }
 
     fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
-        const binding: *ManifestManagerBinding = @ptrCast(@alignCast(manager_state.?));
-        return binding.core.allocate(binding.context, byte_length, @intCast(alignment.toByteUnits()));
+        return sharedCore().allocate(manager_state.?, byte_length, @intCast(alignment.toByteUnits()));
     }
 
     fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
-        const binding: *ManifestManagerBinding = @ptrCast(@alignCast(manager_state.?));
-        binding.core.deallocate(binding.context, memory, byte_length, @intCast(alignment.toByteUnits()));
+        sharedCore().deallocate(manager_state.?, memory, byte_length, @intCast(alignment.toByteUnits()));
     }
 
-    /// No-op by design: the manifest context is process-wide and shared by
-    /// every Phase-2 process, so a per-process wholesale free would tear
-    /// down the shared heap (see the section doc for why this is sound
-    /// under ARC and the Phase-3 per-process-instance seam that makes it a
-    /// real wholesale free).
+    /// The REAL per-process wholesale free (plan item 3.1): release this
+    /// process's entire private heap in one call via the core vtable's
+    /// `deinit`. Replaces the Phase-2 no-op (see the section doc). Sound and
+    /// crash-safe: the context is private to this process, so `deinit` tears
+    /// down only its heap — every still-live cell (a cleanly exited process
+    /// has none; a killed one may have many) is bulk-reclaimed.
     fn teardownThunk(manager_state: ?*anyopaque) void {
-        _ = manager_state;
+        sharedCore().deinit(manager_state.?);
     }
 
-    /// Advisory only (plan item 1.6): the v1.0 core ABI exposes no
-    /// per-context live-byte query, and the shared context's global total
-    /// is not this process's own heap, so report 0 rather than a
-    /// misleading aggregate. Per-process byte accounting arrives with the
-    /// Phase-3 private instances.
+    /// Advisory only (plan item 1.6): the v1.0 core ABI exposes no per-context
+    /// live-byte query, so report 0. Per-process byte accounting is a manager
+    /// capability follow-on; teardown returns the whole heap regardless.
     fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
         _ = manager_state;
         return 0;
@@ -393,11 +414,12 @@ const RuntimeState = struct {
     envelope_pool: concurrency.EnvelopePool,
     scheduler: concurrency.Scheduler,
     ledger: Ledger,
-    /// The manifest manager binding (`zap_proc_bind_manager`). Every
-    /// spawned process's PCB manager context adapts through it. Valid only
-    /// while `manager_bound` is true; pinned (a field of the pinned
-    /// `RuntimeState`) so the `ManagerContext` pointers processes hold
-    /// stay live.
+    /// The manifest manager binding (`zap_proc_bind_manager`): the core
+    /// vtable every spawn mints a fresh private per-process context from.
+    /// Valid only while `manager_bound` is true; pinned (a field of the
+    /// pinned `RuntimeState`) so the per-process thunks that read its `core`
+    /// through `ManifestManagerBinding.sharedCore` stay valid for the life
+    /// of every process holding a context.
     manager_binding: ManifestManagerBinding,
     /// Whether `manager_binding` has been set. Spawn refuses to proceed
     /// until the runtime bootstrap has bound the manifest manager (no
@@ -457,27 +479,30 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
     return ZapProcStatus.ok;
 }
 
-/// Bind the manifest memory manager for spawned processes: `core_vtable`
-/// is the manager's v1.x core vtable (`ZapMemoryManagerCoreV1`) and
-/// `context` its live instance, both created and owned by the runtime
-/// (`src/runtime.zig`, `active_manager_state`). Called once by the gated-on
-/// bootstrap immediately after `zap_proc_runtime_init`, BEFORE any spawn.
-/// Every process spawned thereafter binds its PCB manager context to this
-/// manager through the kernel adapter (`ManifestManagerBinding`) — the
-/// P2-J5 replacement of the Phase-1 std-allocator bootstrap arena. Rebinds
-/// are idempotent-friendly (last wins); the runtime binds exactly once.
-/// Driver thread only.
+/// Bind the manifest memory manager FACTORY for spawned processes:
+/// `core_vtable` is the manager's v1.x core vtable
+/// (`ZapMemoryManagerCoreV1`), created and owned by the runtime
+/// (`src/runtime.zig`, `active_manager_state.core`). Called once by the
+/// gated-on bootstrap immediately after `zap_proc_runtime_init`, BEFORE any
+/// spawn. Every process spawned thereafter MINTS ITS OWN private context
+/// from this vtable's `init` (`ManifestManagerBinding.createProcessContext`)
+/// — the Phase-3 per-process-instance model (plan item 3.1) replacing the
+/// Phase-2 shared-context binding. Note the signature change from Phase 2:
+/// no shared `context` is passed, because each process creates its own
+/// (`docs/memory-manager-abi.md` records the ABI). Rebinds are
+/// idempotent-friendly (last wins); the runtime binds exactly once. Driver
+/// thread only.
 ///
 /// Returns `ZapProcStatus.ok`, `not_initialized`, or
 /// `manager_abi_unsupported` (the core declares a non-1 ABI major or a
 /// sub-v1.0 `size`).
-export fn zap_proc_bind_manager(core_vtable: *const anyopaque, context: *anyopaque) callconv(.c) i32 {
+export fn zap_proc_bind_manager(core_vtable: *const anyopaque) callconv(.c) i32 {
     if (!runtime_initialized) return ZapProcStatus.not_initialized;
     const core: *const ZapMemoryManagerCoreV1 = @ptrCast(@alignCast(core_vtable));
     if (core.abi_major != 1 or core.size < @sizeOf(ZapMemoryManagerCoreV1)) {
         return ZapProcStatus.manager_abi_unsupported;
     }
-    runtime_state.manager_binding = .{ .core = core, .context = context };
+    runtime_state.manager_binding = .{ .core = core };
     runtime_state.manager_bound = true;
     return ZapProcStatus.ok;
 }
@@ -557,33 +582,43 @@ export fn zap_proc_current() callconv(.c) ?*anyopaque {
 // Intrinsics — spawn (driver thread or process body; same OS thread)
 // ---------------------------------------------------------------------------
 
-/// Spawn a process running `entry(process_handle, argument)` under the
-/// manifest manager binding (Phase 2 scope: manifest manager only — the
-/// bootstrap arena manager until plan item 2.4 binds the real manager
-/// ABI). The returned `u64` is the new pid's raw encoding; `0` (the
-/// invalid pid — never issued) signals failure (runtime not initialized,
-/// allocation failure, or process-table exhaustion).
+/// Spawn a process running `entry(process_handle, argument)` on its OWN
+/// private per-process manager instance (plan item 3.1): the spawn mints a
+/// fresh context from the bound manifest manager's core vtable, wholesale-
+/// freed at the process's teardown. The returned `u64` is the new pid's raw
+/// encoding; `0` (the invalid pid — never issued) signals failure (runtime
+/// not initialized, no manager bound, manager `init` failure, allocation
+/// failure, or process-table exhaustion).
 export fn zap_proc_spawn(entry: ZapProcEntry, argument: ?*anyopaque) callconv(.c) u64 {
     if (!runtime_initialized) return concurrency.Pid.invalid.toBits();
     // No fallback bootstrap arena (the no-fallbacks rule): a process cannot
     // spawn until the runtime bootstrap has bound the manifest manager.
     if (!runtime_state.manager_bound) return concurrency.Pid.invalid.toBits();
 
-    const closure_block = runtime_state.ledger.allocate(@sizeOf(SpawnClosure)) catch
+    // Phase-3 per-process instance (plan item 3.1): mint a FRESH private
+    // manager context (a private heap) for this process from the bound core
+    // vtable's `init`. On any downstream spawn failure it is wholesale-freed
+    // via the vtable's `deinit` (`manager_context.teardown()`) so the private
+    // heap never leaks — see `ManifestManagerBinding`.
+    const manager_context = runtime_state.manager_binding.createProcessContext() orelse
         return concurrency.Pid.invalid.toBits();
+
+    const closure_block = runtime_state.ledger.allocate(@sizeOf(SpawnClosure)) catch {
+        manager_context.teardown();
+        return concurrency.Pid.invalid.toBits();
+    };
     const closure: *SpawnClosure = @ptrCast(@alignCast(closure_block.bodyPointer()));
     closure.* = .{ .c_entry = entry, .c_argument = argument };
 
     const pid = runtime_state.scheduler.spawn(.{
         .entry = spawnTrampoline,
         .argument = closure_block,
-        // Every process binds the shared manifest manager context (Phase-2
-        // single-instance discipline; the adapter's teardown is a no-op —
-        // see `ManifestManagerBinding`). No per-process manager state to
-        // reclaim on spawn failure, so the catch only frees the closure.
-        .manager = runtime_state.manager_binding.managerContext(),
+        // The process runs on its OWN private context; the adapter's
+        // teardown wholesale-frees it at exit (`ManifestManagerBinding`).
+        .manager = manager_context,
     }) catch {
         runtime_state.ledger.free(closure_block);
+        manager_context.teardown();
         return concurrency.Pid.invalid.toBits();
     };
     return pid.toBits();
@@ -765,82 +800,156 @@ export fn zap_proc_dead_letter_unexpected(process: *anyopaque) callconv(.c) nore
 
 const testing = std.testing;
 
-/// Test-only manifest-manager double for the kernel's OWN standalone test
-/// binary. The PRODUCTION binding is the real `Memory.ARC` manager, handed
-/// in by `src/runtime.zig`'s bootstrap; the kernel test binary has no
+/// Test-only manifest-manager FACTORY double for the kernel's OWN standalone
+/// test binary. The PRODUCTION binding is the real `Memory.ARC` manager,
+/// handed in by `src/runtime.zig`'s bootstrap; the kernel test binary has no
 /// access to that fork-compiled object, so it drives the
 /// `ManifestManagerBinding` adapter with this page-allocator core double
 /// (clearly test-scoped, per the deliverable's "test-only double where a
-/// std-allocator manager is genuinely needed" carve-out). The kernel's own
-/// tests never allocate through a process's PCB manager (message payloads
-/// ride the ledger, not the process heap), so the double exists to satisfy
-/// the spawn-requires-a-bound-manager contract and to back the adapter unit
-/// test below.
+/// std-allocator manager is genuinely needed" carve-out).
+///
+/// Unlike the Phase-2 shared-context double, this is a REAL per-instance
+/// FACTORY: every `init` mints a fresh private `Context` (an arena over the
+/// backing allocator) and every `deinit` wholesale-frees it — the exact
+/// shape the production ARC manager has (`arcInit`/`arcDeinit`), so the
+/// per-process-instance tests below exercise the same create/allocate/
+/// wholesale-free lifecycle the real manager runs. Factory-wide accounting
+/// (`init_total`/`deinit_total`/`live_context_count`/`live_bytes_total`) is
+/// the leak-exactness oracle: a process that dies with still-live bytes must
+/// see them reclaimed by ITS context's `deinit`, driving `live_bytes_total`
+/// back to zero across spawn/die cycles.
 const TestManagerCore = struct {
+    /// One process's private heap: an arena plus its own live-byte count.
+    const Context = struct {
+        arena: std.heap.ArenaAllocator,
+        live_bytes: usize,
+    };
+
+    // Factory-wide accounting across every context this double mints.
+    var init_total: usize = 0;
+    var deinit_total: usize = 0;
+    var live_context_count: usize = 0;
+    var live_bytes_total: usize = 0;
+
+    /// Zero the factory accounting at the start of a per-instance test so its
+    /// assertions start from a known baseline.
+    fn resetAccounting() void {
+        init_total = 0;
+        deinit_total = 0;
+        live_context_count = 0;
+        live_bytes_total = 0;
+    }
+
     const core = ZapMemoryManagerCoreV1{
         .abi_major = 1,
         .abi_minor = 0,
         .size = @sizeOf(ZapMemoryManagerCoreV1),
         .declared_caps = 0,
-        .init = @ptrCast(&unusedThunk),
-        .deinit = @ptrCast(&unusedThunk),
+        .init = initThunk,
+        .deinit = deinitThunk,
         .allocate = allocateThunk,
         .deallocate = deallocateThunk,
         .get_capability_desc = @ptrCast(&unusedThunk),
     };
 
-    /// Opaque context marker (the double keeps no per-instance state; its
-    /// allocate/deallocate route straight to the backing allocator).
-    var context_marker: u8 = 0;
-
     fn unusedThunk() callconv(.c) void {}
 
-    fn allocateThunk(context: *anyopaque, byte_length: usize, alignment: u32) callconv(.c) ?[*]u8 {
-        _ = context;
-        return backing_allocator.rawAlloc(byte_length, std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    fn initThunk(options: ?*const anyopaque) callconv(.c) ?*anyopaque {
+        _ = options;
+        const context = backing_allocator.create(Context) catch return null;
+        context.* = .{ .arena = std.heap.ArenaAllocator.init(backing_allocator), .live_bytes = 0 };
+        init_total += 1;
+        live_context_count += 1;
+        return @ptrCast(context);
     }
 
-    fn deallocateThunk(context: *anyopaque, memory: [*]u8, byte_length: usize, alignment: u32) callconv(.c) void {
-        _ = context;
-        backing_allocator.rawFree(memory[0..byte_length], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    fn deinitThunk(context_pointer: *anyopaque) callconv(.c) void {
+        const context: *Context = @ptrCast(@alignCast(context_pointer));
+        // Wholesale free: the arena releases every still-live allocation in
+        // one call — the leak-exact per-process teardown this double proves.
+        std.debug.assert(live_bytes_total >= context.live_bytes);
+        live_bytes_total -= context.live_bytes;
+        context.arena.deinit();
+        backing_allocator.destroy(context);
+        deinit_total += 1;
+        std.debug.assert(live_context_count > 0);
+        live_context_count -= 1;
+    }
+
+    fn allocateThunk(context_pointer: *anyopaque, byte_length: usize, alignment: u32) callconv(.c) ?[*]u8 {
+        const context: *Context = @ptrCast(@alignCast(context_pointer));
+        const memory = context.arena.allocator().rawAlloc(
+            byte_length,
+            std.mem.Alignment.fromByteUnits(alignment),
+            @returnAddress(),
+        ) orelse return null;
+        context.live_bytes += byte_length;
+        live_bytes_total += byte_length;
+        return memory;
+    }
+
+    fn deallocateThunk(context_pointer: *anyopaque, memory: [*]u8, byte_length: usize, alignment: u32) callconv(.c) void {
+        const context: *Context = @ptrCast(@alignCast(context_pointer));
+        context.arena.allocator().rawFree(memory[0..byte_length], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+        std.debug.assert(context.live_bytes >= byte_length);
+        context.live_bytes -= byte_length;
+        std.debug.assert(live_bytes_total >= byte_length);
+        live_bytes_total -= byte_length;
     }
 };
 
-/// Bind the kernel test double as the manifest manager — the test-suite
-/// mirror of what `src/runtime.zig`'s bootstrap does with the real ARC
-/// manager. Call after `zap_proc_runtime_init` in any test that spawns.
+/// Bind the kernel test double factory as the manifest manager — the
+/// test-suite mirror of what `src/runtime.zig`'s bootstrap does with the
+/// real ARC manager. Call after `zap_proc_runtime_init` in any test that
+/// spawns.
 fn bindTestManager() void {
-    _ = zap_proc_bind_manager(@ptrCast(&TestManagerCore.core), @ptrCast(&TestManagerCore.context_marker));
+    _ = zap_proc_bind_manager(@ptrCast(&TestManagerCore.core));
 }
 
-test "abi: ManifestManagerBinding adapts a core vtable's allocate/deallocate; teardown no-op; heap bytes 0" {
-    var binding = ManifestManagerBinding{
-        .core = &TestManagerCore.core,
-        .context = @ptrCast(&TestManagerCore.context_marker),
-    };
-    const manager = binding.managerContext();
+test "abi: ManifestManagerBinding mints a fresh per-process context and wholesale-frees it at teardown" {
+    // The section under test needs the runtime's pinned binding live so the
+    // per-process thunks resolve the shared core through `sharedCore()`.
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    TestManagerCore.resetAccounting();
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_bind_manager(@ptrCast(&TestManagerCore.core)));
 
-    const block = manager.allocate(48, .of(u64)) orelse return error.TestUnexpectedResult;
+    // Two spawns get two DISTINCT private contexts (the per-process model,
+    // not a shared instance).
+    const first = runtime_state.manager_binding.createProcessContext() orelse return error.TestUnexpectedResult;
+    const second = runtime_state.manager_binding.createProcessContext() orelse return error.TestUnexpectedResult;
+    try testing.expect(first.manager_state.? != second.manager_state.?);
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.init_total);
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.live_context_count);
+
+    // Allocate into the first context and DELIBERATELY do not free it — the
+    // killed-process shape whose live cells must be reclaimed wholesale.
+    const block = first.allocate(48, .of(u64)) orelse return error.TestUnexpectedResult;
     block[0] = 0x5A;
     block[47] = 0xA5;
+    try testing.expectEqual(@as(usize, 48), TestManagerCore.live_bytes_total);
 
     // heapByteCount is advisory 0 (no per-context query on the v1.0 core).
-    try testing.expectEqual(@as(usize, 0), manager.heapByteCount());
+    try testing.expectEqual(@as(usize, 0), first.heapByteCount());
 
-    // teardown is a deliberate no-op (shared instance) — it must NOT free
-    // the block. Prove the bytes survive.
-    manager.teardown();
-    try testing.expectEqual(@as(u8, 0x5A), block[0]);
-    try testing.expectEqual(@as(u8, 0xA5), block[47]);
+    // teardown is a REAL wholesale free (Phase 3): it reclaims the still-live
+    // block and destroys the private context — no per-cell free needed.
+    first.teardown();
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
+    try testing.expectEqual(@as(usize, 1), TestManagerCore.deinit_total);
+    try testing.expectEqual(@as(usize, 1), TestManagerCore.live_context_count);
 
-    manager.deallocate(block, 48, .of(u64));
+    // The second context is independent — untouched by the first's teardown.
+    second.teardown();
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.deinit_total);
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
 }
 
 test "abi: zap_proc_bind_manager validates the core ABI and gates spawn (no fallback arena)" {
     // Binding before init reports not_initialized.
     try testing.expectEqual(
         ZapProcStatus.not_initialized,
-        zap_proc_bind_manager(@ptrCast(&TestManagerCore.core), @ptrCast(&TestManagerCore.context_marker)),
+        zap_proc_bind_manager(@ptrCast(&TestManagerCore.core)),
     );
 
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
@@ -852,15 +961,15 @@ test "abi: zap_proc_bind_manager validates the core ABI and gates spawn (no fall
         .abi_minor = 0,
         .size = @sizeOf(ZapMemoryManagerCoreV1),
         .declared_caps = 0,
-        .init = @ptrCast(&TestManagerCore.unusedThunk),
-        .deinit = @ptrCast(&TestManagerCore.unusedThunk),
+        .init = TestManagerCore.initThunk,
+        .deinit = TestManagerCore.deinitThunk,
         .allocate = TestManagerCore.allocateThunk,
         .deallocate = TestManagerCore.deallocateThunk,
         .get_capability_desc = @ptrCast(&TestManagerCore.unusedThunk),
     };
     try testing.expectEqual(
         ZapProcStatus.manager_abi_unsupported,
-        zap_proc_bind_manager(@ptrCast(&bad_core), @ptrCast(&TestManagerCore.context_marker)),
+        zap_proc_bind_manager(@ptrCast(&bad_core)),
     );
 
     // Spawn is gated until a valid manager is bound.
@@ -869,6 +978,103 @@ test "abi: zap_proc_bind_manager validates the core ABI and gates spawn (no fall
     const pid_bits = zap_proc_spawn(smokeReceiverEntry, null);
     try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
     // The parked receiver is torn down by deinit (shutdownAllProcesses).
+}
+
+// -- per-process private instances (plan item 3.1, P3-J1) -----------------------
+
+/// Probe for the per-process-instance tests: each process body allocates
+/// `byte_length` bytes into ITS OWN private manager context and deliberately
+/// never frees it — the still-live-at-death shape the wholesale teardown must
+/// reclaim. `processes_run` counts bodies that reached the allocation.
+const PerProcessAllocProbe = struct {
+    byte_length: usize,
+    processes_run: usize = 0,
+};
+
+/// Allocate into this process's own private heap (through the PCB manager
+/// context reached from the entry handle), then return — the normal-exit
+/// path whose teardown wholesale-frees the never-freed block.
+fn perProcessAllocatingEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *PerProcessAllocProbe = @ptrCast(@alignCast(argument.?));
+    const context = contextFromHandle(process);
+    const block = context.record.pcb.manager.allocate(probe.byte_length, .of(u64)) orelse return;
+    block[0] = 0x11;
+    probe.processes_run += 1;
+}
+
+/// Allocate into this process's own private heap, then park forever — the
+/// killed-with-live-allocations shape torn down by `shutdownAllProcesses`.
+fn allocateThenParkEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *PerProcessAllocProbe = @ptrCast(@alignCast(argument.?));
+    const context = contextFromHandle(process);
+    const block = context.record.pcb.manager.allocate(probe.byte_length, .of(u64)) orelse return;
+    block[0] = 0x22;
+    probe.processes_run += 1;
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    _ = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    @panic("the allocating straggler must never receive a message");
+}
+
+/// Return on the first quantum — a driver process whose exit lets
+/// `zap_proc_run_until_exit` return while a straggler stays parked.
+fn immediateExitEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    _ = process;
+    _ = argument;
+}
+
+test "abi: each spawned process gets its own private context, wholesale-freed leak-exact at exit" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    TestManagerCore.resetAccounting();
+    bindTestManager();
+
+    var probe = PerProcessAllocProbe{ .byte_length = 64 };
+    const process_count: usize = 8;
+    var index: usize = 0;
+    while (index < process_count) : (index += 1) {
+        const pid_bits = zap_proc_spawn(perProcessAllocatingEntry, &probe);
+        try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+    }
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // Every process ran and allocated into its OWN private context — one
+    // context minted per spawn (NOT a shared instance).
+    try testing.expectEqual(process_count, probe.processes_run);
+    try testing.expectEqual(process_count, TestManagerCore.init_total);
+    // Every process's context was wholesale-freed at its teardown, reclaiming
+    // the never-freed 64-byte block — leak-exact, zero residue.
+    try testing.expectEqual(process_count, TestManagerCore.deinit_total);
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
+}
+
+test "abi: a killed process's live allocations are wholesale-freed at teardown (crash-teardown leak-exactness)" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    TestManagerCore.resetAccounting();
+    bindTestManager();
+
+    // The allocating straggler parks forever; a driver process exits so
+    // `run_until_exit` returns after the straggler has taken its quantum
+    // (allocated into its private heap, then parked).
+    var probe = PerProcessAllocProbe{ .byte_length = 128 };
+    const straggler_bits = zap_proc_spawn(allocateThenParkEntry, &probe);
+    try testing.expect(straggler_bits != concurrency.Pid.invalid.toBits());
+    const driver_bits = zap_proc_spawn(immediateExitEntry, null);
+    try testing.expect(driver_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(driver_bits));
+
+    // The straggler is parked with a live 128-byte allocation in its context.
+    try testing.expectEqual(@as(usize, 1), probe.processes_run);
+    try testing.expect(TestManagerCore.live_bytes_total >= 128);
+    try testing.expect(TestManagerCore.live_context_count >= 1);
+
+    // Program shutdown kills the straggler; its teardown wholesale-frees the
+    // live allocation — every minted context deinit'd, zero residue.
+    zap_proc_runtime_deinit();
+    try testing.expectEqual(TestManagerCore.init_total, TestManagerCore.deinit_total);
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
 }
 
 test "abi: runtime init/deinit lifecycle guards double-init and supports re-init" {

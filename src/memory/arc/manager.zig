@@ -698,6 +698,13 @@ inline fn slabPoolInit() SlabPool {
 var test_slab_mmap_total: usize = 0;
 var test_slab_unmap_total: usize = 0;
 
+/// Test-only counters for LARGE (page_allocator-backed) allocations —
+/// mirror `test_slab_*`, letting the P3-J1 per-process wholesale-free test
+/// assert every large cell is reclaimed at `arcDeinit` (allocs == frees).
+/// Compile away outside `zig build test`.
+var test_large_alloc_total: usize = 0;
+var test_large_free_total: usize = 0;
+
 fn mmapAlignedSlab() ?[*]align(std.heap.page_size_min) u8 {
     const page_size = std.heap.page_size_min;
     // SLAB_SIZE must be a multiple of the OS page size so the
@@ -1004,15 +1011,27 @@ const LargeHeader = extern struct {
     size: usize,
     alignment: u32,
     refcount: u32,
+    /// Intrusive links in the OWNING CONTEXT's large-allocation list
+    /// (P3-J1). Large allocations (> `MAX_SLAB_CLASS_SIZE`) bypass the slab
+    /// pool and go straight to `page_allocator`, so the per-process wholesale
+    /// free (`arcDeinit`) would leak every one of them unless it can walk
+    /// them — this list is that walk. A cleanly-exiting process unlinks each
+    /// large cell as its refcount hits zero (`largeFree`); a killed process's
+    /// still-live large cells are reclaimed by `arcDeinit` walking `large_head`.
+    /// Owner-only, mutated on alloc/free within the owning process's quantum
+    /// (no atomics — same single-owner discipline as the slab pool).
+    prev: ?*LargeHeader,
+    next: ?*LargeHeader,
 };
 
 comptime {
     // Internal large-allocation header (not a cross-tooling ABI type),
     // so the assert is pointer-width relative: a `u32` magic + `u32`
-    // pad, then a `usize` size, then `u32` alignment + `u32` refcount —
-    // `16 + @sizeOf(usize)` bytes (24 on 64-bit, 20 on wasm32).
-    if (@sizeOf(LargeHeader) != 16 + @sizeOf(usize)) @compileError(
-        "arc: LargeHeader must be its two u32 prefix + usize + two u32 trailer",
+    // pad, then a `usize` size, then `u32` alignment + `u32` refcount,
+    // then two intrusive `?*LargeHeader` list links — `16 + @sizeOf(usize)
+    // + 2 * @sizeOf(pointer)` bytes (40 on 64-bit, 28 on wasm32).
+    if (@sizeOf(LargeHeader) != 16 + @sizeOf(usize) + 2 * @sizeOf(?*LargeHeader)) @compileError(
+        "arc: LargeHeader must be its two u32 prefix + usize + two u32 + two list-link pointers",
     );
 }
 
@@ -1026,7 +1045,7 @@ inline fn largeLeadingFor(alignment: u32) usize {
     return aligned_lead;
 }
 
-fn largeAlloc(size: usize, alignment: u32, init_refcount: u32) ?[*]u8 {
+fn largeAlloc(arc_ctx: *ArcContext, size: usize, alignment: u32, init_refcount: u32) ?[*]u8 {
     const leading = largeLeadingFor(alignment);
     const total = std.math.add(usize, leading, size) catch return null;
     const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(alignment, @as(u32, @intCast(std.heap.page_size_min))));
@@ -1038,11 +1057,34 @@ fn largeAlloc(size: usize, alignment: u32, init_refcount: u32) ?[*]u8 {
         .size = size,
         .alignment = alignment,
         .refcount = init_refcount,
+        // Link at the head of the owning context's large-allocation list so
+        // `arcDeinit` can wholesale-free it (P3-J1 leak-exactness).
+        .prev = null,
+        .next = arc_ctx.large_head,
     };
+    if (arc_ctx.large_head) |old_head| old_head.prev = header_ptr;
+    arc_ctx.large_head = header_ptr;
+    if (builtin.is_test) test_large_alloc_total += 1;
     return base + leading;
 }
 
-fn largeFree(ptr: [*]u8) void {
+/// Return a large allocation's backing page to the OS. Assumes `header_ptr`
+/// has already been validated (`magic == LARGE_MAGIC`) and unlinked from any
+/// context list. Shared by the individual-free path (`largeFree`) and the
+/// wholesale per-process teardown (`arcDeinit`).
+fn largeFreePage(header_ptr: *LargeHeader) void {
+    const alignment = header_ptr.alignment;
+    const leading = largeLeadingFor(alignment);
+    const total = leading + header_ptr.size;
+    // The allocation base sits `leading` bytes before the user pointer, which
+    // is `@sizeOf(LargeHeader)` bytes past the header.
+    const base: [*]u8 = @ptrFromInt(@intFromPtr(header_ptr) + @sizeOf(LargeHeader) - leading);
+    const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(alignment, @as(u32, @intCast(std.heap.page_size_min))));
+    std.heap.page_allocator.rawFree(base[0..total], inner_alignment, @returnAddress());
+    if (builtin.is_test) test_large_free_total += 1;
+}
+
+fn largeFree(arc_ctx: *ArcContext, ptr: [*]u8) void {
     const header_ptr: *LargeHeader = @ptrCast(@alignCast(ptr - @sizeOf(LargeHeader)));
     // Magic mismatch is fatal corruption — the pointer either does
     // not belong to this manager or its header was overwritten.
@@ -1051,12 +1093,14 @@ fn largeFree(ptr: [*]u8) void {
     // even in release builds so the diagnostic surfaces with the
     // failing pointer rather than as a downstream memory corruption.
     if (header_ptr.magic != LARGE_MAGIC) @panic("zap.arc: largeFree: corrupt LargeHeader magic (pointer not owned by this manager or double-free)");
-    const alignment = header_ptr.alignment;
-    const leading = largeLeadingFor(alignment);
-    const total = leading + header_ptr.size;
-    const base: [*]u8 = ptr - leading;
-    const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(alignment, @as(u32, @intCast(std.heap.page_size_min))));
-    std.heap.page_allocator.rawFree(base[0..total], inner_alignment, @returnAddress());
+    // Unlink from the owning context's large-allocation list before freeing.
+    if (header_ptr.prev) |prev| {
+        prev.next = header_ptr.next;
+    } else {
+        arc_ctx.large_head = header_ptr.next;
+    }
+    if (header_ptr.next) |next| next.prev = header_ptr.prev;
+    largeFreePage(header_ptr);
 }
 
 inline fn largeHeader(ptr: *anyopaque) *LargeHeader {
@@ -1074,6 +1118,12 @@ inline fn largeHeader(ptr: *anyopaque) *LargeHeader {
 
 const ArcContext = struct {
     slab_pool: SlabPool,
+    /// Head of the intrusive list of this context's LIVE large allocations
+    /// (> `MAX_SLAB_CLASS_SIZE`, `page_allocator`-backed, outside the slab
+    /// pool). `arcDeinit` walks it to wholesale-free them — the per-process
+    /// leak-exactness contract (P3-J1): a killed process's live large cells
+    /// are bulk-reclaimed here, not leaked.
+    large_head: ?*LargeHeader = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1179,15 @@ fn arcInit(options: ?*const ZapInitOptions) callconv(.c) ?*anyopaque {
 /// (current + partial + every cached empty slab of every class).
 fn arcDeinit(ctx: *anyopaque) callconv(.c) void {
     const arc_ctx: *ArcContext = @ptrCast(@alignCast(ctx));
+    // Wholesale-free every LIVE large allocation (P3-J1 leak-exactness):
+    // large cells (> MAX_SLAB_CLASS_SIZE) bypass the slab pool and would
+    // otherwise leak on a killed process's teardown. Walk the intrusive list
+    // and return each backing page to the OS.
+    while (arc_ctx.large_head) |header_ptr| {
+        arc_ctx.large_head = header_ptr.next;
+        std.debug.assert(header_ptr.magic == LARGE_MAGIC);
+        largeFreePage(header_ptr);
+    }
     var class_index: u32 = 0;
     while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
         const class = &arc_ctx.slab_pool.classes[class_index];
@@ -1162,7 +1221,7 @@ fn arcAllocate(ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8
     if (lookupClass(size, alignment)) |class_index| {
         return slabAllocSlot(&arc_ctx.slab_pool, class_index, 0);
     }
-    return largeAlloc(size, alignment, 0);
+    return largeAlloc(arc_ctx, size, alignment, 0);
 }
 
 /// Raw deallocation slot — `core.deallocate` (spec §4.2). For slab-
@@ -1185,7 +1244,7 @@ fn arcDeallocate(
         slabFreeSlot(&arc_ctx.slab_pool, slab, slot_index);
         return;
     }
-    largeFree(ptr);
+    largeFree(arc_ctx, ptr);
 }
 
 /// REFCOUNT_V1 `allocate_refcounted` (Phase 4.x extension). Same as
@@ -1198,7 +1257,7 @@ fn arcAllocateRefcounted(ctx: *anyopaque, size: usize, alignment: u32) callconv(
     if (lookupClass(size, alignment)) |class_index| {
         return slabAllocSlot(&arc_ctx.slab_pool, class_index, 1);
     }
-    return largeAlloc(size, alignment, 1);
+    return largeAlloc(arc_ctx, size, alignment, 1);
 }
 
 /// First-party direct-call allocation helper for generic `Arc(T)` cells
@@ -1332,7 +1391,7 @@ fn arcReleaseSized(
     if (prev == 1) {
         if (deep_walk) |walk| walk(object);
         const byte_ptr: [*]u8 = @ptrCast(object);
-        largeFree(byte_ptr);
+        largeFree(arc_ctx, byte_ptr);
     }
 }
 
@@ -1808,4 +1867,41 @@ test "ARC empty-slab cache: a workload that never oscillates caches no empties" 
     }
     try std.testing.expectEqual(@as(u32, slab_count), class.live_slab_count);
     try std.testing.expectEqual(@as(u32, slab_count), class.live_slab_peak);
+}
+
+test "ARC large allocations: wholesale deinit reclaims every live large cell (P3-J1 leak-exactness)" {
+    const alloc_baseline = test_large_alloc_total;
+    const free_baseline = test_large_free_total;
+
+    const ctx = init(null) orelse return error.OutOfMemory;
+    // Above every slab class (> MAX_SLAB_CLASS_SIZE) so these take the
+    // page_allocator large-allocation path, outside the slab pool.
+    const large_size: usize = MAX_SLAB_CLASS_SIZE + 4096;
+    const align_bytes: u32 = 16;
+
+    // Three refcounted large cells; individually release ONE, leave TWO live
+    // — the killed-process shape whose live large cells must be bulk-reclaimed
+    // by the wholesale teardown rather than leaked.
+    const first = arcAllocateRefcounted(ctx, large_size, align_bytes) orelse return error.OutOfMemory;
+    const second = arcAllocateRefcounted(ctx, large_size, align_bytes) orelse return error.OutOfMemory;
+    const third = arcAllocateRefcounted(ctx, large_size, align_bytes) orelse return error.OutOfMemory;
+    // Touch the storage to prove it is valid and distinct.
+    first[0] = 0xAA;
+    second[large_size - 1] = 0xBB;
+    third[0] = 0xCC;
+    try std.testing.expectEqual(@as(usize, 3), test_large_alloc_total - alloc_baseline);
+
+    // Individually release the second (rc 1 -> 0): it unlinks from the
+    // context list and frees its page.
+    arcReleaseSized(ctx, @ptrCast(second), large_size, align_bytes, null);
+    try std.testing.expectEqual(@as(usize, 1), test_large_free_total - free_baseline);
+
+    // Wholesale teardown reclaims the two still-live large cells — leak-exact:
+    // every large allocation of this context is freed, none leaked.
+    deinit(ctx);
+    try std.testing.expectEqual(@as(usize, 3), test_large_free_total - free_baseline);
+    try std.testing.expectEqual(
+        test_large_alloc_total - alloc_baseline,
+        test_large_free_total - free_baseline,
+    );
 }

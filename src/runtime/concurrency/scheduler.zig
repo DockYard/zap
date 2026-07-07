@@ -1435,7 +1435,17 @@ pub const Scheduler = struct {
         scheduler.emitTrace(.schedule, pcb.pid);
         scheduler.quantum_total += 1;
         scheduler.current_process = pcb;
+        // Publish this process's PRIVATE manager context (plan item 3.1 /
+        // A.4 OQ1, P3-J1) so the runtime's allocation hot path routes every
+        // cell this quantum allocates — and every message it adopts through
+        // the deep-copy walker — into this process's own heap. Save/restore
+        // the prior value so between-quantum and out-of-quantum allocations
+        // (startup/atexit) keep resolving the runtime's bootstrap context
+        // (seeded by `concurrencyStartupForEntry`).
+        const previous_arc_context = process_module.zap_proc_active_arc_context;
+        process_module.zap_proc_active_arc_context = pcb.manager.manager_state;
         const outcome = fiber_context.resumeFiber(&scheduler.fiber_scheduler_context, &pcb.fiber);
+        process_module.zap_proc_active_arc_context = previous_arc_context;
         scheduler.current_process = null;
         // One watchdog request preempts (at most) one quantum: the
         // quantum just ended, so the request — whether it caused the end

@@ -167,6 +167,28 @@ pub fn refreshReductionCounter() void {
     zap_proc_reductions_remaining = zap_proc_reductions_budget;
 }
 
+/// The current process's PRIVATE per-process manager context (plan item 3.1
+/// / A.4 OQ1, P3-J1) — the scheduler↔runtime seam that routes each process's
+/// compiled-code allocations to its OWN private heap. The scheduler publishes
+/// the running process's `manager.manager_state` here at quantum entry
+/// (`scheduler.zig`, `runQuantum`) and restores the prior value at quantum
+/// exit; the runtime's allocation hot path reads it (gate ON) instead of the
+/// binary-wide singleton, so a `List`/`Map`/`String`/box a process builds —
+/// and every message it adopts through the deep-copy walker — lands in that
+/// process's private context and is wholesale-freed with it at teardown.
+///
+/// A.4 OQ1 resolution: this PUBLISHED-per-quantum read from a stable memory
+/// location beats the Phase-2 ambient `zap_proc_current()` per-allocation
+/// lookup (a call) — measured in `docs/concurrency-bench-results.md` § OQ1;
+/// full register/parameter threading is the J2 monomorphization ceiling. The
+/// runtime seeds this with its bootstrap context (`concurrencyStartupForEntry`)
+/// so out-of-quantum allocations (startup, atexit) resolve a valid heap even
+/// though no process is current. `pub export` for the same cross-object
+/// linkage reason as `zap_proc_reductions_budget`; unreferenced (and thus
+/// costless) with the concurrency gate OFF — the runtime reads it only under
+/// the comptime gate (plan §3 zero-cost guarantee).
+pub export var zap_proc_active_arc_context: ?*anyopaque = null;
+
 /// Minimal per-process memory-manager binding for Phase 1 kernel tests.
 /// See the module doc's "Manager binding" section: the real manager-ABI
 /// wiring replaces this vtable in Phase 2 item 2.4 (manifest ARC manager,
