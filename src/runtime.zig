@@ -3760,6 +3760,336 @@ fn unsendableMessageTypeError(comptime MessageType: type) noreturn {
     );
 }
 
+// ============================================================
+// Deep-copy message walker (P2-J5, plan item 2.4)
+//
+// The sender-side copy + receiver-side adoption of a Zap value graph across
+// a process send, per research.md §6.4/§6.6. The design is the
+// neutral-domain serialize/deserialize discipline the scheduler-local
+// refcount invariant (Constraint 3) demands:
+//
+//   * SERIALIZE (sender) walks the source graph and emits a FLAT,
+//     self-describing message blob. It only READS the source cells (follows
+//     pointers, copies payload) — it NEVER mutates a source refcount — so
+//     the sender's original is untouched and its normal end-of-scope
+//     (Perceus) release still frees it. The blob carries NO live refcounted
+//     cells, so nothing in flight can be touched by two schedulers: the
+//     invariant holds by construction (there are no in-flight refcounts to
+//     race). This is BEAM's two-pass `size_object`/`copy_struct` shape.
+//   * DESERIALIZE / ADOPT (receiver) reconstructs the graph by ALLOCATING
+//     FRESH cells from the receiver's own ARC manager (rc=1 — the refcounted
+//     adoption semantics of zap-concurrency-research.md §2.4), so the result
+//     is an INDEPENDENT copy the receiver solely owns; only the receiver
+//     ever touches those refcounts.
+//
+// The blob is type-directed: sender and receiver monomorphize on the SAME
+// message type (the `Pid(M)`/`M` agreement), so no type tags are stored.
+// The traversal (`measureValue`/`writeValue`/`deserializeValue`) is factored
+// from the byte emit so a future WIRE serializer (distribution, §6.10)
+// reuses the same walk with a byte-inlining emitter.
+//
+// Sendable graph shapes THIS increment (mirrored by `isWalkerSendable`):
+//   * fixed scalars (`int`/`float`/`bool`, incl. atoms as `u32`) — bit-copy;
+//   * `String` (`[]const u8`) — shared BY REFERENCE as an immutable
+//     program-lifetime arena/`.rodata` slice (the immutable-share tier of
+//     research.md §6.4 / §5.4: no copy, no refcount, no cross-thread
+//     mutation; observationally independent because it can be neither
+//     mutated nor individually freed). A wire serializer inlines the bytes;
+//     same-image transport shares them.
+//   * `List(T)` of any sendable element — DEEP-copied into an independent
+//     rc=1 cell (nested `List(List(...))`/`List(String)` fall out of the
+//     recursion).
+//
+// NOT YET sendable (documented compile-time rejection — never a silent
+// truncation): `Map(K,V)` (deep-copy is structurally symmetric to `List`
+// and is the next increment); closures / `Callable` existentials /
+// `ProtocolBox` (the captured environment / boxed inner is an opaque
+// `*anyopaque`, so a reflection walk cannot traverse it — it needs the
+// compiler-emitted per-closure serialize glue the plan reserves as the
+// "ZIR-emitted copy walker"); and raw pointers / resources holding external
+// handles.
+//
+// In-flight transport: Phase 2 rides the P2-J1 opaque-bytes seam (the
+// runtime payload ledger, `abi.zig`). The pool-carved envelope-fragment
+// domain with per-teardown abandon/reclaim (`envelope_pool.zig`) is the
+// memory home the blob moves into in a following increment; the walker is
+// written against a plain byte buffer so that move is transparent to it.
+//
+// Wiring status: the walker is a validated standalone mechanism (the host
+// tests below exercise fidelity + independence directly). Connecting it to
+// `Process.send`/`receive` widens `isSendableMessageType` to `isWalker
+// sendable`, serializes in `send_message`, and adds a generic
+// `receiveMessage(T)` decode — plus the `lib/process.zap` macro tokens for
+// the new types — the mechanical surface step tracked next.
+// ============================================================
+
+/// A bit-copyable scalar leaf of the message grammar: `int`/`float`/`bool`
+/// (atoms travel as `u32`). Copied verbatim into and out of the blob.
+fn isWalkerScalar(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .int, .float, .bool => true,
+        else => false,
+    };
+}
+
+/// If `T` is the runtime representation of a Zap list value —
+/// `?*const List(Element)` — return the `List(Element)` cell type, else
+/// null. Recognized structurally (inline ARC header + `Element` decl +
+/// `len`/`cap` fields) so it never hard-codes a library type name; the
+/// `cap` field (vs `Map`'s `capacity`) and the `Element` decl (vs `Map`'s
+/// `KeyType`/`ValueType`) distinguish `List` from `Map`.
+fn walkerListCell(comptime T: type) ?type {
+    switch (@typeInfo(T)) {
+        .optional => |optional_info| switch (@typeInfo(optional_info.child)) {
+            .pointer => |pointer_info| {
+                if (pointer_info.size != .one) return null;
+                const Cell = pointer_info.child;
+                if (@typeInfo(Cell) != .@"struct") return null;
+                if (!@hasDecl(Cell, "Element")) return null;
+                if (!@hasField(Cell, "header") or !@hasField(Cell, "len") or !@hasField(Cell, "cap")) return null;
+                return Cell;
+            },
+            else => return null,
+        },
+        else => return null,
+    }
+}
+
+/// Whether `T` is copyable by the deep-copy walker (keep in exact agreement
+/// with the three arms of `measureValue`/`writeValue`/`deserializeValue`).
+fn isWalkerSendable(comptime T: type) bool {
+    if (isWalkerScalar(T) or T == []const u8) return true;
+    if (walkerListCell(T)) |Cell| return isWalkerSendable(Cell.Element);
+    return false;
+}
+
+/// Bound on message-graph nesting depth. A well-formed message is a finite
+/// ACYCLIC graph (research.md §6.4: acyclic ARC graphs are the norm);
+/// exceeding this bound means either a pathologically deep graph or a CYCLE
+/// (constructible only by deliberately retaining a container into itself).
+/// The two source-walking passes detect it and abort cleanly rather than
+/// looping forever / overflowing the stack — the "no infinite loop, no
+/// corruption" guarantee. (`deserializeValue` needs no such guard: it reads
+/// a FINITE blob and its recursion is bounded by the blob length.) A cycle-
+/// PRESERVING encoding — a visited-set that emits back-references — is the
+/// documented follow-on if self-referential messages ever become idiomatic.
+const message_walker_max_depth: u32 = 4096;
+
+/// Byte size the message blob needs for `value` (pass 1 of BEAM's
+/// two-pass copier). Reads the source graph only.
+fn measureValue(comptime T: type, value: T, depth: u32) usize {
+    if (depth > message_walker_max_depth) @panic("message walker: message graph too deep or cyclic");
+    if (comptime isWalkerScalar(T) or T == []const u8) return @sizeOf(T);
+    if (comptime walkerListCell(T)) |Cell| {
+        const Element = Cell.Element;
+        var total: usize = @sizeOf(u32); // element count
+        if (value) |list| {
+            std.debug.assert(!list.isIterCell()); // messages carry materialized lists
+            var index: u32 = 0;
+            while (index < list.len) : (index += 1) {
+                total += measureValue(Element, list.slotAtConst(index).*, depth + 1);
+            }
+        }
+        return total;
+    }
+    @compileError("message walker: unsendable type `" ++ @typeName(T) ++ "`");
+}
+
+/// Write `value` into `buffer` at `cursor` (pass 2). `buffer` is presized
+/// by `measureValue`, so this cannot fail. Reads the source graph only —
+/// no source refcount is touched.
+fn writeValue(comptime T: type, value: T, buffer: []u8, cursor: *usize, depth: u32) void {
+    if (depth > message_walker_max_depth) @panic("message walker: message graph too deep or cyclic");
+    if (comptime isWalkerScalar(T) or T == []const u8) {
+        var scratch: T = value;
+        const bytes = std.mem.asBytes(&scratch);
+        @memcpy(buffer[cursor.* .. cursor.* + bytes.len], bytes);
+        cursor.* += bytes.len;
+        return;
+    }
+    if (comptime walkerListCell(T)) |Cell| {
+        const Element = Cell.Element;
+        var count: u32 = 0;
+        if (value) |list| {
+            std.debug.assert(!list.isIterCell());
+            count = list.len;
+        }
+        writeValue(u32, count, buffer, cursor, depth); // count is metadata at this level
+        if (value) |list| {
+            var index: u32 = 0;
+            while (index < count) : (index += 1) {
+                writeValue(Element, list.slotAtConst(index).*, buffer, cursor, depth + 1);
+            }
+        }
+        return;
+    }
+    comptime unreachable; // measureValue already rejected everything else
+}
+
+/// A forward-only cursor over a received message blob.
+const MessageBlobReader = struct {
+    bytes: []const u8,
+    position: usize = 0,
+
+    /// Read `@sizeOf(S)` raw bytes and reinterpret them as an `S`. For a
+    /// `String` (`[]const u8`) this reconstructs the shared slice header
+    /// (pointer + length) into the immutable program-lifetime arena.
+    fn readScalar(reader: *MessageBlobReader, comptime S: type) error{CorruptMessage}!S {
+        const size = @sizeOf(S);
+        if (reader.position + size > reader.bytes.len) return error.CorruptMessage;
+        var value: S = undefined;
+        @memcpy(std.mem.asBytes(&value), reader.bytes[reader.position .. reader.position + size]);
+        reader.position += size;
+        return value;
+    }
+};
+
+/// Reconstruct a `T` from `reader`, ADOPTING it into the receiver's ARC
+/// manager: every `List` level is a freshly-allocated rc=1 cell, so the
+/// result is independent of the sender's graph. On a mid-list failure the
+/// partially-built cell (and the elements already placed in it) are
+/// released before the error propagates — no leak on the error path.
+fn deserializeValue(comptime T: type, reader: *MessageBlobReader) error{ OutOfMemory, CorruptMessage }!T {
+    if (comptime isWalkerScalar(T) or T == []const u8) {
+        return try reader.readScalar(T);
+    }
+    if (comptime walkerListCell(T)) |Cell| {
+        const Element = Cell.Element;
+        const count = try reader.readScalar(u32);
+        if (count == 0) return null; // the empty-list sentinel
+        const list = Cell.bufferAlloc(count, count) orelse return error.OutOfMemory;
+        var index: u32 = 0;
+        while (index < count) : (index += 1) {
+            const element = deserializeValue(Element, reader) catch |err| {
+                // Release only the prefix actually filled so far.
+                list.len = index;
+                list.bufferFreeDeep();
+                return err;
+            };
+            list.dataPtr()[index] = element;
+        }
+        return list;
+    }
+    @compileError("message walker: unsendable type `" ++ @typeName(T) ++ "`");
+}
+
+/// Sender side: deep-copy `value` into a fresh, self-contained message blob
+/// allocated from `allocator` (the caller frees it once the transport has
+/// taken the bytes). Reads the source graph only.
+fn serializeMessage(comptime T: type, value: T, allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
+    comptime std.debug.assert(isWalkerSendable(T));
+    const size = measureValue(T, value, 0);
+    const buffer = try allocator.alloc(u8, size);
+    var cursor: usize = 0;
+    writeValue(T, value, buffer, &cursor, 0);
+    std.debug.assert(cursor == size);
+    return buffer;
+}
+
+/// Receiver side: reconstruct a `T` from `blob`, adopting it into this
+/// process's ARC manager (independent, rc=1). See `deserializeValue`.
+fn deserializeMessage(comptime T: type, blob: []const u8) error{ OutOfMemory, CorruptMessage }!T {
+    comptime std.debug.assert(isWalkerSendable(T));
+    var reader = MessageBlobReader{ .bytes = blob };
+    return deserializeValue(T, &reader);
+}
+
+test "message walker: List(i64) deep-copies to an independent rc=1 cell" {
+    ensureMemoryStartup();
+    var source: ?*const List(i64) = List(i64).new_empty(4);
+    source = List(i64).push(source, 10);
+    source = List(i64).push(source, 20);
+    source = List(i64).push(source, 30);
+
+    const blob = try serializeMessage(?*const List(i64), source, std.testing.allocator);
+    defer std.testing.allocator.free(blob);
+
+    const copy = try deserializeMessage(?*const List(i64), blob);
+
+    // Fidelity.
+    try std.testing.expectEqual(@as(u32, 3), copy.?.len);
+    try std.testing.expectEqual(@as(i64, 10), List(i64).get(copy, 0));
+    try std.testing.expectEqual(@as(i64, 20), List(i64).get(copy, 1));
+    try std.testing.expectEqual(@as(i64, 30), List(i64).get(copy, 2));
+
+    // Independence: a distinct cell, with its own refcount (rc == 1).
+    try std.testing.expect(@intFromPtr(source.?) != @intFromPtr(copy.?));
+    if (comptime refcount_v1_active) {
+        try std.testing.expectEqual(@as(u32, 1), copy.?.header.count());
+        try std.testing.expectEqual(@as(u32, 1), source.?.header.count()); // sender untouched by the copy
+    }
+
+    // Dropping the sender's original must NOT affect the receiver's copy.
+    List(i64).release(source);
+    try std.testing.expectEqual(@as(u32, 3), copy.?.len);
+    try std.testing.expectEqual(@as(i64, 20), List(i64).get(copy, 1));
+
+    List(i64).release(copy);
+}
+
+test "message walker: List(String) shares immutable arena bytes; copy outlives source drop" {
+    ensureMemoryStartup();
+    var source: ?*const List([]const u8) = List([]const u8).new_empty(2);
+    source = List([]const u8).push(source, "alpha");
+    source = List([]const u8).push(source, "beta");
+
+    const blob = try serializeMessage(?*const List([]const u8), source, std.testing.allocator);
+    defer std.testing.allocator.free(blob);
+    const copy = try deserializeMessage(?*const List([]const u8), blob);
+
+    try std.testing.expectEqual(@as(u32, 2), copy.?.len);
+    try std.testing.expect(std.mem.eql(u8, "alpha", List([]const u8).get(copy, 0)));
+    try std.testing.expect(std.mem.eql(u8, "beta", List([]const u8).get(copy, 1)));
+    try std.testing.expect(@intFromPtr(source.?) != @intFromPtr(copy.?));
+
+    // Drop the source; the copy's immutable arena/rodata strings stay valid.
+    List([]const u8).release(source);
+    try std.testing.expect(std.mem.eql(u8, "beta", List([]const u8).get(copy, 1)));
+
+    List([]const u8).release(copy);
+}
+
+test "message walker: empty and null List round-trip to the empty sentinel" {
+    ensureMemoryStartup();
+    const empty_source: ?*const List(i64) = null;
+    const blob = try serializeMessage(?*const List(i64), empty_source, std.testing.allocator);
+    defer std.testing.allocator.free(blob);
+    const copy = try deserializeMessage(?*const List(i64), blob);
+    try std.testing.expectEqual(@as(?*const List(i64), null), copy);
+}
+
+test "message walker: nested List(List(i64)) deep-copies every level independently" {
+    ensureMemoryStartup();
+    var inner: ?*const List(i64) = List(i64).new_empty(2);
+    inner = List(i64).push(inner, 7);
+    inner = List(i64).push(inner, 8);
+
+    // push transfers ownership of the inner list to the outer list.
+    const ListOfList = List(?*const List(i64));
+    var source: ?*const ListOfList = ListOfList.new_empty(1);
+    source = ListOfList.push(source, inner);
+
+    const blob = try serializeMessage(?*const ListOfList, source, std.testing.allocator);
+    defer std.testing.allocator.free(blob);
+    const copy = try deserializeMessage(?*const ListOfList, blob);
+
+    // Independence at the outer level: a distinct outer cell.
+    try std.testing.expectEqual(@as(u32, 1), copy.?.len);
+    try std.testing.expect(@intFromPtr(source.?) != @intFromPtr(copy.?));
+
+    // Drop the ENTIRE source graph (outer + its inner); the deep copy must
+    // stay intact and correct — proving the inner level was copied too.
+    ListOfList.release(source);
+
+    const copy_inner = ListOfList.get(copy, 0); // fresh owner (get retains)
+    defer List(i64).release(copy_inner);
+    try std.testing.expectEqual(@as(u32, 2), copy_inner.?.len);
+    try std.testing.expectEqual(@as(i64, 7), List(i64).get(copy_inner, 0));
+    try std.testing.expectEqual(@as(i64, 8), List(i64).get(copy_inner, 1));
+
+    ListOfList.release(copy);
+}
+
 /// `:zig.ProcessRuntime.*` — the intrinsic bridge behind `lib/process.zap`.
 /// Every function resolves the calling process through the ambient
 /// `zap_proc_current` lookup so the Zap surface stays handle-free in
