@@ -1077,6 +1077,56 @@ test "abi: a killed process's live allocations are wholesale-freed at teardown (
     try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
 }
 
+/// Committed default spawn/die cycles for the per-process ARC teardown soak
+/// (CI-sanity sizing). Overridden by `ZAP_PROC_ARC_TEARDOWN_CYCLES` for a long
+/// soak — the per-process-instance analog of `teardown_stress.zig`'s knob.
+const default_proc_arc_teardown_cycles: usize = 600;
+
+fn procArcTeardownCyclesFromEnvironment() usize {
+    const raw_value = std.c.getenv("ZAP_PROC_ARC_TEARDOWN_CYCLES") orelse
+        return default_proc_arc_teardown_cycles;
+    return std.fmt.parseInt(usize, std.mem.span(raw_value), 10) catch default_proc_arc_teardown_cycles;
+}
+
+test "abi: per-process ARC teardown soak — spawn/die cycles stay leak-exact (teardown_stress-style)" {
+    // The per-process-instance analog of the Phase-1 teardown-stress campaign
+    // (`teardown_stress.zig`), extended to the REAL per-process manager
+    // factory: many waves of allocating processes spawn, run, and exit through
+    // `zap_proc_spawn`/wholesale teardown, each never freeing its allocation —
+    // so every wave's contexts must be wholesale-freed leak-exact, driving the
+    // factory accounting back to zero every wave.
+    const total_cycles = procArcTeardownCyclesFromEnvironment();
+    const processes_per_wave: usize = 6;
+    const wave_count = @max(total_cycles / processes_per_wave, 1);
+
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    TestManagerCore.resetAccounting();
+    bindTestManager();
+
+    var probe = PerProcessAllocProbe{ .byte_length = 48 };
+    var wave: usize = 0;
+    var spawned_total: usize = 0;
+    while (wave < wave_count) : (wave += 1) {
+        var index: usize = 0;
+        while (index < processes_per_wave) : (index += 1) {
+            const pid_bits = zap_proc_spawn(perProcessAllocatingEntry, &probe);
+            try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+        }
+        try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+        spawned_total += processes_per_wave;
+
+        // Exact per-wave accounting: every context minted so far has been
+        // wholesale-freed (its never-freed cell reclaimed), no context or byte
+        // outlives its process — the leak-exact invariant, checked every wave.
+        try testing.expectEqual(spawned_total, TestManagerCore.init_total);
+        try testing.expectEqual(spawned_total, TestManagerCore.deinit_total);
+        try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
+        try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
+    }
+    try testing.expectEqual(spawned_total, probe.processes_run);
+}
+
 test "abi: runtime init/deinit lifecycle guards double-init and supports re-init" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
     defer zap_proc_runtime_deinit();
