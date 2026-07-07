@@ -10874,6 +10874,31 @@ fn materializeAnalysisArcOps(
         };
     }
     try runArcVerifier(alloc, program, type_store, options);
+    try runConcurrencyVerifier(alloc, program, options);
+}
+
+/// P2-J7 (plan item 2.6): the send-boundary concurrency verifier. Runs
+/// after `runArcVerifier` so `local_ownership` and call `arg_modes` are
+/// materialized and settled — the inputs `concurrency_verifier` reasons
+/// over. It is zero-cost for any program that never sends: `verify`
+/// pre-scans each function for a send primitive and returns immediately
+/// when there is none (the natural `runtime_concurrency`-OFF case — a
+/// gate-off build cannot contain a send builtin, since calling
+/// `Process.send` is a compile error before IR). A violation is a hard
+/// build error (surfaced as `error.IrFailed`, the same discipline as the
+/// ARC verifier); the diagnostic was already emitted inside `verify`.
+fn runConcurrencyVerifier(
+    alloc: std.mem.Allocator,
+    program: *const ir.Program,
+    options: CompileOptions,
+) CompileError!void {
+    progressStage(options, "Concurrency: verifying send-boundary invariants", .{});
+    for (program.functions) |*function| {
+        zap.concurrency_verifier.verify(alloc, function, program) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ConcurrencyInvariantViolation => return error.IrFailed,
+        };
+    }
 }
 
 /// Run V1-V11 (fixpoint) + V8/V9 (post-drop reachability) over
