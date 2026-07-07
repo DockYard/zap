@@ -395,6 +395,25 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
     is therefore the Phase-3 seam (this item's per-process private ARC instances) — the
     by-construction zero-live-refcount argument is the Phase-2 guarantee until then. (No TSan
     run is claimed here.)
+  - **LANDED (P3-J1, 2026-07-07).** Per-process manager INSTANCES ship: each process (the root
+    included) mints its OWN private ARC context from the bound manifest manager's core vtable at
+    spawn (`abi.zig` `ManifestManagerBinding.createProcessContext`), and the adapter's `teardown`
+    is now a REAL per-process wholesale free via the vtable's `deinit` (the Phase-2 no-op is
+    replaced, not layered — no-fallbacks). The runtime routes every hot-path allocation to the
+    running process's context via the scheduler-published `zap_proc_active_arc_context`
+    (`process.zig`; A.4 OQ1 resolved to this published-per-quantum read — see the OQ1 ledger
+    section), including List/Map container buffers (previously `c_allocator`-backed) and the
+    walker's adopted cells, so a process's whole heap — and every message it adopts — is
+    wholesale-freed with it (large allocations tracked per-context in `arc/manager.zig` so
+    `arcDeinit` reclaims them too; a killed process leaks nothing). The **TSan seam is now
+    CLOSED**: `src/memory/arc/cross_thread_stress.zig` runs a real multi-thread send/adopt over
+    real per-process ARC instances under ThreadSanitizer — **zero findings across 100 k
+    cross-thread ARC messages** (E3 full-half ledger section). The scheduler-local-refcount
+    invariant is proven by measurement, not just by construction. Kernel/manager/runtime
+    validated: `zig build test` green, `test-kernel` green (per-process-instance + crash-teardown
+    leak-exact kernel tests), gate-ON `:test_concurrency` 49/0. Remaining for J2/J3: the
+    monomorphization hybrid (item 3.2) and the multi-manager driver/registry (this item's
+    per-manager symbol families — J1 ships the single-model ARC foundation).
 - **3.2** Monomorphization hybrid in `src/monomorphize.zig`: specialize spawn-reachable hot
   paths per model (elision decisions per specialization via `src/memory/elision.zig`); cold
   closure/existential paths through the control-block vtable; ICF-unfoldable specializations
@@ -694,6 +713,19 @@ Each is a design commitment, not a suggestion; each cites its evidence.
    (`src/runtime.zig` ~4448), not a threaded parameter or reserved register, so the
    register-vs-parameter tradeoff is genuinely a Phase-3 measurement once managers make the
    lookup hot.]*
+   *[RESOLVED (P3-J1, 2026-07-07): per-process managers landed (item 3.1), making the
+   alloc-path lookup hot and measurable. Measured with the E10 methodology (OQ1 section of
+   `docs/concurrency-bench-results.md`): the **published-per-quantum global**
+   (`zap_proc_active_arc_context`, one `LDR` — the scheduler writes the running process's
+   private context at quantum entry, the runtime reads it in `currentManagerContext`) costs
+   **+2.2% pure / +0.7% mix** over the register/parameter ceiling — inside the E2 budget —
+   while the Phase-2 ambient `zap_proc_current()` per-alloc CALL costs **+8.8% / +3.1%** (a
+   load beats a call, consistent with E10). **DECISION: P3-J1 ships the published-per-quantum
+   global; ambient is rejected.** The register/parameter ceiling (the standing lean) is the
+   J2 monomorphization arm's target (item 3.2) — it recovers the residual +2.2%, which only
+   matters on a pure-alloc tight loop, and requires compiler frame-threading of the context
+   through emitted code. OQ1 is resolved: published now, register/parameter as the J2
+   refinement.]*
 2. **Linux poller wakeup primitive** — eventfd vs io_uring `MSG_RING` (E9 was Darwin-only);
    measured when the Phase 4 poller lands.
 3. **Stack-pool sizing/watermark policy and its interaction with Darwin teardown** — decided

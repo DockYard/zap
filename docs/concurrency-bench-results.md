@@ -811,6 +811,93 @@ scheduler code should load the process pointer once per scheduling quantum
 threadlocal at every dispatch site, since LLVM cannot always hoist it (it
 did per-list in Shape B, per-alloc in Shape A).
 
+## OQ1 — current-process resolution on the alloc hot path (A.4 OQ1, P3-J1, 2026-07-07) — RESOLVED
+
+Appendix A.4 open question 1 — "register vs parameter for the
+current-process pointer" — re-pointed to Phase 3 by P2-R1/D3 because the
+cost it must beat, the alloc-path current-process lookup, does not exist
+until per-process managers make the lookup hot. P3-J1 lands those managers
+(each process owns its own ARC context; `src/runtime.zig`
+`currentManagerContext`), so the lookup is now measurable. This is the E10
+question reframed from "how to DISPATCH the alloc" to "how to RESOLVE the
+context the alloc needs".
+
+### Methodology
+
+- **Date:** 2026-07-07. Same machine as S0.1/E1/E9/E10 (MacBook Air
+  `Mac16,13`, Apple M4, 10 cores, 32 GB, macOS 26.2).
+- **Benchmark:** `spike/concurrency-oq1/resolve.zig` (throwaway spike;
+  E10 methodology verbatim — same `CLOCK_UPTIME_RAW` clock, 1 MiB
+  L2-resident bump buffer pre-faulted and never grown, unrecorded warmup
+  then 5 timed reps of 100 M allocations, median + min per-alloc ns,
+  post-region reset assertion proving the buffer wrapped, and a
+  runtime-selectable decoy context (`decoy_allocs=0` printed as proof)
+  keeping the real path non-constant). Built with the fork compiler at
+  ReleaseFast. The **allocation body is byte-identical and inlined in all
+  three variants** — only the CONTEXT RESOLUTION differs, isolating the
+  number this decision turns on.
+- **Variants:** **`register`** = the context resolved ONCE and carried in a
+  local/register across the loop (the ceiling the J2 monomorphization /
+  parameter-threading arm targets; A.4 rules out a globally reserved
+  register on aarch64 — x18 is Darwin-reserved — so this stands in for
+  "resolved once per quantum, threaded as a parameter"). **`published`** =
+  the P3-J1 SHIP: the context read from the scheduler-published global
+  `zap_proc_active_arc_context` on every allocation (modelled as an
+  atomic-monotonic load = aarch64 `LDR`, non-hoisted, matching the real
+  cross-TU extern var reloaded across the opaque manager call). **`ambient`**
+  = the Phase-2 shape: a `zap_proc_current()`-style out-of-line C-ABI call
+  per allocation. **Asm-verified** (`resolve.s`): the published loop does a
+  per-iteration `ldr` of the published global; the ambient loop does a
+  per-iteration `bl _ambientCurrentContext`; the register loop hoists the
+  resolve entirely.
+- **Load:** 1-minute average **3.2** (busier than the E10 session), so the
+  ABSOLUTE ns run a touch high; the RELATIVE deltas (what the decision
+  turns on) held with <2% rep-to-rep spread, and the register ceiling
+  (1.615 ns) matches E10's inlined pure floor (1.604 ns) — confirming the
+  session is comparable.
+
+### Results (ReleaseFast, per-alloc ns, 100 M allocs × 5 reps)
+
+| Shape | Variant | Median | Min | vs register (median) | vs register (min) |
+|---|---|---:|---:|---:|---:|
+| A pure-alloc | register (ceiling) | 1.615 | 1.605 | — | — |
+| A pure-alloc | **published (P3-J1)** | 1.651 | 1.632 | **+2.2%** | +1.7% |
+| A pure-alloc | ambient (Phase-2) | 1.757 | 1.734 | **+8.8%** | +8.0% |
+| B node-mix | register (ceiling) | 2.004 | 1.957 | — | — |
+| B node-mix | **published (P3-J1)** | 2.019 | 1.984 | **+0.7%** | +1.4% |
+| B node-mix | ambient (Phase-2) | 2.067 | 2.050 | **+3.1%** | +4.8% |
+
+Published-vs-ambient head-to-head: ambient is **+6.4% (pure) / +2.4% (mix)**
+slower than published.
+
+### DECISION — published-per-quantum global; ambient rejected; register is the J2 ceiling
+
+**A.4 OQ1 resolves to the PUBLISHED-PER-QUANTUM GLOBAL.** The runtime reaches
+each process's private context by reading the scheduler-published
+`zap_proc_active_arc_context` (one `LDR`) — NOT the Phase-2 ambient
+`zap_proc_current()` per-allocation call. The data is decisive and consistent
+with the E10 yardstick (a call cost +6.2% direct / +13.8% vtable there):
+- **published costs only +2.2% median on the pure-alloc worst case (+0.7% on
+  the realistic mix)** over the register/parameter ceiling — INSIDE the E2
+  kill criterion (2–3% CLBG regression), and near-free once diluted by real
+  work;
+- **ambient costs +8.8% pure / +3.1% mix** — ~4× the published cost on the
+  worst case and over the E2 budget on its own; the extern call is the
+  expensive part (a load beats a call, exactly as E10 predicted);
+- so among the mechanisms realizable in Phase-3 emitted code (no compiler
+  frame-threading), **published wins outright**, and it is what P3-J1 ships.
+
+**The register/parameter ceiling (resolved once per quantum, carried in a
+register) remains the target of the J2 monomorphization arm** — it buys back
+the residual +2.2%, which only matters on a pure-alloc tight loop and is worth
+the specialization there. Full frame-threading of the context through emitted
+Zap code needs the monomorphization pass (plan item 3.2, J2); until then
+published is the ship. This realizes the feasible half of the standing
+"resolve once per quantum, parameter-thread" lean now, and hands the last
+2.2% to J2. (The Phase-1 kernel is already fully parameter-threaded
+internally — A.4 OQ1's amendment — so J2 extends that discipline into the
+compiled surface.)
+
 ## E3 — same-model race validation (Phase 1 half, P1-J6, 2026-07-06) — GATE: PASS
 
 The Phase 1 half of gate E3 (gate table: "E3 TSan copy matrix +
@@ -927,6 +1014,65 @@ Phase 2 copy walker exists — preserved by construction (opaque stamped
 payloads; the only cross-thread atomics are the mailbox links and pool
 page words, per the `mailbox.zig`/`envelope_pool.zig` inventories) and
 scheduled for direct TSan coverage in E3's full half (Phase 3).
+
+## E3 — cross-thread refcount race validation (full half, P3-J1, 2026-07-07) — GATE: PASS
+
+The Phase-3 full half of gate E3 (gate table: "any cross-scheduler
+refcount race → stop-ship"), unblocked by P3-J1's per-process manager
+INSTANCES: the payload-refcount rule (Constraint 3 — no refcount is ever
+touched by two threads), preserved by construction in the Phase-1 half
+(opaque payloads, no real per-process manager), is now proven under
+ThreadSanitizer against REAL per-process ARC contexts and REAL atomic
+refcounts.
+
+### Harness
+
+`src/memory/arc/cross_thread_stress.zig` drives the REAL production ARC
+manager (`src/memory/arc/manager.zig`) — imported directly, since multiple
+independent ARC instances exist only off the real manager, not the host
+runtime's single `test_only_arc` context. **N=4 producer THREADS, each
+owning its OWN private ARC context**, concurrently: `allocate_refcounted`
+a 32-byte cell (rc=1) in their private slab pool, exercise the ATOMIC
+`retain_sized`/`release_sized` on that own cell, read its data into a FLAT
+message (zero live refcount in flight — the item-3.1 design), release the
+cell (rc→0, freed back into that producer's pool), and hand the flat
+message across threads. **The consumer thread owns a SEPARATE private ARC
+context and ADOPTS** each message by allocating a fresh rc=1 cell in its
+own pool, verifying end-to-end data integrity, then releasing it. Every
+context is thread-exclusive; the cross-thread payload is flat, never a
+refcounted cell — so no two threads ever touch the same slab pool or the
+same cell's side-table refcount.
+
+### Method, volumes, result
+
+TSan with `TSAN_OPTIONS="halt_on_error=1 abort_on_error=1"`, output grepped
+for `ThreadSanitizer|WARNING|data race` (P1-J6 §E3 discipline):
+
+- default (8,000 cross-thread ARC messages): **zero findings**, 10/10 tests
+  pass under TSan, exit 0;
+- soak `ZAP_ARC_XTHREAD_ROUNDS=25000` (**100,000 cross-thread ARC
+  messages** = 100 k `allocate_refcounted` + retain/release + adopt +
+  release across five private contexts): **zero findings**, exit 0;
+- Debug + ReleaseFast (via `zig build test` aggregation, uninstrumented):
+  leak-exact — every slab any context mapped during the run is unmapped at
+  that context's `deinit` (`test_slab_mmap_total` delta == unmap delta),
+  and every adopted message's checksum verifies.
+
+### Verdict
+
+**PASS.** Zero ThreadSanitizer findings across 100 k concurrent
+cross-thread ARC messages over real per-process manager instances; the
+scheduler-local-refcount invariant is now proven by MEASUREMENT (not just
+the by-construction argument the Phase-1 half rested on). No manager change
+was needed. **Concurrency shape tested:** N sender threads (each a private
+manager) + a single adopting consumer — the Phase-3 single-scheduler shape
+(the mailbox push side is any-thread; the adopt runs on the one scheduler
+thread). **Remaining for Phase 4:** the M:N axis — multiple SCHEDULER
+threads each running receivers that adopt into their own per-process
+contexts concurrently — which the Phase-4 Linux CI leg of E3 covers once
+processes migrate across scheduler threads; the invariant is unchanged
+(per-process contexts ⇒ no shared refcount), Phase 4 only widens the set of
+threads that can run the adopt.
 
 ## E2 — safepoint overhead
 

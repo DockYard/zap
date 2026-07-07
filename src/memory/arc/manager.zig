@@ -695,15 +695,19 @@ inline fn slabPoolInit() SlabPool {
 /// `deinit`) and to prove cache reuse maps no fresh slab. The
 /// increments below compile away entirely outside `zig build test`
 /// (`builtin.is_test` is comptime-false in production manager objects).
-var test_slab_mmap_total: usize = 0;
-var test_slab_unmap_total: usize = 0;
+/// `pub` so the cross-thread ARC stress test (`arc_cross_thread_stress.zig`)
+/// can baseline/verify slab mapping traffic for leak-exactness; incremented
+/// atomically (below) so concurrent per-thread contexts do not race the
+/// instrumentation. Production (`!is_test`) never touches them.
+pub var test_slab_mmap_total: usize = 0;
+pub var test_slab_unmap_total: usize = 0;
 
 /// Test-only counters for LARGE (page_allocator-backed) allocations —
 /// mirror `test_slab_*`, letting the P3-J1 per-process wholesale-free test
 /// assert every large cell is reclaimed at `arcDeinit` (allocs == frees).
 /// Compile away outside `zig build test`.
-var test_large_alloc_total: usize = 0;
-var test_large_free_total: usize = 0;
+pub var test_large_alloc_total: usize = 0;
+pub var test_large_free_total: usize = 0;
 
 fn mmapAlignedSlab() ?[*]align(std.heap.page_size_min) u8 {
     const page_size = std.heap.page_size_min;
@@ -723,7 +727,7 @@ fn mmapAlignedSlab() ?[*]align(std.heap.page_size_min) u8 {
         @returnAddress(),
     ) orelse return null;
 
-    if (builtin.is_test) test_slab_mmap_total += 1;
+    if (builtin.is_test) _ = @atomicRmw(usize, &test_slab_mmap_total, .Add, 1, .monotonic);
     return @alignCast(base);
 }
 
@@ -734,7 +738,7 @@ fn unmapSlab(base: [*]align(std.heap.page_size_min) u8) void {
     const page_size = std.heap.page_size_min;
     const slab_alignment: std.mem.Alignment =
         .fromByteUnits(@max(SLAB_ALIGN, @as(usize, page_size)));
-    if (builtin.is_test) test_slab_unmap_total += 1;
+    if (builtin.is_test) _ = @atomicRmw(usize, &test_slab_unmap_total, .Add, 1, .monotonic);
     std.heap.page_allocator.rawFree(base[0..SLAB_SIZE], slab_alignment, @returnAddress());
 }
 
@@ -1064,7 +1068,7 @@ fn largeAlloc(arc_ctx: *ArcContext, size: usize, alignment: u32, init_refcount: 
     };
     if (arc_ctx.large_head) |old_head| old_head.prev = header_ptr;
     arc_ctx.large_head = header_ptr;
-    if (builtin.is_test) test_large_alloc_total += 1;
+    if (builtin.is_test) _ = @atomicRmw(usize, &test_large_alloc_total, .Add, 1, .monotonic);
     return base + leading;
 }
 
@@ -1081,7 +1085,7 @@ fn largeFreePage(header_ptr: *LargeHeader) void {
     const base: [*]u8 = @ptrFromInt(@intFromPtr(header_ptr) + @sizeOf(LargeHeader) - leading);
     const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(alignment, @as(u32, @intCast(std.heap.page_size_min))));
     std.heap.page_allocator.rawFree(base[0..total], inner_alignment, @returnAddress());
-    if (builtin.is_test) test_large_free_total += 1;
+    if (builtin.is_test) _ = @atomicRmw(usize, &test_large_free_total, .Add, 1, .monotonic);
 }
 
 fn largeFree(arc_ctx: *ArcContext, ptr: [*]u8) void {

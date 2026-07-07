@@ -235,6 +235,7 @@ test {
     // fails the test run as a leak).
     _ = @import("memory/tracking/manager.zig");
     _ = @import("memory/arc/manager.zig");
+    _ = @import("memory/arc/cross_thread_stress.zig");
     _ = @import("memory/gc/manager.zig");
     _ = @import("memory/arena/manager.zig");
 }

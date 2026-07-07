@@ -3989,12 +3989,16 @@ fn measureValue(comptime T: type, value: T, depth: u32) usize {
     if (comptime walkerListCell(T)) |Cell| {
         const Element = Cell.Element;
         var total: usize = @sizeOf(u32); // element count
-        if (value) |list| {
-            std.debug.assert(!list.isIterCell()); // messages carry materialized lists
-            var index: u32 = 0;
-            while (index < list.len) : (index += 1) {
-                total += measureValue(Element, list.slotAtConst(index).*, depth + 1);
-            }
+        // N9 hardening: walk through the logical VIEW so an iteration-cursor
+        // cell (`isIterCell`) is MATERIALIZED read-only (its logical suffix,
+        // no allocation, no refcount touched) rather than mis-read as a
+        // materialized list. This replaces the ReleaseFast-ELIDED
+        // `assert(!isIterCell())`, which would let a cursor leaked into a
+        // message silently corrupt the serialized bytes in release builds.
+        const view = Cell.View.fromOptional(value);
+        var index: u32 = 0;
+        while (index < view.len) : (index += 1) {
+            total += measureValue(Element, view.slotAtConst(index).*, depth + 1);
         }
         return total;
     }
@@ -4002,14 +4006,14 @@ fn measureValue(comptime T: type, value: T, depth: u32) usize {
         const Key = Cell.KeyType;
         const Value = Cell.ValueType;
         var total: usize = @sizeOf(u32); // entry count
-        if (value) |map| {
-            std.debug.assert(!map.isIterCell()); // messages carry materialized maps
-            var index: u32 = 0;
-            while (index < map.len) : (index += 1) {
-                const entry = map.entryAtConst(index);
-                total += measureValue(Key, entry.key, depth + 1);
-                total += measureValue(Value, entry.value, depth + 1);
-            }
+        // N9 hardening (see the list case): materialize an iteration-cursor
+        // map read-only through the logical view.
+        const view = Cell.View.fromOptional(value);
+        var index: u32 = 0;
+        while (index < view.len) : (index += 1) {
+            const entry = view.entryAtConst(index);
+            total += measureValue(Key, entry.key, depth + 1);
+            total += measureValue(Value, entry.value, depth + 1);
         }
         return total;
     }
@@ -4048,36 +4052,29 @@ fn writeValue(comptime T: type, value: T, buffer: []u8, cursor: *usize, depth: u
     }
     if (comptime walkerListCell(T)) |Cell| {
         const Element = Cell.Element;
-        var count: u32 = 0;
-        if (value) |list| {
-            std.debug.assert(!list.isIterCell());
-            count = list.len;
-        }
+        // N9 hardening (see `measureValue`): serialize the logical VIEW so an
+        // iteration-cursor cell is materialized read-only, matching pass 1's
+        // sizing exactly. Survives ReleaseFast (no elided assert).
+        const view = Cell.View.fromOptional(value);
+        const count: u32 = view.len;
         writeValue(u32, count, buffer, cursor, depth); // count is metadata at this level
-        if (value) |list| {
-            var index: u32 = 0;
-            while (index < count) : (index += 1) {
-                writeValue(Element, list.slotAtConst(index).*, buffer, cursor, depth + 1);
-            }
+        var index: u32 = 0;
+        while (index < count) : (index += 1) {
+            writeValue(Element, view.slotAtConst(index).*, buffer, cursor, depth + 1);
         }
         return;
     }
     if (comptime walkerMapCell(T)) |Cell| {
         const Key = Cell.KeyType;
         const Value = Cell.ValueType;
-        var count: u32 = 0;
-        if (value) |map| {
-            std.debug.assert(!map.isIterCell());
-            count = map.len;
-        }
+        const view = Cell.View.fromOptional(value);
+        const count: u32 = view.len;
         writeValue(u32, count, buffer, cursor, depth); // entry count metadata
-        if (value) |map| {
-            var index: u32 = 0;
-            while (index < count) : (index += 1) {
-                const entry = map.entryAtConst(index);
-                writeValue(Key, entry.key, buffer, cursor, depth + 1);
-                writeValue(Value, entry.value, buffer, cursor, depth + 1);
-            }
+        var index: u32 = 0;
+        while (index < count) : (index += 1) {
+            const entry = view.entryAtConst(index);
+            writeValue(Key, entry.key, buffer, cursor, depth + 1);
+            writeValue(Value, entry.value, buffer, cursor, depth + 1);
         }
         return;
     }
@@ -4347,6 +4344,38 @@ test "message walker: empty and null List round-trip to the empty sentinel" {
     defer std.testing.allocator.free(blob);
     const copy = try deserializeMessage(?*const List(i64), blob);
     try std.testing.expectEqual(@as(?*const List(i64), null), copy);
+}
+
+test "message walker: an iteration-cursor list serializes its materialized suffix (N9 ReleaseFast-safe)" {
+    ensureMemoryStartup();
+    var source: ?*const List(i64) = List(i64).new_empty(4);
+    source = List(i64).push(source, 10);
+    source = List(i64).push(source, 20);
+    source = List(i64).push(source, 30);
+
+    // `next` CONSUMES `source` and returns an ITER-CELL (cursor) over the
+    // logical suffix [20, 30] — the shape whose ReleaseFast-elided
+    // `assert(!isIterCell())` this hardens. Without the view-based walk, a
+    // release build would mis-read the cursor's internals as a materialized
+    // list and silently corrupt the serialized bytes.
+    const advanced = List(i64).next(source);
+    const cursor: ?*const List(i64) = advanced[2];
+    try std.testing.expect(cursor != null);
+    try std.testing.expect(cursor.?.isIterCell());
+
+    // The walker materializes the cursor's logical suffix read-only:
+    // serialize -> reconstruct yields [20, 30], an independent rc=1 cell.
+    const blob = try serializeMessage(?*const List(i64), cursor, std.testing.allocator);
+    defer std.testing.allocator.free(blob);
+    const copy = try deserializeMessage(?*const List(i64), blob);
+
+    try std.testing.expectEqual(@as(u32, 2), copy.?.len);
+    try std.testing.expectEqual(@as(i64, 20), List(i64).get(copy, 0));
+    try std.testing.expectEqual(@as(i64, 30), List(i64).get(copy, 1));
+
+    List(i64).release(copy);
+    // `cursor` owns the suffix backing (next released the input); drop it.
+    List(i64).release(cursor);
 }
 
 test "message walker: nested List(List(i64)) deep-copies every level independently" {
