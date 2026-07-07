@@ -3732,31 +3732,20 @@ fn requireCurrentProcessHandle() *anyopaque {
     );
 }
 
-/// The set of Zig-level message types the Phase 2 opaque-bytes send
-/// seam carries (P2-J1 `abi.zig`, payload seam): fixed-size scalars
-/// with no heap references, byte-copied into the runtime's payload
-/// ledger. At the Zap surface these are `i64`, `u64`, `f64`, `Bool`,
-/// and `Atom` (atoms travel as their binary-global `u32` table ids —
-/// one atom table per binary, so the id is stable across processes).
-/// Everything richer — `String`, structs, lists, maps, closures — needs
-/// the P2-J5 deep-copy walker (plan item 2.4) and is rejected at
-/// compile time here; no payload is ever silently truncated.
-fn isSendableMessageType(comptime MessageType: type) bool {
-    return switch (MessageType) {
-        i64, u64, f64, bool, u32 => true,
-        else => false,
-    };
-}
-
-/// Shared compile-error text for unsendable payloads, referenced by the
-/// send primitive below and mirrored by the receive set (which is the
-/// same closed type set by construction).
+/// Shared compile-error text for an unsendable payload, raised at the send
+/// primitive when a message type is not `isWalkerSendable`. The sendable set
+/// is the deep-copy walker's: fixed-size scalars (`i64`/`u64`/`f64`/`Bool`,
+/// atoms as `u32`), `String`, `List`/`Map` of sendable elements, and by-value
+/// structs whose fields are all sendable. What remains rejected — and why —
+/// is enumerated here so the diagnostic is actionable; no payload is ever
+/// silently truncated.
 fn unsendableMessageTypeError(comptime MessageType: type) noreturn {
     @compileError(
-        "Process.send: message type `" ++ @typeName(MessageType) ++ "` is not sendable in Phase 2. " ++
-            "Sendable message types are i64, u64, f64, Bool, and Atom (fixed-size scalar payloads over the " ++
-            "opaque-bytes seam). Rich payloads (String, structs, collections, closures) arrive with the " ++
-            "P2-J5 deep-copy walker (docs/concurrency-implementation-plan.md item 2.4).",
+        "Process.send: message type `" ++ @typeName(MessageType) ++ "` is not sendable. " ++
+            "Sendable message types are scalars (i64, u64, f64, Bool, Atom), String, List/Map of sendable " ++
+            "elements, and by-value structs of those. Still unsendable: closures / Callable existentials " ++
+            "(the captured environment is opaque — Phase 3's compiler-emitted per-closure serialize glue), " ++
+            "payload-bearing or parametric unions, and values holding external resource handles.",
     );
 }
 
@@ -4200,11 +4189,20 @@ fn serializeMessage(comptime T: type, value: T, allocator: std.mem.Allocator) er
 }
 
 /// Receiver side: reconstruct a `T` from `blob`, adopting it into this
-/// process's ARC manager (independent, rc=1). See `deserializeValue`.
+/// process's ARC manager (independent, rc=1). See `deserializeValue`. The
+/// whole blob MUST be consumed — trailing bytes mean the sender's message
+/// type is larger/different than `T` (a size/shape mismatch), which is
+/// reported as `CorruptMessage` after releasing the just-built value so the
+/// error path leaks nothing.
 fn deserializeMessage(comptime T: type, blob: []const u8) error{ OutOfMemory, CorruptMessage }!T {
     comptime std.debug.assert(isWalkerSendable(T));
     var reader = MessageBlobReader{ .bytes = blob };
-    return deserializeValue(T, &reader);
+    const value = try deserializeValue(T, &reader);
+    if (reader.position != blob.len) {
+        releaseWalkerValue(T, value);
+        return error.CorruptMessage;
+    }
+    return value;
 }
 
 test "message walker: List(i64) deep-copies to an independent rc=1 cell" {
@@ -4474,10 +4472,11 @@ pub const ProcessRuntime = struct {
     /// Returns `true` when the message was delivered to a live mailbox
     /// and `false` when it was dead-lettered (target dead or stale —
     /// Erlang semantics: not an error). Panics on allocation failure.
-    /// The message type must be Phase 2 sendable (see
-    /// `isSendableMessageType`); the typed `Pid(M)`/`M` agreement is
-    /// enforced above this bridge by `lib/process.zap`'s generic
-    /// signature.
+    /// The message type must be walker-sendable (see `isWalkerSendable`):
+    /// scalars, `String`, `List`/`Map`, and by-value structs of those. The
+    /// typed `Pid(M)`/`M` agreement is enforced above this bridge by
+    /// `lib/process.zap`'s generic signature and the type checker's
+    /// send-site sendability rule.
     pub fn send_message(target_pid_bits: u64, message: anytype) bool {
         requireConcurrencyRuntimeGate();
         // Untyped Zap literals reach the bridge as comptime values;
@@ -4488,15 +4487,46 @@ pub const ProcessRuntime = struct {
             comptime_float => f64,
             else => @TypeOf(message),
         };
-        if (comptime !isSendableMessageType(MessageType)) unsendableMessageTypeError(MessageType);
-        var message_storage: MessageType = message;
-        const payload_bytes = std.mem.asBytes(&message_storage);
-        const status = ZapConcurrencyKernel.zap_proc_send(
+        if (comptime !isWalkerSendable(MessageType)) unsendableMessageTypeError(MessageType);
+
+        // Scalar fast-path (incl. atoms as `u32`): a bare bit-copy — the
+        // bytes are IDENTICAL to what the walker's scalar arm would emit, so
+        // this needs no heap serialization buffer for the hot scalar-send
+        // path while staying wire-compatible with the rich decode.
+        if (comptime isWalkerScalar(MessageType)) {
+            var message_storage: MessageType = message;
+            const payload_bytes = std.mem.asBytes(&message_storage);
+            return interpretSendStatus(ZapConcurrencyKernel.zap_proc_send(
+                requireCurrentProcessHandle(),
+                target_pid_bits,
+                payload_bytes.ptr,
+                payload_bytes.len,
+            ));
+        }
+
+        // Rich payloads (`String` / `List` / `Map` / struct): deep-copy the
+        // value graph into a neutral blob (`serializeMessage`), hand the bytes
+        // to the kernel (which copies them into the mailbox ledger), then free
+        // the blob. The walker READS the source only — the sender's original
+        // is untouched, so its own Perceus release still frees it and no
+        // in-flight refcount can be touched by two schedulers (Constraint 3
+        // holds by construction: the blob carries zero live refcounts).
+        const typed_message: MessageType = message;
+        const blob = serializeMessage(MessageType, typed_message, std.heap.c_allocator) catch
+            @panic("zap: Process.send failed inside the concurrency runtime (out of memory serializing the message)");
+        defer std.heap.c_allocator.free(blob);
+        return interpretSendStatus(ZapConcurrencyKernel.zap_proc_send(
             requireCurrentProcessHandle(),
             target_pid_bits,
-            payload_bytes.ptr,
-            payload_bytes.len,
-        );
+            blob.ptr,
+            blob.len,
+        ));
+    }
+
+    /// Map a `zap_proc_send` status code to the `Process.send` `Bool` result:
+    /// delivered (`ok`) → `true`, dead-lettered → `false` (Erlang semantics —
+    /// not an error), out-of-memory sentinel → panic.
+    fn interpretSendStatus(status: i32) bool {
         return switch (status) {
             0 => true, // ok — delivered
             1 => false, // dead_lettered
@@ -4531,6 +4561,38 @@ pub const ProcessRuntime = struct {
     /// atom-table ids — valid across processes within one binary).
     pub fn receive_atom() u32 {
         return receiveScalarMessage(u32);
+    }
+
+    /// Blocking GENERIC receive: park until the mailbox is nonempty, then
+    /// reconstruct the oldest message as `MessageType` through the deep-copy
+    /// walker (`deserializeMessage`), adopting its `List`/`Map`/`String`
+    /// subterms as fresh receiver-owned copies. This is the decode behind
+    /// every rich `receive`/`receive_raw` — the ZIR backend monomorphizes it
+    /// on the receive scrutinee's annotated message type (which it
+    /// reconstructs from the type-checked result type). Atoms and payload-free
+    /// unions arrive here as their `u32` id, byte-identical to `receive_atom`.
+    /// A payload whose bytes do not decode to a whole `MessageType` (a
+    /// size/shape mismatch between sender and receiver) aborts rather than
+    /// fabricating a value — the raw-receive trust contract.
+    pub fn receiveMessage(comptime MessageType: type) MessageType {
+        comptime std.debug.assert(isWalkerSendable(MessageType));
+        requireConcurrencyRuntimeGate();
+        const process = requireCurrentProcessHandle();
+        var payload_pointer: ?[*]const u8 = null;
+        var payload_len: usize = 0;
+        const envelope = ZapConcurrencyKernel.zap_proc_receive_park(process, &payload_pointer, &payload_len);
+        defer ZapConcurrencyKernel.zap_proc_envelope_free(envelope);
+        const blob: []const u8 = if (payload_pointer) |pointer| pointer[0..payload_len] else &.{};
+        return deserializeMessage(MessageType, blob) catch |err| switch (err) {
+            error.OutOfMemory => @panic(
+                "zap: Process.receive out of memory reconstructing the message",
+            ),
+            error.CorruptMessage => @panic(
+                "zap: Process.receive payload does not match the receive type — the sender's " ++
+                    "message type differs in size/shape from the receive type (raw typed receive " ++
+                    "trusts the caller; the receive construct's message-union check narrows this)",
+            ),
+        };
     }
 
     /// Terminate the calling process at this point (the kernel's

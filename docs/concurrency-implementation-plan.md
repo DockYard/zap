@@ -332,6 +332,22 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
 
 - **3.1** Driver: resolve/validate every spawn-site manager + manifest default; per-manager
   symbol families replacing the `zap_active_manager` singleton; runtime manager registry.
+  - **Scheduler-local refcount invariant on the WIRED send path (Constraint 3) — Phase-2
+    guarantee + Phase-3 TSan seam.** The deep-copy send is now wired (`send_message` serializes,
+    `receiveMessage` reconstructs). The invariant holds BY CONSTRUCTION and more strongly than
+    the fragment-adopt design: the in-flight message is a flat neutral BLOB carrying ZERO live
+    refcounts (the serializer reads the sender's cells and copies their DATA; it never moves a
+    refcounted cell into the envelope), so there is no refcount any second scheduler could ever
+    touch — cross-thread refcount races are impossible, not merely avoided. The sender's
+    original cells stay in the sender's heap (refcounts untouched by anyone else — the
+    borrow-probe test confirms the sender retains its value across the send); the receiver's
+    reconstructed cells are rc=1 in the receiver's heap, touched only by the receiver. A real
+    MULTI-THREAD ThreadSanitizer run of the send path is NOT yet possible in-tree: host
+    `zig build test` and the Phase-2 single scheduler bind ONE binary-wide ARC instance, so
+    there is no second-thread manager to race against. TSan coverage of concurrent send/receive
+    is therefore the Phase-3 seam (this item's per-process private ARC instances) — the
+    by-construction zero-live-refcount argument is the Phase-2 guarantee until then. (No TSan
+    run is claimed here.)
 - **3.2** Monomorphization hybrid in `src/monomorphize.zig`: specialize spawn-reachable hot
   paths per model (elision decisions per specialization via `src/memory/elision.zig`); cold
   closure/existential paths through the control-block vtable; ICF-unfoldable specializations

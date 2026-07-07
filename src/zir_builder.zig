@@ -7461,7 +7461,34 @@ pub const ZirDriver = struct {
                         // `@TypeOf`, so the actual runtime type — including
                         // `Map(u32, Term)` — is preserved.
                         const is_generic_container = std.mem.eql(u8, mod_name, "List") or std.mem.eql(u8, mod_name, "Map");
-                        if (is_generic_container) {
+                        if (std.mem.eql(u8, mod_name, "ProcessRuntime") and std.mem.eql(u8, func_name, "receive_message")) {
+                            // The GENERIC deep-copy receive. `macro.zig` routes
+                            // every non-fixed-scalar `receive`/`receive_raw`
+                            // here as `(:zig.ProcessRuntime.receive_message() ::
+                            // T)`; monomorphize the walker decode
+                            // `ProcessRuntime.receiveMessage(T)` on the message
+                            // type reconstructed from the annotated result type
+                            // (the same return-type-directed reconstruction the
+                            // `List.new_empty` case below uses). This is how a
+                            // rich `receive List(i64)` / `receive String` /
+                            // `receive %Foo{}` — and, as their u32 atom id,
+                            // `Atom`/a payload-free union — decode without a
+                            // per-type named primitive. There is no Zig
+                            // `receive_message`; this intercept is the ONLY
+                            // lowering of that intrinsic name.
+                            const message_type_ref = (try self.emitContainerElementTypeRef(cb.result_type)) orelse
+                                return error.EmitFailed;
+                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                            if (rt_import == error_ref) return error.EmitFailed;
+                            const proc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ProcessRuntime", 14);
+                            if (proc_runtime == error_ref) return error.EmitFailed;
+                            const receive_fn = zir_builder_emit_field_val(self.handle, proc_runtime, "receiveMessage", 14);
+                            if (receive_fn == error_ref) return error.EmitFailed;
+                            const type_args = [_]u32{message_type_ref};
+                            const ref = zir_builder_emit_call_ref(self.handle, receive_fn, &type_args, 1);
+                            if (ref == error_ref) return error.EmitFailed;
+                            try self.setLocal(cb.dest, ref);
+                        } else if (is_generic_container) {
                             if (std.mem.eql(u8, mod_name, "List") and
                                 (std.mem.eql(u8, func_name, "new_empty") or std.mem.eql(u8, func_name, "new_filled")))
                             {

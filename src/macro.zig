@@ -5067,19 +5067,21 @@ pub const MacroEngine = struct {
 
     /// Map a `receive` message-type token to its blocking decode primitive.
     /// The four fixed-width numeric scalars (`i64`/`u64`/`f64`/`Bool`) each
-    /// get their own primitive; EVERYTHING ELSE decodes through the `u32`
-    /// atom transport (`receive_atom`) — that covers `Atom` itself and a
-    /// payload-free message union, whose variants ARE `u32` atom ids at
-    /// runtime (`zir_builder`'s enum representation), so a union message
-    /// travels and decodes exactly as an atom.
+    /// get their own byte-copy primitive; EVERYTHING ELSE decodes through the
+    /// GENERIC deep-copy walker (`receive_message`), which the ZIR backend
+    /// monomorphizes on the annotated message type it reconstructs from the
+    /// scrutinee's result type. That one generic covers `Atom` and a
+    /// payload-free union (their `u32` atom id — byte-identical to the old
+    /// `receive_atom`), plus `String`, `List`/`Map`, and by-value structs
+    /// (deep-copied to fresh receiver-owned cells).
     ///
-    /// The macro cannot resolve types, so it does not adjudicate validity
-    /// here: the type checker validates the annotated scrutinee type is a
-    /// Phase-2 receive message type (a sendable scalar or a payload-free
-    /// union) and rejects anything richer (`String`, structs, payload-
-    /// bearing/parametric unions) with a precise diagnostic. Selecting the
-    /// atom-width decode for an ultimately-rejected token is harmless —
-    /// compilation fails at type check, long before any decode could run.
+    /// The macro cannot resolve types, so bare-name tokens (`String` vs
+    /// `Atom` vs a user struct vs a union — all just names syntactically) MUST
+    /// route to the type-directed generic rather than being adjudicated here.
+    /// The type checker then validates the resolved scrutinee type is
+    /// walker-sendable and rejects the genuinely-unsendable (closures,
+    /// payload-bearing/parametric unions) with a precise diagnostic; the
+    /// backend picks the concrete decode from the resolved type.
     fn receivePrimitiveName(self: *MacroEngine, message_type: *const ast.TypeExpr) anyerror![]const u8 {
         if (message_type.* == .name and message_type.name.args.len == 0) {
             const type_name = self.interner.get(message_type.name.name);
@@ -5088,7 +5090,7 @@ pub const MacroEngine = struct {
             if (std.mem.eql(u8, type_name, "f64")) return "receive_f64";
             if (std.mem.eql(u8, type_name, "Bool")) return "receive_bool";
         }
-        return "receive_atom";
+        return "receive_message";
     }
 
     /// Build a `:zig.ProcessRuntime.<fn>(args…)` call node — the sanctioned

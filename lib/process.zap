@@ -17,16 +17,23 @@
   down wholesale at exit), and `Process.self`/`send`/`receive_raw`
   work in `main` exactly as in any spawned process.
 
-  ## What can travel in a message (Phase 2)
+  ## What can travel in a message
 
-  Messages ride the kernel's opaque-bytes seam as fixed-size scalar
-  payloads: `i64`, `u64`, `f64`, `Bool`, and `Atom` (atoms travel as
-  their binary-global table ids). Everything richer — `String`,
-  structs, lists, maps, closures — needs the P2-J5 deep-copy walker
-  (plan item 2.4) and is REJECTED AT COMPILE TIME today; nothing is
-  silently truncated. Raw pid bits are a `u64`, so a reply channel is
+  Scalars (`i64`, `u64`, `f64`, `Bool`, `Atom` — atoms as their
+  binary-global table ids) travel as fixed-size payloads. Rich values
+  — `String`, `List`/`Map` of sendable elements, and by-value structs
+  of those — travel by DEEP COPY: the sender serializes the value graph
+  into a neutral blob (reading its own data only, never mutating a
+  refcount), and the receiver reconstructs a fresh, INDEPENDENT copy it
+  solely owns (plan item 2.4, the P2-J5 walker). So the sender and
+  receiver never share a mutable cell, and dropping either side's value
+  leaves the other intact. Still UNSENDABLE (a compile error, never a
+  silent truncation): closures / `Callable` existentials (the captured
+  environment is opaque — Phase 3's per-closure serialize glue),
+  payload-bearing or parametric unions, and values holding external
+  resource handles. Raw pid bits are a `u64`, so a reply channel is
   handed to a child by sending `Process.self()` and re-typing it with
-  `Process.pid` on the other side.
+  `Process.pid`/`Pid.of` on the other side.
 
   ## Spawn scope (Phase 2)
 
@@ -107,8 +114,10 @@ pub struct Process {
     Returns `true` when the message was enqueued on a live mailbox
     and `false` when it was dead-lettered (the target has exited or
     the pid is stale — Erlang semantics: not an error). The message
-    type must be Phase 2 sendable (struct doc); anything richer is a
-    compile error until P2-J5.
+    type must be sendable (struct doc): a scalar, `String`, `List`/
+    `Map`, or a by-value struct of those — a rich value is deep-copied
+    so the receiver gets an independent copy. An unsendable type (a
+    closure, a payload-bearing union) is a compile error.
     """
 
   pub fn send(pid :: Pid(message_type), message :: message_type) -> Bool {
@@ -147,12 +156,16 @@ pub struct Process {
 
   @doc = """
     Blocks until a message arrives, then decodes it as the given type
-    token and returns it: `Process.receive_raw(i64)` parks the
-    calling process until its mailbox is nonempty and yields the
-    oldest message as an `i64`. Tokens cover the Phase 2 sendable set
-    (`i64`, `u64`, `f64`, `Bool`, `Atom`). RAW primitive — the type
-    is trusted, not checked (struct doc); a payload whose size does
-    not match the token aborts the program.
+    token and returns it: `Process.receive_raw(i64)` parks the calling
+    process until its mailbox is nonempty and yields the oldest message
+    as an `i64`. Tokens cover the fixed scalar transport (`i64`, `u64`,
+    `f64`, `Bool`, `Atom`). RAW primitive — the type is trusted, not
+    checked (struct doc); a payload whose size does not match the token
+    aborts the program. RICH messages (`String`, `List`/`Map`, structs)
+    are received through the `receive`/`after` LANGUAGE CONSTRUCT — the
+    checked surface — which decodes any sendable message type through
+    the deep-copy walker and dispatches by pattern (`receive <t> {
+    <pattern> -> <body> … }`).
     """
 
   pub macro receive_raw(i64) -> Expr {

@@ -5708,12 +5708,12 @@ pub const TypeChecker = struct {
     //      from this static decision, so it cannot mask a missing variant.
     // ========================================================================
 
-    /// The Phase-2 open sendable scalar message types at the Zap surface:
+    /// The open sendable scalar message types at the Zap surface:
     /// `i64`/`u64`/`f64`/`Bool`/`Atom`. A `receive` over one carries no
     /// compile-time exhaustiveness obligation (the value domain is
-    /// unbounded); unmatched runtime values ride the dead-letter path. This
-    /// mirrors the send-side sendable set in `runtime.zig`
-    /// (`isSendableMessageType`) at the type-checker level.
+    /// unbounded); unmatched runtime values ride the dead-letter path. A fast
+    /// early-out for the common scalar receive; the general sendability
+    /// decision is `typeIsWalkerSendable` (which also admits these).
     fn isReceivableScalarType(type_id: TypeId) bool {
         return switch (type_id) {
             TypeStore.I64, TypeStore.U64, TypeStore.F64, TypeStore.BOOL, TypeStore.ATOM => true,
@@ -5729,6 +5729,62 @@ pub const TypeChecker = struct {
             if (variant.type_id != null) return false;
         }
         return true;
+    }
+
+    /// Whether `type_id` is a walker-sendable message type — the type-checker
+    /// mirror of `runtime.zig`'s `isWalkerSendable` (the two are kept a mirror
+    /// image by construction so send and receive agree): a scalar
+    /// (`int`/`float`/`Bool`/`Atom`), `String`, a `List`/`Map` of sendable
+    /// elements, a by-value struct whose every field is sendable, or a
+    /// payload-free non-parametric union (which travels as its `u32` atom id).
+    /// Everything else — functions/closures, payload-bearing or parametric
+    /// unions, tuples, `Term`, opaque and generic-`applied` types — is
+    /// unsendable.
+    fn typeIsWalkerSendable(self: *const TypeChecker, type_id: TypeId) bool {
+        var budget = TypeGraphBudget.init(default_type_graph_limits);
+        // A depth/node-limit hit (a recursive/cyclic struct graph, whose
+        // runtime shape uses non-walker-sendable indirect pointers anyway) is
+        // conservatively unsendable, not a hard error.
+        return self.typeIsWalkerSendableBudgeted(type_id, 0, &budget) catch false;
+    }
+
+    fn typeIsWalkerSendableBudgeted(
+        self: *const TypeChecker,
+        type_id: TypeId,
+        depth: usize,
+        budget: *TypeGraphBudget,
+    ) TypeGraphError!bool {
+        try budget.enter(depth);
+        return switch (self.store.getType(type_id)) {
+            .int, .float, .bool_type, .atom_type, .string_type => true,
+            .list => |list_type| try self.typeIsWalkerSendableBudgeted(
+                list_type.element,
+                try budget.childDepth(depth),
+                budget,
+            ),
+            .map => |map_type| (try self.typeIsWalkerSendableBudgeted(
+                map_type.key,
+                try budget.childDepth(depth),
+                budget,
+            )) and (try self.typeIsWalkerSendableBudgeted(
+                map_type.value,
+                try budget.childDepth(depth),
+                budget,
+            )),
+            .struct_type => |struct_type| {
+                for (struct_type.fields) |field| {
+                    if (!try self.typeIsWalkerSendableBudgeted(
+                        field.type_id,
+                        try budget.childDepth(depth),
+                        budget,
+                    )) return false;
+                }
+                return true;
+            },
+            .tagged_union => |tagged_union_type| tagged_union_type.type_params.len == 0 and
+                taggedUnionIsPayloadFree(tagged_union_type),
+            else => false,
+        };
     }
 
     /// Whether a receive arm is an unguarded catch-all — a bare wildcard
@@ -5793,8 +5849,13 @@ pub const TypeChecker = struct {
 
         const message_type = self.store.getType(scrutinee_type);
         if (message_type != .tagged_union) {
-            // Not a scalar and not a union: an unsendable receive message
-            // type (String, struct, function, …).
+            // Not the scalar early-out and not a union. Accept any OTHER
+            // walker-sendable message type — `String`, `List`, `Map`, or a
+            // by-value struct of sendable fields — none of which carry a
+            // variant-coverage obligation; reject the genuinely-unsendable
+            // (functions/closures, tuples, `Term`, resource handles, …) with
+            // the actionable diagnostic.
+            if (self.typeIsWalkerSendable(scrutinee_type)) return;
             try self.addReceiveMessageTypeError(ce.meta.span, scrutinee_type);
             return;
         }
@@ -5842,19 +5903,20 @@ pub const TypeChecker = struct {
         const message = if (type_name) |name|
             try std.fmt.allocPrint(
                 self.allocator,
-                "`receive` message type `{s}` is not sendable in Phase 2",
+                "`receive` message type `{s}` is not sendable",
                 .{name},
             )
         else
-            try self.allocator.dupe(u8, "`receive` message type is not sendable in Phase 2");
+            try self.allocator.dupe(u8, "`receive` message type is not sendable");
         errdefer self.allocator.free(message);
 
         try self.addHardError(
             message,
             span,
             "not a sendable message type",
-            "receive over a sendable scalar (i64, u64, f64, Bool, Atom) or a payload-free union; " ++
-                "richer message types (String, structs, payload-bearing or parametric unions) arrive with the P2-J5 deep-copy walker",
+            "receive over a sendable scalar (i64, u64, f64, Bool, Atom), String, a List/Map of sendable " ++
+                "elements, a by-value struct of those, or a payload-free union; closures, payload-bearing " ++
+                "or parametric unions, and values holding external resource handles are not sendable",
         );
     }
 
