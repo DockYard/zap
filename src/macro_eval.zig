@@ -385,16 +385,33 @@ fn evalInner(env: *Env, value: CtValue) MacroEvalError!CtValue {
                 if (arg_elems.len == 2) {
                     const tup = try eval(env, arg_elems[0]);
                     const idx = try eval(env, arg_elems[1]);
-                    if (tup == .tuple and idx == .int) {
-                        const i: usize = @intCast(idx.int);
-                        if (i < tup.tuple.elems.len) return tup.tuple.elems[i];
-                    }
-                    // Also support wrapped integers {42, [], nil} — extract the int
-                    if (tup == .tuple and tup.tuple.elems.len == 3 and idx == .tuple and idx.tuple.elems.len == 3) {
-                        if (idx.tuple.elems[0] == .int) {
-                            const i: usize = @intCast(idx.tuple.elems[0].int);
-                            if (i < tup.tuple.elems.len) return tup.tuple.elems[i];
+                    // Unwrap a wrapped-integer index {42, meta, nil} first
+                    // so both tuple shapes below share one index value.
+                    const index_value: ?usize = blk: {
+                        if (idx == .int) break :blk @intCast(idx.int);
+                        if (idx == .tuple and idx.tuple.elems.len == 3 and idx.tuple.elems[0] == .int) {
+                            break :blk @intCast(idx.tuple.elems[0].int);
                         }
+                        break :blk null;
+                    };
+                    if (index_value) |i| {
+                        // A quoted tuple LITERAL node `{"{}", meta, [elements]}`
+                        // (parsed source — e.g. the `{key, value}` pairs that
+                        // `use Struct, key: value` keyword options encode as)
+                        // indexes its ELEMENT list, with literal leaves
+                        // unwrapped: macro authors address the tuple they
+                        // wrote, not its AST encoding. Raw 3-tuple indexing
+                        // below is preserved for every other node shape (the
+                        // `|>` macro destructures call nodes as
+                        // {name, meta, args}).
+                        if (tup == .tuple and tup.tuple.elems.len == 3 and
+                            tup.tuple.elems[0] == .atom and std.mem.eql(u8, tup.tuple.elems[0].atom, "{}") and
+                            tup.tuple.elems[2] == .list)
+                        {
+                            const tuple_elements = tup.tuple.elems[2].list.elems;
+                            if (i < tuple_elements.len) return unwrapAstLiteral(tuple_elements[i]);
+                        }
+                        if (tup == .tuple and i < tup.tuple.elems.len) return tup.tuple.elems[i];
                     }
                 }
             }

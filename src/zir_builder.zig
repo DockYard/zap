@@ -571,6 +571,17 @@ fn emitRuntimeNamespaceField(handle: *ZirBuilderHandle, parent: u32, comptime ns
     return zir_builder_emit_field_val(handle, parent, ns.name.ptr, ns.len);
 }
 
+/// P2-J2 — the root-level decl name the user's entry function is
+/// emitted under when the `runtime_concurrency` gate is ON (executable
+/// outputs only). The synthetic `main` wrapper references it by name
+/// (`zir_builder_emit_decl_val`) and hands it to
+/// `zap_runtime.runRootProcessMain`, which spawns it as the root
+/// process. Same compiler-internal naming convention as
+/// `zap_builder_entry`; user Zap functions can never collide with it
+/// (only the entry point is emitted at the root level, always as
+/// `main` or this name).
+const root_process_main_decl_name = "zap_root_process_main";
+
 /// For main(), Zig requires void or u8 return type.
 /// Zap executable entrypoints return exact `u8` process exit status.
 /// A lower-level `.void` return is accepted only because Zig's entry
@@ -974,6 +985,24 @@ pub const ZirDriver = struct {
     /// declaration pointing to this function. start.zig checks for this
     /// declaration to activate the builder runtime.
     builder_entry: ?[]const u8 = null,
+    /// P2-J2 — true when the build resolved the `runtime_concurrency`
+    /// gate ON (mirrors `compiler.RuntimeSourceControls.runtime_concurrency`;
+    /// the backend derives it from the presence of the linked kernel
+    /// object). For executable outputs this reroutes the program entry
+    /// through the root-process bootstrap: the user's entry function is
+    /// emitted under `root_process_main_decl_name` (prologue-free) and a
+    /// synthetic `main` wrapper is emitted that runs the memory-startup
+    /// prologue and then `zap_runtime.runRootProcessMain(<user entry>)`
+    /// — user main becomes the ROOT PROCESS of the concurrency runtime
+    /// (plan §2, P2-J1's "entry-process design" seam). OFF (the default)
+    /// leaves entry emission byte-identical to the non-concurrent world.
+    runtime_concurrency: bool = false,
+    /// Set when the user's entry function was emitted under
+    /// `root_process_main_decl_name` (see `runtime_concurrency`): carries
+    /// the entry's mapped ZIR return type (0 = void, else the `u8` type
+    /// ref) so `buildProgram`'s post-function pass can emit the matching
+    /// synthetic `main` wrapper. Null when no wrapper is pending.
+    pending_root_main_return_type: ?u32 = null,
     /// Optional incremental emission filter. When set, only these Zap struct
     /// modules are emitted; the synthetic root is emitted separately according
     /// to `selected_emit_root`.
@@ -1605,6 +1634,51 @@ pub const ZirDriver = struct {
         const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
         if (rt_import == error_ref) return error.EmitFailed;
         try self.emitMemoryStartupForEntryFromRuntime(rt_import);
+    }
+
+    /// P2-J2 — emit the synthetic `main` of a gated-on executable:
+    ///
+    ///   fn main() <ret> {
+    ///       zap_runtime.memoryStartupForEntry();
+    ///       return zap_runtime.runRootProcessMain(zap_root_process_main);
+    ///   }
+    ///
+    /// The prologue runs on the driver thread's OS stack (memory manager
+    /// bind + concurrency runtime init, LIFO atexit registration), then
+    /// `runRootProcessMain` spawns the user entry as the ROOT PROCESS and
+    /// drives the scheduler until it exits (`src/runtime.zig` documents
+    /// the Erlang halt semantics). `root_main_return_type` is the mapped
+    /// return type of the user entry (0 = void, else `u8`), which the
+    /// wrapper mirrors — `runRootProcessMain` is comptime-generic over
+    /// exactly those two shapes.
+    fn emitRootProcessMainWrapper(self: *ZirDriver, root_main_return_type: u32) BuildError!void {
+        const wrapper_name = "main";
+        if (zir_builder_begin_func(self.handle, wrapper_name.ptr, @intCast(wrapper_name.len), root_main_return_type) != 0) {
+            return error.BeginFuncFailed;
+        }
+
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        try self.emitMemoryStartupForEntryFromRuntime(rt_import);
+
+        const run_root_fn = zir_builder_emit_field_val(self.handle, rt_import, "runRootProcessMain", 18);
+        if (run_root_fn == error_ref) return error.EmitFailed;
+        const user_entry_ref = zir_builder_emit_decl_val(
+            self.handle,
+            root_process_main_decl_name.ptr,
+            @intCast(root_process_main_decl_name.len),
+        );
+        if (user_entry_ref == error_ref) return error.EmitFailed;
+        const run_args = [_]u32{user_entry_ref};
+        const run_result = zir_builder_emit_call_ref(self.handle, run_root_fn, &run_args, 1);
+        if (run_result == error_ref) return error.EmitFailed;
+
+        if (root_main_return_type == 0) {
+            if (zir_builder_emit_ret_void(self.handle) != 0) return error.EmitFailed;
+        } else {
+            if (zir_builder_emit_ret(self.handle, run_result) != 0) return error.EmitFailed;
+        }
+        if (zir_builder_end_func(self.handle) != 0) return error.EndFuncFailed;
     }
 
     /// Phase 2.b — inject `pub const panic = @import("zap_runtime").ZapPanic;`
@@ -4199,6 +4273,15 @@ pub const ZirDriver = struct {
                 }
             }
 
+            // P2-J2 — with the concurrency gate ON, emit the synthetic
+            // `main` that runs the startup prologue on the OS stack and
+            // then hands the user entry (emitted above under
+            // `root_process_main_decl_name`) to the runtime's
+            // root-process bootstrap.
+            if (self.pending_root_main_return_type) |root_main_return_type| {
+                try self.emitRootProcessMainWrapper(root_main_return_type);
+            }
+
             // Phase 2.b — inject the root `pub const panic` namespace so
             // Zig's panic interface routes Zig-level safety panics (integer
             // divide-by-zero, `unreachable`, null-unwrap, non-Zap slice
@@ -5634,7 +5717,17 @@ pub const ZirDriver = struct {
 
         self.current_ret_type = ret_type;
 
-        const emit_name = if (is_main)
+        // P2-J2: with the concurrency gate ON, the user's entry function
+        // is emitted under the internal root-process name and a synthetic
+        // `main` wrapper (emitted after all functions — see
+        // `emitRootProcessMainWrapper`) routes it through the runtime's
+        // root-process bootstrap. Everything else about entry emission
+        // (return-type mapping, argv materialization, raises exclusion)
+        // stays exactly the `is_main` shape.
+        const emit_as_root_process_entry = is_main and self.runtime_concurrency and !self.lib_mode;
+        const emit_name = if (emit_as_root_process_entry)
+            @as([]const u8, root_process_main_decl_name)
+        else if (is_main)
             @as([]const u8, "main")
         else if (self.current_emit_struct != null and func.local_name.len > 0)
             func.local_name
@@ -5657,14 +5750,23 @@ pub const ZirDriver = struct {
         }
 
         if (is_main) {
-            // Executable binary builds pair this emitted entry call
-            // with a runtime-source rewrite that sets
-            // `MEMORY_STARTUP_PROLOGUE_EMITTED == true`, allowing
-            // dispatchers to compile away lazy startup. Object outputs
-            // may still contain this generated function, but they have
-            // no guaranteed executable artifact entry boundary, so
-            // their runtime source keeps the marker false.
-            try self.emitMemoryStartupForEntry();
+            if (emit_as_root_process_entry) {
+                // P2-J2: the startup prologue moves into the synthetic
+                // `main` wrapper (it must run on the driver thread's OS
+                // stack BEFORE the concurrency runtime spawns the root
+                // process); record the mapped return type so the
+                // post-function pass emits the matching wrapper.
+                self.pending_root_main_return_type = ret_type;
+            } else {
+                // Executable binary builds pair this emitted entry call
+                // with a runtime-source rewrite that sets
+                // `MEMORY_STARTUP_PROLOGUE_EMITTED == true`, allowing
+                // dispatchers to compile away lazy startup. Object outputs
+                // may still contain this generated function, but they have
+                // no guaranteed executable artifact entry boundary, so
+                // their runtime source keeps the marker false.
+                try self.emitMemoryStartupForEntry();
+            }
 
             // Phase 2.b: record that this compilation produced a real
             // program entry, so `buildProgram` injects the root `panic`
@@ -11918,6 +12020,10 @@ pub fn buildAndInject(
     runtime_path: ?[:0]const u8,
     lib_mode: bool,
     builder_entry: ?[]const u8,
+    /// P2-J2 — the resolved `runtime_concurrency` gate. Forwarded to
+    /// `ZirDriver.runtime_concurrency`; ON reroutes executable entry
+    /// emission through the root-process bootstrap (field doc).
+    runtime_concurrency: bool,
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext,
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership,
     declared_caps: u64,
@@ -11948,6 +12054,7 @@ pub fn buildAndInject(
     var driver = try ZirDriver.init(allocator);
     driver.lib_mode = lib_mode;
     driver.builder_entry = builder_entry;
+    driver.runtime_concurrency = runtime_concurrency;
     driver.analysis_context = analysis_context;
     driver.arc_ownership = arc_ownership;
     driver.declared_caps = declared_caps;
@@ -11991,6 +12098,9 @@ pub fn buildAndInjectSelected(
     compilation_ctx: *ZirContext,
     lib_mode: bool,
     builder_entry: ?[]const u8,
+    /// P2-J2 — the resolved `runtime_concurrency` gate (see
+    /// `buildAndInject`). Forwarded to `ZirDriver.runtime_concurrency`.
+    runtime_concurrency: bool,
     analysis_context: ?*const @import("escape_lattice.zig").AnalysisContext,
     arc_ownership: ?*const @import("arc_liveness.zig").ProgramArcOwnership,
     declared_caps: u64,
@@ -12015,6 +12125,7 @@ pub fn buildAndInjectSelected(
     var driver = try ZirDriver.init(allocator);
     driver.lib_mode = lib_mode;
     driver.builder_entry = builder_entry;
+    driver.runtime_concurrency = runtime_concurrency;
     driver.analysis_context = analysis_context;
     driver.arc_ownership = arc_ownership;
     driver.declared_caps = declared_caps;

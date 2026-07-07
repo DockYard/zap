@@ -10813,6 +10813,10 @@ fn runArcOwnershipVerifier(
     defer verify_ownership.deinit();
 
     progressStage(options, "ARC: verifying ownership invariants", .{});
+    // Dump BEFORE the verifier (same `ZAP_DUMP_IR_FN` selector as the
+    // post-drop dump): a pre-drop verifier abort is exactly when this
+    // stage's IR is needed for diagnosis.
+    dumpIrIfRequested(program, "pre-drop-verify");
     for (program.functions) |*function| {
         const fn_ownership = verify_ownership.get(function.id);
         zap.arc_verifier.verifyFull(
@@ -10938,8 +10942,10 @@ fn runArcDropInsertion(
     options: CompileOptions,
 ) CompileError!void {
     try runArcScopeExitDropInsertion(alloc, program, ownership, options);
-    try runArcDropInsertionVerifier(alloc, program, type_store, options);
+    // Dump BEFORE the verifier: a verifier abort is exactly when the
+    // post-drop IR is needed for diagnosis.
     dumpPostDropInsertionIrIfRequested(program);
+    try runArcDropInsertionVerifier(alloc, program, type_store, options);
 }
 
 /// Semantic drop insertion. These releases make ownership effects
@@ -11052,12 +11058,19 @@ fn runArcDropInsertionVerifier(
 }
 
 fn dumpPostDropInsertionIrIfRequested(program: *const ir.Program) void {
+    dumpIrIfRequested(program, "post-drop-insertion");
+}
+
+/// `ZAP_DUMP_IR_FN=<substring>` debug hook shared by the ARC pipeline's
+/// dump points: prints every function whose IR name contains the
+/// selector, labeled with the pipeline stage it was captured at.
+fn dumpIrIfRequested(program: *const ir.Program, stage_label: []const u8) void {
     if (std.c.getenv("ZAP_DUMP_IR_FN")) |raw| {
         const glob_z: [*:0]const u8 = @ptrCast(raw);
         const glob = std.mem.span(glob_z);
         for (program.functions) |*function| {
             if (std.mem.indexOf(u8, function.name, glob)) |_| {
-                std.debug.print("=== IR dump (post-drop-insertion): {s} (id={d}) ===\n", .{ function.name, function.id });
+                std.debug.print("=== IR dump ({s}): {s} (id={d}) ===\n", .{ stage_label, function.name, function.id });
                 std.debug.print("  param_conventions=[", .{});
                 for (function.param_conventions, 0..) |c, ci| {
                     if (ci > 0) std.debug.print(", ", .{});
@@ -11123,6 +11136,7 @@ fn dumpStream(stream: []const ir.Instruction, indent: usize) void {
                 std.debug.print("]", .{});
             },
             .param_get => |pg| std.debug.print(" dest={d} index={d}", .{ pg.dest, pg.index }),
+            .make_closure => |mc| std.debug.print(" dest={d} function={d} captures={d}", .{ mc.dest, mc.function, mc.captures.len }),
             .const_int => |ci| std.debug.print(" dest={d}", .{ci.dest}),
             .switch_literal => |sl| std.debug.print(" dest={d} scrut={d} cases={d}", .{ sl.dest, sl.scrutinee, sl.cases.len }),
             .tail_call => |tc| {

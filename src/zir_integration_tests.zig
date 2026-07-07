@@ -206,6 +206,34 @@ fn expectCompileFails(source: []const u8) !void {
 }
 
 fn expectCompileFailsWithDiagnostic(source: []const u8, expected_diagnostic: []const u8) !void {
+    try expectCompileFailsWithDiagnosticGated(source, expected_diagnostic, false, false);
+}
+
+/// Variant of `expectCompileFailsWithDiagnostic` whose synthesized
+/// manifest resolves the `runtime_concurrency` gate ON (P2-J2): gated
+/// compiles resolve the concurrency kernel unit relative to the stdlib
+/// root, so the build is pinned to the repo's `lib/` via
+/// `--zap-lib-dir` (the exe-relative stdlib copy under `zig-out/` has
+/// no sibling `src/runtime/concurrency`).
+fn expectGatedCompileFailsWithDiagnostic(source: []const u8, expected_diagnostic: []const u8) !void {
+    try expectCompileFailsWithDiagnosticGated(source, expected_diagnostic, true, true);
+}
+
+/// Variant for a gate-OFF build that still references `Process.*`: the
+/// manifest leaves `runtime_concurrency` OFF (proving the zero-cost gate
+/// diagnostic fires), but the build is still pinned to the repo's `lib/`
+/// via `--zap-lib-dir` so the `Process` stdlib module resolves (the gate
+/// error must come from the comptime gate, not a missing-module error).
+fn expectGateOffConcurrencyCompileFailsWithDiagnostic(source: []const u8, expected_diagnostic: []const u8) !void {
+    try expectCompileFailsWithDiagnosticGated(source, expected_diagnostic, false, true);
+}
+
+fn expectCompileFailsWithDiagnosticGated(
+    source: []const u8,
+    expected_diagnostic: []const u8,
+    runtime_concurrency: bool,
+    pin_repo_lib_dir: bool,
+) !void {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -213,7 +241,25 @@ fn expectCompileFailsWithDiagnostic(source: []const u8, expected_diagnostic: []c
 
     tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
 
-    const build_source =
+    const build_source = if (runtime_concurrency)
+        \\pub struct TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :test_prog ->
+        \\        %Zap.Manifest{
+        \\          name: "test_prog",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: &TestProg.main/0,
+        \\          paths: ["lib/**/*.zap"],
+        \\          runtime_concurrency: true
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    else
         \\pub struct TestProg.Builder {
         \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
         \\    case env.target {
@@ -241,8 +287,23 @@ fn expectCompileFailsWithDiagnostic(source: []const u8, expected_diagnostic: []c
     const zap_binary = try resolveZapBinary(allocator);
     defer allocator.free(zap_binary);
 
+    // Concurrency-referencing builds resolve `Process`/the concurrency
+    // kernel unit relative to the stdlib root — pin it to the repo's
+    // `lib/` (the zir-test runner's cwd is the repo root). Independent of
+    // the manifest gate: a gate-OFF test that references `Process` still
+    // needs the module to resolve so the comptime gate diagnostic fires.
+    var repo_lib_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const repo_lib_dir: ?[]const u8 = if (pin_repo_lib_dir) blk: {
+        const canonical_len = std.Io.Dir.cwd().realPathFile(getTestIo(), "lib", &repo_lib_dir_buffer) catch return error.Unexpected;
+        break :blk repo_lib_dir_buffer[0..canonical_len];
+    } else null;
+    const compile_argv: []const []const u8 = if (repo_lib_dir) |lib_dir|
+        &.{ zap_binary, "build", "test_prog", "--zap-lib-dir", lib_dir }
+    else
+        &.{ zap_binary, "build", "test_prog" };
+
     const compile_result = std.process.run(allocator, getTestIo(), .{
-        .argv = &.{ zap_binary, "build", "test_prog" },
+        .argv = compile_argv,
         .cwd = .{ .path = tmp_dir_path },
         .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
         .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
@@ -5794,4 +5855,100 @@ test "closure: returned/field closures leak-free under Memory.Tracking (Gap E AR
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "106") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak summary:") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
+}
+
+// ============================================================
+// P2-J2 concurrency surface — compile-fail contracts. These pin the
+// static guarantees of `lib/process.zap` / `lib/pid.zap`: the typed
+// `Pid(M)` send discipline, the Phase-2 sendable-payload scope, the
+// spawn closure-soundness restriction, and the zero-cost gate. They
+// live in the zir-test harness because Zest cannot yet express
+// compile-fail expectations (see CLAUDE.md "Test Placement").
+// ============================================================
+
+test "ZIR concurrency: Process.send rejects a message whose type mismatches the typed Pid(M)" {
+    // `echo : Pid(i64)` — sending a String is a compile error (ordinary
+    // generic type-checking of `send(pid :: Pid(m), message :: m)`, NOT
+    // compiler magic): the typed handle is what makes an undecodable
+    // message impossible.
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    echo = Process.pid(i64, Process.self())
+        \\    _sent = Process.send(echo, "hi")
+        \\    0
+        \\  }
+        \\}
+    ,
+        "got `String`",
+    );
+}
+
+test "ZIR concurrency: Process.spawn rejects a closure with a captured environment" {
+    // A closure capturing `captured` cannot cross into the child without
+    // the P2-J5 deep-copy walker (it would share the spawner's heap
+    // unsoundly), so the Phase-2 spawn surface rejects it at compile time.
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    captured = 5
+        \\    _child = Process.spawn(fn() -> Nil {
+        \\      _ignore = captured
+        \\      nil
+        \\    })
+        \\    0
+        \\  }
+        \\}
+    ,
+        "Process.spawn requires a named (or capture-less) zero-parameter function in Phase 2",
+    );
+}
+
+test "ZIR concurrency: Process.receive_raw rejects an unsendable payload type token" {
+    // `String` is outside the Phase-2 sendable set (fixed-size scalars);
+    // the raw-receive token macro has no clause for it, so an unsendable
+    // receive is rejected at compile time rather than fabricating bytes.
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    _value = Process.receive_raw(String)
+        \\    0
+        \\  }
+        \\}
+    ,
+        "no macro clause of `receive_raw/1` matches the arguments",
+    );
+}
+
+test "ZIR concurrency: Process.pid rejects an unsendable message-type token" {
+    // A `Pid(String)` handle is unconstructable through the typed-handle
+    // surface: `String` is not in the Phase-2 sendable token set, so the
+    // `pid` token macro has no matching clause — you cannot stamp a handle
+    // for a message type the runtime cannot carry.
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    _p = Process.pid(String, Process.self())
+        \\    0
+        \\  }
+        \\}
+    ,
+        "no macro clause of `pid/2` matches the arguments",
+    );
+}
+
+test "ZIR concurrency: Process.* is a compile error when the runtime_concurrency gate is OFF" {
+    // The zero-cost guarantee, enforced: a gate-OFF binary carries no
+    // concurrency kernel, so referencing any `Process` operation is a
+    // comptime error (not a link failure) with an actionable message.
+    try expectGateOffConcurrencyCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    _bits = Process.self()
+        \\    0
+        \\  }
+        \\}
+    ,
+        "Process operations require the concurrency runtime",
+    );
 }

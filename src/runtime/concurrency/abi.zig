@@ -404,6 +404,46 @@ export fn zap_proc_run_until_quiescent() callconv(.c) i32 {
     return ZapProcStatus.ok;
 }
 
+/// Drive the scheduler until the process identified by `target_pid_bits`
+/// has exited, then return — other processes may still be live (the
+/// kernel's `runUntilProcessExits`). This is the root-process join the
+/// P2-J2 generated bootstrap drives: user main runs as the root process
+/// and the program's lifetime is the root's lifetime; stragglers are torn
+/// down by `zap_proc_runtime_deinit`'s `shutdownAllProcesses` (Erlang
+/// halt semantics). Driver thread only. Returns immediately when the pid
+/// does not resolve (already dead, stale, or forged).
+///
+/// Returns `ZapProcStatus.ok` or `not_initialized`.
+export fn zap_proc_run_until_exit(target_pid_bits: u64) callconv(.c) i32 {
+    if (!runtime_initialized) return ZapProcStatus.not_initialized;
+    const target = concurrency.Pid.fromBits(target_pid_bits);
+    runtime_state.scheduler.runUntilProcessExits(target) catch |err| switch (err) {
+        // Unreachable under the production idle strategy (the Phase 2
+        // runtime always parks); surfaced defensively for completeness.
+        error.AllProcessesWaiting => return ZapProcStatus.not_initialized,
+    };
+    return ZapProcStatus.ok;
+}
+
+/// The current process's opaque handle — the same value the kernel
+/// passed to the process entry function — or null when no process
+/// quantum is running (including on the driver thread outside the
+/// scheduler loop) or the runtime is not initialized.
+///
+/// This is the ambient-lookup companion to the parameter-threaded
+/// current-process discipline (module doc): compiled Zap code reaches
+/// process-scoped intrinsics through the runtime's process wrappers,
+/// which cannot thread the entry-delivered handle through every Zap
+/// call frame in Phase 2, so they re-resolve it per operation through
+/// this intrinsic (one global read plus one field read on the Phase 2
+/// single scheduler — the A.4.1 register-vs-parameter-vs-TLS decision
+/// for compiled code stays open, and this surface is additive over it).
+/// Kernel-internal code never calls this.
+export fn zap_proc_current() callconv(.c) ?*anyopaque {
+    if (!runtime_initialized) return null;
+    return @ptrCast(runtime_state.scheduler.currentProcessContext());
+}
+
 // ---------------------------------------------------------------------------
 // Intrinsics — spawn (driver thread or process body; same OS thread)
 // ---------------------------------------------------------------------------
@@ -662,6 +702,95 @@ test "abi: init → spawn → send → receive → exit round-trip through the C
     const envelope_stats = runtime_state.envelope_pool.statistics();
     try testing.expectEqual(@as(u32, 0), envelope_stats.live_page_count);
     try testing.expectEqual(@as(u32, 0), envelope_stats.abandoned_page_count);
+}
+
+/// Probe for the ambient-handle and root-join intrinsics: the "root"
+/// process records whether `zap_proc_current` matched its
+/// entry-delivered handle, receives one message, and exits; a straggler
+/// parks forever to prove the join returns before quiescence.
+const AmbientJoinProbe = struct {
+    root_pid_bits: u64 = 0,
+    current_matched_entry_handle: bool = false,
+    current_matched_after_park: bool = false,
+    received_payload_len: usize = 0,
+};
+
+fn ambientRootEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *AmbientJoinProbe = @ptrCast(@alignCast(argument.?));
+    probe.current_matched_entry_handle = zap_proc_current() == process;
+
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    probe.received_payload_len = payload_len;
+    zap_proc_envelope_free(envelope);
+    // The park suspended and resumed the fiber: the ambient handle must
+    // still resolve to this process's own context.
+    probe.current_matched_after_park = zap_proc_current() == process;
+}
+
+fn ambientSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *AmbientJoinProbe = @ptrCast(@alignCast(argument.?));
+    const send_status = zap_proc_send(process, probe.root_pid_bits, "join", 4);
+    std.debug.assert(send_status == ZapProcStatus.ok);
+}
+
+fn parkForeverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    _ = argument;
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    _ = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    @panic("the straggler must never receive a message");
+}
+
+test "abi: zap_proc_current is null on the driver thread and matches the entry handle inside a process" {
+    try testing.expectEqual(@as(?*anyopaque, null), zap_proc_current());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    try testing.expectEqual(@as(?*anyopaque, null), zap_proc_current());
+
+    var probe = AmbientJoinProbe{};
+    const root_pid_bits = zap_proc_spawn(ambientRootEntry, &probe);
+    try testing.expect(root_pid_bits != concurrency.Pid.invalid.toBits());
+    probe.root_pid_bits = root_pid_bits;
+    const sender_pid_bits = zap_proc_spawn(ambientSenderEntry, &probe);
+    try testing.expect(sender_pid_bits != concurrency.Pid.invalid.toBits());
+
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expect(probe.current_matched_entry_handle);
+    try testing.expect(probe.current_matched_after_park);
+    try testing.expectEqual(@as(usize, 4), probe.received_payload_len);
+    // Back on the driver thread between/after quanta: null again.
+    try testing.expectEqual(@as(?*anyopaque, null), zap_proc_current());
+}
+
+test "abi: zap_proc_run_until_exit joins the target and leaves stragglers for deinit" {
+    try testing.expectEqual(ZapProcStatus.not_initialized, zap_proc_run_until_exit(0));
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+
+    const straggler_pid_bits = zap_proc_spawn(parkForeverEntry, null);
+    try testing.expect(straggler_pid_bits != concurrency.Pid.invalid.toBits());
+
+    var probe = AmbientJoinProbe{};
+    const root_pid_bits = zap_proc_spawn(ambientRootEntry, &probe);
+    try testing.expect(root_pid_bits != concurrency.Pid.invalid.toBits());
+    probe.root_pid_bits = root_pid_bits;
+    const sender_pid_bits = zap_proc_spawn(ambientSenderEntry, &probe);
+    try testing.expect(sender_pid_bits != concurrency.Pid.invalid.toBits());
+
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(root_pid_bits));
+
+    // The root is gone; the parked straggler is still live.
+    try testing.expectEqual(@as(usize, 4), probe.received_payload_len);
+    try testing.expectEqual(@as(u32, 1), runtime_state.scheduler.statistics().live_process_count);
+
+    // Joining a dead pid returns immediately.
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(root_pid_bits));
+
+    // Program-shutdown semantics: deinit tears the straggler down.
+    zap_proc_runtime_deinit();
+    try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
 }
 
 fn deadLetterSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {

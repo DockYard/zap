@@ -372,12 +372,25 @@ pub const CompileOptions = struct {
     /// kernel object resolved by `src/concurrency_driver.zig`, linked
     /// into the binary via `zir_compilation_add_link_object_file`.
     /// MUST be non-null exactly when the build's `runtime_concurrency`
-    /// gate is ON (the caller also passes `runtime_concurrency = true`
+    /// gate is ON **and this options value creates the compilation
+    /// context** (the caller also passes `runtime_concurrency = true`
     /// through `compiler.RuntimeSourceControls` so the embedded
     /// runtime's `zap_proc_*` extern references have this object to
-    /// resolve against). Null — the default — is the zero-cost OFF
-    /// posture: nothing is linked and no intrinsic symbol exists.
+    /// resolve against). Incremental-rebuild options reuse a persistent
+    /// context whose link inputs already carry the object and leave
+    /// this null — which is why the gate itself travels separately as
+    /// `runtime_concurrency` below. Null — the default — is the
+    /// zero-cost OFF posture: nothing is linked and no intrinsic
+    /// symbol exists.
     concurrency_kernel_object_path: ?[]const u8 = null,
+    /// P2-J2: the resolved `runtime_concurrency` gate, threaded into
+    /// ZIR emission (`zir_builder.ZirDriver.runtime_concurrency`).
+    /// ON reroutes executable entry emission through the root-process
+    /// bootstrap (user main runs as the root process). Must be set on
+    /// EVERY options value that reaches an inject entry point —
+    /// including incremental rebuilds that leave
+    /// `concurrency_kernel_object_path` null.
+    runtime_concurrency: bool = false,
     /// Shared CLI progress reporter, owned by the command driver.
     progress: ?*progress_mod.Reporter = null,
     /// Phase 0 — DWARF foundation: when true (the default), the ZIR
@@ -830,6 +843,7 @@ pub fn injectAndUpdate(allocator: std.mem.Allocator, program: ir.Program, ctx: *
         null,
         lib_mode,
         options.builder_entry,
+        options.runtime_concurrency,
         options.analysis_context,
         options.arc_ownership,
         options.declared_caps,
@@ -1112,6 +1126,7 @@ pub fn injectPreparedAndUpdate(allocator: std.mem.Allocator, program: ir.Program
         null,
         lib_mode,
         options.builder_entry,
+        options.runtime_concurrency,
         options.analysis_context,
         options.arc_ownership,
         options.declared_caps,
@@ -1173,6 +1188,7 @@ pub fn injectPreparedSelectedAndUpdate(
         ctx,
         lib_mode,
         options.builder_entry,
+        options.runtime_concurrency,
         options.analysis_context,
         options.arc_ownership,
         options.declared_caps,

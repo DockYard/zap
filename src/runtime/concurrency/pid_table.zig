@@ -689,6 +689,22 @@ pub const PidTable = struct {
         return observation.pcb.?;
     }
 
+    /// Silent aliveness probe: the same validation as `lookup` without
+    /// the dead-letter accounting, hook, or log — for control-flow
+    /// checks where a dead pid is the EXPECTED terminal condition
+    /// rather than a mis-addressed message (the scheduler's
+    /// root-process join polls this every loop iteration after the
+    /// root exits).
+    pub fn isAlive(table: *PidTable, pid: Pid) bool {
+        if (!pid.isLocal()) return false;
+        if (pid.slot >= table.slots.len) return false;
+        const observation = readSlotConsistent(&table.slots[pid.slot]);
+        if (observation.metadata.generation != pid.generation) return false;
+        if (observation.metadata.state != .occupied) return false;
+        if (observation.metadata.model != pid.model) return false;
+        return true;
+    }
+
     /// Begin a snapshot-free live-process walk (module doc "Iteration
     /// semantics"; plan item 1.2 / OTP 28 precedent).
     pub fn iterateLiveProcesses(table: *PidTable) LiveProcessIterator {

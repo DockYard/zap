@@ -8114,6 +8114,9 @@ fn compileAndLink(
             resolved_kernel.object_path
         else
             null,
+        // P2-J2: the gate itself, threaded into ZIR emission (root-
+        // process entry rerouting).
+        .runtime_concurrency = runtime_concurrency_enabled,
         .progress = progress,
         // Zig 0.16 error formatting options from manifest
         .error_style = config.error_style,
@@ -10213,6 +10216,9 @@ const IncrementalWatchState = struct {
                 resolved_kernel.object_path
             else
                 null,
+            // P2-J2: the gate itself, threaded into ZIR emission (root-
+            // process entry rerouting).
+            .runtime_concurrency = runtime_concurrency_enabled,
             .debug_info_policy = watch_dbg_resolution.in_binary,
             .frame_pointer_policy = zir_backend.FramePointerPolicy.fromOptional(watch_dbg_resolution.frame_pointers),
         }) catch |err| return incrementalInitErrorOrStatus(err, error.BackendError);
@@ -10346,6 +10352,9 @@ const IncrementalWatchState = struct {
             // `init`, whose link inputs already carry the kernel object;
             // `backendOptions` feeds `injectAndUpdate` (never a fresh
             // `createContext`), so no object path is re-registered here.
+            // P2-J2: the gate itself still travels — ZIR emission needs
+            // it on every rebuild (root-process entry rerouting).
+            .runtime_concurrency = self.runtime_concurrency,
             .progress = progress,
             .debug_info_policy = dbg_resolution.in_binary,
             .frame_pointer_policy = zir_backend.FramePointerPolicy.fromOptional(dbg_resolution.frame_pointers),

@@ -2693,6 +2693,25 @@ const ConsumeSiteRewriter = struct {
         defer rewrite_share_to_cow.deinit(self.allocator);
         var drop_release: std.AutoHashMapUnmanaged(usize, void) = .empty;
         defer drop_release.deinit(self.allocator);
+        // A fresh `box_as_protocol` temporary passed DIRECTLY into an
+        // `.owned` slot (no `share_value` in between — the IR builder
+        // materializes existential boxes per call site, so the box local
+        // has exactly this one use). The box is a caller-owned `+1`, so
+        // V7's discipline is satisfied by moving it into the slot:
+        //
+        //     box_as_protocol{box <- value}
+        //     move_value{moved <- box}          # inserted
+        //     call_x(..., moved, ...)           # arg slot rewired
+        //
+        // Without this, the arg producer classifies as `none` and the
+        // pre-drop verifier rejects the call site (the EnumTest
+        // `Enum.sum(1..10)` shape: boxed `Enumerable` into a promoted
+        // `.owned` receiver — a caller shape the FU-13/FU-38 share
+        // rewrites never see because no share exists).
+        var insert_move_after_box: std.AutoHashMapUnmanaged(usize, BoxedOwnedArgMove) = .empty;
+        defer insert_move_after_box.deinit(self.allocator);
+        var boxed_owned_slot_rewrites: std.ArrayListUnmanaged(BoxedOwnedSlotRewrite) = .empty;
+        defer boxed_owned_slot_rewrites.deinit(self.allocator);
 
         var i: usize = 0;
         while (i < stream.len) : (i += 1) {
@@ -2714,6 +2733,24 @@ const ConsumeSiteRewriter = struct {
                 while (j > 0) {
                     j -= 1;
                     const prev = rebuilt_children.items[j] orelse stream[j];
+                    if (prev == .box_as_protocol and prev.box_as_protocol.dest == arg_local) {
+                        // Fresh existential box (see the table doc
+                        // above): transfer its `+1` into the slot via
+                        // an explicit move.
+                        const moved_local = try self.allocOwnedLocal();
+                        try propagateProtocolBoxLocal(self.allocator, self.function, moved_local, arg_local);
+                        try insert_move_after_box.put(self.allocator, j, .{
+                            .moved_local = moved_local,
+                            .source_local = arg_local,
+                        });
+                        try boxed_owned_slot_rewrites.append(self.allocator, .{
+                            .call_index = i,
+                            .slot = slot,
+                            .moved_local = moved_local,
+                        });
+                        any_change = true;
+                        break;
+                    }
                     if (prev == .share_value and prev.share_value.dest == arg_local) {
                         // FU-13/FU-38: choose move vs copy-on-write by
                         // BOTH ownership and liveness. A direct move is
@@ -2846,7 +2883,19 @@ const ConsumeSiteRewriter = struct {
                     }
                 }
             } else {
-                try new_instrs.append(self.allocator, effective);
+                // Rewire any `.owned` slots consuming a fresh box
+                // through their inserted move locals (table doc above).
+                var patched = effective;
+                for (boxed_owned_slot_rewrites.items) |rewrite| {
+                    if (rewrite.call_index != idx) continue;
+                    patched = try replaceCallArg(self.allocator, patched, rewrite.slot, rewrite.moved_local);
+                }
+                try new_instrs.append(self.allocator, patched);
+            }
+            if (insert_move_after_box.get(idx)) |box_move| {
+                try new_instrs.append(self.allocator, .{
+                    .move_value = .{ .dest = box_move.moved_local, .source = box_move.source_local },
+                });
             }
         }
 
@@ -2931,6 +2980,58 @@ fn callArgs(instr: ir.Instruction) ?[]const ir.LocalId {
         .try_call_named => |tcn| tcn.args,
         else => null,
     };
+}
+
+/// A pending `move_value` insertion directly after a `box_as_protocol`
+/// whose fresh box feeds an `.owned` call slot (see the rewrite-table
+/// doc in `rewriteStream`).
+const BoxedOwnedArgMove = struct {
+    moved_local: ir.LocalId,
+    source_local: ir.LocalId,
+};
+
+/// A pending call-arg rewire pairing `BoxedOwnedArgMove`'s inserted
+/// move with the consuming call site's slot.
+const BoxedOwnedSlotRewrite = struct {
+    call_index: usize,
+    slot: usize,
+    moved_local: ir.LocalId,
+};
+
+/// Rebuild a call-shaped instruction with `args[slot]` replaced by
+/// `replacement`. The args slice is duplicated (the original may be
+/// shared with other IR views); non-call instructions are returned
+/// unchanged (the caller only invokes this for call shapes).
+fn replaceCallArg(
+    allocator: std.mem.Allocator,
+    instr: ir.Instruction,
+    slot: usize,
+    replacement: ir.LocalId,
+) error{OutOfMemory}!ir.Instruction {
+    switch (instr) {
+        .call_named => |cn| {
+            const new_args = try allocator.dupe(ir.LocalId, cn.args);
+            new_args[slot] = replacement;
+            var patched = cn;
+            patched.args = new_args;
+            return .{ .call_named = patched };
+        },
+        .call_direct => |cd| {
+            const new_args = try allocator.dupe(ir.LocalId, cd.args);
+            new_args[slot] = replacement;
+            var patched = cd;
+            patched.args = new_args;
+            return .{ .call_direct = patched };
+        },
+        .try_call_named => |tcn| {
+            const new_args = try allocator.dupe(ir.LocalId, tcn.args);
+            new_args[slot] = replacement;
+            var patched = tcn;
+            patched.args = new_args;
+            return .{ .try_call_named = patched };
+        },
+        else => return instr,
+    }
 }
 
 // ============================================================

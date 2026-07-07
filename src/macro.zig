@@ -2741,6 +2741,20 @@ pub const MacroEngine = struct {
             if (name[0] == ':') return null;
             return name;
         }
+        // A capitalized type reference at the call site (`Bool`, `Atom`,
+        // `String`, a user struct name) quotes as
+        // `{:__aliases__, meta, ["Name"]}` (ast_data.zig's struct_ref
+        // encoding). A single-segment alias is a simple type name — the
+        // subject-side counterpart of `isConcreteTypePatternName`'s
+        // capitalized entries. Multi-segment aliases (`Foo.Bar`) are not
+        // simple names and never match a one-identifier type pattern.
+        if (astNodeArgs(value, "__aliases__")) |alias_parts| {
+            if (alias_parts.len != 1) return null;
+            const part = unwrapAstLeaf(alias_parts[0]);
+            if (part != .atom) return null;
+            if (part.atom.len == 0) return null;
+            return part.atom;
+        }
         return null;
     }
 

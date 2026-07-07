@@ -458,6 +458,18 @@ pub const ProcessRecord = struct {
     /// Intrusive Treiber link in the scheduler's wake stack. Written by
     /// the pushing thread before the head CAS publishes it.
     wake_next: ?*ProcessRecord,
+    /// The `ProcessContext` living on this process's fiber stack, or
+    /// null before the first quantum (the context is built by
+    /// `processFiberEntry` at first schedule). This is the plan-A.2.4
+    /// ambient-lookup seam the module doc's current-process discipline
+    /// reserves for compiled Zap code: kernel code keeps receiving the
+    /// context as a parameter, while `Scheduler.currentProcessContext`
+    /// (backing the `zap_proc_current` intrinsic) reads this field for
+    /// the process the scheduler is currently running. The pointer
+    /// targets `processFiberEntry`'s frame, which outlives every quantum
+    /// of the process — it dies only with the fiber stack at teardown,
+    /// after which the record is recycled and `spawn` resets the field.
+    active_context: ?*ProcessContext,
 };
 
 /// The per-quantum kernel capability handed to a process body: the
@@ -819,6 +831,7 @@ pub const Scheduler = struct {
         record.pending_kill = false;
         record.wake_pending = .init(false);
         record.wake_next = null;
+        record.active_context = null;
         ProcessControlBlock.init(&record.pcb, kernel_fiber, options.manager);
         errdefer fiber_context.reclaimWithoutResume(&record.pcb.fiber);
 
@@ -938,6 +951,64 @@ pub const Scheduler = struct {
                 },
             }
         }
+    }
+
+    /// Run until `target` has exited (its pid no longer resolves), then
+    /// return — other processes may still be live. This is the "join"
+    /// shape the P2-J2 root-process bootstrap drives: the generated main
+    /// spawns user main as the root process and runs the scheduler until
+    /// exactly that process finishes; stragglers are torn down by the
+    /// runtime's atexit `shutdownAllProcesses` (Erlang halt semantics —
+    /// the program's lifetime is the root process's lifetime). Parks when
+    /// idle under `.futex_park`; surfaces `error.AllProcessesWaiting`
+    /// under `.forbid_parking` when the target cannot make progress
+    /// (deterministic-mode deadlock). Scheduler-thread only.
+    pub fn runUntilProcessExits(scheduler: *Scheduler, target: Pid) RunError!void {
+        while (true) {
+            // Silent probe — the target's death is this loop's expected
+            // terminal condition, not a dead-lettered message (the
+            // logging `lookup` would emit a spurious dead-letter for
+            // every join of an exited process).
+            if (!scheduler.pid_table.isAlive(target)) return;
+            scheduler.drainWakeStack();
+            if (scheduler.dequeueNextRunnable()) |record| {
+                if (record.pending_kill) {
+                    // Killed while queued: torn down without ever running
+                    // (legal `runnable → exiting`).
+                    scheduler.teardownProcess(record, .killed);
+                    continue;
+                }
+                scheduler.runQuantum(record);
+                continue;
+            }
+            switch (scheduler.options.idle_strategy) {
+                .futex_park => scheduler.parkUntilWakeSignal(),
+                .forbid_parking => {
+                    // Single-threaded deterministic run: no producer can
+                    // race this re-check, so an empty wake stack here is
+                    // a genuine scenario deadlock.
+                    if (scheduler.wake_stack_head.load(.acquire) == null) {
+                        return error.AllProcessesWaiting;
+                    }
+                },
+            }
+        }
+    }
+
+    /// The `ProcessContext` of the process the scheduler is currently
+    /// running a quantum for, or null between quanta (including on the
+    /// driver thread outside `runQuantum`). The ambient-lookup companion
+    /// to the kernel's parameter-threaded current-process discipline
+    /// (module doc): kernel code never calls this — it exists for the
+    /// `zap_proc_current` intrinsic, which compiled Zap code reaches
+    /// through the runtime's process wrappers. Scheduler-thread only.
+    pub fn currentProcessContext(scheduler: *Scheduler) ?*ProcessContext {
+        const pcb = scheduler.current_process orelse return null;
+        const record: *ProcessRecord = @fieldParentPtr("pcb", pcb);
+        // The first quantum enters `processFiberEntry` before any code
+        // that could observe the scheduler runs, so a current process
+        // always has its context published.
+        return record.active_context;
     }
 
     // -------------------------------------------------------------------------
@@ -1315,7 +1386,11 @@ pub const Scheduler = struct {
 
 /// First function on every process fiber: builds the `ProcessContext`
 /// capability on the fiber stack and runs the process body. Returning
-/// finishes the fiber (normal exit).
+/// finishes the fiber (normal exit). Publishing the context through
+/// `record.active_context` is what makes the ambient-lookup seam
+/// (`Scheduler.currentProcessContext`) work: the frame lives for the
+/// process's entire lifetime, so the pointer stays valid across every
+/// suspend/resume until teardown reclaims the stack.
 fn processFiberEntry(execution: *fiber_context.FiberExecution, argument: ?*anyopaque) void {
     const record: *ProcessRecord = @ptrCast(@alignCast(argument.?));
     var context = ProcessContext{
@@ -1323,6 +1398,7 @@ fn processFiberEntry(execution: *fiber_context.FiberExecution, argument: ?*anyop
         .record = record,
         .execution = execution,
     };
+    record.active_context = &context;
     record.entry_function(&context, record.entry_argument);
 }
 
@@ -2184,6 +2260,129 @@ test "Scheduler: shutdownAllProcesses tears down runnable and waiting processes 
     kernel.scheduler.shutdownAllProcesses();
     try testing.expectEqual(@as(usize, 2), manager.teardown_count);
     try testing.expectEqual(@as(u64, 2), kernel.scheduler.statistics().kill_total);
+    try kernel.expectExactAccounting();
+}
+
+// -- ambient current-process context (the P2-J2 `zap_proc_current` seam) --------------
+
+const AmbientContextProbe = struct {
+    scheduler: *Scheduler,
+    matched_before_yield: bool = false,
+    matched_after_yield: bool = false,
+};
+
+fn ambientContextEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *AmbientContextProbe = @ptrCast(@alignCast(argument.?));
+    probe.matched_before_yield = probe.scheduler.currentProcessContext() == context;
+    context.yieldNow();
+    probe.matched_after_yield = probe.scheduler.currentProcessContext() == context;
+}
+
+test "Scheduler: currentProcessContext is null between quanta and identity-stable inside them" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(test_scheduler_options);
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    // No quantum running: the ambient lookup answers null.
+    try testing.expectEqual(@as(?*ProcessContext, null), kernel.scheduler.currentProcessContext());
+
+    // Two interleaving processes (each yields once mid-body): each must
+    // observe ITS OWN parameter-threaded context through the ambient
+    // lookup both before and after the interleaving yield.
+    var first_probe = AmbientContextProbe{ .scheduler = &kernel.scheduler };
+    var second_probe = AmbientContextProbe{ .scheduler = &kernel.scheduler };
+    _ = try kernel.scheduler.spawn(.{
+        .entry = ambientContextEntry,
+        .argument = &first_probe,
+        .manager = manager.managerContext(),
+    });
+    _ = try kernel.scheduler.spawn(.{
+        .entry = ambientContextEntry,
+        .argument = &second_probe,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    try testing.expect(first_probe.matched_before_yield);
+    try testing.expect(first_probe.matched_after_yield);
+    try testing.expect(second_probe.matched_before_yield);
+    try testing.expect(second_probe.matched_after_yield);
+    // Quiescent again: null.
+    try testing.expectEqual(@as(?*ProcessContext, null), kernel.scheduler.currentProcessContext());
+    try kernel.expectExactAccounting();
+}
+
+// -- run-until-exit (the P2-J2 root-process join) --------------------------------------
+
+test "Scheduler: runUntilProcessExits returns at target exit and leaves stragglers live" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(test_scheduler_options);
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    // A straggler that parks forever, then the "root": a receiver that
+    // exits after one message, fed by a sender. The join must drive the
+    // sender (and the straggler's admission) but return as soon as the
+    // root is gone — with the straggler still parked.
+    _ = try kernel.scheduler.spawn(.{
+        .entry = waitForeverEntry,
+        .manager = manager.managerContext(),
+    });
+    var root_probe = ReceiverProbe{};
+    const root_pid = try kernel.scheduler.spawn(.{
+        .entry = receiveOnceEntry,
+        .argument = &root_probe,
+        .manager = manager.managerContext(),
+    });
+    var sender_probe = SenderProbe{ .target = root_pid, .stamp = 0xF00D };
+    _ = try kernel.scheduler.spawn(.{
+        .entry = sendOnceEntry,
+        .argument = &sender_probe,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilProcessExits(root_pid);
+
+    try testing.expectEqual(SendOutcome.delivered, sender_probe.outcome);
+    try testing.expectEqual(@as(usize, 0xF00D), root_probe.received_stamp);
+    try testing.expectEqual(@as(?*ProcessControlBlock, null), kernel.pid_table.lookup(root_pid));
+    // The straggler is still live and parked.
+    try testing.expectEqual(@as(u32, 1), kernel.scheduler.statistics().live_process_count);
+
+    // A second join on the dead pid returns immediately.
+    try kernel.scheduler.runUntilProcessExits(root_pid);
+
+    // Program-shutdown semantics: stragglers are torn down wholesale.
+    kernel.scheduler.shutdownAllProcesses();
+    try kernel.expectExactAccounting();
+}
+
+test "Scheduler: runUntilProcessExits surfaces deterministic-mode deadlock" {
+    var kernel: TestKernel = undefined;
+    var deterministic_options = test_scheduler_options;
+    deterministic_options.idle_strategy = .forbid_parking;
+    try kernel.init(deterministic_options);
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    // The target parks on an empty mailbox with no sender anywhere: a
+    // genuine deadlock that deterministic mode must surface rather than
+    // park on.
+    const target_pid = try kernel.scheduler.spawn(.{
+        .entry = waitForeverEntry,
+        .manager = manager.managerContext(),
+    });
+    try testing.expectError(
+        error.AllProcessesWaiting,
+        kernel.scheduler.runUntilProcessExits(target_pid),
+    );
+
+    kernel.scheduler.shutdownAllProcesses();
     try kernel.expectExactAccounting();
 }
 

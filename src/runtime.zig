@@ -3520,6 +3520,8 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_proc_runtime_init() callconv(.c) i32;
     extern fn zap_proc_runtime_deinit() callconv(.c) void;
     extern fn zap_proc_run_until_quiescent() callconv(.c) i32;
+    extern fn zap_proc_run_until_exit(target_pid_bits: u64) callconv(.c) i32;
+    extern fn zap_proc_current() callconv(.c) ?*anyopaque;
     extern fn zap_proc_spawn(entry: ProcEntry, argument: ?*anyopaque) callconv(.c) u64;
     extern fn zap_proc_self(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_send(
@@ -3656,6 +3658,368 @@ fn runConcurrencySmoke() void {
         @panic("zap-concurrency-smoke: payload mismatch");
     }
     stderrWriteFlushed("zap-concurrency-smoke: ok\n");
+}
+
+// ============================================================
+// Concurrency language surface — `:zig.ProcessRuntime.*` (P2-J2)
+//
+// The runtime half of `lib/process.zap`: typed `Pid(M)` handles,
+// `Process.spawn/send/self/receive_raw/exit`, and the root-process
+// bootstrap that runs user main as the root process (`zap_proc_current`
+// is the ambient current-process seam; `abi.zig` documents the ABI).
+// Everything below is reachable only from gated-on binaries: with the
+// gate OFF, referencing any `ProcessRuntime` declaration is a compile
+// error (the comptime gate in `requireConcurrencyRuntimeGate`), and
+// unreferenced declarations are never analyzed — the zero-cost
+// guarantee is preserved in both directions.
+// ============================================================
+
+/// Comptime gate shared by every `ProcessRuntime` primitive and the
+/// root-process bootstrap: compiling a `Process.*` call into a binary
+/// whose `runtime_concurrency` gate is OFF is a compile-time error (a
+/// gate-off binary carries no kernel object, so the extern intrinsics
+/// could never link — this diagnostic replaces that link failure with
+/// an actionable message).
+inline fn requireConcurrencyRuntimeGate() void {
+    comptime {
+        if (!runtime_concurrency_active) {
+            @compileError(
+                "Process operations require the concurrency runtime, which is compiled out of this binary. " ++
+                    "Set `runtime_concurrency: true` in the Zap.Manifest or build with -Druntime-concurrency=on " ++
+                    "(the gate defaults OFF — the zero-cost guarantee).",
+            );
+        }
+    }
+}
+
+/// The calling process's opaque kernel handle, resolved through the
+/// ambient-lookup intrinsic. Panics when no process quantum is running:
+/// with the P2-J2 root-process bootstrap in place user code always runs
+/// inside a process, so a null here means a `Process.*` call escaped
+/// onto the driver thread (an atexit handler or another non-process
+/// context) — a programming error worth failing loudly on.
+fn requireCurrentProcessHandle() *anyopaque {
+    requireConcurrencyRuntimeGate();
+    return ZapConcurrencyKernel.zap_proc_current() orelse @panic(
+        "zap: Process operation outside a process (no process quantum is running on this thread)",
+    );
+}
+
+/// The set of Zig-level message types the Phase 2 opaque-bytes send
+/// seam carries (P2-J1 `abi.zig`, payload seam): fixed-size scalars
+/// with no heap references, byte-copied into the runtime's payload
+/// ledger. At the Zap surface these are `i64`, `u64`, `f64`, `Bool`,
+/// and `Atom` (atoms travel as their binary-global `u32` table ids —
+/// one atom table per binary, so the id is stable across processes).
+/// Everything richer — `String`, structs, lists, maps, closures — needs
+/// the P2-J5 deep-copy walker (plan item 2.4) and is rejected at
+/// compile time here; no payload is ever silently truncated.
+fn isSendableMessageType(comptime MessageType: type) bool {
+    return switch (MessageType) {
+        i64, u64, f64, bool, u32 => true,
+        else => false,
+    };
+}
+
+/// Shared compile-error text for unsendable payloads, referenced by the
+/// send primitive below and mirrored by the receive set (which is the
+/// same closed type set by construction).
+fn unsendableMessageTypeError(comptime MessageType: type) noreturn {
+    @compileError(
+        "Process.send: message type `" ++ @typeName(MessageType) ++ "` is not sendable in Phase 2. " ++
+            "Sendable message types are i64, u64, f64, Bool, and Atom (fixed-size scalar payloads over the " ++
+            "opaque-bytes seam). Rich payloads (String, structs, collections, closures) arrive with the " ++
+            "P2-J5 deep-copy walker (docs/concurrency-implementation-plan.md item 2.4).",
+    );
+}
+
+/// `:zig.ProcessRuntime.*` — the intrinsic bridge behind `lib/process.zap`.
+/// Every function resolves the calling process through the ambient
+/// `zap_proc_current` lookup so the Zap surface stays handle-free in
+/// Phase 2 (the A.4.1 parameter-threading decision for compiled code
+/// stays open; this namespace is additive over it).
+pub const ProcessRuntime = struct {
+    /// The calling process's pid as its raw `u64` kernel encoding
+    /// (`pid_table.zig` packing). `lib/process.zap` wraps it into the
+    /// typed `Pid(M)` handle.
+    pub fn self_pid_bits() u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_self(requireCurrentProcessHandle());
+    }
+
+    /// Spawn a new process running `entry` (a zero-parameter function)
+    /// under the manifest manager binding, returning the child's raw
+    /// pid bits. Panics on spawn failure (runtime not initialized,
+    /// allocation failure, or process-table exhaustion) — Phase 2
+    /// treats a failed spawn as fatal rather than returning the
+    /// invalid pid for callers to mishandle.
+    ///
+    /// Phase 2 entry scope: named or capture-less functions only —
+    /// exactly the shapes that lower to a bare function (pointer). A
+    /// closure with a captured environment would share sender-owned
+    /// heap into the child without the P2-J5 deep-copy walker, so it
+    /// is rejected at compile time (no unsound sharing).
+    pub fn spawn_process(entry: anytype) u64 {
+        requireConcurrencyRuntimeGate();
+        const EntryType = @TypeOf(entry);
+        const entry_info = @typeInfo(EntryType);
+        switch (entry_info) {
+            .@"fn" => |function_info| {
+                comptime validateSpawnEntrySignature(EntryType, function_info);
+                // A direct function value is comptime-known: bake it
+                // into a dedicated trampoline, no argument needed.
+                const Trampoline = ComptimeEntryTrampoline(entry);
+                return spawnWithTrampoline(Trampoline.run, null);
+            },
+            .pointer => |pointer_info| {
+                const child_info = @typeInfo(pointer_info.child);
+                if (child_info != .@"fn") rejectSpawnEntryType(EntryType);
+                comptime validateSpawnEntrySignature(pointer_info.child, child_info.@"fn");
+                // A runtime function pointer rides the spawn argument
+                // (never dereferenced as data — reconstructed via
+                // ptrFromInt in the trampoline).
+                const Trampoline = PointerEntryTrampoline(EntryType);
+                return spawnWithTrampoline(Trampoline.run, @ptrFromInt(@intFromPtr(entry)));
+            },
+            else => rejectSpawnEntryType(EntryType),
+        }
+    }
+
+    /// Send `message` to the process identified by `target_pid_bits`.
+    /// Returns `true` when the message was delivered to a live mailbox
+    /// and `false` when it was dead-lettered (target dead or stale —
+    /// Erlang semantics: not an error). Panics on allocation failure.
+    /// The message type must be Phase 2 sendable (see
+    /// `isSendableMessageType`); the typed `Pid(M)`/`M` agreement is
+    /// enforced above this bridge by `lib/process.zap`'s generic
+    /// signature.
+    pub fn send_message(target_pid_bits: u64, message: anytype) bool {
+        requireConcurrencyRuntimeGate();
+        // Untyped Zap literals reach the bridge as comptime values;
+        // materialize them at the language's literal defaults (Integer
+        // → i64, Float → f64) exactly as an ascribed Zap binding would.
+        const MessageType = switch (@TypeOf(message)) {
+            comptime_int => i64,
+            comptime_float => f64,
+            else => @TypeOf(message),
+        };
+        if (comptime !isSendableMessageType(MessageType)) unsendableMessageTypeError(MessageType);
+        var message_storage: MessageType = message;
+        const payload_bytes = std.mem.asBytes(&message_storage);
+        const status = ZapConcurrencyKernel.zap_proc_send(
+            requireCurrentProcessHandle(),
+            target_pid_bits,
+            payload_bytes.ptr,
+            payload_bytes.len,
+        );
+        return switch (status) {
+            0 => true, // ok — delivered
+            1 => false, // dead_lettered
+            else => @panic("zap: Process.send failed inside the concurrency runtime (out of memory)"),
+        };
+    }
+
+    /// Blocking typed receive: park until the mailbox is nonempty and
+    /// decode the oldest message as `i64`. See `receiveScalarMessage`
+    /// for the raw-receive contract shared by the whole set.
+    pub fn receive_i64() i64 {
+        return receiveScalarMessage(i64);
+    }
+
+    /// Blocking typed receive for `u64` payloads (including raw pid
+    /// bits — the Phase 2 way to hand a reply channel to a child).
+    pub fn receive_u64() u64 {
+        return receiveScalarMessage(u64);
+    }
+
+    /// Blocking typed receive for `f64` payloads.
+    pub fn receive_f64() f64 {
+        return receiveScalarMessage(f64);
+    }
+
+    /// Blocking typed receive for `Bool` payloads.
+    pub fn receive_bool() bool {
+        return receiveScalarMessage(bool);
+    }
+
+    /// Blocking typed receive for `Atom` payloads (binary-global `u32`
+    /// atom-table ids — valid across processes within one binary).
+    pub fn receive_atom() u32 {
+        return receiveScalarMessage(u32);
+    }
+
+    /// Terminate the calling process at this point (the kernel's
+    /// kill-path teardown; exit REASONS are Phase 5). Never returns.
+    pub fn exit_process() noreturn {
+        requireConcurrencyRuntimeGate();
+        ZapConcurrencyKernel.zap_proc_exit(requireCurrentProcessHandle());
+    }
+};
+
+/// Validate the Zig-level signature of a spawn entry: zero parameters
+/// (Phase 2 processes receive state via messages, not arguments) and no
+/// exotic calling convention.
+fn validateSpawnEntrySignature(comptime EntryType: type, comptime function_info: std.builtin.Type.Fn) void {
+    if (function_info.params.len != 0) {
+        @compileError(
+            "Process.spawn entry `" ++ @typeName(EntryType) ++ "` must take zero parameters in Phase 2 — " ++
+                "hand the child its inputs by sending messages to its pid (typed via Pid(M)).",
+        );
+    }
+}
+
+/// Shared compile-error path for spawn entries that are not bare
+/// functions: Zap closures with captured environments lower to a
+/// `{call_fn, env}` struct or a boxed `Callable` existential
+/// (`ProtocolBox`) — both carry sender-owned heap that cannot cross
+/// into the child without the P2-J5 deep-copy walker.
+fn rejectSpawnEntryType(comptime EntryType: type) noreturn {
+    @compileError(
+        "Process.spawn requires a named (or capture-less) zero-parameter function in Phase 2; got `" ++
+            @typeName(EntryType) ++ "`. Closures with captured environments would share the spawner's heap " ++
+            "into the child unsafely — capture support arrives with the P2-J5 deep-copy walker " ++
+            "(docs/concurrency-implementation-plan.md item 2.4). TODO(P2-J5): lift this restriction.",
+    );
+}
+
+/// Trampoline for a comptime-known entry function value: the entry is
+/// baked into the type, so the kernel's opaque argument stays null.
+fn ComptimeEntryTrampoline(comptime entry_function: anytype) type {
+    return struct {
+        fn run(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+            _ = process;
+            _ = argument;
+            _ = entry_function();
+        }
+    };
+}
+
+/// Trampoline for a runtime function pointer: the pointer travels as
+/// the kernel's opaque argument (as an address, never dereferenced as
+/// data) and is reconstructed here.
+fn PointerEntryTrampoline(comptime EntryPointerType: type) type {
+    return struct {
+        fn run(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+            _ = process;
+            const entry_function: EntryPointerType = @ptrFromInt(@intFromPtr(argument.?));
+            _ = entry_function();
+        }
+    };
+}
+
+/// Spawn through the intrinsic bridge and normalize the failure
+/// sentinel to a panic (see `ProcessRuntime.spawn_process`).
+fn spawnWithTrampoline(trampoline: ZapConcurrencyKernel.ProcEntry, argument: ?*anyopaque) u64 {
+    const pid_bits = ZapConcurrencyKernel.zap_proc_spawn(trampoline, argument);
+    if (pid_bits == 0) {
+        @panic("zap: Process.spawn failed (concurrency runtime not initialized, out of memory, or process table exhausted)");
+    }
+    return pid_bits;
+}
+
+/// The raw-receive contract shared by the `ProcessRuntime.receive_*`
+/// set: park until the mailbox is nonempty, then decode the oldest
+/// message as `Scalar` and free its envelope. The payload byte length
+/// must match `@sizeOf(Scalar)` exactly — a mismatch means sender and
+/// receiver disagreed about the message type through the RAW typed
+/// receive, which panics rather than truncating or fabricating bytes.
+/// The P2-J3 `receive` construct replaces this trust-the-caller shape
+/// with compiler-checked per-process message unions.
+fn receiveScalarMessage(comptime Scalar: type) Scalar {
+    requireConcurrencyRuntimeGate();
+    const process = requireCurrentProcessHandle();
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = ZapConcurrencyKernel.zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    defer ZapConcurrencyKernel.zap_proc_envelope_free(envelope);
+    if (payload_len != @sizeOf(Scalar)) {
+        @panic(
+            "zap: Process.receive_raw payload size mismatch — the sender's message type does not match " ++
+                "the receive type (raw typed receive trusts the caller; the P2-J3 receive construct adds " ++
+                "checked message unions)",
+        );
+    }
+    var message_value: Scalar = undefined;
+    @memcpy(std.mem.asBytes(&message_value), payload_pointer.?[0..payload_len]);
+    return message_value;
+}
+
+/// Result type of the root-process bootstrap: mirrors the generated
+/// user-main shape (`void` or `u8` — `zir_builder.zig`'s
+/// `mapMainReturnType`).
+fn RootProcessMainResult(comptime EntryPointerType: type) type {
+    const pointer_info = @typeInfo(EntryPointerType);
+    const function_type = switch (pointer_info) {
+        .@"fn" => EntryPointerType,
+        .pointer => |info| info.child,
+        else => @compileError("runRootProcessMain expects a function (pointer), got `" ++ @typeName(EntryPointerType) ++ "`"),
+    };
+    const function_info = @typeInfo(function_type).@"fn";
+    const ReturnType = function_info.return_type.?;
+    if (ReturnType != void and ReturnType != u8) {
+        @compileError("runRootProcessMain: user main must return void or u8, got `" ++ @typeName(ReturnType) ++ "`");
+    }
+    return ReturnType;
+}
+
+/// P2-J2 root-process bootstrap: run user main as the ROOT PROCESS of
+/// the concurrency runtime. The generated `main` of a gated-on binary
+/// calls this (after `memoryStartupForEntry`) instead of calling user
+/// main directly; `zir_builder.zig` emits the wrapper.
+///
+/// Semantics (Erlang halt model, `scheduler.zig`'s
+/// `runUntilProcessExits` doc): the program's lifetime is the root
+/// process's lifetime. The driver thread spawns the root, drives the
+/// scheduler until exactly that process exits, and returns its exit
+/// status; processes still alive at that point are torn down wholesale
+/// by the atexit kernel shutdown (`zapConcurrencyShutdownAtexit` →
+/// `zap_proc_runtime_deinit`). Running main on a kernel fiber gives
+/// `Process.self`/`send`/`receive_raw` full process semantics in main —
+/// the root parks on receive exactly like any spawned process. The
+/// root's stack is a pooled fiber stack (`stack_pool.zig`; lazy-commit,
+/// guard-page protected) rather than the OS main-thread stack; a root
+/// overflow faults loudly on the guard page through the crash reporter.
+pub fn runRootProcessMain(comptime root_main: anytype) RootProcessMainResult(@TypeOf(root_main)) {
+    requireConcurrencyRuntimeGate();
+    const Result = RootProcessMainResult(@TypeOf(root_main));
+    const RootTrampoline = RootProcessTrampoline(root_main, Result);
+
+    var root_state = RootProcessState{};
+    const root_pid_bits = ZapConcurrencyKernel.zap_proc_spawn(RootTrampoline.run, &root_state);
+    if (root_pid_bits == 0) {
+        @panic("zap: failed to spawn the root process");
+    }
+    if (ZapConcurrencyKernel.zap_proc_run_until_exit(root_pid_bits) != 0) {
+        @panic("zap: the concurrency runtime failed while driving the root process");
+    }
+    if (Result == void) return;
+    return root_state.exit_status;
+}
+
+/// Driver-frame slot the root trampoline writes the root process's
+/// exit status into (the driver's `runRootProcessMain` frame outlives
+/// the root process by construction — the join returns only after the
+/// root exits).
+const RootProcessState = struct {
+    exit_status: u8 = 0,
+};
+
+/// Trampoline adapting the generated user main (comptime-known) to the
+/// kernel's C-ABI entry shape, capturing the exit status through the
+/// spawn argument.
+fn RootProcessTrampoline(comptime root_main: anytype, comptime Result: type) type {
+    return struct {
+        fn run(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+            _ = process;
+            const state: *RootProcessState = @ptrCast(@alignCast(argument.?));
+            if (Result == void) {
+                root_main();
+                state.exit_status = 0;
+            } else {
+                state.exit_status = root_main();
+            }
+        }
+    };
 }
 
 /// Idempotent first-call self-arming wrapper used by every ARC
