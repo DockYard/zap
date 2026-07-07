@@ -418,6 +418,33 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
   paths per model (elision decisions per specialization via `src/memory/elision.zig`); cold
   closure/existential paths through the control-block vtable; ICF-unfoldable specializations
   surfaced as verifier red flags.
+  - **LANDED (P3-J2, 2026-07-07).** The COMPILER-SIDE mechanism ships and is unit-tested.
+    (1) **Axis:** `monomorphize.specializeSpawnManagers(plan)` clones the spawn-reachable
+    subgraph per reclamation MODEL (≤4, keyed on Axis A — Arena/NoOp/Leak share BULK_OR_NEVER),
+    tags each clone (`FunctionGroup.reclamation_model`), and redirects intra-subgraph
+    direct/named/dispatch calls to the same-model clones (`current_model_call_redirect`, reusing
+    the type-arg clone path). The reachability walk STOPS at indirect (`.closure`) edges — the
+    precise hot/cold boundary — and flags them (`saw_cold_edge`). Run as a SEPARATE pass after
+    the type-arg axis (concrete functions), so the type-arg machine is untouched. (2)
+    **Per-specialization elision:** `elision.canonicalCaps(model)` + `ir.Function.reclamation_model`
+    (propagated from HIR in `buildFunctionGroup`) + `ZirDriver.effectiveDeclaredCaps` install the
+    model's caps as the function's active `declared_caps` at `emitFunction`, so every elision
+    predicate decodes per-model — a REFCOUNTED specialization emits retain/release, a
+    BULK_OR_NEVER one elides them (unit-proven). (3) **Decision Gate 0** is enforced structurally:
+    a spec carries a resolved `ReclamationModel` enum, so a non-comptime `.manager` cannot enter a
+    plan (J3 diagnoses it at the surface). (4) **ICF red flag:** `modelCloneStructurallyFoldable`
+    verifies each clone is structurally identical to its source modulo header ops — a compile-time,
+    target-independent substitute for "did ICF fold?" (Darwin's self-hosted Mach-O linker has no
+    ICF yet; a fork follow-up). (5) **E4 PASS** — ledger § E4: per-model `__text` delta +1.65%
+    whole-binary / 536 B on the isolated subgraph, allocating functions byte-identical (ICF-foldable
+    to ×1), 4-model ≈ 2-model (non-refcounted models fold together). **Zero-cost off:** the tag
+    fields default null, the pass is not yet wired into the driver pipeline, and every untagged
+    function keeps `base_declared_caps`, so all current builds are byte-identical (proven: `zig
+    build test` green, no behavior change). **Remaining for J3:** the driver resolves the
+    `spawn(f, .{ .manager = X })` surface into the plan `specializeSpawnManagers` consumes, rewires
+    spawn sites via the returned `entry_specializations`, and completes the runtime per-process
+    retain/release model dispatch (the registry — item 3.1/3.3) so cold paths dispatch fully at
+    runtime, not just for allocate.
 - **3.3** Model-tagged pids live; per-reachable-pair copy stubs (lazy generation); adoption
   semantics per model (rc=1 / bulk splice / range registration / free-at-last-use) — **manager
   ABI minor bump** (detach/adopt entry points + envelope-domain semantics) per spec §2.3,

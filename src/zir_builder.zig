@@ -1095,7 +1095,27 @@ pub const ZirDriver = struct {
     /// `0` means "no capabilities" (the default, e.g.
     /// `Memory.NoOp`); `1` (`REFCOUNT_V1_BIT`) means the manager
     /// supports the ARC retain/release contract.
+    ///
+    /// P3-J2: this is now the *active* caps value — every elision predicate
+    /// (`shouldSkipArc`, `shouldEmitRefcountOps`, `reclamationModel`,
+    /// `sharingStrategy`, `cloneOnShareActive`) reads it, so overriding it for
+    /// the duration of a single function's emission makes every one of those
+    /// decisions per-function. `emitFunction` sets it at entry: to
+    /// `elision.canonicalCaps(func.reclamation_model)` for a spawn-reachable
+    /// model specialization, otherwise back to `base_declared_caps`. Only
+    /// retain/release *emission* is scoped this way; cell *layout* (ArcHeader
+    /// presence) stays binary-wide off `base_declared_caps`, tied to the
+    /// manifest manager — a model specialization changes which memory-op calls
+    /// are emitted, never the type's storage shape.
     declared_caps: u64 = 0,
+    /// P3-J2: the immutable binary-wide manifest caps, set once from
+    /// `CompileOptions.declared_caps`. `emitFunction` restores `declared_caps`
+    /// to this for every ordinary (untagged) function, so a program with no
+    /// per-spawn model specializations emits byte-for-byte as today. Kept
+    /// separate from `declared_caps` (the mutable active value) so the
+    /// per-function override is always relative to the true manifest baseline,
+    /// never a leaked previous function's model caps.
+    base_declared_caps: u64 = 0,
     reuse_backed_struct_locals: std.AutoHashMapUnmanaged(ir.LocalId, []const u8) = .empty,
     reuse_backed_union_locals: std.AutoHashMapUnmanaged(ir.LocalId, ir.UnionInit) = .empty,
     reuse_backed_tuple_locals: std.AutoHashMapUnmanaged(ir.LocalId, usize) = .empty,
@@ -1409,6 +1429,21 @@ pub const ZirDriver = struct {
     /// missing panic contract.
     fn shouldEmitRefcountOps(self: *const ZirDriver) bool {
         return elision.shouldEmitRefcountOps(self.declared_caps);
+    }
+
+    /// P3-J2: the caps a function's memory-op codegen must be shaped for. A
+    /// spawn-reachable model specialization (`func.reclamation_model != null`)
+    /// resolves to its model's canonical caps — so a REFCOUNTED specialization
+    /// emits retain/release, a BULK_OR_NEVER (Arena/NoOp/Leak) specialization
+    /// elides them, etc. — while every ordinary function keeps the binary-wide
+    /// manifest baseline (`base_declared_caps`), i.e. today's behavior exactly.
+    /// `emitFunction` installs this as the active `self.declared_caps` for the
+    /// function's emission, so all elision predicates decode per-model. This is
+    /// the codegen half of the manager-monomorphization hybrid: the emit/elide
+    /// decision is per model, comptime, with no per-allocation dispatch.
+    fn effectiveDeclaredCaps(self: *const ZirDriver, func: ir.Function) u64 {
+        if (func.reclamation_model) |model| return elision.canonicalCaps(model);
+        return self.base_declared_caps;
     }
 
     /// The active manager's reclamation model (Axis A), decoded from
@@ -5696,6 +5731,22 @@ pub const ZirDriver = struct {
         self.current_closure_env_ref = null;
         self.skip_next_ret_local = null;
         self.current_function_id = func.id;
+        // P3-J2 per-spawn manager-monomorphization: shape this function's
+        // memory-op elision to its reclamation model. A spawn-reachable model
+        // specialization (`func.reclamation_model != null`) emits retain /
+        // release / free exactly as its model demands — a REFCOUNTED
+        // specialization emits refcount ops, a BULK_OR_NEVER (Arena/NoOp/Leak)
+        // specialization elides them, etc. — because every elision predicate
+        // reads `self.declared_caps`. Every ordinary function restores the
+        // manifest baseline, so a program with no specializations is
+        // byte-for-byte identical to today. Cell layout stays manifest-wide
+        // (see the `base_declared_caps` doc): only op emission is per-model.
+        // Save/restore the previous active caps (not just the base) so the
+        // per-function override is correct under any emission order, including
+        // an inline nested-closure emission that reuses this driver.
+        const saved_active_declared_caps = self.declared_caps;
+        defer self.declared_caps = saved_active_declared_caps;
+        self.declared_caps = self.effectiveDeclaredCaps(func);
         self.current_function_param_conventions = func.param_conventions;
         self.current_function_local_ownership = func.local_ownership;
         self.current_function_return_type = func.return_type;
@@ -12188,6 +12239,10 @@ pub fn buildAndInject(
     driver.analysis_context = analysis_context;
     driver.arc_ownership = arc_ownership;
     driver.declared_caps = declared_caps;
+    // P3-J2: preserve the manifest baseline so `emitFunction` can restore the
+    // active caps for every untagged function and only override for spawn
+    // model specializations.
+    driver.base_declared_caps = declared_caps;
     driver.compilation_ctx = compilation_ctx;
     driver.progress = progress;
     driver.arithmetic_overflow_traps = arithmetic_overflow_traps;
@@ -12259,6 +12314,10 @@ pub fn buildAndInjectSelected(
     driver.analysis_context = analysis_context;
     driver.arc_ownership = arc_ownership;
     driver.declared_caps = declared_caps;
+    // P3-J2: preserve the manifest baseline so `emitFunction` can restore the
+    // active caps for every untagged function and only override for spawn
+    // model specializations.
+    driver.base_declared_caps = declared_caps;
     driver.compilation_ctx = compilation_ctx;
     driver.progress = progress;
     driver.arithmetic_overflow_traps = arithmetic_overflow_traps;
@@ -13689,6 +13748,70 @@ test "ZirDriver.unmarkShareSkippedForClone clears provisional suppression only u
     try arc_driver.arc_share_skipped.put(arc_driver.allocator, 8, {});
     arc_driver.unmarkShareSkippedForClone(8);
     try std.testing.expect(arc_driver.arc_share_skipped.contains(8));
+}
+
+test "ZirDriver.effectiveDeclaredCaps shapes emission per spawn reclamation model (P3-J2)" {
+    // The codegen half of the manager-monomorphization hybrid: a spawn-reachable
+    // model specialization emits/elides memory ops per ITS model, not the
+    // manifest manager's. This is the "ARC process emits retain/release, Arena
+    // process elides them" property at the decision level. Manifest = ARC
+    // (REFCOUNT_V1); the specializations override per model.
+    const memory_abi = @import("memory/abi.zig");
+
+    var driver = ZirDriver{
+        .handle = undefined,
+        .local_refs = .empty,
+        .param_refs = .empty,
+        .allocator = std.testing.allocator,
+        .program = null,
+        .declared_caps = memory_abi.CAPS_REFCOUNTED,
+        .base_declared_caps = memory_abi.CAPS_REFCOUNTED,
+    };
+
+    const base_function = ir.Function{
+        .id = 1,
+        .name = "worker",
+        .scope_id = 0,
+        .arity = 0,
+        .params = &.{},
+        .return_type = .any,
+        .body = &.{},
+        .is_closure = false,
+        .captures = &.{},
+    };
+
+    // An ORDINARY (untagged) function keeps the manifest baseline — byte-for-
+    // byte today's behavior — and, under an ARC manifest, EMITS refcount ops.
+    try std.testing.expectEqual(memory_abi.CAPS_REFCOUNTED, driver.effectiveDeclaredCaps(base_function));
+    try std.testing.expect(elision.shouldEmitRefcountOps(driver.effectiveDeclaredCaps(base_function)));
+
+    // A BULK_OR_NEVER (Arena/NoOp/Leak) specialization ELIDES every retain/
+    // release, regardless of the ARC manifest.
+    var arena_specialization = base_function;
+    arena_specialization.reclamation_model = .bulk_or_never;
+    try std.testing.expectEqual(memory_abi.CAPS_BULK_OR_NEVER, driver.effectiveDeclaredCaps(arena_specialization));
+    try std.testing.expect(!elision.shouldEmitRefcountOps(driver.effectiveDeclaredCaps(arena_specialization)));
+
+    // A REFCOUNTED specialization emits refcount ops even if the manifest were
+    // non-ARC — the model, not the manifest, decides.
+    var arc_specialization = base_function;
+    arc_specialization.reclamation_model = .refcounted;
+    try std.testing.expect(elision.shouldEmitRefcountOps(driver.effectiveDeclaredCaps(arc_specialization)));
+
+    // TRACED and INDIVIDUAL_NO_REFCOUNT specializations both elide refcount ops
+    // (their free models differ downstream, but neither emits retain/release).
+    var traced_specialization = base_function;
+    traced_specialization.reclamation_model = .traced;
+    try std.testing.expect(!elision.shouldEmitRefcountOps(driver.effectiveDeclaredCaps(traced_specialization)));
+    try std.testing.expectEqual(elision.ReclamationModel.traced, elision.reclamationModel(driver.effectiveDeclaredCaps(traced_specialization)));
+
+    var tracking_specialization = base_function;
+    tracking_specialization.reclamation_model = .individual_no_refcount;
+    try std.testing.expect(!elision.shouldEmitRefcountOps(driver.effectiveDeclaredCaps(tracking_specialization)));
+    try std.testing.expectEqual(
+        elision.ReclamationModel.individual_no_refcount,
+        elision.reclamationModel(driver.effectiveDeclaredCaps(tracking_specialization)),
+    );
 }
 
 test "ZirDriver.shouldSkipArc returns true unconditionally under declared_caps=0" {

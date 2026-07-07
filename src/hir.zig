@@ -4,6 +4,16 @@ const types_mod = @import("types.zig");
 const scope_mod = @import("scope.zig");
 const target_triple = @import("target_triple.zig");
 const target_fold = @import("target_fold.zig");
+const elision = @import("memory/elision.zig");
+
+/// Re-export of the reclamation-model projection (`src/memory/elision.zig`,
+/// Axis A) so HIR consumers — chiefly the per-spawn manager-monomorphization
+/// axis in `src/monomorphize.zig` — can tag a specialized function group with
+/// the reclamation model its emitted memory-op codegen must be shaped for,
+/// without re-deriving the decode. The model is the specialization *key*
+/// (≤4: REFCOUNTED / BULK_OR_NEVER / INDIVIDUAL_NO_REFCOUNT / TRACED), never
+/// the manager's identity.
+pub const ReclamationModel = elision.ReclamationModel;
 
 // ============================================================
 // Typed HIR (High-level Intermediate Representation)
@@ -71,6 +81,16 @@ pub const FunctionGroup = struct {
     captures: []const Capture = &.{},
     clauses: []const Clause,
     fallback_parent: ?u32, // ID of the outer scope's function group
+    /// P3-J2 per-spawn manager-monomorphization axis. Non-null on a *model
+    /// specialization* produced by `monomorphize.specializeSpawnManagers`: it
+    /// records the reclamation model (Axis A) whose memory-op codegen this
+    /// clone must be shaped for. The tag rides the group through HIR→IR
+    /// lowering (`ir.buildFunctionGroup` copies it to `ir.Function`) and into
+    /// the ZIR backend, which sets the function's active `declared_caps` from
+    /// `elision.canonicalCaps(model)`. Null on every ordinary (manifest-model)
+    /// function, so a program with no per-spawn model specializations lowers
+    /// byte-for-byte as today.
+    reclamation_model: ?ReclamationModel = null,
 };
 
 pub const Capture = struct {

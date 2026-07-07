@@ -92,6 +92,36 @@ pub fn sharingStrategy(caps: u64) SharingStrategy {
     return if ((caps & abi.SHARING_MOVE_ONLY_BIT) != 0) .move_only else .clone_on_share;
 }
 
+/// Inverse of `reclamationModel`: the canonical `declared_caps` bitmask that
+/// projects back to `model`. The per-spawn manager-monomorphization axis
+/// (`src/monomorphize.zig`) keys a specialization on the reclamation *model*
+/// (Axis A), never on manager identity — Arena/NoOp/Leak all share
+/// `BULK_OR_NEVER`, so they share one specialization. When the ZIR builder
+/// emits a model-tagged specialization it needs the caps value that model
+/// implies so every elision predicate (`shouldEmitRefcountOps`,
+/// `reclamationModel`, `sharingStrategy`, `cloneOnShareActive`) decodes to the
+/// specialization's model rather than the binary-wide manifest manager's.
+///
+/// The mapping is the representative caps for each model:
+///   - `refcounted`             → `CAPS_REFCOUNTED` (`0x1`, bit 0 set)
+///   - `bulk_or_never`          → `CAPS_BULK_OR_NEVER` (`0x0`)
+///   - `individual_no_refcount` → `CAPS_INDIVIDUAL_NO_REFCOUNT` (`0x2`,
+///     Axis B defaulting to `CLONE_ON_SHARE` — the sole codegen-live sharing
+///     strategy, since `MOVE_ONLY` is an upstream compile error)
+///   - `traced`                 → `RECLAMATION_TRACED << SHIFT` (`0x4`)
+///
+/// The round-trip identity `reclamationModel(canonicalCaps(m)) == m` holds for
+/// every model (proven exhaustively in the unit test below), which is what
+/// makes the per-specialization decode sound.
+pub fn canonicalCaps(model: ReclamationModel) u64 {
+    return switch (model) {
+        .refcounted => abi.CAPS_REFCOUNTED,
+        .bulk_or_never => abi.CAPS_BULK_OR_NEVER,
+        .individual_no_refcount => abi.CAPS_INDIVIDUAL_NO_REFCOUNT,
+        .traced => abi.RECLAMATION_TRACED << abi.RECLAMATION_MODEL_SHIFT,
+    };
+}
+
 /// Returns `true` when the compiler should emit refcount-aware
 /// instructions (`retain` / `release` / `freeAny` / `prepareReleaseAny`,
 /// inline `ArcHeader` field, side-table refcounts) for the given
@@ -170,6 +200,41 @@ test "reclamationModel decodes each defined model" {
         ReclamationModel.bulk_or_never,
         reclamationModel(abi.RECLAMATION_RESERVED << abi.RECLAMATION_MODEL_SHIFT),
     );
+}
+
+test "canonicalCaps round-trips through reclamationModel for every model" {
+    // The soundness obligation for the per-spawn monomorphization axis: a
+    // model-tagged specialization emitted with `canonicalCaps(m)` must decode
+    // back to model `m` in every elision predicate. Exhaustive over the 4
+    // Axis-A models.
+    const models = [_]ReclamationModel{
+        .refcounted,
+        .bulk_or_never,
+        .individual_no_refcount,
+        .traced,
+    };
+    for (models) |model| {
+        try std.testing.expectEqual(model, reclamationModel(canonicalCaps(model)));
+    }
+
+    // The representative caps values match the ABI constants exactly.
+    try std.testing.expectEqual(abi.CAPS_REFCOUNTED, canonicalCaps(.refcounted));
+    try std.testing.expectEqual(abi.CAPS_BULK_OR_NEVER, canonicalCaps(.bulk_or_never));
+    try std.testing.expectEqual(abi.CAPS_INDIVIDUAL_NO_REFCOUNT, canonicalCaps(.individual_no_refcount));
+    try std.testing.expectEqual(@as(u64, 0x4), canonicalCaps(.traced));
+
+    // `refcounted` is the only model for which `shouldEmitRefcountOps` holds —
+    // exactly the hot/elide split the specialization axis is built to preserve.
+    try std.testing.expect(shouldEmitRefcountOps(canonicalCaps(.refcounted)));
+    try std.testing.expect(!shouldEmitRefcountOps(canonicalCaps(.bulk_or_never)));
+    try std.testing.expect(!shouldEmitRefcountOps(canonicalCaps(.individual_no_refcount)));
+    try std.testing.expect(!shouldEmitRefcountOps(canonicalCaps(.traced)));
+
+    // Every canonical caps value is inside the known-caps mask (no reserved
+    // bits leak into a specialization's declared caps).
+    for (models) |model| {
+        try std.testing.expectEqual(@as(u64, 0), canonicalCaps(model) & ~abi.KNOWN_CAPS_MASK);
+    }
 }
 
 test "sharingStrategy decodes Axis B bit 3" {

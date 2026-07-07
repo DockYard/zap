@@ -811,6 +811,127 @@ scheduler code should load the process pointer once per scheduling quantum
 threadlocal at every dispatch site, since LLVM cannot always hoist it (it
 did per-list in Shape B, per-alloc in Shape A).
 
+## E4 — manager-monomorphization code size (P3-J2, 2026-07-07) — GATE: PASS
+
+The companion to E10. E10 measured the *runtime* cost of NOT monomorphizing
+(vtable dispatch = +13.8% pure / +4.7% mix); E4 measures the *code-size* cost
+of monomorphizing — the price the hybrid pays to avoid that dispatch. Kill
+criterion (plan §6): post-ICF text growth exceeds the CLBG binary-size budget
+→ shift more paths to vtable dispatch.
+
+**What a model specialization is, in codegen terms.** J2 lowers a spawn-
+reachable function per reclamation model by installing that model's caps as the
+function's active `declared_caps` for its emission (`ZirDriver.effectiveDeclaredCaps`
+→ `elision.canonicalCaps`). The HIR/IR body is IDENTICAL across a source
+function's model specializations — only the header-emission ops (retain /
+release / free) are emitted or elided, per model. So the *exact* code a
+REFCOUNTED specialization emits vs a BULK_OR_NEVER one is what you get by
+compiling the SAME source under `-Dmemory=Memory.ARC` vs `-Dmemory=Memory.Arena`.
+That is the measurement below (real binaries, existing single-model machinery —
+the multi-model driver that puts both in ONE binary is J3, item 3.1/3.3).
+
+**Probe.** `tmp/e4_mm_codesize.zap` (kept as `bench/mm-codesize/e4_mm_codesize.zap`):
+a spawn-reachable-shaped allocating subgraph — `driver → build_list →
+build_list_from` (cons cells in a loop) `→ sum_list → sum_from` (fold) — five
+functions, the shape of a per-process worker hot path. Compiled aarch64-macos.
+
+**Whole-binary `__TEXT,__text` (ReleaseFast), `size -m`:**
+
+| build | reclamation model | `__text` bytes | refcount syms (`nm`) |
+|---|---|---|---|
+| `-Dmemory=Memory.ARC`   | REFCOUNTED    | 227,160 | 16 |
+| `-Dmemory=Memory.Arena` | BULK_OR_NEVER | 223,468 |  2 |
+| **delta** | | **+3,692 (+1.65%)** | |
+
+The whole-binary delta (3.7 KB) is an UPPER bound on one specialization's cost:
+it includes the one-time ARC runtime machinery (`ArcRuntime.retain/release/…`)
+that is present under ARC and folds away under Arena. In a real multi-model
+binary that machinery is present ONCE (shared), so the per-specialization
+*user-code* cost is smaller — isolated next.
+
+**Per-function user-code sizes (Debug, so functions stay distinct; sizes via
+`nm -n` address deltas):**
+
+| function | ARC (REFCOUNTED) | Arena (BULK_OR_NEVER) | delta |
+|---|---|---|---|
+| `build_list_from` (cons/alloc) | 148 | 148 | **0** |
+| `build_list`                    |  56 |  56 | **0** |
+| `sum_from`  (fold/consume)      | 508 | 240 | 268 |
+| `driver_from`                   | 292 | 152 | 140 |
+| `sum_list`                      | 168 |  40 | 128 |
+| **spawn-reachable subgraph**    | **1,172** | **636** | **536** |
+
+The two allocating functions (`build_list_from`, `build_list`) have **zero**
+delta — their specializations are BYTE-IDENTICAL across models (a freshly-owned
+cons needs no retain, and the moved `acc` needs no release). This is the
+empirical confirmation of the ICF claim: a spawn-reachable function that does
+not emit differing header ops produces identical specializations that linker
+ICF folds to ×1. Only the list-*consuming* functions (`sum_from`, `driver_from`,
+`sum_list`) carry a per-model delta (the elided releases), totalling 536 bytes.
+
+**Projection to 1 / 2 / 4 models (post-ICF).** ICF folds byte-identical
+functions; the J2 foldability verifier guarantees each specialization is
+structurally identical to its source modulo header ops, so the ONLY thing that
+can keep two specializations of a function from folding is a genuine header-op
+difference:
+
+| models in use | user-code text (subgraph) | growth over 1-model |
+|---|---|---|
+| 1 (manifest = ARC) | 1,172 (baseline) | — |
+| 2 (ARC + Arena)    | 204 folded + 968 (ARC-differing) + 432 (Arena-differing) = **1,604** | **+432 B** |
+| 4 (ARC + Arena + Tracking + GC) | ≈ **1,604** | **≈ +432 B** |
+
+The 4-model row is ≈ the 2-model row, and this is the load-bearing result: the
+three non-refcounted models (BULK_OR_NEVER, TRACED, and INDIVIDUAL_NO_REFCOUNT
+absent a deep-walk) emit IDENTICAL header ops for these functions — they all
+elide retain/release — so their specializations are byte-identical and ICF
+folds all three into ONE copy. Worst-case post-ICF growth is bounded by
+(**≤2 distinct emission shapes** — refcounted vs not — for a typical function,
+NOT ×4) × (spawn-reachable subgraph text), on top of one shared runtime. For
+this subgraph that is +432 bytes; scaled to a realistic worker it stays low-KB.
+
+**Verdict: PASS.** Post-ICF growth is a small, bounded multiple (≤ the number of
+distinct header-emission shapes ≤ 2 for refcount-splitting functions) of the
+spawn-reachable text, far under any reasonable CLBG binary-size budget (whole-
+program `__text` here is 227 KB; the projected growth is sub-KB). The kill
+criterion is not tripped. The designed caps hold: the §2.3 vtable-dispatch arm
+keeps the *specialized* set confined to genuinely-hot allocating functions
+(Callable-existential cold paths are never cloned — `saw_cold_edge`), and ICF
+folds both the memory-op-free functions and the same-emission models. Calibrates
+with **Nim arc→orc** (orc "produces more machine code than arc" — a modest
+single-digit-% delta; ours is comparable in spirit and *sub-linear in model
+count* thanks to same-emission folding) and with **E10** (the code-size cost we
+accept to avoid E10's +13.8% dispatch tax is bounded and small).
+
+**Two honest caveats, both J-scoped, neither affecting the verdict:**
+
+1. **Darwin has no linker ICF today.** aarch64-macos links through the fork's
+   self-hosted Mach-O linker (`~/projects/zig/src/link/MachO.zig`), which
+   implements dead-strip but not identical-code folding (lld is not used for
+   Mach-O). So the post-ICF numbers above are the *structural* projection —
+   validated by the measured zero-delta functions (byte-identical → foldable)
+   and by J2's compile-time foldability verifier — not a linker-applied fold.
+   On an ICF-capable target (ELF via lld `--icf=all`) the folds are realized by
+   the linker. Enabling Mach-O ICF (a new `MachO/icf.zig` in the fork, analogous
+   to `MachO/dead_strip.zig`) is a decoupled fork task; until it lands, an actual
+   Darwin multi-model binary would carry the *pre*-ICF size (Σ per-model), which
+   for this subgraph is 1,808 B vs the 1,604 B post-ICF — a 204 B difference,
+   still far under budget. The J2 **red-flag verifier** is the target-independent
+   substitute for "did ICF fold?": it flags at COMPILE time any specialization
+   that is not structurally foldable (would not fold even with ICF), which is the
+   early kill signal the research names.
+
+2. **Single-binary multi-model measurement is J3.** The per-model deltas above
+   are measured across two single-model binaries because the driver that
+   resolves multiple managers and rewires spawn sites into ONE binary is J3
+   (item 3.1/3.3). J2 delivers + unit-tests the specialization mechanism
+   (`monomorphize.specializeSpawnManagers`: ≤4 model specializations of the
+   spawn-reachable subgraph, correctly tagged, calls redirected, cold edges
+   excluded) and the per-function emit/elide codegen
+   (`ZirDriver.effectiveDeclaredCaps`); the end-to-end multi-model binary that
+   exercises all specializations at once lands with J3's wiring, at which point
+   this projection becomes a direct measurement.
+
 ## OQ1 — current-process resolution on the alloc hot path (A.4 OQ1, P3-J1, 2026-07-07) — RESOLVED
 
 Appendix A.4 open question 1 — "register vs parameter for the

@@ -416,6 +416,19 @@ const MonomorphContext = struct {
     /// Active substitution map during cloning. Set by cloneGroupWithSubs,
     /// used by cloneExpr/cloneDecision to substitute type_ids.
     current_subs: ?*const SubstitutionMap = null,
+    /// P3-J2 per-spawn manager-monomorphization axis. When set (only while
+    /// `specializeSpawnManagers` clones a spawn-reachable subgraph for one
+    /// reclamation model), maps each ORIGINAL top-level/struct function-group
+    /// id in the reachable subgraph to its MODEL-SPECIALIZED clone id. The
+    /// clone path (`cloneExprKindBudgeted`'s `.call` arm) consults it to
+    /// redirect every resolvable intra-subgraph direct/named/dispatch call to
+    /// the model clone, so a specialization is a closed subgraph that never
+    /// re-enters the manifest-model originals. Null on the type-argument path
+    /// (no redirect), keeping that path byte-for-byte unchanged. Indirect
+    /// (`.closure`) and unresolved calls are left untouched — the deliberate
+    /// hot/cold boundary (§2.3): cold callees keep manifest emission and
+    /// dispatch through the per-process manager context at runtime.
+    current_model_call_redirect: ?*const std.AutoHashMap(u32, u32) = null,
     /// Concrete parameter types for protocol-constrained parameters in the
     /// group currently being cloned. Protocol constraints are positional:
     /// `concat(first :: Enumerable, second :: Enumerable)` may specialize
@@ -1795,6 +1808,51 @@ const MonomorphContext = struct {
         }
     }
 
+    /// P3-J2 per-spawn manager-monomorphization: retarget one call to the
+    /// model-specialized clone of its callee, if that callee is inside the
+    /// spawn-reachable subgraph being cloned. `redirect` maps original group
+    /// id → model-clone id (populated by `specializeSpawnManagers` for one
+    /// reclamation model). Mirrors the type-argument rewrite in
+    /// `rewriteExprBudgeted` exactly: `.direct`/`.dispatch` keep their variant
+    /// with a new `function_group_id`; a `.named` call that resolves into the
+    /// subgraph becomes a `.direct` call to the clone (carrying the resolved
+    /// `clause_index`). Any target not in the subgraph — an indirect
+    /// `.closure`, a `.builtin`, or a `.named`/`.direct` whose callee is a cold
+    /// (unspecialized) function — is returned unchanged, which is exactly the
+    /// hot/cold boundary: cold callees keep manifest emission and dispatch
+    /// through the running process's manager context at runtime.
+    fn redirectCallTargetForModel(
+        self: *const MonomorphContext,
+        target: hir.CallTarget,
+        arity: usize,
+        redirect: *const std.AutoHashMap(u32, u32),
+    ) Allocator.Error!hir.CallTarget {
+        switch (target) {
+            .direct => |dc| {
+                if (redirect.get(dc.function_group_id)) |clone_id| {
+                    return .{ .direct = .{ .function_group_id = clone_id, .clause_index = dc.clause_index } };
+                }
+            },
+            .dispatch => |dp| {
+                if (redirect.get(dp.function_group_id)) |clone_id| {
+                    var new_dispatch = dp;
+                    new_dispatch.function_group_id = clone_id;
+                    return .{ .dispatch = new_dispatch };
+                }
+            },
+            .named => |nc| {
+                const resolved = (try self.resolveNamedCall(nc, @intCast(arity))) orelse return target;
+                if (redirect.get(resolved)) |clone_id| {
+                    return .{ .direct = .{ .function_group_id = clone_id, .clause_index = nc.clause_index } };
+                }
+            },
+            // `.closure` (indirect Callable — the cold boundary) and `.builtin`
+            // are never model-redirected.
+            .closure, .builtin => {},
+        }
+        return target;
+    }
+
     fn scanBlock(self: *MonomorphContext, block: *const hir.Block) error{OutOfMemory}!void {
         var budget = HirWalkBudget{};
         self.scanBlockBudgeted(block, &budget, 0) catch |err| {
@@ -2707,10 +2765,19 @@ const MonomorphContext = struct {
                 // re-cloning, the call site keeps the un-substituted
                 // polymorphic type and the `call_closure` lowering can't
                 // tell whether to unwrap the closure's error union.
-                const new_target: hir.CallTarget = switch (c.target) {
+                const cloned_target: hir.CallTarget = switch (c.target) {
                     .closure => |callee| .{ .closure = try self.cloneExprBudgeted(callee, budget, depth + 1) },
                     else => c.target,
                 };
+                // P3-J2: when cloning a spawn-reachable subgraph for a
+                // reclamation model, redirect resolvable direct/named/dispatch
+                // calls to the model clones so the specialization stays a closed
+                // subgraph. Indirect (`.closure`) targets are the cold boundary
+                // and are never redirected.
+                const new_target: hir.CallTarget = if (self.current_model_call_redirect) |redirect|
+                    try self.redirectCallTargetForModel(cloned_target, c.args.len, redirect)
+                else
+                    cloned_target;
                 try self.applyTargetArgModes(new_target, new_args);
                 break :blk .{ .call = .{ .target = new_target, .args = new_args } };
             },
@@ -3170,7 +3237,660 @@ const MonomorphContext = struct {
             else => {},
         }
     }
+
+    // ---------------------------------------------------------------------
+    // P3-J2 per-spawn manager-monomorphization — spawn-reachable analysis.
+    //
+    // `collectSubgraphCallees` gathers the direct/named/dispatch callee group
+    // ids of one function group and flags whether any indirect (`.closure`) or
+    // unresolvable call was seen (the hot/cold boundary). The traversal mirrors
+    // `rewriteExprBudgeted`/`rewriteBlockBudgeted` so it covers the same
+    // positions the model clone reproduces. SOUNDNESS: an under-approximation
+    // is safe — a callee not discovered simply remains a cold (manifest-
+    // emission, runtime-dispatched) function instead of a hot model
+    // specialization; it can never produce wrong codegen on a path we own.
+    // ---------------------------------------------------------------------
+
+    fn collectSubgraphCallees(
+        self: *MonomorphContext,
+        group: *const hir.FunctionGroup,
+        callees: *std.AutoHashMap(u32, void),
+        saw_cold_edge: *bool,
+    ) HirWalkError!void {
+        var budget = HirWalkBudget{};
+        for (group.clauses) |clause| {
+            try self.collectCalleesInBlock(clause.body, callees, saw_cold_edge, &budget, 0);
+            if (clause.refinement) |refinement| {
+                try self.collectCalleesInExpr(refinement, callees, saw_cold_edge, &budget, 0);
+            }
+            for (clause.params) |param| {
+                if (param.default) |default_expr| {
+                    try self.collectCalleesInExpr(default_expr, callees, saw_cold_edge, &budget, 0);
+                }
+            }
+        }
+    }
+
+    fn collectCalleesInBlock(
+        self: *MonomorphContext,
+        block: *const hir.Block,
+        callees: *std.AutoHashMap(u32, void),
+        saw_cold_edge: *bool,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) HirWalkError!void {
+        try budget.enter(depth);
+        for (block.stmts) |stmt| {
+            switch (stmt) {
+                .expr => |e| try self.collectCalleesInExpr(e, callees, saw_cold_edge, budget, depth + 1),
+                .local_set => |ls| try self.collectCalleesInExpr(ls.value, callees, saw_cold_edge, budget, depth + 1),
+                .function_group => |fg| {
+                    // Nested local functions are SHARED by the clone (see
+                    // `cloneStmtBudgeted`: "local fns: share, not specialized"),
+                    // so they are cold for the model axis — but calls FROM their
+                    // bodies to top-level subgraph functions are still hot edges
+                    // worth discovering.
+                    for (fg.clauses) |clause| {
+                        try self.collectCalleesInBlock(clause.body, callees, saw_cold_edge, budget, depth + 1);
+                    }
+                },
+            }
+        }
+    }
+
+    fn collectCalleesInExpr(
+        self: *MonomorphContext,
+        expr: *const hir.Expr,
+        callees: *std.AutoHashMap(u32, void),
+        saw_cold_edge: *bool,
+        budget: *HirWalkBudget,
+        depth: u32,
+    ) HirWalkError!void {
+        try budget.enter(depth);
+        switch (expr.kind) {
+            .call => |call| {
+                switch (call.target) {
+                    .direct => |dc| try callees.put(dc.function_group_id, {}),
+                    .dispatch => |dp| try callees.put(dp.function_group_id, {}),
+                    .named => |nc| {
+                        if (try self.resolveNamedCall(nc, @intCast(call.args.len))) |group_id| {
+                            try callees.put(group_id, {});
+                        } else {
+                            // A named call that does not resolve to a program
+                            // group (stdlib/runtime intrinsic, etc.) is a cold
+                            // edge — its callee is not model-specialized.
+                            saw_cold_edge.* = true;
+                        }
+                    },
+                    // Indirect Callable existential — the defining cold boundary
+                    // of §2.3; never followed for monomorphization.
+                    .closure => saw_cold_edge.* = true,
+                    // Compiler builtin — no user function group.
+                    .builtin => {},
+                }
+                for (call.args) |arg| try self.collectCalleesInExpr(arg.expr, callees, saw_cold_edge, budget, depth + 1);
+                if (call.target == .closure) {
+                    try self.collectCalleesInExpr(call.target.closure, callees, saw_cold_edge, budget, depth + 1);
+                }
+            },
+            .binary => |b| {
+                try self.collectCalleesInExpr(b.lhs, callees, saw_cold_edge, budget, depth + 1);
+                try self.collectCalleesInExpr(b.rhs, callees, saw_cold_edge, budget, depth + 1);
+            },
+            .unary => |u| try self.collectCalleesInExpr(u.operand, callees, saw_cold_edge, budget, depth + 1),
+            .tuple_init => |elems| for (elems) |e| try self.collectCalleesInExpr(e, callees, saw_cold_edge, budget, depth + 1),
+            .list_init => |elems| for (elems) |e| try self.collectCalleesInExpr(e, callees, saw_cold_edge, budget, depth + 1),
+            .list_cons => |lc| {
+                try self.collectCalleesInExpr(lc.head, callees, saw_cold_edge, budget, depth + 1);
+                try self.collectCalleesInExpr(lc.tail, callees, saw_cold_edge, budget, depth + 1);
+            },
+            .map_init => |entries| for (entries) |entry| {
+                try self.collectCalleesInExpr(entry.key, callees, saw_cold_edge, budget, depth + 1);
+                try self.collectCalleesInExpr(entry.value, callees, saw_cold_edge, budget, depth + 1);
+            },
+            .struct_init => |si| for (si.fields) |field| try self.collectCalleesInExpr(field.value, callees, saw_cold_edge, budget, depth + 1),
+            .field_get => |fg| try self.collectCalleesInExpr(fg.object, callees, saw_cold_edge, budget, depth + 1),
+            .tuple_index_get => |tig| try self.collectCalleesInExpr(tig.object, callees, saw_cold_edge, budget, depth + 1),
+            .list_index_get => |lig| try self.collectCalleesInExpr(lig.list, callees, saw_cold_edge, budget, depth + 1),
+            .list_head_get => |lhg| try self.collectCalleesInExpr(lhg.list, callees, saw_cold_edge, budget, depth + 1),
+            .list_tail_get => |ltg| try self.collectCalleesInExpr(ltg.list, callees, saw_cold_edge, budget, depth + 1),
+            .map_value_get => |mvg| {
+                try self.collectCalleesInExpr(mvg.map, callees, saw_cold_edge, budget, depth + 1);
+                try self.collectCalleesInExpr(mvg.key, callees, saw_cold_edge, budget, depth + 1);
+            },
+            .branch => |br| {
+                try self.collectCalleesInExpr(br.condition, callees, saw_cold_edge, budget, depth + 1);
+                try self.collectCalleesInBlock(br.then_block, callees, saw_cold_edge, budget, depth + 1);
+                if (br.else_block) |eb| try self.collectCalleesInBlock(eb, callees, saw_cold_edge, budget, depth + 1);
+            },
+            .case => |cd| {
+                try self.collectCalleesInExpr(cd.scrutinee, callees, saw_cold_edge, budget, depth + 1);
+                for (cd.arms) |arm| {
+                    if (arm.guard) |g| try self.collectCalleesInExpr(g, callees, saw_cold_edge, budget, depth + 1);
+                    try self.collectCalleesInBlock(arm.body, callees, saw_cold_edge, budget, depth + 1);
+                }
+            },
+            .match => |m| try self.collectCalleesInExpr(m.scrutinee, callees, saw_cold_edge, budget, depth + 1),
+            .block => |b| try self.collectCalleesInBlock(&b, callees, saw_cold_edge, budget, depth + 1),
+            .panic => |e| try self.collectCalleesInExpr(e, callees, saw_cold_edge, budget, depth + 1),
+            .unwrap => |e| try self.collectCalleesInExpr(e, callees, saw_cold_edge, budget, depth + 1),
+            .union_init => |ui| try self.collectCalleesInExpr(ui.value, callees, saw_cold_edge, budget, depth + 1),
+            .error_pipe => |ep| {
+                for (ep.steps) |step| try self.collectCalleesInExpr(step.expr, callees, saw_cold_edge, budget, depth + 1);
+                try self.collectCalleesInExpr(ep.handler, callees, saw_cold_edge, budget, depth + 1);
+            },
+            .closure_create => |cc| {
+                // The closure BODY is a shared nested group (cold); its captured
+                // argument expressions can still contain hot calls.
+                for (cc.captures) |cap| try self.collectCalleesInExpr(cap.expr, callees, saw_cold_edge, budget, depth + 1);
+            },
+            .ret_raise => |rr| try self.collectCalleesInExpr(rr.stash_call, callees, saw_cold_edge, budget, depth + 1),
+            .try_rescue => |tr| {
+                try self.collectCalleesInBlock(tr.body, callees, saw_cold_edge, budget, depth + 1);
+                for (tr.arms) |arm| {
+                    if (arm.guard) |g| try self.collectCalleesInExpr(g, callees, saw_cold_edge, budget, depth + 1);
+                    try self.collectCalleesInBlock(arm.body, callees, saw_cold_edge, budget, depth + 1);
+                }
+                try self.collectCalleesInExpr(tr.raise_occurred_call, callees, saw_cold_edge, budget, depth + 1);
+                try self.collectCalleesInExpr(tr.take_raise_call, callees, saw_cold_edge, budget, depth + 1);
+                if (tr.after_block) |cleanup| try self.collectCalleesInBlock(cleanup, callees, saw_cold_edge, budget, depth + 1);
+            },
+            else => {},
+        }
+    }
 };
+
+// =============================================================================
+// P3-J2 — per-spawn manager-monomorphization axis.
+//
+// `zap-concurrency-research.md` §2.3 / plan §5 Phase 3 item 3.2. Per-spawn
+// managers mean different processes run different reclamation MODELS. Naively
+// that forces per-allocation dynamic dispatch (the E10 +13.8% hot-path tax —
+// unacceptable). The resolved answer is the HYBRID: specialize the spawn-
+// reachable call graph per reclamation MODEL (≤4: REFCOUNTED / BULK_OR_NEVER /
+// INDIVIDUAL_NO_REFCOUNT / TRACED) so each specialization's memory-op codegen
+// is comptime-shaped to that model (cost is CODE SIZE, folded by linker ICF —
+// not dispatch); cold closure/existential paths fall through to the process
+// manager's per-process context at runtime.
+//
+// This axis is a SEPARATE pass run AFTER `monomorphize` (the type-argument
+// axis), so it clones fully-concrete functions and leaves the type-arg machine
+// untouched. The specialization KEY is the reclamation MODEL, never the
+// manager identity (Arena/NoOp/Leak all share BULK_OR_NEVER → share one
+// specialization), so the worst case is ≤4 specializations of the spawn-
+// reachable subgraph, not one per manager.
+//
+// DECISION GATE 0 (comptime-resolved manager at the spawn site — the ratified
+// language rule) is enforced STRUCTURALLY: `SpawnManagerSpec.model` is an
+// already-resolved `ReclamationModel` enum, so a spawn site whose `.manager`
+// is not comptime-resolvable cannot appear in a plan. J3 builds the plan from
+// the `spawn(f, .{ .manager = X })` surface (resolving X → model at the site,
+// diagnosing a non-comptime X there); J2 consumes the plan and returns the
+// entry→specialization mapping J3 uses to rewire the spawn sites.
+// =============================================================================
+
+/// One comptime-resolved spawn site's manager binding: the entry function
+/// group and the reclamation model the spawned process runs under.
+pub const SpawnManagerSpec = struct {
+    /// The spawn entry function's HIR group id (the target of `spawn(f, …)`).
+    entry_group_id: u32,
+    /// The reclamation model the process spawned here runs under. Comptime-
+    /// resolved — this is where Decision Gate 0 is discharged (an enum, not a
+    /// runtime value).
+    model: hir.ReclamationModel,
+};
+
+/// The plan handed to `specializeSpawnManagers`: the manifest (default) model
+/// plus the per-spawn-site specs. An empty `specs` slice makes the whole pass
+/// a no-op (the zero-cost gate: a non-spawning binary — or a binary that only
+/// spawns under the manifest model — carries exactly one specialization,
+/// identical to today).
+pub const SpawnManagerPlan = struct {
+    /// The manifest manager's reclamation model — the model ordinary, untagged
+    /// functions already emit for. A spec whose model equals this needs no
+    /// clone (the entry already emits correctly); its entry-specialization is
+    /// recorded as identity.
+    manifest_model: hir.ReclamationModel,
+    specs: []const SpawnManagerSpec = &.{},
+};
+
+/// The resolved specialization for one `(entry, model)` pair. `specialized_group_id`
+/// equals `entry_group_id` for manifest-model spawns (no clone needed) and the
+/// fresh clone id otherwise. J3 rewires each spawn site's entry reference to
+/// `specialized_group_id`.
+pub const EntrySpecialization = struct {
+    entry_group_id: u32,
+    model: hir.ReclamationModel,
+    specialized_group_id: u32,
+};
+
+pub const SpawnManagerResult = struct {
+    /// The augmented program with the model specializations added.
+    program: hir.Program,
+    /// Total model-specialized clones created across all non-manifest models.
+    specialization_count: u32,
+    /// Distinct non-manifest reclamation models specialized (0..3; the total
+    /// model count including the manifest is `model_count + 1`, capped at 4).
+    model_count: u32,
+    /// Per `(entry, model)` → specialized entry group id, for spawn-site rewiring.
+    entry_specializations: []const EntrySpecialization = &.{},
+    /// True when any spawn-reachable subgraph crossed a cold (indirect Callable
+    /// / unresolved) edge — the paths that fall through to per-process manager
+    /// dispatch at runtime rather than being monomorphized (§2.3).
+    saw_cold_edge: bool = false,
+    errors: []const MonomorphError = &.{},
+    /// The ICF red flags (§2.3 requirement 4): one diagnostic per model
+    /// specialization that is NOT structurally identical to its source modulo
+    /// the ICF-tolerated differences. By construction this is always empty (the
+    /// pass produces faithful identity clones); a non-empty slice means a
+    /// model-dependent HIR transform leaked into a specialization body — a bug
+    /// that would also make the specializations un-foldable by linker ICF.
+    foldability_red_flags: []const MonomorphError = &.{},
+};
+
+/// Short, symbol-safe suffix for a reclamation model, used to mangle a model
+/// specialization's name so the linker sees distinct symbols (which ICF then
+/// folds when they differ only in header-emission ops).
+fn modelSuffix(model: hir.ReclamationModel) []const u8 {
+    return switch (model) {
+        .refcounted => "refcounted",
+        .bulk_or_never => "bulk_or_never",
+        .individual_no_refcount => "individual_no_refcount",
+        .traced => "traced",
+    };
+}
+
+/// The struct index that defines `group_id`, or null when it is a top-level
+/// function (or not found). A model clone is placed in the same container as
+/// its original so cross-struct direct-call resolution matches the original's.
+fn findGroupOriginContainer(program: *const hir.Program, group_id: u32) ?usize {
+    for (program.structs, 0..) |mod, idx| {
+        for (mod.functions) |g| {
+            if (g.id == group_id) return idx;
+        }
+    }
+    return null;
+}
+
+// -----------------------------------------------------------------------------
+// ICF red-flag verifier (§2.3 requirement 4).
+//
+// The model specializations are IDENTITY clones of one source function: the
+// only per-model differences are (a) the `reclamation_model` tag, (b) the
+// model-suffixed name, and (c) call targets redirected to same-model clones.
+// After codegen they therefore differ ONLY in header-emission (retain/release/
+// free) ops — exactly what linker ICF folds. The research's early kill signal
+// is "ICF cannot fold two model specializations of the same function → they
+// differ in more than header ops → a semantic leak." Since the linker's ICF is
+// downstream (and, on Darwin, the self-hosted Mach-O linker has none yet), the
+// robust, target-independent form of that check is a COMPILE-TIME structural
+// invariant: every model specialization must be structurally identical to its
+// source modulo the three tolerated differences. `modelCloneStructurallyFoldable`
+// is that check; a `false` result is the verifier red flag — it means a
+// per-model HIR transform crept in where none should exist. By construction the
+// pass never produces such a clone, so this is a guard that fires only on a
+// future regression (a model-dependent body transform), caught at compile time
+// rather than as a mysterious code-size blow-up when ICF fails to fold.
+// -----------------------------------------------------------------------------
+
+/// True when `clone` is structurally identical to `source` modulo the three
+/// ICF-tolerated differences (reclamation model tag, name, and redirected
+/// call-target ids). A `false` result is the ICF red flag. Coverage mirrors the
+/// clone/collector traversal; call targets are compared by VARIANT only (the
+/// redirected id is expected to differ), so a redirected clone compares equal
+/// to its source, while a body that gained/lost a statement, changed an
+/// operator, or changed control-flow shape does not.
+pub fn modelCloneStructurallyFoldable(source: *const hir.FunctionGroup, clone: *const hir.FunctionGroup) bool {
+    if (source.arity != clone.arity) return false;
+    if (source.clauses.len != clone.clauses.len) return false;
+    for (source.clauses, clone.clauses) |source_clause, clone_clause| {
+        if (source_clause.params.len != clone_clause.params.len) return false;
+        if ((source_clause.refinement == null) != (clone_clause.refinement == null)) return false;
+        if (source_clause.refinement) |source_refinement| {
+            if (!foldableExpr(source_refinement, clone_clause.refinement.?)) return false;
+        }
+        if (!foldableBlock(source_clause.body, clone_clause.body)) return false;
+    }
+    return true;
+}
+
+fn foldableBlock(a: *const hir.Block, b: *const hir.Block) bool {
+    if (a.stmts.len != b.stmts.len) return false;
+    for (a.stmts, b.stmts) |sa, sb| {
+        if (@as(std.meta.Tag(hir.Stmt), sa) != @as(std.meta.Tag(hir.Stmt), sb)) return false;
+        switch (sa) {
+            .expr => |ea| if (!foldableExpr(ea, sb.expr)) return false,
+            .local_set => |la| if (!foldableExpr(la.value, sb.local_set.value)) return false,
+            .function_group => |ga| {
+                const gb = sb.function_group;
+                if (ga.clauses.len != gb.clauses.len) return false;
+                for (ga.clauses, gb.clauses) |ca, cb| {
+                    if (!foldableBlock(ca.body, cb.body)) return false;
+                }
+            },
+        }
+    }
+    return true;
+}
+
+fn foldableExpr(a: *const hir.Expr, b: *const hir.Expr) bool {
+    if (@as(std.meta.Tag(hir.ExprKind), a.kind) != @as(std.meta.Tag(hir.ExprKind), b.kind)) return false;
+    return switch (a.kind) {
+        .call => |ca| blk: {
+            const cb = b.kind.call;
+            // Call targets are compared by variant only: a redirected clone
+            // legitimately points at a different (same-model) group id.
+            if (@as(std.meta.Tag(hir.CallTarget), ca.target) != @as(std.meta.Tag(hir.CallTarget), cb.target)) break :blk false;
+            if (ca.args.len != cb.args.len) break :blk false;
+            for (ca.args, cb.args) |arg_a, arg_b| {
+                if (!foldableExpr(arg_a.expr, arg_b.expr)) break :blk false;
+            }
+            if (ca.target == .closure) {
+                if (!foldableExpr(ca.target.closure, cb.target.closure)) break :blk false;
+            }
+            break :blk true;
+        },
+        .binary => |ba| ba.op == b.kind.binary.op and
+            foldableExpr(ba.lhs, b.kind.binary.lhs) and
+            foldableExpr(ba.rhs, b.kind.binary.rhs),
+        .unary => |ua| ua.op == b.kind.unary.op and foldableExpr(ua.operand, b.kind.unary.operand),
+        .tuple_init => |ea| blk: {
+            const eb = b.kind.tuple_init;
+            if (ea.len != eb.len) break :blk false;
+            for (ea, eb) |x, y| if (!foldableExpr(x, y)) break :blk false;
+            break :blk true;
+        },
+        .list_init => |ea| blk: {
+            const eb = b.kind.list_init;
+            if (ea.len != eb.len) break :blk false;
+            for (ea, eb) |x, y| if (!foldableExpr(x, y)) break :blk false;
+            break :blk true;
+        },
+        .list_cons => |la| foldableExpr(la.head, b.kind.list_cons.head) and
+            foldableExpr(la.tail, b.kind.list_cons.tail),
+        .field_get => |fa| foldableExpr(fa.object, b.kind.field_get.object),
+        .branch => |bra| blk: {
+            const brb = b.kind.branch;
+            if (!foldableExpr(bra.condition, brb.condition)) break :blk false;
+            if (!foldableBlock(bra.then_block, brb.then_block)) break :blk false;
+            if ((bra.else_block == null) != (brb.else_block == null)) break :blk false;
+            if (bra.else_block) |eb| break :blk foldableBlock(eb, brb.else_block.?);
+            break :blk true;
+        },
+        .case => |cda| blk: {
+            const cdb = b.kind.case;
+            if (!foldableExpr(cda.scrutinee, cdb.scrutinee)) break :blk false;
+            if (cda.arms.len != cdb.arms.len) break :blk false;
+            for (cda.arms, cdb.arms) |arm_a, arm_b| {
+                if (!foldableBlock(arm_a.body, arm_b.body)) break :blk false;
+            }
+            break :blk true;
+        },
+        .block => |blk_val| foldableBlock(&blk_val, &b.kind.block),
+        .panic => |ea| foldableExpr(ea, b.kind.panic),
+        .unwrap => |ea| foldableExpr(ea, b.kind.unwrap),
+        .union_init => |ua| foldableExpr(ua.value, b.kind.union_init.value),
+        // Leaves (literals, local/param/capture gets, never) and any node type
+        // not structurally decomposed above: the tag match already established
+        // structural equivalence for the identity-clone invariant.
+        else => true,
+    };
+}
+
+/// Run the per-spawn manager-monomorphization axis. See the section banner
+/// above for the full design. Returns the augmented program plus the
+/// entry→specialization mapping for spawn-site rewiring.
+pub fn specializeSpawnManagers(
+    allocator: Allocator,
+    program: *const hir.Program,
+    store: *TypeStore,
+    next_group_id: *u32,
+    interner: *ast.StringInterner,
+    plan: SpawnManagerPlan,
+) !SpawnManagerResult {
+    // Zero-cost gate: no spawn model specs → the program is returned byte-for-
+    // byte unchanged, so every downstream stage (HIR→IR→ZIR) is identical to a
+    // pre-J2 build. This is the single-model / non-spawning no-op path.
+    if (plan.specs.len == 0) {
+        return .{ .program = program.*, .specialization_count = 0, .model_count = 0 };
+    }
+
+    var ctx = MonomorphContext{
+        .allocator = allocator,
+        .store = store,
+        .next_group_id = next_group_id,
+        .interner = interner,
+        .program = program,
+        .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
+        .specializations = std.AutoHashMap(u64, u32).init(allocator),
+        .specialization_counts = std.AutoHashMap(u32, u32).init(allocator),
+        .new_groups = .empty,
+        .call_rewrites = std.AutoHashMap(u64, u32).init(allocator),
+        .local_types = std.AutoHashMap(u32, TypeId).init(allocator),
+        .errors = .empty,
+    };
+    defer ctx.generic_groups.deinit();
+    defer ctx.specializations.deinit();
+    defer ctx.specialization_counts.deinit();
+    defer ctx.new_groups.deinit(allocator);
+    defer ctx.call_rewrites.deinit();
+    defer ctx.local_types.deinit();
+
+    var errors: std.ArrayListUnmanaged(MonomorphError) = .empty;
+    errdefer errors.deinit(allocator);
+    var entry_specializations: std.ArrayListUnmanaged(EntrySpecialization) = .empty;
+    errdefer entry_specializations.deinit(allocator);
+    // The clones to splice in, each tagged with its origin container.
+    var clones: std.ArrayListUnmanaged(NewGroupEntry) = .empty;
+    defer clones.deinit(allocator);
+    // ICF red flags: model specializations that failed the structural-
+    // foldability invariant (§2.3 requirement 4).
+    var red_flags: std.ArrayListUnmanaged(MonomorphError) = .empty;
+    errdefer red_flags.deinit(allocator);
+
+    var saw_cold_edge = false;
+    var model_count: u32 = 0;
+
+    // The four Axis-A models are the complete key space, so the number of
+    // distinct specializations is ≤4 by construction. Iterating the enum (not
+    // the specs) also deduplicates managers that share a model.
+    const all_models = [_]hir.ReclamationModel{
+        .refcounted,
+        .bulk_or_never,
+        .individual_no_refcount,
+        .traced,
+    };
+
+    for (all_models) |model| {
+        // Manifest-model spawns need no clone: the entry already emits for the
+        // manifest model. Record identity entry-specializations and move on.
+        if (model == plan.manifest_model) {
+            for (plan.specs) |spec| {
+                if (spec.model != model) continue;
+                if (findGroupOriginContainer(program, spec.entry_group_id) == null and
+                    ctx.findFunctionGroupById(spec.entry_group_id) == null)
+                {
+                    try errors.append(allocator, .{
+                        .message = try std.fmt.allocPrint(
+                            allocator,
+                            "spawn manager plan references unknown entry function group id {d}",
+                            .{spec.entry_group_id},
+                        ),
+                        .span = .{ .start = 0, .end = 0 },
+                    });
+                    continue;
+                }
+                try entry_specializations.append(allocator, .{
+                    .entry_group_id = spec.entry_group_id,
+                    .model = model,
+                    .specialized_group_id = spec.entry_group_id,
+                });
+            }
+            continue;
+        }
+
+        // Entries requesting THIS non-manifest model.
+        var model_entries: std.ArrayListUnmanaged(u32) = .empty;
+        defer model_entries.deinit(allocator);
+        for (plan.specs) |spec| {
+            if (spec.model == model) try model_entries.append(allocator, spec.entry_group_id);
+        }
+        if (model_entries.items.len == 0) continue;
+
+        // 1. Spawn-reachable set: BFS from every entry of this model over
+        //    resolvable direct/named/dispatch calls. Cold (indirect) edges stop
+        //    the walk and set `saw_cold_edge`.
+        var reachable = std.AutoHashMap(u32, void).init(allocator);
+        defer reachable.deinit();
+        var worklist: std.ArrayListUnmanaged(u32) = .empty;
+        defer worklist.deinit(allocator);
+        for (model_entries.items) |entry_id| {
+            if (ctx.findFunctionGroupById(entry_id) == null) {
+                try errors.append(allocator, .{
+                    .message = try std.fmt.allocPrint(
+                        allocator,
+                        "spawn manager plan references unknown entry function group id {d}",
+                        .{entry_id},
+                    ),
+                    .span = .{ .start = 0, .end = 0 },
+                });
+                continue;
+            }
+            const gop = try reachable.getOrPut(entry_id);
+            if (!gop.found_existing) try worklist.append(allocator, entry_id);
+        }
+        while (worklist.items.len > 0) {
+            const group_id = worklist.items[worklist.items.len - 1];
+            worklist.items.len -= 1;
+            const group = ctx.findFunctionGroupById(group_id) orelse continue;
+            var callees = std.AutoHashMap(u32, void).init(allocator);
+            defer callees.deinit();
+            try ctx.collectSubgraphCallees(group, &callees, &saw_cold_edge);
+            var callee_it = callees.keyIterator();
+            while (callee_it.next()) |callee_ptr| {
+                const callee_id = callee_ptr.*;
+                // Only clone groups that actually exist in the program. A callee
+                // that resolves nowhere (runtime intrinsic, already a clone) is
+                // a cold edge.
+                if (ctx.findFunctionGroupById(callee_id) == null) continue;
+                const gop = try reachable.getOrPut(callee_id);
+                if (!gop.found_existing) try worklist.append(allocator, callee_id);
+            }
+        }
+        if (reachable.count() == 0) continue;
+
+        model_count += 1;
+
+        // 2. Assign a fresh clone id to each reachable group and build the
+        //    redirect map (original id → clone id).
+        var redirect = std.AutoHashMap(u32, u32).init(allocator);
+        defer redirect.deinit();
+        var id_it = reachable.keyIterator();
+        while (id_it.next()) |orig_ptr| {
+            const clone_id = next_group_id.*;
+            next_group_id.* += 1;
+            try redirect.put(orig_ptr.*, clone_id);
+        }
+
+        // 3. Clone each reachable group with the redirect active (so intra-
+        //    subgraph calls point at the clones) and the model tag set.
+        ctx.current_model_call_redirect = &redirect;
+        defer ctx.current_model_call_redirect = null;
+        var clone_it = reachable.keyIterator();
+        while (clone_it.next()) |orig_ptr| {
+            const orig_id = orig_ptr.*;
+            const orig = ctx.findFunctionGroupById(orig_id).?;
+            const clone_id = redirect.get(orig_id).?;
+
+            var empty_subs = SubstitutionMap.init(allocator);
+            defer empty_subs.deinit();
+            var cloned = try ctx.cloneGroupWithSubs(orig, &empty_subs, &[_]TypeId{}, &[_]TypeId{}, clone_id, 0);
+
+            const base_name = interner.get(orig.name);
+            const suffixed = try std.fmt.allocPrint(allocator, "{s}__mm_{s}", .{ base_name, modelSuffix(model) });
+            defer allocator.free(suffixed);
+            cloned.name = try interner.intern(suffixed);
+            cloned.reclamation_model = model;
+
+            // ICF red-flag verifier: the clone must be structurally identical
+            // to its source modulo the tolerated differences. It always is (an
+            // identity clone), so a failure here is a genuine semantic leak —
+            // surface it as a diagnostic rather than let it become an
+            // un-foldable code-size blow-up downstream.
+            if (!modelCloneStructurallyFoldable(orig, &cloned)) {
+                try red_flags.append(allocator, .{
+                    .message = try std.fmt.allocPrint(
+                        allocator,
+                        "ICF red flag: model specialization '{s}' ({s}) is not structurally " ++
+                            "foldable with its source group {d} — a per-model transform leaked " ++
+                            "into the function body where only header-emission ops should differ",
+                        .{ interner.get(cloned.name), modelSuffix(model), orig_id },
+                    ),
+                    .span = genericGroupSpan(orig),
+                });
+            }
+
+            try clones.append(allocator, .{
+                .group = cloned,
+                .source_group_id = orig_id,
+                .target_struct_idx = findGroupOriginContainer(program, orig_id),
+            });
+        }
+
+        // 4. Entry-specializations for this model's spawn sites.
+        for (model_entries.items) |entry_id| {
+            if (redirect.get(entry_id)) |specialized_id| {
+                try entry_specializations.append(allocator, .{
+                    .entry_group_id = entry_id,
+                    .model = model,
+                    .specialized_group_id = specialized_id,
+                });
+            }
+        }
+    }
+
+    // 5. Splice the clones into their origin containers (same struct as their
+    //    original, or top-level). `target_struct_idx` here means "the struct
+    //    index that defines the source group," or null for a top-level source.
+    var new_structs: std.ArrayListUnmanaged(hir.Struct) = .empty;
+    errdefer new_structs.deinit(allocator);
+    for (program.structs, 0..) |mod, mod_idx| {
+        var new_fns: std.ArrayListUnmanaged(hir.FunctionGroup) = .empty;
+        for (mod.functions) |group| try new_fns.append(allocator, group);
+        for (clones.items) |entry| {
+            if (entry.target_struct_idx) |idx| {
+                if (idx == mod_idx) try new_fns.append(allocator, entry.group);
+            }
+        }
+        try new_structs.append(allocator, .{
+            .name = mod.name,
+            .scope_id = mod.scope_id,
+            .functions = try new_fns.toOwnedSlice(allocator),
+            .types = mod.types,
+        });
+    }
+    var new_top_fns: std.ArrayListUnmanaged(hir.FunctionGroup) = .empty;
+    errdefer new_top_fns.deinit(allocator);
+    for (program.top_functions) |group| try new_top_fns.append(allocator, group);
+    for (clones.items) |entry| {
+        if (entry.target_struct_idx == null) try new_top_fns.append(allocator, entry.group);
+    }
+
+    return .{
+        .program = .{
+            .structs = try new_structs.toOwnedSlice(allocator),
+            .top_functions = try new_top_fns.toOwnedSlice(allocator),
+            .protocols = program.protocols,
+            .impls = program.impls,
+        },
+        .specialization_count = @intCast(clones.items.len),
+        .model_count = model_count,
+        .entry_specializations = try entry_specializations.toOwnedSlice(allocator),
+        .saw_cold_edge = saw_cold_edge,
+        .errors = try errors.toOwnedSlice(allocator),
+        .foldability_red_flags = try red_flags.toOwnedSlice(allocator),
+    };
+}
 
 /// Check if a function group has type variable parameters (is generic).
 fn genericGroupContainsTypeVar(store: *const TypeStore, group: *const hir.FunctionGroup, allocator: Allocator) TypeWalkError!bool {
@@ -4973,4 +5693,311 @@ test "typeIdToMangledName encodes applied parametric types" {
 /// instead of being collapsed to a placeholder type name.
 fn typeIdToMangledName(allocator: Allocator, store: *const TypeStore, type_id: TypeId) TypeMangleError![]u8 {
     return try types_mod.typeIdMangledName(allocator, store, type_id);
+}
+
+// =============================================================================
+// P3-J2 — per-spawn manager-monomorphization pass tests.
+// =============================================================================
+
+/// Build a minimal zero-arity function group whose single clause body is
+/// `body`. Everything the pass reads (id, name, clauses, reclamation_model) is
+/// set; the rest is defaulted. Allocated from `allocator` (an arena in tests).
+fn spawnTestGroup(
+    allocator: Allocator,
+    interner: *ast.StringInterner,
+    id: u32,
+    name: []const u8,
+    body: *const hir.Block,
+) !hir.FunctionGroup {
+    const decision = try allocator.create(hir.Decision);
+    decision.* = .{ .success = .{ .bindings = &.{}, .body_index = 0 } };
+    const clauses = try allocator.alloc(hir.Clause, 1);
+    clauses[0] = .{
+        .params = &.{},
+        .return_type = TypeStore.NIL,
+        .decision = decision,
+        .body = body,
+        .refinement = null,
+        .tuple_bindings = &.{},
+    };
+    return .{
+        .id = id,
+        .scope_id = 0,
+        .name = try interner.intern(name),
+        .arity = 0,
+        .clauses = clauses,
+        .fallback_parent = null,
+    };
+}
+
+/// A body that directly calls `callee_id` (a hot, resolvable edge).
+fn directCallBody(allocator: Allocator, callee_id: u32) !*const hir.Block {
+    const call_expr = try testExpr(allocator, .{ .call = .{
+        .target = .{ .direct = .{ .function_group_id = callee_id } },
+        .args = &.{},
+    } }, TypeStore.NIL, .{ .start = 0, .end = 0 });
+    return blockWithExpr(allocator, call_expr);
+}
+
+/// A body that invokes a value via an indirect closure call (the cold
+/// boundary — never model-specialized).
+fn closureCallBody(allocator: Allocator) !*const hir.Block {
+    const callee = try testExpr(allocator, .{ .local_get = 0 }, TypeStore.NIL, .{ .start = 0, .end = 0 });
+    const call_expr = try testExpr(allocator, .{ .call = .{
+        .target = .{ .closure = callee },
+        .args = &.{},
+    } }, TypeStore.NIL, .{ .start = 0, .end = 0 });
+    return blockWithExpr(allocator, call_expr);
+}
+
+fn findGroupById(program: *const hir.Program, id: u32) ?*const hir.FunctionGroup {
+    for (program.top_functions) |*group| {
+        if (group.id == id) return group;
+    }
+    for (program.structs) |*mod| {
+        for (mod.functions) |*group| {
+            if (group.id == id) return group;
+        }
+    }
+    return null;
+}
+
+test "specializeSpawnManagers clones, tags, and redirects a two-function subgraph" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var interner = ast.StringInterner.init(allocator);
+    var store = try TypeStore.init(allocator, &interner);
+
+    // entry (id 1) directly calls helper (id 2). Both are spawn-reachable.
+    const helper = try spawnTestGroup(allocator, &interner, 2, "helper", try emptyBlock(allocator));
+    const entry = try spawnTestGroup(allocator, &interner, 1, "worker", try directCallBody(allocator, 2));
+
+    const groups = try allocator.alloc(hir.FunctionGroup, 2);
+    groups[0] = entry;
+    groups[1] = helper;
+    const program = hir.Program{ .structs = &.{}, .top_functions = groups };
+
+    var next_group_id: u32 = 3;
+    // Manifest = ARC; the spawn site runs under Arena (BULK_OR_NEVER).
+    const plan = SpawnManagerPlan{
+        .manifest_model = .refcounted,
+        .specs = &[_]SpawnManagerSpec{.{ .entry_group_id = 1, .model = .bulk_or_never }},
+    };
+
+    const result = try specializeSpawnManagers(allocator, &program, &store, &next_group_id, &interner, plan);
+
+    // Two clones (entry + helper) of one model; no cold edge.
+    try std.testing.expectEqual(@as(u32, 2), result.specialization_count);
+    try std.testing.expectEqual(@as(u32, 1), result.model_count);
+    try std.testing.expect(!result.saw_cold_edge);
+    try std.testing.expectEqual(@as(usize, 0), result.errors.len);
+    // Identity clones always pass the ICF foldability invariant.
+    try std.testing.expectEqual(@as(usize, 0), result.foldability_red_flags.len);
+
+    // The entry-specialization maps entry 1 → its Arena clone.
+    try std.testing.expectEqual(@as(usize, 1), result.entry_specializations.len);
+    const entry_spec = result.entry_specializations[0];
+    try std.testing.expectEqual(@as(u32, 1), entry_spec.entry_group_id);
+    try std.testing.expectEqual(hir.ReclamationModel.bulk_or_never, entry_spec.model);
+    try std.testing.expect(entry_spec.specialized_group_id >= 3);
+
+    // The entry clone is tagged Arena and named with the model suffix.
+    const entry_clone = findGroupById(&result.program, entry_spec.specialized_group_id).?;
+    try std.testing.expectEqual(hir.ReclamationModel.bulk_or_never, entry_clone.reclamation_model.?);
+    try std.testing.expect(std.mem.endsWith(u8, interner.get(entry_clone.name), "__mm_bulk_or_never"));
+
+    // The entry clone's direct call is REDIRECTED to the helper clone, never
+    // back to the manifest-model original (id 2).
+    const call = entry_clone.clauses[0].body.stmts[0].expr.kind.call;
+    try std.testing.expect(call.target == .direct);
+    const redirected_id = call.target.direct.function_group_id;
+    try std.testing.expect(redirected_id != 2);
+    const helper_clone = findGroupById(&result.program, redirected_id).?;
+    try std.testing.expectEqual(hir.ReclamationModel.bulk_or_never, helper_clone.reclamation_model.?);
+    try std.testing.expect(std.mem.endsWith(u8, interner.get(helper_clone.name), "__mm_bulk_or_never"));
+
+    // The originals are untouched (still manifest-model / untagged).
+    const original_entry = findGroupById(&result.program, 1).?;
+    try std.testing.expectEqual(@as(?hir.ReclamationModel, null), original_entry.reclamation_model);
+    const original_call = original_entry.clauses[0].body.stmts[0].expr.kind.call;
+    try std.testing.expectEqual(@as(u32, 2), original_call.target.direct.function_group_id);
+}
+
+test "specializeSpawnManagers: manifest-model spawn needs no specialization" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+    var store = try TypeStore.init(allocator, &interner);
+
+    const helper = try spawnTestGroup(allocator, &interner, 2, "helper", try emptyBlock(allocator));
+    const entry = try spawnTestGroup(allocator, &interner, 1, "worker", try directCallBody(allocator, 2));
+    const groups = try allocator.alloc(hir.FunctionGroup, 2);
+    groups[0] = entry;
+    groups[1] = helper;
+    const program = hir.Program{ .structs = &.{}, .top_functions = groups };
+
+    var next_group_id: u32 = 3;
+    const plan = SpawnManagerPlan{
+        .manifest_model = .refcounted,
+        .specs = &[_]SpawnManagerSpec{.{ .entry_group_id = 1, .model = .refcounted }},
+    };
+    const result = try specializeSpawnManagers(allocator, &program, &store, &next_group_id, &interner, plan);
+
+    // No clones; the entry already emits for the manifest (ARC) model.
+    try std.testing.expectEqual(@as(u32, 0), result.specialization_count);
+    try std.testing.expectEqual(@as(u32, 0), result.model_count);
+    try std.testing.expectEqual(@as(usize, 2), result.program.top_functions.len);
+    // Identity entry-specialization: the spawn site targets the entry as-is.
+    try std.testing.expectEqual(@as(usize, 1), result.entry_specializations.len);
+    try std.testing.expectEqual(@as(u32, 1), result.entry_specializations[0].specialized_group_id);
+}
+
+test "specializeSpawnManagers: empty plan is a zero-cost no-op" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+    var store = try TypeStore.init(allocator, &interner);
+
+    const entry = try spawnTestGroup(allocator, &interner, 1, "worker", try emptyBlock(allocator));
+    const groups = try allocator.alloc(hir.FunctionGroup, 1);
+    groups[0] = entry;
+    const program = hir.Program{ .structs = &.{}, .top_functions = groups };
+
+    var next_group_id: u32 = 2;
+    const plan = SpawnManagerPlan{ .manifest_model = .refcounted, .specs = &.{} };
+    const result = try specializeSpawnManagers(allocator, &program, &store, &next_group_id, &interner, plan);
+
+    try std.testing.expectEqual(@as(u32, 0), result.specialization_count);
+    try std.testing.expectEqual(@as(usize, 1), result.program.top_functions.len);
+    try std.testing.expectEqual(@as(usize, 0), result.entry_specializations.len);
+    // next_group_id untouched — no ids were minted.
+    try std.testing.expectEqual(@as(u32, 2), next_group_id);
+}
+
+test "specializeSpawnManagers: indirect (closure) edge is the cold boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+    var store = try TypeStore.init(allocator, &interner);
+
+    // entry (id 1) invokes a value indirectly (closure); helper (id 2) is not
+    // reached through a resolvable edge.
+    const helper = try spawnTestGroup(allocator, &interner, 2, "helper", try emptyBlock(allocator));
+    const entry = try spawnTestGroup(allocator, &interner, 1, "worker", try closureCallBody(allocator));
+    const groups = try allocator.alloc(hir.FunctionGroup, 2);
+    groups[0] = entry;
+    groups[1] = helper;
+    const program = hir.Program{ .structs = &.{}, .top_functions = groups };
+
+    var next_group_id: u32 = 3;
+    const plan = SpawnManagerPlan{
+        .manifest_model = .refcounted,
+        .specs = &[_]SpawnManagerSpec{.{ .entry_group_id = 1, .model = .bulk_or_never }},
+    };
+    const result = try specializeSpawnManagers(allocator, &program, &store, &next_group_id, &interner, plan);
+
+    // Only the entry is specialized; the closure edge is cold and flagged.
+    try std.testing.expectEqual(@as(u32, 1), result.specialization_count);
+    try std.testing.expect(result.saw_cold_edge);
+}
+
+test "specializeSpawnManagers: distinct models yield distinct specializations (<=4 bound)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+    var store = try TypeStore.init(allocator, &interner);
+
+    // Two independent spawn subgraphs: A(1)→helperA(3), B(2)→helperB(4).
+    const helper_a = try spawnTestGroup(allocator, &interner, 3, "helper_a", try emptyBlock(allocator));
+    const helper_b = try spawnTestGroup(allocator, &interner, 4, "helper_b", try emptyBlock(allocator));
+    const entry_a = try spawnTestGroup(allocator, &interner, 1, "worker_a", try directCallBody(allocator, 3));
+    const entry_b = try spawnTestGroup(allocator, &interner, 2, "worker_b", try directCallBody(allocator, 4));
+    const groups = try allocator.alloc(hir.FunctionGroup, 4);
+    groups[0] = entry_a;
+    groups[1] = entry_b;
+    groups[2] = helper_a;
+    groups[3] = helper_b;
+    const program = hir.Program{ .structs = &.{}, .top_functions = groups };
+
+    var next_group_id: u32 = 5;
+    const plan = SpawnManagerPlan{
+        .manifest_model = .refcounted,
+        .specs = &[_]SpawnManagerSpec{
+            .{ .entry_group_id = 1, .model = .bulk_or_never },
+            .{ .entry_group_id = 2, .model = .individual_no_refcount },
+        },
+    };
+    const result = try specializeSpawnManagers(allocator, &program, &store, &next_group_id, &interner, plan);
+
+    // Two models, two subgraphs of two functions each → 4 clones.
+    try std.testing.expectEqual(@as(u32, 2), result.model_count);
+    try std.testing.expectEqual(@as(u32, 4), result.specialization_count);
+    try std.testing.expectEqual(@as(usize, 2), result.entry_specializations.len);
+
+    // Each entry clone carries its own model.
+    for (result.entry_specializations) |spec| {
+        const clone = findGroupById(&result.program, spec.specialized_group_id).?;
+        try std.testing.expectEqual(spec.model, clone.reclamation_model.?);
+        switch (spec.entry_group_id) {
+            1 => try std.testing.expectEqual(hir.ReclamationModel.bulk_or_never, spec.model),
+            2 => try std.testing.expectEqual(hir.ReclamationModel.individual_no_refcount, spec.model),
+            else => return error.UnexpectedEntry,
+        }
+    }
+}
+
+test "specializeSpawnManagers: unknown entry id is a diagnostic, not a crash" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+    var store = try TypeStore.init(allocator, &interner);
+
+    const entry = try spawnTestGroup(allocator, &interner, 1, "worker", try emptyBlock(allocator));
+    const groups = try allocator.alloc(hir.FunctionGroup, 1);
+    groups[0] = entry;
+    const program = hir.Program{ .structs = &.{}, .top_functions = groups };
+
+    var next_group_id: u32 = 2;
+    const plan = SpawnManagerPlan{
+        .manifest_model = .refcounted,
+        .specs = &[_]SpawnManagerSpec{.{ .entry_group_id = 999, .model = .bulk_or_never }},
+    };
+    const result = try specializeSpawnManagers(allocator, &program, &store, &next_group_id, &interner, plan);
+
+    try std.testing.expectEqual(@as(usize, 1), result.errors.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.errors[0].message, "unknown entry") != null);
+    try std.testing.expectEqual(@as(u32, 0), result.specialization_count);
+}
+
+test "modelCloneStructurallyFoldable: redirect-tolerant, flags real divergence (ICF red flag)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+
+    // Source: a body directly calling group id 2.
+    const source = try spawnTestGroup(allocator, &interner, 1, "worker", try directCallBody(allocator, 2));
+
+    // A FAITHFUL clone whose call was redirected to a different (same-model)
+    // group id. The redirected id differs but the structure is identical → the
+    // verifier tolerates it (this is exactly what a real model clone looks like).
+    const faithful_clone = try spawnTestGroup(allocator, &interner, 10, "worker__mm_bulk_or_never", try directCallBody(allocator, 99));
+    try std.testing.expect(modelCloneStructurallyFoldable(&source, &faithful_clone));
+
+    // A DIVERGENT "clone" whose body lost the call statement (a structural
+    // difference beyond header ops) → NOT foldable → the ICF red flag fires.
+    const empty_divergent = try spawnTestGroup(allocator, &interner, 11, "worker__mm_bulk_or_never", try emptyBlock(allocator));
+    try std.testing.expect(!modelCloneStructurallyFoldable(&source, &empty_divergent));
+
+    // A DIVERGENT clone whose call switched variant (direct → closure) — a
+    // model-dependent lowering leak — is also flagged.
+    const variant_divergent = try spawnTestGroup(allocator, &interner, 12, "worker__mm_bulk_or_never", try closureCallBody(allocator));
+    try std.testing.expect(!modelCloneStructurallyFoldable(&source, &variant_divergent));
 }

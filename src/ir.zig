@@ -837,6 +837,20 @@ pub const Function = struct {
     /// function (empty row) is unchanged. Set in `buildFunctionGroup` from
     /// the type store's `inferred_raises` via the stable qualified key.
     raises: bool = false,
+    /// P3-J2 per-spawn manager-monomorphization axis. When non-null, this
+    /// function is a *model specialization* of a spawn-reachable function: its
+    /// memory-op codegen (retain/release emission, ArcHeader layout, free
+    /// model) must be shaped for THIS reclamation model rather than the
+    /// binary-wide manifest manager's. The ZIR backend's per-function
+    /// emission (`emitFunction`) overrides its active `declared_caps` with
+    /// `elision.canonicalCaps(this model)` for the duration of the function,
+    /// so every elision predicate (`shouldEmitRefcountOps`, `reclamationModel`,
+    /// `sharingStrategy`, `cloneOnShareActive`) decodes to the specialization's
+    /// model. Null — the overwhelming common case — means "use the binary-wide
+    /// manifest caps," i.e. today's single-model behavior, byte-for-byte.
+    /// Propagated from the source `hir.FunctionGroup.reclamation_model` in
+    /// `buildFunctionGroup`, exactly as `raises` is propagated.
+    reclamation_model: ?hir_mod.ReclamationModel = null,
     body: []const Block,
     is_closure: bool,
     captures: []const Capture,
@@ -926,6 +940,7 @@ fn cloneFunction(allocator: std.mem.Allocator, function: Function) CloneError!Fu
         .return_type = try cloneZigType(allocator, function.return_type),
         .return_type_id = function.return_type_id,
         .raises = function.raises,
+        .reclamation_model = function.reclamation_model,
         .body = try cloneBlocks(allocator, function.body),
         .is_closure = function.is_closure,
         .captures = try cloneCaptures(allocator, function.captures),
@@ -7100,6 +7115,10 @@ pub const IrBuilder = struct {
             // this clause to an `error{ZapRaise}!T` return when the overload
             // family raises — matching the regular `buildFunctionGroup` path.
             .raises = function_raises,
+            // P3-J2: a spawn-reachable model specialization carries its
+            // reclamation model into IR so `emitFunction` shapes its memory-op
+            // codegen per model. Null on ordinary functions (today's behavior).
+            .reclamation_model = group.reclamation_model,
             .body = body_owner.?,
             .is_closure = group.captures.len > 0,
             .captures = captures_owner.?,
@@ -7800,6 +7819,10 @@ pub const IrBuilder = struct {
             .return_type = return_type,
             .return_type_id = first_clause.return_type,
             .raises = function_raises,
+            // P3-J2: a spawn-reachable model specialization carries its
+            // reclamation model into IR so `emitFunction` shapes its memory-op
+            // codegen per model. Null on ordinary functions (today's behavior).
+            .reclamation_model = group.reclamation_model,
             .body = body_owner.?,
             .is_closure = group.captures.len > 0,
             .captures = captures_owner.?,
@@ -8014,6 +8037,9 @@ pub const IrBuilder = struct {
                 .local_name = try_local_name,
                 .scope_id = group.scope_id,
                 .arity = group.arity,
+                // P3-J2: the __try variant of a model specialization must be
+                // shaped for the same reclamation model as its clause entry.
+                .reclamation_model = group.reclamation_model,
                 .params = try_final_params,
                 .return_type = try_return_type,
                 .body = try_body_owner.?,
