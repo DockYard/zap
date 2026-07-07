@@ -259,6 +259,24 @@ E2E validation is the kernel-suite round-trip test plus the documented
 `ZAP_CONCURRENCY_SMOKE=1` runtime hook, which drives
 init → spawn → send → receive → exit through the real link seam in a gated-on binary.]*
 
+*[Known pre-existing corpus issue — NOT caused by the concurrency campaign (verified 2026-07-06,
+A/B against parent `cb1bee0` with the fork compiler + repo build flags + per-side isolated caches).
+The gate-off `zap test` corpus does not fully compile on `main` and did not before Phase 2. At
+`f941a10` (P2-J2) the corpus aborts at `ClosureTest.catch_basin_handler_preserves_parked_alias`
+(`test/closure_test.zap`, the uniqueness--03 catch-basin runtime guard added in `10571ed`) with
+`arc_verifier` invariant **V11**: `local %4 appears as source of `.copy_value` but `local_ownership`
+classifies it as .trivial`. This is a pre-existing ARC classification/seeding gap in the `~>`
+catch-basin (`try_call_named`) lowering — it involves no closures and none of the P2-J2 changes
+(the `arc_ownership.zig` box→`.owned` `move_value`, the `desugar.zig` unique eta-wrapper names, the
+`macro.zig` single-segment alias resolution, or the general `macro_eval`/`zir_builder`/`zir_backend`
+edits). Proof: the parent `cb1bee0` (which contains NONE of those changes) aborts EARLIER at
+`EnumTest.test_enum_struct_sum_range_step_1_matches_walk` with invariant **V7** — precisely the bug
+P2-J2's `arc_ownership.zig` fix repairs — which MASKS ClosureTest in the full corpus. Compiling
+`test/closure_test.zap` in isolation (EnumTest excluded) reproduces the IDENTICAL ClosureTest V11 at
+BOTH `cb1bee0` and `f941a10`, on byte-identical source (`test/closure_test.zap` is unchanged across
+the two commits). So P2-J2 did not introduce V11; its EnumTest-V7 fix merely UNMASKED the pre-existing
+V11 by advancing the compile past the earlier abort. Out of concurrency scope; left untouched here.]*
+
 - **2.1** Typed pids: `Pid(M)` as the primary handle (Gleam-`Subject` analogue); `send`
   type-checks against `M`; untyped `Pid` exists for registry/dynamic use behind a
   `catch_all`-required receive.
