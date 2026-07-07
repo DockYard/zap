@@ -3509,6 +3509,40 @@ const RUNTIME_CONCURRENCY_DEFAULT: bool = false;
 /// single source every gated declaration in this file branches on.
 pub const runtime_concurrency_active: bool = RUNTIME_CONCURRENCY_DEFAULT;
 
+const RUNTIME_MULTI_MANAGER_DEFAULT: bool = false;
+
+/// Whether this binary selects a NON-manifest memory manager at any
+/// `spawn(f, .{ .manager = X })` site (plan item 3.1/3.3, P3-J3). The
+/// compiler rewrites this to `true` only for a gated-on binary whose
+/// spawn-manager pass resolved at least one distinct non-manifest manager
+/// (`src/compiler.zig`, the multi-manager rewrite stage). When `true` the raw
+/// allocate/deallocate hot path dispatches through the running process's OWN
+/// manager core (`currentManagerCore`) so distinct-model processes each use
+/// their own manager; when `false` (the default — every single-manager binary,
+/// and the entire gate-OFF world) the path keeps the comptime-bound manifest
+/// `active_manager` direct calls, byte-identical to pre-J3 (the zero-cost
+/// guarantee). Implies `runtime_concurrency_active`.
+pub const multi_manager_active: bool = RUNTIME_MULTI_MANAGER_DEFAULT;
+
+/// Runtime-side mirror of the kernel's per-process `ProcessManagerBinding`
+/// (`src/runtime/concurrency/abi.zig`): the running process's manager core
+/// vtable + its private per-process context, published by the scheduler each
+/// quantum as `zap_proc_active_arc_context`. FROZEN layout — `core` first,
+/// `context` second — matching the kernel `extern struct` byte-for-byte so the
+/// runtime can read both from the single published pointer.
+const ProcessManagerBinding = extern struct {
+    core: *const AbiV1.ZapMemoryManagerCoreV1,
+    context: *anyopaque,
+};
+
+/// The bootstrap binding published as the current-process binding OUTSIDE any
+/// process quantum (startup / atexit / driver thread between quanta): the
+/// manifest manager's core over the runtime bootstrap context. Pinned (a
+/// module global) so the published pointer stays valid for the program's life.
+/// Written once by `concurrencyStartupForEntry`; only referenced under the
+/// concurrency gate.
+var concurrency_bootstrap_binding: ProcessManagerBinding = undefined;
+
 /// Extern mirror of the kernel's C-ABI intrinsic bridge. MUST stay
 /// signature-identical to the `export fn zap_proc_*` declarations in
 /// `src/runtime/concurrency/abi.zig` (the authoritative ABI contract,
@@ -3527,6 +3561,11 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_proc_run_until_exit(target_pid_bits: u64) callconv(.c) i32;
     extern fn zap_proc_current() callconv(.c) ?*anyopaque;
     extern fn zap_proc_spawn(entry: ProcEntry, argument: ?*anyopaque) callconv(.c) u64;
+    // P3-J3 per-spawn manager registry (plan item 3.1/3.3): register a manager
+    // core into a registry slot, and spawn a process under a chosen slot. Slot
+    // 0 is the manifest default (also `zap_proc_bind_manager`/`zap_proc_spawn`).
+    extern fn zap_proc_register_manager(manager_index: u32, core_vtable: *const anyopaque) callconv(.c) i32;
+    extern fn zap_proc_spawn_at(entry: ProcEntry, argument: ?*anyopaque, manager_index: u32) callconv(.c) u64;
     extern fn zap_proc_self(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_send(
         process: *anyopaque,
@@ -3598,14 +3637,30 @@ fn concurrencyStartupForEntry() void {
         @panic("zap: concurrency runtime failed to bind the manifest memory manager");
     }
 
-    // Seed the scheduler-published current-process ARC context (A.4 OQ1) with
-    // the runtime's BOOTSTRAP context so allocations OUTSIDE any process
-    // quantum — during the remainder of startup, and in atexit handlers after
-    // the root process has exited — resolve a valid private heap. Once the
-    // root process is scheduled, `runQuantum` overwrites this per quantum with
-    // the running process's own context and restores this bootstrap value
-    // between quanta (`process.zig`, `zap_proc_active_arc_context`).
-    ZapConcurrencyKernel.zap_proc_active_arc_context = bootstrap_context;
+    // P3-J3: register the NON-manifest per-spawn managers (registry slots 1..)
+    // from the compiler-generated `zap_manager_registry` module, BEFORE any
+    // managed spawn. Comptime-gated on `multi_manager_active`, so a
+    // single-manager binary never references the (non-existent) registry module.
+    if (comptime multi_manager_active) {
+        const registry = @import("zap_manager_registry");
+        inline for (registry.entries) |entry| {
+            const status = ZapConcurrencyKernel.zap_proc_register_manager(entry.index, entry.core);
+            if (status != 0) {
+                @panic("zap: concurrency runtime failed to register a per-spawn memory manager");
+            }
+        }
+    }
+
+    // Seed the scheduler-published current-process BINDING (A.4 OQ1) with a
+    // bootstrap `ProcessManagerBinding {manifest_core, bootstrap_context}` so
+    // allocations OUTSIDE any process quantum — during the remainder of
+    // startup, and in atexit handlers after the root process has exited —
+    // resolve BOTH a valid core and private heap. Once the root process is
+    // scheduled, `runQuantum` overwrites this per quantum with the running
+    // process's own binding and restores this bootstrap value between quanta
+    // (`process.zig`, `zap_proc_active_arc_context`).
+    concurrency_bootstrap_binding = .{ .core = manager_core, .context = bootstrap_context };
+    ZapConcurrencyKernel.zap_proc_active_arc_context = @ptrCast(&concurrency_bootstrap_binding);
 
     // LIFO ordering: registered AFTER `zapMemoryShutdownAtexit`
     // (registered inside `zapMemoryStartup` above), so this handler
@@ -4516,6 +4571,20 @@ pub const ProcessRuntime = struct {
     /// heap into the child without the P2-J5 deep-copy walker, so it
     /// is rejected at compile time (no unsound sharing).
     pub fn spawn_process(entry: anytype) u64 {
+        return spawn_process_at(entry, 0);
+    }
+
+    /// Spawn `entry` under the per-spawn manager in registry slot
+    /// `manager_index` (plan item 3.1/3.3, P3-J3 — the target the compiler's
+    /// spawn-manager pass rewrites a comptime-resolved `spawn(f, .{ .manager =
+    /// X })` site to). Slot 0 is the manifest default (`spawn_process`); slots
+    /// 1.. are the distinct non-manifest managers the runtime bootstrap
+    /// registered from `zap_manager_registry`. The spawned process runs on its
+    /// OWN private context minted from that manager, and its pid carries that
+    /// manager's reclamation-model bits (stamped kernel-side by
+    /// `zap_proc_spawn_at`). `manager_index` is comptime — Decision Gate 0 is
+    /// discharged before this bridge; a non-comptime manager never reaches it.
+    pub fn spawn_process_at(entry: anytype, comptime manager_index: u32) u64 {
         requireConcurrencyRuntimeGate();
         const EntryType = @TypeOf(entry);
         const entry_info = @typeInfo(EntryType);
@@ -4525,7 +4594,7 @@ pub const ProcessRuntime = struct {
                 // A direct function value is comptime-known: bake it
                 // into a dedicated trampoline, no argument needed.
                 const Trampoline = ComptimeEntryTrampoline(entry);
-                return spawnWithTrampoline(Trampoline.run, null);
+                return spawnWithTrampolineAt(Trampoline.run, null, manager_index);
             },
             .pointer => |pointer_info| {
                 const child_info = @typeInfo(pointer_info.child);
@@ -4535,7 +4604,7 @@ pub const ProcessRuntime = struct {
                 // (never dereferenced as data — reconstructed via
                 // ptrFromInt in the trampoline).
                 const Trampoline = PointerEntryTrampoline(EntryType);
-                return spawnWithTrampoline(Trampoline.run, @ptrFromInt(@intFromPtr(entry)));
+                return spawnWithTrampolineAt(Trampoline.run, @ptrFromInt(@intFromPtr(entry)), manager_index);
             },
             else => rejectSpawnEntryType(EntryType),
         }
@@ -4763,10 +4832,10 @@ fn PointerEntryTrampoline(comptime EntryPointerType: type) type {
 
 /// Spawn through the intrinsic bridge and normalize the failure
 /// sentinel to a panic (see `ProcessRuntime.spawn_process`).
-fn spawnWithTrampoline(trampoline: ZapConcurrencyKernel.ProcEntry, argument: ?*anyopaque) u64 {
-    const pid_bits = ZapConcurrencyKernel.zap_proc_spawn(trampoline, argument);
+fn spawnWithTrampolineAt(trampoline: ZapConcurrencyKernel.ProcEntry, argument: ?*anyopaque, manager_index: u32) u64 {
+    const pid_bits = ZapConcurrencyKernel.zap_proc_spawn_at(trampoline, argument, manager_index);
     if (pid_bits == 0) {
-        @panic("zap: Process.spawn failed (concurrency runtime not initialized, out of memory, or process table exhausted)");
+        @panic("zap: Process.spawn failed (concurrency runtime not initialized, unregistered/out-of-range manager, out of memory, or process table exhausted)");
     }
     return pid_bits;
 }
@@ -5936,15 +6005,47 @@ pub const ArcRuntime = struct {
     /// branch drops the extern-global reference entirely, preserving the plan
     /// §3 zero-cost guarantee. Returns null only on genuine misuse (dispatch
     /// before startup or after shutdown); callers keep their `orelse` handling.
+    /// The running process's published per-quantum `ProcessManagerBinding`, or
+    /// null when no process quantum is active (bootstrap window / driver thread
+    /// between quanta) or the gate is OFF. The scheduler publishes the binding
+    /// pointer as `zap_proc_active_arc_context`; the bootstrap seeds a static
+    /// binding so out-of-quantum allocations resolve a valid `{core, context}`.
+    inline fn currentProcessBinding() ?*const ProcessManagerBinding {
+        if (comptime runtime_concurrency_active) {
+            const published = ZapConcurrencyKernel.zap_proc_active_arc_context orelse return null;
+            return @ptrCast(@alignCast(published));
+        }
+        return null;
+    }
+
     inline fn currentManagerContext() ?*anyopaque {
         if (comptime runtime_concurrency_active) {
-            // The published per-quantum process context, falling back to the
-            // runtime bootstrap context when no process is current (the tiny
-            // pre-seed startup window, and the driver thread between quanta) so
-            // out-of-quantum allocations always resolve a valid private heap.
-            return ZapConcurrencyKernel.zap_proc_active_arc_context orelse active_manager_state.context;
+            // The published per-quantum process BINDING (`ProcessManagerBinding`),
+            // whose `context` is the running process's private heap. Falls back
+            // to the runtime bootstrap context when no process is current (the
+            // tiny pre-seed startup window, and the driver thread between quanta)
+            // so out-of-quantum allocations always resolve a valid private heap.
+            if (currentProcessBinding()) |binding| return binding.context;
+            return active_manager_state.context;
         }
         return active_manager_state.context;
+    }
+
+    /// The running process's manager CORE vtable (plan item 3.1/3.3, P3-J3 —
+    /// multi-manager per-process dispatch). With per-spawn managers in the
+    /// binary the raw allocate/deallocate hot path dispatches through THIS core
+    /// so an Arena process allocates from Arena and an ARC process from ARC —
+    /// each process's cells land in its own manager's heap. Falls back to the
+    /// binary-wide manifest core out-of-quantum (bootstrap/atexit) and in the
+    /// gate-OFF build. Only referenced under `multi_manager_active`, so a
+    /// single-manager binary keeps the comptime-bound `active_manager` direct
+    /// calls (the zero-cost guarantee).
+    inline fn currentManagerCore() *const AbiV1.ZapMemoryManagerCoreV1 {
+        if (comptime runtime_concurrency_active) {
+            if (currentProcessBinding()) |binding| return binding.core;
+        }
+        return active_manager_state.core orelse
+            @panic("zap runtime: per-process manager dispatch with no active memory manager");
     }
 
     /// Raw (header-less) allocation of `byte_length` bytes at `alignment`
@@ -5969,6 +6070,12 @@ pub const ArcRuntime = struct {
         const ctx = currentManagerContext() orelse
             @panic("zap runtime: container-buffer alloc with null manager context");
         const alignment_bytes: u32 = @intCast(alignment.toByteUnits());
+        // Multi-manager (per-spawn managers): dispatch through the RUNNING
+        // process's own manager core so an Arena process's container backing
+        // lands in Arena and an ARC process's in ARC (plan item 3.1/3.3, J3).
+        if (comptime multi_manager_active) {
+            return currentManagerCore().allocate(ctx, byte_length, alignment_bytes);
+        }
         if (comptime !active_manager_source_available) {
             const core = active_manager_state.core orelse
                 @panic("zap runtime: container-buffer alloc with no active memory manager");
@@ -5991,6 +6098,13 @@ pub const ArcRuntime = struct {
         if (active_manager_state.shutdown_complete) return;
         const ctx = currentManagerContext() orelse return;
         const alignment_bytes: u32 = @intCast(alignment.toByteUnits());
+        // Multi-manager: free back to the RUNNING process's own manager core
+        // (the same core its `containerBufferAlloc` used — a process only frees
+        // its own cells during its own quantum, the scheduler-local invariant).
+        if (comptime multi_manager_active) {
+            currentManagerCore().deallocate(ctx, memory, byte_length, alignment_bytes);
+            return;
+        }
         if (comptime !active_manager_source_available) {
             const core = active_manager_state.core orelse return;
             core.deallocate(ctx, memory, byte_length, alignment_bytes);

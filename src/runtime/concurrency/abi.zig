@@ -100,6 +100,7 @@
 //! simply returns remains the "normal exit" shape.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const concurrency = @import("concurrency.zig");
 
 const process_module = @import("process.zig");
@@ -452,6 +453,27 @@ fn reclamationModelForCaps(declared_caps: u64) pid_table.ReclamationModel {
     };
 }
 
+/// Capability matrix (plan item 3.5): whether reclamation `model` is SOUND to
+/// run on THIS build's target. Comptime on `builtin.target` — the kernel object
+/// is compiled per user-binary target, so this reflects the final binary's OS.
+///
+/// TRACED (conservative stop-the-world mark-sweep) has no COFF/PE global/stack
+/// scanner on Windows and is architecturally impossible on WebAssembly's
+/// linear-memory model (no raw machine stack to scan). Per the cross-compile
+/// requirement EVERY manager backend must stay PRESENT/linkable in EVERY target
+/// binary (a process might spawn any), so an impossible combo is a RUNTIME
+/// spawn error here — NOT a compile-time exclusion of the backend. Every other
+/// model is sound on every target. The build-time driver
+/// (`enforceManagerTargetSupport`) applies the SAME predicate to reject the
+/// statically-known MANIFEST default early; this is its per-process twin.
+fn managerModelSoundOnTarget(model: pid_table.ReclamationModel) bool {
+    if (model != .traced) return true;
+    return switch (builtin.target.os.tag) {
+        .windows, .wasi => false,
+        else => true,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Spawn closure trampoline
 // ---------------------------------------------------------------------------
@@ -698,16 +720,23 @@ export fn zap_proc_spawn_at(entry: ZapProcEntry, argument: ?*anyopaque, manager_
     const core = runtime_state.manager_registry[manager_index] orelse
         return concurrency.Pid.invalid.toBits();
 
+    // Pid model bits (plan §2.4, J3): the reclamation model of the process's
+    // OWN manager, decoded from its declared capabilities.
+    const model = reclamationModelForCaps(core.declared_caps);
+
+    // Capability matrix (plan item 3.5): refuse to spawn a process under a
+    // manager whose model is unsound on this target (e.g. a TRACED manager on
+    // Windows / wasm). The backend stays linkable — this is a spawn error, not
+    // a compile-time exclusion — so a DIFFERENT manager can still be selected
+    // here on the same target.
+    if (!managerModelSoundOnTarget(model)) return concurrency.Pid.invalid.toBits();
+
     // Per-process instance (plan item 3.1): mint a FRESH private manager
     // context (a private heap) for this process from the SELECTED manager's
     // core `init`. On any downstream spawn failure it is wholesale-freed via
     // `manager_context.teardown()` so the private heap never leaks.
     const manager_context = createProcessBinding(core) orelse
         return concurrency.Pid.invalid.toBits();
-
-    // Pid model bits (plan §2.4, J3): the reclamation model of the process's
-    // OWN manager, decoded from its declared capabilities.
-    const model = reclamationModelForCaps(core.declared_caps);
 
     const closure_block = runtime_state.ledger.allocate(@sizeOf(SpawnClosure)) catch {
         manager_context.teardown();
