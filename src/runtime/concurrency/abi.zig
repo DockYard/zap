@@ -105,6 +105,7 @@ const concurrency = @import("concurrency.zig");
 const process_module = @import("process.zig");
 const envelope_pool_module = @import("envelope_pool.zig");
 const mailbox_module = @import("mailbox.zig");
+const pid_table = @import("pid_table.zig");
 
 /// Backing allocator for every runtime-owned structure this bridge
 /// creates (pid table, envelope-pool pages, scheduler records, payload
@@ -138,9 +139,13 @@ pub const ZapProcStatus = struct {
     pub const already_initialized: i32 = -2;
     /// Allocation failure inside the runtime.
     pub const out_of_memory: i32 = -3;
-    /// `zap_proc_bind_manager` was handed a core vtable whose ABI the
-    /// kernel cannot consume (major != 1, or a sub-v1.0 `size`).
+    /// `zap_proc_bind_manager` / `zap_proc_register_manager` was handed a core
+    /// vtable whose ABI the kernel cannot consume (major != 1, or a sub-v1.0
+    /// `size`).
     pub const manager_abi_unsupported: i32 = -4;
+    /// `zap_proc_register_manager` / `zap_proc_spawn_at` was given a manager
+    /// index outside `[0, MAX_MANAGER_SLOTS)`.
+    pub const manager_index_out_of_range: i32 = -5;
 };
 
 /// The C-ABI process entry shape `zap_proc_spawn` accepts. `process` is
@@ -315,66 +320,137 @@ comptime {
         @compileError("abi: ZapMemoryManagerCoreV1.deallocate offset drift");
 }
 
-/// The runtime binding of the manifest manager: its core vtable. One per
-/// runtime (Phase-3 single model — see the section doc). The per-process
-/// STATE is the private context each spawn mints from this vtable via
-/// `createProcessContext`, not a field here. Pinned as a field of the pinned
-/// `RuntimeState`.
-const ManifestManagerBinding = struct {
+/// Number of manager slots the per-spawn manager registry holds (plan item
+/// 3.1/3.3, P3-J3). Index 0 is ALWAYS the manifest default manager (bound by
+/// the runtime bootstrap through `zap_proc_bind_manager`); indices 1.. are the
+/// distinct non-manifest managers referenced by `spawn(f, .{ .manager = X })`
+/// sites, each registered by the runtime from the compiler-generated manager
+/// registry module (`zap_manager_registry`, `src/runtime.zig`). The bound is
+/// generous relative to the number of distinct reclamation-model backends a
+/// real program selects; a program referencing more managers than this fails
+/// registration loudly rather than silently overflowing.
+const MAX_MANAGER_SLOTS: u32 = 16;
+
+/// Per-process manager binding: the manager's core vtable plus the fresh
+/// private per-process context minted from it at spawn (plan item 3.1/3.3).
+///
+/// `ManagerContext.manager_state` points at one of these. The kernel-side
+/// per-process vtable thunks below unpack it to route this process's
+/// `allocate`/`deallocate`/wholesale-`teardown` to ITS manager on ITS private
+/// heap; the runtime reads the SAME `{core, context}` pair (published per
+/// quantum via the scheduler as `manager.manager_state`) so a process's
+/// compiled-code allocations land in its own manager's heap — the multi-
+/// manager per-process dispatch that lets an ARC process and an Arena process
+/// coexist in one binary.
+///
+/// The layout is FROZEN and mirrored on the runtime side (`src/runtime.zig`,
+/// `ProcessManagerBinding`): `core` first, `context` second, both non-optional
+/// (a bound process always has both). `extern struct` pins the field order.
+const ProcessManagerBinding = extern struct {
     core: *const ZapMemoryManagerCoreV1,
-
-    const vtable = process_module.ManagerVTable{
-        .allocate = allocateThunk,
-        .deallocate = deallocateThunk,
-        .teardown = teardownThunk,
-        .heapByteCount = heapByteCountThunk,
-    };
-
-    /// Mint a FRESH private per-process manager context by calling the core
-    /// vtable's `init`, wrapped as the `ManagerContext` handed to
-    /// `scheduler.spawn`. Returns null if the manager's `init` fails (out of
-    /// memory) — the caller surfaces it as spawn failure. The returned
-    /// context's `manager_state` is the opaque private-context pointer; its
-    /// `teardown` wholesale-frees it via the core vtable's `deinit`.
-    fn createProcessContext(binding: *ManifestManagerBinding) ?process_module.ManagerContext {
-        const context = binding.core.init(null) orelse return null;
-        return .{ .manager_state = context, .vtable = &vtable };
-    }
-
-    /// The shared core vtable every per-process thunk dispatches through
-    /// (Phase-3 single model — see the section doc). Read from the pinned
-    /// runtime binding rather than stored per process; the `manager_bound`
-    /// spawn gate guarantees it is live whenever a process holds a context.
-    inline fn sharedCore() *const ZapMemoryManagerCoreV1 {
-        return runtime_state.manager_binding.core;
-    }
-
-    fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
-        return sharedCore().allocate(manager_state.?, byte_length, @intCast(alignment.toByteUnits()));
-    }
-
-    fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
-        sharedCore().deallocate(manager_state.?, memory, byte_length, @intCast(alignment.toByteUnits()));
-    }
-
-    /// The REAL per-process wholesale free (plan item 3.1): release this
-    /// process's entire private heap in one call via the core vtable's
-    /// `deinit`. Replaces the Phase-2 no-op (see the section doc). Sound and
-    /// crash-safe: the context is private to this process, so `deinit` tears
-    /// down only its heap — every still-live cell (a cleanly exited process
-    /// has none; a killed one may have many) is bulk-reclaimed.
-    fn teardownThunk(manager_state: ?*anyopaque) void {
-        sharedCore().deinit(manager_state.?);
-    }
-
-    /// Advisory only (plan item 1.6): the v1.0 core ABI exposes no per-context
-    /// live-byte query, so report 0. Per-process byte accounting is a manager
-    /// capability follow-on; teardown returns the whole heap regardless.
-    fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
-        _ = manager_state;
-        return 0;
-    }
+    context: *anyopaque,
 };
+
+/// The per-process `ManagerVTable` every production (non-test) process
+/// dispatches its cold-path allocate/deallocate/teardown through. Unlike the
+/// Phase-3 single-model binding it replaces (which read one shared core from
+/// the runtime), each thunk reads the PROCESS'S OWN core from the
+/// `ProcessManagerBinding` in `manager_state`, so distinct-model processes in
+/// one binary each dispatch to their own manager (no-fallbacks: the shared
+/// `sharedCore()` singleton is gone, not layered over).
+const process_manager_vtable = process_module.ManagerVTable{
+    .allocate = processAllocateThunk,
+    .deallocate = processDeallocateThunk,
+    .teardown = processTeardownThunk,
+    .heapByteCount = processHeapByteCountThunk,
+};
+
+fn processBinding(manager_state: ?*anyopaque) *ProcessManagerBinding {
+    return @ptrCast(@alignCast(manager_state.?));
+}
+
+/// Mint a FRESH private per-process binding for `core`: call the core vtable's
+/// `init` to create this process's private heap, then wrap `{core, context}`
+/// in a heap-allocated `ProcessManagerBinding` handed to `scheduler.spawn` as
+/// the `ManagerContext`. Returns null if `init` fails (out of memory) or the
+/// binding allocation fails — the caller surfaces it as spawn failure and no
+/// heap leaks (the context is torn down on the binding-allocation failure
+/// path). `teardown` wholesale-frees the context via `deinit` and releases the
+/// binding.
+fn createProcessBinding(core: *const ZapMemoryManagerCoreV1) ?process_module.ManagerContext {
+    const context = core.init(null) orelse return null;
+    const binding = backing_allocator.create(ProcessManagerBinding) catch {
+        core.deinit(context);
+        return null;
+    };
+    binding.* = .{ .core = core, .context = context };
+    return .{ .manager_state = binding, .vtable = &process_manager_vtable };
+}
+
+fn processAllocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
+    const binding = processBinding(manager_state);
+    return binding.core.allocate(binding.context, byte_length, @intCast(alignment.toByteUnits()));
+}
+
+fn processDeallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
+    const binding = processBinding(manager_state);
+    binding.core.deallocate(binding.context, memory, byte_length, @intCast(alignment.toByteUnits()));
+}
+
+/// The REAL per-process wholesale free (plan item 3.1): release this process's
+/// entire private heap in one call via the core vtable's `deinit`, then free
+/// the binding. Sound and crash-safe: the context is private to this process,
+/// so `deinit` tears down only its heap — every still-live cell (a cleanly
+/// exited process has none; a killed one may have many) is bulk-reclaimed.
+fn processTeardownThunk(manager_state: ?*anyopaque) void {
+    const binding = processBinding(manager_state);
+    binding.core.deinit(binding.context);
+    backing_allocator.destroy(binding);
+}
+
+/// Advisory only (plan item 1.6): the v1.0 core ABI exposes no per-context
+/// live-byte query, so report 0. Per-process byte accounting is a manager
+/// capability follow-on; teardown returns the whole heap regardless.
+fn processHeapByteCountThunk(manager_state: ?*anyopaque) usize {
+    _ = manager_state;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// declared_caps → reclamation model decode (pid model bits — plan §2.4, J3)
+//
+// The pid packs a 2-bit reclamation-model field (`pid_table.ReclamationModel`)
+// that a sender reads together with the generation (§2.4 invariant). J3 makes
+// those bits LIVE: the model is decoded from the SELECTED manager's
+// `declared_caps` at spawn and stamped into the pid. The kernel is a
+// self-contained source tree (`concurrency.zig` doc) and cannot import the
+// compiler's `src/memory/elision.zig`, so this decode is redeclared here and
+// asserted name-for-name equivalent to `elision.reclamationModel` /
+// `src/memory/abi.zig`'s axis encoding by the `capsModelCorrespondence` test
+// below (the plan item 3.3 correspondence seam the `pid_table` doc reserves).
+// ---------------------------------------------------------------------------
+
+/// `REFCOUNT_V1` capability flag — bit 0 of `declared_caps` (spec §7.1).
+const CAPS_REFCOUNT_V1_BIT: u64 = 0x1;
+/// Low bit of the 2-bit Axis-A reclamation-model field within `declared_caps`.
+const CAPS_RECLAMATION_MODEL_SHIFT: u6 = 1;
+/// Width mask (pre-shift) of the Axis-A reclamation-model field.
+const CAPS_RECLAMATION_MODEL_MASK: u64 = 0b11;
+
+/// Decode a manager's `declared_caps` into the pid reclamation-model bits.
+/// Mirrors `elision.reclamationModel`: bit 0 set ⇒ `refcounted`; otherwise the
+/// Axis-A field selects the model, with the reserved `0b11` code mapping
+/// conservatively to `bulk_or_never` (elide all individual frees).
+fn reclamationModelForCaps(declared_caps: u64) pid_table.ReclamationModel {
+    if ((declared_caps & CAPS_REFCOUNT_V1_BIT) != 0) return .refcounted;
+    return switch ((declared_caps >> CAPS_RECLAMATION_MODEL_SHIFT) & CAPS_RECLAMATION_MODEL_MASK) {
+        0b00 => .bulk_or_never,
+        0b01 => .individual_no_refcount,
+        0b10 => .traced,
+        0b11 => .bulk_or_never,
+        else => unreachable,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Spawn closure trampoline
@@ -414,17 +490,15 @@ const RuntimeState = struct {
     envelope_pool: concurrency.EnvelopePool,
     scheduler: concurrency.Scheduler,
     ledger: Ledger,
-    /// The manifest manager binding (`zap_proc_bind_manager`): the core
-    /// vtable every spawn mints a fresh private per-process context from.
-    /// Valid only while `manager_bound` is true; pinned (a field of the
-    /// pinned `RuntimeState`) so the per-process thunks that read its `core`
-    /// through `ManifestManagerBinding.sharedCore` stay valid for the life
-    /// of every process holding a context.
-    manager_binding: ManifestManagerBinding,
-    /// Whether `manager_binding` has been set. Spawn refuses to proceed
-    /// until the runtime bootstrap has bound the manifest manager (no
-    /// fallback bootstrap arena — the no-fallbacks rule).
-    manager_bound: bool,
+    /// The per-spawn manager registry (plan item 3.1/3.3, P3-J3): core
+    /// vtables indexed by manager id. Slot 0 is the manifest default (bound by
+    /// `zap_proc_bind_manager`); slots 1.. are the distinct `spawn(f, .{
+    /// .manager = X })` managers registered from the compiler-generated
+    /// registry module. `zap_proc_spawn_at` mints a fresh private per-process
+    /// context from the slot's core. Null slots are unregistered. Replaces the
+    /// Phase-3 single `manager_binding` singleton (no-fallbacks: the singleton
+    /// is gone, not layered over).
+    manager_registry: [MAX_MANAGER_SLOTS]?*const ZapMemoryManagerCoreV1,
 };
 
 var runtime_state_storage: RuntimeState = undefined;
@@ -464,8 +538,7 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
     if (runtime_initialized) return ZapProcStatus.already_initialized;
 
     runtime_state.ledger = .{};
-    runtime_state.manager_binding = undefined;
-    runtime_state.manager_bound = false;
+    runtime_state.manager_registry = @splat(null);
     runtime_state.pid_table = concurrency.PidTable.init(backing_allocator, .{}) catch
         return ZapProcStatus.out_of_memory;
     runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
@@ -497,13 +570,29 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
 /// `manager_abi_unsupported` (the core declares a non-1 ABI major or a
 /// sub-v1.0 `size`).
 export fn zap_proc_bind_manager(core_vtable: *const anyopaque) callconv(.c) i32 {
+    return zap_proc_register_manager(0, core_vtable);
+}
+
+/// Register a manager core vtable into per-spawn registry slot `manager_index`
+/// (plan item 3.1/3.3, P3-J3). Slot 0 is the manifest default (also reachable
+/// through `zap_proc_bind_manager`); slots 1.. are the distinct non-manifest
+/// managers a `spawn(f, .{ .manager = X })` site selects, registered by the
+/// gated-on runtime bootstrap from the compiler-generated registry module
+/// BEFORE any managed spawn. `zap_proc_spawn_at` mints each process's private
+/// context from the selected slot's core. Rebinds are last-wins; the runtime
+/// registers each slot exactly once. Driver thread only.
+///
+/// Returns `ZapProcStatus.ok`, `not_initialized`, `manager_index_out_of_range`
+/// (`manager_index >= MAX_MANAGER_SLOTS`), or `manager_abi_unsupported` (the
+/// core declares a non-1 ABI major or a sub-v1.0 `size`).
+export fn zap_proc_register_manager(manager_index: u32, core_vtable: *const anyopaque) callconv(.c) i32 {
     if (!runtime_initialized) return ZapProcStatus.not_initialized;
+    if (manager_index >= MAX_MANAGER_SLOTS) return ZapProcStatus.manager_index_out_of_range;
     const core: *const ZapMemoryManagerCoreV1 = @ptrCast(@alignCast(core_vtable));
     if (core.abi_major != 1 or core.size < @sizeOf(ZapMemoryManagerCoreV1)) {
         return ZapProcStatus.manager_abi_unsupported;
     }
-    runtime_state.manager_binding = .{ .core = core };
-    runtime_state.manager_bound = true;
+    runtime_state.manager_registry[manager_index] = core;
     return ZapProcStatus.ok;
 }
 
@@ -582,26 +671,43 @@ export fn zap_proc_current() callconv(.c) ?*anyopaque {
 // Intrinsics — spawn (driver thread or process body; same OS thread)
 // ---------------------------------------------------------------------------
 
-/// Spawn a process running `entry(process_handle, argument)` on its OWN
-/// private per-process manager instance (plan item 3.1): the spawn mints a
-/// fresh context from the bound manifest manager's core vtable, wholesale-
-/// freed at the process's teardown. The returned `u64` is the new pid's raw
-/// encoding; `0` (the invalid pid — never issued) signals failure (runtime
-/// not initialized, no manager bound, manager `init` failure, allocation
-/// failure, or process-table exhaustion).
+/// Spawn a process under the MANIFEST default manager (registry slot 0) — the
+/// no-option `Process.spawn(f)` path. Equivalent to `zap_proc_spawn_at(entry,
+/// argument, 0)`; kept as the ABI-stable convenience the Phase-2 surface and
+/// the root-process bootstrap already call.
 export fn zap_proc_spawn(entry: ZapProcEntry, argument: ?*anyopaque) callconv(.c) u64 {
-    if (!runtime_initialized) return concurrency.Pid.invalid.toBits();
-    // No fallback bootstrap arena (the no-fallbacks rule): a process cannot
-    // spawn until the runtime bootstrap has bound the manifest manager.
-    if (!runtime_state.manager_bound) return concurrency.Pid.invalid.toBits();
+    return zap_proc_spawn_at(entry, argument, 0);
+}
 
-    // Phase-3 per-process instance (plan item 3.1): mint a FRESH private
-    // manager context (a private heap) for this process from the bound core
-    // vtable's `init`. On any downstream spawn failure it is wholesale-freed
-    // via the vtable's `deinit` (`manager_context.teardown()`) so the private
-    // heap never leaks — see `ManifestManagerBinding`.
-    const manager_context = runtime_state.manager_binding.createProcessContext() orelse
+/// Spawn a process running `entry(process_handle, argument)` under the manager
+/// in registry slot `manager_index` (plan item 3.1/3.3, P3-J3 — the
+/// `spawn(f, .{ .manager = X })` surface). The spawn mints a FRESH private
+/// per-process context from that manager's core vtable (wholesale-freed at the
+/// process's teardown) and stamps the pid's model bits from the manager's
+/// `declared_caps` (`reclamationModelForCaps`) so a sender reads the target's
+/// reclamation model together with its generation (§2.4 invariant). The
+/// returned `u64` is the new pid's raw encoding; `0` (the invalid pid — never
+/// issued) signals failure: runtime not initialized, `manager_index` out of
+/// range or unregistered (no manager selected — the no-fallbacks spawn gate),
+/// manager `init` failure, allocation failure, or process-table exhaustion.
+export fn zap_proc_spawn_at(entry: ZapProcEntry, argument: ?*anyopaque, manager_index: u32) callconv(.c) u64 {
+    if (!runtime_initialized) return concurrency.Pid.invalid.toBits();
+    if (manager_index >= MAX_MANAGER_SLOTS) return concurrency.Pid.invalid.toBits();
+    // No fallback bootstrap arena (the no-fallbacks rule): a process cannot
+    // spawn until the selected registry slot has a manager registered.
+    const core = runtime_state.manager_registry[manager_index] orelse
         return concurrency.Pid.invalid.toBits();
+
+    // Per-process instance (plan item 3.1): mint a FRESH private manager
+    // context (a private heap) for this process from the SELECTED manager's
+    // core `init`. On any downstream spawn failure it is wholesale-freed via
+    // `manager_context.teardown()` so the private heap never leaks.
+    const manager_context = createProcessBinding(core) orelse
+        return concurrency.Pid.invalid.toBits();
+
+    // Pid model bits (plan §2.4, J3): the reclamation model of the process's
+    // OWN manager, decoded from its declared capabilities.
+    const model = reclamationModelForCaps(core.declared_caps);
 
     const closure_block = runtime_state.ledger.allocate(@sizeOf(SpawnClosure)) catch {
         manager_context.teardown();
@@ -613,9 +719,10 @@ export fn zap_proc_spawn(entry: ZapProcEntry, argument: ?*anyopaque) callconv(.c
     const pid = runtime_state.scheduler.spawn(.{
         .entry = spawnTrampoline,
         .argument = closure_block,
-        // The process runs on its OWN private context; the adapter's
-        // teardown wholesale-frees it at exit (`ManifestManagerBinding`).
+        // The process runs on its OWN private context; the per-process vtable's
+        // teardown wholesale-frees it at exit (`ProcessManagerBinding`).
         .manager = manager_context,
+        .model = model,
     }) catch {
         runtime_state.ledger.free(closure_block);
         manager_context.teardown();
@@ -906,19 +1013,21 @@ fn bindTestManager() void {
     _ = zap_proc_bind_manager(@ptrCast(&TestManagerCore.core));
 }
 
-test "abi: ManifestManagerBinding mints a fresh per-process context and wholesale-frees it at teardown" {
-    // The section under test needs the runtime's pinned binding live so the
-    // per-process thunks resolve the shared core through `sharedCore()`.
+test "abi: per-process binding mints a fresh private context and wholesale-frees it at teardown" {
+    // The section under test needs the runtime live so `createProcessBinding`
+    // can allocate the per-process `ProcessManagerBinding` and the ledger is
+    // available for the teardown path.
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
     defer zap_proc_runtime_deinit();
     TestManagerCore.resetAccounting();
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_bind_manager(@ptrCast(&TestManagerCore.core)));
 
     // Two spawns get two DISTINCT private contexts (the per-process model,
-    // not a shared instance).
-    const first = runtime_state.manager_binding.createProcessContext() orelse return error.TestUnexpectedResult;
-    const second = runtime_state.manager_binding.createProcessContext() orelse return error.TestUnexpectedResult;
+    // not a shared instance) — distinct bindings, each over its own context.
+    const first = createProcessBinding(&TestManagerCore.core) orelse return error.TestUnexpectedResult;
+    const second = createProcessBinding(&TestManagerCore.core) orelse return error.TestUnexpectedResult;
     try testing.expect(first.manager_state.? != second.manager_state.?);
+    try testing.expect(processBinding(first.manager_state).context != processBinding(second.manager_state).context);
     try testing.expectEqual(@as(usize, 2), TestManagerCore.init_total);
     try testing.expectEqual(@as(usize, 2), TestManagerCore.live_context_count);
 
@@ -978,6 +1087,110 @@ test "abi: zap_proc_bind_manager validates the core ABI and gates spawn (no fall
     const pid_bits = zap_proc_spawn(smokeReceiverEntry, null);
     try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
     // The parked receiver is torn down by deinit (shutdownAllProcesses).
+}
+
+// -- per-spawn manager registry (plan item 3.1/3.3, P3-J3) ----------------------
+
+/// A second test manager core reusing `TestManagerCore`'s per-instance factory
+/// thunks + accounting but advertising REFCOUNTED capabilities (`declared_caps
+/// = 0x1`). The registry/model-bit tests register two DISTINCT-MODEL managers
+/// into one runtime and prove `zap_proc_spawn_at` selects the right one and
+/// stamps each pid with its manager's reclamation model.
+const test_refcounted_core = ZapMemoryManagerCoreV1{
+    .abi_major = 1,
+    .abi_minor = 0,
+    .size = @sizeOf(ZapMemoryManagerCoreV1),
+    .declared_caps = 0x1, // REFCOUNT_V1 → refcounted
+    .init = TestManagerCore.initThunk,
+    .deinit = TestManagerCore.deinitThunk,
+    .allocate = TestManagerCore.allocateThunk,
+    .deallocate = TestManagerCore.deallocateThunk,
+    .get_capability_desc = @ptrCast(&TestManagerCore.unusedThunk),
+};
+
+test "abi: reclamationModelForCaps decodes the declared_caps axis encoding (pid model bits)" {
+    // Name-for-name equivalent to `src/memory/elision.zig`'s `reclamationModel`
+    // and the `src/memory/abi.zig` axis encoding — the plan item 3.3
+    // correspondence seam the `pid_table` module doc reserves.
+    try testing.expectEqual(pid_table.ReclamationModel.refcounted, reclamationModelForCaps(0x1)); // ARC
+    try testing.expectEqual(pid_table.ReclamationModel.bulk_or_never, reclamationModelForCaps(0x0)); // Arena/NoOp/Leak
+    try testing.expectEqual(pid_table.ReclamationModel.individual_no_refcount, reclamationModelForCaps(0x2)); // Tracking
+    try testing.expectEqual(pid_table.ReclamationModel.traced, reclamationModelForCaps(0x4)); // GC
+    // Reserved Axis-A code (0b11 << 1 = 0x6) maps conservatively to bulk_or_never.
+    try testing.expectEqual(pid_table.ReclamationModel.bulk_or_never, reclamationModelForCaps(0x6));
+    // Bit 0 dominates: a refcount manager decodes refcounted regardless of the field.
+    try testing.expectEqual(pid_table.ReclamationModel.refcounted, reclamationModelForCaps(0x1 | 0x4));
+}
+
+test "abi: zap_proc_register_manager validates index range and core ABI" {
+    try testing.expectEqual(
+        ZapProcStatus.not_initialized,
+        zap_proc_register_manager(1, @ptrCast(&TestManagerCore.core)),
+    );
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+
+    try testing.expectEqual(
+        ZapProcStatus.manager_index_out_of_range,
+        zap_proc_register_manager(MAX_MANAGER_SLOTS, @ptrCast(&TestManagerCore.core)),
+    );
+
+    const bad_core = ZapMemoryManagerCoreV1{
+        .abi_major = 2,
+        .abi_minor = 0,
+        .size = @sizeOf(ZapMemoryManagerCoreV1),
+        .declared_caps = 0,
+        .init = TestManagerCore.initThunk,
+        .deinit = TestManagerCore.deinitThunk,
+        .allocate = TestManagerCore.allocateThunk,
+        .deallocate = TestManagerCore.deallocateThunk,
+        .get_capability_desc = @ptrCast(&TestManagerCore.unusedThunk),
+    };
+    try testing.expectEqual(
+        ZapProcStatus.manager_abi_unsupported,
+        zap_proc_register_manager(1, @ptrCast(&bad_core)),
+    );
+    try testing.expectEqual(
+        ZapProcStatus.ok,
+        zap_proc_register_manager(1, @ptrCast(&TestManagerCore.core)),
+    );
+}
+
+test "abi: zap_proc_spawn_at selects the registry manager and stamps the pid model bits" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    TestManagerCore.resetAccounting();
+
+    // Two DISTINCT-model managers in one runtime: slot 0 = manifest default
+    // (bulk_or_never, caps=0x0), slot 1 = a refcounted manager (caps=0x1) —
+    // the ARC-process + Arena-process shape a real 2-manager binary carries.
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_bind_manager(@ptrCast(&TestManagerCore.core)));
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_register_manager(1, @ptrCast(&test_refcounted_core)));
+
+    var probe = PerProcessAllocProbe{ .byte_length = 32 };
+
+    // Spawn under each manager; the pid carries the SELECTED manager's model.
+    const bulk_pid_bits = zap_proc_spawn_at(perProcessAllocatingEntry, &probe, 0);
+    try testing.expect(bulk_pid_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(pid_table.ReclamationModel.bulk_or_never, concurrency.Pid.fromBits(bulk_pid_bits).model);
+
+    const refcounted_pid_bits = zap_proc_spawn_at(perProcessAllocatingEntry, &probe, 1);
+    try testing.expect(refcounted_pid_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(pid_table.ReclamationModel.refcounted, concurrency.Pid.fromBits(refcounted_pid_bits).model);
+
+    // An UNREGISTERED slot and an out-of-range index both fail the spawn (no
+    // fallback — the no-fallbacks spawn gate).
+    try testing.expectEqual(concurrency.Pid.invalid.toBits(), zap_proc_spawn_at(perProcessAllocatingEntry, &probe, 2));
+    try testing.expectEqual(concurrency.Pid.invalid.toBits(), zap_proc_spawn_at(perProcessAllocatingEntry, &probe, MAX_MANAGER_SLOTS));
+
+    // Drive both processes to completion; each allocated into its OWN private
+    // context and was wholesale-freed leak-exact at teardown.
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+    try testing.expectEqual(@as(usize, 2), probe.processes_run);
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.init_total);
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.deinit_total);
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
 }
 
 // -- per-process private instances (plan item 3.1, P3-J1) -----------------------
