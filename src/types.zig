@@ -5687,6 +5687,220 @@ pub const TypeChecker = struct {
         );
     }
 
+    // ========================================================================
+    // Per-process message-union rules for `receive` (P2-J4, plan item 2.2).
+    //
+    // A `receive` desugars (in `macro.zig`) to a `case` over a blocking
+    // decode of the mailbox head, carrying a `receive_lowering` marker. The
+    // rules below run in place of the generic enum exhaustiveness check for
+    // such a case:
+    //   1. The decoded message type `M` (the `receive <M>` token, seen here
+    //      as the scrutinee's `:: M` annotation) must be a Phase-2 receive
+    //      message type — an OPEN sendable scalar (`i64`/`u64`/`f64`/`Bool`/
+    //      `Atom`, unbounded domain, no compile-time coverage obligation) or
+    //      a CLOSED payload-free union. Anything richer is a compile error.
+    //   2. When `M` is a closed union, every variant must be handled by a
+    //      user arm unless the receive carries a user catch-all — a
+    //      non-exhaustive `receive` is a compile error naming the missing
+    //      variant(s). The compiler-synthesized dead-letter catch-all is the
+    //      RUNTIME out-of-union safety net (unexpected messages are dead-
+    //      lettered, never crashing the program) and is deliberately excluded
+    //      from this static decision, so it cannot mask a missing variant.
+    // ========================================================================
+
+    /// The Phase-2 open sendable scalar message types at the Zap surface:
+    /// `i64`/`u64`/`f64`/`Bool`/`Atom`. A `receive` over one carries no
+    /// compile-time exhaustiveness obligation (the value domain is
+    /// unbounded); unmatched runtime values ride the dead-letter path. This
+    /// mirrors the send-side sendable set in `runtime.zig`
+    /// (`isSendableMessageType`) at the type-checker level.
+    fn isReceivableScalarType(type_id: TypeId) bool {
+        return switch (type_id) {
+            TypeStore.I64, TypeStore.U64, TypeStore.F64, TypeStore.BOOL, TypeStore.ATOM => true,
+            else => false,
+        };
+    }
+
+    /// Whether every variant of `tagged_union_type` is payload-free (a unit
+    /// variant, `type_id == null`). Only payload-free unions are Phase-2
+    /// sendable — a payload-bearing variant needs the P2-J5 deep-copy walker.
+    fn taggedUnionIsPayloadFree(tagged_union_type: Type.TaggedUnionType) bool {
+        for (tagged_union_type.variants) |variant| {
+            if (variant.type_id != null) return false;
+        }
+        return true;
+    }
+
+    /// Whether a receive arm is an unguarded catch-all — a bare wildcard
+    /// `_ ->` or bind `x ->` with no guard. Such an arm is the dynamic
+    /// opt-out of union exhaustiveness (the developer explicitly accepts
+    /// unenumerated messages). Matches the `receive` desugar's irrefutable
+    /// notion exactly (`macro.zig`'s `patternIsIrrefutable`), so the
+    /// synthesized-catch-all count and this check stay in lockstep.
+    fn receiveClauseIsCatchAll(clause: ast.CaseClause) bool {
+        if (clause.guard != null) return false;
+        return switch (clause.pattern.*) {
+            .wildcard, .bind => true,
+            else => false,
+        };
+    }
+
+    /// Whether `pattern` handles the payload-free union variant
+    /// `variant_name`. Recognizes BOTH surface spellings such a variant
+    /// takes in a pattern: the atom-literal form (`:Ping`) and the qualified
+    /// constructor form (`Signal.Ping`, whose `qualifier`'s final segment is
+    /// the variant name). The generic `case` helper
+    /// (`caseClausesContainTaggedUnionVariant`) recognizes only the atom-
+    /// literal form, so the message-union check uses this corrected predicate
+    /// to avoid the false non-exhaustive report a qualified-form receive
+    /// would otherwise get.
+    fn patternCoversTaggedUnionVariant(pattern: *const ast.Pattern, variant_name: ast.StringId) bool {
+        return switch (pattern.*) {
+            .literal => |literal| literal == .atom and literal.atom.value == variant_name,
+            .tagged_union_variant => |variant_pattern| blk: {
+                const parts = variant_pattern.qualifier.parts;
+                break :blk parts.len != 0 and parts[parts.len - 1] == variant_name;
+            },
+            else => false,
+        };
+    }
+
+    /// Whether any of the user `receive` arms handles union variant
+    /// `variant_name`.
+    fn receiveClausesCoverVariant(clauses: []const ast.CaseClause, variant_name: ast.StringId) bool {
+        for (clauses) |clause| {
+            if (patternCoversTaggedUnionVariant(clause.pattern, variant_name)) return true;
+        }
+        return false;
+    }
+
+    /// Enforce the per-process message-union rules on a `receive`-desugared
+    /// `case`. `scrutinee_type` is the decoded message type `M`;
+    /// `receive_info` records how many trailing arms are the synthesized
+    /// dead-letter catch-all (excluded from the exhaustiveness decision).
+    fn checkReceiveMessageUnion(
+        self: *TypeChecker,
+        ce: ast.CaseExpr,
+        scrutinee_type: TypeId,
+        receive_info: ast.ReceiveLowering,
+    ) !void {
+        // An unresolved scrutinee type means a prior error already fired;
+        // stay quiet to avoid cascading noise.
+        if (scrutinee_type == TypeStore.UNKNOWN) return;
+
+        // Open scalar transports carry no compile-time coverage obligation.
+        if (isReceivableScalarType(scrutinee_type)) return;
+
+        const message_type = self.store.getType(scrutinee_type);
+        if (message_type != .tagged_union) {
+            // Not a scalar and not a union: an unsendable receive message
+            // type (String, struct, function, …).
+            try self.addReceiveMessageTypeError(ce.meta.span, scrutinee_type);
+            return;
+        }
+
+        const tagged_union_type = message_type.tagged_union;
+
+        // Parametric or payload-bearing unions are not Phase-2 sendable
+        // (their payloads need the P2-J5 deep-copy walker); only a concrete
+        // payload-free union is a closed Phase-2 message union.
+        if (tagged_union_type.type_params.len != 0 or !taggedUnionIsPayloadFree(tagged_union_type)) {
+            try self.addReceiveMessageTypeError(ce.meta.span, scrutinee_type);
+            return;
+        }
+
+        // Exhaustiveness reasons over the USER arms only — exclude the
+        // trailing synthesized dead-letter catch-all.
+        const user_clause_count = ce.clauses.len - receive_info.synthesized_catch_all_count;
+        const user_clauses = ce.clauses[0..user_clause_count];
+
+        // An after-only / empty receive dispatches no messages: vacuously
+        // exempt (its runtime behavior is owned by the `after`/dead-letter
+        // paths, not by variant coverage).
+        if (user_clauses.len == 0) return;
+
+        // A user catch-all is the dynamic opt-out of exhaustiveness.
+        for (user_clauses) |clause| {
+            if (receiveClauseIsCatchAll(clause)) return;
+        }
+
+        // Every variant must be handled by a user arm.
+        for (tagged_union_type.variants) |variant| {
+            if (!receiveClausesCoverVariant(user_clauses, variant.name)) {
+                try self.addNonExhaustiveReceiveError(ce.meta.span, tagged_union_type, user_clauses);
+                return;
+            }
+        }
+    }
+
+    /// Diagnostic for a `receive` whose message type is not Phase-2 sendable
+    /// (neither an open scalar nor a payload-free union). Names the offending
+    /// type and mirrors the send-side sendable vocabulary so both ends of a
+    /// channel report the same closed set.
+    fn addReceiveMessageTypeError(self: *TypeChecker, span: ast.SourceSpan, message_type_id: TypeId) !void {
+        const type_name = self.typeToString(message_type_id) catch null;
+        const message = if (type_name) |name|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "`receive` message type `{s}` is not sendable in Phase 2",
+                .{name},
+            )
+        else
+            try self.allocator.dupe(u8, "`receive` message type is not sendable in Phase 2");
+        errdefer self.allocator.free(message);
+
+        try self.addHardError(
+            message,
+            span,
+            "not a sendable message type",
+            "receive over a sendable scalar (i64, u64, f64, Bool, Atom) or a payload-free union; " ++
+                "richer message types (String, structs, payload-bearing or parametric unions) arrive with the P2-J5 deep-copy walker",
+        );
+    }
+
+    /// Non-exhaustive `receive` diagnostic (P2-J4). Reuses the missing-
+    /// variant enumeration shape of `addNonExhaustiveTaggedUnionMatchError`
+    /// but with the corrected coverage predicate (atom-literal AND qualified
+    /// forms) and a receive-specific message and help.
+    fn addNonExhaustiveReceiveError(
+        self: *TypeChecker,
+        span: ast.SourceSpan,
+        tagged_union_type: Type.TaggedUnionType,
+        user_clauses: []const ast.CaseClause,
+    ) !void {
+        var label_buffer: std.ArrayList(u8) = .empty;
+        errdefer label_buffer.deinit(self.allocator);
+
+        try label_buffer.appendSlice(self.allocator, "missing: ");
+        var missing_count: usize = 0;
+        for (tagged_union_type.variants) |variant| {
+            if (receiveClausesCoverVariant(user_clauses, variant.name)) continue;
+
+            if (missing_count != 0) {
+                try label_buffer.appendSlice(self.allocator, ", ");
+            }
+            try label_buffer.appendSlice(self.allocator, self.interner.get(variant.name));
+            missing_count += 1;
+        }
+
+        if (missing_count == 0) return;
+
+        const label_text = try label_buffer.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(label_text);
+
+        const message = try std.fmt.allocPrint(self.allocator, "non-exhaustive `receive` over message union `{s}`", .{
+            self.interner.get(tagged_union_type.name),
+        });
+        errdefer self.allocator.free(message);
+
+        try self.addHardError(
+            message,
+            span,
+            label_text,
+            "handle the missing variants, or add a catch-all `_ ->` arm to accept unexpected messages (routed to the dead-letter path)",
+        );
+    }
+
     fn addFormattedError(self: *TypeChecker, span: ast.SourceSpan, comptime fmt: []const u8, args: anytype) !void {
         const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
         try self.addError(msg, span);
@@ -8843,6 +9057,17 @@ pub const TypeChecker = struct {
                 try self.restoreOwnershipBindings(&ownership_before_clauses);
                 for (clause_ownerships.items) |*snapshot| {
                     try self.mergeMovedOwnershipFromBranch(snapshot);
+                }
+                // Receive-origin case (P2-J4): the per-process message-union
+                // rules REPLACE the generic enum exhaustiveness check below.
+                // The `receive` desugar always appends a dead-letter catch-all
+                // (a `.wildcard`) as the runtime out-of-union safety net, so
+                // `has_wildcard` is set and the generic check would silently
+                // pass a union receive that leaves a variant unhandled. The
+                // message-union check instead reasons over the USER arms only.
+                if (ce.receive_lowering) |receive_info| {
+                    try self.checkReceiveMessageUnion(ce, scrutinee_type, receive_info);
+                    return result_type;
                 }
                 // Enum exhaustiveness check
                 if (!has_wildcard and scrutinee_type != TypeStore.UNKNOWN) {

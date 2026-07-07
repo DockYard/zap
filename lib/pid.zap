@@ -33,4 +33,27 @@
 
 pub struct Pid(message_type) {
   raw :: u64
+
+  @doc = """
+    Types raw pid bits (`u64` kernel encoding) as a `Pid(message_type)`
+    handle for a caller-chosen message type. Annotate (or bind against)
+    the target `Pid(M)` to pin the message type: `(Pid.of(bits) ::
+    Pid(Signal))` yields a `Pid(Signal)`. This is the general re-typing
+    constructor — the analogue of `Process.pid`'s per-token scalar
+    clauses, but open to ANY sendable message type including a payload-
+    free message union, which the scalar `Process.pid(<token>, bits)`
+    macro set cannot name. Like every pid re-typing, the stamp is an
+    unchecked assertion about what the target process expects (P2-J4
+    message-union typing).
+
+    ## Examples
+
+        responder = (Pid.of(Process.spawn(&Server.loop/0)) :: Pid(Signal))
+        Process.send(responder, Signal.Ping)   # type-checked against Signal
+
+    """
+
+  pub fn of(raw_bits :: u64) -> Pid(message_type) {
+    %Pid{raw: raw_bits}
+  }
 }

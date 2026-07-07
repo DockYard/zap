@@ -4942,12 +4942,21 @@ pub const MacroEngine = struct {
         // The message-pattern arms (bodies/guards pre-expanded) plus a
         // synthesized dead-letter catch-all when the user arms are not
         // already exhaustive.
-        const message_clauses = try self.buildReceiveClauses(re.clauses, meta);
+        const built = try self.buildReceiveClauses(re.clauses, meta);
 
-        // Scrutinee: a blocking pop+decode of the mailbox head.
+        // Scrutinee: a blocking pop+decode of the mailbox head. The
+        // `receive_lowering` marker rides the dispatch `case` so the type
+        // checker applies the message-union rules (P2-J4): message-type
+        // sendability + closed-union exhaustiveness over the USER arms,
+        // with the synthesized dead-letter catch-all excluded.
         const decode_call = try self.buildReceiveDecodeCall(re.message_type, meta);
         const dispatch = try self.create(ast.Expr, .{
-            .case_expr = .{ .meta = meta, .scrutinee = decode_call, .clauses = message_clauses },
+            .case_expr = .{
+                .meta = meta,
+                .scrutinee = decode_call,
+                .clauses = built.clauses,
+                .receive_lowering = .{ .synthesized_catch_all_count = built.synthesized_catch_all_count },
+            },
         });
 
         // No `after`: the receive IS the dispatch over a blocking decode.
@@ -4970,12 +4979,25 @@ pub const MacroEngine = struct {
         });
     }
 
+    /// The result of `buildReceiveClauses`: the lowered `case` arms plus a
+    /// count of trailing arms that are the compiler-synthesized dead-letter
+    /// catch-all (`0` or `1`). The count rides the `receive_lowering`
+    /// marker so the type checker can exclude the synthesized arm from the
+    /// message-union exhaustiveness decision (P2-J4).
+    const BuiltReceiveClauses = struct {
+        clauses: []const ast.CaseClause,
+        synthesized_catch_all_count: u32,
+    };
+
     /// Pre-expand the user message-pattern arms and append a dead-letter
     /// catch-all unless the arms already end in an irrefutable one. The
     /// catch-all keeps an unexpected message on the documented non-crashing
     /// dead-letter path instead of the panicking `match_fail` a bare
-    /// non-exhaustive `case` would emit.
-    fn buildReceiveClauses(self: *MacroEngine, clauses: []const ast.CaseClause, meta: ast.NodeMeta) anyerror![]const ast.CaseClause {
+    /// non-exhaustive `case` would emit; the type checker still enforces
+    /// compile-time exhaustiveness over a CLOSED message union's variants,
+    /// reasoning over the user arms only (the synthesized arm is the
+    /// runtime out-of-union safety net, not a source-level opt-out).
+    fn buildReceiveClauses(self: *MacroEngine, clauses: []const ast.CaseClause, meta: ast.NodeMeta) anyerror!BuiltReceiveClauses {
         var out: std.ArrayList(ast.CaseClause) = .empty;
         var arms_are_exhaustive = false;
         for (clauses) |clause| {
@@ -4997,7 +5019,10 @@ pub const MacroEngine = struct {
         if (!arms_are_exhaustive) {
             try out.append(self.allocator, try self.buildDeadLetterCatchAll(meta));
         }
-        return try out.toOwnedSlice(self.allocator);
+        return .{
+            .clauses = try out.toOwnedSlice(self.allocator),
+            .synthesized_catch_all_count = if (arms_are_exhaustive) 0 else 1,
+        };
     }
 
     /// The synthesized `_ -> :zig.ProcessRuntime.dead_letter_unexpected()`
@@ -5040,10 +5065,21 @@ pub const MacroEngine = struct {
         return self.buildProcessRuntimeCall("wait_for_message", &.{duration_exp.expr}, meta);
     }
 
-    /// Map a `receive` message-type token to its scalar decode primitive.
-    /// The Phase 2 transport (mirroring `Process.receive_raw`) carries only
-    /// `i64`/`u64`/`f64`/`Bool`/`Atom`; anything else is a compile error
-    /// until the P2-J5 deep-copy walker lands rich payloads.
+    /// Map a `receive` message-type token to its blocking decode primitive.
+    /// The four fixed-width numeric scalars (`i64`/`u64`/`f64`/`Bool`) each
+    /// get their own primitive; EVERYTHING ELSE decodes through the `u32`
+    /// atom transport (`receive_atom`) — that covers `Atom` itself and a
+    /// payload-free message union, whose variants ARE `u32` atom ids at
+    /// runtime (`zir_builder`'s enum representation), so a union message
+    /// travels and decodes exactly as an atom.
+    ///
+    /// The macro cannot resolve types, so it does not adjudicate validity
+    /// here: the type checker validates the annotated scrutinee type is a
+    /// Phase-2 receive message type (a sendable scalar or a payload-free
+    /// union) and rejects anything richer (`String`, structs, payload-
+    /// bearing/parametric unions) with a precise diagnostic. Selecting the
+    /// atom-width decode for an ultimately-rejected token is harmless —
+    /// compilation fails at type check, long before any decode could run.
     fn receivePrimitiveName(self: *MacroEngine, message_type: *const ast.TypeExpr) anyerror![]const u8 {
         if (message_type.* == .name and message_type.name.args.len == 0) {
             const type_name = self.interner.get(message_type.name.name);
@@ -5051,14 +5087,8 @@ pub const MacroEngine = struct {
             if (std.mem.eql(u8, type_name, "u64")) return "receive_u64";
             if (std.mem.eql(u8, type_name, "f64")) return "receive_f64";
             if (std.mem.eql(u8, type_name, "Bool")) return "receive_bool";
-            if (std.mem.eql(u8, type_name, "Atom")) return "receive_atom";
         }
-        try self.errors.append(self.allocator, .{
-            .message = "`receive` message type must be a Phase 2 scalar (i64, u64, f64, Bool, or Atom); " ++
-                "richer message types arrive with the P2-J5 deep-copy walker",
-            .span = message_type.getMeta().span,
-        });
-        return error.MacroExpansionFailed;
+        return "receive_atom";
     }
 
     /// Build a `:zig.ProcessRuntime.<fn>(args…)` call node — the sanctioned

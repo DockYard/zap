@@ -1050,10 +1050,35 @@ pub const IfExpr = struct {
     else_block: ?[]const Stmt,
 };
 
+/// Metadata attached to a `case_expr` that is the desugaring of a
+/// `receive` message dispatch (`macro.zig`'s `receiveToCase`, concurrency
+/// plan item 2.2, P2-J4). Its presence tells the type checker to apply
+/// the per-process message-union rules: validate the decoded message type
+/// is Phase-2 sendable and, for a closed union, enforce exhaustiveness
+/// over its variants — reasoning over the USER arms only.
+///
+/// The trailing compiler-synthesized dead-letter catch-all (when present)
+/// is the RUNTIME out-of-union safety net, not a source-level wildcard, so
+/// the checker must exclude it from the exhaustiveness decision — otherwise
+/// an unhandled union variant would be silently masked by the dead-letter
+/// arm instead of surfacing as the compile error the design mandates.
+pub const ReceiveLowering = struct {
+    /// Count of trailing `CaseExpr.clauses` that are the compiler-
+    /// synthesized dead-letter catch-all (`1` when the user supplied no
+    /// irrefutable arm of their own, `0` when they did). Excluded from
+    /// the message-union exhaustiveness check.
+    synthesized_catch_all_count: u32,
+};
+
 pub const CaseExpr = struct {
     meta: NodeMeta,
     scrutinee: *const Expr,
     clauses: []const CaseClause,
+    /// Non-null iff this `case` is the desugaring of a `receive` message
+    /// dispatch (P2-J4). Drives the message-union type rules in the
+    /// checker; `null` for an ordinary source-level `case`. A pass that
+    /// rebuilds this node MUST carry the field through unchanged.
+    receive_lowering: ?ReceiveLowering = null,
 };
 
 pub const CaseClause = struct {

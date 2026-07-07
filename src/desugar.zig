@@ -1391,6 +1391,10 @@ pub const Desugarer = struct {
                         .meta = ce.meta,
                         .scrutinee = try self.desugarExpr(ce.scrutinee),
                         .clauses = try new_clauses.toOwnedSlice(self.allocator),
+                        // Carry the P2-J4 `receive` marker through the
+                        // rebuild so the type checker still applies the
+                        // message-union exhaustiveness rules downstream.
+                        .receive_lowering = ce.receive_lowering,
                     },
                 });
             },
@@ -2607,6 +2611,9 @@ pub const Desugarer = struct {
                         .meta = ce.meta,
                         .scrutinee = try self.rewriteCaptureExpr(ce.scrutinee, self_name, capture_set),
                         .clauses = new_clauses,
+                        // Preserve the P2-J4 `receive` marker across the
+                        // capture rewrite (see the main desugar pass).
+                        .receive_lowering = ce.receive_lowering,
                     },
                 });
             },

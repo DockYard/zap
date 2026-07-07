@@ -5961,11 +5961,12 @@ test "ZIR concurrency: Process.* is a compile error when the runtime_concurrency
 // compile-fail expectations (CLAUDE.md "Test Placement").
 // ============================================================
 
-test "ZIR concurrency: receive rejects a non-scalar message type" {
-    // `String` is outside the Phase-2 sendable scalar transport; the
-    // receive desugar has no decode primitive for it, so a rich message
-    // type is a compile error until the P2-J5 deep-copy walker — not a
-    // fabricated decode.
+test "ZIR concurrency: receive rejects a non-sendable message type" {
+    // `String` is outside the Phase-2 sendable set (scalars + payload-free
+    // unions). The receive desugar defers message-type validity to the type
+    // checker (it cannot resolve types), which rejects the rich type here —
+    // a compile error until the P2-J5 deep-copy walker, not a fabricated
+    // decode.
     try expectGatedCompileFailsWithDiagnostic(
         \\pub struct TestProg {
         \\  pub fn main() -> u8 {
@@ -5976,7 +5977,57 @@ test "ZIR concurrency: receive rejects a non-scalar message type" {
         \\  }
         \\}
     ,
-        "message type must be a Phase 2 scalar",
+        "is not sendable in Phase 2",
+    );
+}
+
+test "ZIR concurrency: receive over a closed union must be exhaustive" {
+    // A `receive` over the payload-free message union `Signal` that handles
+    // `Ping` but not `Pong`, with no catch-all, is a non-exhaustive-match
+    // compile error naming the unhandled variant — the P2-J4 message-union
+    // exhaustiveness rule. The compiler-synthesized dead-letter arm is the
+    // runtime out-of-union safety net and does NOT discharge the missing
+    // in-union variant. (Payload-free union variants match as atom-literal
+    // patterns, the shape of their `u32` atom-id representation.)
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub union Signal {
+        \\    Ping,
+        \\    Pong
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    _got = receive Signal {
+        \\      :Ping -> 1
+        \\    after
+        \\      0 -> -1
+        \\    }
+        \\    0
+        \\  }
+        \\}
+    ,
+        "non-exhaustive `receive` over message union `Signal`",
+    );
+}
+
+test "ZIR concurrency: Process.send rejects a value outside the typed Pid(M) union" {
+    // `server : Pid(Signal)` — sending a value that is not a `Signal` is a
+    // compile error at the send site (ordinary generic type-checking of
+    // `send(pid :: Pid(m), message :: m)`): the typed union handle makes an
+    // out-of-union message impossible, exactly as it does for a scalar `M`.
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub union Signal {
+        \\    Ping,
+        \\    Pong
+        \\  }
+        \\  pub fn main() -> u8 {
+        \\    server = (Pid.of(Process.self()) :: Pid(Signal))
+        \\    _sent = Process.send(server, "hi")
+        \\    0
+        \\  }
+        \\}
+    ,
+        "got `String`",
     );
 }
 

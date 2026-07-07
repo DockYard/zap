@@ -606,7 +606,9 @@ fn substituteInExprDepth(
             const owned_clauses = try new_clauses.toOwnedSlice(alloc);
             const adopted_clauses = try owner.adoptCaseClauseSlice(owned_clauses);
             const new_expr = try owner.createExpr();
-            new_expr.* = .{ .case_expr = .{ .meta = ce.meta, .scrutinee = new_scrutinee, .clauses = adopted_clauses } };
+            // Preserve the P2-J4 `receive` marker across attribute
+            // substitution so message-union exhaustiveness still applies.
+            new_expr.* = .{ .case_expr = .{ .meta = ce.meta, .scrutinee = new_scrutinee, .clauses = adopted_clauses, .receive_lowering = ce.receive_lowering } };
             return new_expr;
         },
         .cond_expr => |ce| {
