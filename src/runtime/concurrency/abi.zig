@@ -72,13 +72,22 @@
 //! borrowed `{pointer,length}` view out, receiver frees via
 //! `zap_proc_envelope_free`) is unchanged by the P2-J5 replacement.
 //!
-//! ## Process-heap manager seam (plan item 2.4)
+//! ## Process-heap manager binding (plan item 2.4 / P2-J5)
 //!
-//! Spawned processes bind a bootstrap arena manager (wholesale free on
-//! exit — the plan item 1.4 shape). Binding the real manifest (ARC)
-//! manager ABI for receiver-side adoption REPLACES this binding in plan
-//! item 2.4, per the no-fallbacks rule; `process.zig`'s "Manager
-//! binding" module doc carries the same citation.
+//! Spawned processes bind the REAL manifest memory manager as their PCB
+//! manager context, through the kernel adapter `ManifestManagerBinding`.
+//! The gated-on runtime bootstrap (`src/runtime.zig`,
+//! `concurrencyStartupForEntry`) hands the kernel the manifest manager's
+//! v1.x core vtable + live context via `zap_proc_bind_manager` right after
+//! `zap_proc_runtime_init`; `zap_proc_spawn` then binds every process to
+//! it. This REPLACED the Phase-1 std-allocator bootstrap arena (the
+//! no-fallbacks rule — the placeholder is gone, not layered over), the
+//! replacement `process.zig`'s "Manager binding" module doc reserved for
+//! this item. Phase-2 is single-model (ARC) and single-scheduler, so the
+//! binding is the one shared binary-wide ARC instance and the adapter's
+//! `teardown` is a no-op; the per-process private-instance model with a
+//! real per-process wholesale free is the documented Phase-3 seam (plan
+//! item 3.1). See `ManifestManagerBinding` for the full rationale.
 //!
 //! ## Exit semantics (Phase 5 seam)
 //!
@@ -129,6 +138,9 @@ pub const ZapProcStatus = struct {
     pub const already_initialized: i32 = -2;
     /// Allocation failure inside the runtime.
     pub const out_of_memory: i32 = -3;
+    /// `zap_proc_bind_manager` was handed a core vtable whose ABI the
+    /// kernel cannot consume (major != 1, or a sub-v1.0 `size`).
+    pub const manager_abi_unsupported: i32 = -4;
 };
 
 /// The C-ABI process entry shape `zap_proc_spawn` accepts. `process` is
@@ -225,18 +237,79 @@ const Ledger = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Bootstrap process-heap manager (plan item 2.4 seam — see module doc)
+// Real manifest-manager binding (plan item 2.4 / P2-J5)
 // ---------------------------------------------------------------------------
+//
+// This REPLACES (not layers over — the no-fallbacks rule) the Phase-1
+// std-allocator bootstrap arena that previously stood in for each
+// process's manager context. The gated-on runtime bootstrap
+// (`src/runtime.zig`, `concurrencyStartupForEntry`) hands the kernel the
+// manifest memory manager's v1.x core vtable + live context via
+// `zap_proc_bind_manager` immediately after `zap_proc_runtime_init`; every
+// process spawned thereafter binds its PCB manager context to that manager
+// through the adapter below. In Phase 2 the binary's manifest model is ARC
+// (single model), so this is the real `Memory.ARC` manager — the seam the
+// `process.zig` "Manager binding" module doc reserves for this item.
+//
+// Phase-2 shared-instance discipline (single scheduler, single model): all
+// processes share ONE manager context (the binary-wide manifest instance),
+// so the adapter's `teardown` is a no-op — a per-process wholesale free
+// would tear down the shared heap. This is sound under ARC: a cleanly
+// exiting process has already released its cells through the compiler's
+// end-of-scope (Perceus) releases, and a killed process's still-live cells
+// are reclaimed when the shared context is deinit'd at program exit
+// (`zapMemoryShutdown`, after the LIFO concurrency-runtime shutdown). The
+// DOCUMENTED Phase-3 seam (plan item 3.1, per-spawn managers) is to give
+// each process its OWN manager instance whose `teardown` performs a real
+// per-process wholesale free; the adapter's shape does not change, only the
+// context handed to each process. Adopting cross-process message payloads
+// into a receiver's manager (plan item 2.4, the deep-copy walker) uses the
+// runtime's ARC allocation path directly (`src/runtime.zig`), not this
+// kernel-side context, because materializing typed Zap cells needs the
+// runtime value representation the kernel is deliberately free of.
 
-/// Per-process bootstrap manager state: an arena over the backing
-/// allocator with byte accounting for the plan-1.6 heap-bytes
-/// observability surface. One state block per live process, allocated at
-/// spawn and destroyed by its own vtable `teardown` (the kernel
-/// guarantees exactly one teardown per spawned record on EVERY exit
-/// path, including kill-before-first-quantum).
-const BootstrapManagerState = struct {
-    arena: std.heap.ArenaAllocator,
-    live_heap_bytes: usize,
+/// Locally-redeclared v1.0 prefix of the memory-manager core vtable
+/// (`docs/memory-manager-abi.md` §4; canonical Zig definition in
+/// `src/memory/abi.zig`, self-contained ARC copy in
+/// `src/memory/arc/manager.zig`). The kernel adapter calls only
+/// `allocate`/`deallocate`; `init`/`deinit`/`get_capability_desc` are
+/// typed opaque because the kernel never invokes them (the runtime creates
+/// and owns the context). Redeclared per the self-contained-manager
+/// convention (spec §11.1.1); the `comptime` layout asserts below catch
+/// drift from the canonical definition. A newer-minor manager advertises a
+/// larger `size` and appends trailing fields (spec §2.3); the kernel reads
+/// only this v1.0 prefix, so it stays forward-compatible.
+const ZapMemoryManagerCoreV1 = extern struct {
+    abi_major: u16,
+    abi_minor: u16,
+    size: u32,
+    declared_caps: u64,
+    init: *const anyopaque,
+    deinit: *const anyopaque,
+    allocate: *const fn (context: *anyopaque, byte_length: usize, alignment: u32) callconv(.c) ?[*]u8,
+    deallocate: *const fn (context: *anyopaque, memory: [*]u8, byte_length: usize, alignment: u32) callconv(.c) void,
+    get_capability_desc: *const anyopaque,
+};
+
+comptime {
+    const ptr = @sizeOf(*const anyopaque);
+    // 16-byte integer prefix + five pointer-width slots (spec §4 core
+    // vtable layout; mirrors the assert in src/memory/arc/manager.zig).
+    if (@sizeOf(ZapMemoryManagerCoreV1) != std.mem.alignForward(usize, 16 + 5 * ptr, @alignOf(ZapMemoryManagerCoreV1)))
+        @compileError("abi: ZapMemoryManagerCoreV1 must be its 16-byte prefix plus five pointers");
+    if (@offsetOf(ZapMemoryManagerCoreV1, "allocate") != 16 + 2 * ptr)
+        @compileError("abi: ZapMemoryManagerCoreV1.allocate offset drift");
+    if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 16 + 3 * ptr)
+        @compileError("abi: ZapMemoryManagerCoreV1.deallocate offset drift");
+}
+
+/// The process-wide binding of the manifest manager: its core vtable plus
+/// the live context the runtime created. One per runtime (Phase-2
+/// shared-instance discipline — see the section doc); every spawned
+/// process's PCB manager context adapts through it.
+const ManifestManagerBinding = struct {
+    core: *const ZapMemoryManagerCoreV1,
+    context: *anyopaque,
 
     const vtable = process_module.ManagerVTable{
         .allocate = allocateThunk,
@@ -245,41 +318,40 @@ const BootstrapManagerState = struct {
         .heapByteCount = heapByteCountThunk,
     };
 
-    fn create() error{OutOfMemory}!*BootstrapManagerState {
-        const state = backing_allocator.create(BootstrapManagerState) catch return error.OutOfMemory;
-        state.* = .{
-            .arena = std.heap.ArenaAllocator.init(backing_allocator),
-            .live_heap_bytes = 0,
-        };
-        return state;
-    }
-
-    fn managerContext(state: *BootstrapManagerState) process_module.ManagerContext {
-        return .{ .manager_state = state, .vtable = &vtable };
+    /// The `ManagerContext` handed to `scheduler.spawn`. `binding` must be
+    /// pinned for the life of every process that holds the context — it is
+    /// a field of the pinned `RuntimeState`, satisfied by construction.
+    fn managerContext(binding: *ManifestManagerBinding) process_module.ManagerContext {
+        return .{ .manager_state = binding, .vtable = &vtable };
     }
 
     fn allocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
-        const state: *BootstrapManagerState = @ptrCast(@alignCast(manager_state.?));
-        const memory = state.arena.allocator().rawAlloc(byte_length, alignment, @returnAddress()) orelse return null;
-        state.live_heap_bytes += byte_length;
-        return memory;
+        const binding: *ManifestManagerBinding = @ptrCast(@alignCast(manager_state.?));
+        return binding.core.allocate(binding.context, byte_length, @intCast(alignment.toByteUnits()));
     }
 
     fn deallocateThunk(manager_state: ?*anyopaque, memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
-        const state: *BootstrapManagerState = @ptrCast(@alignCast(manager_state.?));
-        state.arena.allocator().rawFree(memory[0..byte_length], alignment, @returnAddress());
-        state.live_heap_bytes -= byte_length;
+        const binding: *ManifestManagerBinding = @ptrCast(@alignCast(manager_state.?));
+        binding.core.deallocate(binding.context, memory, byte_length, @intCast(alignment.toByteUnits()));
     }
 
+    /// No-op by design: the manifest context is process-wide and shared by
+    /// every Phase-2 process, so a per-process wholesale free would tear
+    /// down the shared heap (see the section doc for why this is sound
+    /// under ARC and the Phase-3 per-process-instance seam that makes it a
+    /// real wholesale free).
     fn teardownThunk(manager_state: ?*anyopaque) void {
-        const state: *BootstrapManagerState = @ptrCast(@alignCast(manager_state.?));
-        state.arena.deinit();
-        backing_allocator.destroy(state);
+        _ = manager_state;
     }
 
+    /// Advisory only (plan item 1.6): the v1.0 core ABI exposes no
+    /// per-context live-byte query, and the shared context's global total
+    /// is not this process's own heap, so report 0 rather than a
+    /// misleading aggregate. Per-process byte accounting arrives with the
+    /// Phase-3 private instances.
     fn heapByteCountThunk(manager_state: ?*anyopaque) usize {
-        const state: *BootstrapManagerState = @ptrCast(@alignCast(manager_state.?));
-        return state.live_heap_bytes;
+        _ = manager_state;
+        return 0;
     }
 };
 
@@ -321,6 +393,16 @@ const RuntimeState = struct {
     envelope_pool: concurrency.EnvelopePool,
     scheduler: concurrency.Scheduler,
     ledger: Ledger,
+    /// The manifest manager binding (`zap_proc_bind_manager`). Every
+    /// spawned process's PCB manager context adapts through it. Valid only
+    /// while `manager_bound` is true; pinned (a field of the pinned
+    /// `RuntimeState`) so the `ManagerContext` pointers processes hold
+    /// stay live.
+    manager_binding: ManifestManagerBinding,
+    /// Whether `manager_binding` has been set. Spawn refuses to proceed
+    /// until the runtime bootstrap has bound the manifest manager (no
+    /// fallback bootstrap arena — the no-fallbacks rule).
+    manager_bound: bool,
 };
 
 var runtime_state_storage: RuntimeState = undefined;
@@ -360,6 +442,8 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
     if (runtime_initialized) return ZapProcStatus.already_initialized;
 
     runtime_state.ledger = .{};
+    runtime_state.manager_binding = undefined;
+    runtime_state.manager_bound = false;
     runtime_state.pid_table = concurrency.PidTable.init(backing_allocator, .{}) catch
         return ZapProcStatus.out_of_memory;
     runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
@@ -370,6 +454,31 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
         .{},
     );
     runtime_initialized = true;
+    return ZapProcStatus.ok;
+}
+
+/// Bind the manifest memory manager for spawned processes: `core_vtable`
+/// is the manager's v1.x core vtable (`ZapMemoryManagerCoreV1`) and
+/// `context` its live instance, both created and owned by the runtime
+/// (`src/runtime.zig`, `active_manager_state`). Called once by the gated-on
+/// bootstrap immediately after `zap_proc_runtime_init`, BEFORE any spawn.
+/// Every process spawned thereafter binds its PCB manager context to this
+/// manager through the kernel adapter (`ManifestManagerBinding`) — the
+/// P2-J5 replacement of the Phase-1 std-allocator bootstrap arena. Rebinds
+/// are idempotent-friendly (last wins); the runtime binds exactly once.
+/// Driver thread only.
+///
+/// Returns `ZapProcStatus.ok`, `not_initialized`, or
+/// `manager_abi_unsupported` (the core declares a non-1 ABI major or a
+/// sub-v1.0 `size`).
+export fn zap_proc_bind_manager(core_vtable: *const anyopaque, context: *anyopaque) callconv(.c) i32 {
+    if (!runtime_initialized) return ZapProcStatus.not_initialized;
+    const core: *const ZapMemoryManagerCoreV1 = @ptrCast(@alignCast(core_vtable));
+    if (core.abi_major != 1 or core.size < @sizeOf(ZapMemoryManagerCoreV1)) {
+        return ZapProcStatus.manager_abi_unsupported;
+    }
+    runtime_state.manager_binding = .{ .core = core, .context = context };
+    runtime_state.manager_bound = true;
     return ZapProcStatus.ok;
 }
 
@@ -456,26 +565,24 @@ export fn zap_proc_current() callconv(.c) ?*anyopaque {
 /// allocation failure, or process-table exhaustion).
 export fn zap_proc_spawn(entry: ZapProcEntry, argument: ?*anyopaque) callconv(.c) u64 {
     if (!runtime_initialized) return concurrency.Pid.invalid.toBits();
+    // No fallback bootstrap arena (the no-fallbacks rule): a process cannot
+    // spawn until the runtime bootstrap has bound the manifest manager.
+    if (!runtime_state.manager_bound) return concurrency.Pid.invalid.toBits();
 
     const closure_block = runtime_state.ledger.allocate(@sizeOf(SpawnClosure)) catch
         return concurrency.Pid.invalid.toBits();
     const closure: *SpawnClosure = @ptrCast(@alignCast(closure_block.bodyPointer()));
     closure.* = .{ .c_entry = entry, .c_argument = argument };
 
-    const manager_state = BootstrapManagerState.create() catch {
-        runtime_state.ledger.free(closure_block);
-        return concurrency.Pid.invalid.toBits();
-    };
-
     const pid = runtime_state.scheduler.spawn(.{
         .entry = spawnTrampoline,
         .argument = closure_block,
-        .manager = manager_state.managerContext(),
+        // Every process binds the shared manifest manager context (Phase-2
+        // single-instance discipline; the adapter's teardown is a no-op —
+        // see `ManifestManagerBinding`). No per-process manager state to
+        // reclaim on spawn failure, so the catch only frees the closure.
+        .manager = runtime_state.manager_binding.managerContext(),
     }) catch {
-        // The failed spawn never registered the manager context, so the
-        // kernel will not run its teardown — destroy it here, along with
-        // the closure that will never reach the trampoline.
-        BootstrapManagerState.teardownThunk(manager_state);
         runtime_state.ledger.free(closure_block);
         return concurrency.Pid.invalid.toBits();
     };
@@ -637,6 +744,112 @@ export fn zap_proc_dead_letter_unexpected(process: *anyopaque) callconv(.c) nore
 
 const testing = std.testing;
 
+/// Test-only manifest-manager double for the kernel's OWN standalone test
+/// binary. The PRODUCTION binding is the real `Memory.ARC` manager, handed
+/// in by `src/runtime.zig`'s bootstrap; the kernel test binary has no
+/// access to that fork-compiled object, so it drives the
+/// `ManifestManagerBinding` adapter with this page-allocator core double
+/// (clearly test-scoped, per the deliverable's "test-only double where a
+/// std-allocator manager is genuinely needed" carve-out). The kernel's own
+/// tests never allocate through a process's PCB manager (message payloads
+/// ride the ledger, not the process heap), so the double exists to satisfy
+/// the spawn-requires-a-bound-manager contract and to back the adapter unit
+/// test below.
+const TestManagerCore = struct {
+    const core = ZapMemoryManagerCoreV1{
+        .abi_major = 1,
+        .abi_minor = 0,
+        .size = @sizeOf(ZapMemoryManagerCoreV1),
+        .declared_caps = 0,
+        .init = @ptrCast(&unusedThunk),
+        .deinit = @ptrCast(&unusedThunk),
+        .allocate = allocateThunk,
+        .deallocate = deallocateThunk,
+        .get_capability_desc = @ptrCast(&unusedThunk),
+    };
+
+    /// Opaque context marker (the double keeps no per-instance state; its
+    /// allocate/deallocate route straight to the backing allocator).
+    var context_marker: u8 = 0;
+
+    fn unusedThunk() callconv(.c) void {}
+
+    fn allocateThunk(context: *anyopaque, byte_length: usize, alignment: u32) callconv(.c) ?[*]u8 {
+        _ = context;
+        return backing_allocator.rawAlloc(byte_length, std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    }
+
+    fn deallocateThunk(context: *anyopaque, memory: [*]u8, byte_length: usize, alignment: u32) callconv(.c) void {
+        _ = context;
+        backing_allocator.rawFree(memory[0..byte_length], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
+    }
+};
+
+/// Bind the kernel test double as the manifest manager — the test-suite
+/// mirror of what `src/runtime.zig`'s bootstrap does with the real ARC
+/// manager. Call after `zap_proc_runtime_init` in any test that spawns.
+fn bindTestManager() void {
+    _ = zap_proc_bind_manager(@ptrCast(&TestManagerCore.core), @ptrCast(&TestManagerCore.context_marker));
+}
+
+test "abi: ManifestManagerBinding adapts a core vtable's allocate/deallocate; teardown no-op; heap bytes 0" {
+    var binding = ManifestManagerBinding{
+        .core = &TestManagerCore.core,
+        .context = @ptrCast(&TestManagerCore.context_marker),
+    };
+    const manager = binding.managerContext();
+
+    const block = manager.allocate(48, .of(u64)) orelse return error.TestUnexpectedResult;
+    block[0] = 0x5A;
+    block[47] = 0xA5;
+
+    // heapByteCount is advisory 0 (no per-context query on the v1.0 core).
+    try testing.expectEqual(@as(usize, 0), manager.heapByteCount());
+
+    // teardown is a deliberate no-op (shared instance) — it must NOT free
+    // the block. Prove the bytes survive.
+    manager.teardown();
+    try testing.expectEqual(@as(u8, 0x5A), block[0]);
+    try testing.expectEqual(@as(u8, 0xA5), block[47]);
+
+    manager.deallocate(block, 48, .of(u64));
+}
+
+test "abi: zap_proc_bind_manager validates the core ABI and gates spawn (no fallback arena)" {
+    // Binding before init reports not_initialized.
+    try testing.expectEqual(
+        ZapProcStatus.not_initialized,
+        zap_proc_bind_manager(@ptrCast(&TestManagerCore.core), @ptrCast(&TestManagerCore.context_marker)),
+    );
+
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+
+    // A non-1 ABI major is rejected.
+    const bad_core = ZapMemoryManagerCoreV1{
+        .abi_major = 2,
+        .abi_minor = 0,
+        .size = @sizeOf(ZapMemoryManagerCoreV1),
+        .declared_caps = 0,
+        .init = @ptrCast(&TestManagerCore.unusedThunk),
+        .deinit = @ptrCast(&TestManagerCore.unusedThunk),
+        .allocate = TestManagerCore.allocateThunk,
+        .deallocate = TestManagerCore.deallocateThunk,
+        .get_capability_desc = @ptrCast(&TestManagerCore.unusedThunk),
+    };
+    try testing.expectEqual(
+        ZapProcStatus.manager_abi_unsupported,
+        zap_proc_bind_manager(@ptrCast(&bad_core), @ptrCast(&TestManagerCore.context_marker)),
+    );
+
+    // Spawn is gated until a valid manager is bound.
+    try testing.expectEqual(concurrency.Pid.invalid.toBits(), zap_proc_spawn(smokeReceiverEntry, null));
+    bindTestManager();
+    const pid_bits = zap_proc_spawn(smokeReceiverEntry, null);
+    try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+    // The parked receiver is torn down by deinit (shutdownAllProcesses).
+}
+
 test "abi: runtime init/deinit lifecycle guards double-init and supports re-init" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
     defer zap_proc_runtime_deinit();
@@ -710,6 +923,7 @@ fn smokeSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) voi
 test "abi: init → spawn → send → receive → exit round-trip through the C-ABI surface" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
     defer zap_proc_runtime_deinit();
+    bindTestManager();
 
     var probe = RoundTripProbe{};
     const receiver_pid_bits = zap_proc_spawn(smokeReceiverEntry, &probe);
@@ -784,6 +998,7 @@ test "abi: zap_proc_current is null on the driver thread and matches the entry h
     try testing.expectEqual(@as(?*anyopaque, null), zap_proc_current());
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
     defer zap_proc_runtime_deinit();
+    bindTestManager();
     try testing.expectEqual(@as(?*anyopaque, null), zap_proc_current());
 
     var probe = AmbientJoinProbe{};
@@ -805,6 +1020,7 @@ test "abi: zap_proc_current is null on the driver thread and matches the entry h
 test "abi: zap_proc_run_until_exit joins the target and leaves stragglers for deinit" {
     try testing.expectEqual(ZapProcStatus.not_initialized, zap_proc_run_until_exit(0));
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    bindTestManager();
 
     const straggler_pid_bits = zap_proc_spawn(parkForeverEntry, null);
     try testing.expect(straggler_pid_bits != concurrency.Pid.invalid.toBits());
@@ -846,6 +1062,7 @@ fn deadLetterSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c
 test "abi: send to a dead pid dead-letters and reclaims the payload block" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
     defer zap_proc_runtime_deinit();
+    bindTestManager();
 
     var observed_status: i32 = std.math.minInt(i32);
     const pid_bits = zap_proc_spawn(deadLetterSenderEntry, &observed_status);
@@ -874,6 +1091,7 @@ fn doubleSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) vo
 
 test "abi: payloads dead-lettered by receiver teardown are swept at deinit" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    bindTestManager();
 
     var receiver_pid_bits = zap_proc_spawn(oneShotReceiverEntry, null);
     try testing.expect(receiver_pid_bits != concurrency.Pid.invalid.toBits());
@@ -907,6 +1125,7 @@ fn waitTimeoutNoSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv
 test "abi: zap_proc_receive_wait_timeout with an empty mailbox and after 0 polls without blocking" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
     defer zap_proc_runtime_deinit();
+    bindTestManager();
 
     var probe = WaitTimeoutProbe{ .timeout_nanoseconds = 0 };
     const pid_bits = zap_proc_spawn(waitTimeoutNoSenderEntry, &probe);
@@ -922,6 +1141,7 @@ test "abi: zap_proc_receive_wait_timeout with an empty mailbox and after 0 polls
 test "abi: zap_proc_receive_wait_timeout fires the deadline under the production futex park" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
     defer zap_proc_runtime_deinit();
+    bindTestManager();
 
     // A small real-time deadline: the single scheduler idle-parks bounded
     // by it, wakes on timeout, and fires the waiter.
@@ -960,6 +1180,7 @@ fn deadLetterSenderToEntry(process: *anyopaque, argument: ?*anyopaque) callconv(
 test "abi: an unexpected message dead-letters with telemetry and does not crash the scheduler" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
     defer zap_proc_runtime_deinit();
+    bindTestManager();
 
     var probe = DeadLetterProbe{};
     const receiver_bits = zap_proc_spawn(deadLetterReceiverEntry, &probe);

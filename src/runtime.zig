@@ -3518,6 +3518,7 @@ const ZapConcurrencyKernel = struct {
     const ProcEntry = *const fn (process: *anyopaque, argument: ?*anyopaque) callconv(.c) void;
 
     extern fn zap_proc_runtime_init() callconv(.c) i32;
+    extern fn zap_proc_bind_manager(core_vtable: *const anyopaque, context: *anyopaque) callconv(.c) i32;
     extern fn zap_proc_runtime_deinit() callconv(.c) void;
     extern fn zap_proc_run_until_quiescent() callconv(.c) i32;
     extern fn zap_proc_run_until_exit(target_pid_bits: u64) callconv(.c) i32;
@@ -3554,6 +3555,27 @@ fn concurrencyStartupForEntry() void {
     if (status != 0) {
         @panic("zap: concurrency runtime failed to initialize");
     }
+
+    // P2-J5: bind the REAL manifest memory manager (Phase 2 = the ARC
+    // default) as every spawned process's manager context, replacing the
+    // kernel's Phase-1 std-allocator bootstrap arena (the no-fallbacks
+    // rule). `zapMemoryStartup` (run earlier in `memoryStartupForEntry`)
+    // has already created the manager context, so `core`/`context` are
+    // live here; the kernel adapts this v1.x core vtable through
+    // `ManifestManagerBinding` (`abi.zig`). Without this bind, every
+    // `zap_proc_spawn` — including the root process — would fail by design.
+    const manager_core = active_manager_state.core orelse
+        @panic("zap: concurrency runtime bootstrap ran before the memory manager was bound");
+    const manager_context = active_manager_state.context orelse
+        @panic("zap: concurrency runtime bootstrap ran before the memory manager context was created");
+    const bind_status = ZapConcurrencyKernel.zap_proc_bind_manager(
+        @ptrCast(manager_core),
+        manager_context,
+    );
+    if (bind_status != 0) {
+        @panic("zap: concurrency runtime failed to bind the manifest memory manager");
+    }
+
     // LIFO ordering: registered AFTER `zapMemoryShutdownAtexit`
     // (registered inside `zapMemoryStartup` above), so this handler
     // fires FIRST at exit — every process is torn down while the memory
