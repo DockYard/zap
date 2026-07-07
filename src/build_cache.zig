@@ -49,6 +49,23 @@ pub const OverrideIdentity = struct {
     /// line, so the manifest-snapshot fast path must MISS on it rather
     /// than reinstalling an artifact built under the other gate value.
     runtime_concurrency: ?bool = null,
+    /// P2-R1 (D6): `-Ddebug-info=<full|split|none>` override, stored as
+    /// the `main.BuildOverrides.DebugInfoOverride` enum tag (null = the
+    /// per-optimize-mode default). It changes the emitted in-binary DWARF
+    /// and any split-debug sibling, so the manifest-snapshot fast path
+    /// must MISS on a flip rather than reinstalling an artifact built
+    /// under a different debug-info policy. Both this and `frame_pointers`
+    /// are live `-D` keys in `main.BUILD_FLAG_KEYS`; the script/run cache
+    /// already keys on them via `BuildCacheOptions.debug_info_tag` /
+    /// `frame_pointers_tag`, and folding them here closes the same gap on
+    /// the manifest invocation identity.
+    debug_info: ?u8 = null,
+    /// P2-R1 (D6): `-Dframe-pointers=on|off` override (null = the
+    /// per-optimize-mode default). Frame-pointer retention changes the
+    /// emitted code — and the concurrency crash-report stack unwind — so
+    /// the fast path must MISS on a flip. Mirror of
+    /// `BuildCacheOptions.frame_pointers_tag` on the script/run path.
+    frame_pointers: ?bool = null,
 };
 
 pub const Pipeline = struct {
@@ -473,9 +490,11 @@ pub fn compilerIdentityDigestForPath(
 pub fn hashInvocationIdentity(allocator: std.mem.Allocator, inputs: InvocationInputs) !InvocationIdentity {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     const identity_magic: u32 = 0x5a_49_44_32; // "ZID2"
-    // v3 (P2-J1): the identity folds the `-Druntime-concurrency=`
-    // override tri-state; the bump retires every pre-gate snapshot.
-    const identity_version: u16 = 3;
+    // v4 (P2-R1/D6): the identity additionally folds the `-Ddebug-info=`
+    // tag and the `-Dframe-pointers=` tri-state; the bump retires every
+    // snapshot that predates their inclusion. v3 (P2-J1) added the
+    // `-Druntime-concurrency=` override tri-state.
+    const identity_version: u16 = 4;
     hashBytes(&hasher, std.mem.asBytes(&identity_magic));
     hashBytes(&hasher, std.mem.asBytes(&identity_version));
     hashBytes(&hasher, inputs.build_source);
@@ -505,6 +524,15 @@ pub fn hashInvocationIdentity(allocator: std.mem.Allocator, inputs: InvocationIn
     // P2-J1: tri-state gate override (0 = unset, 1 = off, 2 = on).
     hashOptionalByte(&hasher, if (inputs.overrides.runtime_concurrency) |gate|
         @as(u8, if (gate) 2 else 1)
+    else
+        null);
+    // P2-R1 (D6): fold the `-Ddebug-info=` tag and the `-Dframe-pointers=`
+    // tri-state (0 = unset, 1 = off, 2 = on). A flip of either changes the
+    // emitted artifact, so two builds differing only in these flags must
+    // land on distinct cache keys instead of false-hitting the snapshot.
+    hashOptionalByte(&hasher, inputs.overrides.debug_info);
+    hashOptionalByte(&hasher, if (inputs.overrides.frame_pointers) |frame_pointers|
+        @as(u8, if (frame_pointers) 2 else 1)
     else
         null);
     hashBool(&hasher, inputs.collect_arc_stats);
@@ -1975,6 +2003,19 @@ test "manifest invocation identity includes required build controls and tool ide
     changed_arc_stats.collect_arc_stats = true;
     const changed_arc_stats_hash = try hashInvocationIdentity(allocator, changed_arc_stats);
     try std.testing.expect(!std.mem.eql(u8, &base_hash, &changed_arc_stats_hash));
+
+    // P2-R1 (D6): flipping `-Ddebug-info=` or `-Dframe-pointers=` must
+    // change the identity — otherwise two builds differing only in those
+    // flags false-hit the manifest snapshot (base leaves both null).
+    var changed_debug_info = base;
+    changed_debug_info.overrides.debug_info = 2;
+    const changed_debug_info_hash = try hashInvocationIdentity(allocator, changed_debug_info);
+    try std.testing.expect(!std.mem.eql(u8, &base_hash, &changed_debug_info_hash));
+
+    var changed_frame_pointers = base;
+    changed_frame_pointers.overrides.frame_pointers = true;
+    const changed_frame_pointers_hash = try hashInvocationIdentity(allocator, changed_frame_pointers);
+    try std.testing.expect(!std.mem.eql(u8, &base_hash, &changed_frame_pointers_hash));
 }
 
 test "snapshot serialization round trip preserves fields" {

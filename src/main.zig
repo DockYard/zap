@@ -4438,6 +4438,11 @@ fn buildOverrideIdentity(overrides: BuildOverrides) build_cache.OverrideIdentity
         .target = overrides.target,
         .cpu = overrides.cpu,
         .runtime_concurrency = overrides.runtime_concurrency,
+        // P2-R1 (D6): thread the `-Ddebug-info=`/`-Dframe-pointers=`
+        // overrides into the manifest invocation identity so two builds
+        // differing only in those flags do not false-hit the snapshot.
+        .debug_info = if (overrides.debug_info) |debug_info| @intFromEnum(debug_info) else null,
+        .frame_pointers = overrides.frame_pointers,
     };
 }
 

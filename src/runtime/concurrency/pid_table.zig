@@ -499,6 +499,16 @@ pub const PidTable = struct {
     dead_letter_hook: DeadLetterHook,
     /// Opaque context handed to `dead_letter_hook`.
     dead_letter_context: ?*anyopaque,
+    /// Whether `release` emits a `warn` when a slot is permanently retired
+    /// on generation exhaustion. Default true: retirement is a real,
+    /// once-in-~570-years operational event (module doc "Capacity policy")
+    /// worth surfacing in production. The white-box retirement test forces
+    /// exhaustion on purpose and opts OUT, so its intentional trigger does
+    /// not write to the test process's stderr — which the Zig build runner
+    /// captures under `--listen=-` and surfaces as `failed command:` noise
+    /// on an otherwise-green step (same seam rationale as the deterministic
+    /// harness's `suppress_failure_seed_print`).
+    warn_on_slot_retirement: bool = true,
     /// See `Statistics.dead_letter_count`.
     dead_letter_count: std.atomic.Value(u64),
     /// See `Statistics.live_process_count`.
@@ -658,7 +668,9 @@ pub const PidTable = struct {
         _ = table.live_process_count.fetchSub(1, .monotonic);
         if (retiring) {
             _ = table.retired_slot_count.fetchAdd(1, .monotonic);
-            log.warn("pid-table slot {d} retired after generation exhaustion", .{pid.slot});
+            if (table.warn_on_slot_retirement) {
+                log.warn("pid-table slot {d} retired after generation exhaustion", .{pid.slot});
+            }
             return;
         }
         table.pushFreeSlot(pid.slot);
@@ -1079,6 +1091,12 @@ test "PidTable: acquire fails cleanly on free-list exhaustion and recovers after
 test "PidTable: generation exhaustion retires the slot instead of wrapping" {
     var table = try PidTable.init(testing.allocator, .{ .capacity = 1 });
     defer table.deinit();
+    // This white-box test DELIBERATELY drives a slot to generation
+    // exhaustion, which fires the retirement `warn`. Opt out of the log so
+    // the intentional trigger stays off the test process's stderr (the Zig
+    // build runner surfaces any such byte as `failed command:` noise on
+    // this otherwise-green step); production keeps the warning.
+    table.warn_on_slot_retirement = false;
 
     var probe = DeadLetterProbe{};
     table.dead_letter_hook = DeadLetterProbe.hook;

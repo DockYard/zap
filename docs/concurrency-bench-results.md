@@ -966,8 +966,10 @@ mandelbrot's `iter`/`row_loop` are TCO-safe (trivial params) → musttail →
 the poll rides the global reduction counter, whose per-iteration load/store
 costs +3%. Both are the inherent cost of cooperative safepoints on tight
 non-FP loops (the same class of cost Go measured). Gate-OFF these benchmarks
-are byte-for-byte unchanged (proven: nbody `__TEXT,__text` SHA is identical
-pre/post-J6), and the CLBG suite is normally run gate-OFF — the gate-ON
+are unchanged (proven durable at HEAD: the gate-OFF binary carries zero
+`zap_proc_*`/`safepoint` symbols and zero poll call sites — see the
+Zero-cost-OFF proof below, which also records a point-in-time byte-identical
+`__text` checkpoint), and the CLBG suite is normally run gate-OFF — the gate-ON
 figure is the "compiled a CLBG kernel WITH preemptive concurrency" scenario.
 
 Documented mitigation for the tight-loop regressions (NOT required — the
@@ -976,11 +978,31 @@ iterations (Go's mitigation), and forcing loopification of musttail loops
 gate-ON so mandelbrot's poll becomes register-local too. Deferred as a
 follow-up optimization pass; noted in the ledger for whoever picks it up.
 
-Zero-cost-OFF proof (the whole point of the comptime gate): a gate-OFF nbody
-compiled with the post-J6 compiler has a `__TEXT,__text` section SHA-256
-BYTE-IDENTICAL to one compiled with the pre-J6 compiler
-(`5075af40…dbb5ecd`), and carries NO `zap_proc_*`/`reductions`/`safepoint`
-symbols. The CLBG wins are untouched with the gate off.
+Zero-cost-OFF proof (the whole point of the comptime gate). The **durable,
+HEAD-stable** evidence is symbol- and instruction-level and does NOT depend on
+cross-commit byte-stability: a gate-OFF nbody compiled at **HEAD `ecb9113`**
+(aarch64-macos, `-OReleaseFast`, fork compiler) carries **zero
+`zap_proc_*`/`reductions`/`safepoint` symbols** — verified `nm`: 0 matches of
+`zap_proc_`, `reduction`, or `safepoint` across all 801 symbols (the only
+`proc`-substring hits are unrelated OS-process symbols, `_Io.Threaded.process*`
+/ `abortProcess`, never the concurrency kernel) — and its `__TEXT,__text`
+disassembly (58 085 lines via `otool -tV`) contains **zero
+`safepoint`/`zap_proc`/`reduction` references**, i.e. no `bl
+zap_proc_safepoint_slow` call site and no reductions-counter access anywhere in
+gate-OFF code. This is the property that matters (the gate emits no concurrency
+machinery), and no amount of always-linked driver churn can invalidate it.
+
+Point-in-time byte anchors (a stronger check *when it reproduces*, but fragile
+across commits because the `__text` bytes fold in every always-linked object):
+the fresh HEAD-`ecb9113` gate-OFF nbody `__TEXT,__text` SHA-256 is
+`d81ead45…d8e8a49` (extracted via `segedit -extract __TEXT __text | shasum -a
+256`). The earlier **J6 checkpoint `5075af40…dbb5ecd`** — a `__text` byte-identical
+between the pre-J6 and post-J6 compilers — **no longer reproduces at HEAD**: it
+drifted because J7's concurrency-verifier registration and J9's `runtime.zig`
+`resetAllocator` fix are now always linked into the driver, shifting `__text`
+bytes *without adding any gate-ON concurrency code*. That drift is precisely why
+the durable proof above is stated at the symbol/instruction level. The CLBG wins
+are untouched with the gate off.
 
 ## E6 — copy crossover (P2-J9, 2026-07-07) — first crossover measurement
 

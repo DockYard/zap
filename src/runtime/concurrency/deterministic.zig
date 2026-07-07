@@ -378,6 +378,19 @@ pub const ScenarioOptions = struct {
     /// exact-accounting check; its error fails the scenario and prints
     /// the seed).
     verify_after_run: ?ScenarioFunction = null,
+    /// Test-only seam: suppress the failing-seed replay print for a
+    /// scenario that is DELIBERATELY driven to a known failure — the
+    /// expected-failure self-test asserts on the RETURNED error
+    /// (`expectError`), so the replay banner is pure noise there. Left
+    /// false for every genuine run, so the plan-1.5 failing-seed contract
+    /// still fires on an unexpected failure. Keeping it false-by-default
+    /// AND set only on the negative self-test also keeps `test-kernel`
+    /// stderr clean: under the Zig build runner's `--listen=-` capture,
+    /// any byte a passing test writes to stderr is surfaced as
+    /// `failed command:` noise on an otherwise-green step (see the
+    /// `diagnostics.zig` capture note). Mirrors the `concurrency_verifier`
+    /// `suppress_diagnostics` negative-test seam.
+    suppress_failure_seed_print: bool = false,
 };
 
 /// Run `scenario` under `seed` to quiescence, verify exact accounting
@@ -394,7 +407,7 @@ pub fn runScenario(
     scenario_context: ?*anyopaque,
     options: ScenarioOptions,
 ) ![]TraceEvent {
-    errdefer std.debug.print(
+    errdefer if (!options.suppress_failure_seed_print) std.debug.print(
         "\n[deterministic] scenario FAILED under seed {d} (0x{x}) — rerun with this seed for an exact replay\n",
         .{ seed, seed },
     );
@@ -864,13 +877,16 @@ test "Deterministic: idle with waiting processes surfaces AllProcessesWaiting (n
 
 test "Deterministic: a failing scenario propagates its error through runScenario" {
     // The deadlock scenario fails inside run(); runScenario must
-    // propagate the error (after printing the seed, which lands on
-    // stderr).
+    // propagate the error. This is a DELIBERATE failure asserted via the
+    // returned error, so `suppress_failure_seed_print` silences the
+    // replay banner: a passing test must not write to stderr, or the Zig
+    // build runner surfaces it as `failed command:` noise on this green
+    // step. The banner itself is exercised by genuine (unsuppressed) runs.
     var state: usize = 0;
     _ = &state;
     try testing.expectError(
         error.AllProcessesWaiting,
-        runScenario(testing.allocator, 7, deadlockScenario, null, .{}),
+        runScenario(testing.allocator, 7, deadlockScenario, null, .{ .suppress_failure_seed_print = true }),
     );
 }
 

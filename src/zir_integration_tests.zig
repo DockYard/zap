@@ -5962,22 +5962,31 @@ test "ZIR concurrency: Process.* is a compile error when the runtime_concurrency
 // ============================================================
 
 test "ZIR concurrency: receive rejects a non-sendable message type" {
-    // `String` is outside the Phase-2 sendable set (scalars + payload-free
-    // unions). The receive desugar defers message-type validity to the type
-    // checker (it cannot resolve types), which rejects the rich type here —
-    // a compile error until the P2-J5 deep-copy walker, not a fabricated
-    // decode.
+    // A payload-BEARING union is outside the Phase-2 sendable set. Only a
+    // payload-free union is walker-sendable (it travels as its `u32` atom
+    // id); a variant carrying a payload needs a union deep-copy walker that
+    // Phase 2 does not have, so `typeIsWalkerSendable` (types.zig) rejects
+    // it and `checkReceiveMessageUnion` emits the sendability diagnostic
+    // naming the offending type. (Contrast `receive String`, which IS
+    // walker-sendable as of P2-J5 and carries positive coverage in the
+    // gate-ON suite — `test_concurrency/rich_message_test.zap`.) The receive
+    // desugar defers message-type validity to the type checker (it cannot
+    // resolve types); the checker rejects the rich type here.
     try expectGatedCompileFailsWithDiagnostic(
         \\pub struct TestProg {
+        \\  pub union Parcel {
+        \\    Data :: i64
+        \\    Empty
+        \\  }
         \\  pub fn main() -> u8 {
-        \\    _value = receive String {
-        \\      s -> s
+        \\    _value = receive Parcel {
+        \\      _msg -> 0
         \\    }
         \\    0
         \\  }
         \\}
     ,
-        "is not sendable in Phase 2",
+        "message type `Parcel` is not sendable",
     );
 }
 

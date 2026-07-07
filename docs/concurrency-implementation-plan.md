@@ -283,6 +283,16 @@ V11 by advancing the compile past the earlier abort. Out of concurrency scope; l
 - **2.2** Message-union: explicit annotation first (`process … receives M`), inference from
   receive patterns second; exhaustiveness verifier; out-of-union send = send-site compile
   error.
+  - *[Shipped vs deferred (P2-R1/D4). **Shipped:** the per-receive `<M>` message-type token —
+    each `receive M { … }` names its own message type M (scalar, `String`, `List`/`Map` of
+    sendable elements, a by-value struct of those, or a payload-free union), with the
+    payload-free-union exhaustiveness verifier (`checkReceiveMessageUnion`, `src/types.zig`)
+    and out-of-union send as a send-site compile error against the typed `Pid(M)`. **Deferred
+    to Phase 3+:** the two ergonomic forms that let a process fix ONE message type across all
+    of its receives — (a) inference of M from the union of a process's receive patterns, and
+    (b) the `process … receives M` block-annotation spelling. Phase 2 requires the type at
+    each `receive` instead; neither deferred form changes the sendability/exhaustiveness rules,
+    only where M is written.]*
 - **2.3** `receive`/`after` lowering onto `Io.Select` (mailbox arm, timer-wheel arm,
   exit-signal arm); `after 0` = poll; suspension at arbitrary call depth (stackful fibers).
 - **2.4** Deep-copy send: sender copies into detachable fragment (closures: share code pointer,
@@ -326,7 +336,11 @@ V11 by advancing the compile past the earlier abort. Out of concurrency scope; l
     FP-heavy bodies) to ride every loop. **E2 PASS** (kill criterion not tripped): nbody −2%,
     spectral-norm −2% (within noise; beats Go's 7.8%); non-gating tight-loop regressions
     fannkuch +10–11%, mandelbrot +3% reported honestly with unrolling / force-loopify-musttail
-    as documented follow-up mitigations. Zero-cost-OFF proven byte-identical (`__text` SHA).
+    as documented follow-up mitigations (see Phase 6 item 6.6). Zero-cost-OFF proven DURABLE at
+    HEAD (`ecb9113`): a gate-OFF nbody carries zero `zap_proc_*`/`safepoint` symbols (`nm`) and
+    zero safepoint-poll call sites (`__text` disasm); a byte-identical `__text` SHA is kept only
+    as a point-in-time checkpoint (the J6 anchor no longer reproduces once J7/J9's always-linked
+    objects shifted `__text` — hence the durable proof is symbol/instruction-level).
     Numbers: `docs/concurrency-bench-results.md` § E2. Latency bound (`scheduler.zig` module
     doc): ≤ one reduction budget of the slowest polled loop — all Zap loops are tail-recursive
     and now polled; the residual un-polled code is bounded straight-line / non-tail chains.
@@ -470,6 +484,15 @@ correlated replies).
 - **6.5** Full observability: send/receive trace points (compile-time-optional), scheduler
   utilization, run-queue depth, deadlock ("all waiting, none runnable") and starvation
   detection.
+- **6.6** Gate-ON tight-loop safepoint mitigation (E2 follow-up; owner for the deferred
+  mitigation flagged in item 2.5 and `docs/concurrency-bench-results.md` § E2). Amortize the
+  cooperative safepoint poll on the tight non-FP loops that regressed gate-ON — fannkuch-redux
+  `reverse_range`/`count_flips` (+10–11%) and mandelbrot `iter`/`row_loop` (+3%). Two
+  Go-precedented levers: (a) loop-unroll to amortize the 2-instruction register poll over K
+  iterations; (b) force loopification of `musttail` self-recursion gate-ON so mandelbrot's poll
+  becomes register-local instead of riding the global reduction counter's per-iteration
+  load/store. NOT a kill-criterion item (E2 already passed with the poll on every loop) — this
+  is a perf-tier refinement that gives the deferred mitigation an explicit owner.
 
 Exit gate: E6 re-run — crossover documented; ping-pong within target with move path on.
 
@@ -664,6 +687,13 @@ Each is a design commitment, not a suggestion; each cites its evidence.
    decides": the landed Phase 1 kernel is fully parameter-threaded internally (the mechanism
    is in), but the choice only becomes measurable once compiled Zap code exists to exercise
    per-site cost — the `scheduler.zig` module doc records the same Phase 2 deferral.]*
+   *[Re-pointed again to Phase 3 (P2-R1/D3): the cost this decision must beat — the alloc-path
+   current-process lookup on the hot path — does not exist until per-process memory managers
+   land (item 3.1); until then there is no per-site alloc cost to measure. Phase 2's emitted
+   code reaches the current process through the ambient `zap_proc_current()` runtime lookup
+   (`src/runtime.zig` ~4448), not a threaded parameter or reserved register, so the
+   register-vs-parameter tradeoff is genuinely a Phase-3 measurement once managers make the
+   lookup hot.]*
 2. **Linux poller wakeup primitive** — eventfd vs io_uring `MSG_RING` (E9 was Darwin-only);
    measured when the Phase 4 poller lands.
 3. **Stack-pool sizing/watermark policy and its interaction with Darwin teardown** — decided
