@@ -3790,24 +3790,41 @@ fn unsendableMessageTypeError(comptime MessageType: type) noreturn {
 //
 // Sendable graph shapes THIS increment (mirrored by `isWalkerSendable`):
 //   * fixed scalars (`int`/`float`/`bool`, incl. atoms as `u32`) — bit-copy;
-//   * `String` (`[]const u8`) — shared BY REFERENCE as an immutable
-//     program-lifetime arena/`.rodata` slice (the immutable-share tier of
-//     research.md §6.4 / §5.4: no copy, no refcount, no cross-thread
-//     mutation; observationally independent because it can be neither
-//     mutated nor individually freed). A wire serializer inlines the bytes;
-//     same-image transport shares them.
+//   * `String` (`[]const u8`) — DEEP-COPIED by value: the bytes are
+//     length-prefixed and inlined into the blob on the sender, and
+//     reconstructed into a fresh RECEIVER-OWNED arena allocation on
+//     adoption (research.md §6.4 "copy tier"; zap-concurrency-research.md
+//     §5.4 "copy-out slices"). This is the SOUND Phase-2 discipline: a Zap
+//     `String`'s backing is NOT always program-lifetime — literals live in
+//     `.rodata`, but dynamically-constructed strings (concat, interpolation,
+//     `Integer.to_string`, IO/file reads: the `bump*`/`runtime_arena`
+//     allocators) live in an arena that becomes PER-PROCESS in Phase 3, so
+//     sharing a sender's slice header by reference would dangle once that
+//     process's arena is reclaimed (a use-after-free). Copying the bytes
+//     makes the receiver's string independent of the sender's lifetime by
+//     construction. True zero-copy immutable-share is reserved for the
+//     atomically-refcounted `Zap.Blob` tier (§5.4, Phase 6); a wire
+//     serializer already inlines the same length-prefixed bytes.
 //   * `List(T)` of any sendable element — DEEP-copied into an independent
 //     rc=1 cell (nested `List(List(...))`/`List(String)` fall out of the
 //     recursion).
+//   * `Map(K,V)` of any sendable key/value — DEEP-copied into an independent
+//     rc=1 cell, structurally symmetric to `List` (walk entries in insertion
+//     order; reconstruct by moving fresh rc=1 entries in via
+//     `put_owned_unchecked`).
+//   * a by-value user `struct` whose every field is sendable — reconstructed
+//     BY VALUE (a Zap struct is a plain Zig struct, not a boxed cell), each
+//     field deep-copied in declaration order via the same recursion. This is
+//     how "a struct containing a List/Map/String" travels.
 //
-// NOT YET sendable (documented compile-time rejection — never a silent
-// truncation): `Map(K,V)` (deep-copy is structurally symmetric to `List`
-// and is the next increment); closures / `Callable` existentials /
-// `ProtocolBox` (the captured environment / boxed inner is an opaque
-// `*anyopaque`, so a reflection walk cannot traverse it — it needs the
-// compiler-emitted per-closure serialize glue the plan reserves as the
-// "ZIR-emitted copy walker"); and raw pointers / resources holding external
-// handles.
+// NOT sendable (documented compile-time rejection — never a silent
+// truncation): closures / `Callable` existentials / `ProtocolBox` (the
+// captured environment / boxed inner is an opaque `*anyopaque`, so a
+// reflection walk cannot traverse it — it needs the compiler-emitted
+// per-closure serialize glue the plan reserves as the "ZIR-emitted copy
+// walker"); payload-BEARING or parametric unions; and raw pointers /
+// resources holding external handles. (A payload-FREE union travels as its
+// `u32` atom id — a scalar — so it needs no union arm here.)
 //
 // In-flight transport: Phase 2 rides the P2-J1 opaque-bytes seam (the
 // runtime payload ledger, `abi.zig`). The pool-carved envelope-fragment
@@ -3815,12 +3832,12 @@ fn unsendableMessageTypeError(comptime MessageType: type) noreturn {
 // memory home the blob moves into in a following increment; the walker is
 // written against a plain byte buffer so that move is transparent to it.
 //
-// Wiring status: the walker is a validated standalone mechanism (the host
-// tests below exercise fidelity + independence directly). Connecting it to
-// `Process.send`/`receive` widens `isSendableMessageType` to `isWalker
-// sendable`, serializes in `send_message`, and adds a generic
-// `receiveMessage(T)` decode — plus the `lib/process.zap` macro tokens for
-// the new types — the mechanical surface step tracked next.
+// Wiring status: WIRED into the language. `Process.send` serializes any
+// walker-sendable value through `serializeMessage` (`send_message`), and the
+// `receive`/`receive_raw` surface decodes it through the generic
+// `receiveMessage(T)` monomorphized on the annotated message type (the ZIR
+// backend reconstructs `T` from the receive scrutinee's result type). The
+// scalar fast-paths (`receive_i64` … `receive_atom`) stay byte-compatible.
 // ============================================================
 
 /// A bit-copyable scalar leaf of the message grammar: `int`/`float`/`bool`
@@ -3855,12 +3872,76 @@ fn walkerListCell(comptime T: type) ?type {
     }
 }
 
+/// If `T` is the runtime representation of a Zap map value —
+/// `?*const Map(K, V)` — return the `Map(K, V)` cell type, else null.
+/// Structurally recognized (inline ARC header + `KeyType`/`ValueType` decls +
+/// the `capacity`/`entry_cap` fields) so it never hard-codes a library type
+/// name; the `capacity` field (vs `List`'s `cap`) and the `KeyType`/
+/// `ValueType` decls (vs `List`'s `Element`) distinguish `Map` from `List`.
+fn walkerMapCell(comptime T: type) ?type {
+    switch (@typeInfo(T)) {
+        .optional => |optional_info| switch (@typeInfo(optional_info.child)) {
+            .pointer => |pointer_info| {
+                if (pointer_info.size != .one) return null;
+                const Cell = pointer_info.child;
+                if (@typeInfo(Cell) != .@"struct") return null;
+                if (!@hasDecl(Cell, "KeyType") or !@hasDecl(Cell, "ValueType")) return null;
+                if (!@hasField(Cell, "header") or !@hasField(Cell, "len") or !@hasField(Cell, "capacity")) return null;
+                return Cell;
+            },
+            else => return null,
+        },
+        else => return null,
+    }
+}
+
+/// If `T` is a by-value user-struct message (a plain Zig `struct` value, the
+/// runtime shape a Zap `%Foo{...}` value takes — NOT boxed, no ARC header),
+/// return `T`, else null. A `ProtocolBox` (erased closure/existential fat
+/// pointer) and a `List`/`Map` cell are both `.@"struct"` at the Zig level
+/// but are NOT walkable user structs, so they are excluded here (the cells
+/// are only ever seen through their `?*const Cell` optional-pointer shape by
+/// `walkerListCell`/`walkerMapCell`; the guard is belt-and-suspenders).
+fn walkerStructType(comptime T: type) ?type {
+    if (@typeInfo(T) != .@"struct") return null;
+    if (comptime ArcRuntime.isProtocolBox(T)) return null;
+    if (comptime ArcRuntime.hasInlineArcHeader(T)) return null;
+    return T;
+}
+
 /// Whether `T` is copyable by the deep-copy walker (keep in exact agreement
-/// with the three arms of `measureValue`/`writeValue`/`deserializeValue`).
+/// with the arms of `measureValue`/`writeValue`/`deserializeValue`). A struct
+/// is sendable iff every field is; a map iff both key and value types are.
 fn isWalkerSendable(comptime T: type) bool {
     if (isWalkerScalar(T) or T == []const u8) return true;
     if (walkerListCell(T)) |Cell| return isWalkerSendable(Cell.Element);
+    if (walkerMapCell(T)) |Cell| return isWalkerSendable(Cell.KeyType) and isWalkerSendable(Cell.ValueType);
+    if (walkerStructType(T)) |StructType| {
+        inline for (@typeInfo(StructType).@"struct".fields) |field| {
+            if (!isWalkerSendable(field.type)) return false;
+        }
+        return true;
+    }
     return false;
+}
+
+/// Release an owned value the deep-copy walker reconstructed, used on the
+/// deserialize ERROR path to free the fields/entries materialized so far.
+/// Scalars and `String`s own no ARC resource (a reconstructed `String` is an
+/// arena copy, freed wholesale with the arena); `List`/`Map` cells are
+/// deep-released; a struct recurses over its fields. Mirrors the sendable
+/// arms exactly.
+fn releaseWalkerValue(comptime T: type, value: T) void {
+    if (comptime isWalkerScalar(T) or T == []const u8) return;
+    if (comptime walkerListCell(T)) |Cell| return Cell.release(value);
+    if (comptime walkerMapCell(T)) |Cell| return Cell.release(value);
+    if (comptime walkerStructType(T)) |StructType| {
+        inline for (@typeInfo(StructType).@"struct".fields) |field| {
+            releaseWalkerValue(field.type, @field(value, field.name));
+        }
+        return;
+    }
+    comptime unreachable;
 }
 
 /// Bound on message-graph nesting depth. A well-formed message is a finite
@@ -3879,7 +3960,12 @@ const message_walker_max_depth: u32 = 4096;
 /// two-pass copier). Reads the source graph only.
 fn measureValue(comptime T: type, value: T, depth: u32) usize {
     if (depth > message_walker_max_depth) @panic("message walker: message graph too deep or cyclic");
-    if (comptime isWalkerScalar(T) or T == []const u8) return @sizeOf(T);
+    if (comptime isWalkerScalar(T)) return @sizeOf(T);
+    // `String` is length-prefixed bytes (deep-copy tier — see the module
+    // header): a `u32` byte count followed by the bytes themselves, so the
+    // receiver reconstructs an independent copy rather than aliasing the
+    // sender's (possibly per-process-arena) backing.
+    if (comptime T == []const u8) return @sizeOf(u32) + value.len;
     if (comptime walkerListCell(T)) |Cell| {
         const Element = Cell.Element;
         var total: usize = @sizeOf(u32); // element count
@@ -3892,6 +3978,31 @@ fn measureValue(comptime T: type, value: T, depth: u32) usize {
         }
         return total;
     }
+    if (comptime walkerMapCell(T)) |Cell| {
+        const Key = Cell.KeyType;
+        const Value = Cell.ValueType;
+        var total: usize = @sizeOf(u32); // entry count
+        if (value) |map| {
+            std.debug.assert(!map.isIterCell()); // messages carry materialized maps
+            var index: u32 = 0;
+            while (index < map.len) : (index += 1) {
+                const entry = map.entryAtConst(index);
+                total += measureValue(Key, entry.key, depth + 1);
+                total += measureValue(Value, entry.value, depth + 1);
+            }
+        }
+        return total;
+    }
+    if (comptime walkerStructType(T)) |StructType| {
+        // A struct's shape is fully comptime-known from `T` (like a list's
+        // element TYPE), so no runtime tag/count is stored — just each field
+        // in declaration order.
+        var total: usize = 0;
+        inline for (@typeInfo(StructType).@"struct".fields) |field| {
+            total += measureValue(field.type, @field(value, field.name), depth + 1);
+        }
+        return total;
+    }
     @compileError("message walker: unsendable type `" ++ @typeName(T) ++ "`");
 }
 
@@ -3900,11 +4011,19 @@ fn measureValue(comptime T: type, value: T, depth: u32) usize {
 /// no source refcount is touched.
 fn writeValue(comptime T: type, value: T, buffer: []u8, cursor: *usize, depth: u32) void {
     if (depth > message_walker_max_depth) @panic("message walker: message graph too deep or cyclic");
-    if (comptime isWalkerScalar(T) or T == []const u8) {
+    if (comptime isWalkerScalar(T)) {
         var scratch: T = value;
         const bytes = std.mem.asBytes(&scratch);
         @memcpy(buffer[cursor.* .. cursor.* + bytes.len], bytes);
         cursor.* += bytes.len;
+        return;
+    }
+    if (comptime T == []const u8) {
+        // Length-prefixed bytes: a `u32` count then the bytes themselves.
+        const byte_length: u32 = @intCast(value.len);
+        writeValue(u32, byte_length, buffer, cursor, depth);
+        @memcpy(buffer[cursor.* .. cursor.* + value.len], value);
+        cursor.* += value.len;
         return;
     }
     if (comptime walkerListCell(T)) |Cell| {
@@ -3923,6 +4042,31 @@ fn writeValue(comptime T: type, value: T, buffer: []u8, cursor: *usize, depth: u
         }
         return;
     }
+    if (comptime walkerMapCell(T)) |Cell| {
+        const Key = Cell.KeyType;
+        const Value = Cell.ValueType;
+        var count: u32 = 0;
+        if (value) |map| {
+            std.debug.assert(!map.isIterCell());
+            count = map.len;
+        }
+        writeValue(u32, count, buffer, cursor, depth); // entry count metadata
+        if (value) |map| {
+            var index: u32 = 0;
+            while (index < count) : (index += 1) {
+                const entry = map.entryAtConst(index);
+                writeValue(Key, entry.key, buffer, cursor, depth + 1);
+                writeValue(Value, entry.value, buffer, cursor, depth + 1);
+            }
+        }
+        return;
+    }
+    if (comptime walkerStructType(T)) |StructType| {
+        inline for (@typeInfo(StructType).@"struct".fields) |field| {
+            writeValue(field.type, @field(value, field.name), buffer, cursor, depth + 1);
+        }
+        return;
+    }
     comptime unreachable; // measureValue already rejected everything else
 }
 
@@ -3931,9 +4075,8 @@ const MessageBlobReader = struct {
     bytes: []const u8,
     position: usize = 0,
 
-    /// Read `@sizeOf(S)` raw bytes and reinterpret them as an `S`. For a
-    /// `String` (`[]const u8`) this reconstructs the shared slice header
-    /// (pointer + length) into the immutable program-lifetime arena.
+    /// Read `@sizeOf(S)` raw bytes and reinterpret them as a bit-copyable
+    /// scalar `S` (`int`/`float`/`bool`, atoms as `u32`).
     fn readScalar(reader: *MessageBlobReader, comptime S: type) error{CorruptMessage}!S {
         const size = @sizeOf(S);
         if (reader.position + size > reader.bytes.len) return error.CorruptMessage;
@@ -3941,6 +4084,23 @@ const MessageBlobReader = struct {
         @memcpy(std.mem.asBytes(&value), reader.bytes[reader.position .. reader.position + size]);
         reader.position += size;
         return value;
+    }
+
+    /// Reconstruct a length-prefixed `String` (`[]const u8`) as a fresh,
+    /// RECEIVER-OWNED copy: read the `u32` byte count, then copy the bytes
+    /// OUT of the blob into a `runtime_arena` allocation the receiver owns.
+    /// The copy is mandatory for soundness — the blob is freed right after
+    /// the decode, and aliasing the sender's original backing would dangle
+    /// once that (per-process in Phase 3) arena is reclaimed. The empty
+    /// string needs no allocation.
+    fn readStringCopy(reader: *MessageBlobReader) error{ OutOfMemory, CorruptMessage }![]const u8 {
+        const byte_length = try reader.readScalar(u32);
+        if (byte_length == 0) return &.{};
+        if (reader.position + byte_length > reader.bytes.len) return error.CorruptMessage;
+        const destination = runtime_arena.allocator().alloc(u8, byte_length) catch return error.OutOfMemory;
+        @memcpy(destination, reader.bytes[reader.position .. reader.position + byte_length]);
+        reader.position += byte_length;
+        return destination;
     }
 };
 
@@ -3950,8 +4110,11 @@ const MessageBlobReader = struct {
 /// partially-built cell (and the elements already placed in it) are
 /// released before the error propagates — no leak on the error path.
 fn deserializeValue(comptime T: type, reader: *MessageBlobReader) error{ OutOfMemory, CorruptMessage }!T {
-    if (comptime isWalkerScalar(T) or T == []const u8) {
+    if (comptime isWalkerScalar(T)) {
         return try reader.readScalar(T);
+    }
+    if (comptime T == []const u8) {
+        return try reader.readStringCopy();
     }
     if (comptime walkerListCell(T)) |Cell| {
         const Element = Cell.Element;
@@ -3969,6 +4132,56 @@ fn deserializeValue(comptime T: type, reader: *MessageBlobReader) error{ OutOfMe
             list.dataPtr()[index] = element;
         }
         return list;
+    }
+    if (comptime walkerMapCell(T)) |Cell| {
+        const Key = Cell.KeyType;
+        const Value = Cell.ValueType;
+        const count = try reader.readScalar(u32);
+        if (count == 0) return null; // the empty-map sentinel (`Map.new()` == null)
+        var map: ?*const Cell = null;
+        // The partially-built map (and every entry moved into it) is released
+        // if a later entry fails to decode — no leak on the error path.
+        errdefer if (map) |built| Cell.release(built);
+        var index: u32 = 0;
+        while (index < count) : (index += 1) {
+            const key = try deserializeValue(Key, reader);
+            const value = deserializeValue(Value, reader) catch |err| {
+                // The key is owned but not yet moved into the map — free it.
+                releaseWalkerValue(Key, key);
+                return err;
+            };
+            // `put_owned_unchecked` MOVES the fresh rc=1 key/value in without a
+            // per-entry retain — the correct adoption primitive for a uniquely
+            // owned accumulator (a `put` would clone-on-shared and double-own).
+            const grown = Cell.put_owned_unchecked(map, key, value);
+            if (grown == null) {
+                releaseWalkerValue(Key, key);
+                releaseWalkerValue(Value, value);
+                return error.OutOfMemory;
+            }
+            map = grown;
+        }
+        return map;
+    }
+    if (comptime walkerStructType(T)) |StructType| {
+        const fields = @typeInfo(StructType).@"struct".fields;
+        var reconstructed: StructType = undefined;
+        // Track how many fields are materialized so a mid-struct failure
+        // releases exactly those owned fields (a nested List/Map/struct) and
+        // leaks nothing.
+        var materialized_field_count: usize = 0;
+        errdefer {
+            inline for (fields, 0..) |field, field_index| {
+                if (field_index < materialized_field_count) {
+                    releaseWalkerValue(field.type, @field(reconstructed, field.name));
+                }
+            }
+        }
+        inline for (fields, 0..) |field, field_index| {
+            @field(reconstructed, field.name) = try deserializeValue(field.type, reader);
+            materialized_field_count = field_index + 1;
+        }
+        return reconstructed;
     }
     @compileError("message walker: unsendable type `" ++ @typeName(T) ++ "`");
 }
@@ -4027,7 +4240,7 @@ test "message walker: List(i64) deep-copies to an independent rc=1 cell" {
     List(i64).release(copy);
 }
 
-test "message walker: List(String) shares immutable arena bytes; copy outlives source drop" {
+test "message walker: List(String) deep-copies element bytes into receiver-owned storage" {
     ensureMemoryStartup();
     var source: ?*const List([]const u8) = List([]const u8).new_empty(2);
     source = List([]const u8).push(source, "alpha");
@@ -4042,11 +4255,47 @@ test "message walker: List(String) shares immutable arena bytes; copy outlives s
     try std.testing.expect(std.mem.eql(u8, "beta", List([]const u8).get(copy, 1)));
     try std.testing.expect(@intFromPtr(source.?) != @intFromPtr(copy.?));
 
-    // Drop the source; the copy's immutable arena/rodata strings stay valid.
+    // The element strings were copied OUT of the source into arena storage the
+    // receiver owns — a distinct backing from the source's, not a shared slice.
+    try std.testing.expect(List([]const u8).get(copy, 0).ptr != List([]const u8).get(source, 0).ptr);
+
+    // Drop the source; the copy's strings stay valid (independent backing).
     List([]const u8).release(source);
     try std.testing.expect(std.mem.eql(u8, "beta", List([]const u8).get(copy, 1)));
 
     List([]const u8).release(copy);
+}
+
+test "message walker: String bytes are deep-copied — receiver survives freeing the sender's backing (UAF guard)" {
+    ensureMemoryStartup();
+    // A DYNAMICALLY-constructed string in a caller-owned heap buffer — the
+    // shape a `String.concat`/interpolation/IO-read result has, whose backing
+    // (unlike a `.rodata` literal) is NOT program-lifetime and would be
+    // reclaimed when its owning process's arena is torn down (Phase 3).
+    const dynamic_backing = try std.testing.allocator.alloc(u8, 5);
+    @memcpy(dynamic_backing, "hello");
+    const source: []const u8 = dynamic_backing;
+
+    // Serialize copies the bytes INTO the blob (the soundness contract).
+    const blob = try serializeMessage([]const u8, source, std.testing.allocator);
+    defer std.testing.allocator.free(blob);
+
+    // Now scribble and FREE the sender's backing BEFORE the receiver decodes.
+    // A share-the-slice-header walker would leave the blob pointing here and
+    // the reconstructed string would read this freed/garbage memory (the
+    // use-after-free this test guards against).
+    @memset(dynamic_backing, 0xAA);
+    std.testing.allocator.free(dynamic_backing);
+
+    // The receiver reconstructs from the blob's OWN copy of the bytes.
+    const copy = try deserializeMessage([]const u8, blob);
+    try std.testing.expect(std.mem.eql(u8, "hello", copy));
+
+    // Empty strings round-trip without allocating.
+    const empty_blob = try serializeMessage([]const u8, "", std.testing.allocator);
+    defer std.testing.allocator.free(empty_blob);
+    const empty_copy = try deserializeMessage([]const u8, empty_blob);
+    try std.testing.expectEqual(@as(usize, 0), empty_copy.len);
 }
 
 test "message walker: empty and null List round-trip to the empty sentinel" {
@@ -4088,6 +4337,85 @@ test "message walker: nested List(List(i64)) deep-copies every level independent
     try std.testing.expectEqual(@as(i64, 8), List(i64).get(copy_inner, 1));
 
     ListOfList.release(copy);
+}
+
+test "message walker: Map(u32, i64) deep-copies to an independent rc=1 cell" {
+    ensureMemoryStartup();
+    const IntMap = Map(u32, i64);
+    var source: ?*const IntMap = null;
+    source = IntMap.put(source, 1, 100);
+    source = IntMap.put(source, 2, 200);
+    source = IntMap.put(source, 3, 300);
+
+    const blob = try serializeMessage(?*const IntMap, source, std.testing.allocator);
+    defer std.testing.allocator.free(blob);
+    const copy = try deserializeMessage(?*const IntMap, blob);
+
+    // Fidelity: every entry survives the round-trip.
+    try std.testing.expectEqual(@as(u32, 3), copy.?.len);
+    try std.testing.expectEqual(@as(i64, 100), IntMap.get(copy, 1, -1));
+    try std.testing.expectEqual(@as(i64, 200), IntMap.get(copy, 2, -1));
+    try std.testing.expectEqual(@as(i64, 300), IntMap.get(copy, 3, -1));
+
+    // Independence: a distinct cell with its own rc == 1.
+    try std.testing.expect(@intFromPtr(source.?) != @intFromPtr(copy.?));
+    if (comptime refcount_v1_active) {
+        try std.testing.expectEqual(@as(u32, 1), copy.?.header.count());
+        try std.testing.expectEqual(@as(u32, 1), source.?.header.count());
+    }
+
+    // Dropping the sender's original must NOT affect the receiver's copy.
+    IntMap.release(source);
+    try std.testing.expectEqual(@as(i64, 200), IntMap.get(copy, 2, -1));
+
+    IntMap.release(copy);
+}
+
+test "message walker: a struct of scalar+String+List+Map deep-copies by value, independently" {
+    ensureMemoryStartup();
+    // The task's "a struct containing these" case: a by-value struct whose
+    // fields span every sendable shape.
+    const Payload = struct {
+        count: i64,
+        label: []const u8,
+        items: ?*const List(i64),
+        table: ?*const Map(u32, i64),
+    };
+
+    var items: ?*const List(i64) = List(i64).new_empty(2);
+    items = List(i64).push(items, 11);
+    items = List(i64).push(items, 22);
+    var table: ?*const Map(u32, i64) = null;
+    table = Map(u32, i64).put(table, 7, 70);
+
+    const source = Payload{ .count = 5, .label = "payload", .items = items, .table = table };
+
+    const blob = try serializeMessage(Payload, source, std.testing.allocator);
+    defer std.testing.allocator.free(blob);
+    const copy = try deserializeMessage(Payload, blob);
+
+    // Fidelity across all field kinds.
+    try std.testing.expectEqual(@as(i64, 5), copy.count);
+    try std.testing.expect(std.mem.eql(u8, "payload", copy.label));
+    try std.testing.expectEqual(@as(u32, 2), copy.items.?.len);
+    try std.testing.expectEqual(@as(i64, 22), List(i64).get(copy.items, 1));
+    try std.testing.expectEqual(@as(i64, 70), Map(u32, i64).get(copy.table, 7, -1));
+
+    // Independence: the owned child cells are distinct from the source's.
+    try std.testing.expect(@intFromPtr(source.items.?) != @intFromPtr(copy.items.?));
+    try std.testing.expect(@intFromPtr(source.table.?) != @intFromPtr(copy.table.?));
+
+    // Drop the ENTIRE source graph; the receiver's copy stays intact — proving
+    // every nested level was copied, not aliased.
+    List(i64).release(source.items);
+    Map(u32, i64).release(source.table);
+    try std.testing.expectEqual(@as(i64, 22), List(i64).get(copy.items, 1));
+    try std.testing.expectEqual(@as(i64, 70), Map(u32, i64).get(copy.table, 7, -1));
+
+    // Release the copy's owned children (the struct itself is by value, so it
+    // owns no cell of its own — only its List/Map fields).
+    List(i64).release(copy.items);
+    Map(u32, i64).release(copy.table);
 }
 
 /// `:zig.ProcessRuntime.*` — the intrinsic bridge behind `lib/process.zap`.

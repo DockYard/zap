@@ -291,6 +291,21 @@ V11 by advancing the compile past the earlier abort. Out of concurrency scope; l
   for receiver-side adoption — replacing the Phase 1 kernel test-manager vtable (not layering
   over it) per the no-fallbacks rule; `src/runtime/concurrency/process.zig`'s "Manager
   binding" module doc cites this item back.
+  - **Realized as serialize-to-blob (2 copies), NOT copy-into-fragment + O(1)-adopt — and this
+    is a first-class finding, not an expedient.** A Zap ARC `List(T)`/`Map(K,V)` cell is a
+    SINGLE CONTIGUOUS allocation obtained through `c_allocator`/libc `malloc`
+    (`src/runtime.zig`, the `List`/`Map` cell `bufferAlloc` — "Layout (single contiguous
+    allocation through `c_allocator`)"). A live ARC cell therefore CANNOT be relocated
+    byte-for-byte into a neutral envelope-pool fragment and still be freed through the normal
+    ARC release path (release recomputes the buffer address from the cell pointer and hands it
+    back to `c_allocator`; a cell sitting in a pool fragment has no such `c_allocator` block).
+    So Phase 2 serializes the value graph into a flat neutral blob on the sender and
+    RECONSTRUCTS fresh rc=1 cells on the receiver (`serializeMessage`/`deserializeMessage` in
+    `src/runtime.zig`) — two full copies (serialize + reconstruct). `String`s are copied by
+    value into the blob for the same reason (their backing is arena memory that becomes
+    per-process in Phase 3; aliasing a sender slice would dangle — see §5.4 copy-out slices).
+    The 2-copy cost is exactly what item **2.8**'s copy-p99-vs-size harness feeds into the E6
+    crossover measurement.
 - **2.5** Safepoints, all three layers, comptime-gated (`runtime_concurrency` off → zero
   emission): alloc piggyback; bare back-edge polls only in alloc-free/call-free loops;
   per-scheduler flag-only watchdog.
@@ -325,6 +340,20 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
   semantics per model (rc=1 / bulk splice / range registration / free-at-last-use) — **manager
   ABI minor bump** (detach/adopt entry points + envelope-domain semantics) per spec §2.3,
   spec doc updated in the same commits.
+  - **R4 (region re-parent / O(1) move) is directly threatened by the Phase-2 finding in 2.4,
+    confirmed by inspection.** The O(1) "move" path (research.md §6.4 / risk R4 at
+    research.md:237; zap-concurrency-research.md §2.4) re-parents a unique, region-closed value
+    graph into the receiver's manager WITHOUT moving bytes — the receiver's manager adopts the
+    sender's slab set. But because Phase-2 ARC `List`/`Map` backing is a single `c_allocator`
+    block per cell (2.4), there is no relocatable region to hand over: an O(1) detach/adopt has
+    no `c_allocator`-owned span it can re-parent, so today's cross-process move DEGRADES TO THE
+    2-copy serialize path. Making the O(1) move real requires either (a) relocatable/arena-
+    backed container buffers carved from a detachable region the receiver's manager can adopt
+    wholesale, or (b) a different move mechanism entirely (page-splice for BULK_OR_NEVER, range
+    registration for TRACED). The `detach`/`adopt` ABI entry points added here MUST encode which
+    models can O(1)-adopt and which fall back to copy (zap-concurrency-research.md §2.4: "the
+    verifier and docs must say so"); P2-J9/item **2.8**'s E6 measurement quantifies the 2-copy
+    cost this fallback pays until then.
 - **3.4** ORC manager: `src/memory/orc/manager.zig` + stdlib adapter; verify the
   shares-REFCOUNTED-specialization hypothesis (cycle-root buffering entirely inside `release`);
   cycle-collection at yield points only.
