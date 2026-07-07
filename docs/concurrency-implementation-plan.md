@@ -309,6 +309,27 @@ V11 by advancing the compile past the earlier abort. Out of concurrency scope; l
 - **2.5** Safepoints, all three layers, comptime-gated (`runtime_concurrency` off → zero
   emission): alloc piggyback; bare back-edge polls only in alloc-free/call-free loops;
   per-scheduler flag-only watchdog.
+  - **Landed (P2-J6, 2026-07-07).** ZIR-builder emission wired to the kernel via
+    `abi.zap_proc_safepoint_slow` → `ProcessContext.reductionSafepoint` (shared slow path:
+    yields on kill / watchdog / a co-runnable peer, else returns switch-free so a sole CLBG
+    hot loop pays no fiber switch). Layer 2 = a loop-local reduction counter LLVM promotes to
+    a register (`subs`/`cbz` per iteration) at every LOOPIFIED back-edge, plus the shared
+    global counter (`procReductionTick`) at every MUSTTAIL back-edge (a TCO-safe frame has no
+    promotable slot). Layer 1 rides `procReductionTick` in `allocAny`/`bufferAlloc`. Layer 3
+    (watchdog flag) honored in the slow path. **Correction to the revision-1 emphasis:** the
+    poll is emitted at EVERY loopified/musttail back-edge, not "only in alloc-free/call-free
+    loops." Rationale, measured: (a) an IR-level "no call" test is unusable — Zap lowers even
+    `a - b` and `Math.sqrt` to `call_named` pre-inline, so it disqualifies essentially every
+    loop; (b) Zap `list_cons`/map growth allocate through an amortized `bufferAlloc`, so an
+    allocating loop excluded from layer 2 and left to the layer-1 piggyback is polled only
+    O(log n) times — unsound. The register poll is cheap enough (2 instructions, hidden in
+    FP-heavy bodies) to ride every loop. **E2 PASS** (kill criterion not tripped): nbody −2%,
+    spectral-norm −2% (within noise; beats Go's 7.8%); non-gating tight-loop regressions
+    fannkuch +10–11%, mandelbrot +3% reported honestly with unrolling / force-loopify-musttail
+    as documented follow-up mitigations. Zero-cost-OFF proven byte-identical (`__text` SHA).
+    Numbers: `docs/concurrency-bench-results.md` § E2. Latency bound (`scheduler.zig` module
+    doc): ≤ one reduction budget of the slowest polled loop — all Zap loops are tail-recursive
+    and now polled; the residual un-polled code is bounded straight-line / non-tail chains.
 - **2.6** Verifier passes v1: no-borrowed-at-send, no-shared-at-send, use-after-move-across-
   send (extends the existing move checker). Compile-fail diagnostics via `zir-test` until Zest
   supports compile-fail.

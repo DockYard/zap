@@ -3544,6 +3544,17 @@ const ZapConcurrencyKernel = struct {
         timeout_nanoseconds: u64,
     ) callconv(.c) i32;
     extern fn zap_proc_dead_letter_unexpected(process: *anyopaque) callconv(.c) noreturn;
+
+    // P2-J6 three-layer cooperative safepoints (plan item 2.5). The
+    // per-quantum reduction budget the scheduler publishes (`_budget`,
+    // read-only here — the layer-2 loop-local counter's seed) and the
+    // layer-1 alloc-piggyback running counter (`_remaining`), mirrored from
+    // `src/runtime/concurrency/process.zig`'s `pub export var`s. The slow
+    // path (`zap_proc_safepoint_slow`) is the shared yield point for both
+    // layers; it takes no handle (it resolves the current process itself).
+    extern var zap_proc_reductions_budget: u32;
+    extern var zap_proc_reductions_remaining: u32;
+    extern fn zap_proc_safepoint_slow() callconv(.c) void;
 };
 
 /// Gated entry-prologue bootstrap: initialize the binary-wide
@@ -5970,6 +5981,14 @@ pub const ArcRuntime = struct {
     /// `Arc(T)` allocation now flows through the manager's vtable so
     /// tracking managers can observe the cell's lifecycle end-to-end.
     pub inline fn allocAny(comptime T: type, allocator: std.mem.Allocator, value: T) *T {
+        // P2-J6 layer-1 alloc piggyback (plan item 2.5): one reduction per
+        // ARC-cell allocation. Comptime-elided with the concurrency gate OFF
+        // (zero cost). This is the single entry for struct/tuple/union/box/
+        // closure cells (it dispatches to `dispatcherAllocImpl` for the
+        // refcounted case), so every non-List/Map aggregate construction in
+        // an allocating loop reaches a safepoint here rather than needing the
+        // layer-2 back-edge poll.
+        Kernel.procReductionTick();
         // Phase 6: under no-REFCOUNT_V1 the slab pool's side-table
         // refcount layout has no semantic meaning, but the value
         // ITSELF still needs heap-backed storage so the indirect-
@@ -8742,6 +8761,14 @@ pub fn List(comptime T: type) type {
         /// region is left UNINITIALISED — callers fill the populated
         /// prefix before returning. Refcount starts at 1.
         fn bufferAlloc(capacity_arg: u32, len_arg: u32) ?*Self {
+            // P2-J6 layer-1 alloc piggyback (plan item 2.5): one reduction
+            // per List/Map cell allocation. This is the contiguous-cell
+            // allocation path (plan §2.4) that List/Map construction and the
+            // COW retaining-clone slow path go through — the safepoint every
+            // `list_init`/`list_cons`/`map_init`-containing loop (which the
+            // layer-2 classifier excludes from the back-edge poll) reaches.
+            // Comptime-elided with the concurrency gate OFF (zero cost).
+            Kernel.procReductionTick();
             std.debug.assert(len_arg <= capacity_arg);
             const allocator = std.heap.c_allocator;
             const align_v = comptime bufferAlign();
@@ -13877,6 +13904,95 @@ test "Simd runtime shuffle delegates to Zig @shuffle" {
 }
 
 pub const Kernel = struct {
+    // ---------------------------------------------------------------------
+    // P2-J6 — three-layer cooperative safepoints (plan item 2.5)
+    //
+    // These are the runtime side of the compiler-emitted preemption
+    // safepoints. Every extern reference is guarded by
+    // `if (comptime !runtime_concurrency_active)` so that with the gate OFF
+    // (the source default, and what host `zig build test` compiles) the
+    // `zap_proc_*` symbols are comptime-dead and no object references them —
+    // the plan §3 zero-cost guarantee. With the gate ON the ZIR builder
+    // emits `procReductionSeed`/`procBackedgePoll` at alloc-free loopified
+    // back-edges (layer 2), while the allocation hot path and the musttail
+    // tail-call back-edge call `procReductionTick` (layer 1, and the musttail
+    // form of layer 2); all are `inline` so the fast path folds into the
+    // caller and only the rare slow path is an out-of-line call.
+    // ---------------------------------------------------------------------
+
+    /// Layer-2 seed: the current per-quantum reduction budget, the initial
+    /// (and re-arm) value of the loop-local reduction counter the ZIR
+    /// builder emits at an alloc-free loop's back-edge. Clamped to ≥ 1 so
+    /// the emitted `counter - 1` never underflows even if a budget of 0 were
+    /// ever published. One relaxed global load; inlines at the loop
+    /// preheader (once) and the reseed arm (rare).
+    pub inline fn procReductionSeed() u32 {
+        if (comptime !runtime_concurrency_active) return 1;
+        const budget = @atomicLoad(u32, &ZapConcurrencyKernel.zap_proc_reductions_budget, .monotonic);
+        return if (budget == 0) 1 else budget;
+    }
+
+    /// Shared slow path for layers 1 and 2: entered when a reduction counter
+    /// reaches zero (a quantum's worth of reductions elapsed). Yields the
+    /// quantum when preemption can matter (kill / watchdog / a co-runnable
+    /// peer) and otherwise returns switch-free — see
+    /// `abi.zap_proc_safepoint_slow`. Out-of-line by design: the common case
+    /// is the counter NOT reaching zero, so this call is not on the hot path.
+    pub inline fn procSafepointSlow() void {
+        if (comptime !runtime_concurrency_active) return;
+        ZapConcurrencyKernel.zap_proc_safepoint_slow();
+    }
+
+    /// A reduction on the shared global counter — the safepoint mechanism
+    /// for sites WITHOUT a persistent loop frame to hold a register-local
+    /// counter. Two callers (plan item 2.5):
+    ///   * Layer-1 alloc piggyback: one reduction per cell allocation, from
+    ///     `ArcRuntime.allocAny` / the List/Map `bufferAlloc`. Every
+    ///     allocating loop already calls the manager, so this rides that call
+    ///     at near-zero cost (BEAM counts allocations; HotSpot checks at TLAB
+    ///     allocation).
+    ///   * Layer-2 musttail form: the tail-call back-edge of a TCO-safe
+    ///     self-recursive function, which reuses its stack frame (no
+    ///     loop-local slot LLVM could promote), so its poll rides this shared
+    ///     counter instead of the register-local `procBackedgePoll`.
+    /// A relaxed global decrement; the slow path fires once per quantum-budget
+    /// reductions. `n <= 1` (rather than `== 0`) guards the decrement so the
+    /// counter never stores 0 and never underflows — the slow path refreshes
+    /// it from the budget.
+    pub inline fn procReductionTick() void {
+        if (comptime !runtime_concurrency_active) return;
+        const n = @atomicLoad(u32, &ZapConcurrencyKernel.zap_proc_reductions_remaining, .monotonic);
+        if (n <= 1) {
+            ZapConcurrencyKernel.zap_proc_safepoint_slow();
+            return;
+        }
+        @atomicStore(u32, &ZapConcurrencyKernel.zap_proc_reductions_remaining, n - 1, .monotonic);
+    }
+
+    /// Layer-2 bare back-edge poll (plan item 2.5, Go #10958). The ZIR
+    /// builder emits ONE call to this at the back-edge of every alloc-free
+    /// loopified loop, threading a pointer to a loop-local `u32` counter it
+    /// allocated in the loop preheader (seeded via `procReductionSeed`).
+    /// Because this is `inline`, Zig consumes the `counter` pointer at
+    /// semantic-analysis time, so the loop-local slot never escapes and LLVM
+    /// promotes it to a register — the emitted hot path is a register
+    /// decrement + `== 0` branch (no per-iteration memory traffic), the key
+    /// to clearing the E2 gate on nbody/spectral-norm. Only when a full
+    /// quantum's worth of reductions has elapsed does control take the
+    /// out-of-line slow path and reseed. `c -% 1` is wrapping only
+    /// defensively: `procReductionSeed` returns ≥ 1 and the reseed restores
+    /// ≥ 1, so `c` is always ≥ 1 here and the subtraction never wraps.
+    pub inline fn procBackedgePoll(counter: *u32) void {
+        if (comptime !runtime_concurrency_active) return;
+        const c = counter.*;
+        const c1 = c -% 1;
+        counter.* = c1;
+        if (c1 == 0) {
+            procSafepointSlow();
+            counter.* = procReductionSeed();
+        }
+    }
+
     /// Generic string conversion used by string interpolation. Strings
     /// pass through untouched; numbers/bools/enums are formatted via the
     /// runtime arena.

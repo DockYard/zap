@@ -67,15 +67,60 @@
 //!
 //! Every quantum starts with a budget in reductions (`Decisions` may vary
 //! it; production uses the configured default). `ProcessContext.yieldCheck`
-//! — the API compiler-inserted safepoints will call from Phase 2 on;
-//! Phase 1 kernel tests call it explicitly — decrements the budget and
-//! yields when it reaches zero, when the watchdog flag is set, or when a
-//! kill is pending. The watchdog is FLAG-ONLY in Phase 1: any thread may
-//! set it (`requestWatchdogPreemption`), the running process observes it
-//! at its next yieldCheck and yields, and the scheduler clears it at the
-//! end of that quantum (one-shot consume). The timer thread that sets it
-//! periodically is Phase 4; tests exercise the seam by setting the flag
-//! directly.
+//! — the Phase 1 kernel-test safepoint — decrements the budget and yields
+//! when it reaches zero, when the watchdog flag is set, or when a kill is
+//! pending. The watchdog is FLAG-ONLY: any thread may set it
+//! (`requestWatchdogPreemption`), the running process observes it at its
+//! next safepoint and yields, and the scheduler clears it at the end of that
+//! quantum (one-shot consume). The timer thread that sets it periodically is
+//! Phase 4; tests exercise the seam by setting the flag directly. Flag-only
+//! is what keeps the watchdog wasm-portable (no signals; Go #36365).
+//!
+//! ### Compiler-emitted safepoints (P2-J6, plan item 2.5)
+//!
+//! From Phase 2 on, COMPILED Zap code reaches this machinery through
+//! `abi.zap_proc_safepoint_slow` → `ProcessContext.reductionSafepoint`, the
+//! shared slow path of a three-layer cooperative-safepoint design the ZIR
+//! builder emits (all comptime-gated on `runtime_concurrency`: OFF ⇒ zero
+//! emission ⇒ the CLBG binaries are byte-for-byte unchanged):
+//!
+//!   * **Layer 2, loopified loops** — a loop-local `u32` reduction counter
+//!     (LLVM promotes it to a register: a `subs`/`cbz` per iteration, no
+//!     per-iteration memory) seeded from `zap_proc_reductions_budget` and
+//!     polled at the loop's back-edge. Emitted for EVERY loopified loop, not
+//!     just statically alloc-free ones: Zap's `list_cons`/map growth
+//!     allocate through an amortized (doubling) `bufferAlloc`, so relying on
+//!     the layer-1 alloc piggyback for allocating loops would leave a
+//!     conses-each-iteration loop polled only O(log n) times — far too
+//!     rarely to bound preemption.
+//!   * **Layer 2, musttail loops** — a TCO-safe self-recursive function
+//!     reuses its frame (no promotable loop-local slot), so its back-edge
+//!     poll (`Kernel.procReductionTick`) rides the shared GLOBAL reduction
+//!     counter `zap_proc_reductions_remaining`.
+//!   * **Layer 1, alloc piggyback** — `procReductionTick` again, one
+//!     reduction per manager cell/buffer allocation (`allocAny`/`bufferAlloc`),
+//!     the safepoint for allocation bursts outside a tail loop.
+//!
+//! The scheduler publishes both counters at quantum entry (`runQuantum`) —
+//! the per-quantum current-process discipline (A.2.4) extended to the
+//! emitted safepoints. `reductionSafepoint` yields only when preemption can
+//! matter (kill / watchdog / a co-runnable peer), so a sole runnable process
+//! (a CLBG hot loop with concurrency compiled on) stays switch-free.
+//!
+//! ### Advertised preemption-latency bound
+//!
+//! Because every Zap loop is a tail-recursive function (loopified or
+//! musttail) and BOTH forms are now polled, preemption latency is bounded by
+//! **one reduction budget's worth of iterations of the slowest polled loop**
+//! (plus one watchdog tick, whichever is larger): a co-runnable peer or a set
+//! watchdog flag is observed at the next budget boundary. The residual
+//! un-polled code is straight-line sequences and NON-tail-recursive call
+//! chains, each bounded by its own finite instruction count / stack depth —
+//! the honest analogue of Go's documented "un-splittable leaf kernel" case,
+//! but narrower here since Zap has no unbounded non-tail loop form. The
+//! separate E7 hazard (a fiber blocking INSIDE a manager call — a GC pause,
+//! a lazy-commit fault) is out of scope for the poll and handled by the
+//! Phase-4 dirty-scheduler handoff.
 //!
 //! ## Spawn (plan 1.4 + A.3: the E1-measured hot path)
 //!
@@ -530,6 +575,39 @@ pub const ProcessContext = struct {
         const watchdog_requested =
             record.scheduler.watchdog_preempt_flag.load(.monotonic);
         if (pcb.preemption_budget == 0 or watchdog_requested or record.pending_kill) {
+            record.yield_reason = .reenqueue;
+            context.execution.yield();
+        }
+    }
+
+    /// The slow path of the compiler-emitted preemption safepoints (plan
+    /// item 2.5, P2-J6) — the three-layer cooperative-safepoint design's
+    /// shared yield point. It is entered when a layer-2 loop-local
+    /// reduction counter (the bare back-edge poll the ZIR builder emits
+    /// into alloc-free loops) or the layer-1 alloc-piggyback counter
+    /// reaches zero, i.e. a full quantum's worth of reductions has elapsed.
+    ///
+    /// Unlike `yieldCheck` (which the Phase 1 kernel tests drive directly
+    /// and which always yields on budget exhaustion), this yields ONLY when
+    /// preemption can matter — a kill is pending (untrappable — the yield
+    /// never returns, the scheduler tears the process down), the flag-only
+    /// watchdog asked (layer 3), or another process is runnable
+    /// (`ready_count > 0`; the running process is dequeued, so any positive
+    /// count is a co-runnable peer). A sole runnable process with no
+    /// watchdog/kill request returns WITHOUT a fiber switch, so a CLBG hot
+    /// loop compiled with concurrency on (the E2 gate) re-arms its counter
+    /// and keeps running rather than burning two switches per quantum.
+    ///
+    /// The layer-1 running counter is refreshed by the C-ABI entry
+    /// (`abi.zap_proc_safepoint_slow` → `refreshReductionCounter`) before
+    /// this runs; the layer-2 loop-local counter is reseeded by the emitted
+    /// code from `zap_proc_reductions_budget` after this returns.
+    pub fn reductionSafepoint(context: *ProcessContext) void {
+        const record = context.record;
+        const scheduler = record.scheduler;
+        const watchdog_requested =
+            scheduler.watchdog_preempt_flag.load(.monotonic);
+        if (record.pending_kill or watchdog_requested or scheduler.ready_count > 0) {
             record.yield_reason = .reenqueue;
             context.execution.yield();
         }
@@ -1343,6 +1421,17 @@ pub const Scheduler = struct {
             scheduler.options.decisions.decision_context,
             scheduler.options.preemption_budget,
         );
+        // P2-J6: publish this quantum's budget to the compiled-code
+        // safepoint counters (plan A.2.4's per-quantum discipline extended
+        // to the ZIR-emitted safepoints). `_budget` seeds the layer-2
+        // loop-local reduction counter the ZIR builder emits at alloc-free
+        // loop back-edges; `_remaining` is the layer-1 alloc-piggyback
+        // running counter the runtime's allocation path decrements. Kept in
+        // lockstep with `pcb.preemption_budget` so the seeded deterministic
+        // mode's budget variation moves every compiled-code preemption
+        // point exactly as it moves the kernel `yieldCheck` path.
+        process_module.zap_proc_reductions_budget = pcb.preemption_budget;
+        process_module.zap_proc_reductions_remaining = pcb.preemption_budget;
         scheduler.emitTrace(.schedule, pcb.pid);
         scheduler.quantum_total += 1;
         scheduler.current_process = pcb;
@@ -2170,6 +2259,183 @@ test "Scheduler: watchdog flag preempts at the next yieldCheck and is consumed o
     try testing.expectEqual(@as(usize, 2), trace_log.countKind(.schedule));
     try testing.expectEqual(@as(usize, 1), trace_log.countKind(.yield));
     try testing.expect(!kernel.scheduler.watchdog_preempt_flag.load(.monotonic));
+    try kernel.expectExactAccounting();
+}
+
+// -- reductionSafepoint (P2-J6 compiled-code safepoint slow path) -----------------
+
+const ReductionProbe = struct {
+    log: *WorkLog,
+    identity: u8,
+    total_steps: usize,
+};
+
+fn reductionSafepointEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *ReductionProbe = @ptrCast(@alignCast(argument.?));
+    var step: usize = 0;
+    while (step < probe.total_steps) : (step += 1) {
+        probe.log.append(probe.identity);
+        context.reductionSafepoint();
+    }
+}
+
+test "Scheduler: reductionSafepoint runs a sole process switch-free (E2 sole-runnable path)" {
+    var trace_log = TestTraceLog{};
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 1000,
+        .trace_hook = TestTraceLog.hook,
+        .trace_context = &trace_log,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var log = WorkLog{};
+    var probe = ReductionProbe{ .log = &log, .identity = 'r', .total_steps = 8 };
+    _ = try kernel.scheduler.spawn(.{
+        .entry = reductionSafepointEntry,
+        .argument = &probe,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    // A sole runnable process with no watchdog/kill request must NOT yield
+    // at reductionSafepoint — it re-arms and runs to completion in ONE
+    // quantum. This is the property the E2 gate depends on: a CLBG hot loop
+    // compiled with concurrency on and no co-runnable peer stays switch-free.
+    try testing.expectEqual(@as(usize, 8), log.count);
+    try testing.expectEqual(@as(usize, 1), trace_log.countKind(.schedule));
+    try testing.expectEqual(@as(usize, 0), trace_log.countKind(.yield));
+    try kernel.expectExactAccounting();
+}
+
+test "Scheduler: reductionSafepoint honors the watchdog flag (layer 3)" {
+    var trace_log = TestTraceLog{};
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        // Budget far larger than the workload: without the watchdog the
+        // process finishes in ONE quantum (see the sole-runnable test).
+        .preemption_budget = 1000,
+        .trace_hook = TestTraceLog.hook,
+        .trace_context = &trace_log,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var log = WorkLog{};
+    var probe = ReductionProbe{ .log = &log, .identity = 'r', .total_steps = 8 };
+    _ = try kernel.scheduler.spawn(.{
+        .entry = reductionSafepointEntry,
+        .argument = &probe,
+        .manager = manager.managerContext(),
+    });
+
+    kernel.scheduler.requestWatchdogPreemption();
+    try kernel.scheduler.runUntilQuiescent();
+
+    // The flag forced a yield at the first reductionSafepoint, was consumed
+    // at that quantum's end, and the process then ran uninterrupted: 2
+    // quanta, 1 forced yield — the wasm-safe flag-only watchdog (layer 3)
+    // reaching the compiled-code safepoint slow path exactly as it reaches
+    // the kernel `yieldCheck` path.
+    try testing.expectEqual(@as(usize, 8), log.count);
+    try testing.expectEqual(@as(usize, 2), trace_log.countKind(.schedule));
+    try testing.expectEqual(@as(usize, 1), trace_log.countKind(.yield));
+    try testing.expect(!kernel.scheduler.watchdog_preempt_flag.load(.monotonic));
+    try kernel.expectExactAccounting();
+}
+
+fn reductionSafepointViaResolutionEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    // Mimics the compiled-code path: reach the safepoint through the ambient
+    // `currentProcessContext` resolver (as `abi.zap_proc_safepoint_slow`
+    // does) rather than the entry-delivered context, so this test covers the
+    // resolution seam the full runtime uses — not just the direct method call.
+    const probe: *ReductionProbe = @ptrCast(@alignCast(argument.?));
+    var step: usize = 0;
+    while (step < probe.total_steps) : (step += 1) {
+        probe.log.append(probe.identity);
+        const resolved = context.record.scheduler.currentProcessContext().?;
+        resolved.reductionSafepoint();
+    }
+}
+
+test "Scheduler: reductionSafepoint via currentProcessContext resolution still interleaves (full-runtime seam)" {
+    var trace_log = TestTraceLog{};
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 1000,
+        .trace_hook = TestTraceLog.hook,
+        .trace_context = &trace_log,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var log = WorkLog{};
+    var probe_a = ReductionProbe{ .log = &log, .identity = 'a', .total_steps = 3 };
+    var probe_b = ReductionProbe{ .log = &log, .identity = 'b', .total_steps = 3 };
+    _ = try kernel.scheduler.spawn(.{
+        .entry = reductionSafepointViaResolutionEntry,
+        .argument = &probe_a,
+        .manager = manager.managerContext(),
+    });
+    _ = try kernel.scheduler.spawn(.{
+        .entry = reductionSafepointViaResolutionEntry,
+        .argument = &probe_b,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    // The ambient-resolution path yields exactly as the direct path does —
+    // the full-runtime `zap_proc_safepoint_slow` seam preserves preemption.
+    try testing.expectEqual(@as(usize, 6), log.count);
+    try testing.expectEqualStrings("ababab", log.recorded());
+    try kernel.expectExactAccounting();
+}
+
+test "Scheduler: reductionSafepoint interleaves co-runnable processes (layer-2 budget preemption)" {
+    var trace_log = TestTraceLog{};
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 1000,
+        .trace_hook = TestTraceLog.hook,
+        .trace_context = &trace_log,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var log = WorkLog{};
+    var probe_a = ReductionProbe{ .log = &log, .identity = 'a', .total_steps = 3 };
+    var probe_b = ReductionProbe{ .log = &log, .identity = 'b', .total_steps = 3 };
+    _ = try kernel.scheduler.spawn(.{
+        .entry = reductionSafepointEntry,
+        .argument = &probe_a,
+        .manager = manager.managerContext(),
+    });
+    _ = try kernel.scheduler.spawn(.{
+        .entry = reductionSafepointEntry,
+        .argument = &probe_b,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    // With a co-runnable peer, each reductionSafepoint yields, so the two
+    // processes interleave step-for-step under production FIFO rather than
+    // one running to completion first ("aaabbb"). This is the deterministic
+    // budget-bounded preemption a compiled alloc-free loop relies on so a
+    // co-runnable process makes progress (plan item 2.5, layer 2).
+    try testing.expectEqual(@as(usize, 6), log.count);
+    try testing.expectEqualStrings("ababab", log.recorded());
     try kernel.expectExactAccounting();
 }
 

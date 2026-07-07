@@ -606,6 +606,17 @@ pub fn build(b: *std.Build) void {
         .install_dir = .prefix,
         .install_subdir = "src/memory",
     });
+    // The concurrency runtime-kernel source unit must ship alongside the
+    // binary (like `src/memory` above): with the `runtime_concurrency` gate
+    // ON the driver compiles it per-target from source
+    // (`concurrency_driver.KERNEL_UNIT_RELATIVE_DIR`), resolved relative to
+    // the installed exe's source root. Without this install, gate-on builds
+    // of a source outside the Zap repo fail with `KernelSourceNotFound`.
+    b.installDirectory(.{
+        .source_dir = b.path("src/runtime/concurrency"),
+        .install_dir = .prefix,
+        .install_subdir = "src/runtime/concurrency",
+    });
 
     const cache_correctness_tests = b.addTest(.{
         .root_module = b.createModule(.{

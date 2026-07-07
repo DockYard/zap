@@ -930,11 +930,57 @@ scheduled for direct TSan coverage in E3's full half (Phase 3).
 
 ## E2 — safepoint overhead
 
-*Reserved — filled in Phase 2. CLBG suite re-run with concurrency compiled ON,
-against the S0.1 baseline table above. Kill criterion: >2–3% regression on
-n-body/spectral-norm → unrolling mitigation first. Alloc-piggyback must be
-≈ 0 on allocating loops; the bare back-edge poll is the number to watch
-(Go's back-edge figure to beat: 7.8% geomean).*
+**VERDICT: PASS (P2-J6, 2026-07-07).** Kill criterion (>2–3% on
+nbody/spectral-norm gate-ON vs gate-OFF) NOT tripped. The three-layer
+cooperative safepoints (comptime-gated on `runtime_concurrency`) clear the
+gate with a wide margin on the CLBG "wins".
+
+Method: quiet-machine INTERLEAVED PAIRED re-baseline (plan item 2.9). For
+each benchmark a gate-OFF and a gate-ON-concurrency-compiled binary were
+built with the SAME fork compiler (`-Doptimize=ReleaseFast`, gate-ON adds
+`-Druntime-concurrency=on`), then run alternately (off, on, off, on, …) in
+one session; paired medians. Load avg during the runs 2.3–3.1 (recorded per
+run); the paired-interleaved discipline cancels shared load. 15 and 25 reps,
+two sessions — deltas stable to ≤1 pt between sessions.
+
+| Benchmark (args)        | gate-OFF | gate-ON | Δ | shape |
+|-------------------------|----------|---------|-----|-------|
+| **nbody** (5,000,000)   | 0.1058 s | 0.1032 s | **−2%** | alloc-free loopified — register poll |
+| **spectral-norm** (2500)| 0.1658 s | 0.1617 s | **−2%** | alloc-free loopified — register poll |
+| mandelbrot (4000)       | 0.5223 s | 0.5425 s | +3% | musttail — global-counter poll |
+| fannkuch-redux (10)     | 0.2355 s | 0.2604 s | +10–11% | very tight loopified — register poll |
+| binarytrees (16)        | 0.1312 s | 0.1335 s | +1% | allocating loopified |
+
+**The kill-criterion loops (nbody, spectral-norm) are within measurement
+noise (±2%) — the loop-local register poll (`subs`/`cbz`, no per-iteration
+memory) is hidden in their FP-heavy loop bodies. This beats Go's 7.8%
+geomean back-edge figure by a wide margin (effectively 0 on these shapes).**
+Verified inline: the emitted nbody `step_loop` poll is `sub xN, xN, #1` +
+`cbz xN, <slow>` with the counter register-promoted; the slow-path
+`bl zap_proc_safepoint_slow` is taken only once per reduction budget.
+
+Non-kill-criterion regressions (honestly reported, NOT gating): fannkuch's
+`reverse_range`/`count_flips` are extremely tight integer/list loops where
+the 2-instruction register poll is a larger fraction of the body (+10–11%);
+mandelbrot's `iter`/`row_loop` are TCO-safe (trivial params) → musttail →
+the poll rides the global reduction counter, whose per-iteration load/store
+costs +3%. Both are the inherent cost of cooperative safepoints on tight
+non-FP loops (the same class of cost Go measured). Gate-OFF these benchmarks
+are byte-for-byte unchanged (proven: nbody `__TEXT,__text` SHA is identical
+pre/post-J6), and the CLBG suite is normally run gate-OFF — the gate-ON
+figure is the "compiled a CLBG kernel WITH preemptive concurrency" scenario.
+
+Documented mitigation for the tight-loop regressions (NOT required — the
+kill criterion passed): loop unrolling to amortize the poll over K
+iterations (Go's mitigation), and forcing loopification of musttail loops
+gate-ON so mandelbrot's poll becomes register-local too. Deferred as a
+follow-up optimization pass; noted in the ledger for whoever picks it up.
+
+Zero-cost-OFF proof (the whole point of the comptime gate): a gate-OFF nbody
+compiled with the post-J6 compiler has a `__TEXT,__text` section SHA-256
+BYTE-IDENTICAL to one compiled with the pre-J6 compiler
+(`5075af40…dbb5ecd`), and carries NO `zap_proc_*`/`reductions`/`safepoint`
+symbols. The CLBG wins are untouched with the gate off.
 
 ## E6 — copy crossover
 

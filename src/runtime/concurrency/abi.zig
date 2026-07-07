@@ -698,6 +698,27 @@ export fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void {
     contextFromHandle(process).yieldCheck();
 }
 
+/// Slow path of the compiler-emitted three-layer preemption safepoints
+/// (plan item 2.5, P2-J6). The ZIR-emitted layer-2 bare back-edge poll
+/// and the runtime's layer-1 alloc piggyback both call this — with NO
+/// process handle — when their reduction counter reaches zero, i.e. a
+/// quantum's worth of reductions has elapsed. It first refreshes the
+/// layer-1 running counter (`refreshReductionCounter`) so allocations made
+/// before the root process is scheduled do not re-enter the slow path on
+/// every call, then, when a process is current, runs the yield-if-warranted
+/// safepoint (`ProcessContext.reductionSafepoint`: yields on kill / watchdog
+/// / a co-runnable peer, else returns switch-free). Unlike
+/// `zap_proc_yield_check`, it resolves the current process itself (the
+/// ambient-lookup companion to the parameter-threaded discipline, matching
+/// `zap_proc_current`) because the emitted safepoint sites cannot thread a
+/// handle through every Zap call frame in Phase 2.
+export fn zap_proc_safepoint_slow() callconv(.c) void {
+    process_module.refreshReductionCounter();
+    if (!runtime_initialized) return;
+    const context = runtime_state.scheduler.currentProcessContext() orelse return;
+    context.reductionSafepoint();
+}
+
 /// C-ABI result of `zap_proc_receive_wait_timeout` (mirrored by the
 /// runtime-side `wait_for_message`). Non-negative domain outcomes.
 pub const ZapProcWaitOutcome = struct {

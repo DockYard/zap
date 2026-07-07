@@ -1050,6 +1050,14 @@ pub const ZirDriver = struct {
     /// `tail_call` to self stores the new args back into the same
     /// slots and emits `repeat`. `null` outside loopification.
     loopify_slots: ?[]u32 = null,
+    /// P2-J6 layer-2 bare back-edge poll (plan item 2.5). When the current
+    /// loopified loop is alloc-free (`streamAllocatesCell` is false for its
+    /// body) and the `runtime_concurrency` gate is ON, this holds the
+    /// pointer Ref of the loop-local `u32` reduction counter allocated in
+    /// the loop preheader. The back-edge (right before the loop's top-level
+    /// `repeat`) emits one `Kernel.procBackedgePoll(<this>)` call. `null`
+    /// outside such a loop (including with the gate OFF — zero emission).
+    loopify_safepoint_slot: ?u32 = null,
     /// Nesting depth of capture contexts (case/switch/if-else bodies).
     /// When > 0, struct_init_typed can't be used because struct_init_field_type
     /// instructions (emitted via addInst) don't enter captured bodies.
@@ -5898,6 +5906,28 @@ pub const ZirDriver = struct {
         var loopify_capture_open = false;
         if (func.loopify) {
             try self.beginLoopification(func);
+            // P2-J6 layer-2 bare back-edge poll (plan item 2.5): with the
+            // concurrency gate ON, seed the loop-local reduction counter in
+            // the preheader (before the capture → outside the `loop` block,
+            // so it runs once per entry) for EVERY loopified loop. The poll
+            // is a register decrement + branch (LLVM promotes the loop-local
+            // counter), so it is cheap enough to ride even allocating loops,
+            // and it MUST: Zap's `list_cons`/`map`-growth allocate through an
+            // amortized (doubling) `bufferAlloc`, so a loop that conses each
+            // iteration hits the layer-1 alloc piggyback only O(log n) times —
+            // far too rarely to bound preemption. Restricting the back-edge
+            // poll to statically alloc-free loops (as an IR-instruction scan
+            // would) therefore leaves genuinely-hot allocating loops
+            // effectively un-polled — an unsound gap this closes. Layer 1
+            // remains as an additional, finer-grained safepoint (and the sole
+            // one for non-loop allocation and musttail-allocating loops). The
+            // CLBG kill-criterion loops (nbody, spectral-norm) are alloc-free
+            // and were already polled, so their measured cost is unchanged.
+            // Gate OFF: nothing is emitted — the CLBG binaries are
+            // byte-for-byte unchanged.
+            if (self.runtime_concurrency) {
+                try self.emitBackedgeSafepointSeed();
+            }
             self.beginCapture();
             loopify_capture_open = true;
         }
@@ -5930,6 +5960,16 @@ pub const ZirDriver = struct {
             // new args into the slots fall through the dispatcher's
             // block and hit this `repeat`, jumping back to the loop
             // header.
+            //
+            // P2-J6 layer-2: the bare back-edge poll goes HERE, immediately
+            // before the top-level `repeat`, so it runs exactly on the
+            // iterating path (matched base cases `ret` before reaching it)
+            // and once per back-edge. It must be at the loop-body top level,
+            // not inside a `cond_br` arm — a `repeat`/poll buried in a branch
+            // is analyzed by that branch and never reaches the loop header.
+            // A no-op when no counter was seeded (gate OFF or an allocating
+            // loop).
+            try self.emitBackedgeSafepointPoll();
             try self.emitRepeat();
             var body_len: u32 = 0;
             const body_ptr = self.endCapture(&body_len);
@@ -5975,6 +6015,48 @@ pub const ZirDriver = struct {
     fn endLoopification(self: *ZirDriver) void {
         if (self.loopify_slots) |slots| self.allocator.free(slots);
         self.loopify_slots = null;
+        self.loopify_safepoint_slot = null;
+    }
+
+    /// Emit a `zap_runtime.Kernel.<name>(args...)` call — the P2-J6 layer-2
+    /// safepoint helpers (`procReductionSeed`, `procBackedgePoll`). Mirrors
+    /// `emitReuseAllocCall`'s import→namespace-field→field-val→call_ref shape.
+    fn emitKernelCall(self: *ZirDriver, name: []const u8, args: []const u32) BuildError!u32 {
+        const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+        if (rt_import == error_ref) return error.EmitFailed;
+        const kernel_ns = emitRuntimeNamespaceField(self.handle, rt_import, runtime_ns.kernel);
+        if (kernel_ns == error_ref) return error.EmitFailed;
+        const fn_ref = zir_builder_emit_field_val(self.handle, kernel_ns, name.ptr, @intCast(name.len));
+        if (fn_ref == error_ref) return error.EmitFailed;
+        const ref = zir_builder_emit_call_ref(self.handle, fn_ref, args.ptr, @intCast(args.len));
+        if (ref == error_ref) return error.EmitFailed;
+        return ref;
+    }
+
+    /// P2-J6 layer-2 preheader emission (plan item 2.5): allocate the loop-
+    /// local `u32` reduction counter and seed it from the current per-quantum
+    /// budget (`Kernel.procReductionSeed`). Emitted ONCE, before the `loop`
+    /// block, so it runs on loop entry rather than every iteration; the
+    /// matching `emitBackedgeSafepointPoll` decrements it at the back-edge.
+    /// The counter pointer is stashed in `loopify_safepoint_slot`.
+    fn emitBackedgeSafepointSeed(self: *ZirDriver) BuildError!void {
+        const u32_type = @intFromEnum(Zir.Inst.Ref.u32_type);
+        const slot = try self.emitAllocMut(u32_type);
+        const seed = try self.emitKernelCall("procReductionSeed", &.{});
+        if (zir_builder_emit_store(self.handle, slot, seed) != 0) return error.EmitFailed;
+        self.loopify_safepoint_slot = slot;
+    }
+
+    /// P2-J6 layer-2 back-edge emission (plan item 2.5): one
+    /// `Kernel.procBackedgePoll(counter)` call at the loop's back-edge, right
+    /// before the top-level `repeat`. Because `procBackedgePoll` is `inline`,
+    /// the counter pointer never escapes and LLVM keeps the counter in a
+    /// register — a register decrement + branch per iteration. A no-op when
+    /// no counter was seeded (gate OFF, or an allocating loop covered by
+    /// layer 1), so it is always safe to call on the loopify back-edge.
+    fn emitBackedgeSafepointPoll(self: *ZirDriver) BuildError!void {
+        const slot = self.loopify_safepoint_slot orelse return;
+        _ = try self.emitKernelCall("procBackedgePoll", &.{slot});
     }
 
     /// Resolve the per-iteration value of param `index` when emitting
@@ -7638,6 +7720,27 @@ pub const ZirDriver = struct {
                             return error.EmitFailed;
                     }
                     return;
+                }
+
+                // P2-J6 layer-2, musttail form (plan item 2.5): the tail_call
+                // IS the loop back-edge for a TCO-safe self-recursive
+                // function. Unlike the loopified path, a musttail reuses the
+                // current stack frame, so there is no persistent loop-local
+                // slot LLVM could promote to a register — the poll therefore
+                // rides the shared GLOBAL reduction counter (`procReductionTick`,
+                // the same counter the layer-1 alloc piggyback uses) rather
+                // than the register-local `procBackedgePoll`. Emitted at every
+                // musttail back-edge when the gate is ON: an alloc-free
+                // musttail loop (e.g. a tight `i64` counter loop) has no other
+                // safepoint and MUST be polled here, and an allocating musttail
+                // loop already covered by layer 1 only pays a redundant
+                // decrement of the same counter (sound, negligible). This is a
+                // non-tail call BEFORE the tail call, so the musttail call
+                // below stays in tail position. Gate OFF: nothing emitted (the
+                // CLBG kill-criterion loops loopify, so this path is not on the
+                // E2-measured hot paths regardless).
+                if (self.runtime_concurrency) {
+                    _ = try self.emitKernelCall("procReductionTick", &.{});
                 }
 
                 // Guaranteed tail call: set always_tail modifier (4) so LLVM

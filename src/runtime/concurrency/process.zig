@@ -136,6 +136,37 @@ pub fn isLegalTransition(from: ProcessState, to: ProcessState) bool {
 /// starting point to be tuned by the E2 gate measurements, not a contract.
 pub const default_preemption_budget: u32 = 4000;
 
+/// The per-quantum reduction budget the compiler-emitted safepoints see
+/// (plan item 2.5, P2-J6). The scheduler publishes it at quantum entry
+/// (`runQuantum`); it seeds the layer-2 bare-back-edge poll's loop-local
+/// reduction counter that the ZIR builder emits into alloc-free loops.
+/// Read-only from compiled code. `pub export` so a ZIR-emitted safepoint
+/// in a user binary links against this symbol; with the concurrency gate
+/// OFF no compiled code references it, so it costs nothing (plan §3
+/// zero-cost guarantee). Homed here — the leaf module both `scheduler`
+/// (writer) and `abi` (the slow-path reader) import — to avoid a
+/// scheduler↔abi import cycle.
+pub export var zap_proc_reductions_budget: u32 = default_preemption_budget;
+
+/// The layer-1 alloc-piggyback running reduction counter (plan item 2.5,
+/// P2-J6). The runtime's allocation hot path decrements it once per cell
+/// allocation and takes the slow path (`zap_proc_safepoint_slow`) when it
+/// reaches zero; the slow path refreshes it from `zap_proc_reductions_budget`
+/// via `refreshReductionCounter`. Distinct from the layer-2 loop-local
+/// counter, which lives in the emitted loop's frame (a register after
+/// LLVM promotion) so a tight numeric loop pays only a register decrement.
+/// `pub export` for the same linkage reason as `zap_proc_reductions_budget`.
+pub export var zap_proc_reductions_remaining: u32 = default_preemption_budget;
+
+/// Refresh the layer-1 alloc running counter to a fresh quantum's budget.
+/// Called by the C-ABI slow path (`zap_proc_safepoint_slow`) — including
+/// when no process is current (allocations during runtime bootstrap reach
+/// the slow path before the root process is scheduled), so pre-process
+/// allocations do not re-enter the slow path on every call.
+pub fn refreshReductionCounter() void {
+    zap_proc_reductions_remaining = zap_proc_reductions_budget;
+}
+
 /// Minimal per-process memory-manager binding for Phase 1 kernel tests.
 /// See the module doc's "Manager binding" section: the real manager-ABI
 /// wiring replaces this vtable in Phase 2 item 2.4 (manifest ARC manager,
