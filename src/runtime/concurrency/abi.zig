@@ -591,6 +591,43 @@ export fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void {
     contextFromHandle(process).yieldCheck();
 }
 
+/// C-ABI result of `zap_proc_receive_wait_timeout` (mirrored by the
+/// runtime-side `wait_for_message`). Non-negative domain outcomes.
+pub const ZapProcWaitOutcome = struct {
+    /// A message is at the mailbox head (a following receive pops it).
+    pub const message_available: i32 = 0;
+    /// The `after` timeout elapsed with no message.
+    pub const timed_out: i32 = 1;
+};
+
+/// Park the calling process until a message is at its mailbox head or
+/// `timeout_nanoseconds` elapses — the `receive … after` timeout
+/// mechanism (plan item 2.3, P2-J3). Returns
+/// `ZapProcWaitOutcome.message_available` (a following
+/// `zap_proc_receive_park` then pops it WITHOUT blocking) or `.timed_out`.
+/// `timeout_nanoseconds == 0` polls once WITHOUT parking (`after 0`). The
+/// wait is NON-consuming; a message that races the deadline wins. If the
+/// process is killed while parked, the call never returns.
+export fn zap_proc_receive_wait_timeout(
+    process: *anyopaque,
+    timeout_nanoseconds: u64,
+) callconv(.c) i32 {
+    const context = contextFromHandle(process);
+    return switch (context.receiveWaitTimeout(timeout_nanoseconds)) {
+        .message_available => ZapProcWaitOutcome.message_available,
+        .timed_out => ZapProcWaitOutcome.timed_out,
+    };
+}
+
+/// Route a mailbox message that matched no `receive` arm to the
+/// non-crashing dead-letter path: record unexpected-message telemetry
+/// (`Scheduler.unexpected_message_total` — never a silent drop) and
+/// terminate the calling process through the kill path (never the
+/// scheduler). Never returns. The keep-alive dead-letter sink is Phase 5.
+export fn zap_proc_dead_letter_unexpected(process: *anyopaque) callconv(.c) noreturn {
+    contextFromHandle(process).deadLetterUnexpected();
+}
+
 // ---------------------------------------------------------------------------
 // Tests — the kernel-side E2E proof of the intrinsic surface. The
 // runtime-side smoke hook (`src/runtime.zig`, `ZAP_CONCURRENCY_SMOKE`)
@@ -848,5 +885,99 @@ test "abi: payloads dead-lettered by receiver teardown are swept at deinit" {
     // its ledger block awaits the deinit sweep (module doc, payload seam).
     try testing.expectEqual(@as(usize, 1), payloadLedgerLiveBlockCount());
     zap_proc_runtime_deinit();
+    try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
+}
+
+// -- receive … after timeout + dead-letter (plan item 2.3, P2-J3) ---------------
+
+/// Probe for the `zap_proc_receive_wait_timeout` integration tests.
+const WaitTimeoutProbe = struct {
+    timeout_nanoseconds: u64 = 0,
+    wait_outcome: i32 = std.math.minInt(i32),
+    finished: bool = false,
+};
+
+fn waitTimeoutNoSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *WaitTimeoutProbe = @ptrCast(@alignCast(argument.?));
+    // No sender: the deadline elapses and the wait reports timed_out.
+    probe.wait_outcome = zap_proc_receive_wait_timeout(process, probe.timeout_nanoseconds);
+    probe.finished = true;
+}
+
+test "abi: zap_proc_receive_wait_timeout with an empty mailbox and after 0 polls without blocking" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+
+    var probe = WaitTimeoutProbe{ .timeout_nanoseconds = 0 };
+    const pid_bits = zap_proc_spawn(waitTimeoutNoSenderEntry, &probe);
+    try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expect(probe.finished);
+    try testing.expectEqual(ZapProcWaitOutcome.timed_out, probe.wait_outcome);
+    // A poll never parks the scheduler thread.
+    try testing.expectEqual(@as(u64, 0), runtime_state.scheduler.statistics().park_count);
+}
+
+test "abi: zap_proc_receive_wait_timeout fires the deadline under the production futex park" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+
+    // A small real-time deadline: the single scheduler idle-parks bounded
+    // by it, wakes on timeout, and fires the waiter.
+    var probe = WaitTimeoutProbe{ .timeout_nanoseconds = 2 * std.time.ns_per_ms };
+    const pid_bits = zap_proc_spawn(waitTimeoutNoSenderEntry, &probe);
+    try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expect(probe.finished);
+    try testing.expectEqual(ZapProcWaitOutcome.timed_out, probe.wait_outcome);
+}
+
+/// Probe for the unexpected-message dead-letter path.
+const DeadLetterProbe = struct {
+    target_bits: u64 = 0,
+    received: bool = false,
+};
+
+fn deadLetterReceiverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *DeadLetterProbe = @ptrCast(@alignCast(argument.?));
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    zap_proc_envelope_free(envelope);
+    probe.received = true;
+    // The message matched no arm: dead-letter it (telemetry) and terminate
+    // THIS process — the scheduler and any other process survive.
+    zap_proc_dead_letter_unexpected(process);
+}
+
+fn deadLetterSenderToEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *DeadLetterProbe = @ptrCast(@alignCast(argument.?));
+    std.debug.assert(zap_proc_send(process, probe.target_bits, "x", 1) == ZapProcStatus.ok);
+}
+
+test "abi: an unexpected message dead-letters with telemetry and does not crash the scheduler" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+
+    var probe = DeadLetterProbe{};
+    const receiver_bits = zap_proc_spawn(deadLetterReceiverEntry, &probe);
+    try testing.expect(receiver_bits != concurrency.Pid.invalid.toBits());
+    probe.target_bits = receiver_bits;
+    const sender_bits = zap_proc_spawn(deadLetterSenderToEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+
+    // The scheduler runs to quiescence — the dead-letter terminates only
+    // the offending process, never the run loop.
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expect(probe.received);
+    const stats = runtime_state.scheduler.statistics();
+    // Non-silent: exactly one unexpected-message dead letter recorded.
+    try testing.expectEqual(@as(u64, 1), stats.unexpected_message_total);
+    // Both processes are gone; the offending one via the kill path.
+    try testing.expectEqual(@as(u32, 0), stats.live_process_count);
+    try testing.expect(stats.kill_total >= 1);
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
 }

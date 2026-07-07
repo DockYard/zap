@@ -3329,6 +3329,7 @@ pub const Parser = struct {
                 return self.parseCaseExpr();
             },
             .keyword_cond => return self.parseCondExpr(),
+            .keyword_receive => return self.parseReceiveExpr(),
             .keyword_for => return self.parseForExpr(),
             .keyword_panic => return self.parsePanicExpr(),
             .keyword_fn => return self.parseAnonymousFunctionExpr(),
@@ -4258,47 +4259,7 @@ pub const Parser = struct {
 
         _ = try self.expect(.arrow);
 
-        // Case arm body: three forms
-        // 1. Same-line expression:  pattern -> expr
-        // 2. Multi-statement block: pattern ->\n  { stmts }
-        // 3. Same-line tuple/map:   pattern -> {:ok, v}  (expression starting with {)
-        var body: []const ast.Stmt = undefined;
-        if (self.check(.newline)) {
-            // After newline: check if next non-newline token is { for braced block
-            self.skipNewlines();
-            if (self.check(.left_brace)) {
-                _ = self.advance();
-                self.skipNewlines();
-                body = try self.parseBlock();
-                self.skipNewlines();
-                _ = try self.expect(.right_brace);
-            } else {
-                // Single expression on next line
-                const expr = try self.parseExpr();
-                const stmts = try self.allocator.alloc(ast.Stmt, 1);
-                stmts[0] = .{ .expr = expr };
-                body = stmts;
-            }
-        } else if (self.check(.left_brace) and self.sameLineBraceBodyIsBlock()) {
-            // Same-line multi-statement block arm: `pattern -> { stmt; stmt }`.
-            // A leading `{` is otherwise a tuple literal (`{:ok, v}`), so a
-            // lookahead distinguishes a statement block (contains a top-level
-            // assignment or newline-separated statements) from a tuple/map.
-            // This is what lets `?` propagation appear inside a brace arm:
-            //   true -> { value = step(n)?\n recurse(value) }
-            _ = self.advance();
-            self.skipNewlines();
-            body = try self.parseBlock();
-            self.skipNewlines();
-            _ = try self.expect(.right_brace);
-        } else {
-            // Same line: parse as a single expression (handles tuples like
-            // {:ok, v} and maps like %{...}).
-            const expr = try self.parseExpr();
-            const stmts = try self.allocator.alloc(ast.Stmt, 1);
-            stmts[0] = .{ .expr = expr };
-            body = stmts;
-        }
+        const body = try self.parseArmBody();
 
         return .{
             .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
@@ -4307,6 +4268,48 @@ pub const Parser = struct {
             .guard = guard,
             .body = body,
         };
+    }
+
+    /// Parse the body that follows a `->` arm arrow (case/cond/rescue/
+    /// receive-after), handling the three forms uniformly:
+    ///   1. Same-line expression:  `-> expr`
+    ///   2. Same-line brace block:  `-> { stmt; stmt }`
+    ///   3. Next-line block:        `->\n  { stmts }`
+    /// A leading same-line `{` is otherwise a tuple/map literal (`{:ok, v}`),
+    /// so `sameLineBraceBodyIsBlock` disambiguates a statement block from a
+    /// container literal.
+    fn parseArmBody(self: *Parser) ![]const ast.Stmt {
+        if (self.check(.newline)) {
+            // After newline: check if next non-newline token is { for braced block
+            self.skipNewlines();
+            if (self.check(.left_brace)) {
+                _ = self.advance();
+                self.skipNewlines();
+                const block = try self.parseBlock();
+                self.skipNewlines();
+                _ = try self.expect(.right_brace);
+                return block;
+            }
+            // Single expression on next line
+            const expr = try self.parseExpr();
+            const stmts = try self.allocator.alloc(ast.Stmt, 1);
+            stmts[0] = .{ .expr = expr };
+            return stmts;
+        } else if (self.check(.left_brace) and self.sameLineBraceBodyIsBlock()) {
+            // Same-line multi-statement block arm: `pattern -> { stmt; stmt }`.
+            _ = self.advance();
+            self.skipNewlines();
+            const block = try self.parseBlock();
+            self.skipNewlines();
+            _ = try self.expect(.right_brace);
+            return block;
+        }
+        // Same line: parse as a single expression (handles tuples like
+        // {:ok, v} and maps like %{...}).
+        const expr = try self.parseExpr();
+        const stmts = try self.allocator.alloc(ast.Stmt, 1);
+        stmts[0] = .{ .expr = expr };
+        return stmts;
     }
 
     /// Lookahead from a same-line `{` in a case-arm body: decide whether the
@@ -4409,6 +4412,87 @@ pub const Parser = struct {
                 .clauses = try clauses.toOwnedSlice(self.allocator),
             },
         });
+    }
+
+    /// Parse `receive <MessageType> { <pattern> -> <body> … [after <duration> -> <body>] }`
+    /// (concurrency plan Phase 2 item 2.3). The message-pattern arms reuse
+    /// `parseCaseClause`, so patterns, guards, and `:: Type` bindings parse
+    /// identically to a `case`. The `after` timeout arm — a contextual
+    /// keyword inside the braces (Elixir's `receive … after … end` shape) —
+    /// is optional, last, and takes a millisecond duration expression.
+    fn parseReceiveExpr(self: *Parser) !*const ast.Expr {
+        const start = self.currentSpan();
+        _ = try self.expect(.keyword_receive);
+
+        // The scalar decode token (`i64`/`u64`/`f64`/`Bool`/`Atom`).
+        const message_type = blk: {
+            const saved = self.disable_trailing_block;
+            self.disable_trailing_block = true;
+            defer self.disable_trailing_block = saved;
+            break :blk try self.parseTypeExpr();
+        };
+
+        _ = try self.expect(.left_brace);
+        self.skipNewlines();
+
+        var clauses: std.ArrayList(ast.CaseClause) = .empty;
+        var after_arm: ?ast.ReceiveAfter = null;
+
+        while (!self.check(.right_brace) and !self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.right_brace)) break;
+
+            // `after <duration> -> <body>` — the timeout section. It is
+            // last inside the braces; once seen, the arm loop ends.
+            if (self.current.isAfterIdent(self.source)) {
+                after_arm = try self.parseReceiveAfterArm();
+                self.skipNewlines();
+                break;
+            }
+
+            const clause = try self.parseCaseClause();
+            try clauses.append(self.allocator, clause);
+            self.skipNewlines();
+        }
+
+        self.skipNewlines();
+        _ = try self.expect(.right_brace);
+
+        return self.create(ast.Expr, .{
+            .receive_expr = .{
+                .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+                .message_type = message_type,
+                .clauses = try clauses.toOwnedSlice(self.allocator),
+                .after = after_arm,
+            },
+        });
+    }
+
+    /// Parse the `after <duration> -> <body>` timeout arm inside a
+    /// `receive`. The current token is the contextual `after` identifier.
+    /// The body accepts the same three forms as a case arm (same-line
+    /// expression, same-line brace block, or next-line block).
+    fn parseReceiveAfterArm(self: *Parser) !ast.ReceiveAfter {
+        const start = self.currentSpan();
+        _ = self.advance(); // consume the `after` identifier
+        // Elixir's `after` may sit on its own line above the arm.
+        self.skipNewlines();
+
+        const duration = blk: {
+            const saved = self.disable_trailing_block;
+            self.disable_trailing_block = true;
+            defer self.disable_trailing_block = saved;
+            break :blk try self.parseExpr();
+        };
+
+        _ = try self.expect(.arrow);
+        const body = try self.parseArmBody();
+
+        return .{
+            .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
+            .duration = duration,
+            .body = body,
+        };
     }
 
     /// Parse `try { <body> } rescue { <pat> -> <expr> … } after { <cleanup> }`

@@ -163,6 +163,7 @@ pub const Mailbox = mailbox.Mailbox;
 pub const Envelope = mailbox.Envelope;
 pub const Fragment = mailbox.Fragment;
 pub const PopOutcome = mailbox.PopOutcome;
+pub const PeekOutcome = mailbox.PeekOutcome;
 pub const WakeCallback = mailbox.WakeCallback;
 pub const EnvelopePool = envelope_pool.EnvelopePool;
 pub const EnvelopePage = envelope_pool.EnvelopePage;

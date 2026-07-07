@@ -733,6 +733,7 @@ pub const Expr = union(enum) {
     if_expr: IfExpr,
     case_expr: CaseExpr,
     cond_expr: CondExpr,
+    receive_expr: ReceiveExpr,
     for_expr: ForExpr,
     with_expr: WithExpr,
 
@@ -809,6 +810,7 @@ pub const Expr = union(enum) {
             .if_expr => |v| v.meta,
             .case_expr => |v| v.meta,
             .cond_expr => |v| v.meta,
+            .receive_expr => |v| v.meta,
             .for_expr => |v| v.meta,
             .with_expr => |v| v.meta,
             .list_cons_expr => |v| v.meta,
@@ -1070,6 +1072,43 @@ pub const CondExpr = struct {
 pub const CondClause = struct {
     meta: NodeMeta,
     condition: *const Expr,
+    body: []const Stmt,
+};
+
+/// The `receive`/`after` blocking pattern-match construct (concurrency
+/// plan Phase 2 item 2.3, P2-J3). Blocks the calling process until a
+/// message arrives, pops the mailbox head, decodes it as `message_type`,
+/// and dispatches it against `clauses` exactly like a `case`. The
+/// optional `after` arm fires when no message arrives within its
+/// duration (`after 0` = non-blocking poll).
+///
+/// This is pure surface syntax: `src/macro.zig`'s `expandExpr` bootstrap
+/// desugars it to a `case_expr` over a synthesized `:zig.ProcessRuntime.*`
+/// receive-primitive scrutinee (blocking mechanics stay native; pattern
+/// dispatch reuses `case`), mirroring how `if`/`cond`/`with` desugar to
+/// `case_expr`. It introduces no new HIR/IR primitive.
+///
+/// `message_type` is the Phase 2 scalar decode token (`i64`/`u64`/`f64`/
+/// `Bool`/`Atom`) — the same fixed transport `Process.receive_raw` uses.
+/// Compiler-inferred per-process message unions replace the explicit
+/// token with P2-J4 (plan item 2.2).
+pub const ReceiveExpr = struct {
+    meta: NodeMeta,
+    /// The scalar message type to decode the mailbox head as.
+    message_type: *const TypeExpr,
+    /// The message-pattern arms (reusing `CaseClause`, so patterns,
+    /// guards, and bindings parse identically to `case`).
+    clauses: []const CaseClause,
+    /// The optional timeout arm.
+    after: ?ReceiveAfter,
+};
+
+/// The `after <duration> -> <body>` timeout arm of a `receive`. `duration`
+/// is a millisecond count (Erlang convention); `after 0` polls the
+/// mailbox once without blocking.
+pub const ReceiveAfter = struct {
+    meta: NodeMeta,
+    duration: *const Expr,
     body: []const Stmt,
 };
 
@@ -1561,7 +1600,7 @@ pub const TypeParenExpr = struct {
 // the compiler enforces: getMeta/inferExpr/desugarExpr/expandExpr/resolveExpr/
 // validateExpr…/walkExpr (capability)/substituteInExpr (attr)/exprToCtValue/
 // stampExpansionOnExpr, plus the StringId-free `remapExpr` no-op arm.
-const expected_expr_variants: usize = 41;
+const expected_expr_variants: usize = 42;
 const expected_pattern_variants: usize = 12;
 const expected_type_expr_variants: usize = 11;
 const expected_top_item_variants: usize = 16;

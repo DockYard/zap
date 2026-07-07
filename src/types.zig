@@ -4694,6 +4694,19 @@ pub const TypeChecker = struct {
                 }
                 return false;
             },
+            .receive_expr => |receive_expr| {
+                for (receive_expr.clauses) |clause| {
+                    if (clause.guard) |guard| {
+                        if (try self.exprInvokesClosureParam(guard, param_name, budget)) return true;
+                    }
+                    if (try self.closureParamInvokedInBodyWithBudget(clause.body, param_name, budget)) return true;
+                }
+                if (receive_expr.after) |after| {
+                    if (try self.exprInvokesClosureParam(after.duration, param_name, budget)) return true;
+                    if (try self.closureParamInvokedInBodyWithBudget(after.body, param_name, budget)) return true;
+                }
+                return false;
+            },
             .case_expr => |case_expr| {
                 if (try self.exprInvokesClosureParam(case_expr.scrutinee, param_name, budget)) return true;
                 for (case_expr.clauses) |clause| {
@@ -5329,6 +5342,19 @@ pub const TypeChecker = struct {
                 for (cond_expr.clauses) |clause| {
                     if (try self.exprUsesClosureParamUnsafely(clause.condition, param_name, false, budget)) return true;
                     if (!(try self.isClosureParamUsedLocallyWithBudget(clause.body, param_name, budget))) return true;
+                }
+                return false;
+            },
+            .receive_expr => |receive_expr| {
+                for (receive_expr.clauses) |clause| {
+                    if (clause.guard) |guard| {
+                        if (try self.exprUsesClosureParamUnsafely(guard, param_name, false, budget)) return true;
+                    }
+                    if (!(try self.isClosureParamUsedLocallyWithBudget(clause.body, param_name, budget))) return true;
+                }
+                if (receive_expr.after) |after| {
+                    if (try self.exprUsesClosureParamUnsafely(after.duration, param_name, false, budget)) return true;
+                    if (!(try self.isClosureParamUsedLocallyWithBudget(after.body, param_name, budget))) return true;
                 }
                 return false;
             },
@@ -7114,6 +7140,16 @@ pub const TypeChecker = struct {
                 for (cond_expr.clauses) |clause| {
                     try self.validateExprDoesNotCallUnderscoreFunctions(clause.condition);
                     for (clause.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                }
+            },
+            .receive_expr => |receive_expr| {
+                for (receive_expr.clauses) |clause| {
+                    if (clause.guard) |guard| try self.validateExprDoesNotCallUnderscoreFunctions(guard);
+                    for (clause.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
+                }
+                if (receive_expr.after) |after| {
+                    try self.validateExprDoesNotCallUnderscoreFunctions(after.duration);
+                    for (after.body) |stmt| try self.validateStmtDoesNotCallUnderscoreFunctions(stmt);
                 }
             },
             .for_expr => |for_expr| {
@@ -9503,6 +9539,7 @@ pub const TypeChecker = struct {
             .quote_expr => TypeStore.UNKNOWN,
             .unquote_expr, .unquote_splicing_expr => TypeStore.UNKNOWN,
             .cond_expr => TypeStore.UNKNOWN, // desugared before type checking
+            .receive_expr => TypeStore.UNKNOWN, // desugared before type checking
             .intrinsic => |intr| {
                 // Recurse into intrinsic args so var_refs mark bindings as used
                 for (intr.args) |arg| {

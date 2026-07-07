@@ -3538,6 +3538,11 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void;
     extern fn zap_proc_exit(process: *anyopaque) callconv(.c) noreturn;
     extern fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void;
+    extern fn zap_proc_receive_wait_timeout(
+        process: *anyopaque,
+        timeout_nanoseconds: u64,
+    ) callconv(.c) i32;
+    extern fn zap_proc_dead_letter_unexpected(process: *anyopaque) callconv(.c) noreturn;
 };
 
 /// Gated entry-prologue bootstrap: initialize the binary-wide
@@ -3853,6 +3858,40 @@ pub const ProcessRuntime = struct {
     pub fn exit_process() noreturn {
         requireConcurrencyRuntimeGate();
         ZapConcurrencyKernel.zap_proc_exit(requireCurrentProcessHandle());
+    }
+
+    /// Park the calling process until a message is at the mailbox head or
+    /// `timeout_milliseconds` elapses — the `receive … after` timeout
+    /// mechanism. Returns `true` when a message is now deliverable (a
+    /// following `receive_*` pops it without blocking) and `false` on
+    /// timeout. `timeout_milliseconds <= 0` polls once WITHOUT parking
+    /// (`after 0`). Erlang-style millisecond durations, converted to the
+    /// kernel's nanosecond deadline here; the wait is non-consuming.
+    pub fn wait_for_message(timeout_milliseconds: i64) bool {
+        requireConcurrencyRuntimeGate();
+        const timeout_nanoseconds: u64 = if (timeout_milliseconds <= 0)
+            0
+        else
+            @as(u64, @intCast(timeout_milliseconds)) *| std.time.ns_per_ms;
+        const outcome = ZapConcurrencyKernel.zap_proc_receive_wait_timeout(
+            requireCurrentProcessHandle(),
+            timeout_nanoseconds,
+        );
+        // 0 = a message is available; 1 = timed out (see `abi.zig`'s
+        // ZapProcWaitOutcome).
+        return outcome == 0;
+    }
+
+    /// Route a mailbox message that matched no `receive` arm to the
+    /// documented non-crashing dead-letter path: record it as an
+    /// unexpected-message dead letter (telemetry — never a silent drop)
+    /// and terminate the CALLING process (never the scheduler). The
+    /// exhaustiveness verifier (plan item 2.2, P2-J4) makes this
+    /// unreachable for well-typed receives; the keep-alive dead-letter
+    /// sink is Phase 5 (plan item 5.3). Never returns.
+    pub fn dead_letter_unexpected() noreturn {
+        requireConcurrencyRuntimeGate();
+        ZapConcurrencyKernel.zap_proc_dead_letter_unexpected(requireCurrentProcessHandle());
     }
 };
 

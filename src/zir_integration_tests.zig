@@ -5952,3 +5952,50 @@ test "ZIR concurrency: Process.* is a compile error when the runtime_concurrency
         "Process operations require the concurrency runtime",
     );
 }
+
+// ============================================================
+// P2-J3 `receive`/`after` — compile-fail contracts. These pin the
+// static guarantees of the receive construct: the Phase-2 scalar
+// message-type scope and the zero-cost gate. WRITTEN, not run here
+// (`zig build zir-test` is driven separately); Zest cannot yet express
+// compile-fail expectations (CLAUDE.md "Test Placement").
+// ============================================================
+
+test "ZIR concurrency: receive rejects a non-scalar message type" {
+    // `String` is outside the Phase-2 sendable scalar transport; the
+    // receive desugar has no decode primitive for it, so a rich message
+    // type is a compile error until the P2-J5 deep-copy walker — not a
+    // fabricated decode.
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    _value = receive String {
+        \\      s -> s
+        \\    }
+        \\    0
+        \\  }
+        \\}
+    ,
+        "message type must be a Phase 2 scalar",
+    );
+}
+
+test "ZIR concurrency: receive is a compile error when the runtime_concurrency gate is OFF" {
+    // The zero-cost guarantee reaches the language construct: `receive`
+    // desugars onto the gated `:zig.ProcessRuntime.*` primitives, so a
+    // gate-OFF binary rejects it at comptime rather than link time.
+    try expectGateOffConcurrencyCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    _value = receive i64 {
+        \\      n -> n
+        \\    after
+        \\      0 -> -1
+        \\    }
+        \\    0
+        \\  }
+        \\}
+    ,
+        "Process operations require the concurrency runtime",
+    );
+}

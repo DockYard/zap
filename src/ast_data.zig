@@ -694,6 +694,38 @@ pub fn exprToCtValue(
             try owner.adopt(meta);
             return makeTuple3WithOwnedChildren(alloc, store, .{ .atom = "cond" }, meta, kw_list, &owner);
         },
+        .receive_expr => |v| {
+            // {:receive, meta, [message_type, [clauses...], after]} where each
+            // clause is {:->, [], [[pattern], body]} and `after` is nil or the
+            // list [duration, body].
+            var clause_vals = TemporaryCtValueList.init(alloc, store);
+            defer clause_vals.deinit();
+            for (v.clauses) |clause| {
+                try clause_vals.append(try caseClauseToCtValue(alloc, interner, store, clause));
+            }
+            const clauses_list = try clause_vals.toCtList();
+
+            const after_val: CtValue = if (v.after) |after| after_blk: {
+                var after_vals = TemporaryCtValueList.init(alloc, store);
+                defer after_vals.deinit();
+                try after_vals.append(try exprToCtValue(alloc, interner, store, after.duration));
+                try after_vals.append(try blockToCtValue(alloc, interner, store, after.body));
+                break :after_blk try after_vals.toCtList();
+            } else CtValue.nil;
+
+            var arg_vals = TemporaryCtValueList.init(alloc, store);
+            defer arg_vals.deinit();
+            try arg_vals.append(try typeExprToCtValue(alloc, interner, store, v.message_type));
+            try arg_vals.append(clauses_list);
+            try arg_vals.append(after_val);
+            const args = try arg_vals.toCtList();
+            var owner = TemporaryCtValueOwner.init(alloc, store);
+            defer owner.deinit();
+            try owner.adopt(args);
+            const meta = try metaToList(alloc, store, v.meta, null);
+            try owner.adopt(meta);
+            return makeTuple3WithOwnedChildren(alloc, store, .{ .atom = "receive" }, meta, args, &owner);
+        },
         .attr_ref => |v| {
             const name: CtValue = .{ .atom = interner.get(v.name) };
             const args = try makeListWithTemporaryChildren(alloc, store, &.{name});
@@ -1690,6 +1722,15 @@ fn deinitDecodedExpr(alloc: Allocator, expr: *const ast.Expr) void {
         .cond_expr => |cond_expr| {
             deinitDecodedCondClauseSlice(alloc, cond_expr.clauses);
             deinitDecodedMeta(alloc, cond_expr.meta);
+        },
+        .receive_expr => |receive_expr| {
+            deinitDecodedTypeExpr(alloc, receive_expr.message_type);
+            deinitDecodedCaseClauseSlice(alloc, receive_expr.clauses);
+            if (receive_expr.after) |after| {
+                deinitDecodedExpr(alloc, after.duration);
+                deinitDecodedStmtSlice(alloc, after.body);
+            }
+            deinitDecodedMeta(alloc, receive_expr.meta);
         },
         .for_expr => |for_expr| {
             deinitDecodedPattern(alloc, for_expr.var_pattern);
@@ -3004,6 +3045,47 @@ fn ctValueToExprBudgeted(
         const clause_slice = try clauses.takeOwnedSlice();
         expr.* = .{ .cond_expr = .{ .meta = node_meta, .clauses = clause_slice } };
         return expr;
+    }
+
+    // Receive: {:receive, meta, [message_type, [clauses...], after]} where
+    // each clause is {:->, [], [[pattern], body]} and `after` is nil or the
+    // list [duration, body].
+    if (std.mem.eql(u8, form_name, "receive")) {
+        if (arg_elems.len == 3) {
+            const message_type = try ctValueToTypeExprBudgeted(alloc, interner, arg_elems[0], budget);
+            errdefer deinitDecodedTypeExpr(alloc, message_type);
+
+            var clauses = DecodedCaseClauseList.init(alloc);
+            defer clauses.deinit();
+            if (arg_elems[1] == .list) {
+                for (arg_elems[1].list.elems) |clause_val| {
+                    try clauses.append(try ctValueToCaseClauseBudgeted(alloc, interner, clause_val, budget));
+                }
+            }
+
+            var after_arm: ?ast.ReceiveAfter = null;
+            if (arg_elems[2] == .list and arg_elems[2].list.elems.len == 2) {
+                const duration = try ctValueToExprBudgeted(alloc, interner, arg_elems[2].list.elems[0], budget);
+                errdefer deinitDecodedExpr(alloc, duration);
+                const after_body = try ctValueToStmtsBudgeted(alloc, interner, arg_elems[2].list.elems[1], budget);
+                after_arm = .{
+                    .meta = ast.NodeMeta{ .span = node_meta.span },
+                    .duration = duration,
+                    .body = after_body,
+                };
+            }
+
+            const expr = try alloc.create(ast.Expr);
+            errdefer alloc.destroy(expr);
+            const clause_slice = try clauses.takeOwnedSlice();
+            expr.* = .{ .receive_expr = .{
+                .meta = node_meta,
+                .message_type = message_type,
+                .clauses = clause_slice,
+                .after = after_arm,
+            } };
+            return expr;
+        }
     }
 
     // String interpolation: {:<<>>, meta, [parts...]}

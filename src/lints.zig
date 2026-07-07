@@ -437,6 +437,13 @@ const RaisesScanner = struct {
                     try self.pushExpr(clause.condition, next_depth);
                 }
             },
+            .receive_expr => |receive_expr| {
+                if (receive_expr.after) |after| {
+                    try self.pushStmts(after.body, next_depth);
+                    try self.pushExpr(after.duration, next_depth);
+                }
+                try self.pushCaseClauses(receive_expr.clauses, next_depth);
+            },
             .for_expr => |for_expr| {
                 try self.pushExpr(for_expr.body, next_depth);
                 if (for_expr.filter) |filter| {
@@ -667,6 +674,17 @@ const Linter = struct {
                 for (ce.clauses) |clause| {
                     try self.lintExpr(clause.condition, is_public);
                     try self.lintBlock(clause.body, is_public);
+                }
+            },
+            .receive_expr => |re| {
+                for (re.clauses) |clause| {
+                    try self.lintPattern(clause.pattern);
+                    if (clause.guard) |guard| try self.lintExpr(guard, is_public);
+                    try self.lintBlock(clause.body, is_public);
+                }
+                if (re.after) |after| {
+                    try self.lintExpr(after.duration, is_public);
+                    try self.lintBlock(after.body, is_public);
                 }
             },
             .block => |b| try self.lintBlock(b.stmts, is_public),

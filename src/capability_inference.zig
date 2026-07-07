@@ -305,6 +305,19 @@ fn walkExpr(
                 for (clause.body) |s| try walkStmt(allocator, record, s, interner, failure, child_depth);
             }
         },
+        .receive_expr => |re| {
+            // Desugared before capability inference normally runs; walk the
+            // arm guards/bodies and the after-arm so any effectful call is
+            // recorded either way.
+            for (re.clauses) |clause| {
+                if (clause.guard) |g| try walkExpr(allocator, record, g, interner, failure, child_depth);
+                for (clause.body) |s| try walkStmt(allocator, record, s, interner, failure, child_depth);
+            }
+            if (re.after) |after| {
+                try walkExpr(allocator, record, after.duration, interner, failure, child_depth);
+                for (after.body) |s| try walkStmt(allocator, record, s, interner, failure, child_depth);
+            }
+        },
         .for_expr => |fe| {
             try walkExpr(allocator, record, fe.iterable, interner, failure, child_depth);
             if (fe.filter) |f| try walkExpr(allocator, record, f, interner, failure, child_depth);

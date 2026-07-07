@@ -412,6 +412,10 @@ const YieldReason = enum(u8) {
     /// Suspended on an empty mailbox; made runnable again only by a wake
     /// signal (or a kill).
     waiting_for_message,
+    /// Suspended on an empty mailbox with a timeout (`receive … after`):
+    /// made runnable by a wake signal, a kill, OR the scheduler observing
+    /// `wake_deadline_nanoseconds` elapse (which sets `receive_timed_out`).
+    waiting_for_message_deadline,
 };
 
 /// Scheduler-side bookkeeping for one process: the PCB plus the fields
@@ -448,6 +452,16 @@ pub const ProcessRecord = struct {
     /// Why the last quantum ended (see `YieldReason`). Written on the
     /// fiber, read by the scheduler after the switch — same thread.
     yield_reason: YieldReason,
+    /// Absolute monotonic-nanosecond deadline for a
+    /// `.waiting_for_message_deadline` suspension (`receive … after`).
+    /// Meaningful only while the record is `.waiting` with that yield
+    /// reason; ignored otherwise. Scheduler-thread only.
+    wake_deadline_nanoseconds: u64,
+    /// Set by the scheduler when it wakes a timed waiter because its
+    /// deadline elapsed (rather than a message arriving); read and cleared
+    /// by `receiveWaitTimeout` on resume. Scheduler-thread + owning-fiber
+    /// (same thread) only.
+    receive_timed_out: bool,
     /// Kill requested (untrappable). Scheduler-thread only: set by
     /// `kill`, observed at scheduling points and safepoints.
     pending_kill: bool,
@@ -553,6 +567,75 @@ pub const ProcessContext = struct {
         }
     }
 
+    /// Blocking receive with a timeout — the `receive … after` mechanism
+    /// (plan item 2.3, P2-J3). Parks (non-consuming) until a message is at
+    /// the mailbox head or `timeout_nanoseconds` elapses, returning which
+    /// happened WITHOUT consuming the message (a following `receive`
+    /// pops it). `timeout_nanoseconds == 0` polls once without parking
+    /// (`after 0`). A message that races the deadline wins. If the process
+    /// is killed while waiting, the suspension never returns.
+    pub fn receiveWaitTimeout(context: *ProcessContext, timeout_nanoseconds: u64) ReceiveWaitOutcome {
+        const record = context.record;
+
+        // `after 0`: poll once without parking. A bounded spin resolves a
+        // producer mid-publish (a materializing message the poll must see).
+        if (timeout_nanoseconds == 0) {
+            var gap_spins: u32 = 0;
+            while (true) {
+                if (record.pending_kill) {
+                    record.yield_reason = .reenqueue;
+                    context.execution.yield();
+                    continue;
+                }
+                switch (record.pcb.mailbox.peek()) {
+                    .available => return .message_available,
+                    .empty => return .timed_out,
+                    .transient_gap => {
+                        gap_spins += 1;
+                        if (gap_spins >= poll_transient_gap_spin_limit) return .timed_out;
+                        std.atomic.spinLoopHint();
+                    },
+                }
+            }
+        }
+
+        const deadline_nanoseconds = monotonicNowNanoseconds() +| timeout_nanoseconds;
+        while (true) {
+            if (record.pending_kill) {
+                record.yield_reason = .reenqueue;
+                context.execution.yield();
+                continue;
+            }
+            switch (record.pcb.mailbox.peek()) {
+                .available => return .message_available,
+                .transient_gap => {
+                    // A producer is mid-publish — a message is arriving.
+                    // Retry next quantum rather than parking on it.
+                    record.yield_reason = .reenqueue;
+                    context.execution.yield();
+                },
+                .empty => {
+                    if (monotonicNowNanoseconds() >= deadline_nanoseconds) return .timed_out;
+                    // Park with the deadline: the scheduler re-runs this
+                    // process on a message wake OR when the deadline
+                    // elapses (setting `receive_timed_out`).
+                    record.receive_timed_out = false;
+                    record.wake_deadline_nanoseconds = deadline_nanoseconds;
+                    record.yield_reason = .waiting_for_message_deadline;
+                    context.execution.yield();
+                    if (record.receive_timed_out) {
+                        record.receive_timed_out = false;
+                        // A message that raced the timeout wins.
+                        if (record.pcb.mailbox.peek() == .available) return .message_available;
+                        return .timed_out;
+                    }
+                    // Message wake or spurious resume: loop re-checks the
+                    // mailbox and the deadline.
+                },
+            }
+        }
+    }
+
     /// Send one envelope to `target`: allocate from THIS process's
     /// envelope handle (the sender-owns-pages discipline), stamp
     /// `fragment` into it, and push it onto the target's mailbox — the
@@ -583,6 +666,18 @@ pub const ProcessContext = struct {
     pub fn kill(context: *ProcessContext, target: Pid) KillOutcome {
         return context.scheduler.kill(target);
     }
+
+    /// Route a mailbox message that matched no `receive` arm to the
+    /// dead-letter path (plan item 2.3 unexpected-message posture): record
+    /// non-silent telemetry (`unexpected_message_total`) and terminate THIS
+    /// process through the kill path — never the scheduler. The keep-alive
+    /// dead-letter sink is Phase 5 (plan item 5.3). Never returns.
+    pub fn deadLetterUnexpected(context: *ProcessContext) noreturn {
+        context.scheduler.unexpected_message_total += 1;
+        _ = context.kill(context.selfPid());
+        context.yieldNow();
+        unreachable;
+    }
 };
 
 /// Default spin iterations before parking: sized to the E9 crossover
@@ -594,6 +689,53 @@ pub const default_spin_iterations_before_park: u32 = 512;
 /// eventcount protocol needs no timeout for correctness — see the module
 /// doc's parking section).
 pub const default_park_timeout_nanoseconds: u64 = 100 * std.time.ns_per_ms;
+
+/// The outcome of `ProcessContext.receiveWaitTimeout` — whether the wait
+/// ended with a deliverable message or the timeout elapsed.
+pub const ReceiveWaitOutcome = enum {
+    /// A message is at the mailbox head; a following `receive` pops it.
+    message_available,
+    /// The `after` duration elapsed with no message.
+    timed_out,
+};
+
+/// Bound on the in-`receiveWaitTimeout` spin that resolves a producer
+/// mid-publish during an `after 0` poll. A gap window is two producer
+/// instructions (`mailbox.zig`); a bound this large only fails to resolve
+/// when a FOREIGN thread's send stalls mid-push, in which case the poll
+/// correctly reports the mailbox empty at that instant.
+const poll_transient_gap_spin_limit: u32 = 4096;
+
+/// Libc-free monotonic nanoseconds for `receive … after` deadlines. The
+/// kernel object is compiled `link_libc = false` on targets that do not
+/// require libc (`abi.zig` module doc), so this cannot use `std.c`; it
+/// mirrors how the futex parking layer reaches the OS directly. Darwin:
+/// `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` from libSystem (always linked,
+/// exactly like the `os_sync_*` futex calls). Linux: the raw
+/// `clock_gettime` syscall (no libc). Other OSes are Phase 4/7 ports —
+/// the same posture as the futex layer.
+fn monotonicNowNanoseconds() u64 {
+    switch (comptime builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => {
+            // CLOCK_UPTIME_RAW (8) — monotonic, does not count time asleep,
+            // and is the clock the os_sync timeout API measures against.
+            return clock_gettime_nsec_np(clock_uptime_raw);
+        },
+        .linux => {
+            const linux = std.os.linux;
+            var now: linux.timespec = undefined;
+            _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &now);
+            return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
+        },
+        else => @compileError(
+            "receive/after monotonic clock is not implemented for this OS (Phase 4/7 ports)",
+        ),
+    }
+}
+
+/// `CLOCK_UPTIME_RAW` from `<time.h>` (Darwin).
+const clock_uptime_raw: u32 = 8;
+extern "c" fn clock_gettime_nsec_np(clock_id: u32) u64;
 
 /// The Phase 1 single scheduler (plan 1.4/1.5; instance-based — see the
 /// module doc). NOT thread-safe as a whole: exactly one thread drives
@@ -622,6 +764,20 @@ pub const Scheduler = struct {
     /// as a parameter; this field is the seam Phase 2's compiled-code
     /// exposure hooks into (module doc).
     current_process: ?*ProcessControlBlock,
+
+    /// Count of `.waiting` processes suspended with a `receive … after`
+    /// deadline. Zero for any program that never uses `after`, so the
+    /// run loop's deadline scan (`fireExpiredReceiveTimeouts`) and the
+    /// deadline-bounded idle park are entirely skipped — the zero-`after`
+    /// fast path. Recomputed exactly by each `fireExpiredReceiveTimeouts`
+    /// scan (so a message-woken or killed timed waiter self-corrects the
+    /// count on the next scan). Scheduler-thread only.
+    timed_waiter_count: usize,
+    /// The earliest not-yet-expired timed-waiter deadline (absolute
+    /// monotonic ns), or 0 when there are none. Written by
+    /// `fireExpiredReceiveTimeouts`; read by the idle park to bound its
+    /// futex wait so a timeout fires on schedule. Scheduler-thread only.
+    earliest_deadline_nanoseconds: u64,
 
     // -- ready queue (scheduler-thread only) --------------------------------
     /// Intrusive FIFO of `.runnable` processes: oldest.
@@ -674,6 +830,10 @@ pub const Scheduler = struct {
     /// Quanta executed (process switch-ins; scheduler-thread only —
     /// plan item 1.6 "quanta executed").
     quantum_total: u64,
+    /// Mailbox messages that matched no `receive` arm and were routed to
+    /// the dead-letter path (`receive`'s unexpected-message posture, plan
+    /// item 2.3). Non-silent telemetry (scheduler-thread only).
+    unexpected_message_total: u64,
 
     /// Construction options.
     pub const Options = struct {
@@ -741,6 +901,9 @@ pub const Scheduler = struct {
         kill_total: u64,
         /// Quanta executed (process switch-ins).
         quantum_total: u64,
+        /// Mailbox messages routed to the dead-letter path for matching no
+        /// `receive` arm (the unexpected-message posture).
+        unexpected_message_total: u64,
         /// Futex parks entered.
         park_count: u64,
         /// `wake()` invocations.
@@ -765,6 +928,8 @@ pub const Scheduler = struct {
             .options = options,
             .fiber_scheduler_context = .{},
             .current_process = null,
+            .timed_waiter_count = 0,
+            .earliest_deadline_nanoseconds = 0,
             .ready_head = null,
             .ready_tail = null,
             .ready_count = 0,
@@ -782,6 +947,7 @@ pub const Scheduler = struct {
             .normal_exit_total = 0,
             .kill_total = 0,
             .quantum_total = 0,
+            .unexpected_message_total = 0,
         };
     }
 
@@ -832,6 +998,8 @@ pub const Scheduler = struct {
         record.wake_pending = .init(false);
         record.wake_next = null;
         record.active_context = null;
+        record.wake_deadline_nanoseconds = 0;
+        record.receive_timed_out = false;
         ProcessControlBlock.init(&record.pcb, kernel_fiber, options.manager);
         errdefer fiber_context.reclaimWithoutResume(&record.pcb.fiber);
 
@@ -919,6 +1087,86 @@ pub const Scheduler = struct {
     }
 
     // -------------------------------------------------------------------------
+    // `receive … after` timeout firing (plan item 2.3, P2-J3)
+    // -------------------------------------------------------------------------
+
+    /// Fire every `receive … after` waiter whose deadline has elapsed —
+    /// make it runnable and mark `receive_timed_out` — and recompute
+    /// `timed_waiter_count` + `earliest_deadline_nanoseconds` from the live
+    /// set (so a message-woken or killed timed waiter self-corrects the
+    /// count here rather than needing a decrement on every wake/kill path).
+    /// A no-op when no timed waiters exist — the zero-`after` fast path.
+    /// Scheduler-thread only; runs at the top of every run-loop iteration.
+    fn fireExpiredReceiveTimeouts(scheduler: *Scheduler) void {
+        if (scheduler.timed_waiter_count == 0) {
+            scheduler.earliest_deadline_nanoseconds = 0;
+            return;
+        }
+        const now = monotonicNowNanoseconds();
+        var remaining: usize = 0;
+        var earliest: u64 = 0;
+        var iterator = scheduler.pid_table.iterateLiveProcesses();
+        while (iterator.next()) |live| {
+            const pcb = live.pcb;
+            if (pcb.state != .waiting) continue;
+            const record: *ProcessRecord = @fieldParentPtr("pcb", pcb);
+            if (record.yield_reason != .waiting_for_message_deadline) continue;
+            if (now >= record.wake_deadline_nanoseconds) {
+                record.receive_timed_out = true;
+                pcb.transitionTo(.runnable);
+                scheduler.readyEnqueue(record);
+                scheduler.emitTrace(.wake, pcb.pid);
+            } else {
+                remaining += 1;
+                if (earliest == 0 or record.wake_deadline_nanoseconds < earliest) {
+                    earliest = record.wake_deadline_nanoseconds;
+                }
+            }
+        }
+        scheduler.timed_waiter_count = remaining;
+        scheduler.earliest_deadline_nanoseconds = earliest;
+    }
+
+    /// Deterministic-mode (`.forbid_parking`) timeout firing: with no wall
+    /// clock to sleep on, when nothing else can run, advance virtual time
+    /// to the EARLIEST timed-waiter deadline and fire exactly that waiter.
+    /// Returns whether one was fired. This is what gives `receive … after`
+    /// deterministic semantics under the seeded scheduler (a timeout fires
+    /// precisely when the system would otherwise deadlock). Scheduler-thread
+    /// only.
+    fn fireEarliestReceiveTimeout(scheduler: *Scheduler) bool {
+        if (scheduler.timed_waiter_count == 0) return false;
+        var earliest_record: ?*ProcessRecord = null;
+        var live_timed_waiters: usize = 0;
+        var iterator = scheduler.pid_table.iterateLiveProcesses();
+        while (iterator.next()) |live| {
+            const pcb = live.pcb;
+            if (pcb.state != .waiting) continue;
+            const record: *ProcessRecord = @fieldParentPtr("pcb", pcb);
+            if (record.yield_reason != .waiting_for_message_deadline) continue;
+            live_timed_waiters += 1;
+            const current = earliest_record orelse {
+                earliest_record = record;
+                continue;
+            };
+            if (record.wake_deadline_nanoseconds < current.wake_deadline_nanoseconds) {
+                earliest_record = record;
+            }
+        }
+        const fire = earliest_record orelse {
+            scheduler.timed_waiter_count = 0;
+            scheduler.earliest_deadline_nanoseconds = 0;
+            return false;
+        };
+        fire.receive_timed_out = true;
+        fire.pcb.transitionTo(.runnable);
+        scheduler.readyEnqueue(fire);
+        scheduler.emitTrace(.wake, fire.pcb.pid);
+        scheduler.timed_waiter_count = live_timed_waiters - 1;
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
     // Run loop (module doc)
     // -------------------------------------------------------------------------
 
@@ -928,6 +1176,7 @@ pub const Scheduler = struct {
     pub fn runUntilQuiescent(scheduler: *Scheduler) RunError!void {
         while (true) {
             scheduler.drainWakeStack();
+            scheduler.fireExpiredReceiveTimeouts();
             if (scheduler.dequeueNextRunnable()) |record| {
                 if (record.pending_kill) {
                     // Killed while queued: torn down without ever running
@@ -940,8 +1189,13 @@ pub const Scheduler = struct {
             }
             if (scheduler.live_record_count == 0) return;
             switch (scheduler.options.idle_strategy) {
+                // Park bounded by the earliest `receive … after` deadline
+                // (parkUntilWakeSignal reads it) so a timeout fires on time.
                 .futex_park => scheduler.parkUntilWakeSignal(),
                 .forbid_parking => {
+                    // Deterministic run: fire the earliest `receive … after`
+                    // waiter (virtual time) before declaring deadlock.
+                    if (scheduler.fireEarliestReceiveTimeout()) continue;
                     // Single-threaded deterministic run: no producer can
                     // race this re-check, so an empty wake stack here is
                     // a genuine scenario deadlock.
@@ -971,6 +1225,7 @@ pub const Scheduler = struct {
             // every join of an exited process).
             if (!scheduler.pid_table.isAlive(target)) return;
             scheduler.drainWakeStack();
+            scheduler.fireExpiredReceiveTimeouts();
             if (scheduler.dequeueNextRunnable()) |record| {
                 if (record.pending_kill) {
                     // Killed while queued: torn down without ever running
@@ -982,8 +1237,13 @@ pub const Scheduler = struct {
                 continue;
             }
             switch (scheduler.options.idle_strategy) {
+                // Park bounded by the earliest `receive … after` deadline
+                // (parkUntilWakeSignal reads it) so a timeout fires on time.
                 .futex_park => scheduler.parkUntilWakeSignal(),
                 .forbid_parking => {
+                    // Deterministic run: fire the earliest `receive … after`
+                    // waiter (virtual time) before declaring deadlock.
+                    if (scheduler.fireEarliestReceiveTimeout()) continue;
                     // Single-threaded deterministic run: no producer can
                     // race this re-check, so an empty wake stack here is
                     // a genuine scenario deadlock.
@@ -1059,6 +1319,7 @@ pub const Scheduler = struct {
             .normal_exit_total = scheduler.normal_exit_total,
             .kill_total = scheduler.kill_total,
             .quantum_total = scheduler.quantum_total,
+            .unexpected_message_total = scheduler.unexpected_message_total,
             .park_count = scheduler.park_count.load(.monotonic),
             .wake_signal_count = scheduler.wake_signal_count.load(.monotonic),
         };
@@ -1114,6 +1375,17 @@ pub const Scheduler = struct {
                         // fired the wake seam; the wake-stack drain at the
                         // top of the run loop converts it to runnable —
                         // no lost-wake window (module doc).
+                    },
+                    .waiting_for_message_deadline => {
+                        scheduler.emitTrace(.wait, pcb.pid);
+                        pcb.transitionTo(.waiting);
+                        // A `receive … after` waiter: countable so the run
+                        // loop scans deadlines and bounds its idle park.
+                        // The count self-corrects on the next scan (message
+                        // wake / kill leave the record no longer a
+                        // `.waiting` deadline waiter), so it is only ever
+                        // incremented here.
+                        scheduler.timed_waiter_count += 1;
                     },
                 }
             },
@@ -1349,9 +1621,23 @@ pub const Scheduler = struct {
         parking_futex.waitBounded(
             &scheduler.wake_epoch,
             observed_epoch,
-            scheduler.options.park_timeout_nanoseconds,
+            scheduler.idleParkTimeoutNanoseconds(),
         );
         scheduler.parked_hint.store(false, .seq_cst);
+    }
+
+    /// The bound for one idle futex park: the default defense-in-depth
+    /// re-check period, shortened to the time remaining until the earliest
+    /// `receive … after` deadline so that timeout fires on schedule (the
+    /// wake then re-runs the loop, whose `fireExpiredReceiveTimeouts` makes
+    /// the expired waiter runnable). No timed waiters ⇒ the default bound.
+    fn idleParkTimeoutNanoseconds(scheduler: *Scheduler) u64 {
+        const default_bound = scheduler.options.park_timeout_nanoseconds;
+        const deadline = scheduler.earliest_deadline_nanoseconds;
+        if (deadline == 0) return default_bound;
+        const now = monotonicNowNanoseconds();
+        if (now >= deadline) return 1; // already due — wake promptly to fire it
+        return @min(default_bound, deadline - now);
     }
 
     // -------------------------------------------------------------------------
@@ -1950,6 +2236,177 @@ test "Scheduler: blocking receive on an empty mailbox — one push wakes it exac
     // and the (exact, empty→nonempty) push signal resumed it once.
     try testing.expectEqual(@as(usize, 1), trace_log.countKind(.wait));
     try testing.expectEqual(@as(usize, 1), trace_log.countKind(.wake));
+    try kernel.expectExactAccounting();
+}
+
+// -- receive … after timeout (plan item 2.3, P2-J3) -------------------------------
+
+const TimeoutProbe = struct {
+    outcome: ReceiveWaitOutcome = .message_available,
+    stamp: usize = 0,
+};
+
+fn timeoutNoSenderEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *TimeoutProbe = @ptrCast(@alignCast(argument.?));
+    // A large timeout with no sender: deterministic mode advances virtual
+    // time and fires the deadline when nothing else can run.
+    probe.outcome = context.receiveWaitTimeout(60 * std.time.ns_per_s);
+}
+
+test "Scheduler: receive … after times out when no message arrives (deterministic firing)" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        .idle_strategy = .forbid_parking,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var probe = TimeoutProbe{};
+    _ = try kernel.scheduler.spawn(.{
+        .entry = timeoutNoSenderEntry,
+        .argument = &probe,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    try testing.expectEqual(ReceiveWaitOutcome.timed_out, probe.outcome);
+    try kernel.expectExactAccounting();
+}
+
+fn pollEmptyEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *TimeoutProbe = @ptrCast(@alignCast(argument.?));
+    // `after 0` on an empty mailbox: a non-blocking poll — never parks.
+    probe.outcome = context.receiveWaitTimeout(0);
+}
+
+test "Scheduler: after 0 polls an empty mailbox without parking" {
+    var trace_log = TestTraceLog{};
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        .idle_strategy = .forbid_parking,
+        .trace_hook = TestTraceLog.hook,
+        .trace_context = &trace_log,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var probe = TimeoutProbe{};
+    _ = try kernel.scheduler.spawn(.{
+        .entry = pollEmptyEntry,
+        .argument = &probe,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    try testing.expectEqual(ReceiveWaitOutcome.timed_out, probe.outcome);
+    // A poll never suspends the process: no `.wait` transition at all.
+    try testing.expectEqual(@as(usize, 0), trace_log.countKind(.wait));
+    try kernel.expectExactAccounting();
+}
+
+const PollSeesMessageProbe = struct {
+    first_stamp: usize = 0,
+    poll_outcome: ReceiveWaitOutcome = .timed_out,
+    second_stamp: usize = 0,
+};
+
+fn pollSeesQueuedMessageEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *PollSeesMessageProbe = @ptrCast(@alignCast(argument.?));
+    // Block for the sender's first message (guarantees the sender ran and
+    // enqueued the SECOND one), then poll — which must see it available.
+    const first = context.receive();
+    probe.first_stamp = first.fragment.payload_byte_length;
+    envelope_pool_module.free(first);
+    probe.poll_outcome = context.receiveWaitTimeout(0);
+    const second = context.receive();
+    probe.second_stamp = second.fragment.payload_byte_length;
+    envelope_pool_module.free(second);
+}
+
+const TwoSendProbe = struct {
+    target: Pid,
+    first_stamp: usize,
+    second_stamp: usize,
+};
+
+fn twoSendEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *TwoSendProbe = @ptrCast(@alignCast(argument.?));
+    _ = context.send(probe.target, .{ .payload_byte_length = probe.first_stamp }) catch
+        @panic("send failed to allocate an envelope");
+    _ = context.send(probe.target, .{ .payload_byte_length = probe.second_stamp }) catch
+        @panic("send failed to allocate an envelope");
+}
+
+test "Scheduler: after 0 poll sees a queued message as available" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(test_scheduler_options);
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var receiver_probe = PollSeesMessageProbe{};
+    const receiver_pid = try kernel.scheduler.spawn(.{
+        .entry = pollSeesQueuedMessageEntry,
+        .argument = &receiver_probe,
+        .manager = manager.managerContext(),
+    });
+    var sender_probe = TwoSendProbe{ .target = receiver_pid, .first_stamp = 0xA1, .second_stamp = 0xB2 };
+    _ = try kernel.scheduler.spawn(.{
+        .entry = twoSendEntry,
+        .argument = &sender_probe,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    try testing.expectEqual(@as(usize, 0xA1), receiver_probe.first_stamp);
+    try testing.expectEqual(ReceiveWaitOutcome.message_available, receiver_probe.poll_outcome);
+    try testing.expectEqual(@as(usize, 0xB2), receiver_probe.second_stamp);
+    try kernel.expectExactAccounting();
+}
+
+fn timeoutMessageArrivesEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *TimeoutProbe = @ptrCast(@alignCast(argument.?));
+    // A generous timeout: the sender's message must arrive first and win.
+    probe.outcome = context.receiveWaitTimeout(60 * std.time.ns_per_s);
+    const envelope = context.receive();
+    probe.stamp = envelope.fragment.payload_byte_length;
+    envelope_pool_module.free(envelope);
+}
+
+test "Scheduler: a message that arrives before the after deadline wins over the timeout" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(test_scheduler_options);
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var receiver_probe = TimeoutProbe{};
+    const receiver_pid = try kernel.scheduler.spawn(.{
+        .entry = timeoutMessageArrivesEntry,
+        .argument = &receiver_probe,
+        .manager = manager.managerContext(),
+    });
+    var sender_probe = SenderProbe{ .target = receiver_pid, .stamp = 0xCC };
+    _ = try kernel.scheduler.spawn(.{
+        .entry = sendOnceEntry,
+        .argument = &sender_probe,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    try testing.expectEqual(ReceiveWaitOutcome.message_available, receiver_probe.outcome);
+    try testing.expectEqual(@as(usize, 0xCC), receiver_probe.stamp);
+    try testing.expectEqual(@as(u64, 0), kernel.scheduler.statistics().unexpected_message_total);
     try kernel.expectExactAccounting();
 }
 

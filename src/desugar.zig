@@ -1857,6 +1857,7 @@ pub const Desugarer = struct {
 
             .if_expr,
             .cond_expr,
+            .receive_expr,
             => return expr,
         }
     }

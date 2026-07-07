@@ -6854,6 +6854,12 @@ pub const HirBuilder = struct {
                 // if_expr should be desugared to case_expr before reaching HIR
                 unreachable;
             },
+            .receive_expr => {
+                // receive_expr is desugared to case_expr (over the
+                // `:zig.ProcessRuntime.*` receive primitives) during macro
+                // expansion, long before HIR.
+                unreachable;
+            },
             .case_expr => |ce| {
                 // `case @target.<field> { :atom -> … ; _ -> … }` folds at
                 // HIR build to the matching clause's body (the others are

@@ -6641,6 +6641,7 @@ fn findUndesugaredMacroFormInExpr(expr: *const ast.Expr) ?UndesugaredMacroForm {
     return switch (expr.*) {
         .if_expr => |if_expr| .{ .name = "if", .span = if_expr.meta.span },
         .cond_expr => |cond_expr| .{ .name = "cond", .span = cond_expr.meta.span },
+        .receive_expr => |receive_expr| .{ .name = "receive", .span = receive_expr.meta.span },
         .pipe => |pipe| .{ .name = "|>", .span = pipe.meta.span },
         .binary_op => |binary| findUndesugaredMacroFormInExpr(binary.lhs) orelse findUndesugaredMacroFormInExpr(binary.rhs),
         .unary_op => |unary| findUndesugaredMacroFormInExpr(unary.operand),
@@ -13403,6 +13404,29 @@ fn remapExpr(alloc: std.mem.Allocator, expr: *ast.Expr, remap: []const ast.Strin
                     try remapStmtSlice(alloc, &mutable_clauses[i].body, remap);
                 }
                 ce.clauses = mutable_clauses;
+            }
+        },
+        .receive_expr => |*re| {
+            const mutable_message_type = try alloc.create(ast.TypeExpr);
+            mutable_message_type.* = re.message_type.*;
+            try remapTypeExpr(alloc, mutable_message_type, remap);
+            re.message_type = mutable_message_type;
+            if (re.clauses.len > 0) {
+                const mutable_clauses = try alloc.alloc(ast.CaseClause, re.clauses.len);
+                for (re.clauses, 0..) |c, i| {
+                    mutable_clauses[i] = c;
+                    try remapCaseClause(alloc, &mutable_clauses[i], remap);
+                }
+                re.clauses = mutable_clauses;
+            }
+            if (re.after) |after| {
+                var mutable_after = after;
+                const mutable_duration = try alloc.create(ast.Expr);
+                mutable_duration.* = after.duration.*;
+                try remapExpr(alloc, mutable_duration, remap);
+                mutable_after.duration = mutable_duration;
+                try remapStmtSlice(alloc, &mutable_after.body, remap);
+                re.after = mutable_after;
             }
         },
         .tuple => |*te| {

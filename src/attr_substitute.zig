@@ -626,6 +626,36 @@ fn substituteInExprDepth(
             new_expr.* = .{ .cond_expr = .{ .meta = ce.meta, .clauses = adopted_clauses } };
             return new_expr;
         },
+        .receive_expr => |re| {
+            var new_clauses: std.ArrayListUnmanaged(ast.CaseClause) = .empty;
+            defer new_clauses.deinit(alloc);
+            var changed = false;
+            for (re.clauses) |clause| {
+                const new_guard = if (clause.guard) |g|
+                    try substituteInExprDepth(owner, alloc, g, func_attrs, mod_attrs, interner, errors, depth + 1)
+                else
+                    null;
+                const new_body = try substituteInStmtsDepth(owner, alloc, clause.body, func_attrs, mod_attrs, interner, errors, depth + 1);
+                if (new_guard != clause.guard or !stmtsUnchanged(clause.body, new_body)) changed = true;
+                var new_clause = clause;
+                new_clause.guard = new_guard;
+                new_clause.body = new_body;
+                try new_clauses.append(alloc, new_clause);
+            }
+            var new_after = re.after;
+            if (re.after) |after| {
+                const new_duration = try substituteInExprDepth(owner, alloc, after.duration, func_attrs, mod_attrs, interner, errors, depth + 1);
+                const new_body = try substituteInStmtsDepth(owner, alloc, after.body, func_attrs, mod_attrs, interner, errors, depth + 1);
+                if (new_duration != after.duration or !stmtsUnchanged(after.body, new_body)) changed = true;
+                new_after = .{ .meta = after.meta, .duration = new_duration, .body = new_body };
+            }
+            if (!changed) return expr;
+            const owned_clauses = try new_clauses.toOwnedSlice(alloc);
+            const adopted_clauses = try owner.adoptCaseClauseSlice(owned_clauses);
+            const new_expr = try owner.createExpr();
+            new_expr.* = .{ .receive_expr = .{ .meta = re.meta, .message_type = re.message_type, .clauses = adopted_clauses, .after = new_after } };
+            return new_expr;
+        },
         .block => |b| {
             const new_stmts = try substituteInStmtsDepth(owner, alloc, b.stmts, func_attrs, mod_attrs, interner, errors, depth + 1);
             if (stmtsUnchanged(b.stmts, new_stmts)) return expr;

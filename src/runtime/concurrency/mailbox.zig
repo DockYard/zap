@@ -182,6 +182,18 @@ pub const PopOutcome = union(enum) {
     transient_gap,
 };
 
+/// Result of a non-consuming `Mailbox.peek` (the `receive … after`
+/// timeout path). Mirrors `PopOutcome` minus the envelope payload — the
+/// message, if any, is left in place for a following `pop`.
+pub const PeekOutcome = enum {
+    /// A deliverable envelope is at the head; a following `pop` returns it.
+    available,
+    /// Linearizably empty at the observation point.
+    empty,
+    /// A producer is mid-publish at the boundary (see `PopOutcome.transient_gap`).
+    transient_gap,
+};
+
 /// How many spin iterations `pop` grants a mid-publish producer before
 /// giving up and reporting `.transient_gap`. The window is two adjacent
 /// instructions, so a small bound resolves every non-preempted case;
@@ -323,6 +335,27 @@ pub const Mailbox = struct {
             (spinForNextLink(head) orelse return .transient_gap);
         mailbox.consumer_head = successor;
         return mailbox.deliver(head);
+    }
+
+    /// Consumer side — the owning process ONLY — whether a deliverable
+    /// envelope is at the head, WITHOUT consuming it. The `receive … after`
+    /// timeout path (`ProcessContext.receiveWaitTimeout`) uses this to
+    /// distinguish message-vs-timeout while leaving the message for a
+    /// following `pop`. Mirrors `pop`'s boundary handling exactly, so no
+    /// false `.empty` can be reported while a producer is mid-publish.
+    pub fn peek(mailbox: *Mailbox) PeekOutcome {
+        const stub_envelope = &mailbox.stub;
+        // `consumer_head` off the stub is always a real, not-yet-delivered
+        // envelope (`pop` advances it past each delivery).
+        if (mailbox.consumer_head != stub_envelope) return .available;
+
+        // At the empty boundary: the first real envelope, if any, hangs off
+        // the stub.
+        if (stub_envelope.next.load(.acquire) != null) return .available;
+        if (mailbox.producer_tail.load(.acquire) == stub_envelope) return .empty;
+        // Tail moved but the stub link has not landed: a producer is
+        // mid-publish right at the boundary.
+        return if (spinForNextLink(stub_envelope) != null) .available else .transient_gap;
     }
 
     /// Approximate number of queued envelopes (see `approximate_depth`).

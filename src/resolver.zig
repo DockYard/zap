@@ -308,6 +308,26 @@ pub const Resolver = struct {
                     self.current_scope = saved;
                 }
             },
+            .receive_expr => |re| {
+                for (re.clauses) |clause| {
+                    const clause_scope = try self.graph.createScope(self.current_scope, .case_clause);
+                    const saved = self.current_scope;
+                    self.current_scope = clause_scope;
+                    try self.resolvePattern(clause.pattern);
+                    try self.bindPattern(clause.pattern);
+                    if (clause.guard) |guard| try self.resolveExpr(guard);
+                    try self.resolveBlock(clause.body);
+                    self.current_scope = saved;
+                }
+                if (re.after) |after| {
+                    try self.resolveExpr(after.duration);
+                    const after_scope = try self.graph.createScope(self.current_scope, .block);
+                    const saved = self.current_scope;
+                    self.current_scope = after_scope;
+                    try self.resolveBlock(after.body);
+                    self.current_scope = saved;
+                }
+            },
             .block => |blk| {
                 const blk_scope = try self.graph.createScope(self.current_scope, .block);
                 const saved = self.current_scope;

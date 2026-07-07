@@ -45,9 +45,13 @@
   it as `t`. It TRUSTS the caller: the compiler cannot yet prove the
   mailbox only carries `t`, and a size mismatch between sender and
   receiver aborts at runtime rather than fabricating bytes. The
-  checked `receive` construct over inferred per-process message
-  unions is the next job (plan items 2.2/2.3, P2-J3) and replaces
-  raw receives in ordinary code.
+  `receive`/`after` LANGUAGE CONSTRUCT (plan item 2.3, P2-J3) is the
+  surface for ordinary code: `receive <t> { <pattern> -> <body> … }`
+  blocks, pops the mailbox head, decodes it as the same fixed scalar
+  transport, and dispatches by pattern match (with an optional `after
+  <ms> -> <body>` timeout arm). Compiler-inferred per-process message
+  unions and exhaustiveness (plan item 2.2, P2-J4) will make its
+  explicit `<t>` token optional and prove every arm reachable.
 
   ## Examples
 

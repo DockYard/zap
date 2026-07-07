@@ -1469,6 +1469,22 @@ pub const Collector = struct {
                     try self.collectBlockBudgeted(clause.body, clause_scope, budget);
                 }
             },
+            .receive_expr => |re| {
+                // Message-pattern arms carry pattern bindings, so each is a
+                // `.case_clause` scope keyed by span (mirrors `.case_expr`).
+                for (re.clauses) |*clause| {
+                    const clause_scope = try self.graph.createScope(parent_scope, .case_clause);
+                    try self.graph.node_scope_map.put(scope.ScopeGraph.spanKey(clause.meta.span), clause_scope);
+                    @constCast(&clause.meta).scope_id = clause_scope;
+                    try self.collectPatternBindingsBudgeted(clause.pattern, clause_scope, budget);
+                    try self.collectBlockBudgeted(clause.body, clause_scope, budget);
+                }
+                if (re.after) |after| {
+                    try self.collectExprScopesBudgeted(after.duration, parent_scope, budget);
+                    const after_scope = try self.graph.createScope(parent_scope, .block);
+                    try self.collectBlockBudgeted(after.body, after_scope, budget);
+                }
+            },
             .try_rescue => |tr| {
                 // The `try` body is its own block scope. Each `rescue` arm is a
                 // case-clause scope carrying its pattern bindings (`e` in

@@ -1541,6 +1541,22 @@ pub const MacroEngine = struct {
                 };
             },
 
+            // `receive`/`after` (concurrency plan Phase 2 item 2.3, P2-J3):
+            // the blocking pattern-match construct. Desugar to a `case` over
+            // a synthesized `:zig.ProcessRuntime.*` receive primitive —
+            // pure sugar over `case` + the genuine blocking/timeout
+            // mechanics, no new HIR/IR primitive, exactly like the
+            // `if`/`cond`/`with` bootstrap fallbacks above. Pattern dispatch
+            // reuses `case`; only the park/decode/timeout/dead-letter leaves
+            // are native (the `:zig.` runtime bridge, never a Zap struct
+            // name — CLAUDE.md prime directive).
+            .receive_expr => |re| {
+                return .{
+                    .expr = try self.receiveToCase(re),
+                    .changed = true,
+                };
+            },
+
             .type_annotated => |ta| {
                 const inner = try self.expandExpr(ta.expr);
                 if (!inner.changed) return .{ .expr = expr, .changed = false };
@@ -4907,6 +4923,172 @@ pub const MacroEngine = struct {
     }
 
     // ============================================================
+    // `receive`/`after` desugar (concurrency plan Phase 2 item 2.3)
+    //
+    // `receive T { arms }` becomes a `case` over a blocking
+    // `:zig.ProcessRuntime.receive_<t>()` decode of the mailbox head. The
+    // optional `after D -> body` timeout arm wraps that dispatch in a
+    // second `case` over `:zig.ProcessRuntime.wait_for_message(D)` (true =
+    // a message arrived within D, so pop+dispatch; false = timed out, so
+    // run the timeout body). `after 0` polls once without blocking. An
+    // unmatched message routes through a synthesized dead-letter catch-all
+    // (`:zig.ProcessRuntime.dead_letter_unexpected()`) rather than the
+    // panicking `match_fail` a bare non-exhaustive `case` would emit.
+    // ============================================================
+
+    fn receiveToCase(self: *MacroEngine, re: ast.ReceiveExpr) anyerror!*const ast.Expr {
+        const meta = re.meta;
+
+        // The message-pattern arms (bodies/guards pre-expanded) plus a
+        // synthesized dead-letter catch-all when the user arms are not
+        // already exhaustive.
+        const message_clauses = try self.buildReceiveClauses(re.clauses, meta);
+
+        // Scrutinee: a blocking pop+decode of the mailbox head.
+        const decode_call = try self.buildReceiveDecodeCall(re.message_type, meta);
+        const dispatch = try self.create(ast.Expr, .{
+            .case_expr = .{ .meta = meta, .scrutinee = decode_call, .clauses = message_clauses },
+        });
+
+        // No `after`: the receive IS the dispatch over a blocking decode.
+        const after = re.after orelse return dispatch;
+
+        // `after`: `case wait_for_message(D) { true -> dispatch; false -> body }`.
+        const wait_call = try self.buildWaitForMessageCall(after.duration, meta);
+        const after_body = try self.expandBlock(after.body);
+
+        const true_pattern = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = meta, .value = true } } });
+        const false_pattern = try self.create(ast.Pattern, .{ .literal = .{ .bool_lit = .{ .meta = meta, .value = false } } });
+        const dispatch_stmts = try self.allocSlice(ast.Stmt, &.{.{ .expr = dispatch }});
+
+        const timeout_clauses = try self.allocator.alloc(ast.CaseClause, 2);
+        timeout_clauses[0] = .{ .meta = meta, .pattern = true_pattern, .type_annotation = null, .guard = null, .body = dispatch_stmts };
+        timeout_clauses[1] = .{ .meta = meta, .pattern = false_pattern, .type_annotation = null, .guard = null, .body = after_body.stmts };
+
+        return try self.create(ast.Expr, .{
+            .case_expr = .{ .meta = meta, .scrutinee = wait_call, .clauses = timeout_clauses },
+        });
+    }
+
+    /// Pre-expand the user message-pattern arms and append a dead-letter
+    /// catch-all unless the arms already end in an irrefutable one. The
+    /// catch-all keeps an unexpected message on the documented non-crashing
+    /// dead-letter path instead of the panicking `match_fail` a bare
+    /// non-exhaustive `case` would emit.
+    fn buildReceiveClauses(self: *MacroEngine, clauses: []const ast.CaseClause, meta: ast.NodeMeta) anyerror![]const ast.CaseClause {
+        var out: std.ArrayList(ast.CaseClause) = .empty;
+        var arms_are_exhaustive = false;
+        for (clauses) |clause| {
+            const body_exp = try self.expandBlock(clause.body);
+            const guard = if (clause.guard) |guard_expr| (try self.expandExpr(guard_expr)).expr else null;
+            try out.append(self.allocator, .{
+                .meta = clause.meta,
+                .pattern = clause.pattern,
+                .type_annotation = clause.type_annotation,
+                .guard = guard,
+                .body = body_exp.stmts,
+            });
+            // An unguarded bare bind/wildcard arm catches every message, so
+            // the arm set is exhaustive and needs no synthesized catch-all.
+            if (clause.guard == null and patternIsIrrefutable(clause.pattern)) {
+                arms_are_exhaustive = true;
+            }
+        }
+        if (!arms_are_exhaustive) {
+            try out.append(self.allocator, try self.buildDeadLetterCatchAll(meta));
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    /// The synthesized `_ -> :zig.ProcessRuntime.dead_letter_unexpected()`
+    /// arm. `dead_letter_unexpected` returns `Never`, so it unifies with any
+    /// arm-body type (like a `panic` arm).
+    fn buildDeadLetterCatchAll(self: *MacroEngine, meta: ast.NodeMeta) anyerror!ast.CaseClause {
+        const wildcard = try self.create(ast.Pattern, .{ .wildcard = .{ .meta = meta } });
+        const dead_letter_call = try self.buildProcessRuntimeCall("dead_letter_unexpected", &.{}, meta);
+        const body = try self.allocSlice(ast.Stmt, &.{.{ .expr = dead_letter_call }});
+        return .{ .meta = meta, .pattern = wildcard, .type_annotation = null, .guard = null, .body = body };
+    }
+
+    /// Build the blocking pop+decode scrutinee for a `receive` message type:
+    /// `:zig.ProcessRuntime.receive_<t>()` for the Phase 2 scalar transport.
+    fn buildReceiveDecodeCall(self: *MacroEngine, message_type: *const ast.TypeExpr, meta: ast.NodeMeta) anyerror!*const ast.Expr {
+        const primitive_name = try self.receivePrimitiveName(message_type);
+        const decode_call = try self.buildProcessRuntimeCall(primitive_name, &.{}, meta);
+        // The `:zig.ProcessRuntime.*` receive primitives are opaque to the
+        // type checker (UNKNOWN return), so annotate the decoded scrutinee
+        // with the message type: `(:zig.… :: T)`. That flows `T` into every
+        // arm's pattern bindings exactly as a `case` over a typed scrutinee.
+        return self.create(ast.Expr, .{
+            .type_annotated = .{ .meta = meta, .expr = decode_call, .type_expr = message_type },
+        });
+    }
+
+    /// Whether a pattern matches every value (an unguarded bare bind or
+    /// wildcard), making a `case`/`receive` arm set exhaustive.
+    fn patternIsIrrefutable(pattern: *const ast.Pattern) bool {
+        return switch (pattern.*) {
+            .wildcard, .bind => true,
+            else => false,
+        };
+    }
+
+    /// Build the timeout-wait scrutinee: `:zig.ProcessRuntime.wait_for_message(D)`.
+    /// The duration is pre-expanded so a macro inside it collapses now.
+    fn buildWaitForMessageCall(self: *MacroEngine, duration: *const ast.Expr, meta: ast.NodeMeta) anyerror!*const ast.Expr {
+        const duration_exp = try self.expandExpr(duration);
+        return self.buildProcessRuntimeCall("wait_for_message", &.{duration_exp.expr}, meta);
+    }
+
+    /// Map a `receive` message-type token to its scalar decode primitive.
+    /// The Phase 2 transport (mirroring `Process.receive_raw`) carries only
+    /// `i64`/`u64`/`f64`/`Bool`/`Atom`; anything else is a compile error
+    /// until the P2-J5 deep-copy walker lands rich payloads.
+    fn receivePrimitiveName(self: *MacroEngine, message_type: *const ast.TypeExpr) anyerror![]const u8 {
+        if (message_type.* == .name and message_type.name.args.len == 0) {
+            const type_name = self.interner.get(message_type.name.name);
+            if (std.mem.eql(u8, type_name, "i64")) return "receive_i64";
+            if (std.mem.eql(u8, type_name, "u64")) return "receive_u64";
+            if (std.mem.eql(u8, type_name, "f64")) return "receive_f64";
+            if (std.mem.eql(u8, type_name, "Bool")) return "receive_bool";
+            if (std.mem.eql(u8, type_name, "Atom")) return "receive_atom";
+        }
+        try self.errors.append(self.allocator, .{
+            .message = "`receive` message type must be a Phase 2 scalar (i64, u64, f64, Bool, or Atom); " ++
+                "richer message types arrive with the P2-J5 deep-copy walker",
+            .span = message_type.getMeta().span,
+        });
+        return error.MacroExpansionFailed;
+    }
+
+    /// Build a `:zig.ProcessRuntime.<fn>(args…)` call node — the sanctioned
+    /// Zig-runtime-primitive bridge (never a Zap struct name), routed by the
+    /// HIR builder to the `ProcessRuntime` intrinsic surface. The primitives
+    /// carry the concurrency-runtime gate, so `receive` in a gate-off build
+    /// is a compile error.
+    fn buildProcessRuntimeCall(
+        self: *MacroEngine,
+        function_name: []const u8,
+        args: []const *const ast.Expr,
+        meta: ast.NodeMeta,
+    ) anyerror!*const ast.Expr {
+        const zig_atom = try self.create(ast.Expr, .{
+            .atom_literal = .{ .meta = meta, .value = try self.interner.intern("zig") },
+        });
+        const namespace = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = meta, .object = zig_atom, .field = try self.interner.intern("ProcessRuntime") },
+        });
+        const callee = try self.create(ast.Expr, .{
+            .field_access = .{ .meta = meta, .object = namespace, .field = try self.interner.intern(function_name) },
+        });
+        const args_copy = try self.allocator.alloc(*const ast.Expr, args.len);
+        @memcpy(args_copy, args);
+        return try self.create(ast.Expr, .{
+            .call = .{ .meta = meta, .callee = callee, .args = args_copy },
+        });
+    }
+
+    // ============================================================
     // Allocation helpers
     // ============================================================
 
@@ -5191,6 +5373,19 @@ fn stampExpansionExprFrame(
                 index -= 1;
                 try stack.append(allocator, .{ .cond_clause = &v.clauses[index] });
             }
+        },
+        .receive_expr => |*v| {
+            stampMetaIfUnset(&v.meta, info);
+            if (v.after) |*after| {
+                var body_index = after.body.len;
+                while (body_index > 0) {
+                    body_index -= 1;
+                    try stack.append(allocator, .{ .stmt = after.body[body_index] });
+                }
+                try stack.append(allocator, .{ .expr = after.duration });
+            }
+            try pushCaseClausesReverse(allocator, stack, v.clauses);
+            try stack.append(allocator, .{ .type_expr = v.message_type });
         },
         .for_expr => |*v| {
             stampMetaIfUnset(&v.meta, info);
