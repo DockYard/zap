@@ -109,6 +109,37 @@ pub struct Process {
   }
 
   @doc = """
+    Spawns `entry` under the memory manager named by the `.manager` option —
+    comptime-resolved AT THE SPAWN SITE (Decision Gate 0). `Process.spawn(entry,
+    .{ .manager = Memory.Arena })` runs the child on its OWN private
+    `Memory.Arena` heap: its allocations use the Arena reclamation model's
+    codegen (individual frees elided; the whole heap bulk-freed wholesale when
+    the process exits), while a `Memory.ARC` process reclaims per-drop. No
+    option (`Process.spawn(entry)`) means the manifest default manager. The
+    child's pid carries the chosen manager's reclamation-model bits.
+
+    The manager MUST be a comptime-known type implementing `Memory.Manager`
+    (`Memory.ARC`, `Memory.Arena`, `Memory.NoOp`, `Memory.Leak`,
+    `Memory.Tracking`, `Memory.GC`, or a third-party manager). A runtime
+    (non-comptime) manager is a COMPILE ERROR: the manager selects the process's
+    reclamation model and per-process codegen, so it cannot be a threaded
+    runtime value. `entry` is the same named/capture-less zero-parameter
+    function `Process.spawn/1` accepts.
+
+    The manager is monomorphized into the spawn-reachable call graph, so hot
+    allocating paths carry NO per-allocation dispatch; a manager backend that is
+    unsound on the target (e.g. a conservative-tracing manager on WebAssembly)
+    is a spawn-time error while the backend stays linkable for the managers this
+    binary CAN use there.
+    """
+
+  pub macro spawn(entry :: Expr, options :: Expr) -> Expr {
+    quote {
+      :zig.ProcessRuntime.spawn_process_managed(unquote(entry), unquote(options))
+    }
+  }
+
+  @doc = """
     Sends `message` to the process behind `pid`, type-checked against
     the handle's message type: `Process.send(pid :: Pid(m), m)`.
     Returns `true` when the message was enqueued on a live mailbox

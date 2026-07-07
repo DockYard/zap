@@ -1290,6 +1290,65 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 | Init returns null at runtime             | Runtime | "zap: manager `<name>` failed to initialize"                                          |
 | `allocate` returns null at runtime       | Runtime | "zap: out of memory: requested `<size>` bytes (alignment `<alignment>`) from manager `<name>`; aborting" |
 
+### 10.5 Per-spawn manager registry (concurrency P3-J3)
+
+The build pipeline above resolves ONE manifest-default manager and registers its
+backend source as `zap_active_manager`. Under the concurrency runtime a process
+may instead select its own manager at spawn: `Process.spawn(f, .{ .manager = X
+})` (Decision Gate 0 — `X` is comptime-resolved at the spawn site). This
+generalizes the single-manager pipeline into an indexed **manager registry**:
+
+- **Driver.** For a gated-on binary the driver resolves + validates EVERY
+  manager referenced by a spawn site PLUS the manifest default (each through the
+  same adapter → backend source → `.zapmem` → `declared_caps` path). Per-spawn
+  managers resolve with `ResolveOptions.gate_target_support = false`, so an
+  unsound manager × target combo stays LINKABLE (the cross-compile requirement:
+  every backend must be present in every target binary — a process might spawn
+  any) rather than being rejected at build; the soundness check becomes a
+  runtime spawn error instead. Each resolved manager is assigned a registry
+  index (0 = manifest default, 1.. = distinct spawn managers).
+
+- **Runtime registry (kernel ABI).** The concurrency kernel
+  (`src/runtime/concurrency/abi.zig`) holds a fixed-capacity array of core
+  vtables indexed by manager id. Two C-ABI intrinsics extend the single-manager
+  surface:
+  - `zap_proc_register_manager(manager_index: u32, core_vtable: *const anyopaque)
+    -> i32` — populate registry slot `manager_index` with a validated core
+    vtable. Slot 0 is also reachable through `zap_proc_bind_manager`. The
+    gated-on runtime bootstrap registers the non-manifest managers from the
+    compiler-generated `zap_manager_registry` module before any managed spawn.
+  - `zap_proc_spawn_at(entry, argument, manager_index: u32) -> u64` — spawn a
+    process under registry slot `manager_index`: mint a FRESH private
+    per-process context from that manager's `init`, stamp the pid's 2-bit
+    reclamation-model field from the manager's `declared_caps`
+    (`reclamationModelForCaps`, mirroring `elision.reclamationModel`), and run
+    the process on its own heap (wholesale-freed at teardown via the manager's
+    `deinit`). `zap_proc_spawn` is `zap_proc_spawn_at(entry, argument, 0)`.
+
+- **Per-process dispatch.** Each process's `ManagerContext.manager_state` points
+  at a `ProcessManagerBinding { core, context }`; the scheduler publishes it per
+  quantum, and the runtime's raw allocate/deallocate hot path dispatches through
+  the RUNNING process's own core (`currentManagerCore`) under the
+  `multi_manager_active` gate — so an ARC process allocates from ARC and an
+  Arena process from Arena in the same binary. A single-manager binary keeps the
+  comptime-bound `active_manager` direct calls (zero-cost, unchanged).
+
+- **Capability matrix (§3.5).** `managerModelSoundOnTarget(model)` (kernel,
+  comptime on `builtin.target`) refuses to spawn a process under a manager whose
+  model is unsound on the target (e.g. a TRACED conservative-mark-sweep manager
+  on Windows/wasm): `zap_proc_spawn_at` returns the invalid pid. The backend
+  stays linkable — a spawn error, not a compile-time exclusion — so a different
+  manager can still be selected there. The build-time driver applies the same
+  predicate to reject the statically-known manifest default early.
+
+- **Monomorphization (the codegen half).** The compiler's spawn-manager pass
+  (`monomorphize.collectAndSpecializeSpawnManagers`) recognizes the
+  `ProcessRuntime.spawn_process_managed` intrinsic (what `lib/process.zap`'s
+  `spawn/2` macro lowers to), resolves each site's manager to a reclamation
+  model, specializes the spawn-reachable subgraph per model (retain/release
+  elided for a BULK_OR_NEVER Arena process, emitted for a REFCOUNTED ARC
+  process), and rewires each site to `spawn_process_at(clone, index)`.
+
 ---
 
 ## 11. Extension model

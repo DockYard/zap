@@ -445,6 +445,41 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
     spawn sites via the returned `entry_specializations`, and completes the runtime per-process
     retain/release model dispatch (the registry — item 3.1/3.3) so cold paths dispatch fully at
     runtime, not just for allocate.
+  - **LANDED (P3-J3, runtime mechanism + compiler pass) — 2026-07-07.** The per-spawn manager
+    machinery ships and is validated end-to-end on the single-manager path. (1) **Kernel registry**
+    (`src/runtime/concurrency/abi.zig`): the single manifest binding is replaced by a manager
+    REGISTRY indexed by id — `zap_proc_register_manager(index, core)` + `zap_proc_spawn_at(entry,
+    arg, index)`; a spawn mints a FRESH private per-process context from the SELECTED registry
+    slot's core and stamps the pid's 2-bit reclamation-model field from that manager's
+    `declared_caps` (`reclamationModelForCaps`, name-for-name equivalent to
+    `elision.reclamationModel`, asserted by a kernel test). `zap_proc_spawn`/`zap_proc_bind_manager`
+    are the slot-0 conveniences. (2) **Per-process dispatch** (`src/runtime.zig`): each process
+    carries a `ProcessManagerBinding {core, context}` (published per quantum); the raw
+    allocate/deallocate hot path dispatches through the RUNNING process's own core
+    (`currentManagerCore`) under the comptime `multi_manager_active` gate, so an ARC process and an
+    Arena process each allocate from their own manager — a single-manager binary keeps the
+    comptime-bound `active_manager` direct calls (zero-cost). (3) **Capability matrix (item 3.5):**
+    `managerModelSoundOnTarget` makes an impossible manager×target combo (TRACED on Windows/wasm) a
+    RUNTIME spawn error while the backend stays LINKABLE (driver `gate_target_support = false` for
+    spawn managers — the cross-compile requirement); the build-time driver applies the same
+    predicate to the manifest default. (4) **Spawn-manager pass**
+    (`monomorphize.collectAndSpecializeSpawnManagers`): recognizes the
+    `ProcessRuntime.spawn_process_managed` intrinsic (the `lib/process.zap` `spawn/2` macro's
+    lowering), resolves each comptime manager → model + registry index via an injected resolver
+    (Decision Gate 0: a non-comptime manager is a compile error at the site), runs
+    `specializeSpawnManagers`, and rewires each site IN PLACE to `spawn_process_at(clone, index)`;
+    wired into the pipeline (`compiler.zig` `runMonomorphize`), surfacing J2's ICF red flags as
+    build diagnostics. **Validated:** kernel `test-kernel` 134/134 (registry + spawn_at model-bit +
+    caps→model correspondence tests); host `zig build test` green; `monomorphize` 1641/1641 (pass
+    unit tests: rewire+specialize, no-op, Decision Gate 0 diagnostic); fresh (cache-nuked) gate-ON
+    `:test_concurrency` 49/0 (the per-process binding-unwrap keeps the single-manager path
+    unchanged). **Remaining last-mile — the running 2-manager binary:** the `main.zig`
+    driver-backed resolver injection into `Pipeline.spawn_manager_resolver` (scope-graph adapter
+    resolution + `driver.resolve` → model + registry-index accumulation), the `zir_backend`
+    `zap_manager_registry` source-module generation (registering each spawn manager alongside
+    `zap_active_manager` + the `multi_manager_active` rewrite stage), and the manager `@export`
+    weak-linkage change so N managers coexist in one binary without a duplicate `zap_memory_section`
+    symbol. Cross-model SEND stays J4.
 - **3.3** Model-tagged pids live; per-reachable-pair copy stubs (lazy generation); adoption
   semantics per model (rc=1 / bulk splice / range registration / free-at-last-use) — **manager
   ABI minor bump** (detach/adopt entry points + envelope-domain semantics) per spec §2.3,

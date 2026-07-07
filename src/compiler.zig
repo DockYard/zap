@@ -4959,6 +4959,12 @@ const Pipeline = struct {
     /// loop in `compileStructByStruct`, which renders all collected
     /// diagnostics once at the end so each error appears exactly once.
     defer_render: bool,
+    /// P3-J3: the injected per-spawn manager resolver (`spawn(f, .{ .manager =
+    /// X })`). Null until the build orchestration (`main.zig`) wires the
+    /// driver-backed resolver; when null, a managed-spawn site is a clear
+    /// diagnostic rather than a silent miss. `runMonomorphize` threads it into
+    /// `collectAndSpecializeSpawnManagers`.
+    spawn_manager_resolver: ?zap.monomorphize.SpawnManagerResolver = null,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -5237,7 +5243,42 @@ const Pipeline = struct {
             reportMonomorphizeErrors(&self.ctx.diag_engine, result.errors) catch return error.OutOfMemory;
             return self.failWithExisting(error.HirFailed);
         }
-        return result.program;
+
+        // P3-J3: run the per-spawn manager-monomorphization axis (ACTIVATES the
+        // P3-J2 mechanism). Recognizes `spawn(f, .{ .manager = X })` sites,
+        // resolves each comptime manager to its reclamation model + registry
+        // index (via the injected resolver), specializes the spawn-reachable
+        // subgraph per model, and rewires each site to `spawn_process_at`. With
+        // no managed-spawn sites (every current build) this is a byte-for-byte
+        // no-op. `spawn_manager_resolver` is null until the driver-backed
+        // resolver is wired at the build orchestration (main.zig); a managed
+        // spawn found without it is a clear diagnostic, never a silent miss.
+        const manifest_model = zap.memory_elision.reclamationModel(self.options.declared_caps);
+        const spawn_result = zap.monomorphize.collectAndSpecializeSpawnManagers(
+            self.alloc,
+            &result.program,
+            type_store,
+            next_group_id,
+            self.ctx.interner,
+            self.spawn_manager_resolver,
+            manifest_model,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.failWith("Error during per-spawn manager specialization", error.HirFailed),
+        };
+        if (spawn_result.errors.len > 0) {
+            reportMonomorphizeErrors(&self.ctx.diag_engine, spawn_result.errors) catch return error.OutOfMemory;
+            return self.failWithExisting(error.HirFailed);
+        }
+        if (spawn_result.foldability_red_flags.len > 0) {
+            // ICF red flags (§2.3 requirement 4): a model specialization is not
+            // structurally foldable with its source — a per-model transform
+            // leaked where only header-emission ops should differ. Surface as a
+            // build diagnostic (by construction the pass never produces these).
+            reportMonomorphizeErrors(&self.ctx.diag_engine, spawn_result.foldability_red_flags) catch return error.OutOfMemory;
+            return self.failWithExisting(error.HirFailed);
+        }
+        return spawn_result.program;
     }
 
     /// Result of an IR-lowering phase: the lowered IR program plus the

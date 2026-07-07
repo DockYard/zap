@@ -4152,7 +4152,8 @@ fn recordManagedSpawnSite(
         // manager type — it cannot be resolved to a reclamation model at compile
         // time, so it cannot select the process's specialization.
         try errors.append(allocator, .{
-            .message = try allocator.dupe(u8,
+            .message = try allocator.dupe(
+                u8,
                 "Process.spawn manager option must be a comptime-known Memory manager type " ++
                     "(e.g. `.{ .manager = Memory.Arena }`). The manager selects the process's " ++
                     "reclamation model and codegen at the spawn site (Decision Gate 0); it cannot " ++
@@ -4165,7 +4166,8 @@ fn recordManagedSpawnSite(
 
     const active_resolver = resolver orelse {
         try errors.append(allocator, .{
-            .message = try std.fmt.allocPrint(allocator,
+            .message = try std.fmt.allocPrint(
+                allocator,
                 "per-spawn memory manager '{s}' cannot be resolved in this build (no manager resolver wired)",
                 .{manager_type_name},
             ),
@@ -4176,7 +4178,8 @@ fn recordManagedSpawnSite(
 
     const resolved = active_resolver.resolve(manager_type_name) catch |err| {
         try errors.append(allocator, .{
-            .message = try std.fmt.allocPrint(allocator,
+            .message = try std.fmt.allocPrint(
+                allocator,
                 "could not resolve per-spawn memory manager '{s}': {s}",
                 .{ manager_type_name, @errorName(err) },
             ),

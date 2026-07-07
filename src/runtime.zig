@@ -3644,8 +3644,8 @@ fn concurrencyStartupForEntry() void {
     if (comptime multi_manager_active) {
         const registry = @import("zap_manager_registry");
         inline for (registry.entries) |entry| {
-            const status = ZapConcurrencyKernel.zap_proc_register_manager(entry.index, entry.core);
-            if (status != 0) {
+            const register_status = ZapConcurrencyKernel.zap_proc_register_manager(entry.index, entry.core);
+            if (register_status != 0) {
                 @panic("zap: concurrency runtime failed to register a per-spawn memory manager");
             }
         }
@@ -4608,6 +4608,22 @@ pub const ProcessRuntime = struct {
             },
             else => rejectSpawnEntryType(EntryType),
         }
+    }
+
+    /// Compiler-internal marker for `spawn(f, .{ .manager = X })` (plan item
+    /// 3.1/3.3, P3-J3). The `lib/process.zap` `spawn/2` macro lowers to this
+    /// intrinsic; the compiler's spawn-manager pass REWRITES every call to
+    /// `spawn_process_at(clone, index)` before ZIR lowering (Decision Gate 0
+    /// diagnoses a non-comptime manager at the site). This body is therefore
+    /// never reached — it exists so the intrinsic name resolves for the type
+    /// checker. Reaching it means the spawn-manager pass did not run (a
+    /// compiler bug), so it aborts loudly rather than silently ignoring the
+    /// selected manager.
+    pub fn spawn_process_managed(entry: anytype, options: anytype) u64 {
+        requireConcurrencyRuntimeGate();
+        _ = entry;
+        _ = options;
+        @panic("zap: internal error — a per-spawn manager selection was not lowered by the spawn-manager pass (compiler bug)");
     }
 
     /// Send `message` to the process identified by `target_pid_bits`.
