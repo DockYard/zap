@@ -3892,6 +3892,444 @@ pub fn specializeSpawnManagers(
     };
 }
 
+// =============================================================================
+// P3-J3 — spawn-site collection, resolution, and rewiring (ACTIVATES J2).
+//
+// Walks the post-monomorphize HIR for `spawn(f, .{ .manager = X })` sites — the
+// `lib/process.zap` macro lowers each to the `ProcessRuntime.spawn_process_managed`
+// INTRINSIC — resolves each site's comptime manager X to its reclamation MODEL
+// + per-spawn registry INDEX (Decision Gate 0: a non-comptime manager is a
+// compile error here), runs `specializeSpawnManagers` on the resulting plan,
+// and REWIRES each site to enter its model's specialization under the chosen
+// registry slot: `ProcessRuntime.spawn_process_at(clone, index)`.
+//
+// Recognition keys on the runtime INTRINSIC name — never a Zap library struct —
+// so the compiler stays a general-purpose tool: the manager identity rides a
+// first-class `Type` value the injected resolver decodes capability-driven.
+// =============================================================================
+
+/// The reclamation model + per-spawn registry index a `.manager = X` option
+/// resolves to. Returned by the injected `SpawnManagerResolver`.
+pub const ResolvedSpawnManager = struct {
+    model: hir.ReclamationModel,
+    registry_index: u32,
+};
+
+pub const SpawnManagerResolveError = error{ ManagerResolutionFailed, OutOfMemory };
+
+/// Injected by the compiler pipeline: resolve a `.manager = X` manager type
+/// name (a `Memory.X`) to its reclamation model + per-spawn registry index,
+/// recording the manager for the registry plan + linking. The pipeline wires
+/// this to the scope-graph adapter resolution + the memory-manager driver
+/// (`declared_caps` → `elision.reclamationModel`); unit tests inject a double.
+pub const SpawnManagerResolver = struct {
+    context: *anyopaque,
+    resolveFn: *const fn (context: *anyopaque, manager_type_name: []const u8) SpawnManagerResolveError!ResolvedSpawnManager,
+
+    pub fn resolve(self: SpawnManagerResolver, manager_type_name: []const u8) SpawnManagerResolveError!ResolvedSpawnManager {
+        return self.resolveFn(self.context, manager_type_name);
+    }
+};
+
+/// Intrinsic a `spawn(f, .{ .manager = X })` site lowers to — the marker the
+/// pass recognizes + rewrites. A runtime PRIMITIVE name, not a Zap struct.
+pub const MANAGED_SPAWN_BUILTIN = "ProcessRuntime.spawn_process_managed";
+/// Intrinsic a resolved managed-spawn site is rewritten to.
+pub const SPAWN_AT_BUILTIN = "ProcessRuntime.spawn_process_at";
+
+/// One recognized + resolved managed-spawn site.
+const ManagedSpawnSite = struct {
+    /// The `spawn_process_managed` call expression (rewritten IN PLACE).
+    call_expr: *const hir.Expr,
+    /// The resolved real entry function group (the target of specialization).
+    entry_group_id: u32,
+    /// The `fn() -> Nil` type of the entry (reused for the rewired closure).
+    entry_type_id: TypeId,
+    /// The reclamation model + registry slot the manager resolved to.
+    model: hir.ReclamationModel,
+    registry_index: u32,
+};
+
+/// Run the P3-J3 spawn-manager wiring: collect + resolve managed-spawn sites,
+/// specialize their reachable subgraphs per model (`specializeSpawnManagers`),
+/// and rewire each site to `spawn_process_at(clone, index)`. When the program
+/// has NO managed-spawn sites the pass is a byte-for-byte no-op (the zero-cost
+/// gate — a single-manager / non-`.manager` binary is unchanged).
+///
+/// `resolver` is null in builds without manager plumbing; a managed-spawn site
+/// found without a resolver, or with a non-comptime manager (Decision Gate 0),
+/// is a diagnostic (never a silent miss). Any diagnostic leaves the program
+/// UNMODIFIED — the driver reports the errors and aborts.
+pub fn collectAndSpecializeSpawnManagers(
+    allocator: Allocator,
+    program: *const hir.Program,
+    store: *TypeStore,
+    next_group_id: *u32,
+    interner: *ast.StringInterner,
+    resolver: ?SpawnManagerResolver,
+    manifest_model: hir.ReclamationModel,
+) !SpawnManagerResult {
+    var sites: std.ArrayListUnmanaged(ManagedSpawnSite) = .empty;
+    defer sites.deinit(allocator);
+    var errors: std.ArrayListUnmanaged(MonomorphError) = .empty;
+    errdefer errors.deinit(allocator);
+
+    try collectManagedSpawnSitesInProgram(allocator, program, interner, resolver, &sites, &errors);
+
+    // Zero-cost gate: no managed-spawn sites (and no diagnostics) → the program
+    // is returned unchanged, so every downstream stage is identical to a build
+    // without per-spawn managers.
+    if (sites.items.len == 0 or errors.items.len > 0) {
+        return .{
+            .program = program.*,
+            .specialization_count = 0,
+            .model_count = 0,
+            .errors = try errors.toOwnedSlice(allocator),
+        };
+    }
+
+    // Build the per-site specs (entry group → model) the J2 axis consumes.
+    var specs: std.ArrayListUnmanaged(SpawnManagerSpec) = .empty;
+    defer specs.deinit(allocator);
+    for (sites.items) |site| {
+        try specs.append(allocator, .{ .entry_group_id = site.entry_group_id, .model = site.model });
+    }
+    const plan = SpawnManagerPlan{ .manifest_model = manifest_model, .specs = specs.items };
+
+    const spec_result = try specializeSpawnManagers(allocator, program, store, next_group_id, interner, plan);
+
+    // Rewire each site: entry → the model's specialized clone, and the call →
+    // `spawn_process_at` with the registry index. The site call_expr pointers
+    // are STABLE across specialization — the caller bodies holding the spawn
+    // sites are NOT cloned (only the spawn-reachable subgraph is), so the shared
+    // Expr nodes are safe to mutate in place (the established HIR-rewrite pattern
+    // in this module; see `rewriteExprBudgeted`).
+    for (sites.items) |site| {
+        const specialized_id = specializedGroupFor(spec_result.entry_specializations, site.entry_group_id, site.model) orelse site.entry_group_id;
+        try rewriteManagedSpawnCall(allocator, site, specialized_id);
+    }
+
+    return spec_result;
+}
+
+fn specializedGroupFor(entry_specializations: []const EntrySpecialization, entry_group_id: u32, model: hir.ReclamationModel) ?u32 {
+    for (entry_specializations) |spec| {
+        if (spec.entry_group_id == entry_group_id and spec.model == model) return spec.specialized_group_id;
+    }
+    return null;
+}
+
+fn collectManagedSpawnSitesInProgram(
+    allocator: Allocator,
+    program: *const hir.Program,
+    interner: *ast.StringInterner,
+    resolver: ?SpawnManagerResolver,
+    sites: *std.ArrayListUnmanaged(ManagedSpawnSite),
+    errors: *std.ArrayListUnmanaged(MonomorphError),
+) !void {
+    for (program.structs) |mod| {
+        for (mod.functions) |group| try collectSpawnSitesInGroup(allocator, program, interner, resolver, group, sites, errors);
+    }
+    for (program.top_functions) |group| try collectSpawnSitesInGroup(allocator, program, interner, resolver, group, sites, errors);
+}
+
+fn collectSpawnSitesInGroup(
+    allocator: Allocator,
+    program: *const hir.Program,
+    interner: *ast.StringInterner,
+    resolver: ?SpawnManagerResolver,
+    group: hir.FunctionGroup,
+    sites: *std.ArrayListUnmanaged(ManagedSpawnSite),
+    errors: *std.ArrayListUnmanaged(MonomorphError),
+) !void {
+    for (group.clauses) |clause| {
+        try collectSpawnSitesInBlock(allocator, program, interner, resolver, clause.body, sites, errors);
+        if (clause.refinement) |refinement| try collectSpawnSitesInExpr(allocator, program, interner, resolver, refinement, sites, errors);
+    }
+}
+
+fn collectSpawnSitesInBlock(
+    allocator: Allocator,
+    program: *const hir.Program,
+    interner: *ast.StringInterner,
+    resolver: ?SpawnManagerResolver,
+    block: *const hir.Block,
+    sites: *std.ArrayListUnmanaged(ManagedSpawnSite),
+    errors: *std.ArrayListUnmanaged(MonomorphError),
+) !void {
+    for (block.stmts) |stmt| switch (stmt) {
+        .expr => |expr| try collectSpawnSitesInExpr(allocator, program, interner, resolver, expr, sites, errors),
+        .local_set => |ls| try collectSpawnSitesInExpr(allocator, program, interner, resolver, ls.value, sites, errors),
+        // Nested groups (eta-wrappers, closures) can themselves hold spawn sites.
+        .function_group => |nested| {
+            for (nested.clauses) |clause| try collectSpawnSitesInBlock(allocator, program, interner, resolver, clause.body, sites, errors);
+        },
+    };
+}
+
+fn collectSpawnSitesInExpr(
+    allocator: Allocator,
+    program: *const hir.Program,
+    interner: *ast.StringInterner,
+    resolver: ?SpawnManagerResolver,
+    expr: *const hir.Expr,
+    sites: *std.ArrayListUnmanaged(ManagedSpawnSite),
+    errors: *std.ArrayListUnmanaged(MonomorphError),
+) anyerror!void {
+    switch (expr.kind) {
+        .call => |call| {
+            if (call.target == .builtin and std.mem.eql(u8, call.target.builtin, MANAGED_SPAWN_BUILTIN)) {
+                try recordManagedSpawnSite(allocator, program, interner, resolver, expr, call, sites, errors);
+                return; // the managed-spawn's own args are consumed by the rewrite
+            }
+            for (call.args) |arg| try collectSpawnSitesInExpr(allocator, program, interner, resolver, arg.expr, sites, errors);
+            if (call.target == .closure) try collectSpawnSitesInExpr(allocator, program, interner, resolver, call.target.closure, sites, errors);
+        },
+        .binary => |b| {
+            try collectSpawnSitesInExpr(allocator, program, interner, resolver, b.lhs, sites, errors);
+            try collectSpawnSitesInExpr(allocator, program, interner, resolver, b.rhs, sites, errors);
+        },
+        .unary => |u| try collectSpawnSitesInExpr(allocator, program, interner, resolver, u.operand, sites, errors),
+        .tuple_init => |elems| for (elems) |e| try collectSpawnSitesInExpr(allocator, program, interner, resolver, e, sites, errors),
+        .list_init => |elems| for (elems) |e| try collectSpawnSitesInExpr(allocator, program, interner, resolver, e, sites, errors),
+        .list_cons => |lc| {
+            try collectSpawnSitesInExpr(allocator, program, interner, resolver, lc.head, sites, errors);
+            try collectSpawnSitesInExpr(allocator, program, interner, resolver, lc.tail, sites, errors);
+        },
+        .map_init => |entries| for (entries) |entry| {
+            try collectSpawnSitesInExpr(allocator, program, interner, resolver, entry.key, sites, errors);
+            try collectSpawnSitesInExpr(allocator, program, interner, resolver, entry.value, sites, errors);
+        },
+        .struct_init => |si| for (si.fields) |field| try collectSpawnSitesInExpr(allocator, program, interner, resolver, field.value, sites, errors),
+        .field_get => |fg| try collectSpawnSitesInExpr(allocator, program, interner, resolver, fg.object, sites, errors),
+        .branch => |br| {
+            try collectSpawnSitesInExpr(allocator, program, interner, resolver, br.condition, sites, errors);
+            try collectSpawnSitesInBlock(allocator, program, interner, resolver, br.then_block, sites, errors);
+            if (br.else_block) |eb| try collectSpawnSitesInBlock(allocator, program, interner, resolver, eb, sites, errors);
+        },
+        .case => |cd| {
+            try collectSpawnSitesInExpr(allocator, program, interner, resolver, cd.scrutinee, sites, errors);
+            for (cd.arms) |arm| try collectSpawnSitesInBlock(allocator, program, interner, resolver, arm.body, sites, errors);
+        },
+        .block => |blk| try collectSpawnSitesInBlock(allocator, program, interner, resolver, &blk, sites, errors),
+        .panic => |e| try collectSpawnSitesInExpr(allocator, program, interner, resolver, e, sites, errors),
+        .unwrap => |e| try collectSpawnSitesInExpr(allocator, program, interner, resolver, e, sites, errors),
+        .union_init => |ui| try collectSpawnSitesInExpr(allocator, program, interner, resolver, ui.value, sites, errors),
+        else => {},
+    }
+}
+
+fn recordManagedSpawnSite(
+    allocator: Allocator,
+    program: *const hir.Program,
+    interner: *ast.StringInterner,
+    resolver: ?SpawnManagerResolver,
+    call_expr: *const hir.Expr,
+    call: hir.CallExpr,
+    sites: *std.ArrayListUnmanaged(ManagedSpawnSite),
+    errors: *std.ArrayListUnmanaged(MonomorphError),
+) !void {
+    if (call.args.len != 2) {
+        try errors.append(allocator, .{
+            .message = try allocator.dupe(u8, "internal error: managed spawn intrinsic must carry (entry, options)"),
+            .span = call_expr.span,
+        });
+        return;
+    }
+    const entry_arg = call.args[0].expr;
+    const options_arg = call.args[1].expr;
+
+    const entry_group_id = extractSpawnEntryGroup(allocator, program, interner, entry_arg) orelse {
+        try errors.append(allocator, .{
+            .message = try allocator.dupe(u8, "Process.spawn entry must be a named (or capture-less) zero-parameter function"),
+            .span = call_expr.span,
+        });
+        return;
+    };
+
+    const manager_type_name = extractManagerTypeName(interner, options_arg) orelse {
+        // Decision Gate 0: the manager option is not a comptime-known Memory
+        // manager type — it cannot be resolved to a reclamation model at compile
+        // time, so it cannot select the process's specialization.
+        try errors.append(allocator, .{
+            .message = try allocator.dupe(u8,
+                "Process.spawn manager option must be a comptime-known Memory manager type " ++
+                    "(e.g. `.{ .manager = Memory.Arena }`). The manager selects the process's " ++
+                    "reclamation model and codegen at the spawn site (Decision Gate 0); it cannot " ++
+                    "be a runtime value.",
+            ),
+            .span = call_expr.span,
+        });
+        return;
+    };
+
+    const active_resolver = resolver orelse {
+        try errors.append(allocator, .{
+            .message = try std.fmt.allocPrint(allocator,
+                "per-spawn memory manager '{s}' cannot be resolved in this build (no manager resolver wired)",
+                .{manager_type_name},
+            ),
+            .span = call_expr.span,
+        });
+        return;
+    };
+
+    const resolved = active_resolver.resolve(manager_type_name) catch |err| {
+        try errors.append(allocator, .{
+            .message = try std.fmt.allocPrint(allocator,
+                "could not resolve per-spawn memory manager '{s}': {s}",
+                .{ manager_type_name, @errorName(err) },
+            ),
+            .span = call_expr.span,
+        });
+        return;
+    };
+
+    try sites.append(allocator, .{
+        .call_expr = call_expr,
+        .entry_group_id = entry_group_id,
+        .entry_type_id = entry_arg.type_id,
+        .model = resolved.model,
+        .registry_index = resolved.registry_index,
+    });
+}
+
+/// The `closure_create` a spawn entry argument reduces to — either the argument
+/// itself (a bare 0-capture funcref) or the result expression of the eta-wrapper
+/// block the desugarer produces for a `&Struct.fn/0` in argument position.
+fn spawnEntryClosure(entry_arg: *const hir.Expr) ?hir.ClosureCreate {
+    switch (entry_arg.kind) {
+        .closure_create => |cc| return cc,
+        .block => |blk| {
+            if (blk.stmts.len == 0) return null;
+            const last = blk.stmts[blk.stmts.len - 1];
+            if (last == .expr and last.expr.kind == .closure_create) return last.expr.kind.closure_create;
+            return null;
+        },
+        else => return null,
+    }
+}
+
+/// Resolve a spawn entry argument to the REAL entry function group. Handles both
+/// a direct 0-capture closure over a findable group and the desugarer's eta
+/// wrapper (`fn() { RealStruct.real_fn() }`), whose forwarding call names the
+/// real entry (the wrapper itself is a nested group `specializeSpawnManagers`
+/// cannot see, so the real, findable entry is what the spec must carry).
+fn extractSpawnEntryGroup(allocator: Allocator, program: *const hir.Program, interner: *ast.StringInterner, entry_arg: *const hir.Expr) ?u32 {
+    const closure = spawnEntryClosure(entry_arg) orelse return null;
+    if (findGroupInProgram(program, closure.function_group_id) != null) return closure.function_group_id;
+    // Nested eta-wrapper: peer into its forwarding call.
+    if (entry_arg.kind == .block) {
+        for (entry_arg.kind.block.stmts) |stmt| {
+            if (stmt == .function_group and stmt.function_group.id == closure.function_group_id) {
+                const wrapper = stmt.function_group;
+                if (wrapper.clauses.len == 0) return null;
+                return forwardingCallGroup(allocator, program, interner, wrapper.clauses[0].body);
+            }
+        }
+    }
+    return null;
+}
+
+fn forwardingCallGroup(allocator: Allocator, program: *const hir.Program, interner: *ast.StringInterner, body: *const hir.Block) ?u32 {
+    for (body.stmts) |stmt| {
+        const expr = switch (stmt) {
+            .expr => |e| e,
+            .local_set => |ls| ls.value,
+            else => continue,
+        };
+        if (expr.kind == .call) {
+            switch (expr.kind.call.target) {
+                .direct => |dc| return dc.function_group_id,
+                .dispatch => |dp| return dp.function_group_id,
+                .named => |nc| return resolveNamedCallGroup(allocator, program, interner, nc),
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
+fn resolveNamedCallGroup(allocator: Allocator, program: *const hir.Program, interner: *ast.StringInterner, nc: hir.NamedCall) ?u32 {
+    const struct_name = nc.struct_name orelse return null;
+    for (program.structs) |mod| {
+        // `joinedWith` always allocates (single-segment names dup), so the
+        // dotted form is freeable uniformly.
+        const dotted = mod.name.joinedWith(allocator, interner, ".") catch return null;
+        defer allocator.free(dotted);
+        if (!std.mem.eql(u8, dotted, struct_name)) continue;
+        for (mod.functions) |group| {
+            if (std.mem.eql(u8, interner.get(group.name), nc.name)) return group.id;
+        }
+    }
+    return null;
+}
+
+/// Extract the `Memory.X` type NAME from a `.{ .manager = X }` options struct.
+/// Returns null when the option is absent or the manager value is not a
+/// comptime-known first-class `Type` value (the Decision Gate 0 signal).
+fn extractManagerTypeName(interner: *ast.StringInterner, options_arg: *const hir.Expr) ?[]const u8 {
+    if (options_arg.kind != .struct_init) return null;
+    for (options_arg.kind.struct_init.fields) |field| {
+        if (std.mem.eql(u8, interner.get(field.name), "manager")) {
+            return typeValueName(interner, field.value);
+        }
+    }
+    return null;
+}
+
+/// A first-class `Type` value lowers to a struct-init with a single `name`
+/// atom field (`hir.buildTypeValueExpr`); recover that atom's string.
+fn typeValueName(interner: *ast.StringInterner, expr: *const hir.Expr) ?[]const u8 {
+    if (expr.kind != .struct_init) return null;
+    for (expr.kind.struct_init.fields) |field| {
+        if (std.mem.eql(u8, interner.get(field.name), "name")) {
+            if (field.value.kind == .atom_lit) return interner.get(field.value.kind.atom_lit);
+        }
+    }
+    return null;
+}
+
+fn findGroupInProgram(program: *const hir.Program, group_id: u32) ?*const hir.FunctionGroup {
+    for (program.structs) |mod| {
+        for (mod.functions) |*group| if (group.id == group_id) return group;
+    }
+    for (program.top_functions) |*group| if (group.id == group_id) return group;
+    return null;
+}
+
+/// Rewrite a managed-spawn call IN PLACE to `spawn_process_at(clone, index)`:
+/// the entry becomes a 0-capture closure over the model specialization (a bare
+/// funcref the backend bakes into the spawn trampoline) and the registry index
+/// a `u32` literal. Uses the module's `@constCast` HIR-mutation pattern — safe
+/// because the caller body holding the site is shared (never cloned).
+fn rewriteManagedSpawnCall(allocator: Allocator, site: ManagedSpawnSite, specialized_group_id: u32) !void {
+    const closure_expr = try allocator.create(hir.Expr);
+    closure_expr.* = .{
+        .kind = .{ .closure_create = .{ .function_group_id = specialized_group_id, .captures = &.{} } },
+        .type_id = site.entry_type_id,
+        .span = site.call_expr.span,
+    };
+    const index_expr = try allocator.create(hir.Expr);
+    index_expr.* = .{
+        .kind = .{ .int_lit = @intCast(site.registry_index) },
+        .type_id = types_mod.TypeStore.U32,
+        .span = site.call_expr.span,
+    };
+    const new_args = try allocator.alloc(hir.CallArg, 2);
+    new_args[0] = .{ .expr = closure_expr, .mode = .share, .expected_type = site.entry_type_id };
+    new_args[1] = .{ .expr = index_expr, .mode = .share, .expected_type = types_mod.TypeStore.U32 };
+
+    const mutable: *hir.Expr = @constCast(site.call_expr);
+    switch (mutable.kind) {
+        .call => |*c| {
+            c.target = .{ .builtin = SPAWN_AT_BUILTIN };
+            c.args = new_args;
+        },
+        else => {},
+    }
+}
+
 /// Check if a function group has type variable parameters (is generic).
 fn genericGroupContainsTypeVar(store: *const TypeStore, group: *const hir.FunctionGroup, allocator: Allocator) TypeWalkError!bool {
     if (group.clauses.len == 0) return false;
@@ -6000,4 +6438,161 @@ test "modelCloneStructurallyFoldable: redirect-tolerant, flags real divergence (
     // model-dependent lowering leak — is also flagged.
     const variant_divergent = try spawnTestGroup(allocator, &interner, 12, "worker__mm_bulk_or_never", try closureCallBody(allocator));
     try std.testing.expect(!modelCloneStructurallyFoldable(&source, &variant_divergent));
+}
+
+// -- P3-J3: managed-spawn collection, resolution, rewiring ----------------------
+
+/// Test double for the injected manager resolver: records the name it saw and
+/// returns a fixed model + registry index (the driver's job in production).
+const MockSpawnResolver = struct {
+    model: hir.ReclamationModel,
+    registry_index: u32,
+    seen_name_buf: [64]u8 = undefined,
+    seen_name_len: usize = 0,
+
+    fn resolve(context: *anyopaque, manager_type_name: []const u8) SpawnManagerResolveError!ResolvedSpawnManager {
+        const self: *MockSpawnResolver = @ptrCast(@alignCast(context));
+        const n = @min(manager_type_name.len, self.seen_name_buf.len);
+        @memcpy(self.seen_name_buf[0..n], manager_type_name[0..n]);
+        self.seen_name_len = n;
+        return .{ .model = self.model, .registry_index = self.registry_index };
+    }
+
+    fn seenName(self: *const MockSpawnResolver) []const u8 {
+        return self.seen_name_buf[0..self.seen_name_len];
+    }
+};
+
+const zero_span: ast.SourceSpan = .{ .start = 0, .end = 0 };
+
+/// Build a first-class `Type` value expr (`Memory.<name>`) — a struct-init with
+/// a single `name` atom field, exactly `hir.buildTypeValueExpr`'s shape.
+fn typeValueExpr(allocator: Allocator, interner: *ast.StringInterner, type_name: []const u8) !*const hir.Expr {
+    const name_field = try interner.intern("name");
+    const fields = try allocator.alloc(hir.StructFieldInit, 1);
+    fields[0] = .{ .name = name_field, .value = try testExpr(allocator, .{ .atom_lit = try interner.intern(type_name) }, TypeStore.UNKNOWN, zero_span) };
+    return try testExpr(allocator, .{ .struct_init = .{ .type_id = TypeStore.UNKNOWN, .fields = fields } }, TypeStore.UNKNOWN, zero_span);
+}
+
+/// Build a `.{ .manager = <value> }` options struct-init expr.
+fn spawnOptionsExpr(allocator: Allocator, interner: *ast.StringInterner, manager_value: *const hir.Expr) !*const hir.Expr {
+    const manager_field = try interner.intern("manager");
+    const fields = try allocator.alloc(hir.StructFieldInit, 1);
+    fields[0] = .{ .name = manager_field, .value = manager_value };
+    return try testExpr(allocator, .{ .struct_init = .{ .type_id = TypeStore.UNKNOWN, .fields = fields } }, TypeStore.UNKNOWN, zero_span);
+}
+
+/// A body with a managed-spawn call `spawn_process_managed(closure(entry_id), options)`.
+fn managedSpawnBody(allocator: Allocator, entry_id: u32, options_expr: *const hir.Expr) !*const hir.Block {
+    const entry_closure = try testExpr(allocator, .{ .closure_create = .{ .function_group_id = entry_id, .captures = &.{} } }, TypeStore.NIL, zero_span);
+    const args = try allocator.alloc(hir.CallArg, 2);
+    args[0] = .{ .expr = entry_closure };
+    args[1] = .{ .expr = options_expr };
+    const call = try testExpr(allocator, .{ .call = .{ .target = .{ .builtin = MANAGED_SPAWN_BUILTIN }, .args = args } }, TypeStore.UNKNOWN, zero_span);
+    return blockWithExpr(allocator, call);
+}
+
+test "collectAndSpecializeSpawnManagers rewires a managed spawn to spawn_process_at and specializes the entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+    var store = try TypeStore.init(allocator, &interner);
+
+    // entry (id 1) is the spawned function; main (id 2) spawns it under Arena.
+    const entry = try spawnTestGroup(allocator, &interner, 1, "worker", try emptyBlock(allocator));
+    const options = try spawnOptionsExpr(allocator, &interner, try typeValueExpr(allocator, &interner, "Memory.Arena"));
+    const main = try spawnTestGroup(allocator, &interner, 2, "main", try managedSpawnBody(allocator, 1, options));
+
+    const groups = try allocator.alloc(hir.FunctionGroup, 2);
+    groups[0] = entry;
+    groups[1] = main;
+    const program = hir.Program{ .structs = &.{}, .top_functions = groups };
+
+    var mock = MockSpawnResolver{ .model = .bulk_or_never, .registry_index = 1 };
+    const resolver = SpawnManagerResolver{ .context = &mock, .resolveFn = MockSpawnResolver.resolve };
+
+    var next_group_id: u32 = 3;
+    const result = try collectAndSpecializeSpawnManagers(allocator, &program, &store, &next_group_id, &interner, resolver, .refcounted);
+
+    // The manager option was resolved by NAME (capability-driven, no hardcoding).
+    try std.testing.expectEqualStrings("Memory.Arena", mock.seenName());
+
+    // A BULK_OR_NEVER specialization of the entry (id 1) was created.
+    try std.testing.expectEqual(@as(usize, 1), result.entry_specializations.len);
+    const spec = result.entry_specializations[0];
+    try std.testing.expectEqual(@as(u32, 1), spec.entry_group_id);
+    try std.testing.expectEqual(hir.ReclamationModel.bulk_or_never, spec.model);
+    const clone = findGroupById(&result.program, spec.specialized_group_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(hir.ReclamationModel.bulk_or_never, clone.reclamation_model.?);
+
+    // The main body's managed-spawn call was rewritten to
+    // `spawn_process_at(closure(clone), 1)`.
+    const main_group = findGroupById(&result.program, 2) orelse return error.TestUnexpectedResult;
+    const call_expr = main_group.clauses[0].body.stmts[0].expr;
+    try std.testing.expect(call_expr.kind == .call);
+    try std.testing.expect(call_expr.kind.call.target == .builtin);
+    try std.testing.expectEqualStrings(SPAWN_AT_BUILTIN, call_expr.kind.call.target.builtin);
+    try std.testing.expectEqual(@as(usize, 2), call_expr.kind.call.args.len);
+
+    const arg0 = call_expr.kind.call.args[0].expr;
+    try std.testing.expect(arg0.kind == .closure_create);
+    try std.testing.expectEqual(spec.specialized_group_id, arg0.kind.closure_create.function_group_id);
+
+    const arg1 = call_expr.kind.call.args[1].expr;
+    try std.testing.expect(arg1.kind == .int_lit);
+    try std.testing.expectEqual(@as(i64, 1), arg1.kind.int_lit);
+}
+
+test "collectAndSpecializeSpawnManagers: no managed spawns is a byte-for-byte no-op" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+    var store = try TypeStore.init(allocator, &interner);
+
+    const only = try spawnTestGroup(allocator, &interner, 1, "plain", try emptyBlock(allocator));
+    const groups = try allocator.alloc(hir.FunctionGroup, 1);
+    groups[0] = only;
+    const program = hir.Program{ .structs = &.{}, .top_functions = groups };
+
+    var next_group_id: u32 = 2;
+    // No resolver at all: with no managed-spawn sites, it is never consulted.
+    const result = try collectAndSpecializeSpawnManagers(allocator, &program, &store, &next_group_id, &interner, null, .refcounted);
+    try std.testing.expectEqual(@as(u32, 0), result.specialization_count);
+    try std.testing.expectEqual(@as(usize, 0), result.errors.len);
+    try std.testing.expectEqual(@as(u32, 2), next_group_id); // unchanged
+}
+
+test "collectAndSpecializeSpawnManagers: a non-comptime manager is a Decision Gate 0 diagnostic (unmodified program)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+    var store = try TypeStore.init(allocator, &interner);
+
+    // The manager option is a RUNTIME value (a local_get), not a comptime Type.
+    const runtime_manager = try testExpr(allocator, .{ .local_get = 0 }, TypeStore.UNKNOWN, zero_span);
+    const options = try spawnOptionsExpr(allocator, &interner, runtime_manager);
+    const entry = try spawnTestGroup(allocator, &interner, 1, "worker", try emptyBlock(allocator));
+    const main = try spawnTestGroup(allocator, &interner, 2, "main", try managedSpawnBody(allocator, 1, options));
+
+    const groups = try allocator.alloc(hir.FunctionGroup, 2);
+    groups[0] = entry;
+    groups[1] = main;
+    const program = hir.Program{ .structs = &.{}, .top_functions = groups };
+
+    var mock = MockSpawnResolver{ .model = .bulk_or_never, .registry_index = 1 };
+    const resolver = SpawnManagerResolver{ .context = &mock, .resolveFn = MockSpawnResolver.resolve };
+
+    var next_group_id: u32 = 3;
+    const result = try collectAndSpecializeSpawnManagers(allocator, &program, &store, &next_group_id, &interner, resolver, .refcounted);
+
+    // Decision Gate 0: a diagnostic, and the program is left UNMODIFIED (the
+    // managed-spawn call is not rewritten — the driver reports and aborts).
+    try std.testing.expect(result.errors.len > 0);
+    const main_group = findGroupById(&result.program, 2) orelse return error.TestUnexpectedResult;
+    const call_expr = main_group.clauses[0].body.stmts[0].expr;
+    try std.testing.expect(call_expr.kind.call.target == .builtin);
+    try std.testing.expectEqualStrings(MANAGED_SPAWN_BUILTIN, call_expr.kind.call.target.builtin);
 }
