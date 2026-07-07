@@ -982,10 +982,212 @@ BYTE-IDENTICAL to one compiled with the pre-J6 compiler
 (`5075af40…dbb5ecd`), and carries NO `zap_proc_*`/`reductions`/`safepoint`
 symbols. The CLBG wins are untouched with the gate off.
 
-## E6 — copy crossover
+## E6 — copy crossover (P2-J9, 2026-07-07) — first crossover measurement
 
-*Reserved — filled in Phase 2 (re-run in Phase 6). Copy p99 vs message size,
-64 B–1 MB; the crossover point drives the steal-vs-copy (Blob/move) decision.*
+**VERDICT: crossover is LATE for flat scalar payloads (~1 KB) and IMMEDIATE +
+catastrophic for `Map` payloads (~256 B, hash-rebuild reconstruct).** The
+plan's two-copy serialize-to-blob send (P2-J5 walker; the R4 note at plan item
+2.4) is *free relative to the ~44 ns same-scheduler RTT floor for messages up
+to ~1 KB of flat scalars* — the common BEAM small-message actor pattern pays
+essentially nothing — but the **receiver-side reconstruct (Copy C) dominates**
+and, for `Map`, rebuilds the hash table entry-by-entry, making a 1 MB map send
+cost **2.19 ms** (150× a bare 1 MB `memcpy`). That split is the Phase-3
+prioritization signal: the O(1) region-move / bulk-adopt path (R4/R5) is
+*deferrable for small flat messages* but *urgent for maps and large payloads*,
+and the win lives in eliminating the reconstruct, not the serialize.
+
+This is the Phase-2 measurement of item **2.8** (moved from S0.1 because it
+needs the 2.4 walker) and quantifies the 2-copy cost the **P2-J5 R4 note**
+flagged (plan item 2.4, "serialize-to-blob (2 copies)…the 2-copy cost is
+exactly what item 2.8's copy-p99-vs-size harness feeds into the E6 crossover
+measurement"; the R4/R5 fallback at item 3.3). Re-run in Phase 6 after the
+Blob/move path lands (gate table row E6).
+
+### Methodology
+
+- **Date:** 2026-07-07. Same machine as the whole series (MacBook Air
+  `Mac16,13`, Apple M4, 10 cores, 32 GB, macOS 26.2 build 25C56).
+- **Harness:** `bench/concurrency-copy/bench.zig` (NOT throwaway — re-runs in
+  Phase 6), compiled with the fork compiler (`~/projects/zig` @
+  `6a425dbaeb`, clean tree) at `-OReleaseFast`. It links the REAL runtime
+  (`src/runtime.zig`) against the REAL production **ARC manager**
+  (`src/memory/arc/manager.zig`, whose `zap_memory_section` the runtime's weak
+  extern binds), so the copied values are real refcounted `List`/`Map`/`String`
+  ARC cells (`refcount_v1_active == true`) and the two timed copies are the
+  exact walker passes `Process.send`/`receive` run — `serializeMessage`
+  (**Copy A**, sender: walk graph → `c_allocator` blob, the allocator
+  `send_message` uses) and `deserializeMessage` (**Copy C**, receiver: allocate
+  FRESH rc=1 ARC cells → copy bytes out). Exact module-graph build command in
+  the bench README. This is NOT a synthetic memcpy — it is the real 2-copy
+  walker on real ARC cells.
+- **Protocol (E1/E9/E10 conventions):** one measurement at a time, foreground,
+  `uptime` recorded before each mode (`run-copy-bench.sh`). Timing via
+  `CLOCK_UPTIME_RAW` directly in the harness, never through the walker. Per
+  size: unrecorded warmup, then **7 reps** (≥5 per the ledger) each collecting
+  a per-op latency sample; samples **pooled across reps** → median / min / p99.
+  A separate **clock-overhead-free floor** (`rt_floor`) times the round trip in
+  small sub-batches and keeps the MIN per-op across every group and rep — the
+  un-preempted group, so neither the ~42 ns per-op clock tick (E9) nor load is
+  in it; it is the number the sub-tick small sizes need. **Load** 1-min ranged
+  **2.4–3.7** across the run (moderate; other agent sessions active) — medians
+  carry that load, **the min and `rt_floor` are the load-robust floor** (the
+  standing caveat), and the tight `rt_repmed` spreads show the medians are
+  nonetheless stable. Anti-elision: every reconstructed value's element count
+  is asserted (forces the copy) + a touched-byte checksum is
+  `doNotOptimizeAway`n.
+- **Message shapes + sizing (documented in the bench README):** blob byte
+  targets 64 B → 1 MB; the row's actual blob is sized to the target by the
+  grammar and printed. `list` = `List(i64)`, blob `= 4 + 8n` (flat scalars,
+  cheapest — pure memcpy). `map` = `Map(i64,i64)`, blob `= 4 + 16n` (reconstruct
+  rebuilds the hash table via `put_owned_unchecked`). `string` = `List(String)`
+  of 16-byte strings, blob `= 4 + n·(4+16)` (reconstruct does one
+  `runtime_arena` allocation per element). `list`/`map` sweep the full range;
+  `string` is capped at 64 KB (bounded arena growth — the scalar/map sweeps
+  carry the crossover).
+- **Substrate honesty:** Phase-2 reality — ONE binary-wide ARC instance (plan
+  item 3.1 makes managers per-process); reconstruct allocates through the
+  production ARC slab pool (representative cell-allocation cost). A latent
+  compile error in `runtime.zig`'s never-before-analyzed `pub fn
+  resetAllocator` (ignored the `bool` from `ArenaAllocator.reset`) was surfaced
+  and fixed by this job (the bench is its first caller).
+- **The floor to beat:** the E1/P1-J6 same-scheduler RTT — **44 ns** median /
+  44 ns min (quiet-run converged; ~50–90 ns median under session load). A copy
+  cheaper than this is hidden inside the message-passing mechanism itself.
+
+### `List(i64)` — primary scalar sweep (median / min / p99 per-op ns, 7 reps)
+
+| Blob (B) | elems | round-trip median | min | p99 | floor | serialize (A) | reconstruct (C) | RT ÷ 44 ns |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 60 | 7 | 0 | 0 | 42 | 35 | 0 | 0 | ≈1× |
+| 252 | 31 | 41 | 0 | 42 | 47 | 0 | 0 | ≈1× |
+| 1 020 | 127 | 83 | 0 | 84 | 96 | 41 | 42 | **~2×** |
+| 4 092 | 511 | 208 | 125 | 209 | 217 | 42 | 166 | ~5× |
+| 16 380 | 2 047 | 708 | 625 | 792 | 737 | 167 | 542 | ~16× |
+| 65 532 | 8 191 | 3 458 | 3 208 | 4 000 | 4 047 | 1 167 | 2 250 | ~79× |
+| 262 140 | 32 767 | 12 208 | 11 958 | 14 791 | 13 602 | 3 292 | 8 333 | ~278× |
+| 1 048 572 | 131 071 | 45 834 | 45 542 | 52 500 | 49 756 | 12 542 | 32 709 | ~1 042× |
+
+### `Map(i64,i64)` sweep (median / min per-op ns, 7 reps)
+
+| Blob (B) | entries | round-trip median | min | p99 | serialize (A) | reconstruct (C) | RT ÷ 44 ns |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 52 | 3 | 42 | 0 | 84 | 0 | 42 | ≈1× |
+| 244 | 15 | 375 | 208 | 625 | 0 | 375 | **~8.5×** |
+| 1 012 | 63 | 1 792 | 1 250 | 2 917 | 41 | 1 791 | ~41× |
+| 4 084 | 255 | 7 375 | 6 000 | 8 833 | 83 | 7 292 | ~168× |
+| 16 372 | 1 023 | 30 958 | 27 208 | 35 584 | 333 | 30 500 | ~704× |
+| 65 524 | 4 095 | 124 791 | 116 208 | 136 333 | 1 542 | 122 750 | ~2 836× |
+| 262 132 | 16 383 | 515 000 | 493 834 | 549 166 | 5 875 | 511 167 | ~11 705× |
+| 1 048 564 | 65 535 | 2 189 917 | 2 119 750 | 2 291 042 | 22 750 | 2 165 583 | ~49 771× |
+
+### `List(String)` (16-byte elements) sweep (median / min per-op ns, 7 reps)
+
+| Blob (B) | elems | round-trip median | min | p99 | serialize (A) | reconstruct (C) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 3 | 41 | 0 | 42 | 0 | 41 |
+| 244 | 12 | 83 | 0 | 125 | 41 | 42 |
+| 1 024 | 51 | 333 | 250 | 417 | 125 | 208 |
+| 4 084 | 204 | 1 250 | 1 208 | 1 375 | 500 | 833 |
+| 16 384 | 819 | 5 083 | 5 000 | 6 417 | 2 041 | 3 250 |
+| 65 524 | 3 276 | 21 333 | 20 667 | 25 625 | 8 292 | 13 541 |
+
+### Calibration — clock floor + transport copy (Copy B proxy)
+
+Per-op `CLOCK_UPTIME_RAW` read cost **12.8 ns** (the per-op-sampling floor;
+the tick quantizes to ~42 ns, so sub-tick sizes are read off `rt_floor`). Bare
+`@memcpy` of a blob-sized buffer — the kernel transport copy (**Copy B**: the
+size-proportional `@memcpy` `zap_proc_send` does into the mailbox ledger,
+`src/runtime/concurrency/abi.zig`), the third size-dependent memcpy a full
+send→receive adds on top of the two walker copies and the payload-independent
+~44 ns mailbox RTT:
+
+| Blob (B) | 64 | 256 | 1 024 | 4 096 | 16 384 | 65 536 | 262 144 | 1 048 576 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| memcpy ns | 1.5 | 2.6 | 9.4 | 37 | 136 | 741 | 3 409 | 14 162 |
+
+### Crossover verdict
+
+"Significant" is defined concretely as **round-trip copy ≥ 2× the 44 ns
+same-scheduler RTT floor (≥ ~88 ns)** — the point where the copy is no longer
+hidden inside the message-passing mechanism; "dominant" as **≥ 10× the floor
+(≥ 440 ns)**.
+
+- **`List(i64)` (flat scalars): crossover ≈ 1 KB.** At ≤ 256 B the round trip
+  is 0–41 ns — at or below the RTT floor, i.e. the two copies are *free*
+  relative to sending the message at all. It reaches ~2× the floor at ~1 KB
+  (127 elems, 83 ns / floor 96 ns), ~5× at 4 KB, and becomes **dominant
+  (~16×) at ~16 KB**. Even 1 MB is only ~46 µs.
+- **`Map(i64,i64)`: crossover is IMMEDIATE (~256 B) and the cost is
+  catastrophic.** 15 entries (244 B) already cost 375 ns (~8.5× the floor);
+  the round trip is ~168× the floor by 4 KB and reaches **2.19 ms at 1 MB —
+  150× the 14 µs bare `memcpy` of the same bytes** — because the reconstruct
+  rebuilds the hash table one `put_owned_unchecked` at a time (hash + probe +
+  incremental-growth rehash), work the flat memcpy never does.
+- **`List(String)`: intermediate, crossover ~256 B–1 KB** (2× floor at ~256 B,
+  7.5× at ~1 KB) — the per-element `runtime_arena` allocation on reconstruct
+  costs more than a flat list but far less than a map's hash rebuild.
+
+**Against the research anchors.** Erlang's **64-byte** refc-binary threshold
+(copy ≤ 64 B, zero-copy refc-share above) is *conservative* for Zap's flat
+scalars: our copy stays ≤ the RTT floor to ~256 B and only crosses at ~1 KB —
+flat data can be copied ~16× longer than Erlang's binary cutoff before it
+matters. But the `Map` result argues the *opposite* for structured data: the
+reconstruct's hash rebuild makes maps cross ~4× earlier than Erlang's byte
+cutoff would suggest, at ~256 B. The protobuf/`bytes` precedent (serialize/parse
+cost ∝ payload, µs/MB for flat data) matches the `list`/`string` rows; the map
+rows are the parse-side hash-build outlier those precedents also see.
+
+### Two-copy attribution (serialize vs reconstruct)
+
+The receiver-side **reconstruct (Copy C) is the dominant half everywhere**, and
+`serialize (A) + reconstruct (C)` reconciles with the round trip (e.g. `Map`
+1 MB: 22 750 + 2 165 583 = 2 188 333 ≈ 2 189 917 round-trip):
+
+| Shape (1 MB / 64 KB) | serialize A | reconstruct C | C ÷ A |
+|---|---:|---:|---:|
+| `List(i64)` @ 1 MB | 12 542 ns | 32 709 ns | **2.6×** |
+| `List(String)` @ 64 KB | 8 292 ns | 13 541 ns | 1.6× |
+| `Map(i64,i64)` @ 1 MB | 22 750 ns | 2 165 583 ns | **95×** |
+
+Serialize is a linear walk + one `c_allocator` blob (`writeValue` is memcpy-
+class); reconstruct additionally *allocates* — fresh rc=1 ARC cells (`list`),
+per-element arena strings (`string`), or a from-scratch hash table (`map`).
+The full send→receive adds Copy B (the transport `memcpy` above, e.g. 14 µs at
+1 MB) and the ~44 ns mailbox RTT, so a real 1 MB `List(i64)` message ≈ 12.5 µs
+(A) + 14 µs (B) + 32.7 µs (C) ≈ **~59 µs end-to-end**; a 1 MB `Map` ≈ **~2.2 ms**,
+almost entirely Copy C.
+
+### Phase-3 implication — feeds R4/R5 prioritization
+
+The crossover is **late for flat scalars, early and catastrophic for maps**,
+and the cost is **concentrated in the reconstruct** — which is exactly the copy
+the O(1) region-move / refcounted-adopt path (research.md §6.4, risk **R4** at
+research.md:237; the R4/R5 fallback at plan item 3.3) eliminates. Therefore:
+
+1. **Flat small messages (< 1 KB): defer.** Copy ≤ the RTT floor; the
+   O(1)-move/`Blob` machinery buys nothing for the common BEAM actor pattern.
+   The verifier + docs may keep serialize-to-blob as the flat-scalar path
+   indefinitely for these sizes.
+2. **`Map` payloads: prioritize.** The hash-rebuild reconstruct crosses at
+   ~256 B and reaches milliseconds — the strongest case in this measurement for
+   a Phase-3 intervention. It specifically justifies the plan item 3.3
+   **`BULK_OR_NEVER` page-splice / bulk-adopt** reconstruct (move the entry
+   region wholesale instead of re-hashing), and it means the R4 degradation the
+   P2-J5 note recorded (cross-process move falls back to the 2-copy serialize
+   because ARC `List`/`Map` cells are single `c_allocator` blocks) is *most
+   expensive for exactly the container that most needs relocatable/arena-backed
+   buffers* (R4 remediation option (a)).
+3. **Large flat/string payloads: valuable, not blocking.** Tens of µs at
+   1 MB — an O(1)-move is a throughput win for bulk-data pipelines, secondary
+   to the map case.
+4. **`Blob` tier (§6.2/6.3): mild.** `String` is the least-penalized shape here;
+   zero-copy immutable `Blob` share helps large-string traffic but is not the
+   Phase-3 urgency the map reconstruct is.
+
+Net: **an early crossover for maps pulls the R4 bulk-adopt/move path forward
+for structured containers; a late crossover for flat scalars lets it be
+deferred there.** Re-run E6 in Phase 6 with the move path on and compare the
+`Map` row against the 2.19 ms/MB serialize-to-blob baseline recorded here.
 
 ## Baseline comparison yardstick
 

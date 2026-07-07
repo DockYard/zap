@@ -338,6 +338,18 @@ V11 by advancing the compile past the earlier abort. Out of concurrency scope; l
 - **2.8** Copy-p99-vs-size harness (moved from S0.1): message-copy latency over 64 B–1 MB
   payloads, built on the 2.4 deep-copy walker (the component whose absence moved this out of
   Phase 0); feeds the E6 crossover measurement below.
+  - **Landed + measured (P2-J9, 2026-07-07).** `bench/concurrency-copy/` times the REAL
+    `serializeMessage`/`deserializeMessage` walker on real refcounted `List`/`Map`/`String`
+    ARC cells (runtime linked against the production ARC manager), median/min/p99 per size,
+    with the serialize-vs-reconstruct split. **E6 first crossover:** flat `List(i64)` copy is
+    ≤ the ~44 ns RTT floor to ~256 B and crosses (≥2× floor) at ~1 KB, dominant (~16×) at
+    ~16 KB, ~46 µs at 1 MB — LATE, deferrable for small flat messages. `Map` crosses
+    IMMEDIATELY (~256 B) and reaches **2.19 ms at 1 MB (150× a bare memcpy)** because the
+    reconstruct rebuilds the hash table — the receiver-side reconstruct (Copy C) is the
+    dominant half everywhere (2.6× serialize for lists, 95× for maps). This makes the R4/R5
+    O(1)-move / bulk-adopt path (item 3.3) **urgent for maps and large payloads, deferrable
+    for small flat messages** — the win is in eliminating the reconstruct. Full table +
+    verdict: `docs/concurrency-bench-results.md` § E6; quantifies the item-2.4 R4 note.
 - **2.9** E2 gate execution precondition: quiet-machine interleaved re-baseline — paired
   baseline-vs-safepoint runs of the same binaries in the same session, compared on paired
   medians/minima per the S0.1 ledger's gating protocol (the archival S0.1 table is drift

@@ -819,7 +819,10 @@ fn tryArenaExtend(slice: []const u8, new_len: usize) bool {
 }
 
 pub fn resetAllocator() void {
-    runtime_arena.reset(.retain_capacity);
+    // `ArenaAllocator.reset` returns whether it kept the backing; the
+    // retain-capacity reset always does, and the caller does not need the
+    // signal — discard it explicitly (as the `.free_all` reset sites do).
+    _ = runtime_arena.reset(.retain_capacity);
 }
 
 // ============================================================
@@ -4189,7 +4192,13 @@ fn deserializeValue(comptime T: type, reader: *MessageBlobReader) error{ OutOfMe
 /// Sender side: deep-copy `value` into a fresh, self-contained message blob
 /// allocated from `allocator` (the caller frees it once the transport has
 /// taken the bytes). Reads the source graph only.
-fn serializeMessage(comptime T: type, value: T, allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
+///
+/// Public because it is the walker's reusable serialize entry (module header:
+/// "a future WIRE serializer reuses the same walk") — `send_message` calls it
+/// for rich payloads, and the E6 copy-crossover benchmark
+/// (`bench/concurrency-copy/`) times it directly to attribute the sender-side
+/// (serialize) half of the plan's two-copy send.
+pub fn serializeMessage(comptime T: type, value: T, allocator: std.mem.Allocator) error{OutOfMemory}![]u8 {
     comptime std.debug.assert(isWalkerSendable(T));
     const size = measureValue(T, value, 0);
     const buffer = try allocator.alloc(u8, size);
@@ -4205,7 +4214,14 @@ fn serializeMessage(comptime T: type, value: T, allocator: std.mem.Allocator) er
 /// type is larger/different than `T` (a size/shape mismatch), which is
 /// reported as `CorruptMessage` after releasing the just-built value so the
 /// error path leaks nothing.
-fn deserializeMessage(comptime T: type, blob: []const u8) error{ OutOfMemory, CorruptMessage }!T {
+///
+/// Public for the same reason as `serializeMessage`: it is the walker's
+/// reusable reconstruct entry (`receiveMessage` calls it), and the E6
+/// copy-crossover benchmark (`bench/concurrency-copy/`) times it directly to
+/// attribute the receiver-side (reconstruct) half of the two-copy send — the
+/// half that allocates fresh ARC cells and, for the R4/R5 verdict, is the
+/// dominant copy.
+pub fn deserializeMessage(comptime T: type, blob: []const u8) error{ OutOfMemory, CorruptMessage }!T {
     comptime std.debug.assert(isWalkerSendable(T));
     var reader = MessageBlobReader{ .bytes = blob };
     const value = try deserializeValue(T, &reader);
@@ -4848,7 +4864,15 @@ fn RootProcessTrampoline(comptime root_main: anytype, comptime Result: type) typ
 ///     call thus always happens from a user-controlled entry point
 ///     (typically `main` or the first ARC-touching call from main),
 ///     not from a hidden module-level initialiser.
-inline fn ensureMemoryStartup() void {
+/// Idempotently start the runtime's memory manager. In a compiler-driven Zap
+/// binary the emitted startup prologue supersedes this (the comptime
+/// `MEMORY_STARTUP_PROLOGUE_EMITTED` early-return), so it is a no-op there; in
+/// host builds that link `runtime.zig` directly WITHOUT that prologue — the
+/// unit tests and the E6 copy benchmark (`bench/concurrency-copy/`) — it binds
+/// the test-only ARC fallback state so `List`/`Map`/`String` allocation and
+/// the deep-copy walker work. Public so those host embedders can call it once
+/// before allocating (the walker unit tests already do).
+pub inline fn ensureMemoryStartup() void {
     if (comptime MEMORY_STARTUP_PROLOGUE_EMITTED) return;
     if (!active_manager_state.started) zapMemoryStartup();
 }
