@@ -1,15 +1,20 @@
-//! Cross-check that the byte-keyed slab pool constants in
-//! `src/runtime.zig`'s `TestOnlyArcSlabPool` match the corresponding
-//! constants in `src/memory/arc/manager.zig` byte-for-byte.
+//! Cross-check that the byte-keyed slab pool constants are byte-for-byte
+//! identical across ALL THREE copies: `src/runtime.zig`'s `TestOnlyArcSlabPool`,
+//! `src/memory/arc/manager.zig`, and `src/memory/orc/manager.zig`.
 //!
 //! Phase 4.x duplicated the slab-pool implementation between the
 //! runtime (for test builds, where the manager `.o` is not linked)
 //! and the production manager (`src/memory/arc/manager.zig`,
 //! compiled as a standalone object via `zap_fork_compile_zig_to_object`).
-//! The production manager rule (spec section 11.1.1) forbids it from
-//! importing sibling files: its only dependencies are `std` and
+//! P3-R1a (G7) added a THIRD copy in `src/memory/orc/manager.zig`: ORC's
+//! production per-process heap is the same page-backed slab/large pool (ORC
+//! keeps its own refcounts, so it never reads the per-slot side table, but the
+//! geometry is identical so the copy stays verbatim and this check stays
+//! trivial).
+//! The production manager rule (spec section 11.1.1) forbids each from
+//! importing sibling files: their only dependencies are `std` and
 //! `builtin`. That means we cannot share a slab-pool module between
-//! the two — the duplication is structural, not accidental.
+//! them — the duplication is structural, not accidental.
 //!
 //! The runtime's test path and the production binary's user code
 //! both reach the slab pool through the REFCOUNT_V1 vtable; a drift
@@ -127,12 +132,14 @@ fn extractConstantValue(source: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-test "slab pool constants are byte-identical between runtime and arc manager" {
+test "slab pool constants are byte-identical across runtime, arc manager, and orc manager" {
     const allocator = std.testing.allocator;
     const runtime_src = try readFile(allocator, "src/runtime.zig");
     defer allocator.free(runtime_src);
     const manager_src = try readFile(allocator, "src/memory/arc/manager.zig");
     defer allocator.free(manager_src);
+    const orc_src = try readFile(allocator, "src/memory/orc/manager.zig");
+    defer allocator.free(orc_src);
 
     // Locate the TestOnlyArcSlabPool block in runtime.zig — every
     // constant we care about is declared inside that block. We
@@ -155,6 +162,7 @@ test "slab pool constants are byte-identical between runtime and arc manager" {
     for (required_constants) |name| {
         const runtime_value_opt = extractConstantValue(runtime_block, name);
         const manager_value_opt = extractConstantValue(manager_src, name);
+        const orc_value_opt = extractConstantValue(orc_src, name);
         if (runtime_value_opt == null) {
             std.debug.print(
                 "runtime.zig: TestOnlyArcSlabPool is missing constant `{s}`\n",
@@ -169,12 +177,32 @@ test "slab pool constants are byte-identical between runtime and arc manager" {
             );
             any_diff = true;
         }
+        if (orc_value_opt == null) {
+            std.debug.print(
+                "src/memory/orc/manager.zig is missing constant `{s}`\n",
+                .{name},
+            );
+            any_diff = true;
+        }
         if (runtime_value_opt) |runtime_value| {
             if (manager_value_opt) |manager_value| {
                 if (!std.mem.eql(u8, runtime_value, manager_value)) {
                     std.debug.print(
                         "slab-pool drift: `{s}` differs\n  runtime.zig: `{s}`\n  arc/manager.zig: `{s}`\n",
                         .{ name, runtime_value, manager_value },
+                    );
+                    any_diff = true;
+                }
+            }
+        }
+        // ORC's copy must match ARC's byte-for-byte (arc is the canonical source
+        // ORC was copied from; runtime is already cross-checked against arc above).
+        if (orc_value_opt) |orc_value| {
+            if (manager_value_opt) |manager_value| {
+                if (!std.mem.eql(u8, orc_value, manager_value)) {
+                    std.debug.print(
+                        "slab-pool drift: `{s}` differs\n  orc/manager.zig: `{s}`\n  arc/manager.zig: `{s}`\n",
+                        .{ name, orc_value, manager_value },
                     );
                     any_diff = true;
                 }

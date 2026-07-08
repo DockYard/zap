@@ -265,16 +265,937 @@ const SideCell = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Production per-process heap — the page-backed size-class slab pool (G7).
+//
+// A VERBATIM structural copy of `src/memory/arc/manager.zig`'s slab pool. The
+// production-manager rule (spec §11.1.1) forbids a standalone-object manager
+// from importing sibling files — its only dependencies are `std` and `builtin`
+// — so a shared slab-pool module is impossible; the duplication is structural,
+// not accidental (exactly as `runtime.zig`'s `TestOnlyArcSlabPool` duplicates
+// it for test builds). `tools/slab_pool_drift_test.zig` cross-checks the layout
+// CONSTANTS across all three copies byte-for-byte so no copy can drift.
+//
+// ORC keeps its OWN refcounts (inline header at offset 0 for `core.allocate`
+// cells; the manager `side_table` for `allocate_refcounted` cells), so it never
+// reads the slab's per-slot side-table refcount — the geometry is identical to
+// ARC's only so the copy stays verbatim and the drift check stays trivial. The
+// heap serves prompt individual free (the ARC fast path), wholesale teardown
+// (per-process leak-exactness, P3-J1), and a page-backed large path (the
+// substrate a future O(1) ORC region move needs — Phase-6 follow-up).
+// ---------------------------------------------------------------------------
+
+/// Slab side (64 KiB) and alignment. The alignment must match the slab
+/// size so any slot pointer's owning slab is `ptr & ~(SLAB_SIZE-1)`.
+/// 64 KiB is a multiple of every supported page size (4 KiB on x86_64
+/// Linux, 16 KiB on aarch64 macOS), so the over-aligned mmap helper
+/// can trim the head and tail of an over-allocated region by integer
+/// page counts.
+const SLAB_SIZE: usize = 64 * 1024;
+const SLAB_ALIGN: usize = SLAB_SIZE;
+const SLAB_MASK: usize = SLAB_SIZE - 1;
+const SLAB_BASE_MASK: usize = ~SLAB_MASK;
+const NULL_SLOT: u32 = 0xFFFFFFFF;
+
+/// Slab magic for the size-class slab pool. Stored in the slab header's
+/// first 4 bytes so `release_sized` can refuse to operate on a pointer
+/// that does not belong to a slab (defence in depth — codegen should
+/// never emit such a call).
+const SLAB_MAGIC: u32 = 0x5A4D5342; // "ZMSB" in little-endian: Zap Memory Slab Base.
+
+/// Magic for the large-allocation header used when a request exceeds
+/// the largest slab class. Each large allocation carries this 16-byte
+/// preamble (magic + size + alignment + refcount); the user pointer
+/// points past the preamble. `release_sized` finds the preamble by
+/// pointer arithmetic; the magic byte sequence is checked before any
+/// dereference of the trailing fields.
+const LARGE_MAGIC: u32 = 0x5A4D4C47; // "ZMLG": Zap Memory LarGe.
+
+/// Size classes for the slab pool. Modelled on the mimalloc / jemalloc
+/// 1.5x progression, capped at 4096 bytes (one Linux page minus header).
+/// Each class is the smallest slot size that fits the requested
+/// allocation. Slot start within a slab is aligned to the class's
+/// natural alignment (see `slotAlignForClass`); requests with a larger
+/// alignment than the class's natural alignment promote to the next
+/// class with sufficient alignment.
+const SLAB_CLASS_SIZES = [_]u32{ 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096 };
+const SLAB_CLASS_COUNT = SLAB_CLASS_SIZES.len;
+
+/// Largest slot size served from the slab pool. Allocations above this
+/// fall through to the large-allocation `page_allocator` path. Chosen
+/// so a 4096-byte slot still leaves 64*1024 - 4096*1 = 61440 bytes
+/// per slab — i.e., at most one slot per slab — so 4096 is a hard
+/// ceiling for the slab class table.
+const MAX_SLAB_CLASS_SIZE: u32 = SLAB_CLASS_SIZES[SLAB_CLASS_COUNT - 1];
+
+/// Natural alignment of each class — comptime-built lookup table so
+/// the hot path (`lookupClass` -> retain/release dispatch) reads one
+/// u32 instead of running a 32-iteration loop per class probe.
+const SLAB_CLASS_ALIGNS: [SLAB_CLASS_COUNT]u32 = blk: {
+    var aligns: [SLAB_CLASS_COUNT]u32 = undefined;
+    var class_index: u32 = 0;
+    while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
+        const size = SLAB_CLASS_SIZES[class_index];
+        // Natural alignment is the largest power-of-two divisor of
+        // `size`. For 16 -> 16, 24 -> 8, 32 -> 32, 48 -> 16, 64 -> 64,
+        // 96 -> 32, 128 -> 128, 192 -> 64, 256 -> 256, 384 -> 128,
+        // 512 -> 512, 768 -> 256, 1024 -> 1024, 1536 -> 512, 2048 -> 2048,
+        // 3072 -> 1024, 4096 -> 4096.
+        var align_val: u32 = 1;
+        var bit: u32 = 0;
+        while (bit < 32) : (bit += 1) {
+            const probe: u32 = @as(u32, 1) << bit;
+            if (probe > size) break;
+            if (size % probe == 0) align_val = probe;
+        }
+        aligns[class_index] = align_val;
+    }
+    break :blk aligns;
+};
+
+inline fn slotAlignForClass(class_index: u32) u32 {
+    return SLAB_CLASS_ALIGNS[class_index];
+}
+
+/// Comptime-built lookup table mapping a size to the smallest class
+/// index whose `slot_size >= size`. The table is indexed by
+/// `(size - 1) / 8` (so each entry covers 8 consecutive byte sizes),
+/// which fits the largest slab class (4096 bytes) in 512 entries
+/// (2 KiB of static data). The 8-byte granularity matches the
+/// minimum alignment that v1.x guarantees (`@alignOf(usize) = 8` on
+/// every supported target), so no entry is ever skipped.
+///
+/// The lookup collapses `lookupClass`'s former 17-iteration linear
+/// scan to a single load + alignment-probe loop (alignment-induced
+/// class escalation never crosses more than 2-3 classes in practice).
+/// On binarytrees N=21 — which calls `lookupClass` ~600 M times — this
+/// optimization shaves 5+ seconds of wall time off the runtime.
+const SLAB_CLASS_LOOKUP_GRANULARITY: usize = 8;
+const SLAB_CLASS_LOOKUP_TABLE_LEN: usize = (MAX_SLAB_CLASS_SIZE + SLAB_CLASS_LOOKUP_GRANULARITY - 1) / SLAB_CLASS_LOOKUP_GRANULARITY;
+const SLAB_CLASS_LOOKUP_TABLE: [SLAB_CLASS_LOOKUP_TABLE_LEN]u32 = blk: {
+    @setEvalBranchQuota(20000);
+    var table: [SLAB_CLASS_LOOKUP_TABLE_LEN]u32 = undefined;
+    var bucket: usize = 0;
+    while (bucket < SLAB_CLASS_LOOKUP_TABLE_LEN) : (bucket += 1) {
+        // Every size in `[bucket*8 + 1, (bucket+1)*8]` falls in this
+        // bucket. The smallest class that can serve every size in the
+        // bucket is the smallest class whose `slot_size >= (bucket+1)*8`.
+        const upper_bound: u32 = @intCast((bucket + 1) * SLAB_CLASS_LOOKUP_GRANULARITY);
+        var class_index: u32 = 0;
+        while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
+            if (SLAB_CLASS_SIZES[class_index] >= upper_bound) break;
+        }
+        table[bucket] = class_index;
+    }
+    break :blk table;
+};
+
+/// Find the smallest slab class whose slot size and natural alignment
+/// can serve a request for `(size, alignment)`. Returns null when the
+/// request is too large for the slab pool (caller must use the large-
+/// allocation path). O(1) on the hot path: one table lookup to
+/// resolve the size lower bound, then at most a few class probes to
+/// satisfy alignment (the alignment promotion ladder is bounded by
+/// the class table's 1.5×-per-step growth, so alignment-induced class
+/// escalation never crosses more than 2-3 classes in practice).
+inline fn lookupClass(size: usize, alignment: u32) ?u32 {
+    if (size == 0 or size > MAX_SLAB_CLASS_SIZE) return null;
+    const bucket: usize = (size - 1) / SLAB_CLASS_LOOKUP_GRANULARITY;
+    var class_index: u32 = SLAB_CLASS_LOOKUP_TABLE[bucket];
+    while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
+        if (SLAB_CLASS_ALIGNS[class_index] >= alignment) return class_index;
+    }
+    return null;
+}
+
+/// First-party direct-call helper for runtime comptime specialization.
+/// Returns the ARC slab class that serves `(size, alignment)`, or null
+/// when the request must use the generic large-allocation path.
+pub inline fn refcountSlabClassIndex(comptime size: usize, comptime alignment: u32) ?u32 {
+    if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return null;
+    return lookupClass(size, alignment);
+}
+
+inline fn validateSlabClassIndex(comptime class_index: u32) void {
+    if (class_index >= SLAB_CLASS_COUNT) {
+        @compileError("arc: slab class index out of range");
+    }
+}
+
+/// Slab header. Lives at the start of every slab; the side-table
+/// refcount array begins immediately after the header (4-byte aligned;
+/// the header is already a multiple of 4 bytes), and the slot array
+/// begins after the side table rounded up to the class's natural
+/// alignment.
+const SlabHeader = extern struct {
+    /// `SLAB_MAGIC` (`0x5A4D5342`). Set by `slabInit` and never
+    /// modified. Verified at the top of every `release_sized` / `retain_sized`
+    /// call so a stray pointer cannot trigger a side-table dereference.
+    magic: u32,
+
+    /// Index into `SLAB_CLASS_SIZES`. Read by `release_sized` to
+    /// recover `slot_size`, `slot_align`, and `capacity` without a
+    /// runtime lookup table.
+    class_index: u32,
+
+    /// Number of currently-live slots in this slab. Decremented by
+    /// `release_sized` on the zero-transition; when this drops to zero
+    /// and the slab is NOT the class's `current`, the slab is either
+    /// retained on the class's bounded empty-slab cache (for hot
+    /// reuse) or returned to `page_allocator`.
+    live_count: u32,
+
+    /// Free-list head (slot index). `NULL_SLOT` when the free list is
+    /// empty (allocations come from bump-allocation in that case until
+    /// the slab fills).
+    free_list_head: u32,
+
+    /// Bump-allocation cursor. Slot indices `< bump_index` have been
+    /// handed out at least once; new allocations either pop from the
+    /// free list or bump-allocate at `bump_index` (when `bump_index <
+    /// capacity`).
+    bump_index: u32,
+
+    /// Total slot count in this slab. Computed by `slabInit` from the
+    /// class size and the slab's payload bytes.
+    capacity: u32,
+
+    /// Intrusive prev/next pointers for the class's partial-slab list.
+    /// Null on both ends when the slab is not on any list (i.e., when
+    /// it is `current` or full). The class's empty-slab cache reuses
+    /// `next` alone as its singly-linked stack link (`prev` stays null
+    /// while a slab is cached).
+    prev: ?*SlabHeader,
+    next: ?*SlabHeader,
+
+    /// Slab base pointer (== `@ptrCast(self)`). Cached here so the
+    /// munmap path can return the aligned page region without recomputing
+    /// the mask. The cast assert (`@intFromPtr(self) == @intFromPtr(allocation_base)`)
+    /// catches a layout error early in debug builds.
+    allocation_base: [*]align(std.heap.page_size_min) u8,
+
+    /// Slab's owning class (`*SizeClass`). Stored here so `release_sized`
+    /// can return the slot to its class's free list with one indirect
+    /// load. Cross-thread frees in a future concurrent model would walk
+    /// `owner` to route the free back to the originating heap.
+    owner: *anyopaque,
+};
+
+/// Fraction divisor and absolute bounds for the per-class empty-slab
+/// cache cap (see `emptyCacheCap`). The cap is
+///
+///   clamp(live_slab_peak / EMPTY_CACHE_PEAK_DIVISOR,
+///         EMPTY_CACHE_RETAIN_FLOOR, EMPTY_CACHE_RETAIN_CEILING)
+///
+/// * `EMPTY_CACHE_PEAK_DIVISOR = 2` — retain at most half the class's
+///   historical live-slab peak. Idle retention is therefore bounded by
+///   half of what the workload itself demonstrably demanded, while an
+///   oscillation whose amplitude is any fraction up to half of peak is
+///   absorbed entirely (binarytrees N=21: peak ≈ 2560 class-0 slabs
+///   during the stretch tree, per-band teardown amplitude ≤ ~650 slabs
+///   — comfortably inside peak/2 ≈ 1280).
+/// * `EMPTY_CACHE_RETAIN_FLOOR = 2` — small working sets whose peak/2
+///   rounds to 0 or 1 may still retain two empties (128 KiB per class),
+///   covering the tiniest oscillations. The floor can never push mapped
+///   memory past the peak: the cache only ever receives slabs that were
+///   just live, so `live + cached <= peak` holds regardless (see the
+///   invariant note on `emptyCacheCap`).
+/// * `EMPTY_CACHE_RETAIN_CEILING = 1024` — bounds worst-case idle
+///   retention at 64 MiB per class (1024 × 64 KiB) for programs whose
+///   live peak was enormous in an early phase but that later shrink
+///   permanently. Large enough that benchmark-scale oscillations
+///   (tens of MiB per class) are still fully absorbed.
+const EMPTY_CACHE_PEAK_DIVISOR: u32 = 2;
+const EMPTY_CACHE_RETAIN_FLOOR: u32 = 2;
+const EMPTY_CACHE_RETAIN_CEILING: u32 = 1024;
+
+/// Per-size-class state. Each class owns its own bank of slabs; the
+/// `current` slab is the most-recently-used allocation target (slot
+/// bumps come from here first), the `partials` list holds slabs with
+/// both live cells AND free slots (a freed slot in a previously-full
+/// slab pushes it to the front), and the `empty_head` stack retains a
+/// bounded number of fully-empty slabs to absorb mmap/munmap thrash
+/// from hot/cold oscillation.
+///
+/// ## Empty-slab cache policy (history and rationale)
+///
+/// The cache began life as a single `cached_empty` slot: workloads that
+/// oscillated around exactly one slab's working set avoided syscall
+/// thrash, but larger oscillations (binarytrees N=21 tears down and
+/// rebuilds hundreds of slabs per band) still paid an mmap + munmap +
+/// page-fault-zeroing round trip per slab per cycle — ~18% of profile
+/// samples. The slot was therefore generalized into a bounded LIFO
+/// stack whose cap derives from the class's live-slab high-watermark
+/// (`live_slab_peak`, see `emptyCacheCap`).
+///
+/// The watermark is tracked PER CLASS, not globally, because the pool
+/// itself is keyed per class: slabs are class-typed (slot geometry and
+/// capacity are functions of `class_index`) and never migrate between
+/// classes, so a global watermark would let one class's peak justify
+/// retaining empties in a class that never demonstrated that demand.
+/// The per-class bound `live + cached <= peak` sums to the same bound
+/// globally, which keeps the no-RSS-regression argument structural.
+const SizeClass = extern struct {
+    /// The active slab — allocations pop from this slab's free list
+    /// first, then bump-allocate. Switched out only when full (rotated
+    /// to the partial list) or when zero-live in `release_sized` (moved
+    /// to the empty-slab cache).
+    current: ?*SlabHeader,
+
+    /// Head of an intrusive doubly-linked list of slabs with both live
+    /// cells AND free slots. Slabs migrate full→partial on `release_sized`
+    /// and partial→current on `acquireSlab` (no allocator call). Empty
+    /// slabs leave the partial list (either to the empty-slab cache or
+    /// back to the OS via `unmapSlab`).
+    partials: ?*SlabHeader,
+
+    /// LIFO stack of fully-empty slabs retained for reuse, singly
+    /// linked through `SlabHeader.next` (`prev` stays null). LIFO order
+    /// keeps the hottest — most recently touched, most likely still
+    /// resident — slab on top. Bounded by `emptyCacheCap`; excess
+    /// empties unmap immediately, exactly as every empty slab did
+    /// under the single-slot design.
+    empty_head: ?*SlabHeader,
+
+    /// Number of slabs on the `empty_head` stack. Compared against
+    /// `emptyCacheCap` on every slab-empty transition.
+    empty_count: u32,
+
+    /// Number of mapped slabs currently in service (current + partial
+    /// + full floaters) — i.e., every slab owned by this class that is
+    /// NOT on the empty stack. Incremented when a slab enters service
+    /// (fresh mmap or reuse from the empty stack), decremented when a
+    /// slab empties out of service.
+    live_slab_count: u32,
+
+    /// High-watermark of `live_slab_count` — the most slabs this class
+    /// ever had simultaneously in service. The empty-cache cap derives
+    /// from this so cached empties can only exist strictly below a
+    /// live-slab level the process already reached while the slabs
+    /// held payload: peak RSS is set by live demand, never by caching.
+    live_slab_peak: u32,
+};
+
+/// Maximum number of empty slabs `class` may retain, derived from its
+/// live-slab high-watermark (see the constant block above for the
+/// clamp rationale).
+///
+/// Structural invariant — mapped slabs never exceed the live peak:
+/// `acquireSlab` reuses a cached empty before it ever maps a fresh
+/// slab, so a fresh mmap only happens while `empty_count == 0` (mapped
+/// total == live count <= peak after the watermark update), and an
+/// empty transition merely moves a slab from live to cached (mapped
+/// total unchanged) or unmaps it (mapped total shrinks). Therefore
+/// `live_slab_count + empty_count <= live_slab_peak` at all times, no
+/// matter what this function returns — the cap only tunes how much of
+/// that already-reached headroom is retained versus returned to the OS.
+inline fn emptyCacheCap(class: *const SizeClass) u32 {
+    const peak_fraction = class.live_slab_peak / EMPTY_CACHE_PEAK_DIVISOR;
+    return @min(@max(peak_fraction, EMPTY_CACHE_RETAIN_FLOOR), EMPTY_CACHE_RETAIN_CEILING);
+}
+
+/// Record that a slab entered service (fresh mmap or reuse from the
+/// empty stack): bump the live count and advance the high-watermark.
+inline fn noteSlabEnteredService(class: *SizeClass) void {
+    class.live_slab_count += 1;
+    if (class.live_slab_count > class.live_slab_peak) {
+        class.live_slab_peak = class.live_slab_count;
+    }
+}
+
+/// Compute the byte offset to the slot array's first slot inside a
+/// slab. Derived from the header size + the side-table refcount array
+/// size, rounded up to the class's natural alignment.
+inline fn slotsOffsetForClass(class_index: u32, capacity: u32) usize {
+    const refcount_bytes: usize = @as(usize, capacity) * @sizeOf(u32);
+    const header_end: usize = @sizeOf(SlabHeader) + refcount_bytes;
+    const align_v: usize = slotAlignForClass(class_index);
+    return std.mem.alignForward(usize, header_end, align_v);
+}
+
+/// Compute the maximum slot count for a class. Solves the closed-form
+/// inequality:
+///   slotsOffset(capacity) + capacity * slot_size <= SLAB_SIZE
+/// where slotsOffset(capacity) = alignUp(sizeOf(SlabHeader) +
+///                                       capacity * sizeOf(u32),
+///                                       slot_align).
+inline fn capacityForClass(class_index: u32) u32 {
+    const slot_size: usize = SLAB_CLASS_SIZES[class_index];
+    const slot_align: usize = slotAlignForClass(class_index);
+    // Each slot adds 4 bytes (side-table) + slot_size (slot proper).
+    // The slot start is bumped up to `slot_align` from the side-table
+    // end. Bound the alignment pad above by `slot_align - 1` to get
+    // a conservative lower bound on capacity that's at most 1 slot
+    // off from the true maximum.
+    if (SLAB_SIZE <= @sizeOf(SlabHeader) + slot_align) return 0;
+    const usable: usize = SLAB_SIZE - @sizeOf(SlabHeader) - slot_align;
+    const per_slot: usize = slot_size + @sizeOf(u32);
+    return @intCast(usable / per_slot);
+}
+
+/// Slab management context. Each manager carries this in its
+/// `Context` struct. The slab pool is single-threaded — Zap programs
+/// are single-threaded today.
+const SlabPool = struct {
+    classes: [SLAB_CLASS_COUNT]SizeClass,
+};
+
+inline fn slabPoolInit() SlabPool {
+    var pool: SlabPool = undefined;
+    var class_index: u32 = 0;
+    while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
+        pool.classes[class_index] = .{
+            .current = null,
+            .partials = null,
+            .empty_head = null,
+            .empty_count = 0,
+            .live_slab_count = 0,
+            .live_slab_peak = 0,
+        };
+    }
+    return pool;
+}
+
+/// Acquire a 64-KiB-aligned `SLAB_SIZE` region. Delegates to
+/// `page_allocator`, which honours over-page alignment requests on every
+/// supported OS (POSIX over-allocates and trims; Windows reserves a
+/// placeholder, splits it, and commits the aligned sub-range). This is
+/// the same libc-free virtual-memory primitive the large-allocation path
+/// uses (`largeAlloc`) and is the primitive the module header documents
+/// for slab backing — `mmap` on POSIX, `NtAllocateVirtualMemory` on
+/// Windows. Returns the aligned base pointer or null on OOM.
+///
+/// `page_allocator` returns a region whose address is already
+/// `SLAB_ALIGN`-aligned, so no manual head/tail trim is needed (and no
+/// raw `std.posix.mmap`, which does not exist on Windows). The returned
+/// pointer doubles as the allocation base recorded in
+/// `SlabHeader.allocation_base`; `unmapSlab` frees exactly this region.
+/// Test-only slab map/unmap accounting. The in-file empty-slab-cache
+/// tests use these totals for an accounting-based leak check (every
+/// mapped slab — cached empties included — must be unmapped by
+/// `deinit`) and to prove cache reuse maps no fresh slab. The
+/// increments below compile away entirely outside `zig build test`
+/// (`builtin.is_test` is comptime-false in production manager objects).
+/// `pub` so the cross-thread ARC stress test (`arc_cross_thread_stress.zig`)
+/// can baseline/verify slab mapping traffic for leak-exactness; incremented
+/// atomically (below) so concurrent per-thread contexts do not race the
+/// instrumentation. Production (`!is_test`) never touches them.
+pub var test_slab_mmap_total: usize = 0;
+pub var test_slab_unmap_total: usize = 0;
+
+/// Test-only counters for LARGE (page_allocator-backed) allocations —
+/// mirror `test_slab_*`, letting the P3-J1 per-process wholesale-free test
+/// assert every large cell is reclaimed at `arcDeinit` (allocs == frees).
+/// Compile away outside `zig build test`.
+pub var test_large_alloc_total: usize = 0;
+pub var test_large_free_total: usize = 0;
+
+fn mmapAlignedSlab() ?[*]align(std.heap.page_size_min) u8 {
+    const page_size = std.heap.page_size_min;
+    // SLAB_SIZE must be a multiple of the OS page size so the
+    // page-granular allocator returns exactly `SLAB_SIZE` usable bytes.
+    std.debug.assert(SLAB_SIZE % page_size == 0);
+
+    // `SLAB_ALIGN` (64 KiB) exceeds every supported page size, so the
+    // alignment is the load-bearing request; clamp to at least the page
+    // size for the degenerate case where a future page size meets or
+    // exceeds `SLAB_ALIGN`.
+    const slab_alignment: std.mem.Alignment =
+        .fromByteUnits(@max(SLAB_ALIGN, @as(usize, page_size)));
+    const base = std.heap.page_allocator.rawAlloc(
+        SLAB_SIZE,
+        slab_alignment,
+        @returnAddress(),
+    ) orelse return null;
+
+    if (builtin.is_test) _ = @atomicRmw(usize, &test_slab_mmap_total, .Add, 1, .monotonic);
+    return @alignCast(base);
+}
+
+/// Counterpart to `mmapAlignedSlab`: release a `SLAB_SIZE`-aligned
+/// `SLAB_SIZE` region back to `page_allocator` (POSIX `munmap` /
+/// Windows `NtFreeVirtualMemory`).
+fn unmapSlab(base: [*]align(std.heap.page_size_min) u8) void {
+    const page_size = std.heap.page_size_min;
+    const slab_alignment: std.mem.Alignment =
+        .fromByteUnits(@max(SLAB_ALIGN, @as(usize, page_size)));
+    if (builtin.is_test) _ = @atomicRmw(usize, &test_slab_unmap_total, .Add, 1, .monotonic);
+    std.heap.page_allocator.rawFree(base[0..SLAB_SIZE], slab_alignment, @returnAddress());
+}
+
+/// Initialise a freshly-mmapped slab. Sets the header and zero-fills
+/// the side-table refcount array so newly bump-allocated slots see rc=0
+/// before the allocator writes the rc=1 starter value.
+fn slabInit(slab: *SlabHeader, class_index: u32, owner: *anyopaque, base: [*]align(std.heap.page_size_min) u8) void {
+    const capacity = capacityForClass(class_index);
+    slab.* = .{
+        .magic = SLAB_MAGIC,
+        .class_index = class_index,
+        .live_count = 0,
+        .free_list_head = NULL_SLOT,
+        .bump_index = 0,
+        .capacity = capacity,
+        .prev = null,
+        .next = null,
+        .allocation_base = base,
+        .owner = owner,
+    };
+    // Zero-fill the side-table array. The capacity is at most a few
+    // thousand u32 entries; @memset is the most portable way to clear
+    // them without per-slot loops.
+    const refcount_ptr_byte: [*]u8 = @ptrCast(slab);
+    const refcount_bytes_ptr = refcount_ptr_byte + @sizeOf(SlabHeader);
+    const refcount_bytes_count: usize = @as(usize, capacity) * @sizeOf(u32);
+    @memset(refcount_bytes_ptr[0..refcount_bytes_count], 0);
+}
+
+/// Pointer to the side-table refcount entry for slot `index` in `slab`.
+inline fn slabRefcountPtr(slab: *SlabHeader, index: u32) *u32 {
+    const base: [*]u8 = @ptrCast(slab);
+    const table: [*]u32 = @ptrCast(@alignCast(base + @sizeOf(SlabHeader)));
+    return &table[index];
+}
+
+/// Pointer to slot `index` in `slab`. Slots start at
+/// `slotsOffsetForClass(class_index, capacity)` and are spaced by
+/// `slot_size` bytes.
+inline fn slabSlotPtr(slab: *SlabHeader, index: u32) [*]u8 {
+    const base: [*]u8 = @ptrCast(slab);
+    const offset = slotsOffsetForClass(slab.class_index, slab.capacity);
+    const slot_size: usize = SLAB_CLASS_SIZES[slab.class_index];
+    return base + offset + slot_size * @as(usize, index);
+}
+
+/// Convert a slot pointer back to its (slab, slot_index) pair. Caller
+/// must have verified that `ptr` is slab-allocated (e.g., by checking
+/// the size class).
+inline fn slabFromSlotPtr(ptr: *anyopaque) *SlabHeader {
+    const ptr_addr = @intFromPtr(ptr);
+    const slab_addr = ptr_addr & SLAB_BASE_MASK;
+    const slab: *SlabHeader = @ptrFromInt(slab_addr);
+    return slab;
+}
+
+inline fn slotIndexInSlab(slab: *SlabHeader, ptr: *anyopaque) u32 {
+    const base_addr = @intFromPtr(slab);
+    const ptr_addr = @intFromPtr(ptr);
+    const offset = ptr_addr - base_addr - slotsOffsetForClass(slab.class_index, slab.capacity);
+    const slot_size: usize = SLAB_CLASS_SIZES[slab.class_index];
+    return @intCast(offset / slot_size);
+}
+
+/// Link `slab` to the head of `class`'s partial-slab list.
+fn pushPartial(class: *SizeClass, slab: *SlabHeader) void {
+    slab.prev = null;
+    slab.next = class.partials;
+    if (class.partials) |head| {
+        head.prev = slab;
+    }
+    class.partials = slab;
+}
+
+/// Remove `slab` from the partial-slab list (no-op when the slab is
+/// not currently on the list).
+fn unlinkPartial(class: *SizeClass, slab: *SlabHeader) void {
+    if (slab.prev) |prev_slab| {
+        prev_slab.next = slab.next;
+    } else if (class.partials == slab) {
+        class.partials = slab.next;
+    }
+    if (slab.next) |next_slab| {
+        next_slab.prev = slab.prev;
+    }
+    slab.prev = null;
+    slab.next = null;
+}
+
+inline fn slabOnPartialList(class: *SizeClass, slab: *SlabHeader) bool {
+    return slab.prev != null or class.partials == slab;
+}
+
+/// Debug-only invariant check: an empty slab's side-table refcount
+/// array is all-zero. `slabFreeSlot` zeroes each entry as the slot is
+/// freed and `slabInit` zeroed every entry past the bump cursor, so a
+/// slab whose `live_count` reached zero holds no non-zero entry — the
+/// load-bearing fact that lets `acquireSlab` reuse a cached empty slab
+/// without re-memsetting the side table.
+fn verifyEmptySlabSideTableZeroed(slab: *SlabHeader) void {
+    var slot_index: u32 = 0;
+    while (slot_index < slab.capacity) : (slot_index += 1) {
+        std.debug.assert(slabRefcountPtr(slab, slot_index).* == 0);
+    }
+}
+
+/// Acquire a slab for `class` to make active. Pulls from the empty-
+/// slab cache if non-empty, then the partial list, then mmaps fresh —
+/// strictly in that order, which is what makes the mapped-slabs-
+/// never-exceed-live-peak invariant structural (see `emptyCacheCap`).
+/// Returns null on OOM.
+///
+/// ## Reuse re-initializes metadata only
+///
+/// A slab reused from the empty cache does NOT get the fresh-mmap
+/// zero-page guarantee back, and deliberately does not emulate it:
+///
+/// * Header allocation state (`live_count`, `free_list_head`,
+///   `bump_index`, list links) is re-initialized explicitly below.
+///   The identity fields (`magic`, `class_index`, `capacity`,
+///   `allocation_base`, `owner`) survive from the original `slabInit`
+///   unchanged — a cached slab never changes class.
+/// * The side-table refcount array is already all-zero: `slabFreeSlot`
+///   zeroes each entry on free, and entries past the bump cursor were
+///   zeroed by `slabInit` and never handed out, so an empty slab holds
+///   no stale count (verified in safety-checked builds below). This is
+///   exactly the state `slabInit`'s memset establishes on a fresh
+///   mapping.
+/// * Slot payload bytes are left dirty. The allocation contract never
+///   promised zeroed payload — free-list recycling inside a live slab
+///   already returns dirty slots — so no caller may depend on it.
+///
+/// Skipping the wholesale re-zero is where the old oscillation cost
+/// went: a fresh mmap pays the kernel zero-page fault for all 64 KiB
+/// on first touch, while reuse touches only the header.
+fn acquireSlab(pool: *SlabPool, class_index: u32) ?*SlabHeader {
+    const class = &pool.classes[class_index];
+
+    if (class.empty_head) |cached| {
+        class.empty_head = cached.next;
+        std.debug.assert(class.empty_count > 0);
+        class.empty_count -= 1;
+        noteSlabEnteredService(class);
+        cached.live_count = 0;
+        cached.free_list_head = NULL_SLOT;
+        cached.bump_index = 0;
+        cached.prev = null;
+        cached.next = null;
+        if (std.debug.runtime_safety) verifyEmptySlabSideTableZeroed(cached);
+        return cached;
+    }
+
+    if (class.partials) |partial| {
+        unlinkPartial(class, partial);
+        return partial;
+    }
+
+    const aligned_base = mmapAlignedSlab() orelse return null;
+    const slab: *SlabHeader = @ptrCast(@alignCast(aligned_base));
+    slabInit(slab, class_index, @ptrCast(class), aligned_base);
+    noteSlabEnteredService(class);
+    return slab;
+}
+
+/// Allocate a slot from `class`. Caller has guaranteed the slot will
+/// satisfy the original `(size, alignment)` pair via `lookupClass`.
+/// Returns null on OOM (mmap failure).
+fn slabAllocSlot(pool: *SlabPool, class_index: u32, init_refcount: u32) ?[*]u8 {
+    const class = &pool.classes[class_index];
+    var slab: *SlabHeader = class.current orelse blk: {
+        const acquired = acquireSlab(pool, class_index) orelse return null;
+        class.current = acquired;
+        break :blk acquired;
+    };
+
+    while (true) {
+        if (slab.free_list_head != NULL_SLOT) {
+            const slot_index = slab.free_list_head;
+            const slot_bytes = slabSlotPtr(slab, slot_index);
+            const free_node: *u32 = @ptrCast(@alignCast(slot_bytes));
+            slab.free_list_head = free_node.*;
+            slab.live_count += 1;
+            slabRefcountPtr(slab, slot_index).* = init_refcount;
+            return slot_bytes;
+        }
+        if (slab.bump_index < slab.capacity) {
+            const slot_index = slab.bump_index;
+            slab.bump_index += 1;
+            slab.live_count += 1;
+            const slot_bytes = slabSlotPtr(slab, slot_index);
+            slabRefcountPtr(slab, slot_index).* = init_refcount;
+            return slot_bytes;
+        }
+        // Active slab is full. Rotate to a fresh slab.
+        class.current = null;
+        const fresh = acquireSlab(pool, class_index) orelse return null;
+        class.current = fresh;
+        slab = fresh;
+    }
+}
+
+/// Return a slot to its slab. Decrements the live count; on the zero-
+/// transition either caches or unmaps the slab when it is not the
+/// class's `current`.
+fn slabFreeSlot(pool: *SlabPool, slab: *SlabHeader, slot_index: u32) void {
+    const class: *SizeClass = @ptrCast(@alignCast(slab.owner));
+    _ = pool;
+
+    const was_full = slab.free_list_head == NULL_SLOT and slab.bump_index >= slab.capacity;
+    const slot_bytes = slabSlotPtr(slab, slot_index);
+    const free_node: *u32 = @ptrCast(@alignCast(slot_bytes));
+    free_node.* = slab.free_list_head;
+    slab.free_list_head = slot_index;
+    std.debug.assert(slab.live_count > 0);
+    slab.live_count -= 1;
+    // Reset the side-table refcount. This zeroing is LOAD-BEARING for
+    // the empty-slab cache: because every freed slot's entry returns
+    // to zero here (and entries past the bump cursor were zeroed by
+    // `slabInit`), a slab that empties out carries an all-zero side
+    // table, which is what lets `acquireSlab` reuse a cached empty
+    // slab with a metadata-only re-init instead of a side-table memset.
+    slabRefcountPtr(slab, slot_index).* = 0;
+
+    if (slab == class.current) return;
+
+    if (slab.live_count == 0) {
+        // Drain the slab from the partial list if it was on it; the
+        // slab is leaving service either way.
+        if (slabOnPartialList(class, slab)) {
+            unlinkPartial(class, slab);
+        }
+        std.debug.assert(class.live_slab_count > 0);
+        class.live_slab_count -= 1;
+        // Retain the empty slab for reuse while the cache is below its
+        // watermark-derived cap; past the cap, excess empties unmap
+        // immediately — the exact pre-cache behaviour.
+        if (class.empty_count < emptyCacheCap(class)) {
+            slab.prev = null;
+            slab.next = class.empty_head;
+            class.empty_head = slab;
+            class.empty_count += 1;
+        } else {
+            unmapSlab(slab.allocation_base);
+        }
+        return;
+    }
+
+    if (was_full) {
+        // Slab just transitioned full → partial; push it onto the
+        // partial list so future allocations can pick it up.
+        pushPartial(class, slab);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Large allocations (above the slab pool's largest class)
+//
+// Requests for `size > MAX_SLAB_CLASS_SIZE` bypass the slab pool and
+// go directly to `page_allocator`. Each large allocation carries a
+// 16-byte preamble immediately before the user pointer:
+//
+//   [ LargeHeader (magic, padding, size, alignment, refcount, padding) ]
+//   [ user payload                                                     ]
+//
+// The header's size is fixed at exactly the requested alignment (with
+// a minimum of 16 bytes, the size of the header struct) so the user
+// pointer remains aligned. `release_sized` finds the header by walking
+// backward from the user pointer.
+// ---------------------------------------------------------------------------
+
+const LargeHeader = extern struct {
+    magic: u32,
+    _pad0: u32,
+    size: usize,
+    alignment: u32,
+    refcount: u32,
+    /// Intrusive links in the OWNING CONTEXT's large-allocation list
+    /// (P3-J1). Large allocations (> `MAX_SLAB_CLASS_SIZE`) bypass the slab
+    /// pool and go straight to `page_allocator`, so the per-process wholesale
+    /// free (`arcDeinit`) would leak every one of them unless it can walk
+    /// them — this list is that walk. A cleanly-exiting process unlinks each
+    /// large cell as its refcount hits zero (`largeFree`); a killed process's
+    /// still-live large cells are reclaimed by `arcDeinit` walking `large_head`.
+    /// Owner-only, mutated on alloc/free within the owning process's quantum
+    /// (no atomics — same single-owner discipline as the slab pool).
+    prev: ?*LargeHeader,
+    next: ?*LargeHeader,
+};
+
+comptime {
+    // Internal large-allocation header (not a cross-tooling ABI type),
+    // so the assert is pointer-width relative: a `u32` magic + `u32`
+    // pad, then a `usize` size, then `u32` alignment + `u32` refcount,
+    // then two intrusive `?*LargeHeader` list links — `16 + @sizeOf(usize)
+    // + 2 * @sizeOf(pointer)` bytes (40 on 64-bit, 28 on wasm32).
+    if (@sizeOf(LargeHeader) != 16 + @sizeOf(usize) + 2 * @sizeOf(?*LargeHeader)) @compileError(
+        "arc: LargeHeader must be its two u32 prefix + usize + two u32 + two list-link pointers",
+    );
+}
+
+/// Return the byte offset from the user pointer back to the `LargeHeader`.
+/// The header is placed at `user_ptr - leading`, where `leading` is the
+/// larger of `sizeOf(LargeHeader)` and the requested alignment (rounded
+/// up to the page allocator's alignment guarantees).
+inline fn largeLeadingFor(alignment: u32) usize {
+    const min_lead: usize = @sizeOf(LargeHeader);
+    const aligned_lead: usize = std.mem.alignForward(usize, min_lead, alignment);
+    return aligned_lead;
+}
+
+fn largeAlloc(self: *SlabHeap, size: usize, alignment: u32, init_refcount: u32) ?[*]u8 {
+    const leading = largeLeadingFor(alignment);
+    const total = std.math.add(usize, leading, size) catch return null;
+    const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(alignment, @as(u32, @intCast(std.heap.page_size_min))));
+    const base = std.heap.page_allocator.rawAlloc(total, inner_alignment, @returnAddress()) orelse return null;
+    const header_ptr: *LargeHeader = @ptrCast(@alignCast(base + leading - @sizeOf(LargeHeader)));
+    header_ptr.* = .{
+        .magic = LARGE_MAGIC,
+        ._pad0 = 0,
+        .size = size,
+        .alignment = alignment,
+        .refcount = init_refcount,
+        // Link at the head of the owning context's large-allocation list so
+        // `arcDeinit` can wholesale-free it (P3-J1 leak-exactness).
+        .prev = null,
+        .next = self.large_head,
+    };
+    if (self.large_head) |old_head| old_head.prev = header_ptr;
+    self.large_head = header_ptr;
+    if (builtin.is_test) _ = @atomicRmw(usize, &test_large_alloc_total, .Add, 1, .monotonic);
+    return base + leading;
+}
+
+/// Return a large allocation's backing page to the OS. Assumes `header_ptr`
+/// has already been validated (`magic == LARGE_MAGIC`) and unlinked from any
+/// context list. Shared by the individual-free path (`largeFree`) and the
+/// wholesale per-process teardown (`arcDeinit`).
+fn largeFreePage(header_ptr: *LargeHeader) void {
+    const alignment = header_ptr.alignment;
+    const leading = largeLeadingFor(alignment);
+    const total = leading + header_ptr.size;
+    // The allocation base sits `leading` bytes before the user pointer, which
+    // is `@sizeOf(LargeHeader)` bytes past the header.
+    const base: [*]u8 = @ptrFromInt(@intFromPtr(header_ptr) + @sizeOf(LargeHeader) - leading);
+    const inner_alignment: std.mem.Alignment = .fromByteUnits(@max(alignment, @as(u32, @intCast(std.heap.page_size_min))));
+    std.heap.page_allocator.rawFree(base[0..total], inner_alignment, @returnAddress());
+    if (builtin.is_test) _ = @atomicRmw(usize, &test_large_free_total, .Add, 1, .monotonic);
+}
+
+fn largeFree(self: *SlabHeap, ptr: [*]u8) void {
+    const header_ptr: *LargeHeader = @ptrCast(@alignCast(ptr - @sizeOf(LargeHeader)));
+    // Magic mismatch is fatal corruption — the pointer either does
+    // not belong to this manager or its header was overwritten.
+    // Continuing would `munmap` an arbitrary memory range and bring
+    // down the process with a SEGV at the next access. Panic loudly
+    // even in release builds so the diagnostic surfaces with the
+    // failing pointer rather than as a downstream memory corruption.
+    if (header_ptr.magic != LARGE_MAGIC) @panic("zap.arc: largeFree: corrupt LargeHeader magic (pointer not owned by this manager or double-free)");
+    // Unlink from the owning context's large-allocation list before freeing.
+    if (header_ptr.prev) |prev| {
+        prev.next = header_ptr.next;
+    } else {
+        self.large_head = header_ptr.next;
+    }
+    if (header_ptr.next) |next| next.prev = header_ptr.prev;
+    largeFreePage(header_ptr);
+}
+
+inline fn largeHeader(ptr: *anyopaque) *LargeHeader {
+    const byte_ptr: [*]u8 = @ptrCast(ptr);
+    return @ptrCast(@alignCast(byte_ptr - @sizeOf(LargeHeader)));
+}
+
+/// The production per-process backing heap: the size-class slab pool plus the
+/// intrusive list of live large (`page_allocator`-backed) allocations. Mirrors
+/// `ArcContext`'s `{ slab_pool, large_head }` and ARC's `arcAllocate` /
+/// `arcDeallocate` / `arcDeinit` routing, but exposes a raw-bytes seam
+/// (`rawAlloc` / `rawFree` / `deinit`) that `OrcContext.gpa` drives through the
+/// `BackingHeap` comptime seam. `init` is comptime — an all-empty pool — so
+/// `orcInit`'s `.gpa = .init` works for both this and the test DebugAllocator.
+const SlabHeap = struct {
+    slab_pool: SlabPool,
+    large_head: ?*LargeHeader = null,
+
+    const init: SlabHeap = .{ .slab_pool = slabPoolInit(), .large_head = null };
+
+    /// Raw allocation (`core.allocate` semantics): slab-backed for sizes that
+    /// map to a class, the large `page_allocator` path otherwise. `init_refcount
+    /// = 0` — ORC never uses the slab's side-table refcount.
+    fn rawAlloc(self: *SlabHeap, size: usize, alignment: u32) ?[*]u8 {
+        std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+        if (size == 0) return null;
+        if (lookupClass(size, alignment)) |class_index| {
+            return slabAllocSlot(&self.slab_pool, class_index, 0);
+        }
+        return largeAlloc(self, size, alignment, 0);
+    }
+
+    /// Prompt individual free (the ARC fast path): return a slab slot to its
+    /// class's free list, or unmap a large allocation. `size`/`alignment` MUST
+    /// match the original request (they select slab-vs-large identically).
+    fn rawFree(self: *SlabHeap, ptr: [*]u8, size: usize, alignment: u32) void {
+        std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+        if (size == 0) return;
+        if (lookupClass(size, alignment)) |class_index| {
+            const slab = slabFromSlotPtr(ptr);
+            std.debug.assert(slab.magic == SLAB_MAGIC);
+            std.debug.assert(slab.class_index == class_index);
+            const slot_index = slotIndexInSlab(slab, ptr);
+            slabFreeSlot(&self.slab_pool, slab, slot_index);
+            return;
+        }
+        largeFree(self, ptr);
+    }
+
+    /// Wholesale per-process teardown (P3-J1 leak-exactness): return every live
+    /// large allocation and every mapped slab (current + partial + cached empty)
+    /// to the OS. A killed process's still-live cells are all reclaimed here.
+    fn deinit(self: *SlabHeap) void {
+        while (self.large_head) |header_ptr| {
+            self.large_head = header_ptr.next;
+            std.debug.assert(header_ptr.magic == LARGE_MAGIC);
+            largeFreePage(header_ptr);
+        }
+        var class_index: u32 = 0;
+        while (class_index < SLAB_CLASS_COUNT) : (class_index += 1) {
+            const class = &self.slab_pool.classes[class_index];
+            if (class.current) |slab| {
+                unmapSlab(slab.allocation_base);
+                class.current = null;
+            }
+            while (class.partials) |slab| {
+                class.partials = slab.next;
+                unmapSlab(slab.allocation_base);
+            }
+            while (class.empty_head) |slab| {
+                class.empty_head = slab.next;
+                unmapSlab(slab.allocation_base);
+            }
+            class.empty_count = 0;
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Per-process ORC context
 // ---------------------------------------------------------------------------
+
+/// The per-process backing heap type (G7). PRODUCTION uses the page-backed
+/// `SlabHeap` (fast, individual-free + wholesale-teardown, page-backed large
+/// path) — NOT the leak-detecting DebugAllocator, which is materially slower.
+/// TESTS swap in the DebugAllocator so the leak-exactness oracle can observe
+/// reclamation exactly; `enable_memory_limit` additionally exposes
+/// `total_requested_bytes`, the live-byte counter the negative-control test
+/// reads to witness an un-reclaimed cycle WITHOUT the `deinit`-time leak report
+/// (whose `log.err` would fail the test runner even for an intentional leak).
+///
+/// Keyed on `builtin.is_test`: the manager compiled as a standalone object for a
+/// real binary (`output_mode == .Obj`, `is_test == false`) always gets the
+/// production `SlabHeap`, so the `:test_concurrency` gate-ON acceptance path runs
+/// on it. ORC's `rawAlloc`/`rawFree`/`orcDeinitInner` route through this via a
+/// matching comptime `is_test` seam (the two heaps expose different APIs).
+const BackingHeap = if (builtin.is_test)
+    std.heap.DebugAllocator(.{ .enable_memory_limit = true })
+else
+    SlabHeap;
 
 const OrcContext = struct {
     /// Backing sub-allocator for this process's refcounted cells. A per-instance
     /// general-purpose allocator: it supports the prompt individual free the ARC
     /// fast path needs, the wholesale teardown the per-process leak-exactness
     /// contract needs (P3-J1), and — critically for the leak-exactness proofs —
-    /// exact leak accounting at `deinit`.
-    gpa: std.heap.DebugAllocator(.{}),
+    /// exact leak accounting at `deinit`. `enable_memory_limit` adds a live-byte
+    /// counter (`total_requested_bytes`) the negative-control test reads to
+    /// observe an un-reclaimed cycle WITHOUT the `deinit`-time leak report (whose
+    /// `log.err` would fail the test runner even for an intentional leak).
+    gpa: BackingHeap,
 
     /// Bookkeeping allocator (roots/colour/registry/side-table maps). Kept
     /// SEPARATE from `gpa` so `gpa`'s leak check reflects only *cells* — the
@@ -385,7 +1306,15 @@ fn orcDeinitInner(ctx_opaque: *anyopaque) std.heap.Check {
     ctx.color.deinit(ctx.meta);
     ctx.descriptors.deinit(ctx.meta);
     ctx.side_table.deinit(ctx.meta);
-    const check = ctx.gpa.deinit();
+    // Wholesale-free the backing heap. The DebugAllocator (test) returns a leak
+    // check the oracle asserts on; the production `SlabHeap` unmaps every slab
+    // and large allocation and has no per-cell accounting, so it reports `.ok`
+    // (its leak-exactness is structural — a killed process's whole heap is
+    // returned regardless of live cells).
+    const check = if (comptime builtin.is_test) ctx.gpa.deinit() else blk: {
+        ctx.gpa.deinit();
+        break :blk std.heap.Check.ok;
+    };
     std.heap.page_allocator.destroy(ctx);
     return check;
 }
@@ -413,15 +1342,25 @@ fn orcGetCapabilityDesc(ctx: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabi
 fn rawAlloc(ctx: *OrcContext, size: usize, alignment: u32) ?[*]u8 {
     if (size == 0) return null;
     if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return null;
-    const log2: u8 = std.math.log2_int(u32, alignment);
-    const mem = ctx.gpa.allocator().rawAlloc(size, @enumFromInt(log2), @returnAddress()) orelse return null;
-    return mem;
+    // BackingHeap comptime seam: the test DebugAllocator drives a `std.mem
+    // .Allocator` (leak oracle); the production `SlabHeap` exposes a raw-bytes
+    // `rawAlloc`. Only the selected branch is analysed, so each build sees the
+    // API its `ctx.gpa` actually has.
+    if (comptime builtin.is_test) {
+        const log2: u8 = std.math.log2_int(u32, alignment);
+        return ctx.gpa.allocator().rawAlloc(size, @enumFromInt(log2), @returnAddress());
+    }
+    return ctx.gpa.rawAlloc(size, alignment);
 }
 
 fn rawFree(ctx: *OrcContext, ptr: [*]u8, size: usize, alignment: u32) void {
     if (size == 0) return;
-    const log2: u8 = std.math.log2_int(u32, alignment);
-    ctx.gpa.allocator().rawFree(ptr[0..size], @enumFromInt(log2), @returnAddress());
+    if (comptime builtin.is_test) {
+        const log2: u8 = std.math.log2_int(u32, alignment);
+        ctx.gpa.allocator().rawFree(ptr[0..size], @enumFromInt(log2), @returnAddress());
+        return;
+    }
+    ctx.gpa.rawFree(ptr, size, alignment);
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +1716,12 @@ fn scanBlack(ctx: *OrcContext, root: *anyopaque, root_dw: ?ZapDeepWalkFn, scratc
     defer stack.deinit(ctx.meta);
     stack.append(ctx.meta, .{ .cell = root, .deep_walk = root_dw }) catch return;
     while (stack.pop()) |node| {
+        // Idempotence guard (mirrors `markGray`/`scan`): a JOIN NODE reached via
+        // ≥2 internal in-edges is pushed once per in-edge. Without this guard it
+        // is popped more than once and restores each child's trial decrement
+        // that many times — permanently inflating a downstream refcount so the
+        // cycle can never be reclaimed. A black node is already fully restored.
+        if (getColor(ctx, node.cell) == .black) continue;
         setColor(ctx, node.cell, .black);
         traceChildren(ctx, node.cell, node.deep_walk, scratch);
         var kids: std.ArrayListUnmanaged(RootEntry) = .empty;
@@ -1061,6 +2006,35 @@ fn testDeinitAssertClean(ctx_opaque: *anyopaque) void {
     }
 }
 
+/// Test-only teardown that SKIPS the final cycle collection and returns the
+/// backing allocator's LIVE-byte count — the negative control proving the
+/// Bacon–Rajan collector is load-bearing. It tears down the bookkeeping maps
+/// (drawn from `meta`, kept out of `gpa`'s accounting) and destroys the context
+/// exactly like `orcDeinitInner`, but deliberately does NOT run
+/// `collectCyclesImpl`. A dropped-but-uncollected cycle's cells are therefore
+/// never reclaimed and remain live in `gpa`, so `total_requested_bytes` is
+/// non-zero — the ARC-alone-leaks half of the proof (ARC's refcounts never reach
+/// zero for a cycle). The live-byte counter (`enable_memory_limit`) is the leak
+/// oracle here rather than `gpa.deinit() == .leak`, because `deinit`'s leak
+/// detection emits `log.err`, which the Zig test runner counts as a failure even
+/// for a DELIBERATE leak — so we read the counter, then `deinitWithoutLeakChecks`
+/// returns every backing page to the OS with NO leak report (the per-process
+/// leak-exactness contract still holds — nothing leaks to the OS; only the
+/// accounting witnesses the un-reclaimed cells).
+fn testLiveHeapBytesSkipCollect(ctx_opaque: *anyopaque) usize {
+    const ctx: *OrcContext = @ptrCast(@alignCast(ctx_opaque));
+    // NOTE: no `collectCyclesImpl(ctx)` here — that omission IS the control.
+    const live_bytes = ctx.gpa.total_requested_bytes;
+    ctx.roots.deinit(ctx.meta);
+    ctx.buffered.deinit(ctx.meta);
+    ctx.color.deinit(ctx.meta);
+    ctx.descriptors.deinit(ctx.meta);
+    ctx.side_table.deinit(ctx.meta);
+    ctx.gpa.deinitWithoutLeakChecks();
+    std.heap.page_allocator.destroy(ctx);
+    return live_bytes;
+}
+
 test "orc: allocate_refcounted / retain_sized / release_sized round-trips like ARC" {
     const ctx_opaque = orcInit(null) orelse return error.OutOfMemory;
     const ctx: *OrcContext = @ptrCast(@alignCast(ctx_opaque));
@@ -1223,12 +2197,12 @@ test "orc: acyclic data is reclaimed promptly by the ARC base (no collector need
     // Leak-exactness asserted at deinit.
 }
 
-test "orc: without collection a dropped cycle leaks — collection is what reclaims it" {
-    // The negative control proving the collector is load-bearing: build a
-    // cycle, drop it, and DO collect (a `.leak` here would fail the backing
-    // allocator's deinit check). Then a second identical run WITHOUT collect
-    // would leak — asserted structurally by live cell accounting instead of a
-    // deliberate leak (which would trip the test allocator).
+test "orc: a dropped two-node cycle is reclaimed by collection (positive control)" {
+    // Positive control: build a cycle, drop both handles, DO collect, and prove
+    // the collection reclaims it (a `.leak` at deinit would fail the oracle).
+    // Its exact negative twin below runs the IDENTICAL workload but SKIPS the
+    // collection and asserts the leak — together they prove ARC alone leaks the
+    // cycle and the collector is what reclaims it.
     const ctx_opaque = orcInit(null) orelse return error.OutOfMemory;
     const ctx: *OrcContext = @ptrCast(@alignCast(ctx_opaque));
     defer testDeinitAssertClean(ctx_opaque);
@@ -1252,6 +2226,43 @@ test "orc: without collection a dropped cycle leaks — collection is what recla
     // Collection reclaims the cycle; deinit's leak check confirms zero leak.
     orcCollectCycles(ctx_opaque);
     try testing.expectEqual(@as(usize, 0), ctx.roots.items.len);
+}
+
+test "orc: WITHOUT collection a dropped cycle leaks — the real negative control" {
+    // The negative twin of the positive control above: the IDENTICAL A <-> B
+    // cycle is built and both handles dropped, but teardown SKIPS the collection
+    // (`testDeinitInnerSkipCollect`). ARC's refcounts stay at 1 (the cycle holds
+    // them), so the cells are NEVER reclaimed and the backing allocator's leak
+    // check MUST report `.leak`. This is the load-bearing proof that the
+    // Bacon–Rajan collector — not ARC — is what reclaims the cycle: run the same
+    // workload through the collecting teardown and it is clean; skip the
+    // collection and it leaks. (The DebugAllocator prints its leak diagnostic to
+    // stderr here BY DESIGN — the named cells are the intentionally-leaked cycle.)
+    const ctx_opaque = orcInit(null) orelse return error.OutOfMemory;
+    const ctx: *OrcContext = @ptrCast(@alignCast(ctx_opaque));
+    setupCycleType(ctx_opaque);
+
+    const a = try newCycleNode(ctx_opaque);
+    const b = try newCycleNode(ctx_opaque);
+    a.right = b;
+    orcRetain(ctx_opaque, @ptrCast(b)); // b.rc: 1 -> 2
+    b.left = a;
+    orcRetain(ctx_opaque, @ptrCast(a)); // a.rc: 1 -> 2
+    orcRelease(ctx_opaque, @ptrCast(a), cycleNodeDeepWalk); // a: 2 -> 1
+    orcRelease(ctx_opaque, @ptrCast(b), cycleNodeDeepWalk); // b: 2 -> 1
+
+    // Both cells remain live at refcount 1, held only by the cycle — ARC can
+    // never drive either to zero.
+    try testing.expectEqual(@as(u32, 1), a.refcount);
+    try testing.expectEqual(@as(u32, 1), b.refcount);
+    try testing.expectEqual(@as(usize, 2), ctx.roots.items.len);
+
+    // Tear down WITHOUT collecting → the un-reclaimed cycle stays live in `gpa`,
+    // so the backing allocator's live-byte count is non-zero (exactly the two
+    // CycleNode cells). Under the collecting teardown the positive control above
+    // leaves this at 0 — the collector is what makes the difference.
+    const live_bytes = testLiveHeapBytesSkipCollect(ctx_opaque);
+    try testing.expect(live_bytes >= 2 * @sizeOf(CycleNode));
 }
 
 test "orc: a three-node cycle with an external reference survives (not wrongly collected)" {
@@ -1294,6 +2305,72 @@ test "orc: a three-node cycle with an external reference survives (not wrongly c
     try testing.expectEqual(@as(usize, 0), ctx.roots.items.len);
 }
 
+test "orc: a join-node cycle collects leak-exact (ScanBlack idempotence — the double-restore regression)" {
+    // A JOIN NODE has two or more internal in-edges inside ONE strongly-
+    // connected cycle (here `j`, reached from both `p1` and `p2`). `ScanBlack`
+    // repaints an externally-reachable cycle black and RESTORES the trial
+    // decrements `MarkGray` applied. Its iterative worklist pushes a node once
+    // per in-edge; without a top-of-loop `black` guard a join node is popped
+    // twice and restores its child's refcount TWICE, permanently inflating a
+    // downstream cell so the cycle can never be reclaimed. `markGray`/`scan`
+    // already carry that guard; `scanBlack` must too.
+    //
+    // Repro shape: R -> P1 -> {J, P2}, P2 -> J, J -> R. An external reference on
+    // R keeps the whole SCC alive across a FIRST collection, forcing the
+    // `ScanBlack` survivor path over the join node. The stack discipline pushes
+    // J (via P1) BELOW P2, so P2 is popped first and pushes J a SECOND time
+    // before J's first pop — the exact double-push the guard absorbs. Dropping
+    // the external reference and collecting again must then reclaim the whole
+    // cycle leak-exact; with the bug R stays over-inflated and the SCC leaks
+    // (the backing-allocator oracle at deinit panics).
+    const ctx_opaque = orcInit(null) orelse return error.OutOfMemory;
+    const ctx: *OrcContext = @ptrCast(@alignCast(ctx_opaque));
+    defer testDeinitAssertClean(ctx_opaque);
+    setupCycleType(ctx_opaque);
+
+    const r = try newCycleNode(ctx_opaque);
+    const p1 = try newCycleNode(ctx_opaque);
+    const p2 = try newCycleNode(ctx_opaque);
+    const j = try newCycleNode(ctx_opaque);
+
+    r.right = p1;
+    orcRetain(ctx_opaque, @ptrCast(p1)); // p1.rc: 1 -> 2
+    p1.left = j;
+    orcRetain(ctx_opaque, @ptrCast(j)); // j.rc: 1 -> 2
+    p1.right = p2;
+    orcRetain(ctx_opaque, @ptrCast(p2)); // p2.rc: 1 -> 2
+    p2.right = j;
+    orcRetain(ctx_opaque, @ptrCast(j)); // j.rc: 2 -> 3 (join node: in-edges from P1 and P2)
+    j.right = r;
+    orcRetain(ctx_opaque, @ptrCast(r)); // r.rc: 1 -> 2 (back-edge closes the cycle)
+
+    // Persistent EXTERNAL owner of R, dropped only AFTER the first collection.
+    orcRetain(ctx_opaque, @ptrCast(r)); // r.rc: 2 -> 3
+
+    // Drop the four construction-time local handles (each to non-zero → buffers).
+    orcRelease(ctx_opaque, @ptrCast(r), cycleNodeDeepWalk); // r: 3 -> 2
+    orcRelease(ctx_opaque, @ptrCast(p1), cycleNodeDeepWalk); // p1: 2 -> 1
+    orcRelease(ctx_opaque, @ptrCast(p2), cycleNodeDeepWalk); // p2: 2 -> 1
+    orcRelease(ctx_opaque, @ptrCast(j), cycleNodeDeepWalk); // j: 3 -> 2
+    try testing.expectEqual(@as(usize, 4), ctx.roots.items.len);
+
+    // First collection: R is externally reachable, so trial deletion restores
+    // the whole SCC via ScanBlack (which traverses the join node). A CORRECT
+    // ScanBlack restores each cell to its post-handle-drop count; the buggy
+    // double-restore over-inflates R (2 -> 3), which this assertion catches.
+    orcCollectCycles(ctx_opaque);
+    try testing.expectEqual(@as(u32, 2), r.refcount);
+    try testing.expectEqual(@as(u32, 1), p1.refcount);
+    try testing.expectEqual(@as(u32, 1), p2.refcount);
+    try testing.expectEqual(@as(u32, 2), j.refcount);
+
+    // Drop the external reference — the SCC is now unreachable and collectable.
+    orcRelease(ctx_opaque, @ptrCast(r), cycleNodeDeepWalk); // r: 2 -> 1
+    orcCollectCycles(ctx_opaque);
+    try testing.expectEqual(@as(usize, 0), ctx.roots.items.len);
+    // deinit's leak oracle (via defer) asserts the whole cycle was reclaimed.
+}
+
 test "orc: zap_memory_section declares REFCOUNTED (Axis A bit 0) — the shared specialization" {
     // The static proof-of-shape behind the shares-the-REFCOUNTED-specialization
     // hypothesis: ORC's declared_caps is byte-identical to ARC's 0x1, so the
@@ -1308,4 +2385,38 @@ test "orc: zap_memory_section declares REFCOUNTED (Axis A bit 0) — the shared 
     defer testDeinitAssertClean(ctx_opaque);
     try testing.expect(orcGetCapabilityDesc(ctx_opaque, REFC_TAG) != null);
     try testing.expect(orcGetCapabilityDesc(ctx_opaque, CYCL_TAG) != null);
+}
+
+test "orc: production SlabHeap serves slab + large allocs and wholesale teardown is leak-exact (G7)" {
+    // Exercise the PRODUCTION heap directly. The manager's own `is_test` build
+    // selects the DebugAllocator oracle for `BackingHeap`, so `SlabHeap` would
+    // otherwise sit in the unanalysed `else` branch; instantiating it explicitly
+    // proves the page-backed slab/large heap a real (`!is_test`) binary runs on
+    // works — prompt individual free (the ARC fast path), a page-backed large
+    // path, and leak-exact wholesale teardown (every mapped slab + large
+    // allocation returned to the OS). The `test_slab_*` / `test_large_*` mmap
+    // accounting is the leak oracle: at `deinit`, maps must equal unmaps.
+    const mmap_before = test_slab_mmap_total;
+    const unmap_before = test_slab_unmap_total;
+    const large_alloc_before = test_large_alloc_total;
+    const large_free_before = test_large_free_total;
+
+    var heap: SlabHeap = .init;
+    const small = heap.rawAlloc(16, 8) orelse return error.OutOfMemory; // slab class 0
+    const medium = heap.rawAlloc(1024, 8) orelse return error.OutOfMemory; // a larger slab class
+    const large = heap.rawAlloc(65536, 16) orelse return error.OutOfMemory; // large path
+
+    // Prompt individual free of a slab slot and of a large allocation (the ARC
+    // fast path); `medium` is left LIVE so wholesale teardown must reclaim it.
+    heap.rawFree(small, 16, 8);
+    heap.rawFree(large, 65536, 16);
+    _ = medium;
+    heap.deinit();
+
+    // Leak-exact: every mapped slab was unmapped, every large allocation freed,
+    // and both paths were actually exercised.
+    try testing.expectEqual(test_slab_mmap_total - mmap_before, test_slab_unmap_total - unmap_before);
+    try testing.expectEqual(test_large_alloc_total - large_alloc_before, test_large_free_total - large_free_before);
+    try testing.expect(test_slab_mmap_total > mmap_before);
+    try testing.expect(test_large_alloc_total > large_alloc_before);
 }

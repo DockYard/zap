@@ -238,5 +238,6 @@ test {
     _ = @import("memory/arc/cross_thread_stress.zig");
     _ = @import("memory/gc/manager.zig");
     _ = @import("memory/orc/manager.zig");
+    _ = @import("memory/orc/cross_thread_stress.zig");
     _ = @import("memory/arena/manager.zig");
 }

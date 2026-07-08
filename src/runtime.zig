@@ -6536,6 +6536,75 @@ pub const ArcRuntime = struct {
             @panic("zap runtime: per-process manager dispatch with no active memory manager");
     }
 
+    /// Per-thread cache of the running process's REFCOUNT_V1 capability vtable
+    /// (or `null` for a NON-refcounted process — Arena/NoOp/GC), keyed by its
+    /// manager CORE pointer (plan item 3.1/3.3; the A.4 OQ1 resolve-once
+    /// discipline applied to the refcount vtable). The capability is a pure
+    /// function of the core (`core.get_capability_desc(REFC).vtable`), and manager
+    /// cores are STATIC storage (`zap_memory_section.core`, a manager module
+    /// `pub const`), so keying the cache on the core pointer is ABA-safe: a
+    /// recycled `ProcessManagerBinding` heap address can never alias a different
+    /// core's capability. `threadlocal` so no scheduler thread ever races
+    /// another's cache — the SACRED scheduler-local invariant extends to this
+    /// dispatch metadata (TSan-clean by construction, no shared mutable state on
+    /// the refcount path). `cached_refcount_capability` is itself optional, so a
+    /// non-refcounted core is cached as `null` and answered without re-resolving;
+    /// `cached_refcount_core` starts `null` and no real core pointer is ever
+    /// `null`, so the first lookup always misses and resolves. Only reachable
+    /// through `currentRefcountCapability`, itself only called under
+    /// `multi_manager_active`, so a single-manager binary never analyses these
+    /// (Zig's lazy analysis drops the uncalled `inline fn` and with it these
+    /// thread-locals — the zero-cost guarantee, verified by `nm`).
+    threadlocal var cached_refcount_core: ?*const AbiV1.ZapMemoryManagerCoreV1 = null;
+    threadlocal var cached_refcount_capability: ?*const AbiV1.ZapRefcountCapabilityV1 = null;
+
+    /// The RUNNING process's REFCOUNT_V1 capability vtable, or `null` when the
+    /// running process's manager does NOT declare REFCOUNT_V1 (a non-refcounted
+    /// Arena/NoOp/GC process) — the retain/release counterpart to
+    /// `currentManagerCore` (multi-manager per-process dispatch, plan item
+    /// 3.1/3.3, P3-R1a).
+    ///
+    /// Two things this fix delivers:
+    ///   * A refcounted process (ARC/ORC) reaches ITS OWN capability with ITS OWN
+    ///     context — so an ORC process's release runs ORC's `noteDecrement` →
+    ///     `possibleRoot` (cycle-root buffering), and no manager is ever handed a
+    ///     foreign context (the closed type-confusion hazard).
+    ///   * A NON-refcounted process returns `null`, and every caller no-ops the
+    ///     refcount op. This is the sound COLD-PATH behaviour: a not-yet-
+    ///     specialized closure/HOF is compiled under the MANIFEST (refcounted)
+    ///     model and emits retain/release, but when an Arena process runs that
+    ///     cold edge on its own cells the op resolves to Arena's (absent) refcount
+    ///     and elides at RUNTIME — exactly what the monomorphizer elides at
+    ///     compile time for a specialized bulk_or_never subgraph. No corruption,
+    ///     no panic, no verifier rejection needed.
+    ///
+    /// Resolves the published per-quantum binding and returns its manager's
+    /// cached capability, re-resolving ONLY when the running process's core
+    /// differs from the cached one — once per context switch to a different-model
+    /// process, never per op in steady state (OQ1). Out of any process quantum
+    /// (bootstrap / atexit) `currentProcessBinding` is null and this folds to the
+    /// manifest capability. Only called under `multi_manager_active` (which
+    /// implies `runtime_concurrency_active`).
+    inline fn currentRefcountCapability() ?*const AbiV1.ZapRefcountCapabilityV1 {
+        const binding = currentProcessBinding() orelse
+            return active_manager_state.refcount_capability;
+        if (cached_refcount_core != binding.core) {
+            cached_refcount_capability = resolveRefcountCapability(binding);
+            cached_refcount_core = binding.core;
+        }
+        return cached_refcount_capability;
+    }
+
+    /// Resolve a process binding's REFCOUNT_V1 capability, or `null` for a
+    /// non-refcounted manager. Checks `declared_caps` first so a non-refcounted
+    /// core is answered without even calling `get_capability_desc`.
+    fn resolveRefcountCapability(binding: *const ProcessManagerBinding) ?*const AbiV1.ZapRefcountCapabilityV1 {
+        if ((binding.core.declared_caps & AbiV1.REFCOUNT_V1_BIT) == 0) return null;
+        const desc = binding.core.get_capability_desc(binding.context, AbiV1.REFC_TAG) orelse
+            @panic("zap runtime: per-process manager declares REFCOUNT_V1 but get_capability_desc(REFC) returned null");
+        return @ptrCast(@alignCast(desc.vtable));
+    }
+
     /// The RUNNING process's reclamation model, decoded at RUNTIME from its
     /// manager core's `declared_caps` (plan item 3.4, P3-J4 — cross-model
     /// message copy). This is the receiver-side model query the deep-copy
@@ -6953,6 +7022,26 @@ pub const ArcRuntime = struct {
             const size = @sizeOf(T);
             const alignment_bytes = @alignOf(T);
             const raw = blk: {
+                // Multi-manager: allocate the refcounted cell from the RUNNING
+                // process's OWN manager so its side-table entry lives where THAT
+                // manager's retain/release/free will look for it. Alloc and free
+                // MUST agree on the manager — an ORC cell allocated by ARC's
+                // side-table would be invisible to ORC's `release_sized` and
+                // leak (the alloc/free-consistency half of P3-R1a). Bypasses the
+                // ARC-source `allocateRefcountedClass` fast path; the generic slot
+                // is the model-agnostic ABI contract.
+                if (comptime multi_manager_active) {
+                    if (currentRefcountCapability()) |cap| {
+                        break :blk cap.allocate_refcounted(ctx, size, @intCast(alignment_bytes));
+                    }
+                    // Non-refcounted running process (Arena/NoOp): a "refcounted"
+                    // cell reached at a cold edge has no side-table home and is
+                    // never individually freed — allocate it raw from the
+                    // process's own heap; wholesale teardown reclaims it
+                    // (bulk_or_never). Its retain/release/refcount ops elide via
+                    // the null-capability branches at the other dispatch sites.
+                    break :blk currentManagerCore().allocate(ctx, size, @intCast(alignment_bytes));
+                }
                 if (comptime !active_manager_source_available) {
                     const cap = active_manager_state.refcount_capability orelse
                         @panic("zap runtime: allocAny dispatched but active manager does not declare REFCOUNT_V1");
@@ -8304,6 +8393,20 @@ pub const ArcRuntime = struct {
     ) void {
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
+        // Multi-manager (per-spawn managers): dispatch the side-table release
+        // through the RUNNING process's OWN refcount capability so an ORC
+        // process reaches ORC's `release_sized` (`noteDecrement` → cycle-root
+        // buffering) with ITS OwnContext — never the manifest ARC's slot on a
+        // foreign context (the type-confusion hazard). Bypasses the ARC-source
+        // `releaseSizedClass` comptime fast path (a manifest-only optimization);
+        // the generic sized slot is the model-agnostic ABI contract every
+        // REFCOUNT_V1 manager honours (plan item 3.1/3.3, P3-R1a).
+        if (comptime multi_manager_active) {
+            if (currentRefcountCapability()) |cap| {
+                cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), deep_walk);
+            }
+            return;
+        }
         if (comptime !active_manager_source_available) {
             const cap = active_manager_state.refcount_capability orelse unreachable;
             cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), deep_walk);
@@ -8975,6 +9078,15 @@ pub const ArcRuntime = struct {
     ) void {
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
+        // Multi-manager: side-table retain through the running process's own
+        // refcount capability (see `releaseArcSideTableSized` for the rationale
+        // and the class-fast-path bypass note).
+        if (comptime multi_manager_active) {
+            if (currentRefcountCapability()) |cap| {
+                cap.retain_sized(ctx, slot_ptr, size, @intCast(alignment_bytes));
+            }
+            return;
+        }
         if (comptime !active_manager_source_available) {
             const cap = active_manager_state.refcount_capability orelse unreachable;
             cap.retain_sized(ctx, slot_ptr, size, @intCast(alignment_bytes));
@@ -9068,6 +9180,20 @@ pub const ArcRuntime = struct {
         const ctx = currentManagerContext() orelse {
             @panic("zap runtime: headerRetain dispatched with null manager context");
         };
+        // Multi-manager: an inline-header retain must reach the RUNNING process's
+        // OWN manager `retain` slot, not the manifest's. The atomic increment on
+        // the offset-0 header is model-agnostic (ARC and ORC share the layout),
+        // but ORC's `retain` ALSO repaints a stale purple cell black — so routing
+        // an ORC process's inline cells through ORC's slot keeps its cycle
+        // colouring coherent (and hands every manager its OWN context, closing
+        // the type-confusion hazard). Plan item 3.1/3.3, P3-R1a.
+        if (comptime multi_manager_active) {
+            if (currentRefcountCapability()) |cap| {
+                cap.retain(ctx, @ptrCast(header_ptr));
+                incrementRuntimeStatCounter(&arc_retains_total);
+            }
+            return;
+        }
         if (comptime !active_manager_source_available) {
             const cap = active_manager_state.refcount_capability orelse {
                 @panic("zap runtime: headerRetain dispatched but active manager does not declare REFCOUNT_V1");
@@ -9136,6 +9262,20 @@ pub const ArcRuntime = struct {
         const ctx = currentManagerContext() orelse {
             @panic("zap runtime: headerRelease dispatched with null manager context");
         };
+        // Multi-manager: an inline-header release must reach the RUNNING
+        // process's OWN manager `release` slot. This is THE load-bearing path for
+        // ORC's inline-cell (Map/List/MapIter) cycle collection: ORC's `release`
+        // runs `noteDecrement` → `possibleRoot`, buffering a non-zero-decrement
+        // cell as a cycle-root candidate. Routed to the manifest ARC instead, an
+        // ORC process's inline cycles would never buffer (and ARC would free on a
+        // foreign context). Plan item 3.1/3.3, P3-R1a.
+        if (comptime multi_manager_active) {
+            if (currentRefcountCapability()) |cap| {
+                cap.release(ctx, @ptrCast(header_ptr), deep_walk);
+                incrementRuntimeStatCounter(&arc_releases_total);
+            }
+            return;
+        }
         if (comptime !active_manager_source_available) {
             const cap = active_manager_state.refcount_capability orelse {
                 @panic("zap runtime: headerRelease dispatched but active manager does not declare REFCOUNT_V1");
@@ -9194,6 +9334,15 @@ pub const ArcRuntime = struct {
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *const T = ptr;
+        // Multi-manager: read the refcount from the RUNNING process's OWN manager
+        // (the one that allocated this cell's side-table entry), so Perceus reuse
+        // sees ITS process's real count. Plan item 3.1/3.3, P3-R1a.
+        if (comptime multi_manager_active) {
+            if (currentRefcountCapability()) |cap| {
+                return cap.refcount_sized(ctx, @ptrCast(@constCast(slot_ptr)), size, @intCast(alignment_bytes));
+            }
+            return 0;
+        }
         if (comptime !active_manager_source_available) {
             const cap = active_manager_state.refcount_capability orelse return 0;
             return cap.refcount_sized(ctx, @ptrCast(@constCast(slot_ptr)), size, @intCast(alignment_bytes));
