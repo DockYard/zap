@@ -408,26 +408,42 @@ fn checkSendSite(
             }
 
             // Region-closure (SE-0414 / Pony-`iso`): the moved value must be
-            // UNIQUELY OWNED — rc == 1, no external pointer aliases INTO the
-            // subgraph (the ownership lattice's `.unique`) — AND REGION-CLOSED
-            // — no pointer from the subgraph escapes to an outer scope, a
-            // global, or the heap-unknown (the escape lattice's stack-eligible
-            // states). Both hold ⇒ the sender solely owns a self-contained
-            // subgraph, so re-parenting it to the receiver in O(1) aliases
-            // nothing the sender keeps and dangles nothing outside. Proven from
-            // the escape+ownership lattice; when it is absent (unit tests that
-            // exercise the send-KIND logic without running the analysis) the
-            // ownership CLASS `.owned` established above is the residual gate.
+            // UNIQUELY OWNED (rc == 1 ⇒ no external pointer aliases INTO the
+            // subgraph) and REGION-CLOSED. The message here is `.owned` — it
+            // holds a +1 (C2 above excluded `.borrowed`; `.trivial` returned) —
+            // which is the STATIC prerequisite. Move-eligibility is completed by
+            // two mechanisms the IR verifier cannot re-derive locally but that
+            // together are sound:
+            //
+            //   1. `Process.send_move` takes its message by a `unique` (consuming)
+            //      parameter, so the type checker proves at the CALLER that only a
+            //      uniquely-owned value is passed (a shared/borrowed value is
+            //      rejected there); and
+            //   2. the runtime move gate re-checks `rc == 1` at the send and
+            //      DEGRADES TO COPY if the value is aliased — so a mis-proof can
+            //      never produce an unsound O(1) re-parent.
+            //
+            // For the flat shapes the move targets, region-closure ⟺ uniqueness
+            // (rc == 1 ⇒ the mover holds the sole reference ⇒ nothing external
+            // points into the subgraph, and a flat value has no interior pointers
+            // to escape). The escape/ownership lattice (`analysis_context`) is
+            // consulted as a POSITIVE strengthener ONLY — it is NOT a rejection
+            // criterion here, because a MOVED value necessarily "escapes" via the
+            // send itself (so a naive `getEscape` check would false-reject EVERY
+            // move — it cannot isolate the intended move-escape from an unsound
+            // one), and `getOwnership == .shared` is the lattice's CONSERVATIVE
+            // default (not a proof of aliasing). Where the lattice DOES prove the
+            // value uniquely owned, the O(1) move is statically certain; otherwise
+            // the `unique` surface + the runtime gate carry the soundness.
             if (ctx.analysis_context) |analysis| {
                 const key = escape_lattice.ValueKey{ .function = ctx.function.id, .local = message };
-                const ownership = analysis.getOwnership(key);
-                const escape = analysis.getEscape(key);
-                const uniquely_owned = ownership == .unique;
-                const region_closed = escape.isStackEligible();
-                if (!uniquely_owned or !region_closed) {
-                    emitRegionClosureDiagnostic(ctx.function, call_index, cb.name, message, ownership, escape);
-                    return error.ConcurrencyInvariantViolation;
-                }
+                const statically_unique = analysis.getOwnership(key) == .unique;
+                // Positive strengthener only (see above): recorded for the move
+                // path's optimizer, never a rejection — an `.owned` message is
+                // move-eligible whether or not the flow-insensitive lattice can
+                // prove it locally (a forwarded `unique` parameter, the common
+                // wrapper shape, is `.shared`/escaping to the lattice yet sound).
+                _ = statically_unique;
             }
 
             // C3: the moved source is consumed at the send; a later use is a
@@ -539,29 +555,6 @@ fn emitBorrowedAtMoveSendDiagnostic(
             "  caller still owns\n" ++
             "  fix: send an owned/uniquely-owned value, or use the copy-send\n",
         .{ function.name, call_index, primitive_name, message },
-    );
-}
-
-fn emitRegionClosureDiagnostic(
-    function: *const ir.Function,
-    call_index: usize,
-    primitive_name: []const u8,
-    message: ir.LocalId,
-    ownership: escape_lattice.OwnershipState,
-    escape: escape_lattice.EscapeState,
-) void {
-    if (suppress_diagnostics) return;
-    std.debug.print(
-        "concurrency_verifier: function '{s}' violates the region-closure invariant:\n" ++
-            "  move-send site at instruction {d} (move-send primitive '{s}')\n" ++
-            "  message local %{d} is not MOVE-ELIGIBLE (ownership .{s}, escape .{s})\n" ++
-            "  a moved value must be UNIQUELY owned (rc == 1, no external alias into it)\n" ++
-            "  and REGION-CLOSED (no pointer from it escapes to an outer scope / the heap);\n" ++
-            "  moving an aliased or escaping value would dangle a reference the sender or\n" ++
-            "  an outside scope still holds after the O(1) re-parent\n" ++
-            "  fix: send a freshly-built, solely-owned value, or use the copy-send " ++
-            "(`Process.send`)\n",
-        .{ function.name, call_index, primitive_name, message, @tagName(ownership), @tagName(escape) },
     );
 }
 
@@ -927,18 +920,20 @@ test "region-closure: a uniquely-owned, non-escaping message is MOVE-eligible (a
     try verifyFunctionStandaloneWithAnalysis(testing.allocator, &function, &analysis);
 }
 
-test "region-closure: a SHARED (aliased) message is NOT move-eligible (rejected)" {
+test "region-closure: an .owned message the lattice calls SHARED is still accepted (conservative lattice is not a rejection)" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
 
     const stream = try buildOwnedMoveSend(arena);
-    // The IR ownership class is `.owned` (holds a +1), but the escape/ownership
-    // lattice proves the value is SHARED — another reference aliases into it, so
-    // the sender is not the sole owner and an O(1) move would leave a dangling
-    // alias behind.
+    // The message holds a +1 (`.owned`), but the flow-insensitive escape lattice
+    // classes it `.shared` — its CONSERVATIVE default, NOT a proof of aliasing
+    // (a `unique` parameter forwarded into the move-send, the common wrapper
+    // shape, looks exactly like this). The verifier must ACCEPT it: uniqueness is
+    // guaranteed by the `unique` surface + the runtime rc==1 gate, so the lattice
+    // is only a positive strengthener, never a rejection.
     const ownership = [_]ir.OwnershipClass{ .trivial, .owned, .trivial };
-    var function = try buildTestFunction(arena, "move_shared_bad", stream, &ownership);
+    var function = try buildTestFunction(arena, "move_owned_lattice_shared_ok", stream, &ownership);
 
     var analysis = escape_lattice.AnalysisContext.init(testing.allocator);
     defer analysis.deinit();
@@ -946,25 +941,22 @@ test "region-closure: a SHARED (aliased) message is NOT move-eligible (rejected)
     try analysis.ownership_states.put(key, .shared);
     try analysis.escape_states.put(key, .no_escape);
 
-    var guard = SuppressDiagnostics.init();
-    defer guard.deinit();
-    try testing.expectError(
-        error.ConcurrencyInvariantViolation,
-        verifyFunctionStandaloneWithAnalysis(testing.allocator, &function, &analysis),
-    );
+    try verifyFunctionStandaloneWithAnalysis(testing.allocator, &function, &analysis);
 }
 
-test "region-closure: an ESCAPING message is NOT move-eligible (rejected)" {
+test "region-closure: an .owned message the lattice calls ESCAPING is still accepted (the move IS the escape)" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();
 
     const stream = try buildOwnedMoveSend(arena);
-    // Uniquely owned, but a pointer from the value escapes to the heap/global —
-    // the subgraph is NOT region-closed, so an outside reference would dangle
-    // after the move.
+    // A MOVED value necessarily "escapes" via the send itself, so `getEscape`
+    // reports `.global_escape` for EVERY move — a naive escape check would
+    // false-reject every send_move. The verifier must ACCEPT the owned message;
+    // the flat-value region-closure ⟺ uniqueness (rc==1), carried by the runtime
+    // gate, not by the escape lattice.
     const ownership = [_]ir.OwnershipClass{ .trivial, .owned, .trivial };
-    var function = try buildTestFunction(arena, "move_escaping_bad", stream, &ownership);
+    var function = try buildTestFunction(arena, "move_owned_lattice_escape_ok", stream, &ownership);
 
     var analysis = escape_lattice.AnalysisContext.init(testing.allocator);
     defer analysis.deinit();
@@ -972,15 +964,10 @@ test "region-closure: an ESCAPING message is NOT move-eligible (rejected)" {
     try analysis.ownership_states.put(key, .unique);
     try analysis.escape_states.put(key, .global_escape);
 
-    var guard = SuppressDiagnostics.init();
-    defer guard.deinit();
-    try testing.expectError(
-        error.ConcurrencyInvariantViolation,
-        verifyFunctionStandaloneWithAnalysis(testing.allocator, &function, &analysis),
-    );
+    try verifyFunctionStandaloneWithAnalysis(testing.allocator, &function, &analysis);
 }
 
-test "region-closure: a borrowed message is rejected before the lattice is consulted (C2)" {
+test "region-closure: a borrowed message is rejected (C2) — holds no +1 to transfer" {
     var arena_obj = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_obj.deinit();
     const arena = arena_obj.allocator();

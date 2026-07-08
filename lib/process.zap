@@ -175,7 +175,7 @@ pub struct Process {
     simply copies.
     """
 
-  pub fn send_move(pid :: Pid(message_type), message :: message_type) -> Bool {
+  pub fn send_move(pid :: Pid(message_type), message :: unique message_type) -> Bool {
     :zig.ProcessRuntime.send_message_moved(pid.raw, message)
   }
 

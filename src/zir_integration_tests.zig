@@ -5904,6 +5904,32 @@ test "ZIR concurrency: Process.spawn rejects a closure with a captured environme
     );
 }
 
+test "ZIR concurrency: Process.send_move consumes its message — a use after the move is a compile error (P3-J5)" {
+    // `Process.send_move` takes its message by a CONSUMING convention
+    // (`message :: unique message_type`): the same-model O(1) region-move
+    // transfers ownership of the value to the receiver, so the value is MOVED
+    // out of the sender. Reusing it afterward is a use-after-move — caught by
+    // the type checker's move tracking (`markBindingMoved` on passing a value to
+    // a `unique` parameter, emitting the "was already moved" ownership error at
+    // `src/types.zig`). This is the compile-time TOOTH the concurrency verifier's
+    // C3 invariant anchors to the move-send boundary; without it a moved value's
+    // dangling reference (the receiver now owns the cell) would go undetected.
+    // WRITTEN, not run here (`zig build zir-test` is driven separately).
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    values = List.new_filled(3, 0 :: i64)
+        \\    echo = (Pid.of(Process.self()) :: Pid(List(i64)))
+        \\    _sent = Process.send_move(echo, values)
+        \\    _reuse = values
+        \\    0
+        \\  }
+        \\}
+    ,
+        "already moved",
+    );
+}
+
 test "ZIR concurrency: Process.receive_raw rejects an unsendable payload type token" {
     // `String` is outside the Phase-2 sendable set (fixed-size scalars);
     // the raw-receive token macro has no clause for it, so an unsendable
