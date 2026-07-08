@@ -809,6 +809,12 @@ pub const ProcessContext = struct {
 /// the ~900 ns parked-wake cost; plan A.2.3).
 pub const default_spin_iterations_before_park: u32 = 512;
 
+/// Default local-FIFO length past which a work-stealing core spills half its
+/// backlog to the global overflow queue (P4-J1). Sized so a core keeps a
+/// healthy local batch (locality) while surfacing surplus for idle cores to
+/// grab in O(1); a starting point, not a tuned contract.
+pub const default_spill_threshold: usize = 64;
+
 /// Default bound on one futex park (defense-in-depth re-check period; the
 /// eventcount protocol needs no timeout for correctness — see the module
 /// doc's parking section).
@@ -873,6 +879,88 @@ extern "c" fn clock_gettime_nsec_np(clock_id: u32) u64;
 /// the Darwin TLV cost (E10) is irrelevant here.
 threadlocal var current_scheduler: ?*Scheduler = null;
 
+/// The pool-wide overflow run queue (P4-J1, research.md §6.1's global queue).
+/// An intrusive FIFO of `.runnable` records guarded by a spinlock, shared by
+/// every core. Two roles: a core with a large local backlog SPILLS half here so
+/// idle cores can grab work in O(1) without hunting for a victim, and any core
+/// pulls from here before it steals. Defined here (not in `scheduler_pool.zig`)
+/// so a `Scheduler` can spill into it with no import cycle. Records carry the
+/// same `ready_next` intrusive link the per-core FIFO uses; a record is on
+/// exactly one queue at a time.
+pub const GlobalRunQueue = struct {
+    lock: std.atomic.Mutex,
+    head: ?*ProcessRecord,
+    tail: ?*ProcessRecord,
+    /// Queue length. Guarded by `lock`; also load-able unlocked as an
+    /// approximate emptiness hint for the worker loop's fast path.
+    count: std.atomic.Value(usize),
+
+    pub fn init() GlobalRunQueue {
+        return .{ .lock = .unlocked, .head = null, .tail = null, .count = .init(0) };
+    }
+
+    /// Approximate emptiness (unlocked) — the worker loop's fast pre-check.
+    pub fn isEmptyApprox(queue: *const GlobalRunQueue) bool {
+        return queue.count.load(.monotonic) == 0;
+    }
+
+    fn acquire(queue: *GlobalRunQueue) void {
+        while (!queue.lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Append a chain of `moved` records (linked by `ready_next`, `chain_tail`
+    /// terminating) to the queue tail. Used by a core spilling surplus work.
+    fn pushChainLocked(queue: *GlobalRunQueue, chain_head: *ProcessRecord, chain_tail: *ProcessRecord, moved: usize) void {
+        chain_tail.ready_next = null;
+        if (queue.tail) |tail| {
+            tail.ready_next = chain_head;
+        } else {
+            queue.head = chain_head;
+        }
+        queue.tail = chain_tail;
+        _ = queue.count.fetchAdd(moved, .monotonic);
+    }
+
+    /// Pop the oldest record, or null when empty. O(1).
+    pub fn pop(queue: *GlobalRunQueue) ?*ProcessRecord {
+        queue.acquire();
+        defer queue.lock.unlock();
+        const record = queue.head orelse return null;
+        queue.head = record.ready_next;
+        if (queue.tail == record) queue.tail = null;
+        record.ready_next = null;
+        _ = queue.count.fetchSub(1, .monotonic);
+        return record;
+    }
+};
+
+/// The seam a `SchedulerPool` (`scheduler_pool.zig`) installs into each of its
+/// cores so a `Scheduler` stays decoupled from the pool while being correct
+/// under work-stealing migration (P4-J1). A standalone scheduler leaves it null
+/// and keeps its Phase-1 per-scheduler bookkeeping byte-for-byte.
+///
+/// Why the live count must leave the scheduler under M:N: a process is spawned
+/// on its origin core (which would `+1`) but, if stolen, torn down on another
+/// core (which would `-1`), so a per-scheduler counter drifts and can underflow.
+/// The pool owns ONE authoritative live-process count; `liveCountDelta` routes
+/// both ends to it. (The record cache stays per-scheduler and race-free: a
+/// record is always recycled to the tearing-down core's OWN cache, and freed
+/// once at `deinit` through the pool's shared allocator.)
+pub const PoolHooks = struct {
+    /// Opaque pool context passed back to every hook.
+    context: ?*anyopaque,
+    /// Adjust the pool-wide live-process count (+1 at spawn, -1 at teardown).
+    liveCountDelta: *const fn (context: ?*anyopaque, delta: i32) void,
+    /// A runnable process was admitted to this core's FIFO — the pool wakes one
+    /// idle (parked) worker so it can steal and run the surplus (netpoller
+    /// wakeup; research.md §6.1). At most one wake per admission.
+    notifyWork: *const fn (context: ?*anyopaque) void,
+    /// A process completed teardown (its raw pid bits) — the pool checks whether
+    /// it was the root process and, if so, signals every core to stop (Erlang
+    /// halt model: the program's lifetime is the root's lifetime).
+    onProcessExit: *const fn (context: ?*anyopaque, exited_pid_bits: u64) void,
+};
+
 /// The M:N run-queue scheduler (plan 1.4/1.5 + Phase 4.1; instance-based — see
 /// the module doc). A single `Scheduler` is NOT thread-safe as a whole:
 /// exactly one thread runs its `runQuantum`/`spawn`/`dequeue` loop. Its
@@ -895,6 +983,12 @@ pub const Scheduler = struct {
     stack_pool: StackPool,
     /// Configuration (see `Options`).
     options: Options,
+    /// Pool-orchestration seam, mirrored from `options.pool_hooks` for hot-path
+    /// access (null for a standalone scheduler). See `PoolHooks`.
+    pool_hooks: ?*const PoolHooks,
+    /// Shared overflow queue, mirrored from `options.global_queue` (null
+    /// standalone). See `GlobalRunQueue`.
+    global_queue: ?*GlobalRunQueue,
     /// Saved scheduler-side cpu state while a process fiber runs.
     fiber_scheduler_context: fiber_context.SchedulerContext,
     /// THE per-quantum current process (plan A.2.4/E10): written once at
@@ -1019,6 +1113,17 @@ pub const Scheduler = struct {
         /// tests, the deterministic harness) behaves byte-identically to Phase
         /// 1. A `SchedulerPool` sets this true for every core it owns.
         work_stealing: bool = false,
+        /// The pool-orchestration seam (see `PoolHooks`). Null for a standalone
+        /// scheduler; set by a `SchedulerPool` to route the live-process count,
+        /// idle-worker wakeups, and root-exit detection to the pool.
+        pool_hooks: ?*const PoolHooks = null,
+        /// The shared overflow queue (see `GlobalRunQueue`). Null for a
+        /// standalone scheduler; set by a `SchedulerPool`. A core whose local
+        /// FIFO grows past `spill_threshold` spills half here for idle cores.
+        global_queue: ?*GlobalRunQueue = null,
+        /// Local-FIFO length past which `readyEnqueue` spills half the backlog
+        /// to `global_queue` (only when both are set). Zero disables spilling.
+        spill_threshold: usize = default_spill_threshold,
         /// The nondeterminism seam (see `Decisions`).
         decisions: Decisions = .production_fifo,
         /// Trace seam (see `TraceHook`); null = zero-cost no trace.
@@ -1095,8 +1200,15 @@ pub const Scheduler = struct {
             .backing_allocator = backing_allocator,
             .pid_table = table,
             .envelope_pool = message_pool,
-            .stack_pool = StackPool.init(.{ .usable_size = options.stack_usable_size }),
+            .stack_pool = StackPool.init(.{
+                .usable_size = options.stack_usable_size,
+                // Under work stealing a stolen process exits on another core,
+                // which releases its stack back to THIS origin pool cross-thread.
+                .thread_safe = options.work_stealing,
+            }),
             .options = options,
+            .pool_hooks = options.pool_hooks,
+            .global_queue = options.global_queue,
             .fiber_scheduler_context = .{},
             .current_process = null,
             .timed_waiter_count = 0,
@@ -1185,9 +1297,16 @@ pub const Scheduler = struct {
 
         record.pcb.transitionTo(.runnable);
         scheduler.readyEnqueue(record);
-        scheduler.live_record_count += 1;
-        if (scheduler.live_record_count > scheduler.live_record_peak) {
-            scheduler.live_record_peak = scheduler.live_record_count;
+        // Live count: the pool's authoritative count under M:N (a stolen
+        // process is torn down on a different core, so a per-scheduler count
+        // would drift); the per-scheduler count for a standalone scheduler.
+        if (scheduler.pool_hooks) |hooks| {
+            hooks.liveCountDelta(hooks.context, 1);
+        } else {
+            scheduler.live_record_count += 1;
+            if (scheduler.live_record_count > scheduler.live_record_peak) {
+                scheduler.live_record_peak = scheduler.live_record_count;
+            }
         }
         scheduler.spawn_total += 1;
         scheduler.emitTrace(.spawn, pid);
@@ -1462,6 +1581,92 @@ pub const Scheduler = struct {
                 },
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Pool-facing API (P4-J1) — `scheduler_pool.zig` drives these on this core's
+    // own thread. A standalone scheduler uses `runUntilQuiescent`/
+    // `runUntilProcessExits` instead; these compose the same primitives so a
+    // pool worker can interleave local work with the global queue and stealing.
+    // -------------------------------------------------------------------------
+
+    /// Publish this scheduler as the current thread's scheduler for the lifetime
+    /// of its worker loop (wake-locality routing; see `current_scheduler`).
+    /// Called once when a pool worker thread enters, paired with `endRunThread`.
+    pub fn beginRunThread(scheduler: *Scheduler) void {
+        current_scheduler = scheduler;
+    }
+
+    /// Clear the current-thread scheduler on worker exit.
+    pub fn endRunThread(scheduler: *Scheduler) void {
+        std.debug.assert(current_scheduler == scheduler);
+        current_scheduler = null;
+    }
+
+    /// Service this core's cross-thread events once: convert freshly-woken
+    /// processes to runnable (drain the wake stack) and fire any elapsed
+    /// `receive … after` deadlines. Run at the top of every worker iteration.
+    pub fn serviceLocalEvents(scheduler: *Scheduler) void {
+        scheduler.drainWakeStack();
+        scheduler.fireExpiredReceiveTimeouts();
+    }
+
+    /// Take the next runnable process from this core (LIFO slot then FIFO), or
+    /// null when this core has no local work. Owner-thread only.
+    pub fn takeLocalRunnable(scheduler: *Scheduler) ?*ProcessRecord {
+        return scheduler.dequeueNextRunnable();
+    }
+
+    /// Run one quantum for `record` on this core (or tear it down if a kill is
+    /// pending) — the per-record body of the run loop. `record` may have been
+    /// dequeued from this core, pulled from the global queue, or just stolen;
+    /// `runQuantum` claims ownership for the quantum (migration). Owner-thread.
+    pub fn runNext(scheduler: *Scheduler, record: *ProcessRecord) void {
+        if (record.pending_kill) {
+            scheduler.teardownProcess(record, .killed);
+            return;
+        }
+        scheduler.runQuantum(record);
+    }
+
+    /// Park this core until woken (spin-then-futex; the netpoller idle path).
+    /// The pool calls this only after local, global, and steal sources are all
+    /// empty; a cross-thread wake (`wake()`, driven by a mailbox push, a new
+    /// spawn's `notifyWork`, or the pool's stop signal) returns it to the loop.
+    pub fn parkForWork(scheduler: *Scheduler) void {
+        scheduler.parkUntilWakeSignal();
+    }
+
+    /// Whether this core is (about to be) parked on its futex — the pool's
+    /// `wakeOneIdle` reads it to pick a parked worker to wake. Thread-safe
+    /// (a plain atomic load of the parking hint); a stale read is benign (a
+    /// spurious `wake()` on an un-parked core is a no-op).
+    pub fn isParkedHint(scheduler: *const Scheduler) bool {
+        return scheduler.parked_hint.load(.acquire);
+    }
+
+    /// Whether this core currently holds any local runnable work (LIFO slot or
+    /// FIFO). Approximate under concurrency (a thief may empty the FIFO); the
+    /// worker loop's park path re-checks authoritatively. Owner-biased read.
+    pub fn hasLocalWork(scheduler: *Scheduler) bool {
+        if (scheduler.runnext != null) return true;
+        scheduler.lockRunQueue();
+        defer scheduler.unlockRunQueue();
+        return scheduler.ready_count != 0;
+    }
+
+    /// Drain this core's cross-thread wake stack without running anything — the
+    /// pool's shutdown flushes every core's stack (single-threaded) so no stale
+    /// entry references a record about to be recycled.
+    pub fn drainPendingWakes(scheduler: *Scheduler) void {
+        scheduler.drainWakeStack();
+    }
+
+    /// Tear down `record` as a shutdown straggler (killed teardown). The caller
+    /// (pool shutdown, single-threaded) has already removed it from every run
+    /// queue, or it is a `.waiting` process that sits on none.
+    pub fn teardownAsStraggler(scheduler: *Scheduler, record: *ProcessRecord) void {
+        scheduler.teardownProcess(record, .killed);
     }
 
     /// The `ProcessContext` of the process the scheduler is currently
@@ -1741,9 +1946,23 @@ pub const Scheduler = struct {
             .normal => scheduler.normal_exit_total += 1,
             .killed => scheduler.kill_total += 1,
         }
-        std.debug.assert(scheduler.live_record_count > 0);
-        scheduler.live_record_count -= 1;
+        // Live count: pool-authoritative under M:N, per-scheduler standalone
+        // (see `spawn`). The record recycles to THIS (tearing-down) core's own
+        // cache — always the local thread, race-free — and is freed once at
+        // `deinit` through the shared allocator.
+        if (scheduler.pool_hooks) |hooks| {
+            hooks.liveCountDelta(hooks.context, -1);
+        } else {
+            std.debug.assert(scheduler.live_record_count > 0);
+            scheduler.live_record_count -= 1;
+        }
         scheduler.recycleRecord(record);
+        // Notify the pool of the completed exit LAST (after the record is safe
+        // to reuse): the pool checks whether this was the root process and, if
+        // so, signals every core to stop.
+        if (scheduler.pool_hooks) |hooks| {
+            hooks.onProcessExit(hooks.context, exit_pid.toBits());
+        }
     }
 
     /// Bound on consecutive transient-gap observations while draining a
@@ -1806,8 +2025,48 @@ pub const Scheduler = struct {
     /// queue; owner-only and lock-free otherwise.
     fn readyEnqueue(scheduler: *Scheduler, record: *ProcessRecord) void {
         scheduler.lockRunQueue();
-        defer scheduler.unlockRunQueue();
         scheduler.readyEnqueueLocked(record);
+        // Spill surplus to the global overflow queue while holding the lock, so
+        // an idle core can grab it in O(1) rather than hunting for a victim
+        // (research.md §6.1). The spilled records leave this core's FIFO, so its
+        // `ready_count` is decremented consistently under the same lock.
+        scheduler.spillOverflowLocked();
+        scheduler.unlockRunQueue();
+        // A runnable process is now stealable from this core's FIFO (or the
+        // global queue) — wake one idle worker so a parked core comes back to
+        // run it (netpoller wakeup). Outside the run-queue lock (it futex-wakes).
+        // No-op for a standalone scheduler. `stealInto`/`reviveEnqueue`
+        // deliberately use `readyEnqueueLocked`, so a steal-splice or a LIFO-slot
+        // displacement does not itself fan out another wake.
+        if (scheduler.pool_hooks) |hooks| hooks.notifyWork(hooks.context);
+    }
+
+    /// Move half of an over-long local FIFO to the global overflow queue, with
+    /// the run-queue lock already held. Oldest-first (the freshest work stays
+    /// local for cache locality). No-op unless both a `global_queue` and a
+    /// non-zero `spill_threshold` are configured and the backlog exceeds it.
+    fn spillOverflowLocked(scheduler: *Scheduler) void {
+        const global = scheduler.global_queue orelse return;
+        const threshold = scheduler.options.spill_threshold;
+        if (threshold == 0 or scheduler.ready_count <= threshold) return;
+        const spill = scheduler.ready_count / 2;
+        var chain_head: ?*ProcessRecord = null;
+        var chain_tail: ?*ProcessRecord = null;
+        var moved: usize = 0;
+        while (moved < spill) : (moved += 1) {
+            const record = scheduler.dequeueReadyAtLocked(0) orelse break;
+            record.ready_next = null;
+            if (chain_tail) |tail| {
+                tail.ready_next = record;
+            } else {
+                chain_head = record;
+            }
+            chain_tail = record;
+        }
+        if (moved == 0) return;
+        global.acquire();
+        global.pushChainLocked(chain_head.?, chain_tail.?, moved);
+        global.lock.unlock();
     }
 
     /// FIFO-tail append with the run-queue lock already held (or not needed).
@@ -1904,7 +2163,7 @@ pub const Scheduler = struct {
     /// enforces (thief only steals from higher-... — see `SchedulerPool.steal`),
     /// so no two schedulers ever lock the same pair in opposite orders. Returns
     /// 0 when the victim has nothing stealable. Runs on the THIEF's thread.
-    fn stealInto(victim: *Scheduler, thief: *Scheduler) usize {
+    pub fn stealInto(victim: *Scheduler, thief: *Scheduler) usize {
         std.debug.assert(victim.work_stealing and thief.work_stealing);
         std.debug.assert(victim != thief);
         // Snapshot half the victim's FIFO under the victim lock into a local

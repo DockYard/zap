@@ -199,6 +199,17 @@ pub const StackPool = struct {
         /// Requested usable stack bytes (excluding the guard page);
         /// rounded up to a whole number of OS pages. Must be non-zero.
         usable_size: usize = default_usable_size,
+        /// Guard `acquire`/`release`/`trim` with a spinlock (P4-J1). Required
+        /// when a stack may be RELEASED on a different scheduler thread than the
+        /// one that acquired it: under M:N work stealing a process is spawned on
+        /// its origin core (acquire) but, if stolen, exits on another core,
+        /// whose `resumeFiber` releases the stack back to this origin pool
+        /// (`KernelFiber.origin_stack_pool`) — a cross-thread free list mutation.
+        /// The lock makes both ends serialize on the ORIGIN pool, keeping its
+        /// counters exact. Default false — a standalone (single-scheduler,
+        /// deterministic) pool is owner-only and pays nothing, preserving the E9
+        /// pooled-spawn floor byte-for-byte.
+        thread_safe: bool = false,
     };
 
     /// Usable bytes per stack (page-multiple, fixed for the pool's
@@ -216,6 +227,11 @@ pub const StackPool = struct {
     live_stack_count: u32,
     /// High-watermark of `live_stack_count`; the cache cap derives from it.
     live_stack_peak: u32,
+    /// Whether `acquire`/`release`/`trim` take `lock` (see `Options.thread_safe`).
+    thread_safe: bool,
+    /// Spinlock guarding the free list and counters when `thread_safe`
+    /// (`std.atomic.Mutex`, kernel convention). Untouched otherwise.
+    lock: std.atomic.Mutex,
 
     /// Create an empty pool. Performs no syscalls; the first `acquire`
     /// maps the first stack.
@@ -229,7 +245,20 @@ pub const StackPool = struct {
             .cached_stack_count = 0,
             .live_stack_count = 0,
             .live_stack_peak = 0,
+            .thread_safe = options.thread_safe,
+            .lock = .unlocked,
         };
+    }
+
+    /// Acquire `lock` when `thread_safe` (a no-op for an owner-only pool).
+    inline fn lockPool(pool: *StackPool) void {
+        if (pool.thread_safe) {
+            while (!pool.lock.tryLock()) std.atomic.spinLoopHint();
+        }
+    }
+
+    inline fn unlockPool(pool: *StackPool) void {
+        if (pool.thread_safe) pool.lock.unlock();
     }
 
     /// Tear the pool down: every acquired stack must already have been
@@ -245,6 +274,8 @@ pub const StackPool = struct {
     /// reservation and protects its guard page (the E9-measured 1,646 ns
     /// growth path).
     pub fn acquire(pool: *StackPool) AcquireError!Stack {
+        pool.lockPool();
+        defer pool.unlockPool();
         if (pool.free_list_head) |cached_node| {
             pool.free_list_head = cached_node.next;
             pool.cached_stack_count -= 1;
@@ -286,6 +317,13 @@ pub const StackPool = struct {
         std.debug.assert(stack.guard_length == pool.guard_length);
         std.debug.assert(stack.mapping.len == pool.reservationLength());
 
+        // Serialize the free-list/counter mutation with a possibly-concurrent
+        // `acquire` on the ORIGIN pool: under M:N a stolen process's stack is
+        // released here on its runner's thread while its origin core may be
+        // spawning (P4-J1). No-op for an owner-only pool.
+        pool.lockPool();
+        defer pool.unlockPool();
+
         // Fiber-stack-lifetime invariant, local half (module doc): the
         // caller must have LEFT this stack. Active in all build modes.
         const releasing_frame_address = @frameAddress();
@@ -320,6 +358,8 @@ pub const StackPool = struct {
     /// Live stacks are unaffected. The high-watermark is deliberately NOT
     /// reset: demonstrated peak demand remains the cache bound.
     pub fn trim(pool: *StackPool) void {
+        pool.lockPool();
+        defer pool.unlockPool();
         while (pool.free_list_head) |cached_node| {
             pool.free_list_head = cached_node.next;
             pool.cached_stack_count -= 1;
