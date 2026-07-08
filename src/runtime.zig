@@ -1802,6 +1802,13 @@ pub const AbiV1 = struct {
     /// Pointer-width relative (`6 * PTR`).
     pub const REFCOUNT_V1_SIZE_V1_1: u16 = @intCast(6 * PTR);
 
+    /// The v1.2 byte length of `ZapRefcountCapabilityV1`, including the
+    /// relocate-extension slots (`detach_region`, `adopt_region`). A
+    /// v1.2+ manager advertises `desc.size >= REFCOUNT_V1_SIZE_V1_2`; the
+    /// runtime may then attempt the same-model O(1) region-move send
+    /// (else it falls back to copy). Pointer-width relative (`8 * PTR`).
+    pub const REFCOUNT_V1_SIZE_V1_2: u16 = @intCast(8 * PTR);
+
     /// Options passed to the manager's `init` entry point (spec
     /// section 4.1). Evolves in place via the leading `size` field.
     pub const ZapInitOptions = extern struct {
@@ -1858,6 +1865,13 @@ pub const AbiV1 = struct {
         release_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
         allocate_refcounted: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
         refcount_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32,
+        // v1.2 relocate extension (slots 6–7): the same-model O(1) region-move
+        // send (plan item 6.1, P3-J5). `detach_region` orphans a relocatable
+        // (large/page-backed) container buffer from the owning context so a
+        // same-model receiver `adopt_region`s it without copying; both are O(1)
+        // list surgery, the refcount untouched. `desc.size` advertises them.
+        detach_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool,
+        adopt_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void,
     };
 
     // Tripwire asserts mirroring `src/memory/abi.zig`. Any drift in
@@ -1932,8 +1946,8 @@ pub const AbiV1 = struct {
             "runtime.AbiV1: ZapMemoryManagerCoreV1.get_capability_desc must be the fifth pointer slot",
         );
 
-        if (@sizeOf(ZapRefcountCapabilityV1) != 6 * PTR) @compileError(
-            "runtime.AbiV1: ZapRefcountCapabilityV1 (Phase 4.x extended) must be six pointer slots wide",
+        if (@sizeOf(ZapRefcountCapabilityV1) != 8 * PTR) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1 (v1.2 relocate-extended) must be eight pointer slots wide",
         );
         if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0 * PTR) @compileError(
             "runtime.AbiV1: ZapRefcountCapabilityV1.retain must be the first pointer slot",
@@ -1953,11 +1967,20 @@ pub const AbiV1 = struct {
         if (@offsetOf(ZapRefcountCapabilityV1, "refcount_sized") != 5 * PTR) @compileError(
             "runtime.AbiV1: ZapRefcountCapabilityV1.refcount_sized must be the sixth pointer slot",
         );
+        if (@offsetOf(ZapRefcountCapabilityV1, "detach_region") != 6 * PTR) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1.detach_region must be the seventh pointer slot",
+        );
+        if (@offsetOf(ZapRefcountCapabilityV1, "adopt_region") != 7 * PTR) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1.adopt_region must be the eighth pointer slot",
+        );
         if (REFCOUNT_V1_SIZE_V1_0 != 2 * PTR) @compileError(
             "runtime.AbiV1: REFCOUNT_V1_SIZE_V1_0 must equal two pointer slots (v1.0 vtable length)",
         );
-        if (REFCOUNT_V1_SIZE_V1_1 != @sizeOf(ZapRefcountCapabilityV1)) @compileError(
-            "runtime.AbiV1: REFCOUNT_V1_SIZE_V1_1 must match the current ZapRefcountCapabilityV1 size",
+        if (REFCOUNT_V1_SIZE_V1_1 != 6 * PTR) @compileError(
+            "runtime.AbiV1: REFCOUNT_V1_SIZE_V1_1 must remain the six-slot v1.1 length",
+        );
+        if (REFCOUNT_V1_SIZE_V1_2 != @sizeOf(ZapRefcountCapabilityV1)) @compileError(
+            "runtime.AbiV1: REFCOUNT_V1_SIZE_V1_2 must match the current ZapRefcountCapabilityV1 size",
         );
     }
 
@@ -2138,6 +2161,15 @@ const ActiveManagerState = struct {
     /// addition to the v1.0 inline-header `retain` / `release` slots.
     refcount_has_sized_extension: bool,
 
+    /// Set to `true` by `zapMemoryStartup` when the active manager's
+    /// REFCOUNT_V1 descriptor advertises `size >= sizeof(v1.2 vtable)` —
+    /// i.e., the manager provides the relocate-extension slots
+    /// (`detach_region` / `adopt_region`) for the same-model O(1)
+    /// region-move send. The move dispatcher on the object-linked path
+    /// MUST consult this flag before calling `detach_region`; under a
+    /// manager that lacks the extension the move degrades to the copy send.
+    refcount_has_relocate_extension: bool,
+
     /// Idempotency guard for `zapMemoryStartup`. Dispatchers ensure
     /// startup runs exactly once on the first ARC-touching call from a
     /// Zap binary's main path; subsequent calls bypass the init path
@@ -2176,6 +2208,7 @@ var active_manager_state: ActiveManagerState = .{
     .core = if (builtin.is_test) &test_only_arc_core else null,
     .refcount_capability = null,
     .refcount_has_sized_extension = false,
+    .refcount_has_relocate_extension = false,
     .started = false,
     .shutdown_complete = false,
 };
@@ -2286,6 +2319,42 @@ fn v1_0_trap_refcount_sized(
     @panic("zap runtime: REFCOUNT_V1 refcount_sized invoked under v1.0 manager (missing has_sized_extension gate)");
 }
 
+/// Trap stub for the v1.2 `detach_region` slot under a manager that lacks the
+/// relocate extension. Reaching it means the move dispatcher called
+/// `detach_region` despite `refcount_has_relocate_extension == false`. Returns
+/// `false` (copy-fallback) rather than panicking: a missing extension is a
+/// legitimate "cannot O(1)-move" answer, so the send path degrades to copy —
+/// the honest R4 fallback, not a fatal error.
+fn v1_0_trap_detach_region(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) bool {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    return false;
+}
+
+/// Trap stub for the v1.2 `adopt_region` slot under a manager that lacks the
+/// relocate extension. Unreachable in practice — a value is only adopted after
+/// a successful `detach_region`, and this stub's `detach` counterpart always
+/// returns `false` — so reaching it is an unrecoverable dispatcher bug.
+fn v1_0_trap_adopt_region(
+    ctx: *anyopaque,
+    object: *anyopaque,
+    size: usize,
+    alignment: u32,
+) callconv(.c) void {
+    _ = ctx;
+    _ = object;
+    _ = size;
+    _ = alignment;
+    @panic("zap runtime: REFCOUNT_V1 adopt_region invoked under a manager without the relocate extension (dispatcher bug)");
+}
+
 /// Bind the active manager's REFCOUNT_V1 capability. When the
 /// descriptor advertises only the v1.0 surface (`desc.size <
 /// REFCOUNT_V1_SIZE_V1_1`), copy the user-provided `retain` /
@@ -2298,13 +2367,50 @@ fn v1_0_trap_refcount_sized(
 /// (`setActiveRefcountCapabilityForTest`) can reuse the same composition
 /// path without duplicating the trap-stub plumbing.
 fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
-    // For a v1.1+ descriptor the typed cast safely aliases the full
-    // 48-byte image — slots 2-5 are real function pointers populated
-    // by the manager. Bind directly.
-    if (desc.size >= AbiV1.REFCOUNT_V1_SIZE_V1_1) {
+    // For a v1.2+ descriptor the typed cast safely aliases the full
+    // 64-byte image — every slot, including the relocate extension
+    // (`detach_region` / `adopt_region`), is a real function pointer
+    // populated by the manager. Bind directly.
+    if (desc.size >= AbiV1.REFCOUNT_V1_SIZE_V1_2) {
         const cap_ptr: *const AbiV1.ZapRefcountCapabilityV1 = @ptrCast(@alignCast(desc.vtable));
         active_manager_state.refcount_capability = cap_ptr;
         active_manager_state.refcount_has_sized_extension = true;
+        active_manager_state.refcount_has_relocate_extension = true;
+        return;
+    }
+    // v1.1 descriptor: slots 0-5 (through `refcount_sized`) are real, but the
+    // relocate slots 6-7 are absent (the image is only 6*PTR bytes). Copy the
+    // six real slots field-by-field — reading only within the safe image — and
+    // trap-stub the relocate slots so the composed buffer is fully populated
+    // (`detach_region` returns false → the move degrades to copy).
+    if (desc.size >= AbiV1.REFCOUNT_V1_SIZE_V1_1) {
+        const V1_1Head = extern struct {
+            retain: *const fn (ctx: *anyopaque, object: *anyopaque) callconv(.c) void,
+            release: *const fn (ctx: *anyopaque, object: *anyopaque, deep_walk: ?AbiV1.ZapDeepWalkFn) callconv(.c) void,
+            retain_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void,
+            release_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?AbiV1.ZapDeepWalkFn) callconv(.c) void,
+            allocate_refcounted: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
+            refcount_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32,
+        };
+        comptime {
+            if (@sizeOf(V1_1Head) != AbiV1.REFCOUNT_V1_SIZE_V1_1) @compileError(
+                "v1_1 head shape must match REFCOUNT_V1_SIZE_V1_1",
+            );
+        }
+        const head: *const V1_1Head = @ptrCast(@alignCast(desc.vtable));
+        v1_0_composed_refcount_vtable = .{
+            .retain = head.retain,
+            .release = head.release,
+            .retain_sized = head.retain_sized,
+            .release_sized = head.release_sized,
+            .allocate_refcounted = head.allocate_refcounted,
+            .refcount_sized = head.refcount_sized,
+            .detach_region = v1_0_trap_detach_region,
+            .adopt_region = v1_0_trap_adopt_region,
+        };
+        active_manager_state.refcount_capability = &v1_0_composed_refcount_vtable;
+        active_manager_state.refcount_has_sized_extension = true;
+        active_manager_state.refcount_has_relocate_extension = false;
         return;
     }
     // v1.0 path: only `retain` + `release` are guaranteed to be valid
@@ -2328,9 +2434,12 @@ fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
         .release_sized = v1_0_trap_release_sized,
         .allocate_refcounted = v1_0_trap_allocate_refcounted,
         .refcount_sized = v1_0_trap_refcount_sized,
+        .detach_region = v1_0_trap_detach_region,
+        .adopt_region = v1_0_trap_adopt_region,
     };
     active_manager_state.refcount_capability = &v1_0_composed_refcount_vtable;
     active_manager_state.refcount_has_sized_extension = false;
+    active_manager_state.refcount_has_relocate_extension = false;
 }
 
 // ----------------------------------------------------------------
@@ -2957,6 +3066,37 @@ fn testOnlyArcRefcountSized(
     return atomic_ptr.load(.acquire);
 }
 
+/// REFCOUNT_V1 `detach_region` (v1.2) for the test-only manager (the
+/// same-model O(1) region-move send). Mirrors the production manager's
+/// slab-vs-large decision: a slab-backed buffer is not relocatable (`false`,
+/// copy-fallback); a LARGE buffer is relocatable (`true`). The test-only large
+/// path is STANDALONE (no per-context list — `TestOnlyArcSlabPool.largeAlloc`
+/// takes no ctx), so a detached large block is already independently
+/// `munmap`-freeable and adoption is a no-op — this exercises the runtime's
+/// move GLUE faithfully; the production manager's `large_head` list surgery is
+/// tested directly in `src/memory/arc/manager.zig`.
+fn testOnlyArcDetachRegion(ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool {
+    _ = ctx;
+    if (!builtin.is_test) return false;
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    if (TestOnlyArcSlabPool.lookupClass(size, alignment) != null) return false;
+    const header = TestOnlyArcSlabPool.largeHeader(object);
+    if (header.magic != TestOnlyArcSlabPool.LARGE_MAGIC) @panic("zap.test_arc: detach_region: corrupt LargeHeader magic");
+    return true;
+}
+
+/// REFCOUNT_V1 `adopt_region` (v1.2) for the test-only manager. The test-only
+/// large path is standalone, so adoption only asserts the block is a valid
+/// large allocation (no list to link into).
+fn testOnlyArcAdoptRegion(ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void {
+    _ = ctx;
+    if (!builtin.is_test) return;
+    std.debug.assert(alignment > 0 and std.math.isPowerOfTwo(alignment));
+    std.debug.assert(TestOnlyArcSlabPool.lookupClass(size, alignment) == null);
+    const header = TestOnlyArcSlabPool.largeHeader(object);
+    if (header.magic != TestOnlyArcSlabPool.LARGE_MAGIC) @panic("zap.test_arc: adopt_region: corrupt LargeHeader magic");
+}
+
 const test_only_arc_refcount_vtable: AbiV1.ZapRefcountCapabilityV1 = .{
     .retain = testOnlyArcRetain,
     .release = testOnlyArcRelease,
@@ -2964,6 +3104,8 @@ const test_only_arc_refcount_vtable: AbiV1.ZapRefcountCapabilityV1 = .{
     .release_sized = testOnlyArcReleaseSized,
     .allocate_refcounted = testOnlyArcAllocateRefcounted,
     .refcount_sized = testOnlyArcRefcountSized,
+    .detach_region = testOnlyArcDetachRegion,
+    .adopt_region = testOnlyArcAdoptRegion,
 };
 
 const test_only_arc_refcount_descriptor: AbiV1.ZapCapabilityDescV1 = .{
@@ -3025,6 +3167,7 @@ const test_only_arc_v1_0_refcount_descriptor: AbiV1.ZapCapabilityDescV1 = .{
 const TestOnlyArcCapabilitySaveSlot = struct {
     capability: ?*const AbiV1.ZapRefcountCapabilityV1,
     has_sized_extension: bool,
+    has_relocate_extension: bool,
     composed_vtable_snapshot: AbiV1.ZapRefcountCapabilityV1,
 };
 
@@ -3046,6 +3189,7 @@ fn saveActiveRefcountCapabilityForTest() void {
     test_only_arc_capability_save_slot = .{
         .capability = active_manager_state.refcount_capability,
         .has_sized_extension = active_manager_state.refcount_has_sized_extension,
+        .has_relocate_extension = active_manager_state.refcount_has_relocate_extension,
         .composed_vtable_snapshot = v1_0_composed_refcount_vtable,
     };
 }
@@ -3054,6 +3198,7 @@ fn restoreActiveRefcountCapabilityForTest() void {
     v1_0_composed_refcount_vtable = test_only_arc_capability_save_slot.composed_vtable_snapshot;
     active_manager_state.refcount_capability = test_only_arc_capability_save_slot.capability;
     active_manager_state.refcount_has_sized_extension = test_only_arc_capability_save_slot.has_sized_extension;
+    active_manager_state.refcount_has_relocate_extension = test_only_arc_capability_save_slot.has_relocate_extension;
 }
 
 fn installRefcountCapabilityForTest(desc: *const AbiV1.ZapCapabilityDescV1) void {

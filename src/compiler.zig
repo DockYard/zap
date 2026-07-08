@@ -10931,7 +10931,7 @@ fn materializeAnalysisArcOps(
         };
     }
     try runArcVerifier(alloc, program, type_store, options);
-    try runConcurrencyVerifier(alloc, program, options);
+    try runConcurrencyVerifier(alloc, program, analysis_context, options);
 }
 
 /// P2-J7 (plan item 2.6): the send-boundary concurrency verifier. Runs
@@ -10947,11 +10947,12 @@ fn materializeAnalysisArcOps(
 fn runConcurrencyVerifier(
     alloc: std.mem.Allocator,
     program: *const ir.Program,
+    analysis_context: *zap.escape_lattice.AnalysisContext,
     options: CompileOptions,
 ) CompileError!void {
     progressStage(options, "Concurrency: verifying send-boundary invariants", .{});
     for (program.functions) |*function| {
-        zap.concurrency_verifier.verify(alloc, function, program) catch |err| switch (err) {
+        zap.concurrency_verifier.verify(alloc, function, program, analysis_context) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ConcurrencyInvariantViolation => return error.IrFailed,
         };

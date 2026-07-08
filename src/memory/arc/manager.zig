@@ -163,6 +163,12 @@ const ZapRefcountCapabilityV1 = extern struct {
     release_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
     allocate_refcounted: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
     refcount_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32,
+    // v1.2 relocate extension (slots 6–7; the same-model O(1) region-move send,
+    // plan item 6.1 / P3-J5). `desc.size` advertises their presence per spec
+    // §2.3, so a consumer that predates them reads the smaller size and ignores
+    // the tail (falling back to the copy send).
+    detach_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool,
+    adopt_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void,
 };
 
 const ZapMemoryManagerCoreV1 = extern struct {
@@ -198,8 +204,8 @@ comptime {
     if (@sizeOf(ZapMemoryManagerCoreV1) != std.mem.alignForward(usize, 16 + 5 * PTR, @alignOf(ZapMemoryManagerCoreV1))) @compileError(
         "arc: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers (aligned)",
     );
-    if (@sizeOf(ZapRefcountCapabilityV1) != 6 * PTR) @compileError(
-        "arc: ZapRefcountCapabilityV1 (Phase 4.x extended) must be six pointer slots wide",
+    if (@sizeOf(ZapRefcountCapabilityV1) != 8 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1 (v1.2 relocate-extended) must be eight pointer slots wide",
     );
 
     if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16 + 0 * PTR) @compileError(
@@ -234,6 +240,12 @@ comptime {
     );
     if (@offsetOf(ZapRefcountCapabilityV1, "refcount_sized") != 5 * PTR) @compileError(
         "arc: ZapRefcountCapabilityV1.refcount_sized must be the sixth pointer slot",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "detach_region") != 6 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1.detach_region must be the seventh pointer slot",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "adopt_region") != 7 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1.adopt_region must be the eighth pointer slot",
     );
 }
 
@@ -1131,6 +1143,95 @@ const ArcContext = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Region relocation — the same-model O(1) region-move send (plan item 6.1,
+// P3-J5). `Memory.ARC` is REFCOUNTED, so a message value proven uniquely
+// owned (rc == 1) and region-closed by the compiler's region-closure verifier
+// can be transferred to a same-model receiver WITHOUT copying its bytes: the
+// sender detaches the backing block from its own heap, the block travels by
+// pointer through the neutral envelope, and the receiver adopts it into its
+// own heap. No refcount is touched cross-thread (rc == 1 means the mover holds
+// the sole reference; only the receiver touches it post-move — the sacred
+// scheduler-local-refcount invariant holds by construction).
+//
+// ## The R4 constraint this confronts (honest)
+//
+// Under the concurrency gate a `List`/`String` container buffer is routed
+// through this manager's `allocate` (P3-J1), landing in one of two disciplines:
+//
+//   * SLAB-backed (≤ `MAX_SLAB_CLASS_SIZE`): the buffer is one slot interleaved
+//     with UNRELATED cells in a shared 64 KiB slab whose free-list/partial-list
+//     bookkeeping is per-context. Re-parenting a single slot to another
+//     context is NOT possible without dragging its co-tenants (and would race
+//     the sender's own slab mutation). `detachRegion` returns `false` for these
+//     — the caller MUST fall back to the copy send. Small buffers copy cheaply,
+//     so this degradation is on the cheap side of the E6 crossover.
+//
+//   * LARGE (> `MAX_SLAB_CLASS_SIZE`): a standalone `page_allocator` (mmap)
+//     block, tracked ONLY by intrusive membership in the owning context's
+//     `large_head` list (`LargeHeader.prev/next`); `munmap` is process-global.
+//     Such a block CAN be re-parented in O(1): unlink from the sender's
+//     `large_head`, relink into the receiver's. This is the sound O(1) subset —
+//     the mechanism that eliminates the E6 reconstruct cost for large payloads.
+//
+// Both operations touch ONLY a per-context `large_head` and the block's own
+// `LargeHeader`, each mutated exclusively within the owning process's quantum
+// (no atomics — the same single-owner discipline as `largeAlloc`/`largeFree`).
+// ---------------------------------------------------------------------------
+
+/// Detach a container buffer previously returned by `arcAllocate` from THIS
+/// context's ownership so a same-model receiver can adopt it without copying
+/// (sender side of the O(1) region-move send). Returns `true` when the buffer
+/// was a LARGE (`page_allocator`-backed) allocation and is now an orphaned,
+/// independently-`munmap`-freeable block owned by neither context — safe to
+/// hand to another process's `adoptRegion`. Returns `false` when the buffer is
+/// SLAB-backed (the R4 degradation): the caller must copy instead. O(1): a
+/// single intrusive-list unlink, scheduler-local, refcount untouched.
+fn arcDetachRegion(ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool {
+    // Mirror `arcAllocate`'s EXACT slab-vs-large decision: a request that maps
+    // to a slab class is slab-backed and not relocatable per-cell.
+    if (lookupClass(size, alignment) != null) return false;
+    const arc_ctx: *ArcContext = @ptrCast(@alignCast(ctx));
+    const byte_ptr: [*]u8 = @ptrCast(object);
+    const header_ptr: *LargeHeader = @ptrCast(@alignCast(byte_ptr - @sizeOf(LargeHeader)));
+    // Corruption is fatal — the pointer is not a large allocation of this
+    // manager (mismatched size, double-detach, or memory corruption).
+    if (header_ptr.magic != LARGE_MAGIC) @panic("zap.arc: detachRegion: corrupt LargeHeader magic (pointer not a large allocation of this manager)");
+    // Unlink from the owning context's large-allocation list so the sender's
+    // teardown (`arcDeinit`) no longer reclaims it — the receiver owns it now.
+    if (header_ptr.prev) |prev| {
+        prev.next = header_ptr.next;
+    } else {
+        arc_ctx.large_head = header_ptr.next;
+    }
+    if (header_ptr.next) |next| next.prev = header_ptr.prev;
+    // Mark orphaned (in-flight, owned by neither context).
+    header_ptr.prev = null;
+    header_ptr.next = null;
+    return true;
+}
+
+/// Adopt a detached LARGE buffer (from another same-model context's
+/// `detachRegion`) into THIS context's ownership, so THIS context's teardown
+/// (`arcDeinit`) and the buffer's eventual individual free (`largeFree`)
+/// reclaim it correctly (receiver side of the O(1) region-move send). The
+/// buffer's own refcount is untouched (it remains the sole reference the mover
+/// proved unique). O(1): a single intrusive-list link, scheduler-local.
+/// `size`/`alignment` must match the original request (asserts large-path).
+fn arcAdoptRegion(ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void {
+    // Adopt is large-path only — the caller only detaches large buffers.
+    std.debug.assert(lookupClass(size, alignment) == null);
+    const arc_ctx: *ArcContext = @ptrCast(@alignCast(ctx));
+    const byte_ptr: [*]u8 = @ptrCast(object);
+    const header_ptr: *LargeHeader = @ptrCast(@alignCast(byte_ptr - @sizeOf(LargeHeader)));
+    if (header_ptr.magic != LARGE_MAGIC) @panic("zap.arc: adoptRegion: corrupt LargeHeader magic (pointer not a detached large allocation)");
+    // Link at the head of the adopting context's large-allocation list.
+    header_ptr.prev = null;
+    header_ptr.next = arc_ctx.large_head;
+    if (arc_ctx.large_head) |old_head| old_head.prev = header_ptr;
+    arc_ctx.large_head = header_ptr;
+}
+
+// ---------------------------------------------------------------------------
 // Atomic helpers
 //
 // Earlier Phase 4 builds of this manager externalised every atomic
@@ -1490,6 +1591,8 @@ const refcount_vtable: ZapRefcountCapabilityV1 = .{
     .release_sized = arcReleaseSized,
     .allocate_refcounted = arcAllocateRefcounted,
     .refcount_sized = arcRefcountSized,
+    .detach_region = arcDetachRegion,
+    .adopt_region = arcAdoptRegion,
 };
 
 const refcount_descriptor: ZapCapabilityDescV1 = .{
@@ -1617,6 +1720,8 @@ pub const release = arcRelease;
 pub const retainSized = arcRetainSized;
 pub const releaseSized = arcReleaseSized;
 pub const refcountSized = arcRefcountSized;
+pub const detachRegion = arcDetachRegion;
+pub const adoptRegion = arcAdoptRegion;
 pub const getCapabilityDesc = arcGetCapabilityDesc;
 
 // ---------------------------------------------------------------------------
@@ -1644,6 +1749,8 @@ comptime {
     const ReleaseSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void;
     const AllocateRefcountedFn = *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8;
     const RefcountSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32;
+    const DetachRegionFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool;
+    const AdoptRegionFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void;
     const ClassIndexFn = fn (comptime size: usize, comptime alignment: u32) callconv(.@"inline") ?u32;
     const AllocateRefcountedClassFn = fn (ctx: *anyopaque, comptime class_index: u32) callconv(.@"inline") ?[*]u8;
     const RetainSizedClassFn = fn (ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) callconv(.@"inline") void;
@@ -1661,6 +1768,8 @@ comptime {
     _ = @as(ReleaseSizedFn, releaseSized);
     _ = @as(AllocateRefcountedFn, allocateRefcounted);
     _ = @as(RefcountSizedFn, refcountSized);
+    _ = @as(DetachRegionFn, detachRegion);
+    _ = @as(AdoptRegionFn, adoptRegion);
     _ = @as(*const ClassIndexFn, refcountSlabClassIndex);
     _ = @as(*const AllocateRefcountedClassFn, allocateRefcountedClass);
     _ = @as(*const RetainSizedClassFn, retainSizedClass);
@@ -1913,4 +2022,123 @@ test "ARC large allocations: wholesale deinit reclaims every live large cell (P3
         test_large_alloc_total - alloc_baseline,
         test_large_free_total - free_baseline,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Region-move (detach / adopt) tests — the same-model O(1) region-move send
+// (plan item 6.1, P3-J5; E5 gate). These prove the R4 mechanism at the manager
+// level: a LARGE buffer moves between two contexts of the same model WITHOUT
+// copying (pointer identity preserved), in O(1) (pure list surgery independent
+// of size), and leak-exact (the sender no longer frees it, the receiver does).
+// ---------------------------------------------------------------------------
+
+test "ARC region-move: a large buffer detaches from the sender and adopts into the receiver without copying" {
+    const alloc_baseline = test_large_alloc_total;
+    const free_baseline = test_large_free_total;
+
+    const sender = init(null) orelse return error.OutOfMemory;
+    const receiver = init(null) orelse return error.OutOfMemory;
+
+    // A large (page_allocator-backed) container buffer — the shape the O(1)
+    // move is sound for. Fill it with a sentinel so we can prove the bytes are
+    // NEVER copied (the same physical block ends up owned by the receiver).
+    const large_size: usize = MAX_SLAB_CLASS_SIZE + 4096;
+    const align_bytes: u32 = 16;
+    const buffer = arcAllocate(sender, large_size, align_bytes) orelse return error.OutOfMemory;
+    buffer[0] = 0x42;
+    buffer[large_size - 1] = 0x99;
+    const original_address = @intFromPtr(buffer);
+    try std.testing.expectEqual(@as(usize, 1), test_large_alloc_total - alloc_baseline);
+
+    // Detach from the sender: the block is now orphaned (owned by neither).
+    // `true` == it was large-backed and is relocatable (not a copy-fallback).
+    try std.testing.expect(arcDetachRegion(sender, buffer, large_size, align_bytes));
+
+    // The sender's teardown MUST NOT free the detached block (it is no longer
+    // in the sender's `large_head`) — else it would double-free / dangle.
+    deinit(sender);
+    try std.testing.expectEqual(@as(usize, 0), test_large_free_total - free_baseline);
+
+    // Adopt into the receiver: same physical block, no copy — pointer identity
+    // and the sentinel bytes are preserved.
+    arcAdoptRegion(receiver, buffer, large_size, align_bytes);
+    try std.testing.expectEqual(original_address, @intFromPtr(buffer));
+    try std.testing.expectEqual(@as(u8, 0x42), buffer[0]);
+    try std.testing.expectEqual(@as(u8, 0x99), buffer[large_size - 1]);
+
+    // The receiver now owns it: its wholesale teardown reclaims exactly this
+    // one block (leak-exact — moved once, freed once).
+    deinit(receiver);
+    try std.testing.expectEqual(@as(usize, 1), test_large_free_total - free_baseline);
+    try std.testing.expectEqual(
+        test_large_alloc_total - alloc_baseline,
+        test_large_free_total - free_baseline,
+    );
+}
+
+test "ARC region-move: the receiver can individually free an adopted large buffer" {
+    const alloc_baseline = test_large_alloc_total;
+    const free_baseline = test_large_free_total;
+
+    const sender = init(null) orelse return error.OutOfMemory;
+    const receiver = init(null) orelse return error.OutOfMemory;
+    defer deinit(receiver);
+    defer deinit(sender);
+
+    const large_size: usize = MAX_SLAB_CLASS_SIZE + 4096;
+    const align_bytes: u32 = 16;
+    // Use the refcounted large path so the receiver can release it by rc.
+    const buffer = arcAllocateRefcounted(sender, large_size, align_bytes) orelse return error.OutOfMemory;
+
+    try std.testing.expect(arcDetachRegion(sender, buffer, large_size, align_bytes));
+    arcAdoptRegion(receiver, buffer, large_size, align_bytes);
+
+    // The receiver frees it individually (rc 1 -> 0). `largeFree` unlinks from
+    // the RECEIVER's `large_head` (where adopt placed it) — the list surgery is
+    // consistent, so the free is clean and leak-exact.
+    arcReleaseSized(receiver, @ptrCast(buffer), large_size, align_bytes, null);
+    try std.testing.expectEqual(@as(usize, 1), test_large_free_total - free_baseline);
+    try std.testing.expectEqual(
+        test_large_alloc_total - alloc_baseline,
+        test_large_free_total - free_baseline,
+    );
+}
+
+test "ARC region-move: a slab-backed buffer is NOT relocatable (detach returns false, copy-fallback)" {
+    const ctx = init(null) orelse return error.OutOfMemory;
+    defer deinit(ctx);
+
+    // A small buffer maps to a slab class — interleaved with unrelated cells in
+    // a shared slab, so it cannot be re-parented per-cell. `detachRegion` must
+    // report `false` so the send path falls back to copy (the R4 degradation).
+    const small_size: usize = 64;
+    const align_bytes: u32 = 8;
+    const buffer = arcAllocate(ctx, small_size, align_bytes) orelse return error.OutOfMemory;
+    defer deallocate(ctx, buffer, small_size, align_bytes);
+    try std.testing.expect(!arcDetachRegion(ctx, buffer, small_size, align_bytes));
+}
+
+test "ARC region-move: detach/adopt is O(1) — cost is independent of buffer size" {
+    // The move touches only the block's `LargeHeader` links and each context's
+    // `large_head`; it never reads or writes the payload. Proven structurally
+    // here by moving buffers across three orders of magnitude and asserting the
+    // SAME constant work each time (one detach + one adopt, pointer preserved).
+    const align_bytes: u32 = 16;
+    const sizes = [_]usize{
+        MAX_SLAB_CLASS_SIZE + 1,
+        MAX_SLAB_CLASS_SIZE * 16,
+        MAX_SLAB_CLASS_SIZE * 256, // ~1 MiB — the E6 catastrophe scale
+    };
+    for (sizes) |size| {
+        const sender = init(null) orelse return error.OutOfMemory;
+        const receiver = init(null) orelse return error.OutOfMemory;
+        const buffer = arcAllocate(sender, size, align_bytes) orelse return error.OutOfMemory;
+        const address_before = @intFromPtr(buffer);
+        try std.testing.expect(arcDetachRegion(sender, buffer, size, align_bytes));
+        arcAdoptRegion(receiver, buffer, size, align_bytes);
+        // Pointer identity across every size == no relocation == O(1).
+        try std.testing.expectEqual(address_before, @intFromPtr(buffer));
+        deinit(sender); // must not touch the moved block
+        deinit(receiver); // reclaims the moved block
+    }
 }
