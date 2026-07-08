@@ -1592,6 +1592,72 @@ test "abi: send to a dead pid dead-letters and reclaims the payload block" {
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
 }
 
+/// Probe for the cross-model stale-pid dead-letter test (P3-J4 §2.4): a sender
+/// records the `zap_proc_send` status of a message aimed at a STALE pid whose
+/// pid-table slot has been recycled by a DIFFERENT-model process.
+const StaleCrossModelProbe = struct {
+    stale_target_bits: u64 = 0,
+    send_status: i32 = std.math.minInt(i32),
+    finished: bool = false,
+};
+
+fn staleCrossModelSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *StaleCrossModelProbe = @ptrCast(@alignCast(argument.?));
+    // Aim a payload at the stale ARC pid whose slot an Arena process recycled.
+    // `zap_proc_send` → `context.send` → `pid_table.lookup`, which validates
+    // {model, generation} as one atomic unit (generation first), so this must
+    // dead-letter rather than deliver ARC-shaped bytes into the Arena process.
+    probe.send_status = zap_proc_send(process, probe.stale_target_bits, "x", 1);
+    probe.finished = true;
+}
+
+test "abi: send to a stale cross-model pid (slot recycled ARC→Arena) dead-letters (P3-J4 §2.4 invariant)" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    TestManagerCore.resetAccounting();
+
+    // Slot 0 = manifest bulk (Arena model, caps=0x0); slot 1 = refcounted
+    // (ARC model, caps=0x1) — the real ARC+Arena two-manager binary shape.
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_bind_manager(@ptrCast(&TestManagerCore.core)));
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_register_manager(1, @ptrCast(&test_refcounted_core)));
+
+    // Batch 1: spawn an ARC (refcounted) process, capture its pid, and run it
+    // to exit so its pid-table slot is released (generation bumped) — the
+    // precondition for a same-slot recycle under a different model.
+    var alloc_probe = PerProcessAllocProbe{ .byte_length = 8 };
+    const arc_pid_bits = zap_proc_spawn_at(perProcessAllocatingEntry, &alloc_probe, 1);
+    try testing.expect(arc_pid_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(pid_table.ReclamationModel.refcounted, concurrency.Pid.fromBits(arc_pid_bits).model);
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // Batch 2: spawn an Arena (bulk) process that RECYCLES the freed slot, and
+    // a sender aimed at the STALE ARC pid. The Arena process reuses the slot
+    // with a bumped generation and NEW (bulk_or_never) model bits.
+    const arena_pid_bits = zap_proc_spawn_at(perProcessAllocatingEntry, &alloc_probe, 0);
+    try testing.expect(arena_pid_bits != concurrency.Pid.invalid.toBits());
+    const arc_pid = concurrency.Pid.fromBits(arc_pid_bits);
+    const arena_pid = concurrency.Pid.fromBits(arena_pid_bits);
+    // The Arena process recycled the ARC process's slot (same slot, bumped
+    // generation, different model) — the exact stale-model-bit hazard §2.4
+    // closes.
+    try testing.expectEqual(arc_pid.slot, arena_pid.slot);
+    try testing.expect(arc_pid.generation != arena_pid.generation);
+    try testing.expectEqual(pid_table.ReclamationModel.bulk_or_never, arena_pid.model);
+
+    var stale_probe = StaleCrossModelProbe{ .stale_target_bits = arc_pid_bits };
+    const sender_bits = zap_proc_spawn(staleCrossModelSenderEntry, &stale_probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // The stale ARC pid resolved to a GENERATION mismatch — never to the live
+    // Arena process on its recycled slot — so the send dead-lettered. A stale
+    // sender can NEVER mis-emit an ARC-shaped layout into an arena heap: the
+    // §2.4 cross-model pid invariant, proven end-to-end through the send path.
+    try testing.expect(stale_probe.finished);
+    try testing.expectEqual(ZapProcStatus.dead_lettered, stale_probe.send_status);
+    try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
+}
+
 fn oneShotReceiverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
     _ = argument;
     var payload_pointer: ?[*]const u8 = null;

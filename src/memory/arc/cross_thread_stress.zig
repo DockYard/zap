@@ -278,6 +278,93 @@ pub fn runCrossThreadArcStress(rounds_per_producer: usize) !void {
     try std.testing.expect(mmap_total - mmap_baseline > 0);
 }
 
+/// Run the CROSS-MODEL send/receive stress (P3-J4): `producer_count` REFCOUNTED
+/// (ARC) sender threads — each on its OWN private ARC context, exercising the
+/// atomic refcount ops on its OWN cells — hand flat messages to a single
+/// consumer (this thread) that adopts each into a BULK_OR_NEVER receiver heap of
+/// a DIFFERENT reclamation model. This is the cross-model half of the sacred
+/// scheduler-local-refcount invariant: the refcount atomics live ENTIRELY on
+/// the ARC senders' side (never touched by the bulk receiver, which maintains
+/// NO refcount), the cross-thread payload is FLAT (zero live refcount), and the
+/// receiver reconstructs each cell into ITS OWN heap — reclaimed WHOLESALE at
+/// the receiver's `deinit`, never per-cell. No two threads touch the same
+/// refcount or the same heap, ACROSS models. TSan asserting zero races over the
+/// senders' real refcount atomics — while a foreign-model receiver concurrently
+/// adopts — is the cross-model proof; the ARC senders' leak-exact slab
+/// accounting proves their heaps are reclaimed, and the bulk receiver's
+/// wholesale `deinit` reclaims the receiver's.
+///
+/// The receiver heap is a `std.heap.ArenaAllocator` over the page allocator —
+/// the exact reclamation SHAPE of `Memory.Arena` (BULK_OR_NEVER): allocate
+/// grows, nothing is freed per-cell, and `deinit` reclaims the whole heap in one
+/// go. It stands in for the real Arena manager here so the file stays a single
+/// self-contained standalone-`zig test` module (the documented ThreadSanitizer
+/// invocation compiles one file, whose module root forbids a cross-directory
+/// manager import); the invariant under test — a foreign-MODEL receiver that
+/// touches no refcount while ARC senders exercise refcount atomics concurrently
+/// — is identical for the real manager, and the gate-ON `:test_concurrency`
+/// suite exercises the REAL Arena manager end-to-end through the walker.
+pub fn runCrossModelSendReceiveStress(rounds_per_producer: usize) !void {
+    const mmap_baseline = @atomicLoad(usize, &arc.test_slab_mmap_total, .monotonic);
+    const unmap_baseline = @atomicLoad(usize, &arc.test_slab_unmap_total, .monotonic);
+
+    var queue = FlatQueue{ .live_producers = producer_count };
+
+    var threads: [producer_count]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer {
+        var index: usize = 0;
+        while (index < spawned) : (index += 1) threads[index].join();
+    }
+    while (spawned < producer_count) : (spawned += 1) {
+        // The senders are the SAME real ARC producers — the refcount-exercising
+        // side whose atomics TSan watches for cross-thread races.
+        threads[spawned] = try std.Thread.spawn(.{}, producerMain, .{ProducerConfig{
+            .queue = &queue,
+            .rounds = rounds_per_producer,
+            .base_seq = @as(u64, spawned) *% 0x1_0000_0000,
+        }});
+    }
+
+    // Cross-model receiver: this thread owns a private BULK_OR_NEVER heap (an
+    // arena/bump allocator, the `Memory.Arena` reclamation shape) and adopts
+    // each flat message by allocating a FRESH cell in it — NO refcount header
+    // maintained, NO per-cell free.
+    var receiver_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const receiver_allocator = receiver_arena.allocator();
+    var adopted: usize = 0;
+    while (queue.pop()) |message| {
+        const cell = receiver_allocator.create(CellPayload) catch
+            @panic("xmodel: bulk receiver adopt alloc failed");
+        // Adopt: reconstruct the cell from the flat data in the receiver's OWN
+        // heap (the cross-model copy). A torn / raced value fails the integrity
+        // check.
+        cell.* = .{ .seq = message.seq, .checksum = message.checksum, .filler = message.seq *% 3, .tag = adopted };
+        if (cell.checksum != checksumFor(cell.seq)) {
+            receiver_arena.deinit();
+            for (&threads) |*thread| thread.join();
+            return error.CrossModelDataCorruption;
+        }
+        // No per-cell free: the bulk heap reclaims WHOLESALE at deinit
+        // (bulk_or_never — the receiver-model adoption discipline, §2.4).
+        adopted += 1;
+    }
+    receiver_arena.deinit(); // wholesale free of the receiver's bulk heap
+
+    for (&threads) |*thread| thread.join();
+
+    try std.testing.expectEqual(producer_count * rounds_per_producer, adopted);
+
+    // Leak-exact on the ARC SENDER side: every slab any producer mapped was
+    // unmapped by that producer's teardown (read after join — happens-before
+    // makes the plain delta race-free and TSan-clean). The bulk receiver's heap
+    // is reclaimed wholesale by its `deinit` above.
+    const mmap_total = @atomicLoad(usize, &arc.test_slab_mmap_total, .monotonic);
+    const unmap_total = @atomicLoad(usize, &arc.test_slab_unmap_total, .monotonic);
+    try std.testing.expectEqual(mmap_total - mmap_baseline, unmap_total - unmap_baseline);
+    try std.testing.expect(mmap_total - mmap_baseline > 0);
+}
+
 fn roundsFromEnvironment() usize {
     // Fork-convention env read (libc `std.c.getenv`; macOS always links
     // libSystem), mirroring `adversarial_stress.zig`/`teardown_stress.zig`.
@@ -288,4 +375,8 @@ fn roundsFromEnvironment() usize {
 
 test "ArcCrossThreadStress: concurrent per-process ARC managers hold the scheduler-local-refcount invariant" {
     try runCrossThreadArcStress(roundsFromEnvironment());
+}
+
+test "ArcCrossThreadStress: cross-model send/receive (ARC senders → Arena receiver) holds the scheduler-local-refcount invariant" {
+    try runCrossModelSendReceiveStress(roundsFromEnvironment());
 }

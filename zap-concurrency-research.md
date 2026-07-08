@@ -231,6 +231,24 @@ mixed-model processes under the tracking/leak manager; assert clean teardown).
 possible when the receiver's model can maintain the adopted slabs; the verifier and docs must
 say so.
 
+**Implementation status (P3-J4, landed).** The cross-model copy stubs + model-tagged pid
+dispatch are implemented (`docs/memory-manager-abi.md` §10.6). The neutral-blob sender
+serialize (P2-J5, `serializeMessage`) is model-agnostic and reused unchanged; the variance is
+receiver-side: `deserializeMessage` reads the receiving process's model at runtime
+(`ArcRuntime.currentReclamationModel`, decoding its manager core's `declared_caps`) and threads
+it through the walk to pick the adoption discipline per receiver model (REFCOUNTED rc=1 cells;
+BULK_OR_NEVER/TRACED wholesale-reclaimed cells with an error path that elides the per-cell free;
+INDIVIDUAL_NO_REFCOUNT tracked cells). Every cell — and every adopted `String` — is allocated
+into the RECEIVER's own private heap (the per-process routing of §10.5), so the copy is an
+independent graph reclaimed by the receiver's model, and the sender's original is never touched
+(the blob carries zero live refcounts — the scheduler-local-refcount invariant holds by
+construction and is TSan-proven). The conceptual 16-cell (sender × receiver) matrix collapses to
+the four receiver-model disciplines because the blob is neutral; only the models a binary spawns
+are reachable. No ABI minor bump was needed — the receiver's existing `core.allocate` IS the
+adoption primitive for the copy path (detach/adopt entry points are reserved for the future
+same-model O(1) move). The pid `{model, generation}` invariant is enforced by `pid_table.lookup`
+(validated as one atomic word, generation first), so a stale cross-model pid dead-letters.
+
 ### 2.5 The model roster: ORC-over-ARC in, mark-sweep demoted (revision-1 correction)
 
 Revision 1 claimed the existing conservative mark-sweep collector

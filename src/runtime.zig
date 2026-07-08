@@ -4160,28 +4160,93 @@ const MessageBlobReader = struct {
 
     /// Reconstruct a length-prefixed `String` (`[]const u8`) as a fresh,
     /// RECEIVER-OWNED copy: read the `u32` byte count, then copy the bytes
-    /// OUT of the blob into a `runtime_arena` allocation the receiver owns.
-    /// The copy is mandatory for soundness — the blob is freed right after
-    /// the decode, and aliasing the sender's original backing would dangle
-    /// once that (per-process in Phase 3) arena is reclaimed. The empty
-    /// string needs no allocation.
+    /// OUT of the blob into an allocation the receiver owns. The copy is
+    /// mandatory for soundness — the blob is freed right after the decode, and
+    /// aliasing the sender's original backing would dangle once that
+    /// per-process arena is reclaimed. The empty string needs no allocation.
+    ///
+    /// P3-J4 (cross-model adoption): under the concurrency gate the bytes are
+    /// adopted into the RECEIVER's PRIVATE heap (`containerBufferAlloc` routes
+    /// to the running process's own manager core), so an adopted string is
+    /// reclaimed at the RECEIVER's teardown — wholesale with the arena for a
+    /// BULK_OR_NEVER receiver, at `arcDeinit` for a REFCOUNTED receiver. This
+    /// replaces the Phase-2 route into the program-lifetime global
+    /// `runtime_arena`, which a long-lived receiver would grow unbounded as it
+    /// adopts message after message (the string never returned to the arena
+    /// until program exit). A `String` is neutral bytes regardless of the
+    /// sender's or receiver's model — the ONE payload whose adoption is the
+    /// same for every receiver model — so this single routing serves the whole
+    /// stub matrix. String slices carry no ARC header and are a release no-op
+    /// (`releaseElementShape` skips slices), so there is no per-cell free to
+    /// match: the wholesale receiver teardown reclaims them. With the gate OFF
+    /// (host tests, non-concurrent binaries) the bytes stay in `runtime_arena`
+    /// exactly as before — the comptime branch keeps the zero-cost guarantee.
     fn readStringCopy(reader: *MessageBlobReader) error{ OutOfMemory, CorruptMessage }![]const u8 {
         const byte_length = try reader.readScalar(u32);
         if (byte_length == 0) return &.{};
         if (reader.position + byte_length > reader.bytes.len) return error.CorruptMessage;
-        const destination = runtime_arena.allocator().alloc(u8, byte_length) catch return error.OutOfMemory;
+        const destination: []u8 = if (comptime runtime_concurrency_active) blk: {
+            const raw = ArcRuntime.containerBufferAlloc(byte_length, .@"1") orelse
+                return error.OutOfMemory;
+            break :blk raw[0..byte_length];
+        } else runtime_arena.allocator().alloc(u8, byte_length) catch return error.OutOfMemory;
         @memcpy(destination, reader.bytes[reader.position .. reader.position + byte_length]);
         reader.position += byte_length;
         return destination;
     }
 };
 
-/// Reconstruct a `T` from `reader`, ADOPTING it into the receiver's ARC
-/// manager: every `List` level is a freshly-allocated rc=1 cell, so the
-/// result is independent of the sender's graph. On a mid-list failure the
-/// partially-built cell (and the elements already placed in it) are
-/// released before the error propagates — no leak on the error path.
-fn deserializeValue(comptime T: type, reader: *MessageBlobReader) error{ OutOfMemory, CorruptMessage }!T {
+/// Whether a receiver `model` reclaims adopted message cells INDIVIDUALLY —
+/// the axis that varies the cross-model reconstruction's ERROR-path cleanup
+/// (plan §2.4 adoption-semantics-per-model, P3-J4):
+///
+///   * `.refcounted` — the adopted rc=1 cells are the receiver's sole
+///     references; a partial graph left by a mid-reconstruction failure would
+///     leak until the receiver's teardown, so the error path deep-releases it
+///     (routing each free to the receiver's own ARC core).
+///   * `.individual_no_refcount` (Tracking) — adoption IS the allocation event
+///     the tracking manager records; the error path must free the partial
+///     graph through the receiver's core so its alloc/free pairs stay balanced.
+///   * `.bulk_or_never` (Arena/NoOp/Leak) — the partial graph lives in the
+///     receiver's bulk heap and is reclaimed WHOLESALE at the receiver's
+///     teardown (Arena reset/deinit; NoOp/Leak never), so an eager per-cell
+///     release is unnecessary and would only route to a no-op deallocate.
+///   * `.traced` (GC, scaffold — gated on J6/E8) — the collector reclaims the
+///     range; like BULK_OR_NEVER the walker does not eagerly free.
+///
+/// The SUCCESS path is identical for every model: cells are allocated into the
+/// receiver's OWN heap via `containerBufferAlloc` (which dispatches to the
+/// running process's manager core), so the adopted graph already lands where
+/// the receiver's model reclaims it. This predicate governs the error path
+/// ONLY.
+inline fn modelReclaimsCellsIndividually(model: ReclamationModel) bool {
+    return switch (model) {
+        .refcounted, .individual_no_refcount => true,
+        .bulk_or_never, .traced => false,
+    };
+}
+
+/// Reconstruct a `T` from `reader`, ADOPTING it into the RECEIVER's heap under
+/// the receiver's reclamation `model` (plan §2.4, P3-J4 — cross-model message
+/// copy). Every `List`/`Map` level is a freshly-allocated cell routed through
+/// `containerBufferAlloc` to the running (receiving) process's OWN manager
+/// core, so the result is an INDEPENDENT graph in the receiver's private heap
+/// — no cell is shared across the process boundary, and the sender's original
+/// is never touched (the blob carries zero live refcounts: the sacred
+/// scheduler-local-refcount invariant holds by construction).
+///
+/// The cell LAYOUT is fixed at compile time by the binary's MANIFEST caps (the
+/// runtime is compiled once — the ARC-shaped inline header is present under an
+/// ARC manifest regardless of the receiver's model); the receiver `model` is a
+/// RUNTIME value that selects the adoption discipline (see
+/// `modelReclaimsCellsIndividually`). A REFCOUNTED receiver gets rc=1 cells its
+/// ARC drops reclaim per-cell; a BULK_OR_NEVER receiver's cells are reclaimed
+/// wholesale at teardown (the inline header, if the manifest forces one, is
+/// inert — the arena model never retains/releases it). On a mid-reconstruction
+/// failure the partially-built graph is released per the model so the error
+/// path leaks nothing under an individually-reclaiming receiver and does no
+/// wasted work under a bulk/traced receiver.
+fn deserializeValue(comptime T: type, reader: *MessageBlobReader, model: ReclamationModel) error{ OutOfMemory, CorruptMessage }!T {
     if (comptime isWalkerScalar(T)) {
         return try reader.readScalar(T);
     }
@@ -4195,10 +4260,15 @@ fn deserializeValue(comptime T: type, reader: *MessageBlobReader) error{ OutOfMe
         const list = Cell.bufferAlloc(count, count) orelse return error.OutOfMemory;
         var index: u32 = 0;
         while (index < count) : (index += 1) {
-            const element = deserializeValue(Element, reader) catch |err| {
-                // Release only the prefix actually filled so far.
-                list.len = index;
-                list.bufferFreeDeep();
+            const element = deserializeValue(Element, reader, model) catch |err| {
+                // Individually-reclaiming receiver: release only the prefix
+                // actually filled so far. Bulk/traced receiver: the partial
+                // cell lives in the receiver's bulk heap, reclaimed wholesale
+                // at teardown — no eager per-cell free (§2.4).
+                if (modelReclaimsCellsIndividually(model)) {
+                    list.len = index;
+                    list.bufferFreeDeep();
+                }
                 return err;
             };
             list.dataPtr()[index] = element;
@@ -4212,23 +4282,30 @@ fn deserializeValue(comptime T: type, reader: *MessageBlobReader) error{ OutOfMe
         if (count == 0) return null; // the empty-map sentinel (`Map.new()` == null)
         var map: ?*const Cell = null;
         // The partially-built map (and every entry moved into it) is released
-        // if a later entry fails to decode — no leak on the error path.
-        errdefer if (map) |built| Cell.release(built);
+        // if a later entry fails to decode — but ONLY under an individually-
+        // reclaiming receiver; a bulk/traced receiver reclaims it wholesale
+        // at teardown (§2.4).
+        errdefer if (modelReclaimsCellsIndividually(model)) {
+            if (map) |built| Cell.release(built);
+        };
         var index: u32 = 0;
         while (index < count) : (index += 1) {
-            const key = try deserializeValue(Key, reader);
-            const value = deserializeValue(Value, reader) catch |err| {
-                // The key is owned but not yet moved into the map — free it.
-                releaseWalkerValue(Key, key);
+            const key = try deserializeValue(Key, reader, model);
+            const value = deserializeValue(Value, reader, model) catch |err| {
+                // The key is owned but not yet moved into the map — free it
+                // (individually-reclaiming receiver only).
+                if (modelReclaimsCellsIndividually(model)) releaseWalkerValue(Key, key);
                 return err;
             };
-            // `put_owned_unchecked` MOVES the fresh rc=1 key/value in without a
+            // `put_owned_unchecked` MOVES the fresh key/value in without a
             // per-entry retain — the correct adoption primitive for a uniquely
             // owned accumulator (a `put` would clone-on-shared and double-own).
             const grown = Cell.put_owned_unchecked(map, key, value);
             if (grown == null) {
-                releaseWalkerValue(Key, key);
-                releaseWalkerValue(Value, value);
+                if (modelReclaimsCellsIndividually(model)) {
+                    releaseWalkerValue(Key, key);
+                    releaseWalkerValue(Value, value);
+                }
                 return error.OutOfMemory;
             }
             map = grown;
@@ -4240,17 +4317,18 @@ fn deserializeValue(comptime T: type, reader: *MessageBlobReader) error{ OutOfMe
         var reconstructed: StructType = undefined;
         // Track how many fields are materialized so a mid-struct failure
         // releases exactly those owned fields (a nested List/Map/struct) and
-        // leaks nothing.
+        // leaks nothing — under an individually-reclaiming receiver; a
+        // bulk/traced receiver reclaims the partial struct wholesale (§2.4).
         var materialized_field_count: usize = 0;
-        errdefer {
+        errdefer if (modelReclaimsCellsIndividually(model)) {
             inline for (fields, 0..) |field, field_index| {
                 if (field_index < materialized_field_count) {
                     releaseWalkerValue(field.type, @field(reconstructed, field.name));
                 }
             }
-        }
+        };
         inline for (fields, 0..) |field, field_index| {
-            @field(reconstructed, field.name) = try deserializeValue(field.type, reader);
+            @field(reconstructed, field.name) = try deserializeValue(field.type, reader, model);
             materialized_field_count = field_index + 1;
         }
         return reconstructed;
@@ -4277,25 +4355,33 @@ pub fn serializeMessage(comptime T: type, value: T, allocator: std.mem.Allocator
     return buffer;
 }
 
-/// Receiver side: reconstruct a `T` from `blob`, adopting it into this
-/// process's ARC manager (independent, rc=1). See `deserializeValue`. The
-/// whole blob MUST be consumed — trailing bytes mean the sender's message
-/// type is larger/different than `T` (a size/shape mismatch), which is
-/// reported as `CorruptMessage` after releasing the just-built value so the
-/// error path leaks nothing.
+/// Receiver side: reconstruct a `T` from `blob`, adopting it into THIS
+/// process's OWN heap under THIS process's reclamation model (plan §2.4,
+/// P3-J4 — cross-model message copy). The receiver's model is read once here
+/// (`ArcRuntime.currentReclamationModel`) and threaded through the walk to
+/// select the adoption discipline (see `deserializeValue`): a REFCOUNTED
+/// receiver gets rc=1 cells, a BULK_OR_NEVER receiver's cells are reclaimed
+/// wholesale at teardown, an INDIVIDUAL_NO_REFCOUNT receiver's are tracked.
+/// The reconstruction is a single-owner, scheduler-local operation — every
+/// cell is allocated into the receiver's own heap and no sender refcount is
+/// touched. The whole blob MUST be consumed — trailing bytes mean the sender's
+/// message type is larger/different than `T` (a size/shape mismatch), reported
+/// as `CorruptMessage` after releasing the just-built value (under an
+/// individually-reclaiming receiver) so the error path leaks nothing.
 ///
 /// Public for the same reason as `serializeMessage`: it is the walker's
 /// reusable reconstruct entry (`receiveMessage` calls it), and the E6
 /// copy-crossover benchmark (`bench/concurrency-copy/`) times it directly to
 /// attribute the receiver-side (reconstruct) half of the two-copy send — the
-/// half that allocates fresh ARC cells and, for the R4/R5 verdict, is the
+/// half that allocates fresh cells and, for the R4/R5 verdict, is the
 /// dominant copy.
 pub fn deserializeMessage(comptime T: type, blob: []const u8) error{ OutOfMemory, CorruptMessage }!T {
     comptime std.debug.assert(isWalkerSendable(T));
+    const receiver_model = ArcRuntime.currentReclamationModel();
     var reader = MessageBlobReader{ .bytes = blob };
-    const value = try deserializeValue(T, &reader);
+    const value = try deserializeValue(T, &reader, receiver_model);
     if (reader.position != blob.len) {
-        releaseWalkerValue(T, value);
+        if (modelReclaimsCellsIndividually(receiver_model)) releaseWalkerValue(T, value);
         return error.CorruptMessage;
     }
     return value;
@@ -4332,6 +4418,49 @@ test "message walker: List(i64) deep-copies to an independent rc=1 cell" {
     try std.testing.expectEqual(@as(i64, 20), List(i64).get(copy, 1));
 
     List(i64).release(copy);
+}
+
+test "message walker: receiver-model-varied reconstruction stays faithful for every model (P3-J4)" {
+    ensureMemoryStartup();
+
+    // The error-path cleanup discipline (§2.4 adoption-semantics-per-model):
+    // REFCOUNTED + INDIVIDUAL_NO_REFCOUNT reclaim adopted cells individually
+    // (eager error-path release); BULK_OR_NEVER + TRACED reclaim wholesale.
+    try std.testing.expect(modelReclaimsCellsIndividually(.refcounted));
+    try std.testing.expect(modelReclaimsCellsIndividually(.individual_no_refcount));
+    try std.testing.expect(!modelReclaimsCellsIndividually(.bulk_or_never));
+    try std.testing.expect(!modelReclaimsCellsIndividually(.traced));
+
+    var source: ?*const List(i64) = List(i64).new_empty(3);
+    source = List(i64).push(source, 1);
+    source = List(i64).push(source, 2);
+    source = List(i64).push(source, 3);
+    const blob = try serializeMessage(?*const List(i64), source, std.testing.allocator);
+    defer std.testing.allocator.free(blob);
+
+    // The SUCCESS path is model-independent: cells are routed to the receiver's
+    // own heap regardless of model, so every receiver model reconstructs the
+    // SAME independent, faithful graph. The model only varies the error path.
+    // Reconstruct the neutral blob under each of the four models directly (the
+    // gate is comptime-OFF in host tests, so `deserializeMessage` would always
+    // read REFCOUNTED — passing the model explicitly exercises all four).
+    const models = [_]ReclamationModel{ .refcounted, .bulk_or_never, .individual_no_refcount, .traced };
+    for (models) |model| {
+        var reader = MessageBlobReader{ .bytes = blob };
+        const copy = try deserializeValue(?*const List(i64), &reader, model);
+        try std.testing.expectEqual(blob.len, reader.position);
+        try std.testing.expectEqual(@as(u32, 3), copy.?.len);
+        try std.testing.expectEqual(@as(i64, 1), List(i64).get(copy, 0));
+        try std.testing.expectEqual(@as(i64, 2), List(i64).get(copy, 1));
+        try std.testing.expectEqual(@as(i64, 3), List(i64).get(copy, 2));
+        // Independence: a distinct cell from the sender's original.
+        try std.testing.expect(@intFromPtr(source.?) != @intFromPtr(copy.?));
+        // Host test owns the reconstructed graph (no per-process wholesale
+        // teardown here) — free it explicitly regardless of the adoption model.
+        List(i64).release(copy);
+    }
+
+    List(i64).release(source);
 }
 
 test "message walker: List(String) deep-copies element bytes into receiver-owned storage" {
@@ -4495,6 +4624,44 @@ test "message walker: Map(u32, i64) deep-copies to an independent rc=1 cell" {
     try std.testing.expectEqual(@as(i64, 200), IntMap.get(copy, 2, -1));
 
     IntMap.release(copy);
+}
+
+test "message walker: isWalkerSendable vocabulary is locked (N10 send/receive mirror guard)" {
+    // The RUNTIME half of the send/receive sendability mirror.
+    // `isWalkerSendable` (this file) and `TypeChecker.typeIsWalkerSendable`
+    // (`src/types.zig`) MUST agree by construction so the send site (checked by
+    // the type-checker) and the receive walk (this runtime) accept exactly the
+    // same message vocabulary — the N10 mirror-drift guard. This test locks the
+    // runtime half against drift in the walker arms (`walkerListCell` /
+    // `walkerMapCell` / `walkerStructType` and their `measureValue` /
+    // `writeValue` / `deserializeValue` twins), which the P3-J4 cross-model
+    // reconstruction sits directly on top of.
+
+    const IntMap = Map(u32, i64);
+
+    // SENDABLE: scalars, String, List/Map of sendable elements, a by-value
+    // struct of sendable fields, and arbitrary nesting of those.
+    try std.testing.expect(isWalkerSendable(i64));
+    try std.testing.expect(isWalkerSendable(u64));
+    try std.testing.expect(isWalkerSendable(f64));
+    try std.testing.expect(isWalkerSendable(bool));
+    try std.testing.expect(isWalkerSendable(u32)); // Atom id
+    try std.testing.expect(isWalkerSendable([]const u8)); // String
+    try std.testing.expect(isWalkerSendable(?*const List(i64)));
+    try std.testing.expect(isWalkerSendable(?*const List([]const u8)));
+    try std.testing.expect(isWalkerSendable(?*const IntMap));
+    try std.testing.expect(isWalkerSendable(?*const List(?*const List(i64))));
+    const SendableStruct = struct { count: i64, label: []const u8, numbers: ?*const List(i64) };
+    try std.testing.expect(isWalkerSendable(SendableStruct));
+
+    // UNSENDABLE: a non-String slice, a raw pointer, an opaque pointer, and a
+    // struct carrying any unsendable field — the walker has no arm for these,
+    // so the type-checker MUST also reject them at the send site (mirror).
+    try std.testing.expect(!isWalkerSendable([]const i64));
+    try std.testing.expect(!isWalkerSendable(*i64));
+    try std.testing.expect(!isWalkerSendable(*const anyopaque));
+    const UnsendableStruct = struct { count: i64, opaque_handle: *i64 };
+    try std.testing.expect(!isWalkerSendable(UnsendableStruct));
 }
 
 test "message walker: a struct of scalar+String+List+Map deep-copies by value, independently" {
@@ -6062,6 +6229,33 @@ pub const ArcRuntime = struct {
         }
         return active_manager_state.core orelse
             @panic("zap runtime: per-process manager dispatch with no active memory manager");
+    }
+
+    /// The RUNNING process's reclamation model, decoded at RUNTIME from its
+    /// manager core's `declared_caps` (plan item 3.4, P3-J4 — cross-model
+    /// message copy). This is the receiver-side model query the deep-copy
+    /// walker's reconstruction reads to pick its adoption discipline: a
+    /// process receiving a message reconstructs the value graph into ITS OWN
+    /// heap under ITS OWN model, and the model is not a compile-time constant
+    /// in a multi-manager binary (the runtime is compiled once under the
+    /// MANIFEST caps — `reclamation_model` — but a process may run any of the
+    /// four models). Reading `currentProcessBinding().core.declared_caps` and
+    /// decoding it (the same `decodeReclamationModel` the manifest uses) yields
+    /// the running process's true model.
+    ///
+    /// Out of any process quantum (bootstrap / atexit / driver thread between
+    /// quanta) or with the concurrency gate OFF, no per-process binding is
+    /// published, so this folds to the comptime manifest `reclamation_model` —
+    /// which is exactly the model the bootstrap context runs under, and (gate
+    /// OFF) the only model the binary has. The comptime branch drops the
+    /// extern-global reference entirely with the gate off (zero cost).
+    inline fn currentReclamationModel() ReclamationModel {
+        if (comptime runtime_concurrency_active) {
+            if (currentProcessBinding()) |binding| {
+                return decodeReclamationModel(binding.core.declared_caps);
+            }
+        }
+        return reclamation_model;
     }
 
     /// Raw (header-less) allocation of `byte_length` bytes at `alignment`

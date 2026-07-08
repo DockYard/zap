@@ -1370,6 +1370,71 @@ single-manager pipeline into an indexed **manager registry**:
   symbol); compiler-driven `.Exe`/`.Lib` sibling modules bind via their module
   DECL (`@import("...").zap_memory_section`), so none emits the colliding symbol.
 
+### 10.6 Cross-model message copy (concurrency P3-J4)
+
+Per-spawn managers (§10.5) mean a sender process and a receiver process may run
+DIFFERENT reclamation models in the same binary (an ARC process sending to an
+Arena process, and the reverse). A cross-process send is a DEEP COPY through the
+neutral-blob walker (`src/runtime.zig` `serializeMessage`/`deserializeMessage`),
+never a shared pointer; P3-J4 makes that copy correct across models.
+
+- **The sender side is model-agnostic.** `serializeMessage`/`measureValue`/
+  `writeValue` READ the source graph only and touch no refcount — the blob is a
+  self-contained byte image carrying ZERO live refcounts. This is what keeps the
+  scheduler-local-refcount invariant intact across a cross-model send: the
+  sender only reads and serializes; the receiver only writes its own heap; no
+  refcount cell is ever touched by two schedulers. Because the blob is neutral,
+  the sender's model is IRRELEVANT to the copy — the conceptual
+  (sender-model × receiver-model) 16-cell stub matrix collapses to the FOUR
+  receiver-model reconstruction disciplines, and only the models a binary
+  actually spawns are reachable at runtime (the spawn-manager pass already
+  enumerates them, §10.5). Cross-model traffic is ALWAYS a copy; the O(1)
+  same-model region move is a separate, same-model-only path.
+
+- **The receiver side varies by the RECEIVER's model, read at RUNTIME.** The
+  runtime is compiled once under the MANIFEST caps, so the walker's cell LAYOUT
+  is fixed at compile time (the ARC inline header is present under an ARC
+  manifest regardless of a given process's model). `deserializeMessage` reads
+  the running (receiving) process's model at runtime from its manager core's
+  `declared_caps` (`ArcRuntime.currentReclamationModel`, decoding the same axes
+  as §7.1/`elision.reclamationModel`) and threads it through the walk to select
+  the adoption discipline, matching §2.4 adoption-semantics-per-model:
+
+  | Receiver model | Cell heap | Adoption / error-path discipline |
+  |---|---|---|
+  | REFCOUNTED (ARC/ORC) | receiver's ARC heap via `core.allocate` | rc=1 cells the receiver's ARC drops reclaim per-cell; error path deep-releases the partial graph |
+  | BULK_OR_NEVER (Arena/NoOp/Leak) | receiver's bulk heap via `core.allocate` | cells reclaimed WHOLESALE at teardown (Arena reset/deinit; NoOp/Leak never) — no per-cell free; error path elides the release (wholesale reclaim) |
+  | INDIVIDUAL_NO_REFCOUNT (Tracking) | receiver's tracked heap via `core.allocate` | adoption IS the allocation event the manager records; error path frees the partial graph through `core.deallocate` so alloc/free pairs stay balanced |
+  | TRACED (GC) | receiver's collected heap | scaffold — gated on the collector work (J6/E8); reconstructs like BULK_OR_NEVER; per-range collector registration is the follow-on |
+
+  The SUCCESS path is identical for every model: each `List`/`Map` cell is
+  allocated into the receiver's OWN heap via `containerBufferAlloc` (which
+  dispatches to the running process's core, §10.5), and adopted `String` bytes
+  are copied into that same private heap — so the reconstructed graph already
+  lands where the receiver's model reclaims it. An adopted string is therefore
+  reclaimed at the RECEIVER's teardown (not the program-lifetime global arena),
+  bounding a long-lived receiver's footprint to its own lifetime. The receiver
+  model governs the ERROR-path cleanup discipline (the table's last column).
+
+- **No ABI minor bump.** The cross-model COPY path reuses the receiver's
+  existing v1.0 `core.allocate` as the adoption primitive — allocating a fresh
+  cell into the receiver's heap IS the adoption. No new manager-ABI entry point
+  is required, so `abi_minor` stays as-is. (The detach/adopt entry points
+  contemplated for the future O(1) same-model region MOVE — reparenting a
+  detachable fragment between two heaps of the same model without copying —
+  would be the additive minor bump when that path lands; the copy path needs
+  none.)
+
+- **Pid {model, generation} validation gates the send.** A sender resolves the
+  target pid through `pid_table.lookup` (§ the generational pid table), which
+  validates occupancy, generation, AND model bits as ONE atomic metadata word,
+  generation first. A stale pid — a slot recycled by a different-model process,
+  which bumps the generation — hits `generation_mismatch` and DEAD-LETTERS; it
+  can never resolve to the live process on the recycled slot, so a stale sender
+  can never emit an ARC-shaped layout into an arena heap (the §2.4 cross-model
+  pid invariant). The model bits and generation are read together, never
+  separately.
+
 ---
 
 ## 11. Extension model
