@@ -210,6 +210,9 @@ test {
     _ = crash_report;
     _ = @import("teardown_stress.zig");
     _ = @import("adversarial_stress.zig");
+    // P4-J1: the scheduler-local-refcount invariant under REAL M:N scheduling
+    // (gate E3's full half by measurement — run under `-fsanitize-thread`).
+    _ = @import("mn_refcount_stress.zig");
     _ = @import("abi.zig");
     // E8: conservative fiber-stack scan cost + false-retention (plan §7 /
     // risk #1) — decides whether conservative mark-sweep ships as a TRACED

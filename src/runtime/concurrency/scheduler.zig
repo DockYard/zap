@@ -1603,6 +1603,15 @@ pub const Scheduler = struct {
         current_scheduler = null;
     }
 
+    /// The scheduler driving the calling thread, or null on a non-scheduler
+    /// thread (P4-J1). The gate-ON ABI uses it to route an in-process spawn to
+    /// the RUNNING core (locality; stealing rebalances) and to resolve the
+    /// current process on the calling core for `zap_proc_current`. Null on the
+    /// driver thread before/after the run loop.
+    pub fn currentThreadScheduler() ?*Scheduler {
+        return current_scheduler;
+    }
+
     /// Service this core's cross-thread events once: convert freshly-woken
     /// processes to runnable (drain the wake stack) and fire any elapsed
     /// `receive … after` deadlines. Run at the top of every worker iteration.

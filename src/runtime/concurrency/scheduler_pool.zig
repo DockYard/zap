@@ -209,6 +209,44 @@ pub const SchedulerPool = struct {
         return pool.live_count.load(.acquire);
     }
 
+    /// Pool-wide statistics: the authoritative live count plus the per-core
+    /// counters summed across every core (spawn/exit/kill totals are recorded on
+    /// whichever core performed the operation, so the pool total is their sum).
+    pub const Statistics = struct {
+        live_process_count: i64,
+        spawn_total: u64,
+        normal_exit_total: u64,
+        kill_total: u64,
+        quantum_total: u64,
+        unexpected_message_total: u64,
+        park_count: u64,
+        wake_signal_count: u64,
+    };
+
+    pub fn statistics(pool: *const SchedulerPool) Statistics {
+        var totals = Statistics{
+            .live_process_count = pool.liveProcessCount(),
+            .spawn_total = 0,
+            .normal_exit_total = 0,
+            .kill_total = 0,
+            .quantum_total = 0,
+            .unexpected_message_total = 0,
+            .park_count = 0,
+            .wake_signal_count = 0,
+        };
+        for (pool.cores) |*core| {
+            const core_stats = core.statistics();
+            totals.spawn_total += core_stats.spawn_total;
+            totals.normal_exit_total += core_stats.normal_exit_total;
+            totals.kill_total += core_stats.kill_total;
+            totals.quantum_total += core_stats.quantum_total;
+            totals.unexpected_message_total += core_stats.unexpected_message_total;
+            totals.park_count += core_stats.park_count;
+            totals.wake_signal_count += core_stats.wake_signal_count;
+        }
+        return totals;
+    }
+
     // -------------------------------------------------------------------------
     // Running
     // -------------------------------------------------------------------------
@@ -254,9 +292,10 @@ pub const SchedulerPool = struct {
         pool.stopping.store(true, .release);
         pool.wakeAll();
         for (pool.worker_threads[0..started]) |thread| thread.join();
-
-        // Single-threaded now: reap every straggler and leave the pool quiescent.
-        pool.reapStragglers();
+        // The workers have joined; the pool is single-threaded and STOPPED. In
+        // quiescent mode nothing is live (the loop ran until the count hit
+        // zero); in root mode the root's children remain as stragglers for
+        // `shutdownAllProcesses` (Erlang halt — the ABI reaps them at deinit).
     }
 
     fn workerEntry(pool: *SchedulerPool, core_index: usize) void {
@@ -277,6 +316,22 @@ pub const SchedulerPool = struct {
         var steal_rng: u64 = (@as(u64, core_index) *% 0x9E3779B97F4A7C15) | 1;
 
         while (!pool.stopping.load(.acquire)) {
+            // Root-mode termination is normally driven by `onProcessExit` when
+            // the root's teardown completes, but the driver (core 0) ALSO polls
+            // the pid table each iteration so the stop is observed even when the
+            // root is ALREADY dead on entry (a second `runUntilRootExits` on a
+            // finished root) or if the exit signal were ever missed — mirroring
+            // the single-scheduler `runUntilProcessExits` loop-top `isAlive`
+            // check. Cheap: one lock-free pid-table probe per iteration, driver
+            // only.
+            if (core_index == 0 and pool.root_target_bits != 0 and
+                !pool.pid_table.isAlive(Pid.fromBits(pool.root_target_bits)))
+            {
+                pool.stopping.store(true, .release);
+                pool.wakeAll();
+                break;
+            }
+
             // Convert freshly-woken processes to runnable and fire elapsed
             // `receive … after` deadlines for this core.
             core.serviceLocalEvents();
@@ -349,12 +404,15 @@ pub const SchedulerPool = struct {
     // Shutdown
     // -------------------------------------------------------------------------
 
-    /// Reap every straggler after the workers have joined (single-threaded).
-    /// Drains each core's wake stack first so no stale wake entry references a
-    /// record about to be recycled, then tears down every runnable process (per
-    /// core and in the global queue) and every waiting process (via the pid
-    /// table), leaving the pool quiescent.
-    fn reapStragglers(pool: *SchedulerPool) void {
+    /// Reap every straggler, leaving the pool quiescent (`deinit`-able). MUST be
+    /// called only after `run` has returned (workers joined — single-threaded).
+    /// The runtime-shutdown path after a root-mode run, in which the root's
+    /// still-live children are killed (Erlang halt model). A no-op after a
+    /// quiescent-mode run (nothing is live). Drains each core's wake stack first
+    /// so no stale wake entry references a record about to be recycled, then
+    /// tears down every runnable process (per core and in the global queue) and
+    /// every waiting process (via the pid table).
+    pub fn shutdownAllProcesses(pool: *SchedulerPool) void {
         for (pool.cores) |*core| core.drainPendingWakes();
 
         // Reap until the pool-wide live count reaches zero. Each pass tears down

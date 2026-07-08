@@ -195,6 +195,18 @@ const LedgerBlock = struct {
 const Ledger = struct {
     head: ?*LedgerBlock = null,
     live_block_count: usize = 0,
+    /// Guards the intrusive list and the count (P4-J1): under M:N a `send` on
+    /// any core allocates a payload block here, and a receiver's teardown on any
+    /// core frees one, so both ends run cross-thread. A `std.atomic.Mutex`
+    /// spinlock by kernel convention; the critical section is O(1) list surgery.
+    /// The backing-allocator call itself is done OUTSIDE the lock (it is
+    /// page-allocator and thread-safe on its own) so the syscall does not
+    /// serialize senders.
+    lock: std.atomic.Mutex = .unlocked,
+
+    fn acquire(ledger: *Ledger) void {
+        while (!ledger.lock.tryLock()) std.atomic.spinLoopHint();
+    }
 
     fn allocate(ledger: *Ledger, body_byte_length: usize) error{OutOfMemory}!*LedgerBlock {
         const raw = backing_allocator.alignedAlloc(
@@ -203,6 +215,8 @@ const Ledger = struct {
             @sizeOf(LedgerBlock) + body_byte_length,
         ) catch return error.OutOfMemory;
         const block: *LedgerBlock = @ptrCast(@alignCast(raw.ptr));
+        ledger.acquire();
+        defer ledger.lock.unlock();
         block.* = .{
             .previous = null,
             .next = ledger.head,
@@ -215,14 +229,18 @@ const Ledger = struct {
     }
 
     fn free(ledger: *Ledger, block: *LedgerBlock) void {
-        if (block.previous) |previous| {
-            previous.next = block.next;
-        } else {
-            ledger.head = block.next;
+        {
+            ledger.acquire();
+            defer ledger.lock.unlock();
+            if (block.previous) |previous| {
+                previous.next = block.next;
+            } else {
+                ledger.head = block.next;
+            }
+            if (block.next) |next| next.previous = block.previous;
+            std.debug.assert(ledger.live_block_count > 0);
+            ledger.live_block_count -= 1;
         }
-        if (block.next) |next| next.previous = block.previous;
-        std.debug.assert(ledger.live_block_count > 0);
-        ledger.live_block_count -= 1;
         freeBlockMemory(block);
     }
 
@@ -510,7 +528,11 @@ fn spawnTrampoline(context: *concurrency.ProcessContext, argument: ?*anyopaque) 
 const RuntimeState = struct {
     pid_table: concurrency.PidTable,
     envelope_pool: concurrency.EnvelopePool,
-    scheduler: concurrency.Scheduler,
+    /// The M:N work-stealing scheduler pool (P4-J1): N cores (default = CPU
+    /// count) over the shared pid table and envelope pool. Replaces the Phase-2
+    /// single scheduler; the ABI is otherwise unchanged (an in-process spawn
+    /// routes to the running core, an external spawn to core 0).
+    pool: concurrency.SchedulerPool,
     ledger: Ledger,
     /// The per-spawn manager registry (plan item 3.1/3.3, P3-J3): core
     /// vtables indexed by manager id. Slot 0 is the manifest default (bound by
@@ -564,12 +586,17 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
     runtime_state.pid_table = concurrency.PidTable.init(backing_allocator, .{}) catch
         return ZapProcStatus.out_of_memory;
     runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
-    runtime_state.scheduler = concurrency.Scheduler.init(
+    concurrency.SchedulerPool.init(
+        &runtime_state.pool,
         backing_allocator,
         &runtime_state.pid_table,
         &runtime_state.envelope_pool,
         .{},
-    );
+    ) catch {
+        runtime_state.envelope_pool.deinit();
+        runtime_state.pid_table.deinit();
+        return ZapProcStatus.out_of_memory;
+    };
     runtime_initialized = true;
     return ZapProcStatus.ok;
 }
@@ -625,8 +652,11 @@ export fn zap_proc_register_manager(manager_index: u32, core_vtable: *const anyo
 /// no-op). After deinit the runtime may be initialized again.
 export fn zap_proc_runtime_deinit() callconv(.c) void {
     if (!runtime_initialized) return;
-    runtime_state.scheduler.shutdownAllProcesses();
-    runtime_state.scheduler.deinit();
+    // Reap stragglers (a root-mode run leaves the root's children live per the
+    // Erlang halt model; also covers an init→spawn→deinit without a run). Safe
+    // and single-threaded: the pool's workers have already joined inside `run`.
+    runtime_state.pool.shutdownAllProcesses();
+    runtime_state.pool.deinit();
     runtime_state.envelope_pool.deinit();
     runtime_state.pid_table.deinit();
     runtime_state.ledger.sweep();
@@ -641,11 +671,7 @@ export fn zap_proc_runtime_deinit() callconv(.c) void {
 /// Returns `ZapProcStatus.ok` or `not_initialized`.
 export fn zap_proc_run_until_quiescent() callconv(.c) i32 {
     if (!runtime_initialized) return ZapProcStatus.not_initialized;
-    runtime_state.scheduler.runUntilQuiescent() catch |err| switch (err) {
-        // Unreachable under the production idle strategy (the Phase 2
-        // runtime always parks); surfaced defensively for completeness.
-        error.AllProcessesWaiting => return ZapProcStatus.not_initialized,
-    };
+    runtime_state.pool.runUntilQuiescent();
     return ZapProcStatus.ok;
 }
 
@@ -662,11 +688,7 @@ export fn zap_proc_run_until_quiescent() callconv(.c) i32 {
 export fn zap_proc_run_until_exit(target_pid_bits: u64) callconv(.c) i32 {
     if (!runtime_initialized) return ZapProcStatus.not_initialized;
     const target = concurrency.Pid.fromBits(target_pid_bits);
-    runtime_state.scheduler.runUntilProcessExits(target) catch |err| switch (err) {
-        // Unreachable under the production idle strategy (the Phase 2
-        // runtime always parks); surfaced defensively for completeness.
-        error.AllProcessesWaiting => return ZapProcStatus.not_initialized,
-    };
+    runtime_state.pool.runUntilRootExits(target);
     return ZapProcStatus.ok;
 }
 
@@ -686,7 +708,11 @@ export fn zap_proc_run_until_exit(target_pid_bits: u64) callconv(.c) i32 {
 /// Kernel-internal code never calls this.
 export fn zap_proc_current() callconv(.c) ?*anyopaque {
     if (!runtime_initialized) return null;
-    return @ptrCast(runtime_state.scheduler.currentProcessContext());
+    // The current process is the one this CORE is running (M:N): resolve through
+    // the calling thread's scheduler. Null on the driver thread outside the run
+    // loop, or on any thread with no quantum in flight.
+    const core = concurrency.Scheduler.currentThreadScheduler() orelse return null;
+    return @ptrCast(core.currentProcessContext());
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +771,13 @@ export fn zap_proc_spawn_at(entry: ZapProcEntry, argument: ?*anyopaque, manager_
     const closure: *SpawnClosure = @ptrCast(@alignCast(closure_block.bodyPointer()));
     closure.* = .{ .c_entry = entry, .c_argument = argument };
 
-    const pid = runtime_state.scheduler.spawn(.{
+    // Route the spawn to the RUNNING core for an in-process spawn (locality;
+    // stealing rebalances) and to core 0 for an external spawn from the driver
+    // (its stack pool + record cache are the driver thread's own — see
+    // `SchedulerPool.primaryCore`). Either core's `spawn` touches only that
+    // core's per-scheduler resources on its own thread.
+    const spawn_core = concurrency.Scheduler.currentThreadScheduler() orelse runtime_state.pool.primaryCore();
+    const pid = spawn_core.spawn(.{
         .entry = spawnTrampoline,
         .argument = closure_block,
         // The process runs on its OWN private context; the per-process vtable's
@@ -954,7 +986,8 @@ export fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void {
 export fn zap_proc_safepoint_slow() callconv(.c) void {
     process_module.refreshReductionCounter();
     if (!runtime_initialized) return;
-    const context = runtime_state.scheduler.currentProcessContext() orelse return;
+    const core = concurrency.Scheduler.currentThreadScheduler() orelse return;
+    const context = core.currentProcessContext() orelse return;
     context.reductionSafepoint();
 }
 
@@ -1029,19 +1062,25 @@ const TestManagerCore = struct {
         live_bytes: usize,
     };
 
-    // Factory-wide accounting across every context this double mints.
-    var init_total: usize = 0;
-    var deinit_total: usize = 0;
-    var live_context_count: usize = 0;
-    var live_bytes_total: usize = 0;
+    // Factory-wide accounting across every context this double mints. ATOMIC
+    // (P4-J1): under the M:N pool a wave's processes are minted and torn down on
+    // DIFFERENT cores concurrently, so these shared counters are cross-thread —
+    // a per-process context's OWN `live_bytes` stays non-atomic (touched only by
+    // the one core running that process). The counters are test instrumentation;
+    // the production per-process contexts are private and unaffected.
+    var init_total: std.atomic.Value(usize) = .init(0);
+    var deinit_total: std.atomic.Value(usize) = .init(0);
+    var live_context_count: std.atomic.Value(usize) = .init(0);
+    var live_bytes_total: std.atomic.Value(usize) = .init(0);
 
     /// Zero the factory accounting at the start of a per-instance test so its
-    /// assertions start from a known baseline.
+    /// assertions start from a known baseline (called before any spawn — no
+    /// concurrent core, so a plain store is fine).
     fn resetAccounting() void {
-        init_total = 0;
-        deinit_total = 0;
-        live_context_count = 0;
-        live_bytes_total = 0;
+        init_total.store(0, .monotonic);
+        deinit_total.store(0, .monotonic);
+        live_context_count.store(0, .monotonic);
+        live_bytes_total.store(0, .monotonic);
     }
 
     const core = ZapMemoryManagerCoreV1{
@@ -1062,8 +1101,8 @@ const TestManagerCore = struct {
         _ = options;
         const context = backing_allocator.create(Context) catch return null;
         context.* = .{ .arena = std.heap.ArenaAllocator.init(backing_allocator), .live_bytes = 0 };
-        init_total += 1;
-        live_context_count += 1;
+        _ = init_total.fetchAdd(1, .monotonic);
+        _ = live_context_count.fetchAdd(1, .monotonic);
         return @ptrCast(context);
     }
 
@@ -1071,13 +1110,13 @@ const TestManagerCore = struct {
         const context: *Context = @ptrCast(@alignCast(context_pointer));
         // Wholesale free: the arena releases every still-live allocation in
         // one call — the leak-exact per-process teardown this double proves.
-        std.debug.assert(live_bytes_total >= context.live_bytes);
-        live_bytes_total -= context.live_bytes;
+        std.debug.assert(live_bytes_total.load(.monotonic) >= context.live_bytes);
+        _ = live_bytes_total.fetchSub(context.live_bytes, .monotonic);
         context.arena.deinit();
         backing_allocator.destroy(context);
-        deinit_total += 1;
-        std.debug.assert(live_context_count > 0);
-        live_context_count -= 1;
+        _ = deinit_total.fetchAdd(1, .monotonic);
+        std.debug.assert(live_context_count.load(.monotonic) > 0);
+        _ = live_context_count.fetchSub(1, .monotonic);
     }
 
     fn allocateThunk(context_pointer: *anyopaque, byte_length: usize, alignment: u32) callconv(.c) ?[*]u8 {
@@ -1088,7 +1127,7 @@ const TestManagerCore = struct {
             @returnAddress(),
         ) orelse return null;
         context.live_bytes += byte_length;
-        live_bytes_total += byte_length;
+        _ = live_bytes_total.fetchAdd(byte_length, .monotonic);
         return memory;
     }
 
@@ -1097,8 +1136,8 @@ const TestManagerCore = struct {
         context.arena.allocator().rawFree(memory[0..byte_length], std.mem.Alignment.fromByteUnits(alignment), @returnAddress());
         std.debug.assert(context.live_bytes >= byte_length);
         context.live_bytes -= byte_length;
-        std.debug.assert(live_bytes_total >= byte_length);
-        live_bytes_total -= byte_length;
+        std.debug.assert(live_bytes_total.load(.monotonic) >= byte_length);
+        _ = live_bytes_total.fetchSub(byte_length, .monotonic);
     }
 };
 
@@ -1125,15 +1164,15 @@ test "abi: per-process binding mints a fresh private context and wholesale-frees
     const second = createProcessBinding(&TestManagerCore.core) orelse return error.TestUnexpectedResult;
     try testing.expect(first.manager_state.? != second.manager_state.?);
     try testing.expect(processBinding(first.manager_state).context != processBinding(second.manager_state).context);
-    try testing.expectEqual(@as(usize, 2), TestManagerCore.init_total);
-    try testing.expectEqual(@as(usize, 2), TestManagerCore.live_context_count);
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.init_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.live_context_count.load(.monotonic));
 
     // Allocate into the first context and DELIBERATELY do not free it — the
     // killed-process shape whose live cells must be reclaimed wholesale.
     const block = first.allocate(48, .of(u64)) orelse return error.TestUnexpectedResult;
     block[0] = 0x5A;
     block[47] = 0xA5;
-    try testing.expectEqual(@as(usize, 48), TestManagerCore.live_bytes_total);
+    try testing.expectEqual(@as(usize, 48), TestManagerCore.live_bytes_total.load(.monotonic));
 
     // heapByteCount is advisory 0 (no per-context query on the v1.0 core).
     try testing.expectEqual(@as(usize, 0), first.heapByteCount());
@@ -1141,14 +1180,14 @@ test "abi: per-process binding mints a fresh private context and wholesale-frees
     // teardown is a REAL wholesale free (Phase 3): it reclaims the still-live
     // block and destroys the private context — no per-cell free needed.
     first.teardown();
-    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
-    try testing.expectEqual(@as(usize, 1), TestManagerCore.deinit_total);
-    try testing.expectEqual(@as(usize, 1), TestManagerCore.live_context_count);
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), TestManagerCore.deinit_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 1), TestManagerCore.live_context_count.load(.monotonic));
 
     // The second context is independent — untouched by the first's teardown.
     second.teardown();
-    try testing.expectEqual(@as(usize, 2), TestManagerCore.deinit_total);
-    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.deinit_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count.load(.monotonic));
 }
 
 test "abi: zap_proc_bind_manager validates the core ABI and gates spawn (no fallback arena)" {
@@ -1283,11 +1322,11 @@ test "abi: zap_proc_spawn_at selects the registry manager and stamps the pid mod
     // Drive both processes to completion; each allocated into its OWN private
     // context and was wholesale-freed leak-exact at teardown.
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
-    try testing.expectEqual(@as(usize, 2), probe.processes_run);
-    try testing.expectEqual(@as(usize, 2), TestManagerCore.init_total);
-    try testing.expectEqual(@as(usize, 2), TestManagerCore.deinit_total);
-    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
-    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
+    try testing.expectEqual(@as(usize, 2), probe.processes_run.load(.monotonic));
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.init_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 2), TestManagerCore.deinit_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total.load(.monotonic));
 }
 
 // -- per-process private instances (plan item 3.1, P3-J1) -----------------------
@@ -1298,7 +1337,10 @@ test "abi: zap_proc_spawn_at selects the registry manager and stamps the pid mod
 /// reclaim. `processes_run` counts bodies that reached the allocation.
 const PerProcessAllocProbe = struct {
     byte_length: usize,
-    processes_run: usize = 0,
+    /// Bodies that reached the allocation. ATOMIC (P4-J1): the soak's wave of
+    /// processes runs on different cores concurrently, so this shared counter is
+    /// cross-thread.
+    processes_run: std.atomic.Value(usize) = .init(0),
 };
 
 /// Allocate into this process's own private heap (through the PCB manager
@@ -1309,7 +1351,7 @@ fn perProcessAllocatingEntry(process: *anyopaque, argument: ?*anyopaque) callcon
     const context = contextFromHandle(process);
     const block = context.record.pcb.manager.allocate(probe.byte_length, .of(u64)) orelse return;
     block[0] = 0x11;
-    probe.processes_run += 1;
+    _ = probe.processes_run.fetchAdd(1, .monotonic);
 }
 
 /// Allocate into this process's own private heap, then park forever — the
@@ -1319,7 +1361,7 @@ fn allocateThenParkEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c
     const context = contextFromHandle(process);
     const block = context.record.pcb.manager.allocate(probe.byte_length, .of(u64)) orelse return;
     block[0] = 0x22;
-    probe.processes_run += 1;
+    _ = probe.processes_run.fetchAdd(1, .monotonic);
     var payload_pointer: ?[*]const u8 = null;
     var payload_len: usize = 0;
     _ = zap_proc_receive_park(process, &payload_pointer, &payload_len);
@@ -1350,13 +1392,13 @@ test "abi: each spawned process gets its own private context, wholesale-freed le
 
     // Every process ran and allocated into its OWN private context — one
     // context minted per spawn (NOT a shared instance).
-    try testing.expectEqual(process_count, probe.processes_run);
-    try testing.expectEqual(process_count, TestManagerCore.init_total);
+    try testing.expectEqual(process_count, probe.processes_run.load(.monotonic));
+    try testing.expectEqual(process_count, TestManagerCore.init_total.load(.monotonic));
     // Every process's context was wholesale-freed at its teardown, reclaiming
     // the never-freed 64-byte block — leak-exact, zero residue.
-    try testing.expectEqual(process_count, TestManagerCore.deinit_total);
-    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
-    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
+    try testing.expectEqual(process_count, TestManagerCore.deinit_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total.load(.monotonic));
 }
 
 test "abi: a killed process's live allocations are wholesale-freed at teardown (crash-teardown leak-exactness)" {
@@ -1375,16 +1417,16 @@ test "abi: a killed process's live allocations are wholesale-freed at teardown (
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(driver_bits));
 
     // The straggler is parked with a live 128-byte allocation in its context.
-    try testing.expectEqual(@as(usize, 1), probe.processes_run);
-    try testing.expect(TestManagerCore.live_bytes_total >= 128);
-    try testing.expect(TestManagerCore.live_context_count >= 1);
+    try testing.expectEqual(@as(usize, 1), probe.processes_run.load(.monotonic));
+    try testing.expect(TestManagerCore.live_bytes_total.load(.monotonic) >= 128);
+    try testing.expect(TestManagerCore.live_context_count.load(.monotonic) >= 1);
 
     // Program shutdown kills the straggler; its teardown wholesale-frees the
     // live allocation — every minted context deinit'd, zero residue.
     zap_proc_runtime_deinit();
-    try testing.expectEqual(TestManagerCore.init_total, TestManagerCore.deinit_total);
-    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
-    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
+    try testing.expectEqual(TestManagerCore.init_total.load(.monotonic), TestManagerCore.deinit_total.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total.load(.monotonic));
 }
 
 /// Committed default spawn/die cycles for the per-process ARC teardown soak
@@ -1429,12 +1471,12 @@ test "abi: per-process ARC teardown soak — spawn/die cycles stay leak-exact (t
         // Exact per-wave accounting: every context minted so far has been
         // wholesale-freed (its never-freed cell reclaimed), no context or byte
         // outlives its process — the leak-exact invariant, checked every wave.
-        try testing.expectEqual(spawned_total, TestManagerCore.init_total);
-        try testing.expectEqual(spawned_total, TestManagerCore.deinit_total);
-        try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count);
-        try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total);
+        try testing.expectEqual(spawned_total, TestManagerCore.init_total.load(.monotonic));
+        try testing.expectEqual(spawned_total, TestManagerCore.deinit_total.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total.load(.monotonic));
     }
-    try testing.expectEqual(spawned_total, probe.processes_run);
+    try testing.expectEqual(spawned_total, probe.processes_run.load(.monotonic));
 }
 
 test "abi: runtime init/deinit lifecycle guards double-init and supports re-init" {
@@ -1530,8 +1572,8 @@ test "abi: init → spawn → send → receive → exit round-trip through the C
 
     // Exactness: every payload and closure ledger block was consumed.
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
-    const stats = runtime_state.scheduler.statistics();
-    try testing.expectEqual(@as(u32, 0), stats.live_process_count);
+    const stats = runtime_state.pool.statistics();
+    try testing.expectEqual(@as(i64, 0), stats.live_process_count);
     try testing.expectEqual(@as(u64, 2), stats.spawn_total);
     // Receiver returned (normal); sender used the exit intrinsic (the
     // Phase 2 kill-path exit — module doc).
@@ -1621,9 +1663,9 @@ test "abi: zap_proc_run_until_exit joins the target and leaves stragglers for de
 
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(root_pid_bits));
 
-    // The root is gone; the parked straggler is still live.
+    // The root is gone; the parked straggler is still live (reaped at deinit).
     try testing.expectEqual(@as(usize, 4), probe.received_payload_len);
-    try testing.expectEqual(@as(u32, 1), runtime_state.scheduler.statistics().live_process_count);
+    try testing.expectEqual(@as(i64, 1), runtime_state.pool.liveProcessCount());
 
     // Joining a dead pid returns immediately.
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(root_pid_bits));
@@ -1786,9 +1828,11 @@ test "abi: zap_proc_receive_wait_timeout with an empty mailbox and after 0 polls
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
 
     try testing.expect(probe.finished);
+    // `after 0` polls without SUSPENDING the calling process — proven by the
+    // immediate `.timed_out` outcome. (Under M:N the pool's OTHER idle cores do
+    // park on their futexes, so a total park count is not a poll-vs-block
+    // signal the way it was for the single Phase-2 scheduler.)
     try testing.expectEqual(ZapProcWaitOutcome.timed_out, probe.wait_outcome);
-    // A poll never parks the scheduler thread.
-    try testing.expectEqual(@as(u64, 0), runtime_state.scheduler.statistics().park_count);
 }
 
 test "abi: zap_proc_receive_wait_timeout fires the deadline under the production futex park" {
@@ -1847,11 +1891,11 @@ test "abi: an unexpected message dead-letters with telemetry and does not crash 
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
 
     try testing.expect(probe.received);
-    const stats = runtime_state.scheduler.statistics();
+    const stats = runtime_state.pool.statistics();
     // Non-silent: exactly one unexpected-message dead letter recorded.
     try testing.expectEqual(@as(u64, 1), stats.unexpected_message_total);
     // Both processes are gone; the offending one via the kill path.
-    try testing.expectEqual(@as(u32, 0), stats.live_process_count);
+    try testing.expectEqual(@as(i64, 0), stats.live_process_count);
     try testing.expect(stats.kill_total >= 1);
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
 }
