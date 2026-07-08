@@ -463,6 +463,47 @@ const YieldReason = enum(u8) {
     waiting_for_message_deadline,
 };
 
+/// The cross-thread wake handshake state of a process (P4-J1). Under M:N a
+/// producer on any thread may deliver a message to a process that a
+/// (different) scheduler thread is simultaneously deciding to suspend; this
+/// atomic is the arbiter that makes exactly ONE party revive the process — no
+/// lost wake, no double enqueue — the role Go's `casgstatus` and Tokio's
+/// task-notify state play.
+///
+/// The whole handshake linearizes on THIS ONE variable via seq_cst
+/// read-modify-writes, so it needs no standalone memory fence (the Zig fork's
+/// std has none): two seq_cst RMWs on one location are totally ordered, and the
+/// message-arrival signal is carried by `park_state` itself (the mailbox
+/// empty→nonempty wake seam swaps in `.notified`) rather than by a second
+/// variable the park would have to re-read behind a StoreLoad barrier.
+///
+/// Protocol (`scheduler.zig`, "Cross-thread wake handshake"):
+///   * a running process is `.running`;
+///   * the mailbox wake seam (any producer thread, on empty→nonempty) does
+///     `swap(.notified)`: if it displaced `.parked` the process was suspended
+///     and this producer owns the revival (push to a scheduler's wake stack);
+///     if it displaced `.running`/`.notified` the process is active and will
+///     observe the message itself — no push;
+///   * the scheduler suspending the process does `cmpxchg(.running → .parked)`
+///     (`commitPark`): success ⇒ genuinely parked, a later wake revives it;
+///     failure ⇒ it read `.notified` (a message landed in the park window) ⇒
+///     the scheduler self-revives immediately.
+/// Exactly one of {producer push, scheduler self-revive} fires per episode
+/// because the two RMWs are totally ordered on this variable.
+pub const ParkState = enum(u8) {
+    /// Running or runnable — not suspended. A wake seam `swap(.notified)`
+    /// displacing this is a no-op (the process observes the message itself).
+    running,
+    /// Suspended on an empty mailbox — a wake must revive it. A wake seam
+    /// `swap(.notified)` displacing this means the displacing producer owns the
+    /// revival.
+    parked,
+    /// A message arrived in the park window (the wake seam swapped this in over
+    /// `.running`): the process's own park attempt sees it and self-revives
+    /// instead of suspending, so the wake is never lost.
+    notified,
+};
+
 /// Scheduler-side bookkeeping for one process: the PCB plus the fields
 /// that are the scheduler's business rather than the process's (queue
 /// links, the sender-side envelope handle, kill/wake flags).
@@ -510,12 +551,17 @@ pub const ProcessRecord = struct {
     /// Kill requested (untrappable). Scheduler-thread only: set by
     /// `kill`, observed at scheduling points and safepoints.
     pending_kill: bool,
-    /// True while this record sits on the scheduler's wake stack —
-    /// coalesces concurrent wake signals into one entry. Any thread CASes
-    /// it false→true (push); the scheduler resets it when consuming.
-    wake_pending: std.atomic.Value(bool),
-    /// Intrusive Treiber link in the scheduler's wake stack. Written by
-    /// the pushing thread before the head CAS publishes it.
+    /// The cross-thread wake handshake state (P4-J1; see `ParkState`). A
+    /// spawned process is `.running`; the scheduler suspending it publishes
+    /// `.parked`; the unique `.parked → .running` CAS winner (a producer that
+    /// delivered a message, or the suspending scheduler's own re-check) owns the
+    /// revival and pushes the record onto a scheduler's wake stack exactly once.
+    /// Replaces the Phase-1 `wake_pending` coalescing flag: the CAS both
+    /// coalesces (one winner) and arbitrates the park/signal race, which a plain
+    /// flag could not do across two scheduler threads.
+    park_state: std.atomic.Value(ParkState),
+    /// Intrusive Treiber link in the target scheduler's wake stack. Written by
+    /// the revival CAS winner before the head CAS publishes it.
     wake_next: ?*ProcessRecord,
     /// The `ProcessContext` living on this process's fiber stack, or
     /// null before the first quantum (the context is built by
@@ -815,12 +861,27 @@ fn monotonicNowNanoseconds() u64 {
 const clock_uptime_raw: u32 = 8;
 extern "c" fn clock_gettime_nsec_np(clock_id: u32) u64;
 
-/// The Phase 1 single scheduler (plan 1.4/1.5; instance-based — see the
-/// module doc). NOT thread-safe as a whole: exactly one thread drives
-/// `spawn`/`kill`/`runUntilQuiescent`/`statistics`; the documented
-/// cross-thread surface is `wake()`, `requestWatchdogPreemption()`,
-/// `parkCount()`, and the mailbox-push wake seam. The value is PINNED
-/// from the first `spawn` on (records hold back-pointers).
+/// The scheduler driving the CURRENT OS thread, or null on a non-scheduler
+/// thread (P4-J1). A `SchedulerPool` worker (and a standalone scheduler's run
+/// loop) publishes itself here for the lifetime of its run loop — ONCE per
+/// thread, never per quantum, since an OS thread only ever drives one
+/// `Scheduler`. The cross-thread wake handshake reads it to route a revived
+/// process onto the PRODUCER's core (message-passing locality, research.md
+/// §6.1's LIFO slot); a foreign producer (null — a test thread, a future I/O
+/// poller or blocking-pool thread) falls back to the process's last-running
+/// scheduler. Read only on the cold wake path — never the alloc hot path — so
+/// the Darwin TLV cost (E10) is irrelevant here.
+threadlocal var current_scheduler: ?*Scheduler = null;
+
+/// The M:N run-queue scheduler (plan 1.4/1.5 + Phase 4.1; instance-based — see
+/// the module doc). A single `Scheduler` is NOT thread-safe as a whole:
+/// exactly one thread runs its `runQuantum`/`spawn`/`dequeue` loop. Its
+/// documented cross-thread surface is `wake()`, `requestWatchdogPreemption()`,
+/// `parkCount()`, the mailbox-push wake seam, and — under `work_stealing` —
+/// `stealInto()` (another core splicing half this FIFO under `run_queue_lock`).
+/// Phase 4 multiplies this instance over the shared, already-M:N-safe pid table
+/// and envelope pool: a `SchedulerPool` owns N of these, one per core. The
+/// value is PINNED from the first `spawn` on (records hold back-pointers).
 pub const Scheduler = struct {
     /// Allocator for process records (records recycle through the record
     /// cache and return here only at `deinit`).
@@ -857,13 +918,39 @@ pub const Scheduler = struct {
     /// futex wait so a timeout fires on schedule. Scheduler-thread only.
     earliest_deadline_nanoseconds: u64,
 
-    // -- ready queue (scheduler-thread only) --------------------------------
-    /// Intrusive FIFO of `.runnable` processes: oldest.
+    // -- run queue (owner + work-stealing thieves) ---------------------------
+    /// Whether this scheduler participates in M:N work stealing (P4-J1). When
+    /// false (the default, single-scheduler and deterministic modes) the run
+    /// queue is a plain owner-only intrusive FIFO exactly as in Phase 1: the
+    /// LIFO slot and the run-queue lock are unused and every wake routes to the
+    /// FIFO tail. When true (a `SchedulerPool` core) the just-woken task lands
+    /// in `runnext` for message-passing locality, thieves steal from the FIFO
+    /// under `run_queue_lock`, and spillover reaches the pool's global queue.
+    work_stealing: bool,
+    /// The just-woken-task LIFO slot (P4-J1, research.md §6.1): a wake enqueues
+    /// the revived process here so the waking core runs it NEXT — the ping-pong
+    /// partner runs immediately on the producer's core (message-passing
+    /// locality). OWNER-ONLY: filled by this scheduler's own `reviveEnqueue`
+    /// (from `drainWakeStack` or the park re-check, both on this thread) and
+    /// consumed first at `dequeueNextRunnable`; thieves never touch it, so the
+    /// LIFO-locality guarantee holds (the partner is never stolen away). Null
+    /// and unused when `work_stealing` is false.
+    runnext: ?*ProcessRecord,
+    /// Intrusive FIFO of `.runnable` processes: oldest. Guarded by
+    /// `run_queue_lock` when `work_stealing` (thieves read the head); owner-only
+    /// otherwise.
     ready_head: ?*ProcessRecord,
     /// Newest.
     ready_tail: ?*ProcessRecord,
-    /// Queue length.
+    /// Queue length. Guarded by `run_queue_lock` when `work_stealing`.
     ready_count: usize,
+    /// Guards `ready_head`/`ready_tail`/`ready_count` so a work-stealing thief
+    /// on another core can splice half this FIFO onto its own (P4-J1). A
+    /// `std.atomic.Mutex` spinlock by kernel convention (no libc-coupled
+    /// `std.Thread.Mutex`; every critical section is O(1) queue-pointer
+    /// surgery). Uncontended — thus ~free — for the owner in single-scheduler
+    /// mode and on the hot path (thieves only lock when their own queue empties).
+    run_queue_lock: std.atomic.Mutex,
 
     // -- record cache (scheduler-thread only) --------------------------------
     /// Free list of recycled records (linked via `ready_next`). Records
@@ -926,6 +1013,12 @@ pub const Scheduler = struct {
         park_timeout_nanoseconds: u64 = default_park_timeout_nanoseconds,
         /// Idle behavior (production parks; deterministic mode forbids).
         idle_strategy: IdleStrategy = .futex_park,
+        /// Enroll this scheduler in M:N work stealing (P4-J1): use the LIFO
+        /// slot for wake locality and let thieves steal from its FIFO. Default
+        /// false — a standalone scheduler (Phase-1 single-scheduler kernel
+        /// tests, the deterministic harness) behaves byte-identically to Phase
+        /// 1. A `SchedulerPool` sets this true for every core it owns.
+        work_stealing: bool = false,
         /// The nondeterminism seam (see `Decisions`).
         decisions: Decisions = .production_fifo,
         /// Trace seam (see `TraceHook`); null = zero-cost no trace.
@@ -1008,9 +1101,12 @@ pub const Scheduler = struct {
             .current_process = null,
             .timed_waiter_count = 0,
             .earliest_deadline_nanoseconds = 0,
+            .work_stealing = options.work_stealing,
+            .runnext = null,
             .ready_head = null,
             .ready_tail = null,
             .ready_count = 0,
+            .run_queue_lock = .unlocked,
             .free_records = null,
             .cached_record_count = 0,
             .live_record_count = 0,
@@ -1035,6 +1131,7 @@ pub const Scheduler = struct {
     pub fn deinit(scheduler: *Scheduler) void {
         std.debug.assert(scheduler.live_record_count == 0);
         std.debug.assert(scheduler.ready_count == 0);
+        std.debug.assert(scheduler.runnext == null);
         std.debug.assert(scheduler.wake_stack_head.load(.acquire) == null);
         while (scheduler.free_records) |record| {
             scheduler.free_records = record.ready_next;
@@ -1073,7 +1170,7 @@ pub const Scheduler = struct {
         record.ready_next = null;
         record.yield_reason = .reenqueue;
         record.pending_kill = false;
-        record.wake_pending = .init(false);
+        record.park_state = .init(.running);
         record.wake_next = null;
         record.active_context = null;
         record.wake_deadline_nanoseconds = 0;
@@ -1114,7 +1211,7 @@ pub const Scheduler = struct {
     pub fn kill(scheduler: *Scheduler, target: Pid) KillOutcome {
         const target_pcb = scheduler.pid_table.lookup(target) orelse return .not_found;
         const record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
-        switch (target_pcb.state) {
+        switch (target_pcb.currentState()) {
             .waiting => {
                 scheduler.teardownProcess(record, .killed);
                 return .killed;
@@ -1150,7 +1247,7 @@ pub const Scheduler = struct {
             const waiting_record = find_waiting: {
                 var iterator = scheduler.pid_table.iterateLiveProcesses();
                 while (iterator.next()) |live| {
-                    if (live.pcb.state == .waiting) {
+                    if (live.pcb.currentState() == .waiting) {
                         const record: *ProcessRecord = @fieldParentPtr("pcb", live.pcb);
                         break :find_waiting record;
                     }
@@ -1186,14 +1283,25 @@ pub const Scheduler = struct {
         var iterator = scheduler.pid_table.iterateLiveProcesses();
         while (iterator.next()) |live| {
             const pcb = live.pcb;
-            if (pcb.state != .waiting) continue;
             const record: *ProcessRecord = @fieldParentPtr("pcb", pcb);
+            // Handshake state (acquire) FIRST: only a genuinely `.parked`
+            // process has its deadline fields published (the parker released
+            // `.parked` after writing `yield_reason`/`wake_deadline`), so this
+            // acquire is what makes the non-atomic reads below race-free when a
+            // sibling scheduler scans the same shared pid table (P4-J1).
+            if (record.park_state.load(.acquire) != .parked) continue;
             if (record.yield_reason != .waiting_for_message_deadline) continue;
             if (now >= record.wake_deadline_nanoseconds) {
-                record.receive_timed_out = true;
-                pcb.transitionTo(.runnable);
-                scheduler.readyEnqueue(record);
-                scheduler.emitTrace(.wake, pcb.pid);
+                // Win the revival against a racing message wake: only the
+                // `.parked → .running` CAS winner fires the timeout. A loss
+                // means a producer notified this waiter (`.notified`) and its
+                // wake owns the enqueue — skip it here.
+                if (record.park_state.cmpxchgStrong(.parked, .running, .seq_cst, .seq_cst) == null) {
+                    record.receive_timed_out = true;
+                    pcb.transitionTo(.runnable);
+                    scheduler.readyEnqueue(record);
+                    scheduler.emitTrace(.wake, pcb.pid);
+                }
             } else {
                 remaining += 1;
                 if (earliest == 0 or record.wake_deadline_nanoseconds < earliest) {
@@ -1219,8 +1327,11 @@ pub const Scheduler = struct {
         var iterator = scheduler.pid_table.iterateLiveProcesses();
         while (iterator.next()) |live| {
             const pcb = live.pcb;
-            if (pcb.state != .waiting) continue;
             const record: *ProcessRecord = @fieldParentPtr("pcb", pcb);
+            // Handshake acquire before the non-atomic deadline read (see
+            // `fireExpiredReceiveTimeouts`). Deterministic mode is single-
+            // threaded, so `.parked` always holds for a live timed waiter here.
+            if (record.park_state.load(.acquire) != .parked) continue;
             if (record.yield_reason != .waiting_for_message_deadline) continue;
             live_timed_waiters += 1;
             const current = earliest_record orelse {
@@ -1236,6 +1347,13 @@ pub const Scheduler = struct {
             scheduler.earliest_deadline_nanoseconds = 0;
             return false;
         };
+        // Win the revival against a racing message wake (a no-op contention in
+        // single-threaded deterministic mode). If a producer notified it first,
+        // fall through and re-scan next call.
+        if (fire.park_state.cmpxchgStrong(.parked, .running, .seq_cst, .seq_cst) != null) {
+            scheduler.timed_waiter_count = live_timed_waiters;
+            return true;
+        }
         fire.receive_timed_out = true;
         fire.pcb.transitionTo(.runnable);
         scheduler.readyEnqueue(fire);
@@ -1252,6 +1370,14 @@ pub const Scheduler = struct {
     /// under `.futex_park`; surfaces `error.AllProcessesWaiting` under
     /// `.forbid_parking` (deterministic mode). Scheduler-thread only.
     pub fn runUntilQuiescent(scheduler: *Scheduler) RunError!void {
+        // Publish this thread's scheduler for the wake handshake's locality
+        // routing (a send from a process body running below resolves THIS core
+        // as the producer's core). Restored on exit so the driver thread's
+        // out-of-loop sends take the foreign path. Set once per run, not per
+        // quantum — an OS thread only ever drives one scheduler.
+        const previous_scheduler = current_scheduler;
+        current_scheduler = scheduler;
+        defer current_scheduler = previous_scheduler;
         while (true) {
             scheduler.drainWakeStack();
             scheduler.fireExpiredReceiveTimeouts();
@@ -1296,6 +1422,11 @@ pub const Scheduler = struct {
     /// under `.forbid_parking` when the target cannot make progress
     /// (deterministic-mode deadlock). Scheduler-thread only.
     pub fn runUntilProcessExits(scheduler: *Scheduler, target: Pid) RunError!void {
+        // See `runUntilQuiescent`: publish this thread's scheduler for wake
+        // locality routing for the lifetime of the loop.
+        const previous_scheduler = current_scheduler;
+        current_scheduler = scheduler;
+        defer current_scheduler = previous_scheduler;
         while (true) {
             // Silent probe — the target's death is this loop's expected
             // terminal condition, not a dead-lettered message (the
@@ -1416,6 +1547,17 @@ pub const Scheduler = struct {
     /// write (A.2.4), switch in, classify the outcome, clear the watchdog.
     fn runQuantum(scheduler: *Scheduler, record: *ProcessRecord) void {
         const pcb = &record.pcb;
+        // Claim ownership for this quantum (P4-J1 migration): a process may run
+        // on a different core than last time (work stealing moved it). The
+        // record's `scheduler` pointer — read by `yieldCheck`/
+        // `reductionSafepoint` for the watchdog/co-runnable check, by the wake
+        // handshake's foreign-producer fallback, and by the process's own
+        // `send`/`spawn`/`kill` through the context — must be THIS core while it
+        // runs here. Refresh the on-stack `ProcessContext` too (it caches the
+        // scheduler; null before the first quantum, when `processFiberEntry`
+        // reads the freshly-set `record.scheduler` instead).
+        record.scheduler = scheduler;
+        if (record.active_context) |context| context.scheduler = scheduler;
         pcb.transitionTo(.running);
         pcb.preemption_budget = scheduler.options.decisions.vtable.chooseQuantumBudget(
             scheduler.options.decisions.decision_context,
@@ -1470,25 +1612,67 @@ pub const Scheduler = struct {
                     .waiting_for_message => {
                         scheduler.emitTrace(.wait, pcb.pid);
                         pcb.transitionTo(.waiting);
-                        // A push that raced the final empty-check already
-                        // fired the wake seam; the wake-stack drain at the
-                        // top of the run loop converts it to runnable —
-                        // no lost-wake window (module doc).
+                        // Commit the park under the cross-thread handshake: a
+                        // message that raced the final empty-check is caught by
+                        // the seq_cst re-check here and revives the process
+                        // immediately; otherwise it stays parked until a wake
+                        // (module doc, "Cross-thread wake handshake"). No
+                        // lost-wake window across scheduler threads.
+                        _ = scheduler.commitPark(record);
                     },
                     .waiting_for_message_deadline => {
                         scheduler.emitTrace(.wait, pcb.pid);
                         pcb.transitionTo(.waiting);
-                        // A `receive … after` waiter: countable so the run
-                        // loop scans deadlines and bounds its idle park.
-                        // The count self-corrects on the next scan (message
-                        // wake / kill leave the record no longer a
-                        // `.waiting` deadline waiter), so it is only ever
-                        // incremented here.
-                        scheduler.timed_waiter_count += 1;
+                        // A `receive … after` waiter: same handshake, and it is
+                        // countable so the run loop scans deadlines and bounds
+                        // its idle park — but ONLY while it actually stayed
+                        // parked. If the re-check revived it (a message beat the
+                        // park), it is runnable, not a timed waiter. The count
+                        // self-corrects on the next scan regardless (a woken or
+                        // killed waiter is no longer a `.waiting` deadline
+                        // waiter), so it is only ever incremented here.
+                        if (scheduler.commitPark(record)) {
+                            scheduler.timed_waiter_count += 1;
+                        }
                     },
                 }
             },
         }
+    }
+
+    /// The parking side of the cross-thread wake handshake (P4-J1). The caller
+    /// has already transitioned `record` to `.waiting` (its mailbox was empty
+    /// when `receive` decided to suspend). This attempts `cmpxchg(.running →
+    /// .parked)` on the single seq_cst handshake variable:
+    ///   * success — genuinely parked; returns true. A later wake seam
+    ///     `swap(.notified)` will displace `.parked`, and THAT producer pushes
+    ///     the record to a wake stack to revive it.
+    ///   * failure — the CAS read `.notified`: a producer delivered a message in
+    ///     the window between `receive` seeing the mailbox empty and this park
+    ///     (the wake seam swapped `.notified` in over `.running`). The scheduler
+    ///     resets `.running`, revives the process locally (the LIFO slot under
+    ///     `work_stealing`), and returns false.
+    /// The producer's `swap` and this `cmpxchg` are seq_cst RMWs on the SAME
+    /// variable and thus totally ordered, so no message and no wake is ever lost
+    /// — and no standalone memory fence is required. Runs on this scheduler's
+    /// own thread.
+    fn commitPark(scheduler: *Scheduler, record: *ProcessRecord) bool {
+        const pcb = &record.pcb;
+        if (record.park_state.cmpxchgStrong(.running, .parked, .seq_cst, .seq_cst)) |observed| {
+            // Not `.running`: a message landed in the park window (`.notified`).
+            // The suspension is resolved by that message — a genuine wakeup, so
+            // emit `.wake` (the trace's "a waiting process became runnable"
+            // event) exactly as the wake-stack drain does for a message that
+            // arrives after the park commits. This keeps the wait/wake tallies
+            // matched and the deterministic trace complete.
+            std.debug.assert(observed == .notified);
+            record.park_state.store(.running, .seq_cst);
+            pcb.transitionTo(.runnable);
+            scheduler.emitTrace(.wake, pcb.pid);
+            scheduler.reviveEnqueue(record);
+            return false;
+        }
+        return true;
     }
 
     // -------------------------------------------------------------------------
@@ -1603,7 +1787,31 @@ pub const Scheduler = struct {
     // Ready queue (intrusive FIFO; Phase 4 upgrade path in the module doc)
     // -------------------------------------------------------------------------
 
+    /// Acquire the run-queue spinlock when `work_stealing` (a no-op for a
+    /// standalone scheduler — the FIFO is then owner-only, byte-identical to
+    /// Phase 1). `std.atomic.Mutex` + `spinLoopHint`, kernel convention.
+    inline fn lockRunQueue(scheduler: *Scheduler) void {
+        if (scheduler.work_stealing) {
+            while (!scheduler.run_queue_lock.tryLock()) std.atomic.spinLoopHint();
+        }
+    }
+
+    inline fn unlockRunQueue(scheduler: *Scheduler) void {
+        if (scheduler.work_stealing) scheduler.run_queue_lock.unlock();
+    }
+
+    /// Admit a runnable process to the FIFO tail (spawn admission, voluntary
+    /// yield re-enqueue, timeout fire, and the non-locality wake path). Takes
+    /// the run-queue lock under `work_stealing` so a thief sees a consistent
+    /// queue; owner-only and lock-free otherwise.
     fn readyEnqueue(scheduler: *Scheduler, record: *ProcessRecord) void {
+        scheduler.lockRunQueue();
+        defer scheduler.unlockRunQueue();
+        scheduler.readyEnqueueLocked(record);
+    }
+
+    /// FIFO-tail append with the run-queue lock already held (or not needed).
+    fn readyEnqueueLocked(scheduler: *Scheduler, record: *ProcessRecord) void {
         record.ready_next = null;
         if (scheduler.ready_tail) |tail| {
             tail.ready_next = record;
@@ -1614,21 +1822,57 @@ pub const Scheduler = struct {
         scheduler.ready_count += 1;
     }
 
-    /// Pick the next runnable process through the Decisions seam.
+    /// Enqueue a JUST-WOKEN process for the wake-locality path (P4-J1). Under
+    /// `work_stealing` the record lands in the owner-only LIFO slot `runnext`
+    /// so the waking core runs it next (the ping-pong partner runs immediately,
+    /// research.md §6.1); any prior occupant is bumped to the FIFO tail so no
+    /// wake is ever dropped. Without work stealing this is a plain FIFO append,
+    /// preserving the Phase-1 wake ordering (and the deterministic trace).
+    /// OWNER-THREAD ONLY — called from `drainWakeStack` and the park re-check,
+    /// both on this scheduler's own thread; thieves never touch `runnext`.
+    fn reviveEnqueue(scheduler: *Scheduler, record: *ProcessRecord) void {
+        if (!scheduler.work_stealing) {
+            scheduler.readyEnqueue(record);
+            return;
+        }
+        record.ready_next = null;
+        const displaced = scheduler.runnext;
+        scheduler.runnext = record;
+        if (displaced) |previous| scheduler.readyEnqueue(previous);
+    }
+
+    /// Pick the next runnable process: the LIFO slot first (wake locality),
+    /// then the FIFO through the Decisions seam. Owner-thread only.
     fn dequeueNextRunnable(scheduler: *Scheduler) ?*ProcessRecord {
+        if (scheduler.work_stealing) {
+            if (scheduler.runnext) |record| {
+                scheduler.runnext = null;
+                return record;
+            }
+        }
+        scheduler.lockRunQueue();
+        defer scheduler.unlockRunQueue();
         if (scheduler.ready_count == 0) return null;
         const chosen_index = scheduler.options.decisions.vtable.chooseNextReadyIndex(
             scheduler.options.decisions.decision_context,
             scheduler.ready_count,
         );
         std.debug.assert(chosen_index < scheduler.ready_count);
-        return scheduler.dequeueReadyAt(chosen_index);
+        return scheduler.dequeueReadyAtLocked(chosen_index);
     }
 
-    /// Unlink and return the `index`-th queued record (0 = oldest), or
-    /// null when the queue is empty. O(index) — production FIFO always
-    /// asks for 0.
+    /// Unlink and return the `index`-th queued record (0 = oldest), taking the
+    /// run-queue lock. Used by `shutdownAllProcesses` (fixed index 0).
     fn dequeueReadyAt(scheduler: *Scheduler, index: usize) ?*ProcessRecord {
+        scheduler.lockRunQueue();
+        defer scheduler.unlockRunQueue();
+        return scheduler.dequeueReadyAtLocked(index);
+    }
+
+    /// Unlink and return the `index`-th queued record (0 = oldest), or null
+    /// when the queue is empty, with the run-queue lock already held (or not
+    /// needed). O(index) — production FIFO always asks for 0.
+    fn dequeueReadyAtLocked(scheduler: *Scheduler, index: usize) ?*ProcessRecord {
         var previous: ?*ProcessRecord = null;
         var current = scheduler.ready_head orelse return null;
         var remaining = index;
@@ -1649,13 +1893,73 @@ pub const Scheduler = struct {
         return current;
     }
 
+    /// Work-stealing (P4-J1, research.md §6.1): a thief scheduler with an empty
+    /// run queue splices up to half of THIS (victim) scheduler's FIFO onto the
+    /// end of the thief's own FIFO, and returns the count moved. Steals from the
+    /// OLD end (head) so the victim keeps its freshest (tail/`runnext`) work —
+    /// the standard deque discipline — and never touches the victim's `runnext`,
+    /// so a just-woken ping-pong partner is never stolen from under its waking
+    /// core. Both queues are taken under their own `run_queue_lock`, thief
+    /// first then victim, in the fixed pool-index order the pool's steal loop
+    /// enforces (thief only steals from higher-... — see `SchedulerPool.steal`),
+    /// so no two schedulers ever lock the same pair in opposite orders. Returns
+    /// 0 when the victim has nothing stealable. Runs on the THIEF's thread.
+    fn stealInto(victim: *Scheduler, thief: *Scheduler) usize {
+        std.debug.assert(victim.work_stealing and thief.work_stealing);
+        std.debug.assert(victim != thief);
+        // Snapshot half the victim's FIFO under the victim lock into a local
+        // detached chain, releasing the victim lock before touching the thief
+        // queue (so the two locks are never held nested here — the pool's steal
+        // order is what prevents A-steals-B / B-steals-A deadlock).
+        victim.lockRunQueue();
+        const available = victim.ready_count;
+        if (available == 0) {
+            victim.unlockRunQueue();
+            return 0;
+        }
+        const take = (available + 1) / 2; // ceil(half): a lone runnable is stolen
+        var chain_head: ?*ProcessRecord = null;
+        var chain_tail: ?*ProcessRecord = null;
+        var moved: usize = 0;
+        while (moved < take) : (moved += 1) {
+            const record = victim.dequeueReadyAtLocked(0) orelse break;
+            record.ready_next = null;
+            if (chain_tail) |tail| {
+                tail.ready_next = record;
+            } else {
+                chain_head = record;
+            }
+            chain_tail = record;
+        }
+        victim.unlockRunQueue();
+        if (moved == 0) return 0;
+        // Splice the detached chain onto the thief's FIFO tail under the thief
+        // lock. The stolen records carry no scheduler-local state that the
+        // victim still touches (they are `.runnable`, off the victim queue), so
+        // the thief may now run them — the run-queue atomics supply the
+        // happens-before that lets the thief's quantum follow the victim's.
+        thief.lockRunQueue();
+        var cursor = chain_head;
+        while (cursor) |record| {
+            cursor = record.ready_next;
+            record.ready_next = null;
+            thief.readyEnqueueLocked(record);
+        }
+        thief.unlockRunQueue();
+        return moved;
+    }
+
     // -------------------------------------------------------------------------
     // Wake stack (cross-thread producers, scheduler consumer)
     // -------------------------------------------------------------------------
 
-    /// Consume every pending wake signal: pop-all (swap — no ABA),
-    /// restore push order, and convert `.waiting` targets to runnable.
-    /// Targets in any other state are no-ops (module doc).
+    /// Consume every pending wake signal: pop-all (swap — no ABA), restore push
+    /// order, and admit each revived process to run. Each record on this stack
+    /// was pushed by the UNIQUE `.parked → .running` handshake winner
+    /// (`mailboxWakeCallback` / the park re-check via `pushWake`), so it is a
+    /// process this core owns the revival of; the drain makes it runnable and
+    /// enqueues it (the LIFO slot under `work_stealing`, for wake locality).
+    /// Runs on this scheduler's own thread.
     fn drainWakeStack(scheduler: *Scheduler) void {
         var popped: ?*ProcessRecord = scheduler.wake_stack_head.swap(null, .acquire) orelse return;
         // The Treiber stack yields newest-first; reverse to process wake
@@ -1669,41 +1973,64 @@ pub const Scheduler = struct {
         while (oldest_first) |record| {
             oldest_first = record.wake_next;
             record.wake_next = null;
-            // Re-arm the coalescing flag BEFORE inspecting state so a
-            // producer signaling right now pushes a fresh entry rather
-            // than being lost.
-            record.wake_pending.store(false, .seq_cst);
             const pcb = &record.pcb;
-            if (pcb.state == .waiting) {
+            // The unique wake-seam winner swapped `.notified` in over `.parked`
+            // before pushing this record, so this core is its sole reviver.
+            // Reset the handshake to `.running` for the process's next life, and
+            // if it is still `.waiting` (not torn down between park and drain)
+            // make it runnable and enqueue it (LIFO slot under `work_stealing`).
+            record.park_state.store(.running, .seq_cst);
+            if (pcb.currentState() == .waiting) {
                 pcb.transitionTo(.runnable);
-                scheduler.readyEnqueue(record);
+                scheduler.reviveEnqueue(record);
                 scheduler.emitTrace(.wake, pcb.pid);
             }
         }
     }
 
-    /// The mailbox wake seam (installed per process at spawn): runs on
-    /// the PRODUCER's thread after the empty→nonempty push. Coalesces via
-    /// the record's wake-pending flag, publishes the record on the wake
-    /// stack, and signals the futex. Cheap, non-blocking, thread-safe —
-    /// the seam's contract (`mailbox.zig`).
-    fn mailboxWakeCallback(wake_context: ?*anyopaque) void {
-        const record: *ProcessRecord = @ptrCast(@alignCast(wake_context.?));
-        if (record.wake_pending.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) {
-            return; // already signaled; the pending entry covers this wake
-        }
-        const scheduler = record.scheduler;
-        var observed_head = scheduler.wake_stack_head.load(.monotonic);
+    /// Push a revived record onto `target`'s wake stack (lock-free Treiber) and
+    /// wake `target` — the cross-thread enqueue channel for a process the caller
+    /// won the revival of. Only the unique handshake winner calls this (per park
+    /// episode), so a record is on at most one wake stack at a time. `target` is
+    /// the producer's own core when the producer is a scheduler thread (wake
+    /// locality) or the process's last-running scheduler for a foreign producer.
+    fn pushWake(target: *Scheduler, record: *ProcessRecord) void {
+        var observed_head = target.wake_stack_head.load(.monotonic);
         while (true) {
             record.wake_next = observed_head;
-            observed_head = scheduler.wake_stack_head.cmpxchgWeak(
+            observed_head = target.wake_stack_head.cmpxchgWeak(
                 observed_head,
                 record,
                 .release,
                 .monotonic,
             ) orelse break;
         }
-        scheduler.wake();
+        target.wake();
+    }
+
+    /// The mailbox wake seam (installed per process at spawn): runs on the
+    /// PRODUCER's thread after an empty→nonempty push (`mailbox.zig`). The
+    /// cross-thread wake handshake (P4-J1): a `seq_cst` fence orders the
+    /// producer's message push BEFORE the state observation, then a single
+    /// `cmpxchg(.parked → .running)` decides whether THIS producer revives the
+    /// target. Only the winner enqueues it — no lost wake, no double enqueue,
+    /// across any number of concurrent producers and the suspending scheduler.
+    /// A wake to a `.running`/`.runnable` process fails the CAS and is a no-op
+    /// (the message is already visible to the target's next receive).
+    fn mailboxWakeCallback(wake_context: ?*anyopaque) void {
+        const record: *ProcessRecord = @ptrCast(@alignCast(wake_context.?));
+        // Mark the process notified (single seq_cst RMW — the whole handshake
+        // linearizes here). Only if this displaced `.parked` was the process
+        // actually suspended and does THIS producer own its revival; displacing
+        // `.running`/`.notified` means the process is active (it will observe
+        // the message via its own receive, or self-revive at `commitPark`) — no
+        // push. The message push in `mailbox.push` is sequenced-before this RMW,
+        // so the reviver sees it.
+        if (record.park_state.swap(.notified, .seq_cst) != .parked) return;
+        // We own the revival. Route onto the producer's core for wake locality;
+        // a foreign producer falls back to the target's last-running scheduler.
+        const target = current_scheduler orelse record.scheduler;
+        pushWake(target, record);
     }
 
     // -------------------------------------------------------------------------
@@ -2059,7 +2386,7 @@ test "Scheduler: spawn → run → exit lifecycle with lazy-start admission" {
     // reserved (pool acquire), but NO code has run — the fiber is still
     // `.ready` and the entry frame is written only at first schedule.
     const pcb = kernel.pid_table.lookup(pid).?;
-    try testing.expectEqual(process_module.ProcessState.runnable, pcb.state);
+    try testing.expectEqual(process_module.ProcessState.runnable, pcb.currentState());
     try testing.expectEqual(fiber_context.LifecycleState.ready, pcb.fiber.lifecycle_state);
     try testing.expect(!probe.entered);
     try testing.expectEqual(@as(u32, 1), kernel.scheduler.stackPoolStatistics().live_stack_count);

@@ -109,7 +109,7 @@ pub fn snapshotLiveProcess(live: pid_table_module.LiveProcess) ProcessSnapshot {
         null;
     return .{
         .pid = live.pid,
-        .state = pcb.state,
+        .state = pcb.currentState(),
         .mailbox_depth = pcb.mailbox.depth(),
         .heap_byte_count = pcb.manager.heapByteCount(),
         .last_suspend = suspend_point,

@@ -3803,8 +3803,11 @@ const ZapConcurrencyKernel = struct {
     // `src/runtime/concurrency/process.zig`'s `pub export var`s. The slow
     // path (`zap_proc_safepoint_slow`) is the shared yield point for both
     // layers; it takes no handle (it resolves the current process itself).
-    extern var zap_proc_reductions_budget: u32;
-    extern var zap_proc_reductions_remaining: u32;
+    // `threadlocal` (P4-J1): under M:N schedulers each scheduler thread runs a
+    // different process's quantum, so the budget/counter are per-thread — the
+    // extern must match `process.zig`'s `pub export threadlocal var`.
+    extern threadlocal var zap_proc_reductions_budget: u32;
+    extern threadlocal var zap_proc_reductions_remaining: u32;
     extern fn zap_proc_safepoint_slow() callconv(.c) void;
 
     // P3-J1 per-process manager routing (plan item 3.1 / A.4 OQ1). The
@@ -3814,7 +3817,12 @@ const ZapConcurrencyKernel = struct {
     // message it adopts — land in its own private heap, wholesale-freed with
     // it at teardown. Seeded by `concurrencyStartupForEntry` with the
     // bootstrap context for out-of-quantum (startup/atexit) allocations.
-    extern var zap_proc_active_arc_context: ?*anyopaque;
+    // `threadlocal` (P4-J1): under M:N each scheduler thread publishes its own
+    // running process's context here, so the alloc hot path reads THIS core's
+    // current process — a shared global would mix two cores' heaps and violate
+    // the scheduler-local-refcount invariant. Matches `process.zig`'s
+    // `pub export threadlocal var`.
+    extern threadlocal var zap_proc_active_arc_context: ?*anyopaque;
 };
 
 /// Gated entry-prologue bootstrap: initialize the binary-wide

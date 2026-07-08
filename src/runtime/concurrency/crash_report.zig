@@ -252,7 +252,7 @@ pub fn captureForTeardown(pcb: *const ProcessControlBlock, reason: ExitReason) C
     var report = CrashReport{
         .pid_bits = pcb.pid.toBits(),
         .reason = reason,
-        .state_at_death = pcb.state,
+        .state_at_death = pcb.currentState(),
         .mailbox_depth_at_death = pcb.mailbox.depth(),
         .trace_status = undefined,
         .suspend_program_counter = 0,
@@ -471,7 +471,7 @@ test "CrashReport: kill while waiting captures reason, state, depth, and a suspe
     // Ground truth for the report's suspend registers, read while the
     // victim is still alive and suspended.
     const victim_pcb = kernel.pid_table.lookup(victim_pid).?;
-    try testing.expectEqual(process_module.ProcessState.waiting, victim_pcb.state);
+    try testing.expectEqual(process_module.ProcessState.waiting, victim_pcb.currentState());
     const saved = fiber_context.savedRegisters(&victim_pcb.fiber).?;
 
     try testing.expectEqual(scheduler_module.KillOutcome.killed, kernel.scheduler.kill(victim_pid));
@@ -699,7 +699,7 @@ test "CrashReport: kernel FP walk matches the fork SelfInfo unwinder on a real s
     var report = CrashReport{
         .pid_bits = victim_pcb.pid.toBits(),
         .reason = .killed,
-        .state_at_death = victim_pcb.state,
+        .state_at_death = victim_pcb.currentState(),
         .mailbox_depth_at_death = 0,
         .trace_status = .captured,
         .suspend_program_counter = saved.program_counter,

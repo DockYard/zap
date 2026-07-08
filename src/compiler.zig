@@ -12158,10 +12158,21 @@ pub fn getRuntimeSourceForRuntimeControls(
     controls: RuntimeSourceControls,
 ) []const u8 {
     const instrumented = @import("build_options").instrument_map;
+    // A multi-manager build's per-process retain/release dispatch reaches ONLY
+    // the v1.2 sized refcount path (`currentRefcountCapability`), so the sized
+    // path MUST be compiled in whenever `multi_manager` is on — this is exactly
+    // the invariant the runtime's `multi_manager_active requires
+    // refcount_sized_extension_active` comptime guard (P3-R1c) asserts. The
+    // per-manifest `refcount_sized_extension` (derived from the manifest
+    // manager's own descriptor) defaults off for single-manager ARC builds
+    // that use the direct header-read path; coupling it to `multi_manager` here
+    // is the correct single-point enforcement of that requirement, so a
+    // multi-manager binary over the (genuinely v1.2-sized) ARC manager resolves
+    // the sized path instead of tripping the guard.
     return rewriteRuntimeSource(.{
         .instrumented = instrumented,
         .declared_caps = declared_caps,
-        .refcount_sized_extension = refcount_sized_extension,
+        .refcount_sized_extension = refcount_sized_extension or controls.multi_manager,
         .memory_startup_prologue_emitted = controls.memory_startup_prologue_emitted,
         .collect_arc_stats = controls.collect_arc_stats,
         .runtime_concurrency = controls.runtime_concurrency,

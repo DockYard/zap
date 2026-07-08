@@ -74,10 +74,18 @@
 //! and nothing else; `introspection.zig`'s cross-thread snapshots read
 //! `state` on the documented best-effort basis.
 //!
-//! Phase 4 (M:N schedulers) tracking line: atomicize `ProcessState` (or
-//! fence the introspection reads) before a second scheduler thread can
-//! observe a PCB — the owner-only contract above is what makes plain
-//! (non-atomic) fields correct today.
+//! Phase 4 (M:N schedulers) — DONE (P4-J1): `state` is now an atomic
+//! (`std.atomic.Value(ProcessState)`) because under M:N a process's state is
+//! written by the scheduler running its quantum, read by a wake handshake on a
+//! producer thread, and read best-effort by cross-thread `introspection.zig`
+//! snapshots — three threads, so a plain field would be a data race. Every
+//! OTHER PCB field stays owner-only: the wake/steal atomics
+//! (`scheduler.zig`'s `park_state`, the run-queue lock, the wake stack) supply
+//! the happens-before that orders one scheduler's quantum strictly before the
+//! next scheduler's quantum for the same process, so non-atomic PCB fields
+//! (mailbox consumer state, drop-list, budget) are touched by exactly one
+//! thread at a time. `state` is atomic on top of that ordering so the
+//! best-effort introspection read never tears.
 
 const std = @import("std");
 const fiber_context = @import("fiber_context.zig");
@@ -146,7 +154,17 @@ pub const default_preemption_budget: u32 = 4000;
 /// zero-cost guarantee). Homed here — the leaf module both `scheduler`
 /// (writer) and `abi` (the slow-path reader) import — to avoid a
 /// scheduler↔abi import cycle.
-pub export var zap_proc_reductions_budget: u32 = default_preemption_budget;
+///
+/// `threadlocal` (P4-J1, plan §5 Phase 4): under M:N schedulers, every
+/// scheduler thread runs a DIFFERENT process's quantum simultaneously, so a
+/// single binary-wide budget would be clobbered across cores (a data race and
+/// a correctness bug — one core's preemption budget stomping another's). Each
+/// scheduler thread owns its running process's budget in its own TLS slot; the
+/// scheduler writes it at quantum entry (`runQuantum`). Costless with the gate
+/// OFF (unreferenced). The Darwin TLV read cost is the price of per-core
+/// current-process state; the J2 register/parameter-threading ceiling recovers
+/// it (plan Appendix A.4 OQ1).
+pub export threadlocal var zap_proc_reductions_budget: u32 = default_preemption_budget;
 
 /// The layer-1 alloc-piggyback running reduction counter (plan item 2.5,
 /// P2-J6). The runtime's allocation hot path decrements it once per cell
@@ -155,8 +173,10 @@ pub export var zap_proc_reductions_budget: u32 = default_preemption_budget;
 /// via `refreshReductionCounter`. Distinct from the layer-2 loop-local
 /// counter, which lives in the emitted loop's frame (a register after
 /// LLVM promotion) so a tight numeric loop pays only a register decrement.
-/// `pub export` for the same linkage reason as `zap_proc_reductions_budget`.
-pub export var zap_proc_reductions_remaining: u32 = default_preemption_budget;
+/// `pub export` for the same linkage reason as `zap_proc_reductions_budget`;
+/// `threadlocal` for the same M:N reason (P4-J1): each scheduler thread
+/// decrements ITS running process's counter, never a shared global.
+pub export threadlocal var zap_proc_reductions_remaining: u32 = default_preemption_budget;
 
 /// Refresh the layer-1 alloc running counter to a fresh quantum's budget.
 /// Called by the C-ABI slow path (`zap_proc_safepoint_slow`) — including
@@ -187,7 +207,19 @@ pub fn refreshReductionCounter() void {
 /// linkage reason as `zap_proc_reductions_budget`; unreferenced (and thus
 /// costless) with the concurrency gate OFF — the runtime reads it only under
 /// the comptime gate (plan §3 zero-cost guarantee).
-pub export var zap_proc_active_arc_context: ?*anyopaque = null;
+///
+/// `threadlocal` (P4-J1, plan §5 Phase 4 — THE sacred-invariant enabler): under
+/// M:N schedulers, N scheduler threads each run a DIFFERENT process's quantum at
+/// the same instant, each routing its process's allocations to that process's
+/// OWN private heap. A single binary-wide global would be clobbered across cores
+/// — every core's alloc hot path would resolve the LAST writer's context,
+/// mixing two processes' heaps and violating the scheduler-local-refcount
+/// invariant (Constraint 3). Per-thread state makes each core's current-context
+/// read see only its own running process. The scheduler writes this thread's
+/// slot at quantum entry and restores it at quantum exit (`runQuantum`); the
+/// runtime's alloc hot path reads this thread's slot. The Darwin TLV read is the
+/// per-core cost; J2 register/parameter threading is the recovery ceiling.
+pub export threadlocal var zap_proc_active_arc_context: ?*anyopaque = null;
 
 /// Minimal per-process memory-manager binding for Phase 1 kernel tests.
 /// See the module doc's "Manager binding" section: the real manager-ABI
@@ -266,8 +298,14 @@ pub const ProcessControlBlock = struct {
     /// Process identity. `Pid.invalid` from `init` until `register`
     /// acquires a pid-table slot; `Pid.invalid` again after `unregister`.
     pid: Pid,
-    /// Lifecycle/scheduling state; mutate only via `transitionTo`.
-    state: ProcessState,
+    /// Lifecycle/scheduling state; mutate only via `transitionTo`, read via
+    /// `currentState`. Atomic (P4-J1): under M:N the state is written by the
+    /// scheduler running the quantum, transitioned `.waiting → .runnable` by a
+    /// wake reviver (possibly a different scheduler thread, ordered by
+    /// `scheduler.zig`'s `park_state` handshake), and read best-effort by
+    /// cross-thread `introspection.zig` snapshots. Release stores / acquire
+    /// loads so a transition publishes to the next observer without tearing.
+    state: std.atomic.Value(ProcessState),
     /// Preemption budget in reductions for the current quantum; refilled
     /// by the scheduler at quantum start, decremented by safepoint polls
     /// (Phase 2.5).
@@ -298,7 +336,7 @@ pub const ProcessControlBlock = struct {
         manager: ManagerContext,
     ) void {
         process.pid = .invalid;
-        process.state = .embryo;
+        process.state = .init(.embryo);
         process.preemption_budget = default_preemption_budget;
         process.fiber = kernel_fiber;
         process.manager = manager;
@@ -322,7 +360,7 @@ pub const ProcessControlBlock = struct {
             @branchHint(.cold);
             @panic("ProcessControlBlock.register: process already registered — kernel bug");
         }
-        if (process.state != .embryo) {
+        if (process.state.load(.monotonic) != .embryo) {
             @branchHint(.cold);
             @panic("ProcessControlBlock.register: identity must be acquired in the embryo state — kernel bug");
         }
@@ -345,7 +383,7 @@ pub const ProcessControlBlock = struct {
             @branchHint(.cold);
             @panic("ProcessControlBlock.unregister: process is not registered — kernel bug");
         }
-        if (process.state != .exiting) {
+        if (process.state.load(.monotonic) != .exiting) {
             @branchHint(.cold);
             @panic("ProcessControlBlock.unregister: identity must be released in the exiting state — kernel bug");
         }
@@ -367,15 +405,28 @@ pub const ProcessControlBlock = struct {
         process.drop_list_head = node;
     }
 
+    /// The process's current lifecycle state (atomic acquire load). The
+    /// owning scheduler reads its own writes; a cross-thread wake handshake or
+    /// best-effort introspection snapshot reads a consistent (non-torn) value
+    /// ordered by the acquiring atomic that delivered the PCB pointer.
+    pub fn currentState(process: *const ProcessControlBlock) ProcessState {
+        return process.state.load(.acquire);
+    }
+
     /// Move the process to `new_state`, enforcing `isLegalTransition`.
     /// Illegal transitions are kernel bugs and panic in every build mode —
-    /// state-machine corruption must never propagate silently.
+    /// state-machine corruption must never propagate silently. The store is a
+    /// release so the transition (and everything the transitioning thread wrote
+    /// before it) publishes to the next observer of `state` (P4-J1). The
+    /// legality read is `.monotonic`: only the current owner transitions, so the
+    /// read-modify-write is not itself contended — the ordering that matters is
+    /// the release store's visibility to the next owner, supplied here.
     pub fn transitionTo(process: *ProcessControlBlock, new_state: ProcessState) void {
-        if (!isLegalTransition(process.state, new_state)) {
+        if (!isLegalTransition(process.state.load(.monotonic), new_state)) {
             @branchHint(.cold);
             @panic("ProcessControlBlock.transitionTo: illegal state transition");
         }
-        process.state = new_state;
+        process.state.store(new_state, .release);
     }
 };
 
@@ -472,7 +523,7 @@ test "PCB: init defaults — embryo state, empty mailbox and drop-list, full bud
     ProcessControlBlock.init(&process, kernel_fiber, test_manager.managerContext());
 
     try testing.expectEqual(Pid.invalid.toBits(), process.pid.toBits());
-    try testing.expectEqual(ProcessState.embryo, process.state);
+    try testing.expectEqual(ProcessState.embryo, process.currentState());
     try testing.expectEqual(default_preemption_budget, process.preemption_budget);
     try testing.expectEqual(mailbox_module.PopOutcome.empty, process.mailbox.pop());
     try testing.expectEqual(@as(usize, 0), process.mailbox.depth());
@@ -501,7 +552,7 @@ test "PCB: transitionTo walks a full legal lifecycle" {
     const lifecycle = [_]ProcessState{ .runnable, .running, .waiting, .runnable, .running, .exiting };
     for (lifecycle) |next_state| {
         process.transitionTo(next_state);
-        try testing.expectEqual(next_state, process.state);
+        try testing.expectEqual(next_state, process.currentState());
     }
 
     // Release the never-run fiber's stack through the pool directly — the
