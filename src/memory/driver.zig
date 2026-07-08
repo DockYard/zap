@@ -500,7 +500,7 @@ fn enforceManagerTargetSupport(
     // global/stack scanning has no COFF/PE backend yet.
     if (is_traced and os_tag == .windows) {
         diag.write(
-            "{s} is unsupported on {s}: conservative global/stack scanning has no COFF/PE backend yet; use Memory.ARC, Memory.Arena, Memory.Leak, Memory.NoOp, or Memory.Tracking",
+            "{s} is unsupported on {s}: conservative global/stack scanning has no COFF/PE backend yet; use Memory.ARC, Memory.ORC, Memory.Arena, Memory.Leak, Memory.NoOp, or Memory.Tracking",
             .{ selected_type_name, target_triple },
         );
         return ResolveError.ManagerTargetUnsupported;
@@ -515,7 +515,7 @@ fn enforceManagerTargetSupport(
     // wasm; only SELECTING the tracing manager is rejected.
     if (is_traced and os_tag == .wasi) {
         diag.write(
-            "{s} is unsupported on {s}: conservative global/stack scanning is architecturally impossible on WebAssembly's linear-memory model; use Memory.ARC, Memory.Arena, Memory.Leak, Memory.NoOp, or Memory.Tracking",
+            "{s} is unsupported on {s}: conservative global/stack scanning is architecturally impossible on WebAssembly's linear-memory model; use Memory.ARC, Memory.ORC, Memory.Arena, Memory.Leak, Memory.NoOp, or Memory.Tracking",
             .{ selected_type_name, target_triple },
         );
         return ResolveError.ManagerTargetUnsupported;

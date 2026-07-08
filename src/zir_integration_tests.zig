@@ -3811,6 +3811,7 @@ test "CLI script flags: -Dmemory runs under each stdlib manager" {
     const allocator = std.testing.allocator;
     inline for (.{
         "Memory.ARC",
+        "Memory.ORC",
         "Memory.Arena",
         "Memory.NoOp",
         "Memory.Leak",

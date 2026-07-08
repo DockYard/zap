@@ -4136,6 +4136,7 @@ test "resolveMemoryManagerBackendFromSourceGraph rejects manager with no conform
 // so `@embedFile` binds the test directly to the real production
 // source the build driver compiles for each manager.
 const REAL_ARC_BACKEND_SOURCE = @embedFile("memory/arc/manager.zig");
+const REAL_ORC_BACKEND_SOURCE = @embedFile("memory/orc/manager.zig");
 const REAL_ARENA_BACKEND_SOURCE = @embedFile("memory/arena/manager.zig");
 const REAL_LEAK_BACKEND_SOURCE = @embedFile("memory/leak/manager.zig");
 const REAL_TRACKING_BACKEND_SOURCE = @embedFile("memory/tracking/manager.zig");
@@ -4171,6 +4172,18 @@ const stdlib_manager_matrix = [_]StdlibManagerCase{
         .type_name = "Memory.ARC",
         .adapter_path = "lib/memory/arc.zap",
         .backend_source = REAL_ARC_BACKEND_SOURCE,
+        .expected_caps = zap.memory_abi.CAPS_REFCOUNTED, // 0x1
+        .expected_model = .refcounted,
+        .expected_sharing = .clone_on_share,
+    },
+    .{
+        // ORC declares REFCOUNTED byte-identically to ARC (0x1) — the
+        // shares-the-specialization hypothesis: same caps ⇒ same reclamation
+        // model ⇒ same codegen specialization. The cycle collector is a
+        // separate CYCL capability descriptor, invisible to `declared_caps`.
+        .type_name = "Memory.ORC",
+        .adapter_path = "lib/memory/orc.zap",
+        .backend_source = REAL_ORC_BACKEND_SOURCE,
         .expected_caps = zap.memory_abi.CAPS_REFCOUNTED, // 0x1
         .expected_model = .refcounted,
         .expected_sharing = .clone_on_share,
@@ -4344,10 +4357,15 @@ test "stdlib manager matrix: each real adapter resolves to its own backend sourc
             zap.memory_elision.sharingStrategy(parsed_caps),
         );
 
-        // No behavior change: `shouldEmitRefcountOps` is true iff REFCOUNTED,
-        // i.e. iff this is ARC — identical to the pre-axes binary gate.
+        // `shouldEmitRefcountOps` is true iff REFCOUNTED. The refcounted stdlib
+        // managers are Memory.ARC and Memory.ORC: ORC (P3-J6) shares ARC's
+        // REFCOUNTED model and codegen specialization byte-for-byte — its cycle
+        // collector is a separate CYCL capability descriptor, invisible to the
+        // Axis-A model — so it emits the identical retain/release gate as ARC.
+        const is_refcounted_stdlib_manager = std.mem.eql(u8, case.type_name, "Memory.ARC") or
+            std.mem.eql(u8, case.type_name, "Memory.ORC");
         try testing.expectEqual(
-            std.mem.eql(u8, case.type_name, "Memory.ARC"),
+            is_refcounted_stdlib_manager,
             zap.memory_elision.shouldEmitRefcountOps(parsed_caps),
         );
         try testing.expectEqual(

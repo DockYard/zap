@@ -1606,6 +1606,99 @@ for structured containers; a late crossover for flat scalars lets it be
 deferred there.** Re-run E6 in Phase 6 with the move path on and compare the
 `Map` row against the 2.19 ms/MB serialize-to-blob baseline recorded here.
 
+## E8 — conservative fiber-stack scan (P3-J6, 2026-07-08) — GATE: PASS (mark-sweep ships as TRACED)
+
+E8 decides the **tracing-GC roster**: can the conservative mark-sweep collector
+(`src/memory/gc/manager.zig`, `Memory.GC`, TRACED) run PER-PROCESS, which
+requires conservatively scanning a suspended fiber's saved register context +
+private guard-paged stack for pointers into a private heap? Kill criterion (plan
+§6): unbounded scan cost or false-retention keeping demonstrably-dead cyclic
+graphs alive → mark-sweep out of v1, ORC-over-ARC the sole cyclic model.
+
+**ORC-over-ARC ships regardless of this verdict** (`src/memory/orc/manager.zig`):
+it works on the refcount graph and needs NO stack scan. E8 decides only whether
+conservative mark-sweep ALSO ships.
+
+### Structural finding — the scan is complete on Darwin/aarch64
+
+The fork fiber `Context` on aarch64 saves only `{sp, fp, pc}`; the context-switch
+asm (`~/projects/zig` `lib/std/Io/fiber.zig`) clobbers `x19–x28`/`x30`, forcing
+the compiler to spill every live callee-saved register onto the fiber's OWN stack
+around the yield. So a single sweep of the live span `[savedRegisters.stack_pointer,
+stack.top())` already covers the saved callee-saved registers — there is no
+separate register save area a conservative scan could miss. This is the property
+that makes a per-fiber conservative scan well-defined here; the Boehm-with-green-
+threads register-root fragility the research flags (Q4) does not bite on
+Darwin/aarch64. Reused primitives: `fiber_context.savedRegisters` (pub) +
+`Stack.top()`/`Stack.usable()` (pub); the containment predicate mirrors the GC's
+`findOwningRecord` (`src/memory/gc/manager.zig`).
+
+### Methodology
+
+`src/runtime/concurrency/e8_fiber_scan.zig` (wired into the kernel suite). Build
+512 tracked objects (48 B each) at page-allocator addresses; suspend a real fiber
+holding genuine pointers to 32 of them plus 8192 words (64 KiB) of realistic +
+adversarial (full-range PRNG) non-pointer stack data; conservatively sweep the
+fiber's live span word-by-word (binary-search interval containment); best-of-5.
+
+### Results (median span ≈ 66 KiB, aarch64)
+
+| build | scan cost | ns/KiB | genuine pointers found | false-retentions | false-retention rate |
+|---|---|---|---|---|---|
+| ReleaseFast (fork zig) | 67 µs / 66 KiB | **1,036 ns/KiB** | 32 / 32 | 0 / 480 | **0.00000%** |
+| Debug (stock zig) | 335–595 µs / 66 KiB | 5,120–9,095 ns/KiB | 32 / 32 | 0 / 480 | **0.00000%** |
+
+* **Scan cost is BOUNDED** — ~1 µs/KiB (ReleaseFast), linear in stack size with a
+  low constant. A typical few-KB live fiber stack scans in microseconds; a full
+  256 KiB stack in ~0.25 ms. Not unbounded.
+* **Coincidental false-retention is NEGLIGIBLE** — 0 of 480 non-referenced
+  objects retained, even with adversarial full-range stack words. The 48-bit
+  address space makes the tracked heap a vanishing fraction (512 × 48 B ≈ 24 KB
+  of 2⁴⁸), so a non-pointer word almost never lands interior to an object.
+* **Scan is COMPLETE** — all 32 genuine pointers found, confirming the spilled
+  callee-saved registers are covered by the `[sp, top())` sweep.
+
+### Verdict: PASS — `Memory.GC` (TRACED) ships as a per-process spawn option
+
+The kill criterion is not tripped (bounded cost, negligible coincidental
+false-retention, complete root coverage). Conservative per-fiber mark-sweep is
+VIABLE on Darwin/aarch64, so `Memory.GC` ships as the TRACED per-process model
+alongside ORC. **ORC-over-ARC remains the *recommended* cyclic model**, because
+conservative scanning carries a hazard E8's coincidental measurement does not
+remove: **stale-pointer false-retention** — a live stack slot still holding a
+pointer to a semantically-dead object (a dropped local not yet overwritten) keeps
+that object, or a dead cycle it anchors, alive for a cycle. That imprecision is
+inherent to conservative stack scanning and bounded only by live stack depth; ORC
+(precise refcount graph, no stack scan, deterministic, no stop-the-world) has no
+such hazard. `Memory.GC` is therefore positioned for FFI-heavy / opaque heaps
+where precise refcounting is impossible; ORC is the default cyclic recommendation.
+
+### Companion — the ORC-shares-REFCOUNTED-specialization hypothesis (CONFIRMED)
+
+E8's counterpart verifies the P3-J6 key hypothesis (zap-concurrency-research.md
+§2.5). `Memory.ORC` declares `declared_caps == 0x1`, byte-identical to `Memory.ARC`
+→ `elision.reclamationModel` = `.refcounted` → `src/monomorphize.zig` keys it onto
+ARC's `.refcounted` specialization (the key is the 4-value `hir.ReclamationModel`
+enum; there is no separate ORC specialization). The Bacon–Rajan cycle-root
+buffering lives entirely inside the ORC manager's `release`/`release_sized`
+(`noteDecrement` → `possibleRoot`) — a runtime black box behind the `retain`/
+`release` ABI vtable slots, so an ARC process and an ORC process emit and run the
+IDENTICAL retain/release code. Proven at three layers: (1) `src/memory/elision.zig`
+— caps `0x1` ⇒ `.refcounted`, indistinguishable from ARC to every codegen gate;
+(2) `src/builder.zig` stdlib-manager matrix — the ORC adapter resolves to
+`expected_caps = 0x1`, `expected_model = .refcounted`, same row shape as ARC;
+(3) end-to-end — `test_concurrency/orc_test.zap` spawns an ARC child and an ORC
+child in ONE binary, both carrying the `refcounted` pid model bits (0), each on
+its own heap. Cycle collection is manager-internal (one new `CYCL` capability
+descriptor, never a new Axis-A model), proven exhaustively in
+`src/memory/orc/manager.zig`'s unit tests: a self-referential cycle and a
+three-node cycle are built through the ORC ABI, dropped, and reclaimed
+(leak-exact via the backing allocator's leak check — a negative control with the
+collector disabled reports the cycle leaked); acyclic data is reclaimed promptly
+by the ARC base with no regression; an externally-reachable cycle is NOT wrongly
+collected. **Hypothesis: CONFIRMED — ORC shares the REFCOUNTED specialization
+exactly, zero additional monomorphized code.**
+
 ## Baseline comparison yardstick
 
 External systems' spawn/RTT numbers (from `research-round-2.md` Q10) — the

@@ -280,19 +280,37 @@ manager's `release` implementation*. If that holds, an ORC manager:
 - **shares the REFCOUNTED codegen specialization exactly** — zero additional monomorphized code,
   unlike TRACED, which needs its own specialization.
 
-This is a design hypothesis, not a verified fact — it depends on the ARC optimizer's
-elision/borrow inference not assuming anything about `release` internals that root-buffering
-would violate. Verify as part of E8's decision (see §7).
+**CONFIRMED (P3-J6, 2026-07-08).** The hypothesis is verified against the actual
+codegen/elision path. `Memory.ORC` (`src/memory/orc/manager.zig` + `lib/memory/orc.zap`)
+declares `declared_caps == 0x1`, byte-identical to `Memory.ARC`, so
+`elision.reclamationModel` maps it to `.refcounted` and `src/monomorphize.zig` keys its
+spawn-reachable subgraph onto the SAME `.refcounted` specialization as ARC — there is no
+separate ORC specialization (the specialization key is `hir.ReclamationModel`, a 4-value
+enum, and ORC's model *is* `.refcounted`). The cycle-root candidate buffering lives entirely
+inside the ORC manager's `release`/`release_sized` (`noteDecrement` → `possibleRoot` on a
+decrement-to-non-zero) — a runtime black box behind the `retain`/`release` ABI vtable slots,
+so the emitted code an ARC process runs and the emitted code an ORC process runs are identical
+(proven end-to-end: `test_concurrency/orc_test.zap` spawns an ARC child and an ORC child in
+one binary, both carrying the `refcounted` pid model bits). The elision/borrow inference
+assumes nothing about `release` internals that root-buffering violates: retain/release/
+deallocate are ABI entry points (not inlined decrements), and the one path that reads the
+refcount directly and reuses a cell in place (`ArcRuntime.resetAny` at rc==1 → `reuseAllocByType`)
+is a synchronous, non-yielding sequence — the thread-local collector runs only at yield points,
+so it never observes a cell mid-repurpose, and a reused rc==1 cell held by a live local is
+externally reachable and correctly survives trial deletion. The only addition beyond the
+shared specialization is one new **capability descriptor** (`CYCL`, the per-type cell-shape
+registration the collector traces through), exactly as §2.5 permitted — never a new Axis-A
+model, never a codegen divergence from ARC.
 
 Roster after this correction:
 
 | Spawn option | Axis A model | Codegen specialization | Status |
 |---|---|---|---|
 | `Memory.ARC` (default) | REFCOUNTED | REFCOUNTED | v1 |
-| ORC-over-ARC (cyclic) | REFCOUNTED | shared with ARC (hypothesis) | v1, recommended cyclic model |
+| `Memory.ORC` (cyclic) | REFCOUNTED | shared with ARC (**confirmed, P3-J6**) | v1, recommended cyclic model |
 | `Memory.Arena` / NoOp / Leak | BULK_OR_NEVER | BULK_OR_NEVER | v1 |
 | `Memory.Tracking` | INDIVIDUAL_NO_REFCOUNT | INDIVIDUAL_NO_REFCOUNT | v1 (test/debug) |
-| `Memory.GC` (conservative mark-sweep) | TRACED | TRACED | contingent on E8; kept for FFI-heavy/opaque heaps |
+| `Memory.GC` (conservative mark-sweep) | TRACED | TRACED | **v1 (E8 PASS, P3-J6)**; positioned for FFI-heavy/opaque heaps |
 
 ### 2.6 What this changes in the staged plan
 

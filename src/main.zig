@@ -656,6 +656,7 @@ const SCRIPT_OPTIMIZE_MODES = [_]struct {
 /// parser, the diagnostic, and the help text.
 const SCRIPT_MEMORY_MANAGERS = [_][]const u8{
     "Memory.ARC",
+    "Memory.ORC",
     "Memory.Arena",
     "Memory.NoOp",
     "Memory.Leak",
@@ -1414,7 +1415,7 @@ fn cmdRunScript(
     if (overrides.memory) |mgr| {
         if (!validateScriptMemoryManager(mgr)) {
             std.debug.print(
-                "Error: unsupported memory manager '{s}' — script mode is single-file with no dependency graph and supports only the stdlib managers: Memory.ARC, Memory.Arena, Memory.NoOp, Memory.Leak, Memory.Tracking, Memory.GC\n",
+                "Error: unsupported memory manager '{s}' — script mode is single-file with no dependency graph and supports only the stdlib managers: Memory.ARC, Memory.ORC, Memory.Arena, Memory.NoOp, Memory.Leak, Memory.Tracking, Memory.GC\n",
                 .{mgr},
             );
             std.process.exit(1);
@@ -1936,7 +1937,7 @@ fn cmdTestScript(
     if (parsed.build_overrides.memory) |mgr| {
         if (!validateScriptMemoryManager(mgr)) {
             std.debug.print(
-                "Error: unsupported memory manager '{s}' — single-file test mode has no dependency graph and supports only the stdlib managers: Memory.ARC, Memory.Arena, Memory.NoOp, Memory.Leak, Memory.Tracking, Memory.GC\n",
+                "Error: unsupported memory manager '{s}' — single-file test mode has no dependency graph and supports only the stdlib managers: Memory.ARC, Memory.ORC, Memory.Arena, Memory.NoOp, Memory.Leak, Memory.Tracking, Memory.GC\n",
                 .{mgr},
             );
             std.process.exit(1);
@@ -16833,8 +16834,11 @@ test "optimizePolicyForBuildConfig maps frontend backend and memory optimize mod
     }
 }
 
-test "validateScriptMemoryManager: accepts exactly the six stdlib managers" {
+test "validateScriptMemoryManager: accepts exactly the seven stdlib managers" {
     try testing.expect(validateScriptMemoryManager("Memory.ARC"));
+    // P3-J6: the ORC-over-ARC cyclic manager (REFCOUNTED reclamation model,
+    // shares ARC's specialization; adds a Bacon–Rajan cycle collector).
+    try testing.expect(validateScriptMemoryManager("Memory.ORC"));
     try testing.expect(validateScriptMemoryManager("Memory.Arena"));
     try testing.expect(validateScriptMemoryManager("Memory.NoOp"));
     try testing.expect(validateScriptMemoryManager("Memory.Leak"));

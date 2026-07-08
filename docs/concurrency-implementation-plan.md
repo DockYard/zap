@@ -565,7 +565,18 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
     cells) also copy.
 - **3.4** ORC manager: `src/memory/orc/manager.zig` + stdlib adapter; verify the
   shares-REFCOUNTED-specialization hypothesis (cycle-root buffering entirely inside `release`);
-  cycle-collection at yield points only.
+  cycle-collection at yield points only. **DONE (P3-J6, 2026-07-08)** — `Memory.ORC`
+  (`lib/memory/orc.zap` + `src/memory/orc/manager.zig`) is a Bacon–Rajan
+  trial-deletion collector over ARC's refcount ABI; the cycle-root buffering lives
+  entirely in `release`/`release_sized` (`noteDecrement` → `possibleRoot`). Hypothesis
+  **CONFIRMED**: ORC declares `declared_caps == 0x1` (REFCOUNTED, byte-identical to ARC)
+  → shares ARC's `.refcounted` monomorphization specialization, zero additional codegen;
+  cycle collection is one new `CYCL` capability descriptor, never a new Axis-A model.
+  Proven at the elision layer, the stdlib-manager matrix, and end-to-end
+  (`test_concurrency/orc_test.zap` — an ARC child and an ORC child coexist in one binary,
+  both `refcounted`). Cycle-collection correctness + leak-exactness proven in the manager's
+  unit tests (build a cycle, drop it, collect it; acyclic reclaimed promptly; a negative
+  control confirms ARC alone leaks the cycle). See ledger § E8's companion.
 - **3.5** Capability matrix (comptime table + runtime spawn error); wasm32 and Windows entries;
   compile-time warnings for statically-known-impossible combos.
 
@@ -664,7 +675,7 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
 | E6 copy crossover | 2, re-run 6 | early crossover → pull Blob/move forward |
 | E3 TSan copy matrix + sender-dies | 1 (same-model), 3 (full) | any cross-scheduler refcount race → stop-ship |
 | E4 post-ICF code size | 3 | exceeds CLBG size budget → shift more paths to vtable dispatch |
-| E8 fiber-stack scan | 3 | unbounded cost / high false retention → mark-sweep out of v1, ORC only |
+| E8 fiber-stack scan | 3 | unbounded cost / high false retention → mark-sweep out of v1, ORC only. **PASS (P3-J6, 2026-07-08)**: ~1 µs/KiB bounded scan, 0.00000% coincidental false-retention, complete root coverage on Darwin/aarch64 → `Memory.GC` (TRACED) ships as a per-process option; ORC remains the recommended cyclic model (no stale-pointer hazard). See ledger § E8. |
 | E7 manager-call blocking | 4 | stalls beyond watchdog tick → mandatory handoff |
 
 ## 7. Risks (top 5; full list in rev 2 §8)

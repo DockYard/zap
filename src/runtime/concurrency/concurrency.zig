@@ -207,4 +207,8 @@ test {
     _ = @import("teardown_stress.zig");
     _ = @import("adversarial_stress.zig");
     _ = @import("abi.zig");
+    // E8: conservative fiber-stack scan cost + false-retention (plan §7 /
+    // risk #1) — decides whether conservative mark-sweep ships as a TRACED
+    // per-process model. ORC ships regardless (no stack scan).
+    _ = @import("e8_fiber_scan.zig");
 }
