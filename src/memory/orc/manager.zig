@@ -78,8 +78,14 @@ const builtin = @import("builtin");
 // wire structs — the production-manager rule forbids a manager (compiled by the
 // driver as a standalone object, `builtin.output_mode == .Obj`) from importing
 // sibling compiler or manager modules, so these mirror `src/memory/arc/
-// manager.zig` byte-for-byte. The `slab_pool_drift`-style comptime layout
-// asserts below fail the build if either side drifts.
+// manager.zig` byte-for-byte. The comptime layout asserts below guard ORC's OWN
+// copies against the spec's fixed byte sizes (they compare these local structs
+// to literal sizes, so they catch a unilateral edit to ORC's copy — but not a
+// drift on ARC's side, which they never inspect). Cross-manager layout drift
+// (ORC vs ARC vs the runtime's test-only slab pool) is caught by
+// `tools/slab_pool_drift_test.zig`, which reads all three source files and
+// cross-checks their slab-pool constants byte-for-byte (P3-R1a extended it to
+// include ORC's copy).
 // ---------------------------------------------------------------------------
 
 const ZapMemoryManagerMetaV1 = extern struct {

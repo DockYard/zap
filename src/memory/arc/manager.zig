@@ -163,7 +163,7 @@ const ZapRefcountCapabilityV1 = extern struct {
     release_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
     allocate_refcounted: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
     refcount_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32,
-    // v1.2 relocate extension (slots 6–7; the same-model O(1) region-move send,
+    // v1.2 relocate extension (slots 6–8; the same-model O(1) region-move send,
     // plan item 6.1 / P3-J5). `desc.size` advertises their presence per spec
     // §2.3, so a consumer that predates them reads the smaller size and ignores
     // the tail (falling back to the copy send).

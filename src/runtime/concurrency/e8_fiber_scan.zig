@@ -267,8 +267,14 @@ test "E8: conservative fiber-stack scan — cost/KB bounded and false-retention 
         },
     );
 
-    // Completeness: every genuine pointer the fiber planted is found (the scan
-    // covers the whole live span, including the spilled callee-saved registers).
+    // Completeness: every genuine pointer the fiber planted is found, confirming
+    // the sweep covers the whole live STACK span. The planted pointers live in an
+    // on-stack buffer, so this asserts stack completeness directly; callee-saved
+    // register coverage is the SEPARATE structural argument in the file header
+    // (the context-switch asm clobbers x19–x28/x30, so any register-resident
+    // pointer is spilled onto this same swept span — no distinct register save
+    // area exists to miss). This assertion does not by itself exercise a
+    // register-only pointer.
     try std.testing.expectEqual(result.live_total, result.live_objects_found);
     try std.testing.expect(result.span_bytes > 0);
 

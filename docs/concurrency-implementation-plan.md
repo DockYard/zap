@@ -550,9 +550,10 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
     PASS:** detach+adopt is 1–2 ns INDEPENDENT of payload size (4 KiB…1 MiB),
     pointer-identity preserved (O(1)), leak-exact; vs copy's O(size) (48 µs memcpy
     at 1 MB, 2.19 ms `Map` reconstruct) — `docs/concurrency-bench-results.md` § E5.
-    **P3-J5-VERIFY (2026-07-08):** gate-ON `:test_concurrency` runs **56/0** (110
-    assertions, exit 0) via `zap run test_concurrency`, including
-    `move_send_test.zap`'s 3 `Process.send_move` cases; and the by-construction
+    **P3-J5-VERIFY (2026-07-08):** gate-ON `:test_concurrency` runs **59/0** (117
+    assertions, exit 0) at HEAD via `zap run test_concurrency` (**56/0** as of
+    P3-J5; +1 P3-J6 `orc_test.zap`, +2 P3-R1a per-process-dispatch tests),
+    including `move_send_test.zap`'s 3 `Process.send_move` cases; and the by-construction
     scheduler-local-refcount invariant is now ALSO proven BY MEASUREMENT — the
     cross-thread detach/adopt move path (`cross_thread_stress.zig`
     `runMoveSendArcStress`, the one shape where a real heap cell crosses threads)
@@ -577,6 +578,24 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
   both `refcounted`). Cycle-collection correctness + leak-exactness proven in the manager's
   unit tests (build a cycle, drop it, collect it; acyclic reclaimed promptly; a negative
   control confirms ARC alone leaks the cycle). See ledger § E8's companion.
+  - **ORC status — honest record (P3-R1a, 2026-07-08).** ORC's cycle collection is proven at
+    the **manager-unit level**: the manager's 10 Zig unit tests build real cycles
+    (self-referential, two-node, three-node, and a join-node) through the ORC ABI, drop them,
+    and collect them leak-exact, with a **negative control** (collector off ⇒ the cycle leaks)
+    and an externally-reachable-cycle-NOT-collected control. The per-process **dispatch is
+    wired** and proven gate-ON: an ORC process's release reaches ORC's own machinery on its own
+    ORC context (`test_concurrency/per_process_refcount_dispatch_test.zap`, checksum 240). What
+    is NOT proven — and is currently INFEASIBLE — is a **surface-level end-to-end** test: a Zap
+    program that builds a reference cycle and observes it collected. Two reasons: (1) Zap is
+    **immutable**, so no `A → B → A` back-edge is expressible at the language surface (an ARC
+    reference cycle cannot be constructed in Zap code); (2) ORC's `CYCL` per-type trace
+    auto-registration (`register_cell_type`) is not yet wired to the runtime container types.
+    So **ORC-as-a-correct-per-spawn-manager is DONE**, while ORC's user-visible cycle-collection
+    VALUE is **DORMANT-UNTIL-MUTATION** — it unlocks with opportunistic-mutation / mutable-closure
+    primitives (future work). This item is manager-level-proven + dispatch-wired, NOT
+    "surface end-to-end proven." Follow-ons: (i) wire `CYCL` `register_cell_type` auto-registration
+    to the runtime container types; (ii) the `Map` O(1)-move migration (item 6.1a); (iii) mutation
+    primitives that make reference cycles constructible at the surface.
 - **3.5** Capability matrix (comptime table + runtime spawn error); wasm32 and Windows entries;
   compile-time warnings for statically-known-impossible combos.
 
@@ -631,6 +650,22 @@ correlated replies).
 - **6.1** Same-model O(1) region move: region-closure verifier constraint over
   `src/region_solver.zig` + escape lattice + uniqueness facts; slab detach/adopt (**E5**:
   truly O(1) and leak-free, else copy-on-move stays, documented).
+- **6.1a** `Map` O(1)-move migration — the numbered owner for the R4 residual
+  recorded under item 3.4. Today `Map` backing buffers allocate through
+  `c_allocator`, NOT the sending process's ARC core large-block path, so every
+  `Map` send degrades to the cross-model copy path. Per **E6** that copy is
+  catastrophic for maps specifically: `Map` reconstruct hits **2.19 ms at 1 MB**
+  (95× the serialize half, versus `List`'s 2.6×) because the receiver rebuilds
+  the hash table from scratch rather than re-parenting a page. The fix is the
+  one-call-site migration already carried by `List`: route `Map.bufferAlloc`/
+  `bufferFreeShallow` through `containerBufferAlloc`/`containerBufferFree` (the
+  exact gate-branch `List` uses, item 3.3 R4) and extend `movableFlatListCell`
+  to a `movableFlatMapCell`, so a large uniquely-owned `Map` re-parents in O(1)
+  through the same REFC **v1.2** relocate slots (`detach_region`/`adopt_region`/
+  `free_detached_region`, spec §8.6) instead of copying. Nested graphs (interior
+  ARC children in separate cells) still copy. Exit: an E6 `Map`-crossover re-run
+  shows the move path replacing the 2.19 ms/MB rebuild for large uniquely-owned
+  maps. `docs/concurrency-bench-results.md` § E6.
 - **6.2** `Blob` (atomically-refcounted immutable byte buffer; naming folds into the pending
   V8→dense rename sweep): the one sanctioned share tier; global immutable registry
   (`persistent_term` analogue).

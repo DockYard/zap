@@ -35,16 +35,19 @@
   handed to a child by sending `Process.self()` and re-typing it with
   `Process.pid`/`Pid.of` on the other side.
 
-  ## Spawn scope (Phase 2)
+  ## Spawn scope
 
   `Process.spawn` accepts a named (or capture-less) zero-parameter
   function — the shapes that lower to a bare function pointer. A
   closure with a captured environment would share the spawner's heap
   into the child unsafely without the P2-J5 walker, so it is rejected
-  at compile time. Processes are always spawned under the manifest
-  memory manager: a per-spawn manager option is not expressible in
-  this surface by design — comptime-resolved per-spawn manager
-  binding is Decision Gate 0 and lands with Phase 3 (plan item 3.1).
+  at compile time. Single-argument `Process.spawn(entry)` runs the
+  child under the manifest memory manager. Per-spawn memory managers
+  ARE live: the two-argument `Process.spawn(entry, ManagerType)` form
+  (below) binds a comptime-resolved manager AT THE SPAWN SITE — this
+  is Decision Gate 0, landed in Phase 3 (plan item 3.1, P3-J3). The
+  chosen manager's reclamation model is monomorphized into the
+  spawn-reachable call graph and recorded in the child's pid bits.
 
   ## Raw receive
 
@@ -97,11 +100,12 @@ pub struct Process {
     the program if the process table is exhausted or the runtime is
     out of memory.
 
-    Phase 2 scope: `entry` must be a named (or capture-less)
-    zero-parameter function; closures with captured environments are
-    rejected at compile time (see the struct doc). A per-spawn
-    manager option is deliberately absent until Phase 3's Decision
-    Gate 0 (plan item 3.1).
+    Scope: `entry` must be a named (or capture-less) zero-parameter
+    function; closures with captured environments are rejected at
+    compile time (see the struct doc). This single-argument form runs
+    the child under the manifest memory manager; to bind a per-spawn
+    manager, use the two-argument `Process.spawn(entry, ManagerType)`
+    form below (Decision Gate 0, landed in Phase 3 — plan item 3.1).
     """
 
   pub fn spawn(entry :: fn() -> Nil) -> u64 {

@@ -1367,15 +1367,18 @@ end-to-end links the P3-J5 job left un-run.
   `./zig-out/bin/zap run test_concurrency` — the `build.zap` `:test_concurrency`
   manifest target (`runtime_concurrency: true`, root
   `TestConcurrency.TestRunner`, glob `test_concurrency/**/*_test.zap`) — reports
-  **56 tests, 0 failures; 110 assertions, 0 failures** (process exit 0). The gate
-  is baked into the manifest target (no `-Druntime-concurrency=on` needed). The
-  56 include `test_concurrency/move_send_test.zap`'s 3 `Process.send_move` cases
+  **59 tests, 0 failures; 117 assertions, 0 failures** (process exit 0) at HEAD
+  (**56 tests / 110 assertions** as of P3-J5; the suite grew by P3-J6 and P3-R1a —
+  see the suite-growth line below). The gate is baked into the manifest target
+  (no `-Druntime-concurrency=on` needed). These include
+  `test_concurrency/move_send_test.zap`'s 3 `Process.send_move` cases
   (confirmed present by name in the `--timings` per-test list): a LARGE
   uniquely-owned `List` move-sends and the receiver gets the whole value; a SMALL
   slab-backed `List` transparently degrades to copy and still delivers; a moved
   `List` is a fresh value the receiver solely owns. Use-after-move stays a
   compile error (pinned in `src/zir_integration_tests.zig`). Suite growth:
-  50/0 (P3-J3) → 53/0 (P3-J4) → **56/0 (P3-J5)**.
+  50/0 (P3-J3) → 53/0 (P3-J4) → 56/0 (P3-J5) → 57/0 (P3-J6, `orc_test.zap`) →
+  **59/0 (P3-R1a, per-process retain/release dispatch tests)**.
 
 - **Scheduler-local-refcount invariant across the move — now by MEASUREMENT.**
   The manager-level claim rests the cross-thread safety of detach/adopt on
@@ -1655,8 +1658,17 @@ fiber's live span word-by-word (binary-search interval containment); best-of-5.
   objects retained, even with adversarial full-range stack words. The 48-bit
   address space makes the tracked heap a vanishing fraction (512 × 48 B ≈ 24 KB
   of 2⁴⁸), so a non-pointer word almost never lands interior to an object.
-* **Scan is COMPLETE** — all 32 genuine pointers found, confirming the spilled
-  callee-saved registers are covered by the `[sp, top())` sweep.
+* **Scan is COMPLETE over the stack span** — all 32 genuine pointers found,
+  confirming the `[sp, top())` sweep covers the entire live stack. Note the 32
+  planted pointers live in an on-stack buffer, so this result measures *stack*
+  completeness directly; it does not by itself exercise a pointer held only in a
+  callee-saved register. Register coverage is argued **structurally** (the file
+  header's Darwin/aarch64 finding): the context-switch asm clobbers `x19–x28`/
+  `x30`, forcing the compiler to spill every live callee-saved register onto the
+  fiber's own stack around the yield, so any register-resident pointer is already
+  within the swept `[sp, top())` span — there is no separate register save area
+  the sweep could miss. The 32/32 measurement confirms the span is swept
+  completely; the asm-clobber argument is what makes that span sufficient.
 
 ### Verdict: PASS — `Memory.GC` (TRACED) ships as a per-process spawn option
 
@@ -1696,8 +1708,14 @@ three-node cycle are built through the ORC ABI, dropped, and reclaimed
 (leak-exact via the backing allocator's leak check — a negative control with the
 collector disabled reports the cycle leaked); acyclic data is reclaimed promptly
 by the ARC base with no regression; an externally-reachable cycle is NOT wrongly
-collected. **Hypothesis: CONFIRMED — ORC shares the REFCOUNTED specialization
-exactly, zero additional monomorphized code.**
+collected. These are **manager-unit-level** proofs (cycles built in Zig through
+the ABI); a **surface-level** Zap-builds-a-cycle test is infeasible today because
+Zap is immutable (no `A → B → A` back-edge is expressible) and `CYCL`'s per-type
+`register_cell_type` auto-registration is not yet wired to the runtime container
+types — so ORC-as-a-correct-manager is done while its user-visible cycle
+collection is **dormant-until-mutation** (see plan item 3.4). **Hypothesis:
+CONFIRMED — ORC shares the REFCOUNTED specialization exactly, zero additional
+monomorphized code.**
 
 ## Baseline comparison yardstick
 

@@ -33,6 +33,18 @@
 //!   layout-identical to v1.0 so a v1.0 consumer that reads only the
 //!   first two slots (per the `size`-field forward-extension contract
 //!   in spec §2.3) remains compatible.
+//! - REFC descriptor tier **v1.2** (spec §8.6, concurrency P3-J5):
+//!   appends `detach_region`, `adopt_region`, and `free_detached_region`
+//!   to `ZapRefcountCapabilityV1` (the same-model O(1) region-move
+//!   relocate extension), growing it from six to nine pointer slots
+//!   (48→72 bytes on 64-bit). This is a §2.3 size-field forward
+//!   extension of the REFC capability vtable, NOT a core/meta struct
+//!   change: the tier is advertised through the REFC descriptor's
+//!   `desc.size` (72), and the runtime gates the relocate path on
+//!   `desc.size >= REFCOUNT_V1_SIZE_V1_2` — never on `abi_minor`. The
+//!   first-party managers that ship it (ARC, ORC) therefore keep
+//!   `abi_minor = 1` while advertising the 72-byte vtable. Bytes 0..48
+//!   are layout-identical to v1.1.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -423,8 +435,8 @@ pub const ZapRefcountCapabilityV1 = extern struct {
     release_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
     allocate_refcounted: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
     refcount_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32,
-    // v1.2 relocate extension (32 additional bytes on 64-bit, slots 6–7; total
-    // 64 bytes): the same-model O(1) region-move send (plan item 6.1, P3-J5).
+    // v1.2 relocate extension (24 additional bytes on 64-bit, slots 6–8; total
+    // 72 bytes): the same-model O(1) region-move send (plan item 6.1, P3-J5).
     //
     //   * `detach_region` — detach a container buffer (a `core.allocate` block,
     //     e.g. a `List`/`String` backing) from the owning context so a same-model
@@ -466,9 +478,10 @@ pub const REFCOUNT_V1_SIZE_V1_0: u16 = @intCast(2 * PTR);
 /// Pointer-width relative (`6 * PTR`): 48 bytes on 64-bit, 24 on wasm32.
 pub const REFCOUNT_V1_SIZE_V1_1: u16 = @intCast(6 * PTR);
 
-/// The v1.2 byte length of `ZapRefcountCapabilityV1`, including the two
-/// relocate-extension slots (`detach_region`, `adopt_region`) — all eight
-/// pointer slots. A v1.2+ manager advertises `desc.size >= REFCOUNT_V1_SIZE_V1_2`
+/// The v1.2 byte length of `ZapRefcountCapabilityV1`, including the three
+/// relocate-extension slots (`detach_region`, `adopt_region`,
+/// `free_detached_region`) — all nine pointer slots. A v1.2+ manager
+/// advertises `desc.size >= REFCOUNT_V1_SIZE_V1_2`
 /// so the runtime can attempt the same-model O(1) region-move send; a manager
 /// advertising less falls back to the copy send. Pointer-width relative
 /// (`9 * PTR`): 72 bytes on 64-bit, 36 on wasm32.

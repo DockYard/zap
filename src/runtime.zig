@@ -1803,10 +1803,11 @@ pub const AbiV1 = struct {
     pub const REFCOUNT_V1_SIZE_V1_1: u16 = @intCast(6 * PTR);
 
     /// The v1.2 byte length of `ZapRefcountCapabilityV1`, including the
-    /// relocate-extension slots (`detach_region`, `adopt_region`). A
-    /// v1.2+ manager advertises `desc.size >= REFCOUNT_V1_SIZE_V1_2`; the
-    /// runtime may then attempt the same-model O(1) region-move send
-    /// (else it falls back to copy). Pointer-width relative (`9 * PTR`).
+    /// three relocate-extension slots (`detach_region`, `adopt_region`,
+    /// `free_detached_region`). A v1.2+ manager advertises
+    /// `desc.size >= REFCOUNT_V1_SIZE_V1_2`; the runtime may then attempt
+    /// the same-model O(1) region-move send (else it falls back to copy).
+    /// Pointer-width relative (`9 * PTR`).
     pub const REFCOUNT_V1_SIZE_V1_2: u16 = @intCast(9 * PTR);
 
     /// Options passed to the manager's `init` entry point (spec
@@ -1865,11 +1866,13 @@ pub const AbiV1 = struct {
         release_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32, deep_walk: ?ZapDeepWalkFn) callconv(.c) void,
         allocate_refcounted: *const fn (ctx: *anyopaque, size: usize, alignment: u32) callconv(.c) ?[*]u8,
         refcount_sized: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32,
-        // v1.2 relocate extension (slots 6–7): the same-model O(1) region-move
+        // v1.2 relocate extension (slots 6–8): the same-model O(1) region-move
         // send (plan item 6.1, P3-J5). `detach_region` orphans a relocatable
         // (large/page-backed) container buffer from the owning context so a
         // same-model receiver `adopt_region`s it without copying; both are O(1)
-        // list surgery, the refcount untouched. `desc.size` advertises them.
+        // list surgery, the refcount untouched. `free_detached_region` reclaims
+        // an undelivered move's orphan (context-free, any thread). `desc.size`
+        // advertises them.
         detach_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool,
         adopt_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void,
         free_detached_region: *const fn (object: *anyopaque) callconv(.c) void,
@@ -2391,7 +2394,7 @@ fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
         return;
     }
     // v1.1 descriptor: slots 0-5 (through `refcount_sized`) are real, but the
-    // relocate slots 6-7 are absent (the image is only 6*PTR bytes). Copy the
+    // relocate slots 6-8 are absent (the image is only 6*PTR bytes). Copy the
     // six real slots field-by-field — reading only within the safe image — and
     // trap-stub the relocate slots so the composed buffer is fully populated
     // (`detach_region` returns false → the move degrades to copy).

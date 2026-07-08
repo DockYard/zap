@@ -122,6 +122,19 @@ Known v1.x minors:
 |-------------|----------|-----------------------------------------------------------------------------------------------------------|
 | 0           | initial  | Baseline ABI: meta header + core vtable + `REFCOUNT_V1` with two slots (`retain`, `release`).             |
 | 1           | Phase 4.x | Extends `ZapRefcountCapabilityV1` to six slots (adds `retain_sized`, `release_sized`, `allocate_refcounted`, `refcount_sized`) for the side-table refcount path used by generic `Arc(T)`. Purely additive — a v1.0 manager remains valid; a v1.1 consumer reading a v1.0 manager observes `desc.size = 16` for the REFC descriptor and routes generic `Arc(T)` allocations through `core.allocate` instead of `allocate_refcounted`. See section 8 for details. |
+| 2           | concurrency P3-J5 | Extends `ZapRefcountCapabilityV1` to nine slots (adds `detach_region`, `adopt_region`, `free_detached_region`) — the same-model O(1) region-move relocate extension — for a total `desc.size = 72` (64-bit; `9 * PTR`). Purely additive: a v1.1/48-byte manager remains valid, and a v1.2 consumer reading it observes `desc.size = 48`, treats the three relocate slots as absent, and falls back to the cross-model **copy** send. See sections 8, 8.0, and 10.6. |
+
+> **Note on the minor-2 relocate extension and `desc.size`.** Every `REFCOUNT_V1`
+> extension is a §2.3 size-field forward extension of one capability vtable, not
+> a change to any core or meta struct. Consumers therefore decide which REFC tier
+> a manager provides from the **REFC descriptor's `desc.size`** (16 / 48 / 72),
+> and gate the relocate path on `desc.size >= 72` — **never** on `meta.abi_minor`.
+> The first-party managers that ship the relocate extension (ARC, ORC) provide
+> the full 72-byte vtable while still advertising `meta.abi_minor = 1`; that
+> remains valid precisely because `desc.size`, not `abi_minor`, is the feature
+> gate. The minor-2 row records the ABI milestone at which the relocate slots
+> became normative, in the same spirit as a spec-version milestone whose
+> individual features are discovered through feature/extension records (§2.3).
 
 ### 2.2 Capability versioning
 
@@ -762,6 +775,8 @@ A "DEFINED" capability has a normative struct shape in this spec. A v1.0 manager
 
 A "RESERVED" capability has a reserved tag and bit position but no committed struct shape. A v1.0 manager **must not** set its bit in `declared_caps`. The compiler rejects managers that declare reserved bits.
 
+Not every DEFINED capability has a `declared_caps` bit. A capability that needs **no compiler-side codegen hook** — one that is purely manager-internal and discovered at runtime through `core.get_capability_desc(tag)` — is exposed as a **descriptor-only** capability with no entry in the section 7.1 table. The `CYCL` cycle-collection capability (section 8.7, exposed by `Memory.ORC`) is the canonical example: ORC declares only `REFCOUNT_V1` on Axis A (byte-identical to ARC) and advertises its collector as the `CYCL` descriptor, so it needs no Axis bit of its own.
+
 ### 7.3 Why a hand-curated table
 
 A hash-mod-64 scheme would risk collisions as the namespace grows; sequential hand-curated assignment guarantees stability and makes the relationship between tag and bit position trivially inspectable. The table is small enough that hand-curation is not a maintenance burden.
@@ -770,14 +785,15 @@ A hash-mod-64 scheme would risk collisions as the namespace grows; sequential ha
 
 ## 8. `ZapRefcountCapabilityV1`
 
-This is the only fully-defined capability in v1.x. A manager that supports atomic reference counting declares the `REFC` bit and exposes a `ZapRefcountCapabilityV1` vtable.
+`REFCOUNT_V1` is the primary fully-defined capability in v1.x (the descriptor-only `CYCL` cycle-collection capability, section 8.7, is the second). A manager that supports atomic reference counting declares the `REFC` bit and exposes a `ZapRefcountCapabilityV1` vtable.
 
-The vtable evolved across two ABI minors:
+The vtable evolved across three REFC descriptor size tiers (see the `desc.size` gate in 8.0; the tier is advertised through `desc.size`, not through `meta.abi_minor` — see the note under 2.1):
 
-- **v1.0** (`abi_minor = 0`) defines two function-pointer slots — `retain` and `release` — totalling 16 bytes. These cover the inline-header refcount path: the manager reads the refcount from a known offset inside the cell pointer the runtime passes in.
-- **v1.1** (`abi_minor = 1`) appends four additional slots — `retain_sized`, `release_sized`, `allocate_refcounted`, and `refcount_sized` — totalling 48 bytes. These cover the side-table refcount path used by the runtime's generic `Arc(T)` cells (the cell's pointer addresses the user payload directly with no inline refcount header; the refcount lives in a separate side-table keyed by the cell's owning slab base).
+- **v1.0** (`desc.size = 16`) defines two function-pointer slots — `retain` and `release` — totalling 16 bytes. These cover the inline-header refcount path: the manager reads the refcount from a known offset inside the cell pointer the runtime passes in.
+- **v1.1** (`desc.size = 48`) appends four additional slots — `retain_sized`, `release_sized`, `allocate_refcounted`, and `refcount_sized` — totalling 48 bytes. These cover the side-table refcount path used by the runtime's generic `Arc(T)` cells (the cell's pointer addresses the user payload directly with no inline refcount header; the refcount lives in a separate side-table keyed by the cell's owning slab base).
+- **v1.2** (`desc.size = 72`) appends three further slots — `detach_region`, `adopt_region`, and `free_detached_region` — totalling 72 bytes. These are the same-model O(1) region-move relocate extension (concurrency P3-J5): a large, page-backed container buffer (a `core.allocate` block such as a `List`/`String` backing that is a standalone `>4096 B` block, not slab-interleaved) can be **re-parented** from a sending process's heap into a same-model receiver's heap without copying. `detach_region` unlinks the buffer from the owning context and returns `true` when the buffer is relocatable (`false` when it is slab-interleaved and the caller must copy instead); `adopt_region` relinks a detached buffer into this context; `free_detached_region` reclaims a detached-but-never-adopted buffer (an undelivered move — dead-lettered, or a mailbox drained at receiver teardown). The mover proves `rc == 1` before detaching, so the refcount is untouched on both sides. See 8.6 for the detailed slot contracts and 10.6 for how the send path chooses move-vs-copy.
 
-The extension is purely additive. The first 16 bytes of the vtable are bit-identical between v1.0 and v1.1. A v1.0 consumer reading only the first two slots remains compatible with a v1.1 manager (per the size-field forward-extension contract in section 2.3). A v1.1+ consumer that loads a v1.0 manager observes `desc.size = 16`, treats the four trailing slots as absent, and routes generic `Arc(T)` allocations through `core.allocate` instead of `allocate_refcounted`.
+The extension is purely additive at every tier. The first 16 bytes of the vtable are bit-identical across v1.0/v1.1/v1.2, and the first 48 bytes are bit-identical across v1.1/v1.2. A v1.0 consumer reading only the first two slots remains compatible with any manager (per the size-field forward-extension contract in section 2.3). A v1.1+ consumer that loads a v1.0 manager observes `desc.size = 16`, treats the trailing slots as absent, and routes generic `Arc(T)` allocations through `core.allocate` instead of `allocate_refcounted`. A v1.2 consumer that loads a v1.1 manager observes `desc.size = 48`, treats the three relocate slots as absent, and falls back to the cross-model copy send (10.6) for every send — the O(1) move is available only when both endpoints advertise `desc.size >= 72`.
 
 ```zig
 /// Compiler-emitted deep-walk callback. When the refcount of an object
@@ -800,7 +816,10 @@ pub const ZapDeepWalkFn = *const fn (object: *anyopaque) callconv(.c) void;
 /// Slots 0 and 1 (`retain`, `release`) are mandatory and define ABI v1.0.
 /// Slots 2 through 5 (`retain_sized`, `release_sized`, `allocate_refcounted`,
 /// `refcount_sized`) are the ABI v1.1 forward-extension; managers built
-/// against v1.0 omit them and advertise `desc.size = 16`.
+/// against v1.0 omit them and advertise `desc.size = 16`. Slots 6 through 8
+/// (`detach_region`, `adopt_region`, `free_detached_region`) are the ABI v1.2
+/// relocate forward-extension (section 8.6); managers built against v1.1 omit
+/// them and advertise `desc.size = 48`.
 pub const ZapRefcountCapabilityV1 = extern struct {
     /// Increment the reference count of `object`. Must be atomic
     /// (relaxed/monotonic ordering is sufficient for retain; the
@@ -920,11 +939,56 @@ pub const ZapRefcountCapabilityV1 = extern struct {
         size: usize,
         alignment: u32,
     ) callconv(.c) u32,
+
+    // -----------------------------------------------------------------
+    // ABI v1.2 relocate extension (slots 6-8). Managers built against
+    // v1.1 omit these fields entirely and advertise `desc.size = 48`.
+    // Managers built against v1.2+ MUST provide all three slots and
+    // advertise `desc.size >= 72`. See section 8.6 for the full contracts.
+    // -----------------------------------------------------------------
+
+    /// Detach a relocatable container buffer (`object`, a `core.allocate`
+    /// block whose `size`/`alignment` were its original allocation
+    /// parameters) from the owning context so a same-model receiver can
+    /// `adopt_region` it WITHOUT copying. Returns `true` when the buffer
+    /// is relocatable (a standalone page-backed block re-parented in
+    /// O(1)); returns `false` when it is slab-interleaved and the caller
+    /// must fall back to a copy send. The mover has already proven the
+    /// buffer is uniquely owned (`rc == 1`), so the refcount is untouched.
+    detach_region: *const fn (
+        ctx: *anyopaque,
+        object: *anyopaque,
+        size: usize,
+        alignment: u32,
+    ) callconv(.c) bool,
+
+    /// Adopt a previously-`detach_region`ed buffer into this context so
+    /// this context's teardown (and the buffer's eventual free) reclaims
+    /// it. Must only be called on a buffer for which `detach_region`
+    /// returned `true`. The refcount is untouched (the mover proved
+    /// `rc == 1`).
+    adopt_region: *const fn (
+        ctx: *anyopaque,
+        object: *anyopaque,
+        size: usize,
+        alignment: u32,
+    ) callconv(.c) void,
+
+    /// Reclaim a detached-but-never-adopted buffer — an undelivered move
+    /// (dead-lettered, or a mailbox drained at receiver teardown).
+    /// Context-free and race-free: it reads the size/alignment from the
+    /// block itself and performs no tracking-list surgery, so it is safe
+    /// to call from any thread with no current process quantum. Only
+    /// valid on a buffer for which `detach_region` returned `true` and
+    /// which was never `adopt_region`ed.
+    free_detached_region: *const fn (
+        object: *anyopaque,
+    ) callconv(.c) void,
 };
 
 comptime {
-    if (@sizeOf(ZapRefcountCapabilityV1) != 48) @compileError(
-        "ZapRefcountCapabilityV1 (ABI v1.1) must be exactly 48 bytes on a " ++
+    if (@sizeOf(ZapRefcountCapabilityV1) != 72) @compileError(
+        "ZapRefcountCapabilityV1 (ABI v1.2) must be exactly 72 bytes on a " ++
         "64-bit target with 8-byte function-pointer alignment",
     );
 }
@@ -934,16 +998,19 @@ comptime {
 
 A manager advertises which slots it provides through the `size` field of its `ZapCapabilityDescV1`:
 
-| `desc.size` (bytes) | ABI minor | Slots provided                                                                                  |
+| `desc.size` (bytes) | REFC tier | Slots provided                                                                                  |
 |---------------------|-----------|-------------------------------------------------------------------------------------------------|
 | `16`                | v1.0      | `retain`, `release`                                                                             |
 | `48`                | v1.1      | `retain`, `release`, `retain_sized`, `release_sized`, `allocate_refcounted`, `refcount_sized`   |
-| `> 48`              | future    | All v1.1 slots plus additional trailing fields. Consumers read up to their known size and ignore the trailer per section 2.3. |
+| `72`                | v1.2      | All v1.1 slots plus `detach_region`, `adopt_region`, `free_detached_region` (the relocate extension, section 8.6) |
+| `> 72`              | future    | All v1.2 slots plus additional trailing fields. Consumers read up to their known size and ignore the trailer per section 2.3. |
 | `< 16`              | invalid   | The compiler rejects the manager at section-validation time (`ValidationFailed`).               |
 
-A v1.1+ consumer (the current Zap runtime) inspects `desc.size` at startup. When `desc.size >= 48` the runtime takes the side-table path for generic `Arc(T)` allocations: `allocate_refcounted` → `retain_sized` → `release_sized` → `refcount_sized`. When `desc.size == 16` (a v1.0 manager) the runtime instead routes those allocations through `core.allocate` (with the v1.0 manager owning whichever inline-header layout it prefers). The first two slots — `retain` and `release` — are used identically in both modes for inline-header cells (Map, List, MapIter).
+The tier column names the REFC descriptor size tier, advertised through `desc.size` (72 bytes = `9 * PTR` on a 64-bit target). It is NOT the same as `meta.abi_minor`: the relocate extension is a section-2.3 size-field forward extension of the REFC vtable, so a manager may provide the 72-byte v1.2 vtable while still declaring `meta.abi_minor = 1` — as the first-party ARC and ORC managers do (see the note under 2.1). Consumers gate on `desc.size`, never on `abi_minor`.
 
-Reserved upper bound: the compiler caps the accepted `desc.size` at `8 * sizeof(ZapRefcountCapabilityV1) = 384` bytes. A larger value is treated as a corrupt manager image and rejected at validation time. This matches the same upper-bound discipline applied to `meta.size` and `core.size` (see sections 3.5 and 4).
+A v1.1+ consumer (the current Zap runtime) inspects `desc.size` at startup. When `desc.size >= 48` the runtime takes the side-table path for generic `Arc(T)` allocations: `allocate_refcounted` → `retain_sized` → `release_sized` → `refcount_sized`. When `desc.size >= 72` it additionally enables the same-model O(1) region-move send (10.6) — it may call `detach_region` on a send and `adopt_region`/`free_detached_region` on the receiver; when `desc.size == 48` every send falls back to the cross-model copy path. When `desc.size == 16` (a v1.0 manager) the runtime instead routes those allocations through `core.allocate` (with the v1.0 manager owning whichever inline-header layout it prefers). The first two slots — `retain` and `release` — are used identically in every mode for inline-header cells (Map, List, MapIter).
+
+Reserved upper bound: the compiler caps the accepted `desc.size` at `8 × 48 = 384` bytes — eight times the 48-byte v1.1 REFC vtable length (`8 * targetRefcountSizeV1_1`; the bound is deliberately anchored to the v1.1 size, not the current struct size, so extending the vtable never silently widens the acceptance window). A larger value is treated as a corrupt manager image and rejected at validation time. This matches the same upper-bound discipline applied to `meta.size` and `core.size` (see sections 3.5 and 4).
 
 ### 8.1 Object header expectations
 
@@ -977,6 +1044,92 @@ The manager is the sole authority on *when* to invoke `deep_walk`. The compiler 
 ### 8.5 No-op when capability absent
 
 If a manager does not declare `REFCOUNT_V1`, the compiler statically elides every retain and release in user code (the calls simply do not appear in the emitted IR). This is the central optimization that makes non-refcounting managers cell-overhead-free; see section 10 for how the elision is wired through the build pipeline.
+
+### 8.6 The v1.2 relocate extension (`detach_region` / `adopt_region` / `free_detached_region`)
+
+The three slots appended at `desc.size = 72` implement the **same-model O(1) region-move send** (concurrency P3-J5). When a process sends a message to a same-model peer, the runtime may relocate a large, uniquely-owned container buffer between the two per-process heaps by re-parenting it, instead of deep-copying it through the cross-model walker (10.6). This is the mechanism behind `Process.send_move`.
+
+Applicability. A buffer is relocatable only when it is a **standalone, page-backed block** — a `core.allocate` allocation large enough (`> 4096 B` under the first-party ARC/ORC slab geometry) to be an independent `page_allocator`/`mmap` region tracked purely by intrusive membership in the owning context's large-block list. A **slab-interleaved** buffer (`≤ 4096 B`, sharing a 64-KiB slab with unrelated cells) cannot be re-parented per-cell; for such buffers `detach_region` returns `false` and the caller copies instead. The move is therefore an *optimization for large payloads*; small payloads transparently degrade to copy and still deliver.
+
+Uniqueness precondition. The mover proves the buffer is uniquely owned (`rc == 1`) **before** calling `detach_region`. No relocate slot touches the refcount: the sole reference is what is being handed across, so re-parenting the block is sufficient and the scheduler-local-refcount invariant (no cross-thread refcount mutation) holds by construction.
+
+The slot contracts:
+
+- **`detach_region(ctx, object, size, alignment) -> bool`** — Unlink `object` (a `core.allocate` block, its original `size`/`alignment` supplied so the manager can recover its bookkeeping) from `ctx`'s ownership. Return `true` when the buffer was relocatable and is now detached (orphaned — owned by neither heap until adopted); return `false` when it is slab-interleaved and the caller must copy. O(1): a single unlink from the large-block list.
+- **`adopt_region(ctx, object, size, alignment) -> void`** — Relink a detached buffer into `ctx` so `ctx`'s teardown and the buffer's eventual free reclaim it. Called on the receiver's heap after a successful `detach_region` on the sender's. O(1): a single relink. The refcount is untouched.
+- **`free_detached_region(object) -> void`** — Reclaim a detached-but-never-adopted buffer: an **undelivered move** (dead-lettered because the target exited, or still sitting in a mailbox drained at receiver teardown). Deliberately **context-free** — it takes no `ctx` and performs no tracking-list surgery, recovering the size/alignment from the block header itself — so it is safe to call from any thread that holds no process quantum. This is the leak-safety valve: every detached block is eventually either adopted or freed here.
+
+Both endpoints of a move MUST advertise `desc.size >= 72`. A same-model pair where either side is only v1.1 (`desc.size = 48`) has no relocate slots to call, so the runtime uses the copy send for that traffic. Cross-model traffic (different reclamation models) is ALWAYS a copy regardless of `desc.size` (10.6); the relocate path is same-model only.
+
+### 8.7 `ZapCycleCollectCapabilityV1` (`CYCL`) — descriptor-only cycle collection
+
+`CYCL` is the second fully-defined capability shape, exposed by the ORC (`Memory.ORC`) manager. ORC is a Bacon–Rajan trial-deletion cycle collector layered over the refcount ABI: it declares `REFCOUNT_V1` and exposes the identical `ZapRefcountCapabilityV1` vtable as ARC, and adds `CYCL` to reclaim genuinely-unreachable reference cycles that pure refcounting would leak.
+
+**`CYCL` is a descriptor-only capability — it has NO `declared_caps` bit** (it does not appear in the section 7.1 table). This is deliberate and load-bearing:
+
+- ORC's `declared_caps` is `CAP_REFCOUNT_V1` (`0x1`) — **byte-identical to ARC**. On Axis A (the reclamation-model selector, section 7.2) ORC is `REFCOUNTED`, exactly like ARC. `elision.reclamationModel(declared_caps)` therefore returns `.refcounted` for ORC, and the compiler keys ORC onto ARC's `.refcounted` monomorphization specialization: an ARC process and an ORC process emit and run **identical** retain/release code. There is no ORC-specific codegen.
+- The cycle collector is entirely **manager-internal**: the cycle-root buffering lives inside ORC's `release`/`release_sized` (a runtime black box behind the REFC vtable slots), and the `CYCL` vtable carries only the manager-facing registration and trigger. Because collection needs no compiler-side codegen hook, it needs no Axis bit; a new capability *descriptor* is sufficient (this is the "at most a new capability descriptor" the ORC design permits — never a new Axis-A model).
+
+Discovery. ORC embeds no descriptors in its `.zapmem` blob (`desc_count = 0`); both its `REFC` and `CYCL` descriptors are served dynamically through `core.get_capability_desc(tag)`. A consumer obtains the `CYCL` descriptor by calling `get_capability_desc(ctx, 'CYCL')`; a manager that does not implement cycle collection (ARC) returns `null` for that tag and is entirely unaffected.
+
+The vtable (`desc.version = 1`, `desc.size = 16` on a 64-bit target — two pointer slots):
+
+```zig
+/// The collector-supplied visitor a trace calls once per Arc'd child,
+/// reporting the child cell pointer and the child's own `deep_walk` (the
+/// stable per-type key the collector recurses under).
+pub const OrcVisitFn = *const fn (
+    visitor_ctx: *anyopaque,
+    child: *anyopaque,
+    child_deep_walk: ?ZapDeepWalkFn,
+) callconv(.c) void;
+
+/// Per-type "shallow finalize" for cycle reclamation: free the cell's owned
+/// NON-cell storage (e.g. a `List`'s element buffer) WITHOUT releasing its
+/// Arc'd children (the collector frees those by recursion). Null for
+/// self-contained cells (mutually-referencing structs / closures — the
+/// canonical cycle shape).
+pub const OrcFinalizeFn = *const fn (cell: *anyopaque) callconv(.c) void;
+
+/// Non-destructive per-type child enumerator (the Bacon-Rajan `children(S)`):
+/// for each Arc'd child of `cell` it calls `visit(visitor_ctx, child,
+/// child_deep_walk)`. Generated per type from the same field walk that
+/// generates `deep_walk`.
+pub const OrcTraceFn = *const fn (
+    cell: *anyopaque,
+    visitor_ctx: *anyopaque,
+    visit: OrcVisitFn,
+) callconv(.c) void;
+
+pub const ZapCycleCollectCapabilityV1 = extern struct {
+    /// Register a cyclic type's cell shape, keyed by its `deep_walk`
+    /// pointer (a stable per-type identity). Idempotent. Until a type is
+    /// registered, its cells are conservatively treated as leaves — never
+    /// buffered, never collected (safe over-retention, never a wrong free).
+    /// `is_inline` distinguishes the 4-byte inline-header refcount
+    /// (Map/List/MapIter `core.allocate` cells) from the manager
+    /// side-table refcount (`allocate_refcounted` cells); `finalize`
+    /// optionally frees the cell's owned non-cell storage during shallow
+    /// cycle reclamation (null for self-contained cells).
+    register_cell_type: *const fn (
+        ctx: *anyopaque,
+        deep_walk: ?ZapDeepWalkFn,
+        trace: OrcTraceFn,
+        cell_size: usize,
+        cell_align: u32,
+        is_inline: bool,
+        finalize: ?OrcFinalizeFn,
+    ) callconv(.c) void,
+
+    /// Force a full trial-deletion collection now (the yield-point /
+    /// teardown trigger; also reachable for tests). Acyclic data is
+    /// unaffected — it is already reclaimed promptly by the ARC base at
+    /// the zero-transition; only buffered cycle roots are scanned here.
+    collect_cycles: *const fn (ctx: *anyopaque) callconv(.c) void,
+};
+```
+
+Status. ORC-as-a-per-spawn-manager is complete and correct: the collector is proven leak-exact in the manager's own unit tests (self-referential, two-node, three-node, and join-node cycles built through the ABI, dropped, and reclaimed; a negative control confirms that without collection the cycle leaks; an externally-reachable cycle is NOT wrongly collected), and the per-process dispatch is wired (an ORC process's release reaches ORC's machinery). The **surface-level** value of cycle collection — a Zap program building a reference cycle and observing it reclaimed — is currently DORMANT: Zap is immutable, so no `A → B → A` back-edge is expressible at the language surface, and `CYCL`'s per-type `register_cell_type` auto-registration is not yet wired to the runtime container types. Both are future work (mutable-closure / opportunistic-mutation primitives, and the `register_cell_type` wiring). See `docs/concurrency-implementation-plan.md` item 3.4.
 
 ---
 
@@ -1416,14 +1569,20 @@ never a shared pointer; P3-J4 makes that copy correct across models.
   bounding a long-lived receiver's footprint to its own lifetime. The receiver
   model governs the ERROR-path cleanup discipline (the table's last column).
 
-- **No ABI minor bump.** The cross-model COPY path reuses the receiver's
-  existing v1.0 `core.allocate` as the adoption primitive — allocating a fresh
-  cell into the receiver's heap IS the adoption. No new manager-ABI entry point
-  is required, so `abi_minor` stays as-is. (The detach/adopt entry points
-  contemplated for the future O(1) same-model region MOVE — reparenting a
-  detachable fragment between two heaps of the same model without copying —
-  would be the additive minor bump when that path lands; the copy path needs
-  none.)
+- **The copy path adds no new ABI entry point.** The cross-model COPY path
+  reuses the receiver's existing v1.0 `core.allocate` as the adoption primitive —
+  allocating a fresh cell into the receiver's heap IS the adoption. The copy
+  path itself requires no new manager-ABI slot. The separate O(1) same-model
+  region MOVE — reparenting a detachable fragment between two heaps of the same
+  model without copying — DID land (concurrency P3-J5) as the REFC **v1.2**
+  relocate extension: the `detach_region` / `adopt_region` / `free_detached_region`
+  slots, advertised through the REFC descriptor's `desc.size = 72` (sections 8.6
+  and 8.0). Because that extension is a section-2.3 size-field forward extension
+  of the REFC vtable, it is gated on `desc.size`, and the first-party managers
+  advertise it while keeping `meta.abi_minor = 1` (see the note under 2.1). The
+  copy path documented here is the always-available fallback for the traffic the
+  move path does not cover — every cross-model send, and any same-model send of a
+  slab-interleaved (non-relocatable) buffer.
 
 - **Pid {model, generation} validation gates the send.** A sender resolves the
   target pid through `pid_table.lookup` (§ the generational pid table), which
@@ -2308,7 +2467,11 @@ Offset  Size  Field               Notes
 ------  ----  ------------------  ------------------------------------------
 0x00    4     magic               'ZMEM' as u32 (target-endianness)
 0x04    2     abi_major           1
-0x06    2     abi_minor           0 (v1.0) or 1 (v1.1; see section 2.1)
+0x06    2     abi_minor           0 or 1 in shipping managers. NOT the REFC
+                                  tier selector — the REFC vtable tier (v1.0/
+                                  v1.1/v1.2) is advertised through the REFC
+                                  descriptor's desc.size, and v1.2 managers
+                                  declare abi_minor = 1 (see the note under 2.1).
 0x08    2     size                32 in v1.x (sizeof(ZapMemoryManagerMetaV1))
 0x0A    2     _reserved2          Reserved; must be 0
 0x0C    4     desc_count          Number of embedded ZapCapabilityDescV1
@@ -2351,7 +2514,7 @@ Entry offset relative to start of entry:
 0x00    4     id              FourCC tag as u32 (target-endianness)
 0x04    2     version         Per-capability version
 0x06    2     size            sizeof(vtable struct). For REFCOUNT_V1: 16
-                                (v1.0) or 48 (v1.1). See section 8.
+                                (v1.0), 48 (v1.1), or 72 (v1.2). See section 8.
 0x08    4     flags           Capability-specific; SHOULD be 0 in v1.0
                                 (unknown bits are silently ignored)
 0x0C    4     (padding)       Zero-filled; required for 8-byte align
@@ -2364,14 +2527,14 @@ Entry offset relative to start of entry:
 The `vtable` field of a REFCOUNT_V1 descriptor points at an out-of-section vtable whose length is given by `desc.size`. The byte layout of the vtable proper:
 
 ```
-v1.0 (desc.size = 16, abi_minor = 0):
+v1.0 (desc.size = 16):
 Offset  Size  Field        Notes
 ------  ----  -----------  -----------------------------------------
 0x00    8     retain       Function pointer (callconv(.c))
 0x08    8     release      Function pointer (callconv(.c))
 0x10    -     -            (end of v1.0 vtable; total 16 bytes)
 
-v1.1 (desc.size = 48, abi_minor = 1):
+v1.1 (desc.size = 48):
 Offset  Size  Field                Notes
 ------  ----  -------------------  -----------------------------------------
 0x00    8     retain               Function pointer (callconv(.c)). Identical
@@ -2383,9 +2546,18 @@ Offset  Size  Field                Notes
 0x20    8     allocate_refcounted  Function pointer (callconv(.c)). v1.1+.
 0x28    8     refcount_sized       Function pointer (callconv(.c)). v1.1+.
 0x30    -     -                    (end of v1.1 vtable; total 48 bytes)
+
+v1.2 (desc.size = 72) — the relocate extension (section 8.6):
+Offset  Size  Field                 Notes
+------  ----  --------------------  ----------------------------------------
+0x00    48    (v1.1 prefix)         Slots 0-5, bit-identical to v1.1.
+0x30    8     detach_region         Function pointer (callconv(.c)). v1.2+.
+0x38    8     adopt_region          Function pointer (callconv(.c)). v1.2+.
+0x40    8     free_detached_region  Function pointer (callconv(.c)). v1.2+.
+0x48    -     -                     (end of v1.2 vtable; total 72 bytes)
 ```
 
-The first 16 bytes are bit-identical across both minors — v1.1 is an additive extension. A consumer that knows only v1.0 reads `desc.size = 16` for a v1.0 manager (or `desc.size = 48` for a v1.1 manager and ignores the trailer per section 2.3). A v1.1+ consumer reads up to the slot count it understands and routes generic `Arc(T)` allocations to `allocate_refcounted` only when `desc.size >= 48`.
+The first 16 bytes are bit-identical across all three tiers, and the first 48 bytes across v1.1/v1.2 — each tier is an additive size-field extension (section 2.3). A consumer that knows only v1.0 reads `desc.size = 16` for a v1.0 manager (or the advertised size for a higher-tier manager and ignores the trailer). A v1.1+ consumer routes generic `Arc(T)` allocations to `allocate_refcounted` only when `desc.size >= 48`, and enables the same-model O(1) region-move slots only when `desc.size >= 72`. The tier is advertised through `desc.size`, independent of `meta.abi_minor` (the note under 2.1): first-party v1.2 managers advertise `desc.size = 72` while declaring `abi_minor = 1`.
 
 ### B.4 Total `.zapmem` section size
 
