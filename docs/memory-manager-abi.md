@@ -1294,9 +1294,11 @@ The compiled `<manager>.o` is content-addressed by `(zig_fork_version, manager_s
 
 The build pipeline above resolves ONE manifest-default manager and registers its
 backend source as `zap_active_manager`. Under the concurrency runtime a process
-may instead select its own manager at spawn: `Process.spawn(f, .{ .manager = X
-})` (Decision Gate 0 — `X` is comptime-resolved at the spawn site). This
-generalizes the single-manager pipeline into an indexed **manager registry**:
+may instead select its own manager at spawn: `Process.spawn(f, Memory.X)`
+(Decision Gate 0 — `Memory.X` is a comptime first-class `Type` value resolved at
+the spawn site; Zap has no anonymous-struct literal, so the manager type is
+passed directly rather than wrapped in an options struct). This generalizes the
+single-manager pipeline into an indexed **manager registry**:
 
 - **Driver.** For a gated-on binary the driver resolves + validates EVERY
   manager referenced by a spawn site PLUS the manifest default (each through the
@@ -1348,6 +1350,25 @@ generalizes the single-manager pipeline into an indexed **manager registry**:
   model, specializes the spawn-reachable subgraph per model (retain/release
   elided for a BULK_OR_NEVER Arena process, emitted for a REFCOUNTED ARC
   process), and rewires each site to `spawn_process_at(clone, index)`.
+
+- **Build orchestration (landed P3-J3-FINISH).** `src/main.zig`
+  (`SpawnManagerAccumulator`) injects the driver-backed resolver into
+  `CompileOptions.spawn_manager_resolver`: each spawn site's `Memory.X` resolves
+  through the SAME adapter → backend → `.zapmem` → `declared_caps` →
+  `reclamationModel` path the manifest default takes, accumulating the distinct
+  non-manifest managers. `src/zir_backend.zig`
+  (`generateManagerRegistrySource`) then registers each backend as a
+  `zap_spawn_manager_<index>` sibling module and synthesizes the
+  `zap_manager_registry` module (`entries` = `{index, core}`), and a
+  `RuntimeSourceControls.multi_manager` rewrite stage flips
+  `RUNTIME_MULTI_MANAGER_DEFAULT` ON. The incremental manifest daemon recreates
+  its persistent context bound to the discovered manager family
+  (`SpawnManagerSetChanged` → retry). **Symbol coexistence:** N managers in one
+  binary each emit `zap_memory_section`, so a manager emits that mandatory LINKER
+  SYMBOL only when compiled as a standalone `.Obj` (`builtin.output_mode ==
+  .Obj` — the validation object + object-linked hosts, the sole readers of the
+  symbol); compiler-driven `.Exe`/`.Lib` sibling modules bind via their module
+  DECL (`@import("...").zap_memory_section`), so none emits the colliding symbol.
 
 ---
 

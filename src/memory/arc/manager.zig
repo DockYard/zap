@@ -1545,35 +1545,40 @@ pub const zap_memory_section: ZapMemorySection = .{
     },
 };
 
-// Emit the mandatory `zap_memory_section` LINKER SYMBOL only in non-test
-// builds. (The `pub const` above always stays visible as a Zig decl — see
-// below — so this gates ONLY the exported symbol, not the value.)
+// Emit the mandatory `zap_memory_section` LINKER SYMBOL only when this manager
+// is compiled as a STANDALONE OBJECT (`builtin.output_mode == .Obj`). (The
+// `pub const` above always stays visible as a Zig decl — see below — so this
+// gates ONLY the exported symbol, not the value.)
 //
-// `zap_memory_section` is a MANDATORY exported symbol (spec §3.2): the
-// runtime's `externalMemorySection` discovers it via a weak `@extern`, and
-// the driver's post-link check (`assertExportsManagerSymbol`) enforces its
-// presence in every standalone-compiled manager object. Production manager
-// objects are built by `zap_fork_compile_zig_to_object`, which is never a
-// test build, so the symbol is always present where the contract requires it.
+// `zap_memory_section` is the manager's `.zapmem` payload (spec §3.2). It is
+// read through the linker symbol in exactly two places, BOTH of which compile
+// the manager as a standalone `.Obj`:
+//   1. The build driver's validation object (`zap_fork_compile_zig_to_object`,
+//      which emits an object) — the driver parses `.zapmem` from it and its
+//      post-link check (`assertExportsManagerSymbol`) enforces the symbol's
+//      presence.
+//   2. An object-linked host that links a pre-compiled manager `.o` and binds
+//      it through `runtime.zig`'s weak `externalMemorySection` extern.
 //
-// The value must ALSO remain a `pub const` decl unconditionally: the Phase-4
-// source-registered dispatch path (`runtime.zig`'s `bindSourceActiveManager`)
-// reads it directly as `active_manager.zap_memory_section` via `@hasDecl` —
-// a Zig-decl access, NOT the linker symbol — so a user binary that registers
-// this manager as its active source needs the decl regardless of `export`.
+// In a COMPILER-DRIVEN binary (`.Exe`/`.Lib`) the manager is instead registered
+// as a sibling SOURCE MODULE (`zap_active_manager`, or a per-spawn
+// `zap_spawn_manager_<index>`; docs/memory-manager-abi.md §10.5) and the runtime
+// binds it through that module's DECL — `@import("...").zap_memory_section` —
+// NOT the linker symbol (`RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT` is rewritten to
+// true for every user binary, so the weak-extern path is dead there). Gating
+// emission on `.Obj` is therefore what lets N managers coexist as sibling
+// modules in ONE binary (per-spawn managers) — each keeps its own `pub const`
+// storage while NONE emits the colliding `zap_memory_section` symbol. It also
+// subsumes the old `!builtin.is_test` gate: a `zig build test` binary is an
+// `.Exe`, so no manager exports the symbol into the aggregated test binary.
 //
-// Under `builtin.is_test` the SYMBOL is dead: `runtime.zig`'s
-// `externalMemorySection` early-returns null in test mode (see its
-// `if (builtin.is_test) return null;` guard), so no test ever reads the
-// section through the linker. Gating EMISSION on `!builtin.is_test` lets BOTH
-// the ARC and Tracking managers be imported into the same `zig build test`
-// binary (`src/root.zig`'s aggregation) without colliding on the single,
-// strongly-linked `zap_memory_section` symbol — two unconditional `export`s
-// of the same name in one binary is a duplicate-symbol link error. The
-// `.section` reproduces the prior `linksection(SECTION_NAME)` byte-for-byte.
+// `.linkage = .weak` is retained as defence-in-depth for the object-linked
+// shape: it keeps two independently-compiled manager `.o`s (each an `.Obj`
+// export) from hard-colliding if both are ever linked. `.section` reproduces
+// the prior `linksection(SECTION_NAME)` byte-for-byte.
 comptime {
-    if (!builtin.is_test) {
-        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME });
+    if (builtin.output_mode == .Obj) {
+        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME, .linkage = .weak });
     }
 }
 

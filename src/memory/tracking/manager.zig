@@ -1512,15 +1512,18 @@ pub const zap_memory_section: ZapMemorySection = .{
 // as `active_manager.zap_memory_section` via `@hasDecl` — a decl access, not
 // the linker symbol.
 //
-// Under `builtin.is_test` the symbol is dead — `runtime.zig`'s
-// `externalMemorySection` early-returns null in test mode — so gating
-// emission on `!builtin.is_test` lets the Tracking and ARC managers coexist
-// in the same `zig build test` binary (`src/root.zig`'s aggregation) without
-// a duplicate `zap_memory_section` symbol. The `.section` reproduces the
-// prior `linksection(SECTION_NAME)` byte-for-byte.
+// Emission is gated on `builtin.output_mode == .Obj` — a standalone-object
+// compile (the driver's validation object + object-linked hosts), the only
+// readers of the linker symbol. In a compiler-driven `.Exe`/`.Lib`, Tracking is
+// bound via its sibling-module decl (`active_manager.zap_memory_section`), so it
+// must not emit the colliding symbol; gating on `.Obj` lets N managers coexist
+// as sibling modules in one binary (manifest + per-spawn `zap_spawn_manager_*`,
+// docs/memory-manager-abi.md §10.5) and subsumes the old `!is_test` gate (a test
+// binary is an `.Exe`). See `src/memory/arc/manager.zig` for the full rationale.
+// `.section` reproduces the prior `linksection(SECTION_NAME)` byte-for-byte.
 comptime {
-    if (!builtin.is_test) {
-        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME });
+    if (builtin.output_mode == .Obj) {
+        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME, .linkage = .weak });
     }
 }
 

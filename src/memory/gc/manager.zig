@@ -266,8 +266,8 @@ const HEAP_GROWTH_DENOMINATOR: usize = 1;
 /// of classes; covers the common Zap cell sizes (List/Map/String/struct cells)
 /// up to `MAX_SLAB_CLASS_BYTES`.
 const SIZE_CLASSES = [_]usize{
-    16,   32,   48,   64,    96,    128,  192,
-    256,  384,  512,  768,   1024,  1536, 2048,
+    16,   32,   48,   64,   96,   128,  192,
+    256,  384,  512,  768,  1024, 1536, 2048,
     3072, 4096, 6144, 8192,
 };
 
@@ -1262,17 +1262,18 @@ pub const zap_memory_section: ZapMemorySection = .{
 // built by `zap_fork_compile_zig_to_object`, which is never a test build, so
 // the symbol is always present where the contract requires it.
 //
-// Under `builtin.is_test` the SYMBOL is dead: `runtime.zig`'s
-// `externalMemorySection` early-returns null in test mode, so no test reads the
-// section through the linker. Gating EMISSION on `!builtin.is_test` lets the
-// GC manager be aggregated into the same `zig build test` binary alongside the
-// ARC and Tracking managers (`src/root.zig`) without colliding on the single,
-// strongly-linked `zap_memory_section` symbol — two unconditional `export`s of
-// the same name in one binary is a duplicate-symbol link error. The `.section`
-// reproduces the prior `linksection(SECTION_NAME)` byte-for-byte.
+// Emission is gated on `builtin.output_mode == .Obj` — a standalone-object
+// compile (the driver's validation object + object-linked hosts), the only
+// readers of the linker symbol. In a compiler-driven `.Exe`/`.Lib`, GC is bound
+// via its sibling-module decl (`active_manager.zap_memory_section`), so it must
+// not emit the colliding symbol; gating on `.Obj` lets N managers coexist as
+// sibling modules in one binary (manifest + per-spawn `zap_spawn_manager_*`,
+// docs/memory-manager-abi.md §10.5) and subsumes the old `!is_test` gate (a test
+// binary is an `.Exe`). See `src/memory/arc/manager.zig` for the full rationale.
+// `.section` reproduces the prior `linksection(SECTION_NAME)` byte-for-byte.
 comptime {
-    if (!builtin.is_test) {
-        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME });
+    if (builtin.output_mode == .Obj) {
+        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME, .linkage = .weak });
     }
 }
 

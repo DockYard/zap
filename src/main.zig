@@ -7975,6 +7975,26 @@ fn compileAndLink(
         kernel_object_node.succeed();
     }
 
+    // P3-J3: the driver-backed per-spawn manager resolver + registry accumulator
+    // (docs/memory-manager-abi.md §10.5). Threaded into the frontend pipeline so
+    // the spawn-manager pass resolves each `spawn(f, .{ .manager = X })` site's
+    // comptime manager to a reclamation model + registry index via the SAME
+    // adapter/driver path the manifest default took. Its `registrations` (the
+    // DISTINCT non-manifest managers) are read AFTER the frontend to drive the
+    // ZIR backend's `zap_manager_registry` generation + the runtime multi-manager
+    // gate. Empty for every build with no `.manager` spawn — the zero-cost path.
+    // Lives across both the frontend (resolver runs during monomorphize) and the
+    // backend compile below; the resolver captures its address.
+    var spawn_manager_accumulator = SpawnManagerAccumulator{
+        .alloc = alloc,
+        .source_roots = inputs.source_roots,
+        .source_units = inputs.source_units,
+        .target_name = target_name,
+        .build_opts = inputs.build_opts,
+        .driver_options_template = memory_driver_options,
+        .manifest_backend_source_path = resolved_manager.active_manager_source_path,
+    };
+
     // Compile through frontend
     // Use per-file pipeline for import-driven discovery, legacy pipeline for glob
     var frontend_node = ScopedProgressNode.start(progress, compile_parent_node, "Frontend compile");
@@ -7992,6 +8012,7 @@ fn compileAndLink(
         .ctfe_optimize = @tagName(config.optimize),
         .io = global_io,
         .declared_caps = resolved_manager.declared_caps,
+        .spawn_manager_resolver = spawn_manager_accumulator.resolver(),
     }) catch |err| {
         if (isUserDiagnosedCompileError(err)) {
             std.process.exit(1);
@@ -8094,6 +8115,14 @@ fn compileAndLink(
                 // the kernel object below resolves the resulting
                 // `zap_proc_*` extern references.
                 .runtime_concurrency = runtime_concurrency_enabled,
+                // P3-J3: flips the runtime's comptime per-spawn manager gate
+                // (`RUNTIME_MULTI_MANAGER_DEFAULT`) when the build resolved at
+                // least one NON-manifest spawn manager, arming per-process
+                // `currentManagerCore` dispatch + the startup
+                // `@import("zap_manager_registry")` the ZIR backend generates
+                // below. OFF (no `.manager` spawn) keeps the comptime-bound
+                // manifest `active_manager` direct calls — byte-identical to pre-J3.
+                .multi_manager = spawn_manager_accumulator.registrations.items.len > 0,
             },
         ),
         .output_mode = output_mode_val,
@@ -8112,6 +8141,12 @@ fn compileAndLink(
         // wire intact end-to-end.
         .declared_caps = resolved_manager.declared_caps,
         .active_manager_source_path = resolved_manager.active_manager_source_path,
+        // P3-J3: the DISTINCT non-manifest per-spawn managers (registry index
+        // ≥ 1). The ZIR backend links each backend as a `zap_spawn_manager_<index>`
+        // sibling module and synthesizes the `zap_manager_registry` module the
+        // gated runtime imports at startup. Empty ⇒ single-manager binary
+        // (nothing generated; the multi-manager gate above stays OFF).
+        .spawn_managers = spawn_manager_accumulator.registrations.items,
         // P2-J1: the content-addressed kernel object spliced into the
         // link line when the concurrency gate is ON; null keeps the
         // zero-cost OFF posture.
@@ -8188,6 +8223,203 @@ fn compileAndLink(
     const artifact = try makeBuildArtifact(allocator, output_path, config.kind, compile_target, config.pipeline);
     compile_parent_succeeded = true;
     return artifact;
+}
+
+/// P3-J3 driver-backed per-spawn manager resolver + registry accumulator
+/// (`docs/memory-manager-abi.md` §10.5). Injected into the frontend pipeline as
+/// a `monomorphize.SpawnManagerResolver`; the spawn-manager pass calls
+/// `resolveCallback` for each `spawn(f, .{ .manager = X })` site's comptime
+/// manager type. Resolution reuses the EXACT path the manifest default takes —
+/// scope-graph adapter resolution (`builder.evaluateMemoryManagerAdapterFromSources`)
+/// → package backend + `.zapmem` validation (`memory_driver.resolve`) →
+/// `declared_caps` → `memory_elision.reclamationModel` — so the compiler never
+/// hardcodes a manager name. Per-spawn managers resolve with
+/// `gate_target_support = false` (unsound target×model combos stay LINKABLE; the
+/// soundness check becomes a runtime spawn error). The DISTINCT non-manifest
+/// managers accumulate into `registrations` (registry indices 1..; the manifest
+/// default is index 0 = `zap_active_manager`), which the ZIR backend turns into
+/// the linked `zap_spawn_manager_<index>` sibling modules + the
+/// `zap_manager_registry` module. All allocation uses the build arena, freed
+/// wholesale when `buildTarget` returns.
+const SpawnManagerAccumulator = struct {
+    alloc: std.mem.Allocator,
+    source_roots: []const zap.discovery.SourceRoot,
+    source_units: []const compiler.SourceUnit,
+    target_name: []const u8,
+    build_opts: std.StringHashMapUnmanaged([]const u8),
+    driver_options_template: zap.memory_driver.ResolveOptions,
+    /// The manifest default manager's resolved backend source path. A spawn site
+    /// naming the SAME manager resolves to registry index 0 (no separate slot).
+    manifest_backend_source_path: []const u8,
+
+    /// Dedup cache keyed by the surface manager type name (e.g. "Memory.Arena"):
+    /// a repeated spawn under the same manager returns its cached model + index
+    /// without re-running the heavy adapter/driver resolution.
+    resolved: std.ArrayListUnmanaged(ResolvedEntry) = .empty,
+    /// The NON-manifest managers (registry index ≥ 1) the ZIR backend must link
+    /// and register. Empty ⇒ a single-manager binary (the multi-manager gate
+    /// stays OFF).
+    registrations: std.ArrayListUnmanaged(zir_backend.SpawnManagerRegistration) = .empty,
+
+    const ResolvedEntry = struct {
+        type_name: []const u8,
+        model: zap.hir.ReclamationModel,
+        registry_index: u32,
+    };
+
+    /// The injected resolver view over this accumulator. Valid only while the
+    /// accumulator is live (its address is captured), which spans the frontend
+    /// compile that runs the spawn-manager pass.
+    fn resolver(self: *SpawnManagerAccumulator) zap.monomorphize.SpawnManagerResolver {
+        return .{ .context = self, .resolveFn = resolveCallback };
+    }
+
+    fn resolveCallback(
+        context: *anyopaque,
+        manager_type_name: []const u8,
+    ) zap.monomorphize.SpawnManagerResolveError!zap.monomorphize.ResolvedSpawnManager {
+        const self: *SpawnManagerAccumulator = @ptrCast(@alignCast(context));
+        return self.resolveManager(manager_type_name);
+    }
+
+    fn resolveManager(
+        self: *SpawnManagerAccumulator,
+        manager_type_name: []const u8,
+    ) zap.monomorphize.SpawnManagerResolveError!zap.monomorphize.ResolvedSpawnManager {
+        // Dedup: a manager seen at a prior spawn site is resolved exactly once.
+        for (self.resolved.items) |entry| {
+            if (std.mem.eql(u8, entry.type_name, manager_type_name)) {
+                return .{ .model = entry.model, .registry_index = entry.registry_index };
+            }
+        }
+
+        // Scope-graph adapter resolution: the manager type name → its declaring
+        // `impl Memory.Manager for X` source file (the adapter source path). This
+        // is the SAME resolver the manifest default uses, so nothing is hardcoded.
+        const adapter_eval = zap.builder.evaluateMemoryManagerAdapterFromSources(
+            self.alloc,
+            self.source_roots,
+            self.source_units,
+            .{ .type_name = manager_type_name, .adapter_source_path = null },
+            self.target_name,
+            self.build_opts,
+        ) catch |err| {
+            std.debug.print(
+                "Error: could not resolve adapter for per-spawn memory manager '{s}': {s}\n",
+                .{ manager_type_name, @errorName(err) },
+            );
+            return error.ManagerResolutionFailed;
+        };
+        const adapter = adapter_eval.manager orelse {
+            std.debug.print(
+                "Error: per-spawn memory manager '{s}' does not implement Memory.Manager\n",
+                .{manager_type_name},
+            );
+            return error.ManagerResolutionFailed;
+        };
+        const adapter_source_path = adapter.adapter_source_path orelse {
+            std.debug.print(
+                "Error: per-spawn memory manager '{s}' has no resolvable adapter source path\n",
+                .{manager_type_name},
+            );
+            return error.ManagerResolutionFailed;
+        };
+
+        // Package backend + `.zapmem` validation → declared_caps. The unsound
+        // target×model gate is disabled here (§10.5): the backend stays linkable
+        // and a bad combo faults only if a process actually spawns it.
+        var driver_diag_buffer: [4096]u8 = undefined;
+        var driver_diag: zap.memory_driver.DriverDiagnostic = .{ .buffer = &driver_diag_buffer };
+        var options = self.driver_options_template;
+        options.adapter = .{ .type_name = adapter.type_name, .adapter_source_path = adapter_source_path };
+        options.gate_target_support = false;
+
+        const resolved_manager = zap.memory_driver.resolve(self.alloc, options, &driver_diag) catch |err| {
+            std.debug.print(
+                "Error: per-spawn memory manager '{s}' resolution failed: {s}\n  {s}\n",
+                .{ manager_type_name, @errorName(err), driver_diag.text() },
+            );
+            return error.ManagerResolutionFailed;
+        };
+
+        const model = zap.memory_elision.reclamationModel(resolved_manager.declared_caps);
+
+        // Registry index assignment: the manifest default is slot 0 (already
+        // linked as `zap_active_manager`); every DISTINCT non-manifest manager
+        // gets the next dense slot (1..) and a registration for the ZIR backend.
+        const registry_index: u32 = blk: {
+            if (std.mem.eql(u8, resolved_manager.active_manager_source_path, self.manifest_backend_source_path)) {
+                break :blk 0;
+            }
+            const new_index: u32 = @intCast(self.registrations.items.len + 1);
+            const backend_path_copy = self.alloc.dupe(u8, resolved_manager.active_manager_source_path) catch return error.OutOfMemory;
+            self.registrations.append(self.alloc, .{
+                .index = new_index,
+                .backend_source_path = backend_path_copy,
+            }) catch return error.OutOfMemory;
+            break :blk new_index;
+        };
+
+        const type_name_copy = self.alloc.dupe(u8, manager_type_name) catch return error.OutOfMemory;
+        self.resolved.append(self.alloc, .{
+            .type_name = type_name_copy,
+            .model = model,
+            .registry_index = registry_index,
+        }) catch return error.OutOfMemory;
+
+        return .{ .model = model, .registry_index = registry_index };
+    }
+};
+
+/// Deep-copy a spawn-manager registration slice into `allocator` (each
+/// `backend_source_path` too), so it can outlive the build arena that produced
+/// it — used to persist a rebuild's discovered set on the incremental state and
+/// to hand it off across a context recreation.
+fn dupeSpawnManagerRegistrations(
+    allocator: std.mem.Allocator,
+    registrations: []const zir_backend.SpawnManagerRegistration,
+) ![]const zir_backend.SpawnManagerRegistration {
+    if (registrations.len == 0) return &.{};
+    const out = try allocator.alloc(zir_backend.SpawnManagerRegistration, registrations.len);
+    errdefer allocator.free(out);
+    var filled: usize = 0;
+    errdefer for (out[0..filled]) |registration| allocator.free(registration.backend_source_path);
+    for (registrations, 0..) |registration, index| {
+        out[index] = .{
+            .index = registration.index,
+            .backend_source_path = try allocator.dupe(u8, registration.backend_source_path),
+        };
+        filled = index + 1;
+    }
+    return out;
+}
+
+/// Free a spawn-manager registration slice previously produced by
+/// `dupeSpawnManagerRegistrations`. Safe on the empty slice.
+fn freeSpawnManagerRegistrations(
+    allocator: std.mem.Allocator,
+    registrations: []const zir_backend.SpawnManagerRegistration,
+) void {
+    if (registrations.len == 0) return;
+    for (registrations) |registration| allocator.free(registration.backend_source_path);
+    allocator.free(registrations);
+}
+
+/// Whether two spawn-manager registration sets are identical (same registry
+/// indices bound to the same backend source paths, in order). The resolver
+/// assigns indices deterministically, so a stable set compares equal across
+/// rebuilds; a differing set means the persistent context (pinned to its
+/// manager family at creation) must be rebuilt.
+fn spawnManagerRegistrationsEqual(
+    a: []const zir_backend.SpawnManagerRegistration,
+    b: []const zir_backend.SpawnManagerRegistration,
+) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.index != right.index) return false;
+        if (!std.mem.eql(u8, left.backend_source_path, right.backend_source_path)) return false;
+    }
+    return true;
 }
 
 fn compileProjectFrontend(
@@ -9564,6 +9796,14 @@ const IncrementalError = error{
     BackendError,
     CacheMetadataError,
     OutOfMemory,
+    /// P3-J3: `rebuild`'s resolver-wired frontend discovered a per-spawn manager
+    /// set (docs/memory-manager-abi.md §10.5) that differs from the one the
+    /// persistent context was created with. The context bakes in the manager
+    /// family (sibling modules + `zap_manager_registry` + `multi_manager`
+    /// runtime rewrite), so it must be recreated bound to the discovered set —
+    /// `establishIncrementalWatchState` retries with `discovered_spawn_managers`.
+    /// Never produced by a single-manager build (the resolver is never called).
+    SpawnManagerSetChanged,
 };
 
 const InteractiveWatchSetupError = IncrementalInitError || IncrementalError;
@@ -9610,6 +9850,7 @@ fn classifyInteractiveWatchSetupFailure(
     return switch (err) {
         error.FrontendError,
         error.ContextInvalidated,
+        error.SpawnManagerSetChanged,
         error.ReadError,
         error.ManifestError,
         error.DiscoveryError,
@@ -9665,6 +9906,10 @@ fn classifyInteractiveWatchRebuildFailure(
 
     return switch (err) {
         error.ContextInvalidated => .rebuild_fresh_context,
+        // P3-J3: a spawn-manager set change requires a fresh context bound to the
+        // new manager family (the retry inside `establishIncrementalWatchState`
+        // supplies the discovered set on recreation).
+        error.SpawnManagerSetChanged => .rebuild_fresh_context,
         else => .wait_for_next_change,
     };
 }
@@ -9834,6 +10079,7 @@ test "incremental watch init propagates allocator OOM" {
             false,
             null,
             null,
+            &.{},
         ),
     );
 }
@@ -9932,6 +10178,21 @@ const IncrementalWatchState = struct {
     /// into the rebuild metadata cache key so gated-on watch artifacts
     /// are keyed to the exact kernel sources they linked.
     concurrency_kernel_key: []const u8,
+    /// P3-J3: the NON-manifest per-spawn managers this persistent context was
+    /// CREATED with (registry index ≥ 1; docs/memory-manager-abi.md §10.5). The
+    /// context bakes in each `zap_spawn_manager_<index>` sibling module + the
+    /// `zap_manager_registry` module + the `multi_manager` runtime rewrite, so a
+    /// change to this set requires a fresh context (surfaced as
+    /// `ContextInvalidated` by `rebuild`). Empty for every single-manager binary
+    /// — then this whole axis is inert and the context is byte-identical to
+    /// pre-J3. Owned by `allocator`; freed in `deinit`.
+    spawn_managers: []const zir_backend.SpawnManagerRegistration = &.{},
+    /// P3-J3: the per-spawn manager set the MOST RECENT `rebuild` discovered
+    /// (via the resolver-wired frontend). When it differs from `spawn_managers`
+    /// the context is stale; `rebuild` records the new set here and returns
+    /// `ContextInvalidated` so `rebuildManifestDaemonState` can recreate the
+    /// context bound to it. Owned by `allocator`; freed in `deinit`.
+    discovered_spawn_managers: []const zir_backend.SpawnManagerRegistration = &.{},
 
     fn deinit(self: *IncrementalWatchState) void {
         zir_backend.destroyContext(self.zir_ctx);
@@ -9944,6 +10205,8 @@ const IncrementalWatchState = struct {
         if (self.target) |target| self.allocator.free(target);
         self.allocator.free(self.active_manager_source_path);
         self.allocator.free(self.concurrency_kernel_key);
+        freeSpawnManagerRegistrations(self.allocator, self.spawn_managers);
+        freeSpawnManagerRegistrations(self.allocator, self.discovered_spawn_managers);
         self.manifest_arena.deinit();
     }
 
@@ -9966,6 +10229,10 @@ const IncrementalWatchState = struct {
         collect_arc_stats: bool,
         zap_lib_dir_override: ?[]const u8,
         progress: ?*zap.progress.Reporter,
+        // P3-J3: the NON-manifest per-spawn managers to bake into the persistent
+        // context (empty on first creation; populated by a prior `rebuild`'s
+        // discovery when a context is recreated for a multi-manager binary).
+        spawn_managers: []const zir_backend.SpawnManagerRegistration,
     ) IncrementalInitError!IncrementalWatchState {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -10207,6 +10474,10 @@ const IncrementalWatchState = struct {
                     .memory_startup_prologue_emitted = has_generated_executable_startup_prologue,
                     .collect_arc_stats = collect_arc_stats,
                     .runtime_concurrency = runtime_concurrency_enabled,
+                    // P3-J3: arm the per-process manager gate when this context is
+                    // being created for a multi-manager binary (mirrors the direct
+                    // `compileAndLink` path). Empty ⇒ OFF ⇒ byte-identical to pre-J3.
+                    .multi_manager = spawn_managers.len > 0,
                 },
             ),
             .output_mode = output_mode_val,
@@ -10217,6 +10488,10 @@ const IncrementalWatchState = struct {
             .incremental = true,
             .declared_caps = declared_caps,
             .active_manager_source_path = active_manager_source_path_owned,
+            // P3-J3: the per-spawn manager backends the ZIR backend links as
+            // `zap_spawn_manager_<index>` sibling modules + the generated
+            // `zap_manager_registry` module (docs/memory-manager-abi.md §10.5).
+            .spawn_managers = spawn_managers,
             .concurrency_kernel_object_path = if (resolved_concurrency_kernel) |resolved_kernel|
                 resolved_kernel.object_path
             else
@@ -10272,6 +10547,10 @@ const IncrementalWatchState = struct {
             .active_manager_source_digest = active_manager_source_digest,
             .runtime_concurrency = runtime_concurrency_enabled,
             .concurrency_kernel_key = concurrency_kernel_key_owned,
+            // P3-J3: pin the manager family this context was created with, so
+            // `rebuild` can detect a spawn-manager set change and force a fresh
+            // context. Deep-copied into the persistent allocator.
+            .spawn_managers = dupeSpawnManagerRegistrations(allocator, spawn_managers) catch return error.OutOfMemory,
         };
     }
 
@@ -10435,6 +10714,47 @@ const IncrementalWatchState = struct {
         }
         profileLap(&profile_timer, "memory validation", .{});
 
+        // P3-J3: the driver-backed per-spawn manager resolver + accumulator,
+        // mirroring the direct `compileAndLink` path (docs/memory-manager-abi.md
+        // §10.5). Wired into the incremental frontend below so the spawn-manager
+        // pass resolves each `spawn(f, .{ .manager = X })` site. The discovered
+        // NON-manifest managers are reconciled AFTER the frontend against the set
+        // the persistent context was created with; a difference forces a fresh
+        // context (`SpawnManagerSetChanged`). For a single-manager binary NO
+        // managed-spawn site exists, the resolver is never called, and the
+        // accumulator stays empty — the incremental path is byte-identical to
+        // pre-J3. The driver `ResolveOptions` template mirrors `init`'s manifest
+        // resolution so a per-spawn manager resolves the same way the manifest
+        // default did.
+        const rebuild_optimize_policy = optimizePolicyForBuildConfig(config.optimize);
+        const rebuild_zap_source_tree_root: []const u8 = if (self.manifest_zap_lib_dir) |lib_dir|
+            (std.fs.path.dirname(lib_dir) orelse project_root)
+        else
+            project_root;
+        const rebuild_memory_driver_source_roots = sourceRootsForMemoryDriver(alloc, self.manifest_source_roots) catch return error.OutOfMemory;
+        var spawn_manager_accumulator = SpawnManagerAccumulator{
+            .alloc = alloc,
+            .source_roots = self.manifest_source_roots,
+            .source_units = manifest_sources.source_units,
+            .target_name = target_name,
+            .build_opts = build_opts,
+            .driver_options_template = .{
+                .adapter = .{ .type_name = "", .adapter_source_path = null },
+                .source_roots = rebuild_memory_driver_source_roots,
+                .project_root = project_root,
+                .zap_source_root = rebuild_zap_source_tree_root,
+                .cache_dir = ".zap-cache/memory",
+                .zig_lib_dir = self.zig_lib_dir,
+                .compiler_identity_digest = self.compiler_identity_digest,
+                .zig_lib_identity_digest = self.zig_lib_identity_digest,
+                .optimize = rebuild_optimize_policy.memory_driver_optimize,
+                .target = self.target,
+                .cpu = config.cpu,
+                .progress = progress,
+            },
+            .manifest_backend_source_path = self.active_manager_source_path,
+        };
+
         if (progress) |reporter| reporter.stage("Frontend: compiling Zap sources", .{});
         var frontend_prepared = self.frontend_state.prepare(alloc, manifest_sources.source_units, .{
             .file_to_structs = &manifest_sources.source_file_to_structs,
@@ -10461,10 +10781,26 @@ const IncrementalWatchState = struct {
             // code did) would strip every refcount op even under a
             // REFCOUNT_V1 manager and silently leak every Arc cell.
             .declared_caps = self.declared_caps,
+            .spawn_manager_resolver = spawn_manager_accumulator.resolver(),
         }) catch |err| return incrementalErrorOrStatus(err, error.FrontendError);
         defer frontend_prepared.deinit();
         var result = frontend_prepared.result;
         profileLap(&profile_timer, "frontend", .{});
+
+        // P3-J3: reconcile the discovered per-spawn manager set with the one the
+        // persistent context was created with. A difference (a spawn site added,
+        // removed, or retargeted to a different manager) means the context — which
+        // baked in the `zap_spawn_manager_<index>` sibling modules, the
+        // `zap_manager_registry` module, and the `multi_manager` runtime rewrite —
+        // is stale. Record the discovered set (into the persistent allocator so it
+        // survives this build arena) and force a fresh context bound to it; the
+        // retry in `establishIncrementalWatchState` supplies it to `init`.
+        if (!spawnManagerRegistrationsEqual(spawn_manager_accumulator.registrations.items, self.spawn_managers)) {
+            const discovered = dupeSpawnManagerRegistrations(self.allocator, spawn_manager_accumulator.registrations.items) catch return error.OutOfMemory;
+            freeSpawnManagerRegistrations(self.allocator, self.discovered_spawn_managers);
+            self.discovered_spawn_managers = discovered;
+            return error.SpawnManagerSetChanged;
+        }
 
         // Resolve entry point
         if (config.root) |root| {
@@ -13959,6 +14295,13 @@ fn tryManifestDaemonBuild(
     zap_lib_dir_override: ?[]const u8,
     progress_node: ?zap.progress.Node,
 ) !ManifestDaemonBuildResult {
+    // Escape hatch: `ZAP_NO_MANIFEST_DAEMON` forces the direct (non-daemon)
+    // build path. Useful for CI determinism, debugging, and any build the
+    // persistent single-manager daemon context cannot serve incrementally.
+    if (std.c.getenv("ZAP_NO_MANIFEST_DAEMON") != null) {
+        return .{ .fallback = .daemon_unavailable };
+    }
+
     const endpoint_path = try manifestDaemonEndpointPath(scratch_allocator, invocation_identity);
     defer scratch_allocator.free(endpoint_path);
     const log_path = try manifestDaemonLogPath(scratch_allocator, invocation_identity);
@@ -14130,6 +14473,12 @@ fn rebuildManifestDaemonState(
         ) catch |err| switch (err) {
             error.ContextInvalidated,
             error.BackendContextInvalidated,
+            // P3-J3: an edit changed the per-spawn manager set; the persistent
+            // context is pinned to its manager family, so tear it down and
+            // recreate. `ensureManifestDaemonState` → `establishIncrementalWatchState`
+            // rediscovers the set and binds the fresh context to it (its retry
+            // loop handles the empty→discovered transition).
+            error.SpawnManagerSetChanged,
             => {
                 if (daemon_state.watch_snapshot) |*snapshot| snapshot.deinit(allocator);
                 daemon_state.watch_snapshot = null;
@@ -14379,13 +14728,39 @@ fn establishIncrementalWatchState(
     zap_lib_dir_override: ?[]const u8,
     progress_reporter: ?*zap.progress.Reporter,
 ) InteractiveWatchSetupError!IncrementalWatchState {
-    var state = try IncrementalWatchState.init(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, progress_reporter);
-    errdefer state.deinit();
-    state.rebuild(allocator, project_root, target_name, build_opts, build_overrides, &.{}, zap_lib_dir_override, progress_reporter) catch |err| {
-        std.debug.print("Initial incremental build failed ({s})\n", .{@errorName(err)});
-        return err;
-    };
-    return state;
+    // P3-J3: the manager family we (re)create the persistent context with. A
+    // fresh session starts empty (single-manager assumption); the retry below
+    // rebinds it to whatever the initial resolver-wired build DISCOVERS, so a
+    // multi-manager binary converges on a correctly-bound context. Owned across
+    // iterations.
+    var attempt_spawn_managers: []const zir_backend.SpawnManagerRegistration = &.{};
+    defer freeSpawnManagerRegistrations(allocator, attempt_spawn_managers);
+
+    // The initial build may discover a per-spawn manager set differing from what
+    // the context was created with (`SpawnManagerSetChanged`); recreate the
+    // context bound to the discovered set and retry. The resolver assigns
+    // registry indices deterministically, so this converges in ONE retry — a
+    // second change would be a bug and propagates as a hard failure.
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        var state = try IncrementalWatchState.init(allocator, project_root, target_name, build_opts, build_overrides, collect_arc_stats, zap_lib_dir_override, progress_reporter, attempt_spawn_managers);
+        state.rebuild(allocator, project_root, target_name, build_opts, build_overrides, &.{}, zap_lib_dir_override, progress_reporter) catch |err| {
+            if (err == error.SpawnManagerSetChanged and attempt == 0) {
+                const discovered = dupeSpawnManagerRegistrations(allocator, state.discovered_spawn_managers) catch {
+                    state.deinit();
+                    return error.OutOfMemory;
+                };
+                state.deinit();
+                freeSpawnManagerRegistrations(allocator, attempt_spawn_managers);
+                attempt_spawn_managers = discovered;
+                continue;
+            }
+            state.deinit();
+            std.debug.print("Initial incremental build failed ({s})\n", .{@errorName(err)});
+            return err;
+        };
+        return state;
+    }
 }
 
 /// Watch source files for changes and rebuild (and optionally re-run) on change.

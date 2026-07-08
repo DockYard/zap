@@ -3579,8 +3579,21 @@ fn foldableExpr(a: *const hir.Expr, b: *const hir.Expr) bool {
         .call => |ca| blk: {
             const cb = b.kind.call;
             // Call targets are compared by variant only: a redirected clone
-            // legitimately points at a different (same-model) group id.
-            if (@as(std.meta.Tag(hir.CallTarget), ca.target) != @as(std.meta.Tag(hir.CallTarget), cb.target)) break :blk false;
+            // legitimately points at a different (same-model) group id. The
+            // model redirect ALSO rewrites a RESOLVABLE `.named` call into a
+            // `.direct` call on the same-model clone (see
+            // `redirectCallTargetForModel`'s `.named` arm), so a source `.named`
+            // paired with a clone `.direct` is exactly that intended, ICF-neutral
+            // redirect — both lower to a direct call to the resolved target — not
+            // a semantic leak. Every OTHER variant mismatch (e.g. `.direct` ↔
+            // `.closure`, a hot→cold boundary change) is a real structural
+            // divergence and correctly flags.
+            const source_target_tag = @as(std.meta.Tag(hir.CallTarget), ca.target);
+            const clone_target_tag = @as(std.meta.Tag(hir.CallTarget), cb.target);
+            if (source_target_tag != clone_target_tag) {
+                const named_to_direct_redirect = source_target_tag == .named and clone_target_tag == .direct;
+                if (!named_to_direct_redirect) break :blk false;
+            }
             if (ca.args.len != cb.args.len) break :blk false;
             for (ca.args, cb.args) |arg_a, arg_b| {
                 if (!foldableExpr(arg_a.expr, arg_b.expr)) break :blk false;
@@ -4268,17 +4281,31 @@ fn resolveNamedCallGroup(allocator: Allocator, program: *const hir.Program, inte
     return null;
 }
 
-/// Extract the `Memory.X` type NAME from a `.{ .manager = X }` options struct.
-/// Returns null when the option is absent or the manager value is not a
-/// comptime-known first-class `Type` value (the Decision Gate 0 signal).
-fn extractManagerTypeName(interner: *ast.StringInterner, options_arg: *const hir.Expr) ?[]const u8 {
-    if (options_arg.kind != .struct_init) return null;
-    for (options_arg.kind.struct_init.fields) |field| {
+/// Extract the `Memory.X` type NAME the spawn site's manager argument names.
+/// Two surface shapes reduce to the same comptime-known first-class `Type`:
+///
+///   * The bare manager type — `Process.spawn(entry, Memory.Arena)`. The
+///     argument IS the `Type` value (`hir.buildTypeValueExpr`: a struct-init
+///     carrying a single `name` atom field), read directly by `typeValueName`.
+///   * An options struct carrying a `.manager` field — the forward-compatible
+///     shape reserved for future spawn options (`.manager` + siblings). The
+///     field value is itself a `Type` value.
+///
+/// Returns null when neither shape names a comptime-known manager type (a
+/// runtime value, a non-`Type` expression) — the Decision Gate 0 signal that
+/// makes a non-comptime `.manager` a compile error at the call site.
+fn extractManagerTypeName(interner: *ast.StringInterner, manager_arg: *const hir.Expr) ?[]const u8 {
+    if (manager_arg.kind != .struct_init) return null;
+    // Options-struct shape: a `.manager` field wins when present.
+    for (manager_arg.kind.struct_init.fields) |field| {
         if (std.mem.eql(u8, interner.get(field.name), "manager")) {
             return typeValueName(interner, field.value);
         }
     }
-    return null;
+    // Bare-manager shape: the argument itself is the `Type` value. A Type value
+    // is a struct-init with a `name` field (never a `manager` field), so this
+    // fallthrough is unambiguous with the options-struct branch above.
+    return typeValueName(interner, manager_arg);
 }
 
 /// A first-class `Type` value lowers to a struct-init with a single `name`
@@ -6180,6 +6207,17 @@ fn directCallBody(allocator: Allocator, callee_id: u32) !*const hir.Block {
     return blockWithExpr(allocator, call_expr);
 }
 
+/// A body that invokes a cross-struct function by NAME — the shape real stdlib
+/// callers take (`Enum.sum` → `Range.count`). The model redirect resolves such a
+/// named call to a same-model clone and rewrites it as a `.direct` call.
+fn namedCallBody(allocator: Allocator, struct_name: []const u8, name: []const u8) !*const hir.Block {
+    const call_expr = try testExpr(allocator, .{ .call = .{
+        .target = .{ .named = .{ .struct_name = struct_name, .name = name } },
+        .args = &.{},
+    } }, TypeStore.NIL, .{ .start = 0, .end = 0 });
+    return blockWithExpr(allocator, call_expr);
+}
+
 /// A body that invokes a value via an indirect closure call (the cold
 /// boundary — never model-specialized).
 fn closureCallBody(allocator: Allocator) !*const hir.Block {
@@ -6441,6 +6479,34 @@ test "modelCloneStructurallyFoldable: redirect-tolerant, flags real divergence (
     // model-dependent lowering leak — is also flagged.
     const variant_divergent = try spawnTestGroup(allocator, &interner, 12, "worker__mm_bulk_or_never", try closureCallBody(allocator));
     try std.testing.expect(!modelCloneStructurallyFoldable(&source, &variant_divergent));
+}
+
+test "modelCloneStructurallyFoldable: a redirected named->direct call is foldable (real cross-struct clone shape)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var interner = ast.StringInterner.init(allocator);
+
+    // Source calls a cross-struct function by NAME — the shape a real stdlib
+    // caller takes (`Enum.sum` → `Range.count`). The `.named` targets that the
+    // synthetic `directCallBody` tests never exercised are exactly where the
+    // model redirect converts a call's VARIANT.
+    const source = try spawnTestGroup(allocator, &interner, 1, "worker", try namedCallBody(allocator, "Range", "count"));
+
+    // `redirectCallTargetForModel`'s `.named` arm rewrites a resolvable named
+    // call into a `.direct` call on the same-model clone. The variant changed
+    // (`.named` → `.direct`) but this is the intended, ICF-neutral redirect —
+    // both lower to a direct call to the resolved target. The verifier MUST
+    // tolerate it (the regression that fired on every real spawn-reachable
+    // stdlib function before the fix).
+    const redirected_clone = try spawnTestGroup(allocator, &interner, 10, "worker__mm_bulk_or_never", try directCallBody(allocator, 99));
+    try std.testing.expect(modelCloneStructurallyFoldable(&source, &redirected_clone));
+
+    // A named call rewritten to a CLOSURE (a hot→cold boundary change) is a real
+    // structural divergence and must still flag — the tolerance is narrow: it
+    // admits ONLY the `.named` → `.direct` redirect, nothing else.
+    const closure_divergent = try spawnTestGroup(allocator, &interner, 11, "worker__mm_bulk_or_never", try closureCallBody(allocator));
+    try std.testing.expect(!modelCloneStructurallyFoldable(&source, &closure_divergent));
 }
 
 // -- P3-J3: managed-spawn collection, resolution, rewiring ----------------------

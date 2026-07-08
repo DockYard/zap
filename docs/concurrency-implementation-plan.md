@@ -473,13 +473,44 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
     caps→model correspondence tests); host `zig build test` green; `monomorphize` 1641/1641 (pass
     unit tests: rewire+specialize, no-op, Decision Gate 0 diagnostic); fresh (cache-nuked) gate-ON
     `:test_concurrency` 49/0 (the per-process binding-unwrap keeps the single-manager path
-    unchanged). **Remaining last-mile — the running 2-manager binary:** the `main.zig`
-    driver-backed resolver injection into `Pipeline.spawn_manager_resolver` (scope-graph adapter
-    resolution + `driver.resolve` → model + registry-index accumulation), the `zir_backend`
-    `zap_manager_registry` source-module generation (registering each spawn manager alongside
-    `zap_active_manager` + the `multi_manager_active` rewrite stage), and the manager `@export`
-    weak-linkage change so N managers coexist in one binary without a duplicate `zap_memory_section`
-    symbol. Cross-model SEND stays J4.
+    unchanged). Cross-model SEND stays J4.
+  - **LANDED (P3-J3-FINISH, the running 2-manager proof) — 2026-07-07.** The build-orchestration
+    last mile is closed and the RUNNING 2-manager binary is the acceptance test. (1) **Resolver
+    injection** (`src/main.zig` `SpawnManagerAccumulator`): a driver-backed
+    `monomorphize.SpawnManagerResolver` threaded into `CompileOptions.spawn_manager_resolver`
+    (`Pipeline.init`). It resolves each `spawn(entry, Memory.X)` site's manager the SAME way the
+    manifest default does — scope-graph adapter resolution
+    (`builder.evaluateMemoryManagerAdapterFromSources`) → `memory_driver.resolve`
+    (`gate_target_support = false`, so an unsound target×model combo stays LINKABLE) → `declared_caps`
+    → `memory_elision.reclamationModel` — and accumulates the DISTINCT non-manifest managers into a
+    dense registry (index 0 = manifest default, 1.. = spawn managers). (2) **Surface** (`lib/process.zap`):
+    `Process.spawn(entry, manager)` passes the manager type DIRECTLY (a first-class `Type` value —
+    Zap has no anonymous-struct literal, so the reserved `.{ .manager = X }` options shape does not
+    parse); `extractManagerTypeName` accepts the bare `Type` value (and still the options-struct
+    shape). (3) **Registry generation** (`src/zir_backend.zig` `generateManagerRegistrySource`): each
+    spawn manager backend is registered as a `zap_spawn_manager_<index>` sibling module and a
+    generated `zap_manager_registry` module exposes `entries` = `{index, core}` pairs the runtime
+    bootstrap feeds to `zap_proc_register_manager` under `multi_manager_active` (rewritten ON by a new
+    `RuntimeSourceControls.multi_manager` stage). (4) **N managers coexist**: the mandatory
+    `zap_memory_section` linker symbol is now emitted only when the manager compiles as a standalone
+    `.Obj` (`builtin.output_mode == .Obj` — the driver's validation object + object-linked hosts, the
+    only readers of the symbol); compiler-driven `.Exe`/`.Lib` sibling modules bind via their module
+    DECL (`RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT` is always rewritten true), so NONE emits the
+    colliding symbol. (5) **ICF verifier fix**: `modelCloneStructurallyFoldable` now tolerates the
+    redirect's legitimate `.named` → `.direct` call-variant rewrite
+    (`redirectCallTargetForModel`) — the synthetic unit tests only exercised `.direct` calls, so this
+    fired on every real spawn-reachable stdlib function (`Enum`/`List`/`Range`). (6) **Daemon**: the
+    incremental manifest daemon recreates its persistent context bound to the discovered manager
+    family via a `SpawnManagerSetChanged` → retry in `establishIncrementalWatchState`
+    (single-manager builds never call the resolver → byte-identical). **Acceptance test**
+    (`test_concurrency/two_manager_proof_test.zap`): spawns an ARC process (manifest, slot 0) AND an
+    Arena process (`Memory.Arena`, slot 1) in ONE binary; asserts their pid reclamation-model bits
+    DIFFER (refcounted 0 vs bulk_or_never 1 — the kernel dispatched them to different managers) and
+    that each allocates a 1000-cell `List` on its OWN process heap and reports back — the Arena
+    child proving the BULK_OR_NEVER monomorphization elides retain/release (else Arena, which
+    services no REFCOUNT_V1, would panic on refcount dispatch). **Validated:** gate-ON
+    `:test_concurrency` **50/0** (49 baseline + the proof) via BOTH the default daemon path and the
+    direct path; host `zig build test` green; `zig fmt` clean.
 - **3.3** Model-tagged pids live; per-reachable-pair copy stubs (lazy generation); adoption
   semantics per model (rc=1 / bulk splice / range registration / free-at-last-use) — **manager
   ABI minor bump** (detach/adopt entry points + envelope-domain semantics) per spec §2.3,

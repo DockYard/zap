@@ -341,7 +341,7 @@ const ZapMemorySection = extern struct {
 /// `src/memory/driver.zig`'s post-link symbol check (`assertExportsManagerSymbol`).
 /// Spec section 3.2 + section 10.5 codify the requirement; this comment
 /// pins the implementation-side invariant in source.
-pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) = .{
+pub const zap_memory_section: ZapMemorySection = .{
     .meta = .{
         .magic = ZMEM_MAGIC,
         .abi_major = 1,
@@ -365,6 +365,24 @@ pub export const zap_memory_section: ZapMemorySection linksection(SECTION_NAME) 
         .get_capability_desc = leakGetCapabilityDesc,
     },
 };
+
+// Emit the mandatory `zap_memory_section` LINKER SYMBOL only when compiled as a
+// STANDALONE OBJECT (`builtin.output_mode == .Obj`) — the driver's validation
+// object + object-linked hosts, the only readers of the linker symbol. The
+// `pub const` above stays a visible Zig decl unconditionally so the
+// source-registered dispatch path binds it directly as
+// `active_manager.zap_memory_section`; this comptime block gates ONLY the symbol.
+// In a compiler-driven `.Exe`/`.Lib`, Leak — whether the manifest manager or a
+// per-spawn `zap_spawn_manager_<index>` — is bound via its module decl, so it
+// must not emit the colliding symbol; gating on `.Obj` lets N managers coexist
+// as sibling modules in one binary (docs/memory-manager-abi.md §10.5) and
+// subsumes the old `!is_test` gate. See `src/memory/arc/manager.zig` for the
+// full rationale.
+comptime {
+    if (builtin.output_mode == .Obj) {
+        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME, .linkage = .weak });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // REFCOUNT_V1 panic stubs (Phase 4)

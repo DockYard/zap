@@ -935,6 +935,16 @@ pub const CompileOptions = struct {
     /// that name declarations in target/dependency sources not loaded during
     /// the initial build.zap-only pass. Project compilation leaves this false.
     allow_external_static_references: bool = false,
+    /// P3-J3: the driver-backed per-spawn manager resolver injected by the
+    /// build orchestration (`src/main.zig`). When set, `Pipeline.runMonomorphize`
+    /// threads it into `collectAndSpecializeSpawnManagers` so each
+    /// `spawn(f, .{ .manager = X })` site resolves its comptime manager type to
+    /// a reclamation model + registry index (scope-graph adapter resolution +
+    /// `driver.resolve` → `declared_caps` → `elision.reclamationModel`). Null in
+    /// every non-`main.zig` compile (manifest eval, host tests, per-struct
+    /// pipelines), where a managed-spawn site is a clear diagnostic rather than a
+    /// silent miss. See `docs/memory-manager-abi.md` §10.5.
+    spawn_manager_resolver: ?zap.monomorphize.SpawnManagerResolver = null,
 };
 
 fn ctfeCompileOptionsHash(options: CompileOptions) u64 {
@@ -4983,6 +4993,12 @@ const Pipeline = struct {
             .error_baseline = ctx.diag_engine.errorCount(),
             .last_type_check_failure_kind = null,
             .defer_render = false,
+            // P3-J3: carry the injected per-spawn manager resolver from the build
+            // orchestration into the monomorphize axis. Null in every pipeline
+            // except the driver-backed `main.zig` build (manifest eval and
+            // per-struct pipelines never set it), keeping the spawn pass a
+            // no-op / diagnostic there.
+            .spawn_manager_resolver = options.spawn_manager_resolver,
         };
     }
 
@@ -12105,6 +12121,16 @@ pub const RuntimeSourceControls = struct {
     /// the compiled kernel object (`src/concurrency_driver.zig`) so the
     /// runtime's `zap_proc_*` extern references resolve.
     runtime_concurrency: bool = false,
+    /// P3-J3 per-spawn manager gate: true only when the build's spawn-manager
+    /// pass resolved at least one NON-manifest manager at a `spawn(f, .{ .manager
+    /// = X })` site, so the ZIR backend generated the `zap_manager_registry`
+    /// module. Flips `RUNTIME_MULTI_MANAGER_DEFAULT` → true, arming the runtime's
+    /// per-process `currentManagerCore` allocate/deallocate dispatch AND the
+    /// startup `@import("zap_manager_registry")` that registers the per-spawn
+    /// managers into their kernel slots. Implies `runtime_concurrency`. OFF (the
+    /// default, every single-manager binary) keeps the comptime-bound manifest
+    /// `active_manager` direct calls — byte-identical to pre-J3.
+    multi_manager: bool = false,
 };
 
 /// Variant of `getRuntimeSource` for callers whose output mode does
@@ -12138,6 +12164,7 @@ pub fn getRuntimeSourceForRuntimeControls(
         .memory_startup_prologue_emitted = controls.memory_startup_prologue_emitted,
         .collect_arc_stats = controls.collect_arc_stats,
         .runtime_concurrency = controls.runtime_concurrency,
+        .multi_manager = controls.multi_manager,
     });
 }
 
@@ -12149,6 +12176,8 @@ const RuntimeRewrite = struct {
     collect_arc_stats: bool,
     /// P2-J1 concurrency gate (see `RuntimeSourceControls`).
     runtime_concurrency: bool = false,
+    /// P3-J3 per-spawn manager gate (see `RuntimeSourceControls`).
+    multi_manager: bool = false,
 };
 
 /// Lazily-built rewritten runtime source. Keyed by the rewrite
@@ -12181,6 +12210,7 @@ fn rewriteCacheKey(req: RuntimeRewrite) u128 {
     if (req.collect_arc_stats) key |= (@as(u128, 1) << 66);
     if (req.refcount_sized_extension) key |= (@as(u128, 1) << 67);
     if (req.runtime_concurrency) key |= (@as(u128, 1) << 68);
+    if (req.multi_manager) key |= (@as(u128, 1) << 69);
     return key;
 }
 
@@ -12401,6 +12431,31 @@ fn rewriteRuntimeSource(req: RuntimeRewrite) []const u8 {
         @memcpy(gate_buf[gate_idx + gate_replacement.len ..], final_buf[gate_idx + gate_needle.len ..]);
         std.heap.page_allocator.free(final_buf);
         final_buf = gate_buf;
+    }
+
+    // Stage 7b: P3-J3 per-spawn-manager gate marker rewrite. Only a gated-on
+    // build whose spawn-manager pass resolved at least one NON-manifest manager
+    // flips this marker. It arms the runtime's per-process `currentManagerCore`
+    // allocate/deallocate dispatch AND the startup `@import("zap_manager_registry")`
+    // that registers the per-spawn managers into their kernel slots (the ZIR
+    // backend generated that module in the same build). The default-OFF marker
+    // keeps every single-manager binary on the comptime-bound manifest
+    // `active_manager` direct calls — byte-identical to pre-J3. `multi_manager`
+    // implies `runtime_concurrency`, so this stage runs only in gated-on builds.
+    if (req.multi_manager) {
+        const mm_needle = "const RUNTIME_MULTI_MANAGER_DEFAULT: bool = false;";
+        const mm_replacement = "const RUNTIME_MULTI_MANAGER_DEFAULT: bool = true;";
+        const mm_idx = std.mem.indexOf(u8, final_buf, mm_needle) orelse {
+            @panic("runtime.zig is missing the RUNTIME_MULTI_MANAGER_DEFAULT marker; the P3-J3 per-spawn-manager gate rewrite cannot proceed");
+        };
+        const mm_total_len = final_buf.len - mm_needle.len + mm_replacement.len;
+        var mm_buf = std.heap.page_allocator.alloc(u8, mm_total_len) catch
+            @panic("out of memory rewriting runtime source for the per-spawn-manager gate");
+        @memcpy(mm_buf[0..mm_idx], final_buf[0..mm_idx]);
+        @memcpy(mm_buf[mm_idx .. mm_idx + mm_replacement.len], mm_replacement);
+        @memcpy(mm_buf[mm_idx + mm_replacement.len ..], final_buf[mm_idx + mm_needle.len ..]);
+        std.heap.page_allocator.free(final_buf);
+        final_buf = mm_buf;
     }
 
     // Stage 8: runtime_os seam splice. The source-level seam in
