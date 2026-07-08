@@ -1357,6 +1357,48 @@ receiver-teardown-drain (the kernel drain invokes the fragment's
 `moved_reclaim`, `munmap`ing the orphan). Every path frees the moved backing
 exactly once.
 
+### Gate-ON end-to-end + ThreadSanitizer (P3-J5-VERIFY, 2026-07-08)
+
+The E5 mechanism above is proven at the manager level; this closes the two
+end-to-end links the P3-J5 job left un-run.
+
+- **Language-surface behavioral proof (gate-ON `:test_concurrency`).** After
+  rebuilding the zap CLI (`zig build -Dzap-compiler-lib=… -Dllvm-lib-path=…`),
+  `./zig-out/bin/zap run test_concurrency` — the `build.zap` `:test_concurrency`
+  manifest target (`runtime_concurrency: true`, root
+  `TestConcurrency.TestRunner`, glob `test_concurrency/**/*_test.zap`) — reports
+  **56 tests, 0 failures; 110 assertions, 0 failures** (process exit 0). The gate
+  is baked into the manifest target (no `-Druntime-concurrency=on` needed). The
+  56 include `test_concurrency/move_send_test.zap`'s 3 `Process.send_move` cases
+  (confirmed present by name in the `--timings` per-test list): a LARGE
+  uniquely-owned `List` move-sends and the receiver gets the whole value; a SMALL
+  slab-backed `List` transparently degrades to copy and still delivers; a moved
+  `List` is a fresh value the receiver solely owns. Use-after-move stays a
+  compile error (pinned in `src/zir_integration_tests.zig`). Suite growth:
+  50/0 (P3-J3) → 53/0 (P3-J4) → **56/0 (P3-J5)**.
+
+- **Scheduler-local-refcount invariant across the move — now by MEASUREMENT.**
+  The manager-level claim rests the cross-thread safety of detach/adopt on
+  "rc == 1 ⇒ no cross-thread refcount touch, by construction." A dedicated
+  ThreadSanitizer harness now proves it by measurement, mirroring E3's full-half
+  method: `src/memory/arc/cross_thread_stress.zig`'s new `runMoveSendArcStress` —
+  N=4 ARC sender threads, each on its OWN private ARC context, allocate a LARGE
+  (8 KiB) refcounted cell, `detachRegion` it, and hand it BY POINTER to a single
+  consumer that `adoptRegion`s it into its own context, verifies the physical
+  bytes crossed intact (`seq` + checksum + tail sentinel), and releases it
+  (rc 1 → 0, `munmap`). This is the ONE send shape where a real heap cell crosses
+  the thread boundary — the copy harnesses (P3-J1 / P3-J4) hand only flat data.
+  `TSAN_OPTIONS="halt_on_error=1 abort_on_error=1"
+  zig test -fsanitize-thread src/memory/arc/cross_thread_stress.zig`: **zero
+  findings** at the 8,000-cell default AND a 20,000-cell soak
+  (`ZAP_ARC_XTHREAD_ROUNDS=5000`), leak-exact (`test_large_alloc_total` delta ==
+  `test_large_free_total` delta), exit 0 — grep for `ThreadSanitizer|WARNING|data
+  race` empty. Scope note: Phase-3's scheduler is single-threaded, so a *real*
+  move runs detach and adopt on the same OS thread; the harness deliberately
+  models the more-conservative cross-thread shape (the mailbox push side is
+  any-thread by design), forward-looking to Phase 4's M:N scheduler — the
+  invariant is unchanged (per-process contexts ⇒ no shared refcount).
+
 ## E6 — copy crossover (P2-J9, 2026-07-07) — first crossover measurement
 
 **VERDICT: crossover is LATE for flat scalar payloads (~1 KB) and IMMEDIATE +

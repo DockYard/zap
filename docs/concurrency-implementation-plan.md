@@ -550,6 +550,13 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
     PASS:** detach+adopt is 1–2 ns INDEPENDENT of payload size (4 KiB…1 MiB),
     pointer-identity preserved (O(1)), leak-exact; vs copy's O(size) (48 µs memcpy
     at 1 MB, 2.19 ms `Map` reconstruct) — `docs/concurrency-bench-results.md` § E5.
+    **P3-J5-VERIFY (2026-07-08):** gate-ON `:test_concurrency` runs **56/0** (110
+    assertions, exit 0) via `zap run test_concurrency`, including
+    `move_send_test.zap`'s 3 `Process.send_move` cases; and the by-construction
+    scheduler-local-refcount invariant is now ALSO proven BY MEASUREMENT — the
+    cross-thread detach/adopt move path (`cross_thread_stress.zig`
+    `runMoveSendArcStress`, the one shape where a real heap cell crosses threads)
+    is ThreadSanitizer-clean at 8k + a 20k-cell soak, leak-exact (§ E5).
     **R4 residual:** `Map` still uses `c_allocator` (not the large path), so a `Map`
     send degrades to copy until `Map.bufferAlloc`/`bufferFreeShallow` migrate to
     `containerBufferAlloc`/`Free` (the exact gate-branch `List` already carries);

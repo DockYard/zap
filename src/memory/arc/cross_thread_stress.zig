@@ -36,6 +36,18 @@
 //! alloc/free is the proof. Exact accounting (every mapped slab of every
 //! context unmapped at its `deinit`) proves leak-freedom across the run.
 //!
+//! Three send shapes live here, all under the same ThreadSanitizer run:
+//!   1. same-model COPY (`runCrossThreadArcStress`, P3-J1) — flat data, consumer
+//!      rebuilds a fresh cell;
+//!   2. cross-model COPY (`runCrossModelSendReceiveStress`, P3-J4) — ARC senders
+//!      → a foreign-model (bulk) receiver, flat data;
+//!   3. same-model O(1) MOVE (`runMoveSendArcStress`, P3-J5) — the ONE shape
+//!      where a REAL heap cell crosses by pointer: a LARGE buffer is DETACHED
+//!      from the sender's ARC context and ADOPTED in place by the receiver's,
+//!      refcount untouched by the move itself (rc==1, uniquely owned), the
+//!      sender's last touch ordered before the receiver's by the hand-off. It is
+//!      the direct TSan proof of the detach/adopt region-move primitive.
+//!
 //! ## Concurrency shape tested, and what remains for Phase 4 (M:N)
 //!
 //! Phase 3's scheduler is SINGLE-threaded (one run queue), so a process's own
@@ -111,67 +123,78 @@ const default_rounds_per_producer: usize = 2_000;
 const rounds_environment_variable = "ZAP_ARC_XTHREAD_ROUNDS";
 const producer_count: usize = 4;
 
-/// A bounded MPSC hand-off of flat messages, guarded by the kernel-convention
+/// A bounded MPSC hand-off of `Message` values, guarded by the kernel-convention
 /// `std.atomic.Mutex` spinlock (the fork drops the libc-coupled
 /// `std.Thread.Mutex`/`Condition`; `envelope_pool.zig`/`tracking/manager.zig`
 /// use the same spinlock). Deliberately NOT lock-free: the hand-off mechanism
-/// is not what this test validates (the kernel mailbox is already TSan-proven,
+/// is not what these tests validate (the kernel mailbox is already TSan-proven,
 /// E3 Phase 1) — the per-process ARC contexts are. The spinlock makes the queue
 /// itself race-free so any finding TSan reports is an ARC-context/refcount
-/// race, not queue noise; when the queue is full/empty the waiter spins.
-const FlatQueue = struct {
-    lock: std.atomic.Mutex = .unlocked,
-    buffer: [1024]FlatMessage = undefined,
-    head: usize = 0,
-    count: usize = 0,
-    live_producers: usize,
+/// race, not queue noise; when the queue is full/empty the waiter spins. The
+/// lock/unlock pair is also the release/acquire edge that orders a producer's
+/// last touch of a handed-off value BEFORE the consumer's first — the same
+/// happens-before the real mailbox provides for a moved cell.
+fn HandoffQueue(comptime Message: type) type {
+    return struct {
+        lock: std.atomic.Mutex = .unlocked,
+        buffer: [1024]Message = undefined,
+        head: usize = 0,
+        count: usize = 0,
+        live_producers: usize,
 
-    fn acquire(queue: *FlatQueue) void {
-        while (!queue.lock.tryLock()) std.atomic.spinLoopHint();
-    }
+        const Self = @This();
 
-    fn push(queue: *FlatQueue, message: FlatMessage) void {
-        while (true) {
-            queue.acquire();
-            if (queue.count < queue.buffer.len) {
-                const tail = (queue.head + queue.count) % queue.buffer.len;
-                queue.buffer[tail] = message;
-                queue.count += 1;
-                queue.lock.unlock();
-                return;
-            }
-            queue.lock.unlock(); // full — release and spin
-            std.atomic.spinLoopHint();
+        fn acquire(queue: *Self) void {
+            while (!queue.lock.tryLock()) std.atomic.spinLoopHint();
         }
-    }
 
-    /// Pop the next message, or null once every producer has finished and the
-    /// buffer is drained.
-    fn pop(queue: *FlatQueue) ?FlatMessage {
-        while (true) {
-            queue.acquire();
-            if (queue.count > 0) {
-                const message = queue.buffer[queue.head];
-                queue.head = (queue.head + 1) % queue.buffer.len;
-                queue.count -= 1;
-                queue.lock.unlock();
-                return message;
+        fn push(queue: *Self, message: Message) void {
+            while (true) {
+                queue.acquire();
+                if (queue.count < queue.buffer.len) {
+                    const tail = (queue.head + queue.count) % queue.buffer.len;
+                    queue.buffer[tail] = message;
+                    queue.count += 1;
+                    queue.lock.unlock();
+                    return;
+                }
+                queue.lock.unlock(); // full — release and spin
+                std.atomic.spinLoopHint();
             }
-            if (queue.live_producers == 0) {
-                queue.lock.unlock();
-                return null; // drained and every producer has finished
-            }
-            queue.lock.unlock(); // empty but producers live — release and spin
-            std.atomic.spinLoopHint();
         }
-    }
 
-    fn producerFinished(queue: *FlatQueue) void {
-        queue.acquire();
-        queue.live_producers -= 1;
-        queue.lock.unlock();
-    }
-};
+        /// Pop the next message, or null once every producer has finished and the
+        /// buffer is drained.
+        fn pop(queue: *Self) ?Message {
+            while (true) {
+                queue.acquire();
+                if (queue.count > 0) {
+                    const message = queue.buffer[queue.head];
+                    queue.head = (queue.head + 1) % queue.buffer.len;
+                    queue.count -= 1;
+                    queue.lock.unlock();
+                    return message;
+                }
+                if (queue.live_producers == 0) {
+                    queue.lock.unlock();
+                    return null; // drained and every producer has finished
+                }
+                queue.lock.unlock(); // empty but producers live — release and spin
+                std.atomic.spinLoopHint();
+            }
+        }
+
+        fn producerFinished(queue: *Self) void {
+            queue.acquire();
+            queue.live_producers -= 1;
+            queue.lock.unlock();
+        }
+    };
+}
+
+/// The copy hand-off (P3-J1 / P3-J4): carries FLAT data — no heap pointer ever
+/// crosses the thread boundary.
+const FlatQueue = HandoffQueue(FlatMessage);
 
 const ProducerConfig = struct {
     queue: *FlatQueue,
@@ -365,6 +388,182 @@ pub fn runCrossModelSendReceiveStress(rounds_per_producer: usize) !void {
     try std.testing.expect(mmap_total - mmap_baseline > 0);
 }
 
+// ---------------------------------------------------------------------------
+// The O(1) region-move send path under ThreadSanitizer (P3-J5).
+//
+// The two harnesses above hand FLAT data across threads and the consumer
+// reconstructs a fresh cell — no heap pointer ever crosses; that is the COPY
+// send. The MOVE send is fundamentally different: a LARGE (page-allocator
+// backed) container buffer is DETACHED from the sender's ARC context and handed
+// to the receiver BY POINTER (zero copy), which ADOPTS it into its own context
+// in place. The SAME physical cell crosses the thread boundary — so this is the
+// one send shape where a real heap pointer, not flat data, is shared.
+//
+// What TSan proves here: cross-thread `detach → hand-off → adopt` is race-free.
+// `arcDetachRegion` mutates only the SENDER context's `large_head` and the
+// block's own `LargeHeader` links; `arcAdoptRegion` mutates only the RECEIVER
+// context's `large_head` and the same links — each within one thread's exclusive
+// ownership window, and the queue's release/acquire orders the sender's last
+// touch before the receiver's first. The refcount the sender set at allocation
+// (rc=1) and the receiver clears at release (rc→0) is therefore a SYNCHRONIZED
+// ownership transfer of a uniquely-owned cell, never a data race — the
+// scheduler-local-refcount invariant across the move primitive. (Same-model
+// only: a slab-backed buffer, a `Map`, or a cross-model receiver degrades to the
+// copy path above, already TSan-proven; `arcDetachRegion` returns `false` and
+// `send_message_moved` falls back to the copy send. See `manager.zig`'s
+// region-move unit tests + `move_send_test.zap`.)
+// ---------------------------------------------------------------------------
+
+/// The moved container buffer's size: 8 KiB, safely above the ARC manager's
+/// 4096-byte hard slab ceiling (`manager.zig` `SLAB_CLASS_SIZES`), so every
+/// allocation is a standalone `page_allocator` block — the exact shape the O(1)
+/// region-move re-parents. Mirrors `move_send_test.zap`'s large-`List` case
+/// (1000 × `i64` ≈ 8 KB).
+const move_payload_bytes: usize = 8 * 1024;
+const move_payload_alignment: u32 = 16;
+
+/// The cross-thread MOVE message. Carries the detached cell's address (as a
+/// `usize`, so it is a plain value in the queue) plus `seq` for end-to-end
+/// integrity. Unlike `FlatMessage`, the address names a REAL heap cell that the
+/// receiver adopts in place — the byte payload is never copied.
+const MoveMessage = struct {
+    cell_address: usize,
+    seq: u64,
+};
+
+/// The move hand-off: carries a heap-cell POINTER across the thread boundary
+/// (the receiver adopts it in place — no reconstruct).
+const MoveQueue = HandoffQueue(MoveMessage);
+
+const MoveProducerConfig = struct {
+    queue: *MoveQueue,
+    rounds: usize,
+    base_seq: u64,
+};
+
+/// Stamp `seq`, its checksum, and a tail sentinel into a moved buffer so the
+/// receiver can prove the SAME physical bytes survived the pointer hand-off — a
+/// copy, a torn write, or a raced value would fail the receiver's check.
+fn stampMovePayload(buffer: [*]u8, seq: u64) void {
+    const words: [*]u64 = @ptrCast(@alignCast(buffer));
+    words[0] = seq;
+    words[1] = checksumFor(seq);
+    buffer[move_payload_bytes - 1] = @truncate(seq);
+}
+
+/// One MOVE producer thread: owns its OWN private ARC context, and per round
+/// allocates a LARGE refcounted cell (rc=1), stamps it, DETACHES it (unlinking
+/// it from this context so the context teardown can never free it — the receiver
+/// owns it after adopt), and hands the pointer across. After the loop it tears
+/// its context down: the detached orphans MUST survive that teardown (they are
+/// in no context's list), which is exactly what proves detach transferred
+/// ownership OUT rather than merely aliasing.
+fn moveProducerMain(config: MoveProducerConfig) void {
+    const context = arc.init(null) orelse @panic("arc-xthread-move: producer manager init failed");
+
+    var round: usize = 0;
+    while (round < config.rounds) : (round += 1) {
+        const seq = config.base_seq + round;
+
+        const cell = arc.allocateRefcounted(context, move_payload_bytes, move_payload_alignment) orelse
+            @panic("arc-xthread-move: producer large cell alloc failed");
+        stampMovePayload(cell, seq);
+
+        // Detach from THIS context's `large_head`. `true` == large-backed and
+        // relocatable; `false` would be a slab-backed copy-fallback, impossible
+        // at this size — so a `false` here is a real regression, not a skip.
+        if (!arc.detachRegion(context, cell, move_payload_bytes, move_payload_alignment))
+            @panic("arc-xthread-move: a large buffer must be region-move eligible");
+
+        config.queue.push(.{ .cell_address = @intFromPtr(cell), .seq = seq });
+    }
+
+    // The sender exits after sending. Its detached cells are orphans (in no
+    // context's list) and MUST survive this teardown: `arcDeinit` walks only this
+    // context's `large_head`, which no longer holds them — so nothing here can
+    // race the consumer's concurrent adopt/release of those same cells.
+    arc.deinit(context);
+    config.queue.producerFinished();
+}
+
+/// Run the O(1) region-move send stress (P3-J5): `producer_count` ARC sender
+/// threads — each on its OWN private ARC context — allocate LARGE refcounted
+/// cells, DETACH them, and hand them BY POINTER to a single consumer (this
+/// thread) that ADOPTS each into its own ARC context, verifies the physical
+/// bytes crossed intact, and releases it (rc 1 → 0, `munmap`). Under
+/// ThreadSanitizer this proves the scheduler-local-refcount invariant across the
+/// move primitive: a real cell crosses threads, ordered by the mailbox hand-off
+/// — zero races. Leak-exact: every moved cell is mapped once and freed once, and
+/// no detached orphan leaks through a producer teardown.
+pub fn runMoveSendArcStress(rounds_per_producer: usize) !void {
+    // Baseline the (atomic) large map/unmap counters before any thread runs; read
+    // single-threaded here and again after join, so the delta is the exact
+    // per-run large-block traffic.
+    const large_alloc_baseline = @atomicLoad(usize, &arc.test_large_alloc_total, .monotonic);
+    const large_free_baseline = @atomicLoad(usize, &arc.test_large_free_total, .monotonic);
+
+    var queue = MoveQueue{ .live_producers = producer_count };
+
+    var threads: [producer_count]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer {
+        var index: usize = 0;
+        while (index < spawned) : (index += 1) threads[index].join();
+    }
+    while (spawned < producer_count) : (spawned += 1) {
+        threads[spawned] = try std.Thread.spawn(.{}, moveProducerMain, .{MoveProducerConfig{
+            .queue = &queue,
+            .rounds = rounds_per_producer,
+            .base_seq = @as(u64, spawned) *% 0x1_0000_0000, // disjoint seq ranges per producer
+        }});
+    }
+
+    // Consumer: owns a SEPARATE private ARC context and ADOPTS each moved cell in
+    // place (no reconstruct), then releases it through that context.
+    const consumer_context = arc.init(null) orelse @panic("arc-xthread-move: consumer manager init failed");
+    var adopted: usize = 0;
+    while (queue.pop()) |message| {
+        const cell: *anyopaque = @ptrFromInt(message.cell_address);
+        // Adopt: re-parent the SAME physical block into the consumer's context
+        // (O(1) list surgery, no copy).
+        arc.adoptRegion(consumer_context, cell, move_payload_bytes, move_payload_alignment);
+
+        // End-to-end integrity: the same bytes crossed — `seq`, checksum, and the
+        // tail sentinel must all match, or a copy/torn/raced value slipped through.
+        const words: [*]const u64 = @ptrCast(@alignCast(cell));
+        const bytes: [*]const u8 = @ptrCast(cell);
+        const intact = words[0] == message.seq and
+            words[1] == checksumFor(message.seq) and
+            bytes[move_payload_bytes - 1] == @as(u8, @truncate(message.seq));
+        if (!intact) {
+            arc.releaseSized(consumer_context, cell, move_payload_bytes, move_payload_alignment, null);
+            arc.deinit(consumer_context);
+            for (&threads) |*thread| thread.join();
+            return error.MoveSendDataCorruption;
+        }
+
+        // The consumer now solely owns it: release drops rc 1 → 0 and `munmap`s it
+        // via the consumer's `large_head` (where adopt linked it) — leak-exact.
+        arc.releaseSized(consumer_context, cell, move_payload_bytes, move_payload_alignment, null);
+        adopted += 1;
+    }
+    arc.deinit(consumer_context); // wholesale free of the consumer's own heap
+
+    for (&threads) |*thread| thread.join();
+
+    // Exactly one moved cell per producer round was adopted.
+    try std.testing.expectEqual(producer_count * rounds_per_producer, adopted);
+
+    // Leak-exact: every large block mapped during the run (one per moved cell)
+    // was `munmap`ed exactly once — the moved cells by the consumer's release,
+    // and NO detached orphan leaked through a producer teardown (read after join,
+    // so the plain delta is race-free by happens-before and TSan-clean).
+    const large_alloc_total = @atomicLoad(usize, &arc.test_large_alloc_total, .monotonic);
+    const large_free_total = @atomicLoad(usize, &arc.test_large_free_total, .monotonic);
+    try std.testing.expectEqual(producer_count * rounds_per_producer, large_alloc_total - large_alloc_baseline);
+    try std.testing.expectEqual(large_alloc_total - large_alloc_baseline, large_free_total - large_free_baseline);
+}
+
 fn roundsFromEnvironment() usize {
     // Fork-convention env read (libc `std.c.getenv`; macOS always links
     // libSystem), mirroring `adversarial_stress.zig`/`teardown_stress.zig`.
@@ -379,4 +578,8 @@ test "ArcCrossThreadStress: concurrent per-process ARC managers hold the schedul
 
 test "ArcCrossThreadStress: cross-model send/receive (ARC senders → Arena receiver) holds the scheduler-local-refcount invariant" {
     try runCrossModelSendReceiveStress(roundsFromEnvironment());
+}
+
+test "ArcCrossThreadStress: O(1) region-move send (detach → cross-thread pointer hand-off → adopt) holds the scheduler-local-refcount invariant" {
+    try runMoveSendArcStress(roundsFromEnvironment());
 }
