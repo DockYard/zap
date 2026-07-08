@@ -3587,8 +3587,22 @@ pub fn consBuiltinTailSlot(name: []const u8) ?usize {
 /// Slot 0 only (the boxed-`Error` argument). The pre-monomorph name is
 /// the only shape: `recoverable_raise` takes a bare `Error` existential,
 /// so the `:zig.` bridge is never type-specialised into an encoded name.
+///
+/// The same-model O(1) region-move send (`ProcessRuntime.send_message_moved`,
+/// P3-J5) is the second stash builtin: its MESSAGE argument (slot 1; slot 0 is
+/// the destination pid bits) is transferred out of the sender — MOVED to the
+/// receiver through the mailbox sink, or (on the copy fallback / dead-letter)
+/// disposed of by the runtime itself. Exactly one net owner exists across the
+/// transfer, so `Process.send_move`'s message parameter promotes to `.owned`,
+/// the arg is lowered `.move`, the sender emits NO post-call release, and the
+/// concurrency verifier's C2/C3 move-send invariants engage (a `.borrowed`
+/// message is rejected; a use after the move is a use-after-move error). This
+/// is the runtime-primitive vocabulary the compiler already reasons over
+/// (`Map.put`, `List.cons`), not a Zap library-struct name.
 pub fn sideChannelStashBuiltinArg(name: []const u8, slot: usize) bool {
-    return slot == 0 and std.mem.eql(u8, name, "Kernel.recoverable_raise");
+    if (slot == 0 and std.mem.eql(u8, name, "Kernel.recoverable_raise")) return true;
+    if (slot == 1 and std.mem.eql(u8, name, "ProcessRuntime.send_message_moved")) return true;
+    return false;
 }
 
 /// Does `function`'s body forward parameter `param_index` directly into the
@@ -4195,6 +4209,27 @@ test "arc_liveness: recoverable-raise side-channel stash consumes its boxed-Erro
     try std.testing.expect(!sideChannelStashBuiltinArg("KernelAlt.recoverable_raise", 0));
     try std.testing.expect(!sideChannelStashBuiltinArg("recoverable_raise", 0));
     try std.testing.expect(!sideChannelStashBuiltinArg("", 0));
+}
+
+test "arc_liveness: move-send consumes its message arg (slot 1), pid slot borrowed" {
+    // `ProcessRuntime.send_message_moved(pid_bits, message)` MOVES the message
+    // out of the sender (to the receiver, or disposed by the runtime), so slot 1
+    // is a consume sink: the message can move in at last use, the wrapper emits
+    // no post-call release, and `Process.send_move`'s message parameter promotes
+    // to `.owned` (engaging the verifier's C2/C3 move-send invariants).
+    try std.testing.expect(sideChannelStashBuiltinArg("ProcessRuntime.send_message_moved", 1));
+    try std.testing.expect(alwaysConsumingBuiltinArg("ProcessRuntime.send_message_moved", 1));
+    try std.testing.expect(builtinArgCanMoveAtLastUse("ProcessRuntime.send_message_moved", 1));
+
+    // Slot 0 (the destination pid bits, a trivial u64) is NOT consuming.
+    try std.testing.expect(!sideChannelStashBuiltinArg("ProcessRuntime.send_message_moved", 0));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("ProcessRuntime.send_message_moved", 0));
+
+    // The deep-COPY send borrows its message (it reads-and-copies) — NOT a move
+    // sink, so its message must keep the borrow convention (a `.move` into it
+    // would leak; concurrency_verifier invariant C1).
+    try std.testing.expect(!sideChannelStashBuiltinArg("ProcessRuntime.send_message", 1));
+    try std.testing.expect(!alwaysConsumingBuiltinArg("ProcessRuntime.send_message", 1));
 }
 
 fn makeSideChannelForwardingTestFunction(arena: std.mem.Allocator) !ir.Function {

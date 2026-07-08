@@ -441,6 +441,12 @@ pub const ZapRefcountCapabilityV1 = extern struct {
     // manager advertises `desc.size >= REFCOUNT_V1_SIZE_V1_2`.
     detach_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool,
     adopt_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void,
+    // `free_detached_region` — reclaim a detached-but-never-adopted buffer (an
+    // undelivered move: dead-lettered, or a mailbox drained at receiver
+    // teardown). Context-free and race-free (no tracking-list surgery; reads the
+    // size/alignment from the block itself), so it is safe to call from any
+    // thread with no current process quantum.
+    free_detached_region: *const fn (object: *anyopaque) callconv(.c) void,
 };
 
 /// The legacy v1.0 byte length of `ZapRefcountCapabilityV1` — the first
@@ -465,12 +471,12 @@ pub const REFCOUNT_V1_SIZE_V1_1: u16 = @intCast(6 * PTR);
 /// pointer slots. A v1.2+ manager advertises `desc.size >= REFCOUNT_V1_SIZE_V1_2`
 /// so the runtime can attempt the same-model O(1) region-move send; a manager
 /// advertising less falls back to the copy send. Pointer-width relative
-/// (`8 * PTR`): 64 bytes on 64-bit, 32 on wasm32.
-pub const REFCOUNT_V1_SIZE_V1_2: u16 = @intCast(8 * PTR);
+/// (`9 * PTR`): 72 bytes on 64-bit, 36 on wasm32.
+pub const REFCOUNT_V1_SIZE_V1_2: u16 = @intCast(9 * PTR);
 
 comptime {
-    if (@sizeOf(ZapRefcountCapabilityV1) != 8 * PTR) @compileError(
-        "abi: ZapRefcountCapabilityV1 (ABI v1.2) must be exactly eight pointer slots wide",
+    if (@sizeOf(ZapRefcountCapabilityV1) != 9 * PTR) @compileError(
+        "abi: ZapRefcountCapabilityV1 (ABI v1.2) must be exactly nine pointer slots wide",
     );
     if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0 * PTR) @compileError(
         "abi: ZapRefcountCapabilityV1.retain must be the first pointer slot",
@@ -495,6 +501,9 @@ comptime {
     );
     if (@offsetOf(ZapRefcountCapabilityV1, "adopt_region") != 7 * PTR) @compileError(
         "abi: ZapRefcountCapabilityV1.adopt_region must be the eighth pointer slot",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "free_detached_region") != 8 * PTR) @compileError(
+        "abi: ZapRefcountCapabilityV1.free_detached_region must be the ninth pointer slot",
     );
     if (REFCOUNT_V1_SIZE_V1_1 != 6 * PTR) @compileError(
         "abi: REFCOUNT_V1_SIZE_V1_1 must remain the six-slot v1.1 length",
@@ -526,8 +535,8 @@ test "ZapMemoryManagerCoreV1 layout is exactly 56 bytes" {
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(ZapMemoryManagerCoreV1));
 }
 
-test "ZapRefcountCapabilityV1 layout is exactly 64 bytes (ABI v1.2)" {
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(ZapRefcountCapabilityV1));
+test "ZapRefcountCapabilityV1 layout is exactly 72 bytes (ABI v1.2)" {
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(ZapRefcountCapabilityV1));
 }
 
 test "ZapRefcountCapabilityV1 retain/release prefix matches v1.0 byte layout" {
@@ -543,12 +552,13 @@ test "ZapRefcountCapabilityV1 retain/release prefix matches v1.0 byte layout" {
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(ZapRefcountCapabilityV1, "refcount_sized"));
     try std.testing.expectEqual(@as(usize, 48), @offsetOf(ZapRefcountCapabilityV1, "detach_region"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(ZapRefcountCapabilityV1, "adopt_region"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(ZapRefcountCapabilityV1, "free_detached_region"));
 }
 
 test "REFCOUNT_V1 size constants" {
     try std.testing.expectEqual(@as(u16, 16), REFCOUNT_V1_SIZE_V1_0);
     try std.testing.expectEqual(@as(u16, 48), REFCOUNT_V1_SIZE_V1_1);
-    try std.testing.expectEqual(@as(u16, 64), REFCOUNT_V1_SIZE_V1_2);
+    try std.testing.expectEqual(@as(u16, 72), REFCOUNT_V1_SIZE_V1_2);
     try std.testing.expectEqual(@as(u16, @intCast(@sizeOf(ZapRefcountCapabilityV1))), REFCOUNT_V1_SIZE_V1_2);
 }
 

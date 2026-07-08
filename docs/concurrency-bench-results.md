@@ -1271,6 +1271,92 @@ bytes *without adding any gate-ON concurrency code*. That drift is precisely why
 the durable proof above is stated at the symbol/instruction level. The CLBG wins
 are untouched with the gate off.
 
+## E5 — region detach/adopt (P3-J5, 2026-07-07) — the same-model O(1) region-move
+
+**VERDICT: the same-model region MOVE is O(1) — detach+adopt is 1–2 ns,
+INDEPENDENT of payload size (measured 4 KiB … 1 MiB), with pointer identity
+preserved (zero relocation) and leak-exact reclamation — vs the copy send's
+O(size) cost (a bare `memcpy` alone is 48 µs at 1 MB, and E6's `Map` reconstruct
+is 2.19 ms). The move eliminates the O(size) copy entirely for the value shapes
+where it is sound.** This is the E5 gate the plan (item 6.1, exit-gate row E5)
+requires: "truly O(1) and leak-free, else copy-on-move stays, documented."
+
+### The R4 resolution (the honest mechanism)
+
+R4 (plan item 2.4/3.3) asked whether an O(1) re-parent is achievable given that
+a live ARC `List`/`Map` cell is a single contiguous allocation. The P2-J5
+finding was "single `c_allocator` block per cell → no relocatable region." **P3-J1
+sharpened this**: under the concurrency gate a `List`/`String` container buffer
+routes through the running process's OWN ARC manager core, landing in one of two
+disciplines, and the answer differs per discipline:
+
+- **SLAB-backed (≤ `MAX_SLAB_CLASS_SIZE` = 4096 B):** the buffer is one slot
+  interleaved with UNRELATED cells in a shared 64 KiB slab whose free/partial
+  bookkeeping is per-context. A single slot cannot be re-parented to another
+  context without dragging its co-tenants (and would race the sender's own slab
+  mutation). **NOT O(1)-relocatable — degrades to copy** (small, so copy is on
+  the cheap side of the E6 crossover).
+- **LARGE (> 4096 B → `page_allocator` mmap):** a standalone block tracked ONLY
+  by intrusive membership in the owning context's `large_head` list
+  (`LargeHeader.prev/next`); `munmap` is process-global. **This is the one
+  discipline that supports a sound O(1) cross-process re-parent:** `detachRegion`
+  unlinks the `LargeHeader` from the sender's `large_head`, `adoptRegion` relinks
+  it into the receiver's — both scheduler-local (each touched only in its owner's
+  quantum, no atomics), the refcount left untouched (rc == 1 ⇒ sole reference, so
+  no cross-thread refcount touch — the sacred scheduler-local invariant holds by
+  construction). An undelivered move's orphan is reclaimed context-free by
+  `freeDetachedRegion` (`munmap`, no list surgery).
+
+The mechanism is delivered as ABI **v1.2** on the REFCOUNT_V1 capability
+(`detach_region` / `adopt_region` / `free_detached_region`; only ARC/ORC
+implement it — Arena/NoOp/Leak/Tracking are untouched). The `Process.send_move`
+surface consumes its message; the region-closure verifier
+(`src/concurrency_verifier.zig`) proves MOVE-ELIGIBILITY (rc == 1 + region-closed
+over the escape+ownership lattice), and the runtime attempts the O(1) move for a
+flat `List(scalar)` large cell sent to a same-model receiver, degrading to copy
+otherwise.
+
+**R4 residual (documented, honest):** `Map` cells are still allocated through
+`c_allocator` directly (un-migrated even under the gate), so a `Map` is NOT on
+the large path and its send DEGRADES TO COPY today — the E6 `Map` catastrophe is
+addressed IN-MECHANISM (the O(1) move fixes it the moment a large `Map` cell
+routes through `largeAlloc`) but not yet applied to `Map`. Making the map-send
+O(1) is the one-call-site follow-up of migrating `Map.bufferAlloc`/
+`bufferFreeShallow` to `containerBufferAlloc`/`Free` (the exact gate-branch
+`List` already carries), after which `movableFlatListCell` extends to
+`movableFlatMapCell`. Nested graphs (a `List`/`Map` of `String`/`List`/`Map`)
+have interior ARC children in separate cells and also copy.
+
+### Measurement
+
+- **Date:** 2026-07-07. Same machine as the series (Apple M4).
+- **Manager-level (the O(1) claim lives here):** `detachRegion` + `adoptRegion`
+  on real ARC large cells, ping-ponged between two contexts, per-op time
+  (`-OReleaseFast`, fork compiler):
+
+  | payload | move (detach+adopt) | copy (`memcpy` only) |
+  |---|---|---|
+  | 4 KiB   | **1–2 ns** | ~0 (sub-resolution) |
+  | 16 KiB  | **1–2 ns** | small |
+  | 256 KiB | **1–2 ns** | ~11 µs |
+  | 1 MiB   | **1–2 ns** | ~48 µs |
+
+  The move is FLAT (constant ~4 pointer writes — one intrusive unlink + one
+  relink — regardless of size); the copy is linear. At 1 MB the move is ~24,000×
+  a bare `memcpy` and ~1,000,000× the E6 `Map` reconstruct (2.19 ms).
+- **Structural O(1) proof (in the test suite):** `src/memory/arc/manager.zig`
+  test "detach/adopt is O(1) — cost is independent of buffer size" asserts
+  POINTER IDENTITY across 4 KiB…1 MiB (zero relocation), and the leak-exactness
+  tests assert the sender's teardown skips the moved block, the receiver reclaims
+  it, and an un-adopted orphan is reclaimed exactly once (`test_large_free_total`
+  deltas).
+
+**Leak-exactness:** proven at three points — delivered (receiver adopts, its
+release reclaims), dead-lettered (sender re-owns: re-adopt + release), and
+receiver-teardown-drain (the kernel drain invokes the fragment's
+`moved_reclaim`, `munmap`ing the orphan). Every path frees the moved backing
+exactly once.
+
 ## E6 — copy crossover (P2-J9, 2026-07-07) — first crossover measurement
 
 **VERDICT: crossover is LATE for flat scalar payloads (~1 KB) and IMMEDIATE +

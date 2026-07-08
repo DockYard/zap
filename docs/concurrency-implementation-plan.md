@@ -529,6 +529,33 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
     models can O(1)-adopt and which fall back to copy (zap-concurrency-research.md §2.4: "the
     verifier and docs must say so"); P2-J9/item **2.8**'s E6 measurement quantifies the 2-copy
     cost this fallback pays until then.
+  - **R4 RESOLVED (P3-J5, the same-model O(1) region-move send). The mechanism is
+    option (a) refined for the P3-J1 slab reality.** Under the gate a `List`/`String`
+    container buffer routes through the process's own ARC core: SLAB-backed
+    (≤4096 B) buffers are interleaved in shared 64 KiB slabs and are NOT
+    relocatable per-cell (degrade to copy — small, cheap); LARGE (>4096 B →
+    `page_allocator` mmap) buffers are standalone blocks tracked only by intrusive
+    membership in the per-context `large_head` list, so they CAN be re-parented in
+    O(1): `detachRegion` unlinks the `LargeHeader` from the sender's `large_head`,
+    `adoptRegion` relinks it into the receiver's — both scheduler-local, the
+    refcount untouched (rc==1 ⇒ sole reference; no cross-thread refcount touch, the
+    invariant holds by construction), `munmap` process-global. An undelivered
+    move's orphan is reclaimed context-free by `freeDetachedRegion`. Delivered as
+    ABI **v1.2** on the REFCOUNT_V1 capability (`detach_region`/`adopt_region`/
+    `free_detached_region`; ARC/ORC only). Transport reuses the copy-free kernel
+    `context.send` with a `Fragment.moved_reclaim` discriminator + leak-safe
+    reclaim in `zap_proc_envelope_free` and the teardown drain. Surface:
+    `Process.send_move` (consumes its message via the `sideChannelStashBuiltinArg`
+    consume-sink recognition, so the region-closure verifier's C2/C3 engage). **E5
+    PASS:** detach+adopt is 1–2 ns INDEPENDENT of payload size (4 KiB…1 MiB),
+    pointer-identity preserved (O(1)), leak-exact; vs copy's O(size) (48 µs memcpy
+    at 1 MB, 2.19 ms `Map` reconstruct) — `docs/concurrency-bench-results.md` § E5.
+    **R4 residual:** `Map` still uses `c_allocator` (not the large path), so a `Map`
+    send degrades to copy until `Map.bufferAlloc`/`bufferFreeShallow` migrate to
+    `containerBufferAlloc`/`Free` (the exact gate-branch `List` already carries);
+    the O(1) map-send fix is that one-call-site migration + extending
+    `movableFlatListCell` to maps. Nested graphs (interior ARC children in separate
+    cells) also copy.
 - **3.4** ORC manager: `src/memory/orc/manager.zig` + stdlib adapter; verify the
   shares-REFCOUNTED-specialization hypothesis (cycle-root buffering entirely inside `release`);
   cycle-collection at yield points only.

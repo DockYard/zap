@@ -126,7 +126,9 @@ const envelope_pool = @import("envelope_pool.zig");
 /// non-atomic-refcount invariant (module doc) depends on that.
 pub const Fragment = struct {
     /// First byte of the detached payload fragment (null until Phase 2
-    /// populates it, or for payload-less control messages).
+    /// populates it, or for payload-less control messages). For a MOVED
+    /// payload (`moved_reclaim != null`) this is the ROOT of a value graph
+    /// re-parented from the sender uncopied — not a byte blob.
     payload_pointer: ?[*]const u8 = null,
     /// Fragment length in bytes.
     payload_byte_length: usize = 0,
@@ -134,7 +136,21 @@ pub const Fragment = struct {
     /// distinct from `Envelope.origin_page`, which is the page the
     /// ENVELOPE HEADER itself lives in).
     payload_origin_page: ?*envelope_pool.EnvelopePage = null,
+    /// The same-model O(1) region-move send (plan item 6.1, P3-J5). When
+    /// non-null, `payload_pointer` is a value graph MOVED from the sender
+    /// (detached from its heap, uncopied), and this is the leak-exactness
+    /// reclaim to run IF the envelope is freed WITHOUT the receiver adopting
+    /// the graph (dead-letter, or a mailbox drained at receiver teardown). The
+    /// receive path clears the fragment once it takes ownership, so a delivered
+    /// move is never reclaimed. Its presence is also the moved-vs-copied
+    /// discriminator. Opaque to the mailbox and pool — the kernel never
+    /// interprets the payload, only invokes this caller-supplied hook.
+    moved_reclaim: ?MovedReclaimFn = null,
 };
+
+/// Reclaim hook for an un-adopted moved payload (see `Fragment.moved_reclaim`).
+/// Given the moved graph's root pointer, returns its backing to the OS.
+pub const MovedReclaimFn = *const fn (payload_pointer: [*]const u8) callconv(.c) void;
 
 /// One in-flight message: the intrusive Vyukov node plus the opaque
 /// payload fragment reference. Envelope headers are carved from

@@ -157,6 +157,29 @@ pub struct Process {
   }
 
   @doc = """
+    Sends `message` to `pid` by MOVE, CONSUMING it — the same-model O(1)
+    region-move send. Unlike `send` (which deep-copies), `send_move` transfers
+    ownership of the value to the receiver: when the value is uniquely owned
+    (rc == 1), region-closed, and its backing is relocatable, the sender
+    re-parents the whole subgraph to a same-model receiver in O(1) with NO copy
+    — the fix for the deep-copy cost of large payloads. Every other case (an
+    aliased value, a cross-model receiver, a non-relocatable backing) degrades
+    transparently to the copy `send`; the result is identical, only the cost
+    differs.
+
+    `send_move` CONSUMES `message`: after `Process.send_move(pid, value)`, using
+    `value` again is a use-after-move compile error (the value now belongs to
+    the receiver). Returns `true` when enqueued on a live mailbox, `false` when
+    dead-lettered (Erlang semantics). The message type and sendability rules are
+    exactly `send`'s; a value that is not move-eligible is not an error — it
+    simply copies.
+    """
+
+  pub fn send_move(pid :: Pid(message_type), message :: message_type) -> Bool {
+    :zig.ProcessRuntime.send_message_moved(pid.raw, message)
+  }
+
+  @doc = """
     Types raw pid bits as a `Pid(t)` handle for the given message
     type token: `Process.pid(i64, bits)` returns a `Pid(i64)`. Tokens
     cover exactly the Phase 2 sendable set: `i64`, `u64`, `f64`,

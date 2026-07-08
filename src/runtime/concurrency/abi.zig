@@ -812,6 +812,67 @@ export fn zap_proc_send(
     };
 }
 
+/// Send a MOVED value graph to `target_pid_bits` — the same-model O(1)
+/// region-move send (plan item 6.1, P3-J5). Unlike `zap_proc_send`, the payload
+/// is NOT copied: `root_pointer` is a value graph the sender detached from its
+/// own heap (proven uniquely owned + region-closed by the region-closure
+/// verifier), transported by pointer through the neutral envelope with ZERO
+/// byte copy. `reclaim` is the leak-exactness hook invoked if the envelope is
+/// freed without the receiver adopting the graph (dead-letter, or a receiver
+/// teardown drain). On `dead_lettered` the graph was never enqueued; the CALLER
+/// re-owns the orphan (the kernel does not reclaim it here).
+export fn zap_proc_send_moved(
+    process: *anyopaque,
+    target_pid_bits: u64,
+    root_pointer: [*]const u8,
+    byte_length: usize,
+    reclaim: mailbox_module.MovedReclaimFn,
+) callconv(.c) i32 {
+    const context = contextFromHandle(process);
+    const target = concurrency.Pid.fromBits(target_pid_bits);
+    const fragment = mailbox_module.Fragment{
+        .payload_pointer = root_pointer,
+        .payload_byte_length = byte_length,
+        .payload_origin_page = null,
+        .moved_reclaim = reclaim,
+    };
+    const outcome = context.send(target, fragment) catch {
+        // Enqueue failed (out of envelope capacity); nothing consumed the graph.
+        return ZapProcStatus.out_of_memory;
+    };
+    return switch (outcome) {
+        .delivered => ZapProcStatus.ok,
+        // Nothing was enqueued — the sender re-owns the detached graph.
+        .dead_lettered => ZapProcStatus.dead_lettered,
+    };
+}
+
+/// Whether `target_pid_bits` names a REFCOUNTED-model process. The same-model
+/// O(1) region-move send (P3-J5) is sound only when sender and receiver share a
+/// reclamation model; the sender (always refcounted when it reaches the move
+/// path) queries this to decide move-vs-copy BEFORE detaching. Reads the pid's
+/// model bits (the §2.4 `{slot, generation, model}` invariant); a stale/invalid
+/// pid decodes to whatever model its bits carry, and the send then dead-letters
+/// harmlessly if the slot is dead.
+export fn zap_proc_pid_is_refcounted(target_pid_bits: u64) callconv(.c) bool {
+    return concurrency.Pid.fromBits(target_pid_bits).model == .refcounted;
+}
+
+/// If the parked envelope carries a MOVED value graph, return its root pointer
+/// and TRANSFER ownership to the caller (clearing the fragment so the following
+/// `zap_proc_envelope_free` neither reclaims nor byte-frees it); otherwise
+/// return null (a copied payload the caller reconstructs from the byte view).
+/// Called by the receive lowering immediately after `zap_proc_receive_park`.
+export fn zap_proc_envelope_take_moved(envelope_handle: *anyopaque) callconv(.c) ?[*]const u8 {
+    const envelope: *mailbox_module.Envelope = @ptrCast(@alignCast(envelope_handle));
+    if (envelope.fragment.moved_reclaim == null) return null;
+    const root = envelope.fragment.payload_pointer;
+    // Ownership transfers to the receiver (which adopts the graph): clear the
+    // fragment so `zap_proc_envelope_free` performs a pure header free.
+    envelope.fragment = .{};
+    return root;
+}
+
 /// Park the calling process until its mailbox is nonempty, then return
 /// the oldest deliverable envelope as an opaque reference, with the
 /// payload view written through the out-parameters (`null`/`0` for
@@ -836,7 +897,14 @@ export fn zap_proc_receive_park(
 /// to the shared pool. Exactly-once per received envelope.
 export fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void {
     const envelope: *mailbox_module.Envelope = @ptrCast(@alignCast(envelope_handle));
-    if (envelope.fragment.payload_pointer) |payload| {
+    if (envelope.fragment.moved_reclaim) |reclaim| {
+        // A MOVED payload the receiver did NOT adopt (dead-letter, or a mailbox
+        // drained at receiver teardown — a delivered move clears the fragment
+        // via `zap_proc_envelope_take_moved`, so this branch sees only orphans).
+        // Reclaim the detached graph leak-exactly (`reclaim` munmaps it).
+        if (envelope.fragment.payload_pointer) |payload| reclaim(payload);
+        envelope.fragment = .{};
+    } else if (envelope.fragment.payload_pointer) |payload| {
         // P2-J1 transport invariant: a non-null payload with a null
         // origin page is a ledger block (module doc). P2-J5's pool-carved
         // fragments set `payload_origin_page` and take the other branch.

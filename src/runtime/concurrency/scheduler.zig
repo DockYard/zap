@@ -1574,6 +1574,15 @@ pub const Scheduler = struct {
         while (true) {
             switch (mailbox.pop()) {
                 .envelope => |envelope| {
+                    // Leak-exactness for an undelivered MOVED payload: the graph
+                    // was detached from a sender but this receiver dies before
+                    // adopting it, so reclaim it (munmap) before the header goes
+                    // back to the pool. A copied payload's ledger block is
+                    // reclaimed at runtime-ledger teardown, as before.
+                    if (envelope.fragment.moved_reclaim) |reclaim| {
+                        if (envelope.fragment.payload_pointer) |payload| reclaim(payload);
+                        envelope.fragment = .{};
+                    }
                     envelope_pool_module.free(envelope);
                     consecutive_gap_spins = 0;
                 },

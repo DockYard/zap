@@ -169,6 +169,7 @@ const ZapRefcountCapabilityV1 = extern struct {
     // the tail (falling back to the copy send).
     detach_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool,
     adopt_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void,
+    free_detached_region: *const fn (object: *anyopaque) callconv(.c) void,
 };
 
 const ZapMemoryManagerCoreV1 = extern struct {
@@ -204,8 +205,8 @@ comptime {
     if (@sizeOf(ZapMemoryManagerCoreV1) != std.mem.alignForward(usize, 16 + 5 * PTR, @alignOf(ZapMemoryManagerCoreV1))) @compileError(
         "arc: ZapMemoryManagerCoreV1 size must be its 16-byte prefix plus five pointers (aligned)",
     );
-    if (@sizeOf(ZapRefcountCapabilityV1) != 8 * PTR) @compileError(
-        "arc: ZapRefcountCapabilityV1 (v1.2 relocate-extended) must be eight pointer slots wide",
+    if (@sizeOf(ZapRefcountCapabilityV1) != 9 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1 (v1.2 relocate-extended) must be nine pointer slots wide",
     );
 
     if (@offsetOf(ZapMemoryManagerCoreV1, "init") != 16 + 0 * PTR) @compileError(
@@ -246,6 +247,9 @@ comptime {
     );
     if (@offsetOf(ZapRefcountCapabilityV1, "adopt_region") != 7 * PTR) @compileError(
         "arc: ZapRefcountCapabilityV1.adopt_region must be the eighth pointer slot",
+    );
+    if (@offsetOf(ZapRefcountCapabilityV1, "free_detached_region") != 8 * PTR) @compileError(
+        "arc: ZapRefcountCapabilityV1.free_detached_region must be the ninth pointer slot",
     );
 }
 
@@ -1231,6 +1235,20 @@ fn arcAdoptRegion(ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u
     arc_ctx.large_head = header_ptr;
 }
 
+/// Free a DETACHED large buffer that was never adopted by a receiver — the
+/// leak-exactness cleanup for a moved message that is never delivered
+/// (dead-lettered, or a mailbox drained at receiver teardown). Unlike
+/// `deallocate`, it does NO `large_head` list surgery: a detached block is in
+/// NO context's list, so it is context-free AND race-free — it simply returns
+/// the standalone `page_allocator` block to the OS. Reads the size/alignment
+/// from the block's own `LargeHeader`, so no context or size argument is needed.
+fn arcFreeDetachedRegion(object: *anyopaque) callconv(.c) void {
+    const byte_ptr: [*]u8 = @ptrCast(object);
+    const header_ptr: *LargeHeader = @ptrCast(@alignCast(byte_ptr - @sizeOf(LargeHeader)));
+    if (header_ptr.magic != LARGE_MAGIC) @panic("zap.arc: freeDetachedRegion: corrupt LargeHeader magic (not a detached large allocation)");
+    largeFreePage(header_ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Atomic helpers
 //
@@ -1593,6 +1611,7 @@ const refcount_vtable: ZapRefcountCapabilityV1 = .{
     .refcount_sized = arcRefcountSized,
     .detach_region = arcDetachRegion,
     .adopt_region = arcAdoptRegion,
+    .free_detached_region = arcFreeDetachedRegion,
 };
 
 const refcount_descriptor: ZapCapabilityDescV1 = .{
@@ -1722,6 +1741,7 @@ pub const releaseSized = arcReleaseSized;
 pub const refcountSized = arcRefcountSized;
 pub const detachRegion = arcDetachRegion;
 pub const adoptRegion = arcAdoptRegion;
+pub const freeDetachedRegion = arcFreeDetachedRegion;
 pub const getCapabilityDesc = arcGetCapabilityDesc;
 
 // ---------------------------------------------------------------------------
@@ -1751,6 +1771,7 @@ comptime {
     const RefcountSizedFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) u32;
     const DetachRegionFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool;
     const AdoptRegionFn = *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void;
+    const FreeDetachedRegionFn = *const fn (object: *anyopaque) callconv(.c) void;
     const ClassIndexFn = fn (comptime size: usize, comptime alignment: u32) callconv(.@"inline") ?u32;
     const AllocateRefcountedClassFn = fn (ctx: *anyopaque, comptime class_index: u32) callconv(.@"inline") ?[*]u8;
     const RetainSizedClassFn = fn (ctx: *anyopaque, object: *anyopaque, comptime class_index: u32) callconv(.@"inline") void;
@@ -1770,6 +1791,7 @@ comptime {
     _ = @as(RefcountSizedFn, refcountSized);
     _ = @as(DetachRegionFn, detachRegion);
     _ = @as(AdoptRegionFn, adoptRegion);
+    _ = @as(FreeDetachedRegionFn, freeDetachedRegion);
     _ = @as(*const ClassIndexFn, refcountSlabClassIndex);
     _ = @as(*const AllocateRefcountedClassFn, allocateRefcountedClass);
     _ = @as(*const RetainSizedClassFn, retainSizedClass);
@@ -2097,6 +2119,32 @@ test "ARC region-move: the receiver can individually free an adopted large buffe
     // the RECEIVER's `large_head` (where adopt placed it) — the list surgery is
     // consistent, so the free is clean and leak-exact.
     arcReleaseSized(receiver, @ptrCast(buffer), large_size, align_bytes, null);
+    try std.testing.expectEqual(@as(usize, 1), test_large_free_total - free_baseline);
+    try std.testing.expectEqual(
+        test_large_alloc_total - alloc_baseline,
+        test_large_free_total - free_baseline,
+    );
+}
+
+test "ARC region-move: an un-adopted detached buffer is reclaimed leak-exactly (undelivered move)" {
+    const alloc_baseline = test_large_alloc_total;
+    const free_baseline = test_large_free_total;
+
+    const sender = init(null) orelse return error.OutOfMemory;
+    const large_size: usize = MAX_SLAB_CLASS_SIZE + 4096;
+    const align_bytes: u32 = 16;
+    const buffer = arcAllocate(sender, large_size, align_bytes) orelse return error.OutOfMemory;
+
+    // Detach but NEVER adopt — the "moved message never delivered" shape
+    // (dead-lettered, or the receiver's mailbox drained at teardown).
+    try std.testing.expect(arcDetachRegion(sender, buffer, large_size, align_bytes));
+
+    // The sender's teardown skips it (unlinked); the orphan would leak unless
+    // the undelivered-move cleanup reclaims it. `freeDetachedRegion` munmaps it
+    // context-free, no list surgery.
+    deinit(sender);
+    try std.testing.expectEqual(@as(usize, 0), test_large_free_total - free_baseline);
+    arcFreeDetachedRegion(buffer);
     try std.testing.expectEqual(@as(usize, 1), test_large_free_total - free_baseline);
     try std.testing.expectEqual(
         test_large_alloc_total - alloc_baseline,

@@ -1806,8 +1806,8 @@ pub const AbiV1 = struct {
     /// relocate-extension slots (`detach_region`, `adopt_region`). A
     /// v1.2+ manager advertises `desc.size >= REFCOUNT_V1_SIZE_V1_2`; the
     /// runtime may then attempt the same-model O(1) region-move send
-    /// (else it falls back to copy). Pointer-width relative (`8 * PTR`).
-    pub const REFCOUNT_V1_SIZE_V1_2: u16 = @intCast(8 * PTR);
+    /// (else it falls back to copy). Pointer-width relative (`9 * PTR`).
+    pub const REFCOUNT_V1_SIZE_V1_2: u16 = @intCast(9 * PTR);
 
     /// Options passed to the manager's `init` entry point (spec
     /// section 4.1). Evolves in place via the leading `size` field.
@@ -1872,6 +1872,7 @@ pub const AbiV1 = struct {
         // list surgery, the refcount untouched. `desc.size` advertises them.
         detach_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool,
         adopt_region: *const fn (ctx: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void,
+        free_detached_region: *const fn (object: *anyopaque) callconv(.c) void,
     };
 
     // Tripwire asserts mirroring `src/memory/abi.zig`. Any drift in
@@ -1946,8 +1947,8 @@ pub const AbiV1 = struct {
             "runtime.AbiV1: ZapMemoryManagerCoreV1.get_capability_desc must be the fifth pointer slot",
         );
 
-        if (@sizeOf(ZapRefcountCapabilityV1) != 8 * PTR) @compileError(
-            "runtime.AbiV1: ZapRefcountCapabilityV1 (v1.2 relocate-extended) must be eight pointer slots wide",
+        if (@sizeOf(ZapRefcountCapabilityV1) != 9 * PTR) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1 (v1.2 relocate-extended) must be nine pointer slots wide",
         );
         if (@offsetOf(ZapRefcountCapabilityV1, "retain") != 0 * PTR) @compileError(
             "runtime.AbiV1: ZapRefcountCapabilityV1.retain must be the first pointer slot",
@@ -1972,6 +1973,9 @@ pub const AbiV1 = struct {
         );
         if (@offsetOf(ZapRefcountCapabilityV1, "adopt_region") != 7 * PTR) @compileError(
             "runtime.AbiV1: ZapRefcountCapabilityV1.adopt_region must be the eighth pointer slot",
+        );
+        if (@offsetOf(ZapRefcountCapabilityV1, "free_detached_region") != 8 * PTR) @compileError(
+            "runtime.AbiV1: ZapRefcountCapabilityV1.free_detached_region must be the ninth pointer slot",
         );
         if (REFCOUNT_V1_SIZE_V1_0 != 2 * PTR) @compileError(
             "runtime.AbiV1: REFCOUNT_V1_SIZE_V1_0 must equal two pointer slots (v1.0 vtable length)",
@@ -2355,6 +2359,14 @@ fn v1_0_trap_adopt_region(
     @panic("zap runtime: REFCOUNT_V1 adopt_region invoked under a manager without the relocate extension (dispatcher bug)");
 }
 
+/// Trap stub for the v1.2 `free_detached_region` slot under a manager that
+/// lacks the relocate extension. Unreachable — an undelivered move only exists
+/// after a successful `detach_region`, whose stub always returns `false`.
+fn v1_0_trap_free_detached_region(object: *anyopaque) callconv(.c) void {
+    _ = object;
+    @panic("zap runtime: REFCOUNT_V1 free_detached_region invoked under a manager without the relocate extension (dispatcher bug)");
+}
+
 /// Bind the active manager's REFCOUNT_V1 capability. When the
 /// descriptor advertises only the v1.0 surface (`desc.size <
 /// REFCOUNT_V1_SIZE_V1_1`), copy the user-provided `retain` /
@@ -2407,6 +2419,7 @@ fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
             .refcount_sized = head.refcount_sized,
             .detach_region = v1_0_trap_detach_region,
             .adopt_region = v1_0_trap_adopt_region,
+            .free_detached_region = v1_0_trap_free_detached_region,
         };
         active_manager_state.refcount_capability = &v1_0_composed_refcount_vtable;
         active_manager_state.refcount_has_sized_extension = true;
@@ -2436,6 +2449,7 @@ fn bindRefcountCapability(desc: *const AbiV1.ZapCapabilityDescV1) void {
         .refcount_sized = v1_0_trap_refcount_sized,
         .detach_region = v1_0_trap_detach_region,
         .adopt_region = v1_0_trap_adopt_region,
+        .free_detached_region = v1_0_trap_free_detached_region,
     };
     active_manager_state.refcount_capability = &v1_0_composed_refcount_vtable;
     active_manager_state.refcount_has_sized_extension = false;
@@ -3097,6 +3111,18 @@ fn testOnlyArcAdoptRegion(ctx: *anyopaque, object: *anyopaque, size: usize, alig
     if (header.magic != TestOnlyArcSlabPool.LARGE_MAGIC) @panic("zap.test_arc: adopt_region: corrupt LargeHeader magic");
 }
 
+/// REFCOUNT_V1 `free_detached_region` (v1.2) for the test-only manager: reclaim
+/// a detached-but-never-adopted large block (an undelivered move). The
+/// test-only large path is standalone, so this simply returns the block to the
+/// OS via the pool's `largeFree` (no list surgery), context-free.
+fn testOnlyArcFreeDetachedRegion(object: *anyopaque) callconv(.c) void {
+    if (!builtin.is_test) return;
+    const header = TestOnlyArcSlabPool.largeHeader(object);
+    if (header.magic != TestOnlyArcSlabPool.LARGE_MAGIC) @panic("zap.test_arc: free_detached_region: corrupt LargeHeader magic");
+    const byte_ptr: [*]u8 = @ptrCast(object);
+    TestOnlyArcSlabPool.largeFree(byte_ptr);
+}
+
 const test_only_arc_refcount_vtable: AbiV1.ZapRefcountCapabilityV1 = .{
     .retain = testOnlyArcRetain,
     .release = testOnlyArcRelease,
@@ -3106,6 +3132,7 @@ const test_only_arc_refcount_vtable: AbiV1.ZapRefcountCapabilityV1 = .{
     .refcount_sized = testOnlyArcRefcountSized,
     .detach_region = testOnlyArcDetachRegion,
     .adopt_region = testOnlyArcAdoptRegion,
+    .free_detached_region = testOnlyArcFreeDetachedRegion,
 };
 
 const test_only_arc_refcount_descriptor: AbiV1.ZapCapabilityDescV1 = .{
@@ -3718,11 +3745,30 @@ const ZapConcurrencyKernel = struct {
         payload_pointer: ?[*]const u8,
         payload_len: usize,
     ) callconv(.c) i32;
+    /// The same-model O(1) region-move send (P3-J5): transports a detached value
+    /// graph by pointer with zero byte copy. `reclaim` is the leak-exactness hook
+    /// for an undelivered move (`MovedReclaimFn`: given the root pointer, munmaps
+    /// the detached backing).
+    extern fn zap_proc_send_moved(
+        process: *anyopaque,
+        target_pid_bits: u64,
+        root_pointer: [*]const u8,
+        byte_length: usize,
+        reclaim: *const fn (payload_pointer: [*]const u8) callconv(.c) void,
+    ) callconv(.c) i32;
     extern fn zap_proc_receive_park(
         process: *anyopaque,
         out_payload_pointer: *?[*]const u8,
         out_payload_len: *usize,
     ) callconv(.c) *anyopaque;
+    /// If the parked envelope carries a MOVED graph, returns its root pointer and
+    /// transfers ownership to the caller (which adopts it); else null (a copied
+    /// payload the caller reconstructs from the byte view). Called right after
+    /// `zap_proc_receive_park`.
+    extern fn zap_proc_envelope_take_moved(envelope_handle: *anyopaque) callconv(.c) ?[*]const u8;
+    /// Whether a target pid names a REFCOUNTED-model process — the same-model
+    /// gate for the O(1) region-move send (cross-model degrades to copy).
+    extern fn zap_proc_pid_is_refcounted(target_pid_bits: u64) callconv(.c) bool;
     extern fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void;
     extern fn zap_proc_exit(process: *anyopaque) callconv(.c) noreturn;
     extern fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void;
@@ -4090,6 +4136,20 @@ fn walkerListCell(comptime T: type) ?type {
         },
         else => return null,
     }
+}
+
+/// If `T` is a FLAT `List(Scalar)` value — `?*const List(Scalar)` whose element
+/// is a walker scalar (no ARC children) — return its `List` cell type, else
+/// null. This is exactly the message shape the same-model O(1) region-move send
+/// (P3-J5) can transfer soundly: a single contiguous large-backed buffer with
+/// no interior pointers, so re-parenting the one cell moves the WHOLE value. A
+/// `List` of `String`/`List`/`Map` (interior ARC children living in separate
+/// cells), a `Map` (its backing is a non-relocatable `c_allocator` block), a
+/// `String` slice, or a struct all fall back to the copy send.
+fn movableFlatListCell(comptime T: type) ?type {
+    const Cell = walkerListCell(T) orelse return null;
+    if (!isWalkerScalar(Cell.Element)) return null;
+    return Cell;
 }
 
 /// If `T` is the runtime representation of a Zap map value —
@@ -4861,6 +4921,16 @@ test "message walker: a struct of scalar+String+List+Map deep-copies by value, i
 /// `zap_proc_current` lookup so the Zap surface stays handle-free in
 /// Phase 2 (the A.4.1 parameter-threading decision for compiled code
 /// stays open; this namespace is additive over it).
+/// Leak-exactness reclaim for a MOVED value graph that is never delivered
+/// (dead-lettered, or a mailbox drained at the receiver's teardown). Passed to
+/// `zap_proc_send_moved` and invoked by the kernel envelope-free/drain paths on
+/// the detached-but-un-adopted graph. Context-free: it returns the standalone
+/// large backing to the OS via the manager's `freeDetachedRegion` — no heap
+/// tracking-list surgery, safe from any thread.
+fn movedOrphanReclaim(payload_pointer: [*]const u8) callconv(.c) void {
+    ArcRuntime.freeDetachedRegion(@constCast(payload_pointer));
+}
+
 pub const ProcessRuntime = struct {
     /// The calling process's pid as its raw `u64` kernel encoding
     /// (`pid_table.zig` packing). `lib/process.zap` wraps it into the
@@ -5004,6 +5074,78 @@ pub const ProcessRuntime = struct {
         };
     }
 
+    /// Send `message` to `target_pid_bits` by MOVE — the same-model O(1)
+    /// region-move send (plan item 6.1, P3-J5). CONSUMES `message` (the
+    /// `Process.send_move` surface passes it by a consuming convention, so a use
+    /// after this call is a use-after-move compile error). Returns `true` on
+    /// delivery, `false` on dead-letter (Erlang semantics).
+    ///
+    /// The move is attempted only for the value shape it is SOUND for — a flat
+    /// `List(scalar)` whose backing is a single relocatable (large/page-backed)
+    /// cell — sent to a SAME-MODEL (refcounted) receiver, with the value proven
+    /// uniquely owned (rc == 1, the runtime gate paired with the compile-time
+    /// region-closure verifier). When eligible, the sender DETACHES the cell from
+    /// its own heap and transports it by pointer with ZERO byte copy; the
+    /// receiver adopts it (see `receiveMessage`). Every other case — a non-flat
+    /// or `Map`/`String` payload, a cross-model receiver, an aliased or
+    /// slab-backed cell — transparently DEGRADES to the deep-copy send (the
+    /// honest R4 fallback), still consuming the argument.
+    pub fn send_message_moved(target_pid_bits: u64, message: anytype) bool {
+        requireConcurrencyRuntimeGate();
+        const MessageType = switch (@TypeOf(message)) {
+            comptime_int => i64,
+            comptime_float => f64,
+            else => @TypeOf(message),
+        };
+        if (comptime !isWalkerSendable(MessageType)) unsendableMessageTypeError(MessageType);
+
+        // A scalar "move" is a bit-copy — identical to the copy send, and the
+        // scalar owns no heap, so there is nothing to consume afterward.
+        if (comptime isWalkerScalar(MessageType)) {
+            return send_message(target_pid_bits, message);
+        }
+
+        const typed_message: MessageType = message;
+
+        // Move-eligible shape: a flat List(scalar) whose backing is relocatable,
+        // sent to a same-model receiver, uniquely owned. Only reached when the
+        // sender itself is refcounted (`refcount_v1_active`).
+        if (comptime refcount_v1_active) {
+            if (comptime movableFlatListCell(MessageType)) |Cell| {
+                if (typed_message) |cell| {
+                    const same_model = ZapConcurrencyKernel.zap_proc_pid_is_refcounted(target_pid_bits);
+                    if (same_model and cell.header.count() == 1) {
+                        const byte_length = Cell.bufferSize(cell.cap);
+                        const alignment = comptime Cell.bufferAlign();
+                        const cell_bytes: [*]u8 = @ptrCast(@constCast(cell));
+                        if (ArcRuntime.detachRegion(cell_bytes, byte_length, alignment)) {
+                            const status = ZapConcurrencyKernel.zap_proc_send_moved(
+                                requireCurrentProcessHandle(),
+                                target_pid_bits,
+                                cell_bytes,
+                                byte_length,
+                                movedOrphanReclaim,
+                            );
+                            if (status == 0) return true; // delivered — receiver owns the graph
+                            // Not delivered (dead-letter / OOM): nothing consumed the
+                            // detached graph. Re-home it into our own heap and release
+                            // our +1 (send_move consumes its argument).
+                            ArcRuntime.adoptRegion(cell_bytes, byte_length, alignment);
+                            Cell.release(typed_message);
+                            return interpretSendStatus(status);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Copy fallback: deep-copy the message to the receiver, then release our
+        // +1 (send_move CONSUMES its argument — the caller will not release it).
+        const delivered = send_message(target_pid_bits, typed_message);
+        releaseWalkerValue(MessageType, typed_message);
+        return delivered;
+    }
+
     /// Blocking typed receive: park until the mailbox is nonempty and
     /// decode the oldest message as `i64`. See `receiveScalarMessage`
     /// for the raw-receive contract shared by the whole set.
@@ -5052,6 +5194,24 @@ pub const ProcessRuntime = struct {
         var payload_len: usize = 0;
         const envelope = ZapConcurrencyKernel.zap_proc_receive_park(process, &payload_pointer, &payload_len);
         defer ZapConcurrencyKernel.zap_proc_envelope_free(envelope);
+
+        // Same-model O(1) region-move receive (P3-J5): if the envelope carries a
+        // MOVED value graph (not a copied byte blob), take ownership of it,
+        // ADOPT its backing into THIS process's heap, and return it IN PLACE —
+        // no reconstruction, no copy. The sender only ever moves a flat
+        // `List(scalar)` cell (see `send_message_moved`), so the moved root IS a
+        // `MessageType` value; a moved payload for any other receive type is a
+        // protocol violation.
+        if (ZapConcurrencyKernel.zap_proc_envelope_take_moved(envelope)) |moved_root| {
+            if (comptime movableFlatListCell(MessageType)) |Cell| {
+                const alignment = comptime Cell.bufferAlign();
+                ArcRuntime.adoptRegion(@constCast(moved_root), payload_len, alignment);
+                return @as(MessageType, @ptrCast(@alignCast(moved_root)));
+            } else {
+                @panic("zap: Process.receive got a MOVED payload for a non-movable receive type (protocol violation — the sender and receiver message types disagree)");
+            }
+        }
+
         const blob: []const u8 = if (payload_pointer) |pointer| pointer[0..payload_len] else &.{};
         return deserializeMessage(MessageType, blob) catch |err| switch (err) {
             error.OutOfMemory => @panic(
@@ -6466,6 +6626,64 @@ pub const ArcRuntime = struct {
             return;
         }
         active_manager.deallocate(ctx, memory, byte_length, alignment_bytes);
+    }
+
+    /// Detach a container buffer from the CURRENT (sender) process's heap so a
+    /// same-model receiver can adopt it without copying — the sender side of the
+    /// same-model O(1) region-move send (plan item 6.1, P3-J5). Returns `true`
+    /// when the buffer is RELOCATABLE (a standalone large/page-backed block now
+    /// orphaned, owned by neither heap — safe to transport by pointer and hand
+    /// to `adoptRegion`) and `false` when it is slab-interleaved and the send
+    /// must fall back to copy (the honest R4 degradation). Dispatches through the
+    /// running process's REFCOUNT_V1 manager; a manager without the v1.2 relocate
+    /// extension answers `false`. Scheduler-local: the sender detaches its own
+    /// cell in its own quantum, refcount untouched.
+    pub inline fn detachRegion(memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) bool {
+        if (active_manager_state.shutdown_complete) return false;
+        const ctx = currentManagerContext() orelse return false;
+        const alignment_bytes: u32 = @intCast(alignment.toByteUnits());
+        if (comptime active_manager_source_available and refcount_v1_active) {
+            return active_manager.detachRegion(ctx, memory, byte_length, alignment_bytes);
+        }
+        if (!active_manager_state.refcount_has_relocate_extension) return false;
+        const cap = active_manager_state.refcount_capability orelse return false;
+        return cap.detach_region(ctx, memory, byte_length, alignment_bytes);
+    }
+
+    /// Adopt a detached container buffer into the CURRENT (receiver) process's
+    /// heap — the receiver side of the O(1) region-move send. After this the
+    /// receiver solely owns the buffer (the mover proved rc == 1) and its normal
+    /// ARC release reclaims it. Scheduler-local: the receiver links the block
+    /// into its own heap in its own quantum. Only called after a successful
+    /// `detachRegion`, so the relocate extension is known present.
+    pub inline fn adoptRegion(memory: [*]u8, byte_length: usize, alignment: std.mem.Alignment) void {
+        const ctx = currentManagerContext() orelse
+            @panic("zap runtime: region adopt with no active manager context");
+        const alignment_bytes: u32 = @intCast(alignment.toByteUnits());
+        if (comptime active_manager_source_available and refcount_v1_active) {
+            active_manager.adoptRegion(ctx, memory, byte_length, alignment_bytes);
+            return;
+        }
+        const cap = active_manager_state.refcount_capability orelse
+            @panic("zap runtime: region adopt with no REFCOUNT_V1 capability");
+        cap.adopt_region(ctx, memory, byte_length, alignment_bytes);
+    }
+
+    /// Reclaim a DETACHED buffer that was never adopted — the leak-exactness
+    /// cleanup for a moved message that is never delivered (dead-lettered, or a
+    /// mailbox drained at receiver teardown). Context-free and race-free: it
+    /// returns the standalone page-backed block to the OS without touching any
+    /// heap's tracking list (a detached block is in none). Reads the size/align
+    /// from the block itself, so it is safe to call from any thread with no
+    /// current process quantum.
+    pub inline fn freeDetachedRegion(memory: [*]u8) void {
+        if (comptime active_manager_source_available and refcount_v1_active) {
+            active_manager.freeDetachedRegion(memory);
+            return;
+        }
+        const cap = active_manager_state.refcount_capability orelse return;
+        if (!active_manager_state.refcount_has_relocate_extension) return;
+        cap.free_detached_region(memory);
     }
 
     /// Increment the runtime `arc_consumes_total` counter. Emitted as a
