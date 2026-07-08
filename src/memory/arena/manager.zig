@@ -668,19 +668,19 @@ pub const zap_memory_section: ZapMemorySection = .{
 // a Zig-decl access, NOT the linker symbol — so a user binary that registers
 // this manager as its active source needs the decl regardless of `export`.
 //
-// Under `builtin.is_test` the SYMBOL is dead: `runtime.zig`'s
-// `externalMemorySection` early-returns null in test mode (see its
-// `if (builtin.is_test) return null;` guard), so no test ever reads the
-// section through the linker. Gating EMISSION on `!builtin.is_test` lets the
-// Arena manager be imported into the same `zig build test` binary as the
-// other first-party managers (`src/root.zig`'s aggregation) without
-// colliding on the single, strongly-linked `zap_memory_section` symbol —
-// multiple unconditional `export`s of the same name in one binary is a
-// duplicate-symbol link error. The `.section` reproduces the prior
-// `linksection(SECTION_NAME)` byte-for-byte.
+// Emission is gated on `builtin.output_mode == .Obj` — a standalone-object
+// compile (the driver's validation object + object-linked hosts), the only
+// contexts that read the section through the linker symbol. In a compiler-driven
+// `.Exe`/`.Lib` the manager is a sibling SOURCE MODULE bound via its decl
+// (`@import("...").zap_memory_section`), so it must NOT emit the colliding
+// symbol — this is what lets Arena coexist with the manifest manager (and any
+// other per-spawn manager) as sibling modules in ONE binary
+// (docs/memory-manager-abi.md §10.5). It also subsumes the old `!is_test` gate
+// (a test binary is an `.Exe`). See `src/memory/arc/manager.zig` for the full
+// rationale. `.linkage = .weak` + `.section` are retained as before.
 comptime {
-    if (!builtin.is_test) {
-        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME });
+    if (builtin.output_mode == .Obj) {
+        @export(&zap_memory_section, .{ .name = "zap_memory_section", .section = SECTION_NAME, .linkage = .weak });
     }
 }
 

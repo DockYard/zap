@@ -300,6 +300,22 @@ pub const CompileError = error{
     SymbolTableSidecarDeleteFailed,
 };
 
+/// P3-J3: one NON-manifest per-spawn manager the build must link into a
+/// user binary alongside the manifest default. Produced by the driver-backed
+/// resolver in `src/main.zig` and consumed by `createContext` to register the
+/// backend sibling module + synthesize the `zap_manager_registry` module.
+pub const SpawnManagerRegistration = struct {
+    /// Kernel registry slot index. Always ≥ 1 — slot 0 is the manifest default,
+    /// registered separately as `zap_active_manager`. Indices are dense and
+    /// unique across the binary's distinct non-manifest managers.
+    index: u32,
+    /// Absolute path to the manager's Zig backend source (the same
+    /// `ResolvedManager.active_manager_source_path` the driver validated through
+    /// the `.zapmem` object pipeline). Registered as the `zap_spawn_manager_<index>`
+    /// sibling source module.
+    backend_source_path: []const u8,
+};
+
 pub const CompileOptions = struct {
     /// Path to Zig's lib directory (contains std/).
     zig_lib_dir: []const u8,
@@ -368,6 +384,16 @@ pub const CompileOptions = struct {
     /// user-binary build. The memory driver validates the same source
     /// through the `.zapmem` object pipeline before it reaches here.
     active_manager_source_path: []const u8,
+    /// P3-J3 per-spawn managers: the NON-manifest managers selected at
+    /// `spawn(f, .{ .manager = X })` sites (registry index ≥ 1; the manifest
+    /// default is index 0 = `zap_active_manager`). Empty (the default) for every
+    /// single-manager binary. When non-empty, `createContext` registers each
+    /// backend source as a `zap_spawn_manager_<index>` sibling module and
+    /// synthesizes the `zap_manager_registry` module the gated runtime imports at
+    /// startup to register each into its kernel slot (`zap_proc_register_manager`).
+    /// See `docs/memory-manager-abi.md` §10.5. The caller (`src/main.zig`) also
+    /// sets `RuntimeSourceControls.multi_manager` so the runtime's gate flips ON.
+    spawn_managers: []const SpawnManagerRegistration = &.{},
     /// P2-J1 concurrency gate: path to the per-target concurrency
     /// kernel object resolved by `src/concurrency_driver.zig`, linked
     /// into the binary via `zir_compilation_add_link_object_file`.
@@ -696,6 +722,36 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
         return error.CompilationFailed;
     }
 
+    // P3-J3 per-spawn manager registry (docs/memory-manager-abi.md §10.5).
+    // For a gated-on binary that selected a NON-manifest manager at any
+    // `spawn(f, .{ .manager = X })` site, register each backend source as a
+    // `zap_spawn_manager_<index>` sibling module (exactly as `zap_active_manager`
+    // above), then synthesize the `zap_manager_registry` module the runtime
+    // imports at startup under `multi_manager_active` to register each into its
+    // kernel slot. Empty for every single-manager binary — nothing is registered
+    // and no `zap_manager_registry` module exists (the runtime never imports it).
+    if (options.spawn_managers.len > 0) {
+        for (options.spawn_managers) |registration| {
+            const module_name = std.fmt.allocPrintSentinel(allocator, "zap_spawn_manager_{d}", .{registration.index}, 0) catch return error.OutOfMemory;
+            defer allocator.free(module_name);
+            const backend_path_z = allocator.dupeZ(u8, registration.backend_source_path) catch return error.OutOfMemory;
+            defer allocator.free(backend_path_z);
+            if (zir_compilation_add_struct(ctx, module_name, backend_path_z) != 0) {
+                zir_compilation_destroy(ctx);
+                return error.CompilationFailed;
+            }
+        }
+
+        // The generated module is written to disk by `add_struct_source` during
+        // this call (it copies the bytes), so the buffer is safe to free after.
+        const registry_source = generateManagerRegistrySource(allocator, options.spawn_managers) catch return error.OutOfMemory;
+        defer allocator.free(registry_source);
+        if (zir_compilation_add_struct_source(ctx, "zap_manager_registry", registry_source.ptr, @intCast(registry_source.len)) != 0) {
+            zir_compilation_destroy(ctx);
+            return error.CompilationFailed;
+        }
+    }
+
     // P2-J1 concurrency gate: splice the per-target kernel object into
     // the link line. Present exactly when the build resolved
     // `runtime_concurrency` ON — the rewritten runtime source then
@@ -710,6 +766,71 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
     }
 
     return ctx;
+}
+
+/// Synthesize the `zap_manager_registry` Zig module source for a gated-on
+/// binary's NON-manifest per-spawn managers (P3-J3; `docs/memory-manager-abi.md`
+/// §10.5). Each manager's backend is registered separately as a
+/// `zap_spawn_manager_<index>` sibling source module; this module imports each
+/// and exposes `entries` — the `{ index, core }` pairs the runtime's startup
+/// bootstrap (`concurrencyStartupForEntry`) feeds to `zap_proc_register_manager`
+/// under `multi_manager_active`. `core` is `&section.core` — the manager's
+/// `.zapmem` core vtable pointer, the exact shape `zap_proc_bind_manager` binds
+/// for the manifest slot 0 — reached through the manager module's OWN
+/// `zap_memory_section` DECL (not the weak linker symbol), so per-module storage
+/// keeps each manager's core distinct.
+///
+/// The caller owns the returned buffer.
+fn generateManagerRegistrySource(
+    allocator: std.mem.Allocator,
+    managers: []const SpawnManagerRegistration,
+) error{OutOfMemory}![]u8 {
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+
+    try buffer.appendSlice(allocator,
+        \\// GENERATED by src/zir_backend.zig:generateManagerRegistrySource (P3-J3).
+        \\// The per-spawn memory-manager registry the gated runtime imports at
+        \\// startup to register each NON-manifest manager into its kernel slot.
+        \\// See docs/memory-manager-abi.md section 10.5.
+        \\
+        \\
+    );
+
+    for (managers) |registration| {
+        const import_line = try std.fmt.allocPrint(
+            allocator,
+            "const spawn_manager_{d} = @import(\"zap_spawn_manager_{d}\");\n",
+            .{ registration.index, registration.index },
+        );
+        defer allocator.free(import_line);
+        try buffer.appendSlice(allocator, import_line);
+    }
+
+    try buffer.appendSlice(allocator,
+        \\
+        \\pub const Entry = struct {
+        \\    index: u32,
+        \\    core: *const anyopaque,
+        \\};
+        \\
+        \\pub const entries = [_]Entry{
+        \\
+    );
+
+    for (managers) |registration| {
+        const entry_line = try std.fmt.allocPrint(
+            allocator,
+            "    .{{ .index = {d}, .core = @ptrCast(&spawn_manager_{d}.zap_memory_section.core) }},\n",
+            .{ registration.index, registration.index },
+        );
+        defer allocator.free(entry_line);
+        try buffer.appendSlice(allocator, entry_line);
+    }
+
+    try buffer.appendSlice(allocator, "};\n");
+
+    return try buffer.toOwnedSlice(allocator);
 }
 
 /// Inject ZIR from a Zap IR program into the context and run the Zig
@@ -1560,6 +1681,37 @@ fn canonicalizeDupeForTest(allocator: std.mem.Allocator, path: []const u8) anyer
 }
 
 const testing = std.testing;
+
+test "generateManagerRegistrySource: emits an import + a {index, core} entry per manager" {
+    const managers = [_]SpawnManagerRegistration{
+        .{ .index = 1, .backend_source_path = "/pkg/src/memory/arena/manager.zig" },
+        .{ .index = 2, .backend_source_path = "/pkg/src/memory/no_op/manager.zig" },
+    };
+    const source = try generateManagerRegistrySource(testing.allocator, &managers);
+    defer testing.allocator.free(source);
+
+    // One sibling-module import per manager, keyed by registry index.
+    try testing.expect(std.mem.indexOf(u8, source, "const spawn_manager_1 = @import(\"zap_spawn_manager_1\");") != null);
+    try testing.expect(std.mem.indexOf(u8, source, "const spawn_manager_2 = @import(\"zap_spawn_manager_2\");") != null);
+
+    // The `entries` array the runtime bootstrap iterates: each entry binds the
+    // registry slot to that manager's `.zapmem` core vtable pointer.
+    try testing.expect(std.mem.indexOf(u8, source, "pub const entries = [_]Entry{") != null);
+    try testing.expect(std.mem.indexOf(u8, source, ".{ .index = 1, .core = @ptrCast(&spawn_manager_1.zap_memory_section.core) }") != null);
+    try testing.expect(std.mem.indexOf(u8, source, ".{ .index = 2, .core = @ptrCast(&spawn_manager_2.zap_memory_section.core) }") != null);
+
+    // The `Entry` shape the runtime's `inline for` destructures.
+    try testing.expect(std.mem.indexOf(u8, source, "index: u32,") != null);
+    try testing.expect(std.mem.indexOf(u8, source, "core: *const anyopaque,") != null);
+}
+
+test "generateManagerRegistrySource: empty manager list yields an empty entries array (no imports)" {
+    const source = try generateManagerRegistrySource(testing.allocator, &.{});
+    defer testing.allocator.free(source);
+
+    try testing.expect(std.mem.indexOf(u8, source, "pub const entries = [_]Entry{") != null);
+    try testing.expect(std.mem.indexOf(u8, source, "@import(\"zap_spawn_manager_") == null);
+}
 
 test "P4J2: incremental publish source path resolution preserves OutOfMemory" {
     var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });

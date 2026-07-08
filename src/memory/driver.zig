@@ -354,6 +354,17 @@ pub const ResolveOptions = struct {
     fork_compile_fn: ?ForkCompileFn = null,
     /// Optional CLI progress reporter owned by the build command.
     progress: ?*progress_mod.Reporter = null,
+    /// Whether to apply the build-time manager × target soundness gate
+    /// (`enforceManagerTargetSupport`). True (the default) for the MANIFEST
+    /// default manager — a statically-known unsound combo (e.g. a TRACED
+    /// manager on Windows/wasm) is rejected early. FALSE when resolving a
+    /// per-spawn `spawn(f, .{ .manager = X })` manager (plan item 3.1/3.5,
+    /// P3-J3): every manager backend must stay PRESENT/linkable in every target
+    /// binary (the cross-compile requirement — a process might spawn any), so
+    /// an impossible combo is a RUNTIME spawn error (`managerModelSoundOnTarget`
+    /// in the kernel), not a compile-time exclusion that would drop the backend
+    /// from the link.
+    gate_target_support: bool = true,
 };
 
 /// Resolve the active memory manager for the build. Returns a
@@ -472,6 +483,11 @@ fn enforceManagerTargetSupport(
     options: ResolveOptions,
     diag: *DriverDiagnostic,
 ) ResolveError!void {
+    // Per-spawn managers opt out of the BUILD-TIME gate so their backend stays
+    // linkable on every target (the cross-compile requirement); the kernel's
+    // `managerModelSoundOnTarget` turns an impossible combo into a runtime
+    // spawn error instead (plan item 3.5, P3-J3).
+    if (!options.gate_target_support) return;
     const target_triple = options.target orelse return; // native host: GC is supported (ELF/Mach-O backends exist)
     const target = parseTargetTriple(target_triple) orelse return; // malformed triples are surfaced later by the compile path
     const os_tag = enumFromTag(std.Target.Os.Tag, target.os_tag) orelse return;
