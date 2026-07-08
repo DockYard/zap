@@ -8,19 +8,28 @@
 //! semantics) is Zap code in `lib/*.zap` layered on intrinsics in later
 //! phases.
 //!
-//! ## The scheduler model (P1-J4)
+//! ## The scheduler model (P1-J4 → P4-J1 M:N)
 //!
-//! Phase 1 runs ONE bespoke run-queue scheduler built directly on the
-//! fork's `std.Io.fiber` context switch (the Appendix A / S0.5 decision):
-//! processes are COOPERATIVE — a quantum runs until the process yields,
-//! suspends on its mailbox, exhausts its preemption budget at a
-//! `yieldCheck` safepoint, observes the flag-only watchdog, or exits —
-//! and the scheduler parks on an OS futex when nothing is runnable
-//! (Darwin: `os_sync_wait_on_address`/`__ulock` per E9; spin ~1–2 µs
-//! first). Every structure is INSTANCE-based (no module-level mutable
-//! state): Phase 4 multiplies scheduler instances over the shared,
-//! already-M:N-safe pid table and envelope pool for the per-core
-//! queues + LIFO slot + work-stealing design of research.md §6.1.
+//! The scheduler is a bespoke run-queue scheduler built directly on the fork's
+//! `std.Io.fiber` context switch (the Appendix A / S0.5 decision): processes are
+//! COOPERATIVE — a quantum runs until the process yields, suspends on its
+//! mailbox, exhausts its preemption budget at a `yieldCheck` safepoint, observes
+//! the flag-only watchdog, or exits — and an idle core parks on an OS futex
+//! (Darwin: `os_sync_wait_on_address`/`__ulock` per E9; spin ~1–2 µs first).
+//!
+//! Every structure is INSTANCE-based (no module-level mutable state), which
+//! Phase 4 (P4-J1, `scheduler_pool.zig`) realizes as genuine multicore
+//! parallelism: a `SchedulerPool` multiplies `Scheduler` instances — one per
+//! core, default = CPU count — over the shared, already-M:N-safe pid table and
+//! envelope pool, with per-core run queues + a LIFO slot for the just-woken task
+//! + work-stealing between cores + a global overflow queue + netpoller-style
+//! parking (research.md §6.1). The SACRED invariant holds under real
+//! parallelism: each process's manager/heap/refcounts are touched by only ONE
+//! core at a time (the one running its quantum); the only cross-thread atomics
+//! are the mailbox links, envelope pages, pid slots, run-queue/steal/LIFO
+//! machinery, and wake signals — never a payload refcount. A standalone
+//! `Scheduler` (`work_stealing = false`) is byte-identical to Phase 1, which is
+//! what the deterministic mode drives.
 //!
 //! A seeded DETERMINISTIC mode (plan 1.5, decision 11) funnels all
 //! scheduler nondeterminism — next-runnable choice, per-quantum budget —
@@ -64,6 +73,15 @@
 //!   handle abandon → invariant stack release → pid generation bump →
 //!   wholesale manager free; EXACT accounting), and futex idle parking
 //!   with cross-thread mailbox-push wakes.
+//! * `scheduler_pool.zig` — the M:N work-stealing scheduler pool (P4-J1):
+//!   N per-core `Scheduler` instances over the shared pid table + envelope
+//!   pool, per-core queues + LIFO slot + work stealing + a global overflow
+//!   queue + netpoller parking, the worker loop, the root-exit/quiescent stop,
+//!   and straggler shutdown. The realization of the instance-based design.
+//! * `mn_refcount_stress.zig` — the scheduler-local-refcount invariant under
+//!   REAL M:N scheduling (gate E3's full half by assertion + leak-exactness;
+//!   skipped under `-fsanitize-thread`, where TSan's own runtime cannot
+//!   instrument the fiber-switch volume — see that file's header).
 //! * `deterministic.zig` — the seeded deterministic mode: seeded
 //!   `Decisions`, append-only trace recording with equality comparison,
 //!   scenario harness + seed sweeps, failing-seed printing.

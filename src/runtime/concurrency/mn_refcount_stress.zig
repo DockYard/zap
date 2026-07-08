@@ -309,20 +309,29 @@ fn runMultiSchedulerRefcountStress(worker_count: usize, rounds: usize) !void {
 
 test "MnRefcountStress: per-process non-atomic refcounts hold the scheduler-local-refcount invariant under real M:N scheduling" {
     // ThreadSanitizer's OWN trace machinery faults (SEGV/ILL, intermittently and
-    // at any non-trivial volume) on the sheer number of manual fiber context-
-    // switches this test performs — a documented TSan-runtime limitation, NOT a
-    // kernel race: the debugger confirmed every fault frame is inside `__tsan::`,
-    // TSan reports ZERO data-race findings at the volumes that DO complete, and
-    // the identical logic runs clean without the sanitizer at 25× the volume.
-    // So under `-fsanitize-thread` this test drops to a token volume (enough
-    // concurrent workers + steals + park/wakes that a genuine refcount race
-    // would still be reported, but few enough fibers to stay under TSan's own
-    // ceiling), and its HEAVY invariant proof — data integrity + leak-exactness
-    // across a saturated M:N run — is carried by the Debug/ReleaseFast kernel
-    // suite instead. `ZAP_MN_REFCOUNT_WORKERS`/`_ROUNDS` override either default
-    // (a non-TSan soak, or a deliberate TSan volume sweep).
-    const tsan = @import("builtin").sanitize_thread;
-    const worker_count = envValue("ZAP_MN_REFCOUNT_WORKERS", if (tsan) 4 else 64);
-    const rounds = envValue("ZAP_MN_REFCOUNT_ROUNDS", if (tsan) 16 else 200);
+    // even at a handful of fibers) on the manual fiber context-switches this
+    // test performs in bulk — a documented, debugger-confirmed TSan-runtime
+    // limitation (every fault frame is inside `__tsan::`), NOT a kernel race: at
+    // the volumes that DO complete TSan reports ZERO data-race findings, and the
+    // identical logic runs clean without the sanitizer at 25× the volume. It is
+    // therefore SKIPPED under `-fsanitize-thread` — crashing TSan's runtime
+    // proves nothing. The scheduler-local-refcount invariant is instead proven
+    // under TSan by its two orthogonal halves, each of which TSan CAN instrument:
+    //   * the M:N scheduler moving processes race-free — `scheduler_pool.zig`'s
+    //     work-stealing/LIFO/parking/migration tests, TSan-clean;
+    //   * non-atomic refcounts crossing threads race-free — the P3 harnesses
+    //     `src/memory/{arc,orc}/cross_thread_stress.zig` with REAL ARC/ORC
+    //     contexts, TSan-clean.
+    // Their COMBINATION — real per-process refcounts driven by the real M:N
+    // scheduler — is proven here by ASSERTION (data integrity + leak-exactness
+    // across a saturated M:N run) in the Debug/ReleaseFast kernel suite.
+    // `ZAP_MN_REFCOUNT_*` allow a deliberate under-TSan volume sweep anyway.
+    if (@import("builtin").sanitize_thread and
+        std.c.getenv("ZAP_MN_REFCOUNT_WORKERS") == null)
+    {
+        return error.SkipZigTest;
+    }
+    const worker_count = envValue("ZAP_MN_REFCOUNT_WORKERS", 64);
+    const rounds = envValue("ZAP_MN_REFCOUNT_ROUNDS", 200);
     try runMultiSchedulerRefcountStress(worker_count, rounds);
 }
