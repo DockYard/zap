@@ -3699,6 +3699,21 @@ const RUNTIME_MULTI_MANAGER_DEFAULT: bool = false;
 /// guarantee). Implies `runtime_concurrency_active`.
 pub const multi_manager_active: bool = RUNTIME_MULTI_MANAGER_DEFAULT;
 
+comptime {
+    // Per-process refcount dispatch (the `multi_manager_active` branches in
+    // retain/release/*Sized) reaches only the size-extended v1.2 refcount path;
+    // it structurally assumes the v1.0 fallback blocks (guarded by
+    // `!refcount_sized_extension_active`) are comptime-dead. The compiler only
+    // enables `multi_manager` for source-linked v1.x manifests, which always
+    // carry the sized extension — but enforce the invariant here so a future
+    // build flipping `multi_manager` on a non-sized-extension manifest fails
+    // loudly instead of silently exposing the unguarded fallback.
+    if (multi_manager_active and !refcount_sized_extension_active) {
+        @compileError("multi_manager_active requires refcount_sized_extension_active " ++
+            "(per-process retain/release dispatch reaches only the v1.2 sized path)");
+    }
+}
+
 /// Runtime-side mirror of the kernel's per-process `ProcessManagerBinding`
 /// (`src/runtime/concurrency/abi.zig`): the running process's manager core
 /// vtable + its private per-process context, published by the scheduler each

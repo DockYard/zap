@@ -1637,11 +1637,14 @@ const ZapMemorySection = extern struct {
 /// in non-test builds so the linker symbol the weak-extern/driver path
 /// discovers is present and not dead-stripped.
 ///
-/// `abi_minor = 1` because this manager exposes the v1.1 extended
-/// `ZapRefcountCapabilityV1` vtable (6 slots / 48 bytes — see spec
-/// section 8). A consumer that only knows v1.0 reads the vtable's
-/// `desc.size = 48` and ignores the trailing four slots per spec
-/// section 2.3.
+/// `abi_minor = 1`: this manager exposes the v1.2 extended
+/// `ZapRefcountCapabilityV1` vtable (9 slots / 72 bytes — see spec
+/// section 8, incl. the three v1.2 relocate slots detach/adopt/
+/// free_detached), advertised via the forward-extension `desc.size = 72`
+/// per spec section 2.3 (the milestone is "minor 2"; first-party
+/// managers surface it under `abi_minor = 1` through the size field, not
+/// a bumped minor). A consumer that only knows v1.0/v1.1 reads
+/// `desc.size` and ignores the trailing slots it does not recognize.
 pub const zap_memory_section: ZapMemorySection = .{
     .meta = .{
         .magic = ZMEM_MAGIC,
