@@ -591,7 +591,9 @@ test "SchedulerPool: work stealing runs every process exactly once with no loss,
 
     // Saturate core 0: every process is admitted to core 0's FIFO before any
     // worker runs, so the other cores can only make progress by STEALING.
-    const child_count: usize = 500;
+    // Fewer under ThreadSanitizer (its fiber-trace machinery faults on the
+    // switch volume; the stealing coverage holds at 64 just as well as 500).
+    const child_count: usize = if (@import("builtin").sanitize_thread) 64 else 500;
     var spawned: usize = 0;
     for (0..child_count) |_| {
         _ = pool.primaryCore().spawn(.{
@@ -823,8 +825,11 @@ test "SchedulerPool: a spawn/die storm across cores tears down leak-exact under 
     // `parent_count` parents that each spawn `children_per_parent` children; the
     // whole tree runs and exits on cores chosen by stealing. Leak-exact after
     // every wave: exactly one teardown per process, zero pids, zero pages.
-    const waves: usize = 8;
-    const parent_count: usize = 32;
+    // Fewer waves/parents under ThreadSanitizer (fiber-trace volume ceiling);
+    // the cascade teardown coverage is identical, just smaller.
+    const tsan = @import("builtin").sanitize_thread;
+    const waves: usize = if (tsan) 2 else 8;
+    const parent_count: usize = if (tsan) 8 else 32;
     const children_per_parent: usize = 8;
     const per_wave_total = parent_count * (1 + children_per_parent);
 
@@ -850,4 +855,56 @@ test "SchedulerPool: a spawn/die storm across cores tears down leak-exact under 
 
     // Cumulative leak-exactness: one teardown per process across every wave.
     try testing.expectEqual(waves * per_wave_total, manager.teardown_count.load(.monotonic));
+}
+
+const TimeoutState = struct {
+    manager: *PoolTestManager,
+    timeout_nanoseconds: u64,
+    timed_out_count: std.atomic.Value(usize) = .init(0),
+};
+
+fn timeoutWaiterBody(context: *ProcessContext, argument: ?*anyopaque) void {
+    const state: *TimeoutState = @ptrCast(@alignCast(argument.?));
+    // Park as a timed waiter with no sender: the deadline fires. The firing
+    // core reads the pid for the trace, then the timed-out process becomes
+    // runnable and STEALABLE — a sibling can run and tear it down concurrently
+    // (the P4-J1 race that read the pid after enqueue). Exercised across N cores.
+    const outcome = context.receiveWaitTimeout(state.timeout_nanoseconds);
+    if (outcome == .timed_out) _ = state.timed_out_count.fetchAdd(1, .monotonic);
+}
+
+test "SchedulerPool: receive-after timed waiters fire and tear down race-free across cores" {
+    var pid_table = try PidTable.init(testing.allocator, .{ .capacity = 1024 });
+    defer pid_table.deinit();
+    var envelope_pool = EnvelopePool.init(testing.allocator, .{});
+    defer envelope_pool.deinit();
+    var manager = PoolTestManager{};
+    var state = TimeoutState{ .manager = &manager, .timeout_nanoseconds = std.time.ns_per_ms };
+
+    var pool: SchedulerPool = undefined;
+    try SchedulerPool.init(&pool, testing.allocator, &pid_table, &envelope_pool, .{});
+    defer pool.deinit();
+
+    // Many timed waiters, each parked on some core and fired by whichever core's
+    // deadline scan wins the revival CAS — then run and torn down on any core.
+    // Fewer under ThreadSanitizer (its fiber-trace machinery faults on the
+    // park/fire switch volume — see `mn_refcount_stress.zig`); enough there to
+    // still exercise the fire-then-steal-then-teardown path this test guards.
+    const waiter_count: usize = if (@import("builtin").sanitize_thread) 6 else 128;
+    for (0..waiter_count) |_| {
+        _ = try pool.primaryCore().spawn(.{
+            .entry = timeoutWaiterBody,
+            .argument = &state,
+            .manager = manager.managerContext(),
+            .model = .refcounted,
+        });
+    }
+
+    pool.runUntilQuiescent();
+
+    try testing.expectEqual(waiter_count, state.timed_out_count.load(.monotonic));
+    try testing.expectEqual(waiter_count, manager.teardown_count.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), pid_table.statistics().live_process_count);
+    try testing.expectEqual(@as(u32, 0), envelope_pool.statistics().live_page_count);
+    try testing.expectEqual(@as(i64, 0), pool.liveProcessCount());
 }

@@ -1416,10 +1416,16 @@ pub const Scheduler = struct {
                 // means a producer notified this waiter (`.notified`) and its
                 // wake owns the enqueue — skip it here.
                 if (record.park_state.cmpxchgStrong(.parked, .running, .seq_cst, .seq_cst) == null) {
+                    // Read `pcb.pid` for the trace BEFORE `readyEnqueue` makes
+                    // the process stealable (P4-J1): once it is on the FIFO a
+                    // sibling core can steal, run, and TEAR IT DOWN — writing
+                    // `pcb.pid` — concurrently with a later read here. Capture it
+                    // while this scan still exclusively owns the revival.
+                    const timed_out_pid = pcb.pid;
                     record.receive_timed_out = true;
                     pcb.transitionTo(.runnable);
+                    scheduler.emitTrace(.wake, timed_out_pid);
                     scheduler.readyEnqueue(record);
-                    scheduler.emitTrace(.wake, pcb.pid);
                 }
             } else {
                 remaining += 1;
@@ -1473,10 +1479,15 @@ pub const Scheduler = struct {
             scheduler.timed_waiter_count = live_timed_waiters;
             return true;
         }
+        // Capture the pid for the trace before `readyEnqueue` (deterministic
+        // mode is single-threaded, so this cannot race today, but it mirrors
+        // `fireExpiredReceiveTimeouts` — never read a shared PCB field after the
+        // process is enqueued and thus potentially owned by another core).
+        const fired_pid = fire.pcb.pid;
         fire.receive_timed_out = true;
         fire.pcb.transitionTo(.runnable);
+        scheduler.emitTrace(.wake, fired_pid);
         scheduler.readyEnqueue(fire);
-        scheduler.emitTrace(.wake, fire.pcb.pid);
         scheduler.timed_waiter_count = live_timed_waiters - 1;
         return true;
     }
