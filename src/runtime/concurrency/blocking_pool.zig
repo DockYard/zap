@@ -101,8 +101,11 @@ pub const BlockingPool = struct {
     /// Opaque context forwarded to every `execute` call.
     execute_context: ?*anyopaque,
     /// Worker OS threads. Capacity `max_thread_count`; `[0..started_thread_count)`
-    /// are live. Owned.
-    threads: []std.Thread,
+    /// are slots. Optional so a growth `submit` can RESERVE a slot (null) under
+    /// the lock, drop the lock to run `std.Thread.spawn` (mmap+clone) OFF the
+    /// lock (DEFER #6), then publish the handle — a slot whose spawn failed, or a
+    /// reservation not yet published, reads null and is skipped at join. Owned.
+    threads: []?std.Thread,
 
     /// Guards the submit queue and the worker-population counters. A
     /// `std.atomic.Mutex` spinlock by kernel convention (no libc-coupled
@@ -176,7 +179,8 @@ pub const BlockingPool = struct {
     ) error{OutOfMemory}!void {
         const max = @max(options.max_thread_count, 1);
         const initial = @min(options.initial_thread_count, max);
-        const threads = allocator.alloc(std.Thread, max) catch return error.OutOfMemory;
+        const threads = allocator.alloc(?std.Thread, max) catch return error.OutOfMemory;
+        @memset(threads, null);
 
         pool.* = .{
             .allocator = allocator,
@@ -272,23 +276,51 @@ pub const BlockingPool = struct {
         // (serialized behind that one woken worker). `queue_len + inflight_count
         // > started_thread_count` grows exactly when the existing workers cannot
         // cover the outstanding blocks, giving true dirty-scheduler parallelism.
-        // Spawn under the lock — rare (bounded to `max_thread_count` over the
-        // pool's life; workers persist) so the held-lock cost is bounded and
-        // submit is not a hot path. A spawn failure is non-fatal: the record is
-        // served by an existing worker (the pool is live ⇒ ≥1 worker exists).
-        if (pool.queue_len + pool.inflight_count > pool.started_thread_count and
-            pool.started_thread_count < pool.max_thread_count)
-        {
-            const spawned: ?std.Thread = std.Thread.spawn(.{}, workerEntry, .{pool}) catch null;
-            if (spawned) |thread| {
-                pool.threads[pool.started_thread_count] = thread;
+        //
+        // RESERVE the slot here but SPAWN below, OFF the lock (DEFER #6):
+        // `std.Thread.spawn` does mmap+clone, and holding `state_lock` (a
+        // spinlock) across that syscall would stall every concurrent submit and
+        // every worker's post-drain re-check on the spin for the whole spawn.
+        // Bumping `started_thread_count` at reservation (not at publish) makes a
+        // concurrent submit see the slot as provisioned so it does not
+        // double-grow for the same demand; the slot reads null until the handle
+        // is published. Growth is rare (bounded to `max_thread_count` over the
+        // pool's life; workers persist), so the extra lock round-trip is cheap.
+        const reserved_index: ?usize = blk: {
+            if (pool.queue_len + pool.inflight_count > pool.started_thread_count and
+                pool.started_thread_count < pool.max_thread_count)
+            {
+                const index = pool.started_thread_count;
+                pool.threads[index] = null; // reserved; published below or rolled back
                 pool.started_thread_count += 1;
                 if (pool.started_thread_count > pool.peak_thread_count) {
                     pool.peak_thread_count = pool.started_thread_count;
                 }
+                break :blk index;
             }
-        }
+            break :blk null;
+        };
         pool.unlockState();
+
+        // Spawn OFF the lock, then re-lock only to publish the handle. A spawn
+        // failure is non-fatal — the record is served by an existing worker (the
+        // pool is live ⇒ ≥1 worker exists) — but the reservation must be released
+        // so it does not permanently lower the grow ceiling: reclaim it when ours
+        // is still the last slot; otherwise a concurrent grow already took a later
+        // slot, so leave this one null (join skips it) rather than open a hole.
+        if (reserved_index) |index| {
+            const spawned: ?std.Thread = std.Thread.spawn(.{}, workerEntry, .{pool}) catch null;
+            pool.lockState();
+            if (spawned) |thread| {
+                pool.threads[index] = thread;
+            } else {
+                if (index == pool.started_thread_count - 1) {
+                    pool.started_thread_count -= 1;
+                }
+                pool.threads[index] = null;
+            }
+            pool.unlockState();
+        }
         // Wake a parked worker (eventcount): bump the epoch a parked worker read
         // under the lock, then futex-wake one. A worker that read the epoch and
         // is about to wait sees the bump and re-checks instead of sleeping — no
@@ -328,7 +360,12 @@ pub const BlockingPool = struct {
         pool.lockState();
         const live = pool.started_thread_count;
         pool.unlockState();
-        for (pool.threads[0..live]) |thread| thread.join();
+        // Skip null slots: a reservation whose spawn failed (DEFER #6) leaves a
+        // null in `[0..started_thread_count)`. `deinit` runs after every core has
+        // stopped, so no reservation is still in flight here.
+        for (pool.threads[0..live]) |maybe_thread| {
+            if (maybe_thread) |thread| thread.join();
+        }
         pool.allocator.free(pool.threads);
         pool.* = undefined;
     }

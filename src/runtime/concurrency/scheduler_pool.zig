@@ -22,16 +22,26 @@
 //! happens-before edge that orders one scheduler's quantum for a process
 //! strictly before the next scheduler's quantum for that same process, so the
 //! non-atomic per-process state a quantum touches is single-threaded by
-//! construction. This is the invariant the P4 ThreadSanitizer harnesses prove
-//! by measurement.
+//! construction. Since P4-R1 added the `__tsan_switch_to_fiber` annotations
+//! that let ThreadSanitizer follow the kernel's manual fiber context switches,
+//! the P4 TSan harnesses RUN this invariant end-to-end — the marquee
+//! `-fsanitize-thread` suite passes with ZERO findings, where before R1 TSan
+//! faulted on the switch and could not observe it at all.
 //!
 //! ## Threading model
 //!
 //! `run` starts N−1 worker OS threads (cores 1..N−1) and runs core 0's worker
 //! loop on the CALLING (driver) thread, so the driver's pre-run spawn of the
-//! root process and core 0's quanta share one thread — core 0's per-scheduler
-//! stack pool and record cache are never touched cross-thread. Subsequent
-//! spawns are in-process (on the running core). When the root process exits
+//! root process and core 0's quanta share one thread (that handoff needs no
+//! lock). Each core's RECORD CACHE stays strictly owner-only — a finished
+//! process's record recycles to the OWN cache of whichever core tore it down,
+//! never another's. The per-scheduler STACK POOL, by contrast, IS touched
+//! cross-thread under work stealing: a process stolen from its origin core
+//! exits on another core, whose `resumeFiber` releases the stack back to the
+//! ORIGIN pool — which is exactly why the stack pool takes its spinlock when
+//! `work_stealing` (`StackPool.thread_safe`), keeping the origin pool's counters
+//! exact. Subsequent spawns are in-process (on the running core). When the root
+//! process exits
 //! (Erlang halt model: the program's lifetime is the root's lifetime) every
 //! core is signalled to stop; after the workers join, the driver reaps every
 //! straggler single-threaded and the pool is `deinit`-able.

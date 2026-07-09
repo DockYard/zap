@@ -1780,6 +1780,17 @@ pub const Scheduler = struct {
             .seq_cst,
             .seq_cst,
         )) |_| {
+            // Deliberately do NOT null `record.timer_entry` here. The CAS failed
+            // because this episode already ended — a message revived the process,
+            // or it was killed/recycled/re-parked — so it may now be RUNNING (and
+            // arming a NEW timer, writing `timer_entry`) on another core. Writing
+            // its per-process `timer_entry` from this (the old owner's) wheel
+            // would be a cross-core write to state that core owns — a data race
+            // violating the sacred scheduler-local invariant, and it could clobber
+            // the freshly-armed entry. The stale pointer is safe left dangling:
+            // every reader (`tryEagerCancelReceiveTimer`, `cancelProcessTimer`)
+            // gates on `timer_wheel_owner`/`timer_epoch` first, which no longer
+            // match this discarded episode, so the freed node is never touched.
             return .discarded;
         }
         // Won the revival. Read `pcb.pid` for the trace BEFORE `readyEnqueue`
@@ -2830,18 +2841,20 @@ pub const Scheduler = struct {
     /// OLD end (head) so the victim keeps its freshest (tail/`runnext`) work —
     /// the standard deque discipline — and never touches the victim's `runnext`,
     /// so a just-woken ping-pong partner is never stolen from under its waking
-    /// core. Both queues are taken under their own `run_queue_lock`, thief
-    /// first then victim, in the fixed pool-index order the pool's steal loop
-    /// enforces (thief only steals from higher-... — see `SchedulerPool.steal`),
-    /// so no two schedulers ever lock the same pair in opposite orders. Returns
-    /// 0 when the victim has nothing stealable. Runs on the THIEF's thread.
+    /// core. The two `run_queue_lock`s are NEVER held at the same time: the
+    /// victim lock is taken and RELEASED to detach a chain, and only then is the
+    /// thief lock taken to splice it. Because no thief ever holds both locks,
+    /// there is no lock-ordering hazard — two schedulers stealing from each other
+    /// concurrently (A↔B) cannot deadlock regardless of the pool's scan order
+    /// (`SchedulerPool.tryStealFor`). Returns 0 when the victim has nothing
+    /// stealable. Runs on the THIEF's thread.
     pub fn stealInto(victim: *Scheduler, thief: *Scheduler) usize {
         std.debug.assert(victim.work_stealing and thief.work_stealing);
         std.debug.assert(victim != thief);
         // Snapshot half the victim's FIFO under the victim lock into a local
-        // detached chain, releasing the victim lock before touching the thief
-        // queue (so the two locks are never held nested here — the pool's steal
-        // order is what prevents A-steals-B / B-steals-A deadlock).
+        // detached chain, releasing the victim lock BEFORE touching the thief
+        // queue: the two run-queue locks are never held nested, so no A-steals-B
+        // / B-steals-A pair can deadlock, whatever order the pool scans victims.
         victim.lockRunQueue();
         const available = victim.ready_count;
         if (available == 0) {

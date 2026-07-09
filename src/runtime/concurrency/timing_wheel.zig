@@ -168,6 +168,13 @@ pub const TimingWheel = struct {
     /// Live entry count (the zero-`after` fast path: a scheduler with no timers
     /// skips advancing entirely).
     count: usize,
+    /// Total `advance` outer-loop passes over the wheel's life (telemetry). One
+    /// pass fires up to a full level-0 rotation of ticks; a scheduler that stays
+    /// current does 0–1 passes per `advance`. Exposed so the DEFER/PERF #5
+    /// idle-fast-path test can assert `advance` is O(1) after an arbitrary
+    /// timer-free idle (bounded passes) rather than O(idle) — a regression guard
+    /// on the empty-wheel snap. Wraps harmlessly.
+    advance_pass_total: u64,
     /// Backing allocator for the node pool (the pool is unmanaged — the
     /// allocator is threaded through `create`/`destroy`/`deinit`).
     allocator: std.mem.Allocator,
@@ -186,6 +193,7 @@ pub const TimingWheel = struct {
             .base_clk = 0,
             .clock_seeded = false,
             .count = 0,
+            .advance_pass_total = 0,
             .allocator = allocator,
             .pool = .empty,
         };
@@ -243,6 +251,19 @@ pub const TimingWheel = struct {
         now_nanoseconds: u64,
     ) error{OutOfMemory}!*Entry {
         wheel.seedClock(now_nanoseconds);
+        // Arming the FIRST timer after a timer-free idle: `base_clk` froze while
+        // the wheel was empty (seedClock is one-shot), so snap it forward to now
+        // (DEFER/PERF #5). Without this, `advance` would later sweep every empty
+        // tick of the idle span — O(idle) — instead of only the new timer's
+        // lead. Safe because an empty wheel holds no entry whose level/bucket
+        // position depends on the stale `base_clk`. The companion empty-wheel
+        // fast path in `advance` covers the case where an advance runs first;
+        // whichever fires first keeps `base_clk` current, so the O(1)-after-idle
+        // guarantee holds regardless of call order.
+        if (wheel.count == 0) {
+            const now_tick = now_nanoseconds / base_tick_nanoseconds;
+            if (now_tick > wheel.base_clk) wheel.base_clk = now_tick;
+        }
         var deadline_tick = deadlineToTick(deadline_nanoseconds);
         // A deadline in the current (or a past) tick is placed one tick ahead so
         // it fires on the next advance rather than aliasing into an already-swept
@@ -357,7 +378,10 @@ pub const TimingWheel = struct {
             const rotated = std.math.rotr(u64, occupancy, @as(u6, @intCast(current_index)));
             const ahead: u64 = @ctz(rotated);
             // Boundary tick = the start of that bucket's next occurrence.
-            const boundary = (level_now + ahead) * tick;
+            // Saturating so a far-future coarse-level boundary can never wrap
+            // (it is only a park-bound hint; `earliestDeadlineNanoseconds`
+            // clamps it to at least `base_clk + 1`).
+            const boundary = (level_now + ahead) *| tick;
             if (earliest == null or boundary < earliest.?) earliest = boundary;
         }
         // The overflow list's nearest deadline can beat every wheel boundary.
@@ -393,12 +417,25 @@ pub const TimingWheel = struct {
     ) void {
         wheel.seedClock(now_nanoseconds);
         const now_tick = now_nanoseconds / base_tick_nanoseconds;
+        // Empty-wheel fast path (DEFER/PERF #5): with no armed timer there is
+        // nothing to fire or cascade, so SNAP the clock forward in O(1) rather
+        // than iterating the loop below once per level-0 rotation across the
+        // whole idle span. Without this, the first `advance` after a long
+        // timer-free idle — the scheduler parked with no armed timer, then woke
+        // on a MESSAGE — costs O(idle_ticks / wheel_size) on the scheduler hot
+        // path. `base_clk` lands on `now_tick` so the next `insert` places its
+        // levels relative to real time.
+        if (wheel.count == 0) {
+            if (now_tick > wheel.base_clk) wheel.base_clk = now_tick;
+            return;
+        }
         // Process ticks `base_clk .. now_tick` INCLUSIVE (a timer at
         // `deadline_tick == now_tick` is due). Firing a level-0 bucket is
         // batched across empty buckets via occupancy; a rotation boundary
         // (index 0) cascades the higher levels down first, exactly as Linux's
         // per-jiffy timer loop does — but empty spans cost nothing.
         while (wheel.base_clk <= now_tick) {
+            wheel.advance_pass_total +%= 1;
             const index: usize = @intCast(wheel.base_clk & wheel_mask);
             if (index == 0) {
                 // Entering a fresh level-0 rotation: the higher levels advanced,
@@ -609,6 +646,53 @@ test "TimingWheel: insert then advance past the deadline fires exactly once" {
     // Advancing further fires nothing more.
     wheel.advance(100 * std.time.ns_per_ms, *FireLog, &log, FireLog.fire);
     try testing.expectEqual(@as(usize, 1), log.fired.items.len);
+}
+
+test "TimingWheel: advance/insert after an arbitrary idle is O(1), not O(gap) (DEFER/PERF #5)" {
+    var wheel = TimingWheel.init(testing.allocator);
+    defer wheel.deinit();
+    var log = FireLog.init(testing.allocator);
+    defer log.deinit();
+
+    // Arm and fire one timer so `base_clk` is seeded to a low tick and then the
+    // wheel goes empty — modeling a scheduler that used a timer, then idled.
+    const seed_ns: u64 = 100 * base_tick_nanoseconds;
+    _ = try wheel.insert(tagContext(1), 0, seed_ns + base_tick_nanoseconds, seed_ns);
+    wheel.advance(seed_ns + 2 * base_tick_nanoseconds, *FireLog, &log, FireLog.fire);
+    try testing.expectEqual(@as(usize, 1), log.fired.items.len);
+    try testing.expectEqual(@as(usize, 0), wheel.count);
+    const low_base_clk = wheel.base_clk;
+
+    // A LONG timer-free idle: real time jumps ~1e9 ticks (≈ 11.6 days at 1 ms
+    // ticks) ahead while the wheel stays empty (no armed timer to advance for).
+    const idle_ticks: u64 = 1_000_000_000;
+    const idle_end_ns: u64 = (low_base_clk + idle_ticks) * base_tick_nanoseconds;
+
+    // Insert-side snap: arm the FIRST post-idle timer with NO intervening
+    // advance. The frozen `base_clk` must snap forward AT INSERT — landing on
+    // `now`, having skipped the whole idle gap — so the fire-advance below
+    // sweeps only the timer's lead, not the ~1e9 empty ticks. Without the snap,
+    // `base_clk` would still read `low_base_clk` here.
+    _ = try wheel.insert(tagContext(2), 0, idle_end_ns + base_tick_nanoseconds, idle_end_ns);
+    try testing.expectEqual(idle_end_ns / base_tick_nanoseconds, wheel.base_clk);
+
+    // Firing does only a BOUNDED number of outer-loop passes (the timer's lead),
+    // NOT ~1e9 / wheel_size: the idle gap is never in `[base_clk, now]`.
+    const passes_before_fire = wheel.advance_pass_total;
+    wheel.advance(idle_end_ns + 2 * base_tick_nanoseconds, *FireLog, &log, FireLog.fire);
+    try testing.expectEqual(@as(usize, 2), log.fired.items.len);
+    try testing.expectEqual(@as(usize, 2), log.fired.items[1]);
+    try testing.expect(wheel.advance_pass_total - passes_before_fire <= 2);
+    try testing.expectEqual(@as(usize, 0), wheel.count);
+
+    // Advance-side fast path: an advance on the now-empty wheel after ANOTHER
+    // long idle snaps `base_clk` in O(1) — ZERO outer-loop passes.
+    const second_idle_end_ns: u64 = (wheel.base_clk + idle_ticks) * base_tick_nanoseconds;
+    const passes_before_empty = wheel.advance_pass_total;
+    wheel.advance(second_idle_end_ns, *FireLog, &log, FireLog.fire);
+    try testing.expectEqual(second_idle_end_ns / base_tick_nanoseconds, wheel.base_clk);
+    try testing.expectEqual(passes_before_empty, wheel.advance_pass_total); // zero sweeps
+    try testing.expectEqual(@as(usize, 2), log.fired.items.len); // nothing new fired
 }
 
 test "TimingWheel: a timer never fires early (rounds up to the tick)" {
