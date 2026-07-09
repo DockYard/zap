@@ -1061,6 +1061,24 @@ pub const default_spin_iterations_before_park: u32 = 512;
 /// grab in O(1); a starting point, not a tuned contract.
 pub const default_spill_threshold: usize = 64;
 
+/// The runnext-fairness poll interval (P4-R2 finding #3; Go's runtime
+/// `schedtick % 61` analogue). Under work stealing, a hot mutual-wake pair
+/// refills the owner-only `runnext` LIFO slot every quantum, so a plain
+/// "runnext first, always" pick would let that pair monopolize the core and
+/// STARVE any process stranded in the local FIFO or the global overflow queue
+/// — stealing only rescues such work while an idle core still exists, so with
+/// EVERY core hot the stranded process never runs. Every `runnext_fairness_
+/// interval`-th pick therefore BYPASSES `runnext` and serves the global queue
+/// then the local FIFO first (`dequeueNextRunnable`), guaranteeing bounded
+/// progress for stranded work. 61 is chosen exactly as Go chose it: PRIME (so
+/// the poll cannot phase-lock with a power-of-two or otherwise periodic wake
+/// cadence and systematically miss/hit the same slot), large enough that the
+/// LIFO-locality fast path is preserved on 60 of every 61 picks (the poll's
+/// amortized cost is negligible and the ping-pong-locality benchmark floor is
+/// unmoved), yet small enough to bound a stranded process's scheduling delay to
+/// ≤ 61 quanta.
+pub const runnext_fairness_interval: u64 = 61;
+
 /// Default bound on one futex park (defense-in-depth re-check period; the
 /// eventcount protocol needs no timeout for correctness — see the module
 /// doc's parking section).
@@ -1303,8 +1321,18 @@ pub const Scheduler = struct {
     /// (from `drainWakeStack` or the park re-check, both on this thread) and
     /// consumed first at `dequeueNextRunnable`; thieves never touch it, so the
     /// LIFO-locality guarantee holds (the partner is never stolen away). Null
-    /// and unused when `work_stealing` is false.
+    /// and unused when `work_stealing` is false. Consumed first on 60 of every
+    /// 61 picks; the 61st pick BYPASSES it for fairness (see `schedule_tick` /
+    /// `runnext_fairness_interval`), so a hot mutual-wake pair cannot starve the
+    /// FIFO / global queue.
     runnext: ?*ProcessRecord,
+    /// Per-core quantum counter driving the runnext-fairness poll (P4-R2
+    /// finding #3). `dequeueNextRunnable` bumps it once per pick under work
+    /// stealing; every `runnext_fairness_interval`-th pick bypasses `runnext`
+    /// to serve the global queue / local FIFO first. Wraps harmlessly (`+%`);
+    /// only its residue modulo the interval matters. Owner-thread only; unused
+    /// (and never bumped) when `work_stealing` is false.
+    schedule_tick: u64,
     /// Intrusive FIFO of `.runnable` processes: oldest. Guarded by
     /// `run_queue_lock` when `work_stealing` (thieves read the head); owner-only
     /// otherwise.
@@ -1525,6 +1553,7 @@ pub const Scheduler = struct {
             .receive_timer_wheel = timing_wheel_module.TimingWheel.init(backing_allocator),
             .work_stealing = options.work_stealing,
             .runnext = null,
+            .schedule_tick = 0,
             .ready_head = null,
             .ready_tail = null,
             .ready_count = 0,
@@ -2714,14 +2743,44 @@ pub const Scheduler = struct {
     }
 
     /// Pick the next runnable process: the LIFO slot first (wake locality),
-    /// then the FIFO through the Decisions seam. Owner-thread only.
+    /// then the FIFO through the Decisions seam — EXCEPT on the periodic
+    /// fairness tick, which bypasses the LIFO slot (P4-R2 finding #3). Under
+    /// work stealing a hot mutual-wake pair refills `runnext` every quantum, so
+    /// serving `runnext` unconditionally would starve any process stranded in
+    /// the global queue or the local FIFO (stealing rescues them only while an
+    /// idle core exists — with every core hot, none does). So every
+    /// `runnext_fairness_interval`-th pick BYPASSES `runnext` and serves the
+    /// global overflow queue then the local FIFO first, guaranteeing bounded
+    /// progress for stranded work while preserving the LIFO-locality fast path
+    /// on the other 60 of every 61 picks (Go's `schedtick % 61`). A stranded
+    /// record found on the fairness tick is returned WITHOUT consuming
+    /// `runnext`, so the just-woken partner still runs next. Owner-thread only.
     fn dequeueNextRunnable(scheduler: *Scheduler) ?*ProcessRecord {
         if (scheduler.work_stealing) {
+            scheduler.schedule_tick +%= 1;
+            if (scheduler.schedule_tick % runnext_fairness_interval == 0) {
+                // Fairness tick: serve the global queue, then the local FIFO,
+                // BYPASSING `runnext`. `runnext` is left intact when a stranded
+                // record is found, so the wake-locality partner runs the very
+                // next pick — the poll costs the pair one quantum every 61.
+                if (scheduler.global_queue) |global| {
+                    if (global.pop()) |record| return record;
+                }
+                if (scheduler.dequeueLocalFifo()) |record| return record;
+            }
             if (scheduler.runnext) |record| {
                 scheduler.runnext = null;
                 return record;
             }
         }
+        return scheduler.dequeueLocalFifo();
+    }
+
+    /// Pick from the local FIFO through the Decisions seam, taking the
+    /// run-queue lock. Null when the FIFO is empty. The common (non-fairness)
+    /// pick and the periodic fairness bypass share this one body so both honor
+    /// the Decisions policy identically. Owner-thread only.
+    fn dequeueLocalFifo(scheduler: *Scheduler) ?*ProcessRecord {
         scheduler.lockRunQueue();
         defer scheduler.unlockRunQueue();
         if (scheduler.ready_count == 0) return null;
@@ -3308,6 +3367,196 @@ test "Scheduler: round-robin fairness under the preemption budget (FIFO policy)"
         "aaaabbbbccccaaaabbbbccccaaaabbbbcccc",
         log.recorded(),
     );
+    try testing.expectEqual(@as(usize, 3), manager.teardown_count);
+    try kernel.expectExactAccounting();
+}
+
+// -- runnext fairness poll (P4-R2 finding #3) ----------------------------------
+
+/// A trivial process body: increment a `*usize` run counter and exit. Used to
+/// mint valid, immediately-exiting records for the white-box fairness test.
+fn fairnessExitBody(context: *ProcessContext, argument: ?*anyopaque) void {
+    _ = context;
+    const run_count: *usize = @ptrCast(@alignCast(argument.?));
+    run_count.* += 1;
+}
+
+test "Scheduler: the runnext fairness poll serves stranded global/FIFO work past a saturated LIFO slot (P4-R2 finding #3)" {
+    // White-box proof at the pick chokepoint. A hot mutual-wake pair refills
+    // `runnext` before EVERY pick; a plain "runnext first" policy would then
+    // return the hot partner on all 122 picks and never serve the two stranded
+    // records. The fairness poll instead bypasses `runnext` on each 61st pick,
+    // serving the GLOBAL-queued record on the first tick and the FIFO-queued
+    // record on the second — each WITHOUT consuming `runnext`.
+    var global_queue = GlobalRunQueue.init();
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        .work_stealing = true,
+        .global_queue = &global_queue,
+        // Disable spawn-time spilling so the three fresh records stay in the
+        // local FIFO for us to relocate deterministically.
+        .spill_threshold = 0,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var hot_run_count: usize = 0;
+    var global_run_count: usize = 0;
+    var fifo_run_count: usize = 0;
+    _ = try kernel.scheduler.spawn(.{ .entry = fairnessExitBody, .argument = &hot_run_count, .manager = manager.managerContext() });
+    _ = try kernel.scheduler.spawn(.{ .entry = fairnessExitBody, .argument = &global_run_count, .manager = manager.managerContext() });
+    _ = try kernel.scheduler.spawn(.{ .entry = fairnessExitBody, .argument = &fifo_run_count, .manager = manager.managerContext() });
+
+    // Detach the three fresh records from the FIFO the spawns queued them into.
+    const hot_record = kernel.scheduler.dequeueReadyAt(0).?;
+    const global_stranded_record = kernel.scheduler.dequeueReadyAt(0).?;
+    const fifo_stranded_record = kernel.scheduler.dequeueReadyAt(0).?;
+
+    // One record stranded in the global overflow queue, one in the local FIFO.
+    global_queue.acquire();
+    global_queue.pushChainLocked(global_stranded_record, global_stranded_record, 1);
+    global_queue.lock.unlock();
+    kernel.scheduler.readyEnqueue(fifo_stranded_record);
+
+    var global_served_at_pick: ?u64 = null;
+    var fifo_served_at_pick: ?u64 = null;
+    var runnext_picks: u64 = 0;
+    const total_picks = runnext_fairness_interval * 2;
+    var pick: u64 = 0;
+    while (pick < total_picks) : (pick += 1) {
+        kernel.scheduler.runnext = hot_record; // the ever-refilled LIFO slot
+        const chosen = kernel.scheduler.dequeueNextRunnable().?;
+        if (chosen == hot_record) {
+            runnext_picks += 1;
+        } else if (chosen == global_stranded_record) {
+            global_served_at_pick = pick + 1;
+        } else if (chosen == fifo_stranded_record) {
+            fifo_served_at_pick = pick + 1;
+        } else unreachable;
+    }
+
+    // The global-stranded record surfaces on the first fairness tick (global is
+    // served before the FIFO), the FIFO-stranded record on the second. Every
+    // other pick returned `runnext` — the exact starvation a plain "runnext
+    // first" policy would make permanent.
+    try testing.expectEqual(@as(?u64, runnext_fairness_interval), global_served_at_pick);
+    try testing.expectEqual(@as(?u64, runnext_fairness_interval * 2), fifo_served_at_pick);
+    try testing.expectEqual(total_picks - 2, runnext_picks);
+
+    // The fairness ticks handed us the two stranded records (now detached) and
+    // left `hot_record` in `runnext`. Re-enqueue and drain to leak-exact exit.
+    kernel.scheduler.readyEnqueue(global_stranded_record);
+    kernel.scheduler.readyEnqueue(fifo_stranded_record);
+    try kernel.scheduler.runUntilQuiescent();
+
+    try testing.expectEqual(@as(usize, 1), hot_run_count);
+    try testing.expectEqual(@as(usize, 1), global_run_count);
+    try testing.expectEqual(@as(usize, 1), fifo_run_count);
+    try testing.expectEqual(@as(usize, 3), manager.teardown_count);
+    try kernel.expectExactAccounting();
+}
+
+/// Shared state for the mutual-wake fairness scenario. Single-threaded (one
+/// standalone scheduler), so plain fields — no atomics.
+const FairnessPairState = struct {
+    pinger_pid: Pid = undefined,
+    ponger_pid: Pid = undefined,
+    rounds: usize,
+    pinger_rounds: usize = 0,
+    ponger_rounds: usize = 0,
+    stranded_ran: bool = false,
+    /// The pinger's completed-round count at the instant the stranded process
+    /// first ran — the starvation-vs-progress signal. Without the fairness
+    /// poll this equals `rounds` (the stranded process runs only after the pair
+    /// exhausts); with it, far less (the poll runs it mid-flight).
+    stranded_pinger_rounds_at_run: usize = 0,
+};
+
+fn fairnessPingerBody(context: *ProcessContext, argument: ?*anyopaque) void {
+    const state: *FairnessPairState = @ptrCast(@alignCast(argument.?));
+    // Bootstrap the loop: the ponger is parked on its first receive.
+    _ = context.send(state.ponger_pid, .{}) catch @panic("pinger bootstrap send failed");
+    var round: usize = 0;
+    while (round < state.rounds) : (round += 1) {
+        envelope_pool_module.free(context.receive());
+        state.pinger_rounds += 1;
+        if (round + 1 < state.rounds) {
+            _ = context.send(state.ponger_pid, .{}) catch @panic("pinger send failed");
+        }
+    }
+}
+
+fn fairnessPongerBody(context: *ProcessContext, argument: ?*anyopaque) void {
+    const state: *FairnessPairState = @ptrCast(@alignCast(argument.?));
+    var round: usize = 0;
+    while (round < state.rounds) : (round += 1) {
+        envelope_pool_module.free(context.receive());
+        state.ponger_rounds += 1;
+        _ = context.send(state.pinger_pid, .{}) catch @panic("ponger send failed");
+    }
+}
+
+fn fairnessStrandedBody(context: *ProcessContext, argument: ?*anyopaque) void {
+    _ = context;
+    const state: *FairnessPairState = @ptrCast(@alignCast(argument.?));
+    state.stranded_ran = true;
+    state.stranded_pinger_rounds_at_run = state.pinger_rounds;
+}
+
+test "Scheduler: a hot mutual-wake pair cannot starve a FIFO-stranded process — the fairness poll runs it mid-flight (P4-R2 finding #3)" {
+    // A standalone work-stealing scheduler is single-threaded and fully
+    // deterministic here: every wake is in-process (routes through `runnext`)
+    // and the scheduler never futex-parks (the stranded process is always
+    // runnable). The pair ping-pongs `rounds` times, refilling `runnext` every
+    // quantum; the stranded process sits in the FIFO the whole time. WITHOUT
+    // the fairness poll it runs only AFTER the pair exhausts
+    // (`stranded_pinger_rounds_at_run == rounds`); WITH it, the 61st pick
+    // bypasses `runnext` and runs it while the pair is still hot
+    // (`stranded_pinger_rounds_at_run` well below one fairness interval).
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        .work_stealing = true,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var state = FairnessPairState{ .rounds = 200 };
+    // Spawn order [ponger, pinger, stranded]: the ponger parks first, the
+    // pinger's bootstrap wakes it into `runnext`, and the pair then cycles
+    // through `runnext` while the stranded process waits at the FIFO head.
+    const ponger_pid = try kernel.scheduler.spawn(.{
+        .entry = fairnessPongerBody,
+        .argument = &state,
+        .manager = manager.managerContext(),
+    });
+    const pinger_pid = try kernel.scheduler.spawn(.{
+        .entry = fairnessPingerBody,
+        .argument = &state,
+        .manager = manager.managerContext(),
+    });
+    _ = try kernel.scheduler.spawn(.{
+        .entry = fairnessStrandedBody,
+        .argument = &state,
+        .manager = manager.managerContext(),
+    });
+    state.ponger_pid = ponger_pid;
+    state.pinger_pid = pinger_pid;
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    // Every round completed (no lost wake), and the stranded process ran while
+    // the pair was still mid-flight — impossible without the fairness poll.
+    try testing.expectEqual(state.rounds, state.pinger_rounds);
+    try testing.expectEqual(state.rounds, state.ponger_rounds);
+    try testing.expect(state.stranded_ran);
+    try testing.expect(state.stranded_pinger_rounds_at_run < state.rounds);
+    try testing.expect(state.stranded_pinger_rounds_at_run < runnext_fairness_interval);
     try testing.expectEqual(@as(usize, 3), manager.teardown_count);
     try kernel.expectExactAccounting();
 }
