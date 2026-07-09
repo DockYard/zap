@@ -45,6 +45,24 @@
 //! no longer drive an allowlist. The runtime is now FULLY OS-portable, with
 //! EVERY domain — including the crash handler — confined to the seam and
 //! enforced here.
+//!
+//! ## Concurrency-kernel tree (P4-R2 finding #7)
+//!
+//! The M:N concurrency kernel (`src/runtime/concurrency/`) also ships into user
+//! binaries and is inherently OS-coupled (futex, guard-paged stacks, monotonic
+//! clocks, opt-in env knobs). Through Phase 4 its per-OS calls were governed
+//! only by comment — a NEW `std.c.` added to, say, the scheduler hot path would
+//! ship silently on a target that happens to link libc. A second gate below now
+//! SCANS the kernel's production files and FAILS the build on any per-OS call
+//! outside the explicitly-enumerated, documented seams (`kernel_seam_allowlist`
+//! — futex primitive, stack-guard `mprotect`, scheduler env knobs, Linux
+//! monotonic clock). Kernel test code is excluded exactly as it is not shipped:
+//! everything from a file's `const testing = std.testing;` boundary onward (its
+//! test section and helpers), plus the pure test-harness files, is skipped. The
+//! kernel's per-OS calls are legitimate OS PRIMITIVES (their own tiny seam
+//! layer, like `runtime_os`), not portability leaks — so they are allowlisted
+//! WITH a rationale, not moved; the gate's job here is to catch the NEXT one
+//! that is not.
 
 const std = @import("std");
 
@@ -447,4 +465,236 @@ test "gate allowlists raw calls inside a top-level test block" {
     defer allocator.free(result.violations);
     try std.testing.expectEqual(@as(usize, 0), result.violations.len);
     try std.testing.expectEqual(@as(usize, 3), result.testblock_hits);
+}
+
+// ===========================================================================
+// Concurrency-kernel tree scan (P4-R2 finding #7)
+// ===========================================================================
+
+/// One production kernel source (embedded at comptime — the gate has no
+/// filesystem dependency). Pure test-harness files (`*_stress.zig`,
+/// `panic_guards.zig`, `e7_*`/`e8_*`, `test_support.zig`) are deliberately
+/// EXCLUDED — they never ship, so they are not part of the port surface.
+const KernelFile = struct { name: []const u8, source: []const u8 };
+
+const kernel_files = [_]KernelFile{
+    .{ .name = "concurrency.zig", .source = @embedFile("runtime/concurrency/concurrency.zig") },
+    .{ .name = "abi.zig", .source = @embedFile("runtime/concurrency/abi.zig") },
+    .{ .name = "scheduler.zig", .source = @embedFile("runtime/concurrency/scheduler.zig") },
+    .{ .name = "scheduler_pool.zig", .source = @embedFile("runtime/concurrency/scheduler_pool.zig") },
+    .{ .name = "stack_pool.zig", .source = @embedFile("runtime/concurrency/stack_pool.zig") },
+    .{ .name = "fiber_context.zig", .source = @embedFile("runtime/concurrency/fiber_context.zig") },
+    .{ .name = "process.zig", .source = @embedFile("runtime/concurrency/process.zig") },
+    .{ .name = "pid_table.zig", .source = @embedFile("runtime/concurrency/pid_table.zig") },
+    .{ .name = "mailbox.zig", .source = @embedFile("runtime/concurrency/mailbox.zig") },
+    .{ .name = "envelope_pool.zig", .source = @embedFile("runtime/concurrency/envelope_pool.zig") },
+    .{ .name = "timing_wheel.zig", .source = @embedFile("runtime/concurrency/timing_wheel.zig") },
+    .{ .name = "blocking_pool.zig", .source = @embedFile("runtime/concurrency/blocking_pool.zig") },
+    .{ .name = "futex.zig", .source = @embedFile("runtime/concurrency/futex.zig") },
+    .{ .name = "deterministic.zig", .source = @embedFile("runtime/concurrency/deterministic.zig") },
+    .{ .name = "deterministic_mn.zig", .source = @embedFile("runtime/concurrency/deterministic_mn.zig") },
+    .{ .name = "introspection.zig", .source = @embedFile("runtime/concurrency/introspection.zig") },
+    .{ .name = "crash_report.zig", .source = @embedFile("runtime/concurrency/crash_report.zig") },
+};
+
+/// An enumerated, documented per-OS seam permitted in a kernel production body.
+/// A flagged line in `file` is allowlisted iff it contains one of `needles`.
+/// These are genuine OS PRIMITIVES — the kernel's own thin per-OS layer — not
+/// portability leaks, so they are permitted here rather than moved.
+const KernelSeam = struct {
+    file: []const u8,
+    needles: []const []const u8,
+    /// Why this per-OS call is a legitimate primitive (documentation).
+    reason: []const u8,
+};
+
+const kernel_seam_allowlist = [_]KernelSeam{
+    .{
+        .file = "futex.zig",
+        .needles = &.{ "std.c.UL", "std.c.__ulock_wait", "std.c.__ulock_wake", "std.c._errno", "std.c.E", "std.os.linux" },
+        .reason =
+        \\The kernel's per-OS FUTEX primitive — Linux `futex(2)` and macOS
+        \\`__ulock_wait`/`__ulock_wake`. This tiny file IS the futex seam
+        \\(the kernel's `runtime_os`-equivalent for parking); every per-OS
+        \\call here is its whole purpose.
+        ,
+    },
+    .{
+        .file = "stack_pool.zig",
+        .needles = &.{"std.c.mprotect"},
+        .reason =
+        \\Guard-page protection (`mprotect`) for lazy-commit fiber stacks —
+        \\the memory primitive that makes a stack overflow trap instead of
+        \\corrupting the neighbor. (The Mach/Linux region-protection PROBES
+        \\live in the test section and are excluded by the `const testing`
+        \\boundary.)
+        ,
+    },
+    .{
+        .file = "abi.zig",
+        .needles = &.{"std.c.getenv"},
+        .reason =
+        \\Opt-in scheduler env knobs (`ZAP_SCHED_SEED`/`ZAP_SCHED_CORES`) read
+        \\once at runtime init via libc `getenv`. A per-OS call, but a benign
+        \\one: on a target that does not link libc it is a loud link error,
+        \\never silent misbehavior. Documented in `concurrency.zig`.
+        ,
+    },
+    .{
+        .file = "scheduler.zig",
+        .needles = &.{"std.os.linux"},
+        .reason =
+        \\The Linux arm of `monotonicNowNanoseconds` (raw `clock_gettime`
+        \\syscall, no libc) — the monotonic clock the park-timeout math needs.
+        \\macOS uses its own `os_sync`-aligned clock; both are per-OS primitives
+        \\by nature, the same posture as the futex layer.
+        ,
+    },
+};
+
+/// Whether `code` (a comment-stripped kernel line with a banned prefix) is an
+/// allowlisted seam for `file_name`.
+fn kernelSeamAllows(file_name: []const u8, code: []const u8) bool {
+    for (kernel_seam_allowlist) |seam| {
+        if (!std.mem.eql(u8, seam.file, file_name)) continue;
+        for (seam.needles) |needle| {
+            if (std.mem.indexOf(u8, code, needle) != null) return true;
+        }
+    }
+    return false;
+}
+
+const KernelScanResult = struct {
+    violations: []Violation,
+    /// Allowlisted seam hits seen — proves the scan reached the seam lines
+    /// (a "PASS" with zero seam hits would be vacuous).
+    seam_hits: usize,
+};
+
+/// Scan ONE kernel file's PRODUCTION body. Skips everything from the
+/// `const testing = std.testing;` boundary (or the first top-level `test`
+/// block) to EOF — a file's test section and its helpers are not shipped, so
+/// they are not part of the port surface. Caller owns `violations`.
+fn scanKernelFile(allocator: std.mem.Allocator, file: KernelFile) !KernelScanResult {
+    var violations: std.ArrayList(Violation) = .empty;
+    errdefer violations.deinit(allocator);
+    var seam_hits: usize = 0;
+
+    var line_number: usize = 0;
+    var it = std.mem.splitScalar(u8, file.source, '\n');
+    while (it.next()) |raw_line| {
+        line_number += 1;
+        const trimmed = std.mem.trimStart(u8, raw_line, " \t");
+        // Test-section boundary: production code precedes it; stop scanning.
+        if (std.mem.startsWith(u8, trimmed, "const testing = std.testing;")) break;
+        if (std.mem.startsWith(u8, raw_line, "test ") or
+            std.mem.startsWith(u8, raw_line, "test\"") or
+            std.mem.startsWith(u8, raw_line, "test{"))
+        {
+            break;
+        }
+
+        const code = codePortion(raw_line);
+        const matched = bannedPrefixIn(code) orelse continue;
+        if (kernelSeamAllows(file.name, code)) {
+            seam_hits += 1;
+            continue;
+        }
+        try violations.append(allocator, .{
+            .line_number = line_number,
+            .prefix = matched,
+            .line_text = std.mem.trim(u8, raw_line, " \t\r"),
+        });
+    }
+
+    return .{ .violations = try violations.toOwnedSlice(allocator), .seam_hits = seam_hits };
+}
+
+test "concurrency kernel has no raw std.c/std.posix/std.os calls outside the enumerated production seams" {
+    const allocator = std.testing.allocator;
+
+    var total_violations: usize = 0;
+    var futex_seam_hits: usize = 0;
+    var stack_pool_seam_hits: usize = 0;
+    var abi_seam_hits: usize = 0;
+    var scheduler_seam_hits: usize = 0;
+
+    for (kernel_files) |file| {
+        const result = try scanKernelFile(allocator, file);
+        defer allocator.free(result.violations);
+
+        if (result.violations.len != 0) {
+            std.debug.print(
+                \\
+                \\========================================================================
+                \\concurrency-kernel OS-portability gate FAILED: {d} raw per-OS call(s)
+                \\found in src/runtime/concurrency/{s} OUTSIDE the enumerated seams.
+                \\
+                \\The kernel ships into every Zap user binary, so a raw `std.c.` /
+                \\`std.posix.` / `std.os.` call here is a per-OS assumption. If it is a
+                \\genuine OS primitive, add it to `kernel_seam_allowlist` in
+                \\src/runtime_os_portability_gate.zig WITH a documented reason; otherwise
+                \\route it through an existing primitive (futex/clock/stack) instead.
+                \\------------------------------------------------------------------------
+                \\
+            , .{ result.violations.len, file.name });
+            for (result.violations) |v| {
+                std.debug.print("  src/runtime/concurrency/{s}:{d}: raw `{s}`\n    {s}\n", .{
+                    file.name, v.line_number, v.prefix, v.line_text,
+                });
+            }
+            total_violations += result.violations.len;
+        }
+
+        if (std.mem.eql(u8, file.name, "futex.zig")) futex_seam_hits = result.seam_hits;
+        if (std.mem.eql(u8, file.name, "stack_pool.zig")) stack_pool_seam_hits = result.seam_hits;
+        if (std.mem.eql(u8, file.name, "abi.zig")) abi_seam_hits = result.seam_hits;
+        if (std.mem.eql(u8, file.name, "scheduler.zig")) scheduler_seam_hits = result.seam_hits;
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), total_violations);
+
+    // Sanity: the scan reached the known seams in each file — a vacuous pass
+    // (renamed marker / broken embed / test-boundary swallowing production) is
+    // caught here, not silently accepted.
+    try std.testing.expect(futex_seam_hits > 0);
+    try std.testing.expect(stack_pool_seam_hits > 0);
+    try std.testing.expect(abi_seam_hits > 0);
+    try std.testing.expect(scheduler_seam_hits > 0);
+}
+
+test "kernel gate fires on a planted raw call and allowlists an enumerated seam + the test section" {
+    const allocator = std.testing.allocator;
+
+    // A rogue `std.c.write` in the production body of a non-seam file is a
+    // violation; the same call inside a seam file's allowlisted needle is not;
+    // and anything from the `const testing` boundary onward is excluded.
+    const planted_nonseam = KernelFile{ .name = "mailbox.zig", .source =
+        \\fn hotPath() void {
+        \\    _ = std.c.write(1, "x", 1);
+        \\}
+        \\const testing = std.testing;
+        \\fn testHelper() void {
+        \\    _ = std.c.clock_gettime(.MONOTONIC, undefined);
+        \\}
+    };
+    const nonseam = try scanKernelFile(allocator, planted_nonseam);
+    defer allocator.free(nonseam.violations);
+    try std.testing.expectEqual(@as(usize, 1), nonseam.violations.len);
+    try std.testing.expectEqual(@as(usize, 2), nonseam.violations[0].line_number);
+    try std.testing.expectEqual(@as(usize, 0), nonseam.seam_hits); // clock call was past the boundary
+
+    // The SAME rogue call inside `futex.zig` is NOT allowlisted (only the
+    // enumerated futex needles are), proving whole-file trust is not implied.
+    const planted_seamfile = KernelFile{ .name = "futex.zig", .source =
+        \\fn wait() void {
+        \\    _ = std.c.__ulock_wait(0, undefined, 0, 0);
+        \\    _ = std.c.write(1, "x", 1);
+        \\}
+    };
+    const seamfile = try scanKernelFile(allocator, planted_seamfile);
+    defer allocator.free(seamfile.violations);
+    try std.testing.expectEqual(@as(usize, 1), seamfile.violations.len); // the write, not the ulock
+    try std.testing.expectEqual(@as(usize, 3), seamfile.violations[0].line_number);
+    try std.testing.expectEqual(@as(usize, 1), seamfile.seam_hits); // the __ulock_wait
 }
