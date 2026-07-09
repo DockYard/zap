@@ -1454,6 +1454,15 @@ export fn zap_proc_last_signal_kind(process: *anyopaque) callconv(.c) i64 {
     return contextFromHandle(process).lastSignalKind();
 }
 
+/// The current MONOTONIC time in nanoseconds, read through the scheduler's clock
+/// seam (the same clock as `receive … after`). The `lib/process.zap`
+/// `Process.monotonic_millis` surface divides to milliseconds; supervisors
+/// (`lib/supervisor.zap`) use it for the restart-intensity window. Seeded-mode:
+/// reads the virtual clock, so timed policy stays reproducible under a seed.
+export fn zap_proc_monotonic_nanos(process: *anyopaque) callconv(.c) u64 {
+    return contextFromHandle(process).monotonicNanos();
+}
+
 // ---------------------------------------------------------------------------
 // Local process registry (P5-J2, `registry.zig`): the atomic name→pid table the
 // Zap `Process.register`/`whereis`/`unregister` and send-by-name surface stand

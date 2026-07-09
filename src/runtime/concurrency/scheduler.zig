@@ -1077,6 +1077,18 @@ pub const ProcessContext = struct {
         return @intFromEnum(context.record.last_signal_kind);
     }
 
+    /// The current MONOTONIC time in nanoseconds, read through the scheduler's
+    /// `Clock` seam — the SAME clock that drives `receive … after` deadlines
+    /// (`receiveWaitTimeout`) and the timing wheel. In production this is the
+    /// libc-free monotonic clock; under the seeded deterministic scheduler it is
+    /// the shared virtual clock, so a caller that measures elapsed intervals
+    /// (e.g. a supervisor's restart-intensity window, `lib/supervisor.zap`) is
+    /// reproducible under a seed exactly like every other timed decision. It is a
+    /// pure read — no allocation, no yield.
+    pub fn monotonicNanos(context: *const ProcessContext) u64 {
+        return context.scheduler.options.clock.read();
+    }
+
     // -- Local process registry (P5-J2, `registry.zig`) -----------------------
 
     /// `register(name)`: register the CALLING process under `name` (an atom id).

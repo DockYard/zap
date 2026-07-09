@@ -93,6 +93,27 @@ pub struct Process {
   }
 
   @doc = """
+    The calling process's current MONOTONIC time in milliseconds, read through
+    the scheduler's clock — the SAME clock that drives `receive`'s `after`
+    deadlines. The epoch is unspecified: only the DIFFERENCE between two reads is
+    meaningful (elapsed milliseconds). The value never decreases within a run, so
+    it is safe for measuring intervals (unlike a wall clock, it does not jump on
+    NTP/DST adjustments). Under the seeded deterministic scheduler it reads the
+    virtual clock, so interval-based policy — e.g. a `Supervisor`'s restart-
+    intensity window — is reproducible under a seed.
+
+    ## Example
+
+        started = Process.monotonic_millis()
+        _work = do_something()
+        elapsed = Process.monotonic_millis() - started
+    """
+
+  pub fn monotonic_millis() -> i64 {
+    :zig.ProcessRuntime.monotonic_millis()
+  }
+
+  @doc = """
     Spawns a new process running `entry` under the manifest memory
     manager and returns the child's raw pid bits (type them with
     `Process.pid`). The child starts with an empty mailbox; hand it

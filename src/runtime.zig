@@ -3830,6 +3830,7 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_proc_last_signal_from(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_last_signal_ref(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_last_signal_kind(process: *anyopaque) callconv(.c) i64;
+    extern fn zap_proc_monotonic_nanos(process: *anyopaque) callconv(.c) u64;
 
     // Local process registry (P5-J2, `src/runtime/concurrency/registry.zig`):
     // the atomic name→pid table `Process.register`/`whereis`/`unregister` and
@@ -5006,6 +5007,18 @@ pub const ProcessRuntime = struct {
     pub fn self_pid_bits() u64 {
         requireConcurrencyRuntimeGate();
         return ZapConcurrencyKernel.zap_proc_self(requireCurrentProcessHandle());
+    }
+
+    /// The calling process's current MONOTONIC time in MILLISECONDS, read
+    /// through the scheduler clock seam (the same clock as `receive … after`).
+    /// `lib/process.zap` wraps this as `Process.monotonic_millis`; supervisors
+    /// (`lib/supervisor.zap`) measure their restart-intensity window with it.
+    /// The value is monotonically non-decreasing within a run; only intervals
+    /// between two reads are meaningful (the epoch is unspecified).
+    pub fn monotonic_millis() i64 {
+        requireConcurrencyRuntimeGate();
+        const nanos = ZapConcurrencyKernel.zap_proc_monotonic_nanos(requireCurrentProcessHandle());
+        return @intCast(nanos / std.time.ns_per_ms);
     }
 
     /// Spawn a new process running `entry` (a zero-parameter function)
